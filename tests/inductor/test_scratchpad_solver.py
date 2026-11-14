@@ -2559,6 +2559,29 @@ class TestSympyExprToCpSatPrinter(TestCase):
                     abs(solver.float_value(cp_expr) - want), _QUANTIZE_TOLERANCE * want
                 )
 
+    def test_a_curve_nothing_multiplies_prints_past_the_product_bound(self):
+        # A curve alone in its term takes the Min's scale and the term's
+        # coefficient; its integers pass _MAX_PRODUCT_BOUND here. That bound is
+        # for a product's factors, and the curve is still one lookup.
+        menu = {"split_a": [1, 2, 4, 8, 16]}
+        model, division, sym_map, buffer_map, (a,) = self._one_buffer(menu)
+        sym_map["x"] = model.new_int_var(0, 1000, "x")
+        x = sympy.Symbol("x", integer=True, nonnegative=True)
+        expr = sympy.Min(3.7e6 + 1.5 * x, 1.3e6 * a**0.5)
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        self.assertEqual(model.validate(), "")
+        for (i, value), vx in itertools.product(enumerate(menu["split_a"]), (0, 1000)):
+            with self.subTest(division=i, x=vx):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["x"] == vx)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = min(3.7e6 + 1.5 * vx, 1.3e6 * value**0.5)
+                self.assertAlmostEqual(
+                    solver.float_value(cp_expr), want, delta=_MINMAX_TOLERANCE * want
+                )
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]

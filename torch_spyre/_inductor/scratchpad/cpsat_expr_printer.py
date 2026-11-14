@@ -422,7 +422,7 @@ class _SympyExprToCpSat(Printer):
             result = result.astype(object)
         return owner, result
 
-    def _division_table(self, expr):
+    def _division_table(self, expr, bound=_MAX_PRODUCT_BOUND):
         evaluated = self._candidate_values(expr)
         if evaluated is None:
             return None
@@ -443,7 +443,7 @@ class _SympyExprToCpSat(Printer):
         if divisor == 0:
             return raw[0]
         table = tuple(v // divisor for v in differences)
-        if max(table) > _MAX_PRODUCT_BOUND:
+        if bound is not None and max(table) > bound:
             return None
         scale = Fraction(divisor, denominator)
         offset = int(base) if base.denominator == 1 else float(base)
@@ -789,7 +789,7 @@ class _SympyExprToCpSat(Printer):
             off, on = (power(base.subs(lit, value)) for value in (0, 1))
             return off + (on - off) * lit
         if base.is_Piecewise:
-            return _LazyPiecewise(*((power(v), c) for v, c in base.args))
+            return base.func(*((power(v), c) for v, c in base.args))
         is_min = isinstance(base, sympy.Min)
         func = _LazyMin if is_min == (exponent > 0) else _LazyMax
         return func(*(power(arg) for arg in base.args))
@@ -1030,7 +1030,7 @@ class _SympyExprToCpSat(Printer):
             values = [self._round(factor * value, numbers) for value in table]
             return _CurveTable(arg, xs, sympy.Tuple(*values))
         if isinstance(node, sympy.Piecewise):
-            return _LazyPiecewise(
+            return node.func(
                 *(
                     (self._scale_operand(value, factor, numbers), cond)
                     for value, cond in node.args
@@ -1098,11 +1098,12 @@ class _SympyExprToCpSat(Printer):
         """A curve outside any Min/Max, quantized on its own: its values on the
         smallest power-of-two scale that keeps each within _QUANTIZE_TOLERANCE,
         an integer table ``_division_table`` prints. An integer curve is that
-        one lookup even where the caller prints without tables: it has no
-        narrower factorization."""
+        one lookup even where the caller prints without tables, and past
+        _MAX_PRODUCT_BOUND: one that wide took its Min/Max's scale, so only
+        numbers and literals multiply it."""
         values = [float(v) for v in expr.args[2]]
         if all(float(v).is_integer() for v in values):
-            table = self._division_table(expr)
+            table = self._division_table(expr, bound=None)
             if table is None:
                 raise ValueError(f"curve over {expr.args[0]} is not tabulable")
             return table
