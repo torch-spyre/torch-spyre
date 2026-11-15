@@ -34,13 +34,13 @@ UNION ALL
 SELECT 'artifact.recorded', '', a.artifact_id, min(a.ts), '', '', CAST(map(), 'Map(String, String)'), '', '',
        min(a.audit_timestamp)
 FROM artifacts AS a
-WHERE a.component != 'reference'
+WHERE a.artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')
 GROUP BY a.artifact_id
 UNION ALL
 SELECT 'artifact.promoted', '', a.artifact_id, min(a.ts), '', '', CAST(map(), 'Map(String, String)'), '', '',
        min(a.audit_timestamp)
 FROM artifacts AS a
-WHERE a.origin = 'promoted' AND a.component != 'reference'
+WHERE a.origin = 'promoted' AND a.artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')
 GROUP BY a.artifact_id
 UNION ALL
 SELECT 'results.recorded', concat(toString(v.run_id), '/', v.test_type), v.artifact_id, v.ts, '', '',
