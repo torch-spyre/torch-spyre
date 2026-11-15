@@ -96,7 +96,8 @@ def _labels(result, pinning):
 
 
 def _relaxed(relax, key):
-    return any(p == key or (p.endswith("*") and key.startswith(p[:-1])) for p in relax)
+    """key is named by a relax pattern: exact, or a prefix with a trailing `*` (a bare `*` relaxes nothing)."""
+    return any(p == key or (p.endswith("*") and len(p) > 1 and key.startswith(p[:-1])) for p in relax)
 
 
 def _strict(labels, relax):
@@ -285,7 +286,9 @@ def compare(cmp_, rows, unit="1", direction=None, relax=()):
     """Per (across, by) cell: n, mean, median, cv_pct, effect_pct vs the baseline cell, within_noise, reading.
 
     relax: attributes (subject.id, env.id, env.node, env.label.<k>, trailing * allowed) that may differ between cells,
-    for a comparison whose point is that difference (card count, build); a cell itself still holds one Result."""
+    for a comparison whose point is that difference (card count, build); a cell itself still holds one Result.
+    Relaxing env.id drops the whole environment fingerprint from the check, not only the attribute being compared;
+    derive pairs stay strict."""
     across = cmp_.get("across", [])
     cells = {}
     for row in rows:

@@ -2561,7 +2561,6 @@ class TraceScalingExample(unittest.TestCase):
     def test_scaling_against_one_card(self):
         cells = {c["env.label.device.count"]: c for c in self.analyze(self.results())["compare"]["cells"]}
         self.assertAlmostEqual(cells["4"]["effect_pct"], (160.0 - 330.0) / 330.0 * 100)
-        self.assertAlmostEqual(330.0 / cells["4"]["median"], 2.0625)
         self.assertIsNone(cells["1"]["effect_pct"])
         self.assertEqual(cells["2"]["reading"], "better")
 
@@ -2578,15 +2577,30 @@ class TraceScalingExample(unittest.TestCase):
         with self.assertRaisesRegex(analysis.AnalysisError, "different environment labels"):
             self.analyze(self.results(node_class="node-b"))
 
-    def test_relax_accepts_a_trailing_wildcard(self):
-        def widen(spec):
-            spec["relax"] = ["env.*"]
+    def test_relax_accepts_a_trailing_wildcard_but_a_bare_star_relaxes_nothing(self):
+        def labels(spec):
+            spec["relax"] = ["env.id", "env.label.device.*"]
 
-        self.assertEqual(len(self.analyze(self.results(), widen)["compare"]["cells"]), 3)
+        def bare(spec):
+            spec["relax"] = ["*"]
 
-    def test_rank_spread_is_a_valid_stored_row_query(self):
-        d = cat("trace-demo").by[("Analysis", "rank-spread")]
-        self.assertEqual(d.spec["vary"], ["run.rank"])
+        self.assertEqual(len(self.analyze(self.results(), labels)["compare"]["cells"]), 3)
+        with self.assertRaisesRegex(analysis.AnalysisError, "different env_id"):
+            self.analyze(self.results(), bare)
+
+    def test_relaxing_env_id_stops_comparing_the_fingerprint(self):
+        """Documented limit: the per-card-count kernel fingerprints differ in the fixture and the comparison still runs."""
+        r = self.results()
+        self.assertNotEqual(r[0]["status"]["environment"]["env_id"], r[2]["status"]["environment"]["env_id"])
+        self.assertEqual(len(self.analyze(r)["compare"]["cells"]), 3)
+
+    def test_rank_spread_resolves_against_the_registered_rank_attribute(self):
+        c = cat("trace-demo")
+        self.assertEqual(c.errors, [])
+        self.assertEqual(c.by[("Analysis", "rank-spread")].spec["vary"], ["run.rank"])
+        d = copy_catalog("trace-demo", "rank-unregistered")
+        edit(d / "analysis" / "rank-spread.yaml", "vary: [run.rank]", "vary: [run.rank_nope]")
+        self.assertTrue(any("matches no registered attribute" in e for e in cat(d, [TRACE_PACK], []).errors))
 
 
 class PinningExample(unittest.TestCase):
