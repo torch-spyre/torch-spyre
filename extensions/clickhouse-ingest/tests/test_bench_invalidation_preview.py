@@ -177,7 +177,7 @@ def test_a_restored_event_keeps_its_impact_but_leaves_the_active_view(inj):
     assert row == {
         "state": "restored",
         "runs": 2,
-        "repeats": 2 * REPEATS * len(BENCHMARKS),
+        "repeats": 2 * REPEATS,
     }
 
 

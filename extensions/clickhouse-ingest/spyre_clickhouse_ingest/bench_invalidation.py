@@ -112,7 +112,8 @@ def _when(value, what):
         raise InvalidationError(
             f"{what} is not an ISO-8601 timestamp: {value!r}"
         ) from None
-    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    d = (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    return d.replace(microsecond=d.microsecond // 1000 * 1000)
 
 
 def normalize(ev):
@@ -302,7 +303,7 @@ def hits(client, ev):
     p = hit_params(ev)
     head = _rows(
         client,
-        f"SELECT uniqExact(run_id) AS runs, count() AS repeats FROM {HITS}",
+        f"SELECT uniqExact(run_id) AS runs, uniqExact(run_id, repeat) AS repeats, count() AS n_rows FROM {HITS}",
         p,
     )[0]
     detail = _rows(
@@ -315,20 +316,22 @@ def hits(client, ev):
         int(head["runs"]),
         int(head["repeats"]),
         detail,
-        int(head["repeats"]) > len(detail),
+        int(head["n_rows"]) > len(detail),
     )
 
 
-def all_run_ids(client, ev):
-    rows = _rows(
+def run_summary(client, ev):
+    """(run count, hash of the exact run set, first runs): the set itself never leaves the server."""
+    row = _rows(
         client,
-        f"SELECT DISTINCT toString(run_id) AS run_id FROM {HITS} ORDER BY run_id",
+        "SELECT uniqExact(run_id) AS runs, hex(sipHash128(arraySort(groupUniqArray(run_id)))) AS h, "
+        f"arraySlice(arraySort(groupUniqArray(toString(run_id))), 1, {SAMPLE_RUNS}) AS sample FROM {HITS}",
         hit_params(ev),
-    )
-    return [r["run_id"] for r in rows]
+    )[0]
+    return int(row["runs"]), row["h"], list(row["sample"])
 
 
-def confirm_token(ev, run_ids):
+def confirm_token(ev, runs_hash):
     """Binds a confirmation to the scope, the target state and the exact set of runs the preview showed."""
     body = json.dumps(
         [
@@ -337,7 +340,7 @@ def confirm_token(ev, run_ids):
             str(ev["window_from"]),
             str(ev["window_to"]),
             ev["state"],
-            sorted(run_ids),
+            runs_hash,
         ]
     )
     return hashlib.sha256(body.encode()).hexdigest()[:12]
@@ -441,7 +444,7 @@ def preview(client, ev, limit=None, with_verdicts=True):
         )
     runs, repeats, detail, truncated = hits(client, ev)
     limit = threshold(limit)
-    run_ids = all_run_ids(client, ev) if runs <= 100000 else []
+    _, runs_hash, sample = run_summary(client, ev)
     series, benchmarks, by_run = {}, {}, {}
     for r in detail:
         by_run.setdefault(
@@ -483,11 +486,11 @@ def preview(client, ev, limit=None, with_verdicts=True):
     out = {
         "invalidation_id": ev["invalidation_id"], "scope_kind": ev["scope_kind"], "state_before": current, "state_after": ev["state"],
         "noop": noop, "matched_runs": runs, "matched_repeats": repeats, "truncated": truncated, "threshold": limit,
-        "needs_confirm": runs > limit, "confirm_token": confirm_token(ev, run_ids),
+        "needs_confirm": runs > limit, "confirm_token": confirm_token(ev, runs_hash),
         "benchmarks": sorted(benchmarks.values(), key=lambda b: (b["name"], b["benchmark_id"])),
         "series": sorted(({**s, "runs": len(s["runs"])} for s in series.values()), key=lambda s: (s["component"], s["name"], s["benchmark_id"])),
         "runs": [{**r, "repeats": sorted(r["repeats"]), "benchmarks": len(r["benchmarks"])} for r in by_run.values()][: DETAIL_ROWS],
-        "sample_runs": run_ids[:SAMPLE_RUNS],
+        "sample_runs": sample,
     }  # fmt: skip
     out["verdict_changes"] = {"available": False, "reason": "skipped"}
     if with_verdicts and not noop and runs:
@@ -503,15 +506,31 @@ def preview(client, ev, limit=None, with_verdicts=True):
 
 def next_ts(requested, last, now=None):
     """Strictly after `last` (the id's newest event), in ClickHouse's millisecond resolution."""
+    clock = now or datetime.now(
+        timezone.utc
+    )  # zone-aware: a naive value is read in the client's zone
     t = (
-        requested or now or datetime.now(timezone.utc)
-    )  # always zone-aware: a naive value is read in the client's zone
+        requested if requested and requested <= clock else clock
+    )  # a future time would pin the id's clock
     t = t.replace(microsecond=t.microsecond // 1000 * 1000)
     if last is not None:
         last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
         if t <= last:
             t = last + timedelta(milliseconds=1)
     return t
+
+
+def _replayed(client, evs, props):
+    """(id, state) pairs this bundle already recorded, so re-running an old bundle cannot undo a later restore."""
+    sha = str((props or {}).get("bundle_sha256") or "")
+    if not sha:
+        return set()
+    rows = _rows(
+        client,
+        "SELECT DISTINCT toString(invalidation_id) AS i, state FROM result_invalidations WHERE props['bundle_sha256'] = {sha:String}",
+        {"sha": sha},
+    )
+    return {(r["i"], r["state"]) for r in rows}
 
 
 def apply(
@@ -537,11 +556,17 @@ def apply(
     if not evs:
         raise InvalidationError("no events")
     states = current_states(client, [e["invalidation_id"] for e in evs])
-    last_ts, latest, results, rows = {}, {}, [], []
+    last_ts, latest, results, rows, first_scope = {}, {}, [], [], {}
+    replayed = _replayed(client, evs, props)
     for e in evs:
         i = e["invalidation_id"]
         st = states.get(i)
-        stored = _stored_scope(st) if st else None
+        stored = _stored_scope(st) if st else first_scope.get(i)
+        first_scope.setdefault(
+            i,
+            {k: e[k] for k in SCOPE_COLUMNS}
+            | {"placement_id": (e["placement_id"] or "").lower()},
+        )
         if i not in last_ts and st:
             last_ts[i] = _utc_ms(st["updated_ms"])
         cur = latest.get(i, st["state"] if st else None)
@@ -549,7 +574,7 @@ def apply(
             raise InvalidationError(
                 f"{i} exists with a different scope; an event repeats its invalidation's scope"
             )
-        if e["state"] == cur:
+        if e["state"] == cur or (i, e["state"]) in replayed:
             results.append(
                 {
                     "invalidation_id": i,
@@ -563,14 +588,13 @@ def apply(
             raise InvalidationError(
                 f"{i}: {cur or 'a new invalidation'} cannot become {e['state']}"
             )
-        run_ids = all_run_ids(client, e)
-        n = len(run_ids)
+        n, runs_hash, sample = run_summary(client, e)
         if n > limit:
             if not e["confirmed"]:
                 raise InvalidationError(
                     f"{i}: {n} runs exceed the confirmation threshold {limit}; preview it and confirm"
                 )
-            if e["confirm_token"] and e["confirm_token"] != confirm_token(e, run_ids):
+            if e["confirm_token"] and e["confirm_token"] != confirm_token(e, runs_hash):
                 raise InvalidationError(
                     f"{i}: the runs it covers changed since the preview (confirm token mismatch); preview again"
                 )
@@ -583,7 +607,7 @@ def apply(
                 "action": "write",
                 "ts": ts.isoformat(),
                 "matched_runs": n,
-                "sample_runs": run_ids[:SAMPLE_RUNS],
+                "sample_runs": sample,
             }
         )
         rows.append([
@@ -655,7 +679,7 @@ def impact(client, invalidation_id, limit=DETAIL_ROWS):
 def stored_event(client, invalidation_id):
     """The creation event of an id as a bundle-shaped event (scope only), or None."""
     row = current_states(client, [_uuid(invalidation_id, "invalidation_id")]).get(
-        str(uuid.UUID(invalidation_id))
+        str(uuid.UUID(str(invalidation_id)))
     )
     if not row:
         return None
@@ -697,9 +721,9 @@ def load(root):
         raise BundleError(f"a {KIND} bundle holds only {EVENTS_FILE}: {present}")
     listed = meta.get("files")
     if listed is not None:
-        if [f.get("path") for f in listed] != [EVENTS_FILE] or listed[0].get(
-            "sha256"
-        ) != sha256(root / EVENTS_FILE):
+        if [f.get("path") if isinstance(f, dict) else None for f in listed] != [
+            EVENTS_FILE
+        ] or listed[0].get("sha256") != sha256(root / EVENTS_FILE):
             raise BundleError(
                 "files[] does not match results/invalidation.json (sha256)"
             )
@@ -740,9 +764,8 @@ def ingest(root, args, client=None):
     from .client import ClickHouse, ClickHouseEnv
 
     events = load(root)
-    meta = json.loads((Path(root) / BUNDLE_FILE).read_text())
     extra = dict(getattr(args, "bundle_prop", None) or [])
-    actor = getattr(args, "uploader", "") or meta.get("uploader") or getpass.getuser()
+    actor = getattr(args, "uploader", "") or getpass.getuser()
     sha = digest(Path(root))
     if client is None:
         db = ClickHouseEnv.target_database()

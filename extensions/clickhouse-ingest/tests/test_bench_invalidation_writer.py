@@ -15,7 +15,7 @@
 """bench_invalidation on real chdb: preview, the write rules, ordering, and the bundle kind."""
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -83,9 +83,7 @@ def test_preview_lists_runs_series_and_benchmarks(world):
     f, c = world
     runs, _ = poison(f)
     p = bi.preview(c, ev(), with_verdicts=False)
-    assert p["matched_runs"] == 4 and p["matched_repeats"] == 4 * REPEATS * len(
-        BENCHMARKS
-    )
+    assert p["matched_runs"] == 4 and p["matched_repeats"] == 4 * REPEATS
     assert {r["run_id"] for r in p["runs"]} == set(runs)
     assert len(p["series"]) == len(BENCHMARKS) and {s["runs"] for s in p["series"]} == {
         4
@@ -430,3 +428,63 @@ def test_results_from_bundle_dispatches_the_kind(world, tmp_path, monkeypatch):
         root, args(trusted_job_prefix=[], expect_key="", bundle_url="")
     )
     assert report["status"] == "ingested" and len(stored(c)) == 1
+
+
+def test_a_replayed_old_bundle_cannot_undo_a_restore(world, tmp_path):
+    f, c = world
+    poison(f)
+    old = bi.write_bundle(tmp_path / "a", [ev()])
+    bi.ingest(old, args(), client=c)
+    bi.apply(c, [ev(state="restored")], actor="a")
+    assert bi.ingest(old, args(), client=c)["status"] == "duplicate"
+    assert c.db.rows(
+        f"SELECT state FROM v_invalidation_state WHERE invalidation_id = '{ID1}'"
+    ) == [{"state": "restored"}]
+
+
+def test_two_events_of_a_new_id_cannot_change_scope(world):
+    f, c = world
+    poison(f)
+    with pytest.raises(bi.InvalidationError, match="different scope"):
+        bi.apply(
+            c, [ev(state="suspect"), ev(scope={"device_serial": "SN1"})], actor="a"
+        )
+    assert stored(c) == []
+
+
+def test_the_actor_is_never_the_bundles_uploader(world, tmp_path):
+    f, c = world
+    poison(f)
+    root = bi.write_bundle(tmp_path / "b", [ev()], uploader="mallory")
+    a = args()
+    a.uploader = ""
+    bi.ingest(root, a, client=c)
+    assert stored(c)[0]["actor"] != "mallory"
+
+
+def test_a_future_event_time_does_not_pin_the_clock(world):
+    f, c = world
+    poison(f)
+    bi.apply(c, [ev(ts="2099-01-01T00:00:00+00:00")], actor="a")
+    assert datetime.fromisoformat(stored(c)[0]["ts"]).year < 2099
+
+
+def test_a_window_with_microseconds_keeps_its_scope(world):
+    f, c = world
+    poison(f)
+    n = {
+        "kind": "node",
+        "scope": {"node": "n3"},
+        "window_from": "2026-10-01T00:00:00.123456Z",
+    }
+    bi.apply(c, [ev(**n)], actor="a")
+    bi.apply(c, [ev(state="restored", **n)], actor="a")
+
+
+def test_a_big_scope_confirms_with_the_server_side_token(world):
+    f, c = world
+    poison(f)
+    t1 = bi.preview(c, ev(), limit=1, with_verdicts=False)["confirm_token"]
+    assert (
+        t1 and t1 == bi.preview(c, ev(), limit=1, with_verdicts=False)["confirm_token"]
+    )

@@ -85,7 +85,7 @@ SELECT
     s.reason_code AS reason_code, s.reason AS reason, s.actor AS actor, s.created_at AS created_at,
     s.updated_at AS updated_at, s.window_from AS window_from, s.window_to AS window_to,
     uniqExactIf(i.run_id, i.run_id != toUUID('00000000-0000-0000-0000-000000000000')) AS runs,
-    countIf(i.run_id != toUUID('00000000-0000-0000-0000-000000000000')) AS repeats,
+    uniqExactIf((i.run_id, i.repeat), i.run_id != toUUID('00000000-0000-0000-0000-000000000000')) AS repeats,
     uniqExactIf(i.benchmark_id, i.run_id != toUUID('00000000-0000-0000-0000-000000000000')) AS benchmarks
 FROM v_invalidation_state AS s
 LEFT JOIN v_bench_invalidation_impact AS i ON i.invalidation_id = s.invalidation_id
