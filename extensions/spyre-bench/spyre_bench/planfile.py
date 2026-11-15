@@ -55,6 +55,7 @@ INGEST_TOKENS = (
     "out_dir",
     "case",
     "profile",
+    "test_type",
 )
 TOKEN = re.compile(r"\{\{|\}\}|\{([A-Za-z0-9_.-]+)\}")
 CASE_KEYS = ("case", "benchmark", "component", "environment")
