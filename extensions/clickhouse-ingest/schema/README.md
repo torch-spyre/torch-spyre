@@ -48,6 +48,7 @@ Applying them in filename order works from an empty database.
 | `85-benchmark-verdict-views.sql` | `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `v_perf_regression_gate` (they skip invalidated runs and keep suspect or non-baseline-purpose runs out of baselines) | 20, 49, 60, 62, 83 |
 | `86-bench-references.sql` | `v_bench_references` | 20, 49, 50 |
 | `87-bench-trace-views.sql` | `v_bench_step_records`, `v_bench_step_rank_agg`, `v_bench_step_lag`, `v_bench_step_headline`, `v_bench_step_outliers`, `v_bench_rank_coverage`, `v_bench_spans` (step and span values unnested from `benchmark_runs` arrays; see `docs/trace-views.md`) | 30, 83 |
+| `88-bench-anchored-verdicts.sql` | `v_benchmark_series_runs`, `v_benchmark_anchor`, `v_benchmark_anchored_verdicts` (a fixed accepted baseline per series beside the rolling verdict; changes no existing view) | 20, 30, 49, 50, 60, 62, 83, 85, 86 |
 | `90-bench-span-values.sql` | OPTIONAL: `bench_span_values`, `mv_bench_span_values`, `v_bench_spans_fast` (an insert-triggered copy of the unnested spans) | 30, 83, 87 |
 
 ### Benchmark schema stack (81-89)
