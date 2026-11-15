@@ -65,7 +65,8 @@ works today.
 | Seal a bundle from JUnit, vLLM bench, perf-suite report, generic benchmark rows or per-table rows | `SEAL --offline --out <bundle> ...` | available |
 | Same results, same host, same kit: same bundle digest and same `.tgz` bytes | seal | available (see [Step 5](#step-5-seal)) |
 | Leave the sealing host and user out of the bundle | `--redact-host`, `--redact-user` | available (partial, see Step 5) |
-| Label where the results came from | `--seal-trust lab\|external` | available |
+| Label where the results came from | `--seal-trust lab\|external` (`none` writes no label, for a CI job) | available |
+| Seal an engine results directory (kind `bench`) | `SEAL --offline --bench-dir <dir> ...` | available |
 | Run the sealer with the standard library only | `SEAL="python offline.py"` (one file plus `bundle.schema.json`) | available |
 | Validate a bundle with no network | `results --from-bundle <bundle> --validate-only` | available |
 | Ask what an ingest accepts, and whether it can read a bundle | `results --check [<bundle>]` | available |
@@ -429,7 +430,10 @@ bundle is moved aside with a `REJECTED.json` that states the reason.
 | Kind | Who creates it | Notes |
 |---|---|---|
 | `junit`, `vllm`, `sendnn`, `benchmarks`, `tables` | a site or anyone | available |
-| other kinds (results with repeats and placement, comparison references, definitions, qualification) | the program's operators | planned; not accepted yet |
+| `bench` (results with repeats, placement and environment, from `spyre-bench`) | a site or anyone | available; [details](../../clickhouse-ingest/docs/bench-bundles.md). A site seals with `--bench-dir`, and the upload is stored as `external` unless the channel says otherwise |
+| `bench-definitions`, `bench-qualification`, `bench-placement` | the program's CI | not for sites: only a CI-trusted channel ingests them, and the inbox refuses them |
+| `bench-invalidation` | the program's operators | not for sites |
+| comparison references | the program's operators | planned; not accepted yet |
 
 ## Step 9: verify and keep the receipt
 
@@ -646,8 +650,10 @@ version in `TRANSFER.txt`.
 
 **Do we need an account on the dashboard?** The site does not. The uploader does.
 
-**Which command works today for results with repeats and placement?** Seal the raw output with one of the existing
-kinds (`benchmarks` or `tables`). A dedicated kind is planned; do not hand-write its manifest.
+**Which command works today for results with repeats and placement?** Seal an engine results directory with
+`SEAL --offline --bench-dir <results dir> --arch <arch> --out <bundle>` (kind `bench`), or run
+`spyre-bench upload <results dir>` on the connected side; both drop the keys the receiving channel owns. Do not
+hand-write the manifest. Raw output that has no engine Result can still use `benchmarks` or `tables`.
 
 **Can we seal on a machine other than the one that ran the tests?** Yes, if the results are copied there intact. The sealing
 machine's zone no longer matters (zone-less JUnit times are read as UTC); pass `--triggered-at` and `--ended-at` with

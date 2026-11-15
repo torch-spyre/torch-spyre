@@ -35,8 +35,13 @@ def test_result_kind_and_test_type_match_artifact_results():
 
 
 def test_format_matches_the_bundle_kinds():
+    """Every bundle kind that records a run is an allowed upload format; `reference` is the references kind's."""
     kinds = offline.schema()["properties"]["kind"]["enum"]
-    assert _check("49-result-uploads.sql", "chk_format") == kinds
+    recorded = {
+        offline.UPLOAD_FORMAT.get(k, k) for k in kinds if k not in offline.ADMIN_KINDS
+    }
+    allowed = set(_check("49-result-uploads.sql", "chk_format"))
+    assert recorded <= allowed and allowed - recorded <= {"reference"}
 
 
 NIL = "00000000-0000-0000-0000-000000000000"
