@@ -21,6 +21,7 @@ import importlib.util
 CONTRACT_VERSION = 1
 INGEST_MODULE = "spyre_clickhouse_ingest.identity"
 INGEST_DIST = "spyre-clickhouse-ingest"
+INVALIDATION_MODULE = "spyre_clickhouse_ingest.bench_invalidation"
 # Known answers, each element pinning one property of the ingest rule: tags are stripped, lower-cased, deduplicated,
 # sorted, raw (no alias or namespace handling, empty dropped, non-str stringified); values only strip and lower-case
 # (no NFC/NFKC/casefold, inner whitespace kept, bool/float/None via str, no truncation); keys keep case and padding, an
@@ -156,6 +157,14 @@ def profile_keys(profile):
     """The ingest's key list for a profile, or None when it cannot be read (see profile_status)."""
     kind, value = profile_status(profile)
     return value if kind == "keys" else None
+
+
+def invalidation():
+    """The ingest's invalidation module (preview, write rules, bundle kind), or IngestUnavailable with how to install it."""
+    try:
+        return importlib.import_module(INVALIDATION_MODULE)
+    except Exception as e:  # noqa: BLE001 - any import-time failure means the module is unusable
+        raise IngestUnavailable(f"{INVALIDATION_MODULE} is not importable ({type(e).__name__}: {e}); {HINT}") from e
 
 
 def info():

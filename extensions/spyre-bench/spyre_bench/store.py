@@ -98,6 +98,10 @@ class Store:
         """The series' newest `n` baseline-eligible runs up to and including `row`'s run: dicts run_key, run_ts, samples."""
         raise StoreError(f"store {self.name!r} holds no runs")
 
+    def client(self):
+        """A query client on the store's database, for readers that ship their own SQL (invalidate)."""
+        raise StoreError(f"store {self.name!r} has no query client")
+
 
 class NullStore(Store):
     pass
@@ -248,12 +252,15 @@ class ClickHouseStore(Store):
                 raise StoreError(f"clickhouse_connect is not importable ({e}); {INSTALL_HINT}") from e
             self._db = settings.pop("database")
             try:
-                self._client = clickhouse_connect.get_client(**settings)
+                self._client = clickhouse_connect.get_client(**settings, database=self._db)
             except Exception as e:  # noqa: BLE001 - any connect failure must surface as a store error
                 raise StoreError(f"cannot connect to ClickHouse: {type(e).__name__}: {e}") from e
         if self._db is None:
             self._db = connection_settings(self._env)["database"]
         return self._client
+
+    def client(self):
+        return self._connection()
 
     def _rows(self, sql, parameters):
         client = self._connection()
