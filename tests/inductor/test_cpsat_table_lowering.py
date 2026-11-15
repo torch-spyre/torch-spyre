@@ -222,6 +222,30 @@ def test_a_residency_gated_relayout_charge_is_exact():
     _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
 
 
+def test_a_literal_gates_its_term_instead_of_widening_a_table():
+    from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
+
+    menu = [1, 2, 4, 8, 16, 32, 64]
+    model, buffer_map, divisions, s = _buffers({"a": {"split_a": menu}})
+    names = ("is_lx_a", "is_lx_b", "is_lx_copy")
+    sym_map = {n: model.new_bool_var(n) for n in names}
+    sym_map["division_a"] = divisions["a"]
+    sym_map["_division_of_division_a"] = types.SimpleNamespace(division=divisions["a"])
+    lit_a, lit_b, lit_copy = (sympy.Symbol(n, integer=True) for n in names)
+    division = sympy.Symbol("division_a", integer=True)
+    expr = (
+        lit_a * 100 / s["split_a"]
+        + (1 - lit_b) * (7 + s["split_a"] ** sympy.Rational(1, 2))
+        + RelayoutCharge(lit_copy, division, 40, 20, 10)
+    )
+    lowered = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
+    # Each term is a 7-entry table over the division, switched by its literal;
+    # a table over (literal, division) would hold 14.
+    assert max(_element_sizes(model, 0)) <= len(menu)
+    choices = {divisions["a"]: range(len(menu)), **{sym_map[n]: (0, 1) for n in names}}
+    _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
+
+
 def test_an_expression_it_cannot_table_leaves_the_model_unchanged():
     model = cp_model.CpModel()
     names = "wxyz"

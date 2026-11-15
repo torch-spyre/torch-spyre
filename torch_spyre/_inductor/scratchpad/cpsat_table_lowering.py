@@ -30,7 +30,10 @@ linear. Four rules keep every list short:
 3. a node whose inputs fit the cap takes the cheaper of one table over those
    inputs and the form built from its parts;
 4. a short factor times a node too wide to index is pushed into the node's
-   sums and Min/Max operands, a negative factor turning a Min into a Max.
+   sums and Min/Max operands, a negative factor turning a Min into a Max;
+5. a 0/1 literal times the rest of a product gates it: the rest is lowered
+   with the literal fixed on, and a variable equals it while the literal is
+   on and 0 otherwise, so no table has to read the literal.
 
 The whole objective is planned before anything is added to the model, so
 ``lower_cost_with_tables`` returns None with the model untouched when a node
@@ -252,6 +255,8 @@ class _Linear:
     constant: float = 0.0
     tables: dict = field(default_factory=dict)
     extrema: list = field(default_factory=list)
+    # (literal name, value it is on at) -> the _Linear it gates
+    gated: dict = field(default_factory=dict)
 
     def add(self, term: _Indexed, coeff: float) -> None:
         if term.index is None:
@@ -267,6 +272,10 @@ class _Linear:
             acc = self.tables.get(index)
             self.tables[index] = values if acc is None else acc + values
         self.extrema.extend(other.extrema)
+        for gate, inner in other.gated.items():
+            if gate not in self.gated:
+                self.gated[gate] = _Linear()
+            self.gated[gate].extend(inner)
 
 
 def _relayout_charge(lit, division, *prices):
@@ -290,6 +299,7 @@ class _TableLowering:
         self._symbol_values: dict = {}  # symbol name -> value at each choice
         self._constants: dict = {}
         self._division_of: set = set()
+        self._literals: dict = {}  # symbol name -> its Boolean CP-SAT variable
         self.failure: Optional[str] = None
         self._indexed: dict = {}
         self._evaluated: dict = {}
@@ -348,6 +358,8 @@ class _TableLowering:
             self._inputs[key] = _Index(build, 0, len(values))
         self._symbol_input[name] = key
         self._symbol_values[name] = values
+        if var.is_boolean and list(values) == [0.0, 1.0]:
+            self._literals[name] = var
 
     def _position_of(self, var, values):
         position = self._model.new_int_var(0, len(values) - 1, f"pos_{var.name}")
@@ -703,6 +715,9 @@ class _TableLowering:
         table in the objective, and a factor goes into it term by term unless
         one table over the whole sum and the factor is smaller. A node is one
         table only when that is smaller than its linear form (rule 3)."""
+        gate = self._split_gate(node)
+        if gate is not None:
+            return self._emit_gated(gate, factor, coeff)
         ix = None if node.is_Add and factor is None else self.indexed(node)
         if ix is not None and factor is None and self._prefers_linear(node, ix):
             ix = None
@@ -724,6 +739,43 @@ class _TableLowering:
             self.failure = f"cannot lower {type(node).__name__}: {str(node)[:120]}"
         return None
 
+    def _split_gate(self, node):
+        """``(literal symbol, value it is on at, the rest with it fixed)`` for a
+        product with a 0/1 literal or one minus it as a factor, or a relayout
+        charge (its literal times a price by division); None when there is none,
+        or the rest is then a constant (a plain coefficient)."""
+        if isinstance(node, RelayoutCharge):
+            literal = node.args[0]
+            if literal.is_Symbol and literal.name in self._literals:
+                return literal, 1, node.xreplace({literal: sympy.Integer(1)})
+            return None
+        if not node.is_Mul:
+            return None
+        for i, arg in enumerate(node.args):
+            gate = None
+            if arg.is_Symbol and arg.name in self._literals:
+                gate = (arg, 1)
+            elif arg.is_Add and len(arg.free_symbols) == 1:
+                (sym,) = arg.free_symbols
+                if sym.name in self._literals and sympy.expand(arg - (1 - sym)) == 0:
+                    gate = (sym, 0)
+            if gate is None:
+                continue
+            rest = sympy.Mul(*(a for j, a in enumerate(node.args) if j != i))
+            rest = rest.xreplace({gate[0]: gate[1]})
+            if rest.free_symbols:
+                return gate[0], gate[1], rest
+        return None
+
+    def _emit_gated(self, gate, factor, coeff):
+        sym, on, rest = gate
+        inner = self.emit(rest, factor, coeff)
+        if inner is None:
+            return None
+        out = _Linear()
+        out.gated[(sym.name, on)] = inner
+        return out
+
     def _linear_entries(self, node) -> float:
         """Entries ``node`` needs in the objective, a sum and a Min/Max kept
         linear where that is smaller than their table; inf when it cannot be
@@ -734,6 +786,8 @@ class _TableLowering:
             cost = 0.0
         elif node.is_Add:
             cost = sum(self._linear_entries(a) for a in node.args)
+        elif self._split_gate(node) is not None:
+            cost = self._linear_entries(self._split_gate(node)[2])
         else:
             ix = self.indexed(node)
             tabled = math.inf if ix is None else self._table_entries(ix)
@@ -782,7 +836,10 @@ class _TableLowering:
         same_index: dict = {}
         for term in node.args:
             ix = self.indexed(term)
-            if ix is not None and factor is None and self._prefers_linear(term, ix):
+            if ix is not None and (
+                self._split_gate(term) is not None
+                or (factor is None and self._prefers_linear(term, ix))
+            ):
                 ix = None
             if ix is None or ix.index is None:
                 part = self.emit(term, factor, coeff)
@@ -882,6 +939,12 @@ class _TableLowering:
             pick = min if is_min else max
             lo += pick(b[0] for b in bounds)
             hi += pick(b[1] for b in bounds)
+        for inner in lin.gated.values():
+            bounds = self._bounds(inner)
+            if bounds is None:
+                return None
+            lo += min(0, bounds[0])
+            hi += max(0, bounds[1])
         if max(abs(lo), abs(hi)) > _MAX_BOUND:
             self.failure = "an objective bound past int64"
             return None
@@ -908,7 +971,20 @@ class _TableLowering:
             else:
                 self._model.add_max_equality(target, exprs)
             total += target
+        for (name, on), inner in lin.gated.items():
+            total += self._gated(self._literals[name], on, inner)
         return total
+
+    def _gated(self, literal, on, inner: _Linear):
+        """A variable equal to ``inner`` while ``literal`` is ``on``, else 0."""
+        expr = self._build(inner)
+        lo, hi = self._bounds(inner)
+        self._count += 1
+        var = self._model.new_int_var(min(0, lo), max(0, hi), f"gated_{self._count}")
+        active = literal if on else ~literal
+        self._model.add(var == expr).only_enforce_if(active)
+        self._model.add(var == 0).only_enforce_if(~active)
+        return var
 
     def _operand(self, lin: _Linear):
         expr = self._build(lin)
