@@ -41,6 +41,9 @@ entirely separate mechanism worth understanding on its own terms.
    `spyre_v2` copies on the dev server, seeded from prod: how to sign up,
    connect an MCP client, change schema safely, and prove a branch with
    `verify_schema` before its PR.
+7. **[Perf Lab data API](perf-api.md)** — the read endpoints behind the
+   drill-down (overview to kernel spans, compare, references), their bounds,
+   and how invalidated rows are handled.
 
 ## The shape of the whole system
 
