@@ -263,10 +263,12 @@ class Approvals(unittest.TestCase):
         self.assertEqual(od.sandbox_profile(True)["provenance"], "fork")
 
 
-FORKREQ = lambda **kw: req(sha=SHA[:7], **kw)  # noqa: E731
+FORKREQ = lambda **kw: req(sha=SHA[:12], **kw)  # noqa: E731
+PLAN_OK = {"cases": [{"name": "c", "action": "run", "run_props": {"run.tier": "sanity"}}]}
 
 
 def planned(**kw):
+    kw.setdefault("plan", PLAN_OK)
     return facts(stage="planned", **kw)
 
 
@@ -286,8 +288,11 @@ class Authorize(unittest.TestCase):
         d = od.authorize(facts(head_repo="someone/r"))
         self.assertEqual(d.state, "deny")
         self.assertIn("sha=", d.reasons[0])
-        wrong = od.authorize(facts(request=req(sha="bbbbbbb"), head_repo="someone/r"))
+        wrong = od.authorize(facts(request=req(sha="bbbbbbbbbbbb"), head_repo="someone/r"))
         self.assertEqual(wrong.state, "deny")
+        short = od.authorize(facts(request=req(sha=SHA[:7]), head_repo="someone/r"))
+        self.assertEqual(short.state, "deny")
+        self.assertIn("12", short.reasons[0])
 
     def test_fork_with_write_commenter_gets_pinned_approval(self):
         d = od.authorize(facts(request=FORKREQ(), head_repo="someone/r"))
@@ -341,6 +346,17 @@ class Authorize(unittest.TestCase):
         self.assertEqual(od.authorize(planned(estimate_device_hours=5)).state, "deny")
         self.assertEqual(od.authorize(planned(estimate_device_hours=3)).state, "needs_confirm")
         self.assertEqual(od.authorize(planned(estimate_device_hours=1)).state, "admit")
+
+    def test_planned_stage_needs_the_plan(self):
+        for plan in (None, {}, {"cases": []}, "x"):
+            with self.subTest(plan):
+                self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=plan)).state, "deny")
+
+    def test_history_rows_of_odd_types_and_cases_still_count(self):
+        h = self.history(pr="7", state="Active")
+        self.assertEqual(od.authorize(planned(history=h, estimate_device_hours=1)).cancel, ["r1"])
+        big = self.history(pr="7", state="done", est=100)
+        self.assertEqual(od.authorize(planned(history=big, estimate_device_hours=1)).state, "deny")
 
     def test_planned_stage_needs_a_usable_estimate(self):
         for est in (None, float("nan"), -1, "x", float("inf")):
@@ -665,7 +681,11 @@ class State(unittest.TestCase):
 class Confirm(unittest.TestCase):
     def confirm(self, **kw):
         return planned(
-            confirmed=True, pinned_sha=kw.pop("pinned_sha", SHA), requester=kw.pop("requester", WRITER), **kw
+            confirmed=True,
+            pinned_sha=kw.pop("pinned_sha", SHA),
+            requester=kw.pop("requester", WRITER),
+            requested_at=kw.pop("requested_at", "2026-11-16T09:00:00Z"),
+            **kw,
         )
 
     def test_confirm_clears_the_band_but_not_the_limit(self):
@@ -679,6 +699,13 @@ class Confirm(unittest.TestCase):
 
     def test_confirm_on_a_moved_head_is_denied(self):
         self.assertEqual(od.authorize(self.confirm(pinned_sha=SHA2, estimate_device_hours=3)).state, "deny")
+
+    def test_confirm_expires(self):
+        old = od.authorize(self.confirm(estimate_device_hours=3, requested_at="2026-11-14T09:00:00Z"))
+        self.assertIn("too old", old.reasons[0])
+        none = self.confirm(estimate_device_hours=3)
+        none["requested_at"] = None
+        self.assertEqual(od.authorize(none).state, "deny")
 
     def test_confirm_without_a_recorded_sha_is_denied(self):
         f = self.confirm(estimate_device_hours=3)
@@ -826,6 +853,39 @@ class Hardening(unittest.TestCase):
         for body in ("/bench confirm foo=bar", "/bench cancel now"):
             with self.assertRaises(od.RequestError):
                 od.parse_command(body)
+
+    def test_stored_requests_are_validated_again(self):
+        good = req().to_dict()
+        for patch in (
+            {"sha": "a"},
+            {"reuse": "zzz"},
+            {"profile": "x"},
+            {"budget": float("nan")},
+            {"force": ["a b"]},
+            {"env": "a b"},
+            {"vs": "tomorrow"},
+            {"selections": [{"product": "nope", "selection": {}, "as_asked": ""}]},
+            {"selections": [{"product": "torch-spyre", "selection": {"tier": "huge"}, "as_asked": ""}]},
+            {"selections": []},
+            {"max_wait_s": -1},
+        ):
+            with self.subTest(patch), self.assertRaises(od.RequestError):
+                od.OnDemandRequest.from_dict({**good, **patch})
+
+    def test_www_and_brackets_are_defanged_in_errors_and_cells(self):
+        with self.assertRaises(od.RequestError) as cm:
+            od.parse_flags({"bench": "sanity", "[click](https://evil.example)": "1"})
+        for bad in ("](", "://", "["):
+            self.assertNotIn(bad, str(cm.exception))
+        self.assertNotIn("www.", od.safe("www.evil.com"))
+
+    def test_action_and_repeats_cells_are_sanitised(self):
+        plan = plan_doc("--purpose", "pr", "--subject-id", SUBJECT, "--tier", "sanity")
+        plan["cases"][0].update(action="run | x", repeats="1 | @team")
+        text = od.render_markdown(od.build_preview(plan, req(), GH))
+        row = next(line for line in text.splitlines() if line.startswith("| run"))
+        self.assertEqual(row.count("|"), 5)
+        self.assertNotIn("@team", row)
 
     def test_sha_flag(self):
         self.assertEqual(req(sha="abcdef1").sha, "abcdef1")

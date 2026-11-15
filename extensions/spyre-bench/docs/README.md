@@ -661,12 +661,12 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | `reuse` | `if_valid`, `never`, `prefer`, `only` | `if_valid` |
 | `force` | case names, or `all` | none (needs a reuse mode other than `never`) |
 | `profile` | `off`, `light`, `full` | `off` |
-| `vs` | `main`, `nightly`, `build:<job>#<n>` | `nightly` |
+| `vs` | `main`, `nightly`, `build:<job>#<n>` (kept in the request for the report; the planner does not read it) | `nightly` |
 | `clean` | `true`, `false` | `false` (needs write access) |
-| `max-wait` | `45m`, `1h`, ... (with `clean=true`) | 30m, capped at 60m |
+| `max-wait` | `45m`, `1h`, ... (with `clean=true`) | the placer's default; capped at 60m |
 | `env` | an Environment name | the preset's |
 | `budget` | device-hours; lowers the cap, never raises it | the cap |
-| `sha` | 7 to 40 hex characters of the head commit you reviewed; required for a fork head | none |
+| `sha` | 7 to 40 hex characters of the head commit you reviewed; a fork head needs at least 12 | none |
 
 ### Policy
 
@@ -682,17 +682,20 @@ start a line; lines inside code fences, quotes or indented are ignored.
 
 Numbers are proposals until catalogs carry real `est` values. An estimate above half the limit needs `/bench confirm`;
 above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
-access may cancel anyone's, others are refused while another user's request runs). Row states `active`, `previewed`,
-`launched`, `admit` and `needs_confirm` are live; `cancelled`, `denied`, `rejected` and `deny` are dead, and dead work
-does not count against the window, but still counts toward the hourly rate and the daily clean quota. A history row
-with a non-finite or negative estimate fails closed. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
+access may cancel anyone's, others are refused while another user's request runs). History rows are normalised
+(pull request numbers compared as text, states case-insensitively). A state that is not dead or finished is live
+(`active`, `previewed`, `launched`, `admit`, `needs_confirm` and anything unknown); `done`, `completed` and `finished`
+are never cancelled but count against the window; `cancelled`, `denied`, `rejected` and `deny` count for nothing
+except the hourly rate and the daily clean quota, so a submit-and-cancel loop still costs. The rate limit counts only
+what the caller records in the history, so the caller must record refused requests too. A row with a non-finite or
+negative estimate fails closed. There is no per-user device-hour cap across pull requests. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
 at once overall.
 
 ### Fork pull requests and the pinned sha
 
 - A request is made for one full head sha, recorded with it. If the PR head moves, the request is refused; a new
   comment is a new request and a new permission check.
-- A fork head runs only if the comment names the commit (`sha=`, a prefix of the current head) and the commenter has
+- A fork head runs only if the comment names the commit (`sha=`, at least 12 characters, a prefix of the current head) and the commenter has
   write access; this is what makes the approval about the commit that was reviewed rather than the one that was
   force-pushed a moment before the comment. The comment is the approval, recorded as
   `{sha, approver, permission, request_digest, granted_at}`. It is valid for that sha, that request (by digest) and 72 h.
@@ -709,8 +712,10 @@ data as a PR comment that starts with a marker so it is edited in place. Text th
 stripped of control and bidirectional characters, backticks, tags, pipes, link and image syntax, and issue references,
 `@` is neutralised and URL schemes are broken, before it is put in a table; `RequestError` messages get the lighter
 form (`neutral`). The JSON preview carries the raw plan strings: a dashboard must escape them. A confirm
-(`/bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha` and, for a
-fork, the recorded approval; the confirmer must have write access.
+(`/bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha`,
+`requested_at` (no older than 24 hours) and, for a fork, the recorded approval; the confirmer must have write access.
+`authorize` re-validates the request it is given (shape, enums, names, sha) and at `stage: planned` refuses to admit
+without a plan that has cases, because the tier limit of case and Selection picks can only be judged there.
 
 ## Running the tests
 
