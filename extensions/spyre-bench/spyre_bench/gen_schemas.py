@@ -238,6 +238,12 @@ DEFS = {
             "runner": s(pattern=NAME),
             "seed": integer(),
             "fresh_cache": BOOL,
+            "allow_empty": {
+                "type": "boolean",
+                "description": "a run that exits 0 without raw output or metrics.json is not a failure",
+            },
+            "command": arr(s(minLength=1), minItems=1, description="argv with {tokens}; see docs/README.md (Running)"),
+            "ingest": arr(s(minLength=1), minItems=1, description="argv of the ingest hand-off, same tokens"),
         },
         desc="run attributes: never identity; overridable at run time",
     ),

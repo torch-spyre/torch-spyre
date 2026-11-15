@@ -2231,7 +2231,8 @@ class PlanError(Exception):
 
 
 def validity_at_least(have, floor):
-    return VALIDITY_ORDER.index(have) >= VALIDITY_ORDER.index(floor)
+    """A validity outside the vocabulary (stored data we cannot read) never satisfies a floor."""
+    return have in VALIDITY_ORDER and VALIDITY_ORDER.index(have) >= VALIDITY_ORDER.index(floor)
 
 
 def parse_ts(v):
@@ -2720,7 +2721,9 @@ def _plan_case(cat, c, env_name, env, request, ov, s, leg, existing, invalidatio
         **({"selection": s.name} if s else {}),
         **({"expand": c["workload"]["expand"]} if c["workload"].get("expand") else {}),
     }
-    cfg = (s.spec.get("reuse") if s else None) or request.get("reuse") or {"mode": "never"}
+    asked = request.get("reuse") or None
+    cfg = (asked if asked and asked.get("override") else None) or (s.spec.get("reuse") if s else None) or asked
+    cfg = cfg or {"mode": "never"}
     subject = request.get("subject") or {}
     forced = {"all", c["name"]} & set(cfg.get("force", []))
     if not reason and cfg["mode"] != "never":
