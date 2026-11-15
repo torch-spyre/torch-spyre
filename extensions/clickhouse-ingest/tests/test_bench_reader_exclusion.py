@@ -286,6 +286,9 @@ def populate(c, extras):
                              "classname": "T", "name": "t"}])  # fmt: skip
     c.insert("test_case_runs", [{"run_id": fun, "test_case_id": u("tc"),
                                  "component": "spyre-inference", "status": "passed"}])  # fmt: skip
+    if extras:
+        c.insert("test_case_runs", [{"run_id": u("ref-functional"), "test_case_id": u("tc"),
+                                     "component": "spyre-inference", "status": "passed"}])  # fmt: skip
 
     if extras:
         ref = dict(
@@ -379,6 +382,7 @@ FACTS = {
     "ref_only_rows": "SELECT count() n FROM benchmark_runs WHERE props['run.ref_only'] = '1'",
     "ref_type_rows": "SELECT count() n FROM benchmark_runs WHERE props['run.record_type'] = 'reference'",
     "ref_artifacts": "SELECT count() n FROM artifacts WHERE component = 'reference'",
+    "ref_case_rows": f"SELECT count() n FROM test_case_runs WHERE run_id = '{u('ref-functional')}'",
     "ref_tags": "SELECT count() n FROM artifact_tags WHERE tag_family = 'reference'",
     "ref_verdicts": f"SELECT count() n FROM artifact_results WHERE artifact_id = '{A_REF}'",
     "runs_stored": "SELECT count() n FROM benchmark_runs",
@@ -454,7 +458,7 @@ def test_the_fixture_exercises_every_view(base):
 
 def test_references_and_artifacts_added_to_the_fixture_are_all_stored(extra):
     n = {k: v[0]["n"] for k, v in extra["facts"].items() if k.startswith("ref_")}  # noqa: E501
-    assert n == {"ref_only_rows": 2, "ref_type_rows": 3, "ref_artifacts": 1, "ref_tags": 4,
+    assert n == {"ref_only_rows": 2, "ref_type_rows": 3, "ref_artifacts": 1, "ref_case_rows": 1, "ref_tags": 4,
                  "ref_verdicts": 6, "ref_runs_measured": 0}  # fmt: skip
 
 
