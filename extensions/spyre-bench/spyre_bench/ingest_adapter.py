@@ -58,6 +58,11 @@ PROFILE_SOURCES = {
     "vllm-sweep": ("spyre_clickhouse_ingest.vllm", "SWEEP_ID_KEYS"),
 }
 
+OFFLINE_MODULE = "spyre_clickhouse_ingest.offline"
+# The offline module's bench support: absent in an ingest that predates bench bundles.
+OFFLINE_NEEDS = ("bench_inputs", "content_digest", "receipt_id")
+UPGRADE_HINT = "upgrade the ingest first (a kit sealed by a newer ingest than the receiving one is refused)"
+
 _state = {}
 
 
@@ -92,6 +97,19 @@ def _load():
             )
     _state.update(derive=derive, namespace=str(namespace))
     return derive
+
+
+def offline():
+    """The ingest's stdlib-only sealing and upload module (it reads bundle.schema.json beside itself, so the whole
+    package is needed; a vendored identity module is not enough)."""
+    try:
+        mod = importlib.import_module(OFFLINE_MODULE)
+    except Exception as e:  # noqa: BLE001 - any import-time failure means the module is unusable
+        raise IngestUnavailable(f"{OFFLINE_MODULE} is not importable ({type(e).__name__}: {e}); {HINT}") from e
+    missing = [n for n in OFFLINE_NEEDS if not hasattr(mod, n)]
+    if missing:
+        raise IngestUnavailable(f"{OFFLINE_MODULE} lacks {missing}: it predates bench bundles; {UPGRADE_HINT}")
+    return mod
 
 
 def reset():
