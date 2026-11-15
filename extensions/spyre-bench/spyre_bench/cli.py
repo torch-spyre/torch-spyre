@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""spyre-bench command line: validate, explain, ids, plan, run, upload, verdict, analyze, gen-schemas."""
+"""spyre-bench command line: validate, explain, ids, plan, run, upload, verdict, accept, analyze, gen-schemas."""
 
 import sys
 
@@ -24,6 +24,7 @@ VERBS = {
         "seal a results directory and send it to the results inbox (dry run unless --apply)",
     ),
     "verdict": ("spyre_bench.verdict", "print the stored verdict of a run or artifact (advisory)"),
+    "accept": ("spyre_bench.accept", "propose a stored run as the new accepted baseline (anchor) of its series"),
     "validate": ("spyre_bench.validate", "validate catalogs against the core schemas, packs and cross-resource rules"),
     "explain": ("spyre_bench.explain", "show a case with every reference resolved, its identity and its plan record"),
     "ids": ("spyre_bench.ids", "print the stored benchmark_id of each case, or its derivation inputs (--inputs)"),
