@@ -1,4 +1,5 @@
 name: bench-on-demand
+run-name: ${{ inputs.pr_number != '' && format('bench-on-demand pr={0} by={1}', inputs.pr_number, inputs.requested_by) || 'bench-on-demand' }}
 
 # On-demand run of the benchmarks/ catalog through spyre-bench: validate -> plan -> run -> ingest ->
 # verdict. Nightly and weekly runs are triggered from Jenkins presets (they must run on the nightly-built image);
@@ -35,10 +36,27 @@ on:
         required: false
         type: boolean
         default: false
+      pr_number:
+        description: Pull request this run answers (set by bench-pr-comment; same-repository heads only)
+        required: false
+        type: string
+        default: ''
+      requested_by:
+        description: Login of the user who asked (set by bench-pr-comment)
+        required: false
+        type: string
+        default: ''
+      bench_env:
+        description: JSON object of BENCH_* variables from the request (set by bench-pr-comment)
+        required: false
+        type: string
+        default: ''
 
+# A newer request for the same pull request cancels the older one (also across bench-on-demand-fork).
 concurrency:
-  group: bench-on-demand-${{ inputs.smoke && 'smoke' || 'full' }}
-  cancel-in-progress: false
+  group: ${{ inputs.pr_number != '' && format('bench-on-demand-pr-{0}', inputs.pr_number) || format('bench-on-demand-{0}', inputs.smoke && 'smoke' || 'full')
+    }}
+  cancel-in-progress: ${{ inputs.pr_number != '' }}
 
 permissions:
   contents: read
@@ -101,6 +119,11 @@ jobs:
     timeout-minutes: 240
     # Advisory: a failing benchmark never turns the workflow red or blocks anything.
     continue-on-error: true
+    outputs:
+      plan: ${{ steps.plan.outcome }}
+      run: ${{ steps.run.outcome }}
+      ingest: ${{ steps.ingest.outcome }}
+      verdict: ${{ steps.verdict.outcome }}
     env:
       BENCH_RESULTS_DIR: ${{ github.workspace }}/bench-results
       BENCH_PLAN_FILE: ${{ github.workspace }}/bench-results/plan/plan.json
@@ -126,6 +149,24 @@ jobs:
             extensions/spyre-bench
             extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
+
+      # The request is data from a trusted dispatch; keys and values are checked again here because anyone with
+      # write access can also dispatch this workflow by hand.
+      - name: Apply the request
+        if: ${{ inputs.bench_env != '' }}
+        env:
+          REQUEST_JSON: ${{ inputs.bench_env }}
+          PINNED_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${PINNED_REF}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full commit sha for a pull request run"; exit 1; }
+          printf '%s' "${REQUEST_JSON}" | jq -e 'type == "object"' > /dev/null
+          allowed='BENCH_PURPOSE BENCH_REUSE BENCH_SELECTION BENCH_TIER BENCH_SUITES BENCH_FORCE BENCH_BUDGET BENCH_ENVIRONMENT BENCH_SET'
+          echo "BENCH_SELECTION=" >> "$GITHUB_ENV"
+          for key in ${allowed}; do
+            value=$(printf '%s' "${REQUEST_JSON}" | jq -r --arg k "${key}" 'if has($k) then .[$k] else empty end | select(type == "string" and test("\\A[A-Za-z0-9._,=#@+-]{0,300}\\z"))')
+            [ -z "${value}" ] || echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
 
       - name: Set up Python (hosted runner)
         if: ${{ inputs.smoke }}
@@ -217,7 +258,7 @@ jobs:
         with:
           xml-dir: ${{ env.BENCH_RESULTS_DIR }}/ingest-xml
           workflow: bench-on-demand
-          branch: ${{ inputs.ref || github.ref_name }}
+          branch: ${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.ref || github.ref_name }}
           sha: ${{ inputs.ref || github.sha }}
           run-id: ${{ steps.collect.outputs.run_id }}
           gha-run-id: ${{ github.run_id }}
@@ -266,3 +307,34 @@ jobs:
             echo "- validate: ${VALIDATE_OUTCOME:-n/a}; collect: ${COLLECT_OUTCOME:-n/a}; ingest requested: ${DO_INGEST}"
             echo "- plan: ${PLAN_OUTCOME:-n/a}; run: ${RUN_OUTCOME:-n/a}; ingest: ${INGEST_OUTCOME:-n/a}; verdict: ${VERDICT_OUTCOME:-n/a}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Counts-only answer on the pull request. Trusted code only: nothing from the PR head is checked out here.
+  report:
+    name: Answer on the pull request
+    needs: [bench]
+    if: ${{ !cancelled() && inputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ inputs.pr_number }}
+      PLAN: ${{ needs.bench.outputs.plan }}
+      RUN: ${{ needs.bench.outputs.run }}
+      INGEST: ${{ needs.bench.outputs.ingest }}
+      VERDICT: ${{ needs.bench.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Comment
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          {
+            echo "### Benchmark run finished"
+            echo
+            echo "plan: ${PLAN:-n/a} · run: ${RUN:-n/a} · stored: ${INGEST:-n/a} · verdict: ${VERDICT:-n/a}"
+            echo
+            echo "[Workflow run](${RUN_URL})"
+          } > body.md
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@body.md > /dev/null
