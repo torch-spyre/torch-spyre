@@ -121,6 +121,8 @@ class Chdb:
         ]
 
     def insert(self, table, rows):
+        if not rows:
+            return
         body = "\n".join(json.dumps(r) for r in rows)
         self.command(f"INSERT INTO {table} FORMAT JSONEachRow\n{body}")
 
@@ -285,6 +287,9 @@ def populate(c, extras):
     c.insert("test_cases", [{"test_case_id": u("tc"), "component": "spyre-inference",
                              "classname": "T", "name": "t"}])  # fmt: skip
     c.insert("test_case_runs", [{"run_id": fun, "test_case_id": u("tc"),
+                                 "component": "spyre-inference", "status": "passed"}])  # fmt: skip
+    # Cases with no verdict at all: coverage reports them as a missing result.
+    c.insert("test_case_runs", [{"run_id": u("cases-only"), "test_case_id": u("tc"),
                                  "component": "spyre-inference", "status": "passed"}])  # fmt: skip
     if extras:
         c.insert("test_case_runs", [{"run_id": u("ref-functional"), "test_case_id": u("tc"),
@@ -522,7 +527,10 @@ def test_rows_with_no_artifact_behind_them_are_kept(setting, base, extra):
         assert snap["facts"][setting] == [{"tags": 1, "results": 1, "bench": 1}]
 
 
-COVERAGE = "SELECT runs, runs_linked, runs_missing_result, runs_missing_cases FROM v_run_coverage"
+COVERAGE = (
+    "SELECT toString(day) d, arch, runs, runs_linked, runs_missing_result, runs_missing_cases "
+    "FROM v_run_coverage ORDER BY d, arch"
+)
 
 
 def coverage_with(extra_verdicts, case_runs):
