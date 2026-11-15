@@ -30,15 +30,25 @@ from spyre_bench import engine
 
 def identity_changes(base, cur):
     """(warnings, notes): series that restart, and series that end."""
-    old = {c["name"]: base.ids(c)["benchmark_id"] for c in base.cases}
+    old, out = {}, []
+
+    def token(cat, c, side):
+        try:
+            return cat.id_token(c)
+        except ValueError as x:
+            out.append(f"{c['where']}: cannot compare identity ({side} tree): {str(x).splitlines()[0]}")
+            return None
+
+    for c in base.cases:
+        old[c["name"]] = token(base, c, "base")
     now = {b.name: b for b in cur.of("Benchmark")}
     renamed = {p: b.name for b in now.values() for p in b.spec.get("previous_names", [])}
-    out = []
     for c in cur.cases:
-        if c["name"] in old and old[c["name"]] != cur.ids(c)["benchmark_id"]:
+        new = token(cur, c, "current") if old.get(c["name"]) is not None else None
+        if new is not None and old[c["name"]] != new:
             out.append(
                 f"{c['where']}: identity changed under the same case name: a new series starts "
-                f"(old benchmark_id {old[c['name']][:8]})"
+                f"(old identity {old[c['name']][:8]})"
             )
     notes = []
     for b in base.of("Benchmark"):

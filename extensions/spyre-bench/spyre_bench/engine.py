@@ -33,7 +33,8 @@ from pathlib import Path
 import regex as re
 import yaml
 
-from spyre_bench import placement
+from spyre_bench import ingest_adapter, placement
+from spyre_bench.ingest_adapter import IngestUnavailable
 from spyre_bench.placement import parse_cpu_list
 
 try:
@@ -344,6 +345,47 @@ LEGACY_TAG_ALIASES = {
     "spyre-backend": "domain__spyre-backend",
     "torch-spyre": "domain__torch-spyre",
 }
+
+
+# Discriminator key lists of the ingest producers, in hash order (compared with the ingest's constants by
+# ingest_adapter.profile_keys). `generic` has no fixed list: the keys are the sorted prop names the block gives.
+INGEST_DISC_KEYS = ("record_type", "config_name", "input_shapes", "run_mode", "kernel_name", "is_total")
+_VLLM_KEYS = ("record_type", "run_mode", "tensor_parallel", "input_len", "output_len")
+ID_PROFILES = {
+    "perf-kernel": INGEST_DISC_KEYS,
+    "vllm": _VLLM_KEYS,
+    "vllm-sweep": _VLLM_KEYS + ("concurrency", "num_prompts", "max_model_len", "max_num_seqs"),
+}
+GENERIC_PROFILE = "generic"
+DEFAULT_PROFILE = "perf-kernel"
+ID_SOURCES = ("case.", "system.", "input.")
+TAG_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}\Z"
+IDENT_NAME = r"^[a-z0-9_][a-z0-9._@:/-]{0,199}\Z"
+RUN_LEVEL_TAGS = ("tier", "suite", "run")
+
+
+def check_profile(profile):
+    """'match'; 'skipped (...)' when the ingest has no producer module (vendored identity); 'unverified (...)' when it
+    has one that cannot be imported; IngestUnavailable on a difference."""
+    fixed = ID_PROFILES.get(profile)
+    if not fixed:
+        return "skipped (no fixed key list)"
+    kind, theirs = ingest_adapter.profile_status(profile)
+    if kind == "absent":
+        return f"skipped (ingest producer module absent: {theirs})"
+    if kind == "unverified":
+        return f"unverified ({theirs})"
+    if tuple(theirs) != fixed:
+        raise IngestUnavailable(
+            f"the ingest hashes {list(theirs)} for profile {profile}, the engine expects {list(fixed)}: "
+            "the ingest rule changed; update ID_PROFILES, the examples and the conformance table together"
+        )
+    return "match"
+
+
+def under(n, names, delims):
+    """True when `n` is one of `names` or starts with one followed by a delimiter character."""
+    return any(n == g or (n.startswith(g) and n[len(g)] in delims) for g in names)
 
 
 def norm(value):
@@ -1252,6 +1294,7 @@ class Catalog:
         for b in benches:
             if not self._file_ok(b, order):
                 continue
+            self._check_identity(b)
             modes = [k for k in ("variants", "matrix", "derive") if k in b.spec]
             if len(modes) != 1:
                 self.errors.append(
@@ -1269,13 +1312,96 @@ class Catalog:
             if c["name"] in seen:
                 self.errors.append(f"{c['where']}: case name {c['name']!r} also produced by {seen[c['name']]}")
             seen.setdefault(c["name"], c["where"])
-            bid = self.ids(c)["benchmark_id"]
+            unresolved = []
+            self.ingest_inputs(c, unresolved)
+            if unresolved:
+                self.errors += unresolved
+                continue
+            bid = self.id_token(c)
             if bid in ids and ids[bid] != c["name"]:
                 self.errors.append(
                     f"{c['where']}: same benchmark_id as case {ids[bid]!r}: they differ only in run "
                     "attributes (environment, profile, tier), which are runs, not cases"
                 )
             ids.setdefault(bid, c["name"])
+
+    def _check_identity(self, b):
+        """Static rules of a Benchmark's `identity` block; `from` references are resolved per case (ingest_inputs)."""
+        w, bad = f"{b.where}", []
+        hours = b.spec.get("est_hours")
+        if isinstance(hours, float) and not math.isfinite(hours):
+            bad.append(f"est_hours: {hours!r} must be finite (the schema bounds it below by 0)")
+        blk = b.spec.get("identity")
+        if blk is not None:
+            bad += [f"identity: {x}" for x in self._identity_errors(blk)]
+        self.errors += [f"{w}: {x}" for x in bad]
+
+    def _identity_errors(self, blk):
+        bad = []
+        mode = blk.get("mode")
+        extra = sorted(set(blk) - {"mode"})
+        if mode == "engine" and extra:
+            bad.append(f"{extra} need mode: ingest (mode: engine takes no other field)")
+        if mode != "ingest":
+            return bad
+        for f_ in ("component", "name"):
+            if f_ in blk and not norm(blk[f_]):
+                bad.append(f"{f_} is empty: the ingest refuses an id without a component and a name")
+            elif f_ in blk and not re.match(IDENT_NAME, blk[f_]):
+                bad.append(f"{f_}: {blk[f_]!r} does not match {IDENT_NAME}")
+        names = {norm(g) for g in self.groupings} | {"tier", "suite"}
+        groups = names | {"run", "backend"}
+        values = {norm(v) for g in self.groupings.values() for v in g.get("values", [])}
+        values |= {norm(d.name) for d in self.docs if d.kind == "Suite"}
+        seen_tags = set()
+        for t in blk.get("tags", []):
+            n = norm(t)
+            ns = n.split("__", 1)[0]
+            if n in seen_tags:
+                bad.append(f"tags: {t!r} is listed twice")
+            seen_tags.add(n)
+            if n in LEGACY_TAG_ALIASES or ns in RUN_CONTEXT_TAG_NAMESPACES | RESULT_TAG_NAMESPACES:
+                bad.append(f"tags: {t!r} is a run-context or result tag, not an identity tag")
+            elif under(n, groups, "_-.:="):
+                bad.append(
+                    f"tags: {t!r} starts with a run-level grouping or `backend` ({sorted(groups)}) up to a "
+                    "delimiter (_ - . : =); groupings are run props and backend is unhashed, never tags"
+                )
+            elif n in values:
+                bad.append(f"tags: {t!r} is a grouping value (a tier or suite name): a run prop, never a tag")
+            elif not re.match(TAG_PATTERN, t):
+                bad.append(f"tags: {t!r} does not match {TAG_PATTERN}")
+        profile = blk.get("profile", DEFAULT_PROFILE)
+        discs = blk.get("discriminators", [])
+        keys = [d.get("key") for d in discs]
+        for k in dict.fromkeys(keys):
+            nk = norm(k)
+            if keys.count(k) > 1:
+                bad.append(f"discriminators: key {k!r} is listed twice")
+            if not nk:
+                bad.append("discriminators: key is empty")
+            elif "backend" in re.split(r"__|[.:=]", nk) or re.split(r"__|[_.:=-]", nk)[0] == "backend":
+                bad.append(f"discriminators: key {k!r}: backend is the comparison axis and is never hashed")
+            elif under(nk, names, "_-.:=") or under(nk, {"run"}, ".:=") or nk.startswith("run__"):
+                bad.append(f"discriminators: key {k!r} is a run-level grouping or run prop, never a hashed key")
+            elif profile != GENERIC_PROFILE and k not in ID_PROFILES.get(profile, ()):
+                bad.append(f"discriminators: unknown key {k!r} for profile {profile} ({list(ID_PROFILES[profile])})")
+        if not bad and profile == GENERIC_PROFILE and keys != sorted(keys):
+            bad.append(f"discriminators: profile generic hashes the sorted prop names; list {sorted(keys)}, not {keys}")
+        if not bad and profile in ID_PROFILES and keys != list(ID_PROFILES[profile]):
+            bad.append(
+                f"discriminators: profile {profile} hashes exactly {list(ID_PROFILES[profile])} in that order "
+                f"(use value: '' for an empty one), not {keys}: any other list derives an id that producer never writes"
+            )
+        for n, d in enumerate(discs):
+            at = f"discriminators[{n}] ({d.get('key')})"
+            if ("value" in d) == ("from" in d):
+                bad.append(f"{at}: needs exactly one of value, from")
+            if "join" in d and "from" not in d:
+                bad.append(f"{at}: join needs from")
+            if "from" in d and not d["from"].startswith(ID_SOURCES):
+                bad.append(f"{at}: from {d['from']!r} must start with one of {ID_SOURCES}")
+        return bad
 
     def _file_ok(self, b, order):
         folder, ok = b.path.parent.name, True
@@ -1436,6 +1562,8 @@ class Catalog:
             "analyze": b.spec.get("analyze", []),
             "derived_metrics": b.spec.get("derived_metrics", []),
             "requires_reference": bool(suite.spec.get("requires_reference")),
+            "identity": b.spec.get("identity"),
+            "est_hours": b.spec.get("est_hours"),
         }
 
     def _add(self, b, name, patch, extra):
@@ -1872,7 +2000,12 @@ class Catalog:
 
     # ------------------------------------------------------------- identity
     def identity(self, c):
-        """The BenchmarkId inputs: component, name, identity tags, discriminators (+ unhashed props)."""
+        """The engine-native BenchmarkId inputs: component, name, identity tags, discriminators (+ unhashed props)."""
+        i = self._identity(c)
+        return {**i, "disc": {k: dstr(v) for k, v in i["disc"].items()}}
+
+    def _identity(self, c):
+        """identity() with the discriminator values as authored (lists stay lists)."""
         wl = c["workload"]
         t = self.reg.types.get(("Workload", wl.get("type")), {})
         body = {k: v for k, v in wl.items() if k not in ("base", "patch", "scenario", "inputs", "type")}
@@ -1900,7 +2033,6 @@ class Catalog:
             disc[f"input.{n}.select"] = canonical(sel)
             props.update({f"input.{n}.{k}": v for k, v in props_in.items()})
         ident, ctx = split_tags(c["tags"])
-        disc = {k: dstr(v) for k, v in disc.items()}
         return {
             "component": self.component,
             "name": c["benchmark"],
@@ -1944,9 +2076,82 @@ class Catalog:
             return [self.ref_id("Model", inp["model"])], inp.get("select") or {}, {"model": inp["model"]}
         return [self.ref_id("Asset", inp["asset"])], inp.get("select") or {}, {"asset_name": inp["asset"]}
 
-    def ids(self, c):
+    def ingest_inputs(self, c, errs=None):
+        """The ingest derivation inputs of a case whose Benchmark declares `identity: {mode: ingest}`, else None.
+
+        Needs no ingest package. Unresolvable `from` references are appended to `errs`, or raise ValueError.
+        """
+        blk = c.get("identity")
+        if not blk or blk.get("mode") != "ingest":
+            return None
+        raw = self._identity(c)["disc"]
+        bad = [] if errs is None else errs
+        disc, keys = {}, []
+        for n, d in enumerate(blk.get("discriminators", [])):
+            keys.append(d.get("key"))
+            if "from" not in d:
+                disc[d.get("key")] = dstr(d.get("value"))
+                continue
+            at = f"{c['where']}: identity.discriminators[{n}] ({d.get('key')})"
+            if d["from"] not in raw:
+                bad.append(
+                    f"{at}: {d['from']!r} is not an identity value of this case; unhashed run properties such as "
+                    f"system.backend cannot feed an id (available: {', '.join(sorted(raw))})"
+                )
+                disc[d.get("key")] = ""
+            elif "join" in d and not isinstance(raw[d["from"]], list):
+                bad.append(f"{at}: join needs a list value, {d['from']!r} is not one")
+                disc[d.get("key")] = ""
+            elif isinstance(raw[d["from"]], (list, dict)) and "join" not in d:
+                bad.append(
+                    f"{at}: {d['from']!r} is a list or mapping; the ingest writes scalars, so a list needs "
+                    "`join` and a mapping cannot feed a discriminator"
+                )
+                disc[d.get("key")] = ""
+            else:
+                v = raw[d["from"]]
+                disc[d.get("key")] = d["join"].join(dstr(x) for x in v) if "join" in d else dstr(v)
+        if errs is None and bad:
+            raise ValueError("\n".join(bad))
+        return {
+            "component": blk.get("component", self.component),
+            "name": blk.get("name", c["benchmark"]),
+            "tags": list(blk.get("tags", [])),
+            "disc": disc,
+            "disc_keys": keys,
+            "profile": blk.get("profile", DEFAULT_PROFILE),
+        }
+
+    def engine_id(self, c):
+        """The engine-native hash of the case; needs no ingest package. Never a join key in ingest mode."""
         i = self.identity(c)
-        return {"benchmark_id": benchmark_id(i["component"], i["name"], i["tags"], i["disc"], sorted(i["disc"]))}
+        return benchmark_id(i["component"], i["name"], i["tags"], i["disc"], sorted(i["disc"]))
+
+    def ids(self, c):
+        """`benchmark_id` is the stored join key. With `identity: {mode: ingest}` it comes from the ingest derivation
+        (IngestUnavailable without it) and `engine_id` is kept beside it."""
+        eid = self.engine_id(c)
+        a = self.ingest_inputs(c)
+        if a is None:
+            return {"benchmark_id": eid}
+        check_profile(a["profile"])
+        bid = ingest_adapter.benchmark_id(a["component"], a["name"], a["tags"], a["disc"], a["disc_keys"])
+        return {"benchmark_id": bid, "engine_id": eid, "id_mode": "ingest"}
+
+    def id_token(self, c):
+        """Equality token for duplicate and change detection that needs no ingest package: `benchmark_id` in engine
+        mode, a hash of the normalised ingest inputs otherwise. Never stored."""
+        a = self.ingest_inputs(c)
+        if a is None:
+            return self.ids(c)["benchmark_id"]
+        parts = [norm(a["component"]), norm(a["name"]), tag_part(a["tags"]), disc_part(a["disc"], a["disc_keys"])]
+        return hid("ingest-inputs", ID_SEP.join(parts))  # the string the ingest hashes, so its collisions collide
+
+    def try_id(self, c):
+        try:
+            return self.ids(c)["benchmark_id"]
+        except IngestUnavailable:
+            return None
 
     # ------------------------------------------------------------- ad hoc variants
     def variant(self, case_name, sets):
@@ -1970,9 +2175,9 @@ class Catalog:
             self.cases, self.errors = saved, []
         if found:
             raise ValueError("\n".join(found))
-        return new, identity_diff(
-            self.identity(base), self.identity(new), self.ids(base)["benchmark_id"], self.ids(new)["benchmark_id"]
-        )
+        diff = identity_diff(self.identity(base), self.identity(new), self.try_id(base), self.try_id(new))
+        diff["identity_changed"] = self.id_token(base) != self.id_token(new)
+        return new, diff
 
 
 def identity_diff(old, new, old_id="", new_id=""):
@@ -2635,7 +2840,26 @@ def build_result(
     if bad:
         raise ValueError(f"not fingerprint attributes in the registry: {bad}")
     ident = cat.identity(case)
-    bid = cat.ids(case)["benchmark_id"]
+    ids = cat.ids(case)
+    bid = ids["benchmark_id"]
+    ingest = cat.ingest_inputs(case)
+    case_block = {
+        "benchmark_id": bid,
+        "component": ident["component"],
+        "name": ident["name"],
+        "tags": ident["tags"],
+        "disc": ident["disc"],
+        "props": ident["props"],
+    }
+    if ingest:
+        case_block = {
+            **case_block,
+            **{k: ingest[k] for k in ("component", "name", "tags", "disc", "disc_keys")},
+            "id_mode": "ingest",
+            "engine_id": ids["engine_id"],
+            "benchmark": case["benchmark"],
+            "case": case["name"],
+        }
     labels = {**({PIN_LABEL: "none"} if PIN_LABEL in cat.project.spec.get("series_labels", []) else {}), **labels}
     series = {k: labels[k] for k in cat.project.spec.get("series_labels", []) if k in labels}
     reps = []
@@ -2657,14 +2881,7 @@ def build_result(
         "kind": "Result",
         "metadata": {"name": name},
         "status": {
-            "case": {
-                "benchmark_id": bid,
-                "component": ident["component"],
-                "name": ident["name"],
-                "tags": ident["tags"],
-                "disc": ident["disc"],
-                "props": ident["props"],
-            },
+            "case": case_block,
             "subject": subject,
             "environment": {
                 "env_id": env_id_of(fingerprint, fingerprint_version),
@@ -2728,13 +2945,20 @@ def recompute(result, reg=None):
     st, bad = result["status"], []
     c = st["case"]
     for k, v in (c.get("props") or {}).items():
-        if k in c["disc"]:
+        if k in c["disc"] and c.get("id_mode") != "ingest":  # an ingest disc is the producer's namespace, not ours
             bad.append(f"props overlap {k}")
         elif reg is not None and k.startswith("system.ext."):
             a = reg.lookup(k)
             if a is None or (a.get("values") and v not in [dstr(x) for x in a["values"]]):
                 bad.append(f"props {k}")
-    if benchmark_id(c["component"], c["name"], c["tags"], c["disc"], sorted(c["disc"])) != c["benchmark_id"]:
+    if c.get("id_mode") == "ingest":  # IngestUnavailable propagates: an ingest id is never silently unchecked
+        keys = c.get("disc_keys")
+        again = (
+            None if keys is None else ingest_adapter.benchmark_id(c["component"], c["name"], c["tags"], c["disc"], keys)
+        )
+    else:
+        again = benchmark_id(c["component"], c["name"], c["tags"], c["disc"], sorted(c["disc"]))
+    if again != c["benchmark_id"]:
         bad.append("benchmark_id")
     env = st["environment"]
     if env_id_of(env["fingerprint"], env.get("fingerprint_version", 1)) != env["env_id"]:
