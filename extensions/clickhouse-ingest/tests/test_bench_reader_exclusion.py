@@ -47,8 +47,12 @@ FILES = (
     "55-dispatch-views.sql",
     "60-benchmark-views.sql",
     "62-benchmark-verdicts.sql",
-    "63-perf-regression-gate.sql",
     "70-vllm-hud-projection.sql",
+    "81-bench-environments.sql",
+    "82-run-placements.sql",
+    "83-result-invalidations.sql",
+    "84-bench-views.sql",
+    "85-benchmark-verdict-views.sql",
 )
 TRACE_TYPES = (
     "step_trace",
