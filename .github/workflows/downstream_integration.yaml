@@ -2,7 +2,8 @@ name: downstream_integration
 
 # Pre-queue stand-in for Jenkins' downstream fan-out: once auto-merge is enabled on a PR, or a
 # maintainer comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
-# (advisory) integration suites on their latest main. Inert unless GHA_DOWNSTREAM_INTEGRATION is "true".
+# (advisory) integration suites on their main against this PR's torch-spyre head. Inert unless
+# GHA_DOWNSTREAM_INTEGRATION is "true".
 run-name: downstream-integration
 
 on:
@@ -95,7 +96,7 @@ jobs:
         with:
           repository: torch-spyre/${{ matrix.repo }}
           token: ${{ steps.app-token.outputs.token }}
-          triggering_sha: ${{ needs.resolve.outputs.sha }}
+          torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}
       - name: Report result
         if: always()

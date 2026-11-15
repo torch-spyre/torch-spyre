@@ -208,7 +208,7 @@ jobs:
           exit 1
 
   # Replaces Jenkins' downstream fan-out in the merge queue: the sibling repos' integration suites run
-  # on their latest main. hf-adapters gates "Spyre Test (amd64)"; spyre-inference is advisory.
+  # on their main against this commit's torch-spyre. hf-adapters gates "Spyre Test (amd64)"; spyre-inference is advisory.
   downstream-integration:
     name: Integration (${{ matrix.repo }})
     needs: changes
@@ -244,7 +244,7 @@ jobs:
         with:
           repository: torch-spyre/${{ matrix.repo }}
           token: ${{ steps.app-token.outputs.token }}
-          triggering_sha: ${{ github.sha }}
+          torch_spyre_ref: ${{ github.sha }}
           hash_source: ${{ github.event.merge_group.head_ref }}
 
   # Posts the required "Spyre Test (amd64)" context on merge-queue entries and on PRs where GHA ran
