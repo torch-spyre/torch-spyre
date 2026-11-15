@@ -66,6 +66,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
+| `bench_verdicts.py` | read-only verdict reader for one run or artifact (`python -m spyre_clickhouse_ingest bench-verdicts`): verdict, baseline, repeats/CV, trust, validity and invalidation per benchmark metric, as JSON or markdown; the advisory check poster is `.github/scripts/bench_check.py` |
 
 ## Naming an artifact (simple -> advanced)
 
