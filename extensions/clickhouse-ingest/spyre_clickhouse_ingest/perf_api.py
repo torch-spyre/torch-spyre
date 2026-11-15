@@ -1257,49 +1257,43 @@ def steps(
     signal=None,
     outlier_z=3.5,
     max_rows=100000,
+    _views=True,
     **_,
 ):
     now = naive(now)
     rid = uuid_arg(run_id, "run_id")
     cap = bounded(max_rows, "max_rows", 100000, 1, 1000000)
     extra = (
-        (" AND r.benchmark_id = {bid:UUID}" if benchmark_id else "")
+        (" AND t.benchmark_id = {bid:UUID}" if benchmark_id else "")
+        + (" AND t.repeat = {rep:UInt16}" if repeat is not None else "")
+        + (" AND t.prompt = {pr:String}" if prompt is not None else "")
+    )
+    raw_extra = (
+        (" AND benchmark_id = {bid:UUID}" if benchmark_id else "")
         + (
-            " AND toUInt16OrZero(r.props['run.repeat']) = {rep:UInt16}"
+            " AND toUInt16OrZero(props['run.repeat']) = {rep:UInt16}"
             if repeat is not None
             else ""
         )
-        + (" AND r.props['run.prompt'] = {pr:String}" if prompt is not None else "")
+        + (" AND props['run.prompt'] = {pr:String}" if prompt is not None else "")
     )
+    qp = {
+        "run_id": rid,
+        **({"bid": uuid_arg(benchmark_id, "benchmark_id")} if benchmark_id else {}),
+        **(
+            {"rep": bounded(repeat, "repeat", 0, 0, 65535)}
+            if repeat is not None
+            else {}
+        ),
+        **({"pr": str(prompt)} if prompt is not None else {}),
+    }
     rows = run(
-        f"""SELECT t.benchmark_id AS benchmark_id, t.repeat AS repeat, t.rank AS rank, t.prompt AS prompt, pos,
-                   toUInt32(t.m['step_index'][pos]) AS step_index, toUInt8(t.m['step_kind'][pos]) AS step_kind,
-                   toUInt8(t.m['cold'][pos]) AS cold,
-                   mapApply((k, v) -> (k, v[pos]), mapFilter((k, v) -> NOT startsWith(k, 'summary.') AND NOT startsWith(k, 'headline.')
-                       AND k NOT IN ('step_index', 'step_kind', 'cold') AND length(v) >= pos, t.m)) AS metrics
-            FROM
-            (
-                SELECT r.benchmark_id AS benchmark_id, toUInt16OrZero(r.props['run.repeat']) AS repeat,
-                       toUInt16OrZero(r.props['run.rank']) AS rank, r.props['run.prompt'] AS prompt,
-                       argMax(r.measurements, (r.ts, r.audit_timestamp, r.audit_uuid)) AS m,
-                       argMax(r.props, (r.ts, r.audit_timestamp, r.audit_uuid)) AS pr
-                FROM benchmark_runs AS r
-                WHERE r.run_id = {{run_id:UUID}} AND mapContains(r.measurements, 'step_kind') AND mapContains(r.measurements, 'step_index'){extra}
-                GROUP BY benchmark_id, repeat, rank, prompt
-            ) AS t
-            ARRAY JOIN range(1, length(t.m['step_kind']) + 1) AS pos
-            ORDER BY benchmark_id, repeat, prompt, rank, pos LIMIT {{cap:UInt32}}""",
-        {
-            "run_id": rid,
-            "cap": cap + 1,
-            **({"bid": uuid_arg(benchmark_id, "benchmark_id")} if benchmark_id else {}),
-            **(
-                {"rep": bounded(repeat, "repeat", 0, 0, 65535)}
-                if repeat is not None
-                else {}
-            ),
-            **({"pr": str(prompt)} if prompt is not None else {}),
-        },
+        f"""SELECT t.benchmark_id AS benchmark_id, t.backend AS backend, t.repeat AS repeat, t.rank AS rank, t.prompt AS prompt, t.pos AS pos,
+                   t.step_index AS step_index, t.step_kind AS step_kind, t.cold AS cold, t.metrics AS metrics
+            FROM v_bench_step_records AS t
+            WHERE t.run_id = {{run_id:UUID}}{extra}
+            ORDER BY benchmark_id, backend, repeat, prompt, rank, pos LIMIT {{cap:UInt32}}""",
+        {**qp, "cap": cap + 1},
     )
     if len(rows) > cap:
         raise ApiError(
@@ -1309,6 +1303,35 @@ def steps(
             max_rows=cap,
         )
     if not rows:
+        probe = run(
+            f"""SELECT 1 AS x FROM benchmark_runs WHERE run_id = {{run_id:UUID}} AND mapContains(measurements, 'step_kind')
+                {raw_extra} LIMIT 1""",
+            qp,
+        )
+        want_bid = str(uuid_arg(benchmark_id, "benchmark_id")) if benchmark_id else None
+        want_rep = None if repeat is None else int(repeat)
+        hits = [
+            h
+            for h in invalidations(run, {rid}).get(rid, [])
+            if h["state"] == "invalidated"
+            and (want_bid is None or h["benchmark_id"] in (None, want_bid))
+            and (want_rep is None or h["repeat"] in (None, want_rep))
+        ]
+        if probe and hits:
+            raise ApiError(
+                404,
+                "no_matching_steps",
+                "no step records match (or the matching repeats are invalidated)",
+                run_id=rid,
+            )
+        if probe:
+            return envelope(
+                {"records": [], "ranks": [], "steps": []},
+                now,
+                300,
+                no_data=True,
+                reason="step rows exist but none is readable (arrays of unequal length, non-finite or duplicate indexes are skipped)",
+            )
         return envelope(
             {"records": [], "ranks": [], "steps": []},
             now,
@@ -1316,32 +1339,18 @@ def steps(
             no_data=True,
             reason="no step_trace rows for this run",
         )
-    inv = invalidations(run, {rid}).get(rid, [])
-    sel_repeat = None if repeat is None else int(repeat)
     keys = sorted(
         {
-            (str(r["benchmark_id"]), int(r["repeat"]), r["prompt"])
+            (str(r["benchmark_id"]), int(r["repeat"]), r["prompt"], r["backend"])
             for r in rows
-            if sel_repeat in (None, int(r["repeat"])) and prompt in (None, r["prompt"])
         }
     )
-    keys = [
-        k
-        for k in keys
-        if not any(h["state"] == "invalidated" and covers(h, k[0], k[1]) for h in inv)
-    ]
-    if not keys:
-        raise ApiError(
-            404,
-            "no_matching_steps",
-            "no step records match (or the matching repeats are invalidated)",
-            run_id=rid,
-        )
-    chosen = keys[0]
+    chosen, backend = keys[0][:3], keys[0][3]
     sel = [
         r
         for r in rows
-        if (str(r["benchmark_id"]), int(r["repeat"]), r["prompt"]) == chosen
+        if (str(r["benchmark_id"]), int(r["repeat"]), r["prompt"], r["backend"])
+        == keys[0]
     ]
     metas = {
         (str(m["benchmark_id"]), int(m["repeat"]), m["prompt"], int(m["rank"])): m
@@ -1352,9 +1361,10 @@ def steps(
                       mapFilter((k, v) -> startsWith(k, 'summary.'),
                                 argMax(r.measurements, (r.ts, r.audit_timestamp, r.audit_uuid))) AS summ
                FROM benchmark_runs AS r
-               WHERE r.run_id = {run_id:UUID} AND r.benchmark_id = {bid:UUID} AND mapContains(r.measurements, 'step_kind')
+               WHERE r.run_id = {run_id:UUID} AND r.benchmark_id = {bid:UUID} AND r.backend = {be:String}
+                 AND mapContains(r.measurements, 'step_kind')
                GROUP BY benchmark_id, repeat, rank, prompt LIMIT 10000""",
-            {"run_id": rid, "bid": chosen[0]},
+            {"run_id": rid, "bid": chosen[0], "be": backend},
         )
     }
     props = metas[(chosen[0], chosen[1], chosen[2], int(sel[0]["rank"]))]["pr"]
@@ -1369,13 +1379,13 @@ def steps(
             signals=signals,
         )
     ranks = sorted({int(r["rank"]) for r in sel})
-    stepl = sorted({int(r["pos"]) for r in sel})
+    stepl = sorted({(int(r["step_index"]), int(r["step_kind"])) for r in sel})
     names = {}
     cold = {}
     kind = {}
     cell = {}
     for r in sel:
-        s = int(r["pos"])
+        s = (int(r["step_index"]), int(r["step_kind"]))
         names[s] = "ttft" if r["step_kind"] == 0 else f"itl_{int(r['step_index']):04d}"
         kind[s] = "ttft" if r["step_kind"] == 0 else "itl"
         cold[s] = max(cold.get(s, 0), int(r["cold"]))
@@ -1387,8 +1397,10 @@ def steps(
             for rk in ranks
         ]
 
-    rule = props.get(f"agg.{sig_total}") or "mean"
     declared = bool(props.get(f"agg.{sig_total}"))
+    rule = props.get(f"agg.{sig_total}") or (
+        "max" if sig_total == roles["total"] else "mean"
+    )
     agg = {
         "max": max,
         "min": min,
@@ -1451,6 +1463,10 @@ def steps(
         names,
         float(outlier_z),
     )
+    if _views and sig_total == roles["total"] and float(outlier_z) == 3.5:
+        headline, outliers = _headline_outliers(
+            run, rid, chosen, backend, rnd, rule, declared
+        )
     ws = props.get("run.world_size") or None
     consistency = []
     for key, kd in (("summary.itl." + sig_total, "itl"),):
@@ -1468,7 +1484,7 @@ def steps(
                     mean = statistics.mean(steps_v)
                     consistency.append({"rank": rk, "signal": sig_total, "reported": rnd(rep, 3), "from_steps": rnd(mean, 3), "rel_diff_pct": rnd((rep - mean) / mean * 100, 2) if mean else None})  # fmt: skip
     data = {
-        "selection": {"benchmark_id": chosen[0], "repeat": chosen[1], "prompt": chosen[2], "available": [{"benchmark_id": k[0], "repeat": k[1], "prompt": k[2]} for k in keys]},  # fmt: skip
+        "selection": {"benchmark_id": chosen[0], "repeat": chosen[1], "prompt": chosen[2], "backend": backend, "available": [{"benchmark_id": k[0], "repeat": k[1], "prompt": k[2], "backend": k[3]} for k in keys]},  # fmt: skip
         "roles": roles, "signals": signals, "signal": sig_total, "ranks": ranks, "steps": [names[s] for s in stepl], "cold": [bool(cold[s]) for s in stepl],
         "values": [[rnd(v, 3) for v in rowv] for rowv in total], "cross_rank": per_step, "lag": lag, "wait": None if not wait else [[rnd(v, 3) for v in rowv] for rowv in wait],  # fmt: skip
         "awaited_rank": awaited, "headline": headline, "outliers": outliers, "consistency": consistency,
@@ -1477,6 +1493,37 @@ def steps(
         "trace_uri": props.get("run.trace_uri") or None,
     }  # fmt: skip
     return envelope(data, now, 300)
+
+
+def _headline_outliers(run, rid, key, backend, rnd, rule, declared):
+    """The headline per kind and the outlier steps of one (benchmark, repeat, prompt), from schema 87 (role total, z > 3.5)."""
+    p = {"run_id": rid, "bid": key[0], "rep": key[1], "pr": key[2], "be": backend}
+    where = "run_id = {run_id:UUID} AND benchmark_id = {bid:UUID} AND backend = {be:String} AND repeat = {rep:UInt16} AND prompt = {pr:String}"
+    headline = {
+        kd: {
+            "value": None,
+            "n_warm_steps": 0,
+            "rule": rule,
+            "rule_declared": declared,
+            "rank_medians": {},
+            "rank_skew": None,
+            "slowest_rank": None,
+        }
+        for kd in ("ttft", "itl")
+    }
+    for h in run(f"SELECT * FROM v_bench_step_headline WHERE {where}", p):
+        med = {str(k): rnd(v, 3) for k, v in sorted((h["rank_medians"] or {}).items())}
+        headline[h["kind"]] = {"value": rnd(h["headline"], 3), "n_warm_steps": int(h["n_warm_steps"]), "rule": h["rule"],
+                               "rule_declared": bool(h["rule_declared"]), "rank_medians": med,
+                               "rank_skew": rnd(h["rank_skew"], 3), "slowest_rank": h["slowest_rank"]}  # fmt: skip
+    out = []
+    for o in run(f"SELECT * FROM v_bench_step_outliers WHERE {where} LIMIT 10000", p):
+        both = o["excess_wait"] is None and o["excess_compute"] is None
+        out.append({"rank": int(o["rank"]), "step": o["step"], "value": rnd(o["value"], 3), "median": rnd(o["median"], 3), "z": rnd(o["z"], 1),
+                    "excess": rnd(o["excess"], 3), "excess_wait": rnd(o["excess_wait"], 3), "excess_compute": rnd(o["excess_compute"], 3),
+                    "excess_host": None if both else rnd(o["excess_host"], 3)})  # fmt: skip
+    out.sort(key=lambda o: (-o["z"], o["rank"], o["step"]))
+    return headline, out
 
 
 def _outliers(ranks, stepl, kind, cold, total, wait, comp, names, zcut):
@@ -1529,25 +1576,34 @@ TRACE_TYPES = {
     "compile_pass",
 }
 
-SPAN_UNNEST = """
-FROM
-(
-    SELECT r.benchmark_id AS benchmark_id, toUInt16OrZero(r.props['run.repeat']) AS repeat, toUInt16OrZero(r.props['run.rank']) AS rank,
-           r.props['run.prompt'] AS prompt, argMax(r.measurements, (r.ts, r.audit_timestamp, r.audit_uuid)) AS m
-    FROM benchmark_runs AS r
-    WHERE r.run_id = {run_id:UUID} AND mapContains(r.measurements, 'dur_ns') AND mapContains(r.measurements, 'start_ns')
-    GROUP BY benchmark_id, repeat, rank, prompt
-    HAVING length(m['step']) = length(m['dur_ns']) AND length(m['seq']) = length(m['dur_ns']) AND length(m['parent_seq']) = length(m['dur_ns'])
-       AND length(m['depth']) = length(m['dur_ns']) AND length(m['layer']) = length(m['dur_ns']) AND length(m['start_ns']) = length(m['dur_ns'])
-) AS g
-INNER JOIN
-(
-    SELECT benchmark_id, any(props['lane']) AS lane, any(props['kernel_name']) AS name
-    FROM benchmarks WHERE props['record_type'] = 'span' GROUP BY benchmark_id
-) AS b ON b.benchmark_id = g.benchmark_id
-ARRAY JOIN g.m['step'] AS step, g.m['seq'] AS seq, g.m['parent_seq'] AS parent_seq, g.m['depth'] AS depth,
-           g.m['layer'] AS layer, g.m['start_ns'] AS start_ns, g.m['dur_ns'] AS dur_ns
-"""
+
+def _span_source(run, rid):
+    """v_bench_spans_fast (schema 90) when it holds exactly the spans the run's rows declare in `iterations`, else v_bench_spans.
+
+    Any mismatch (a partial backfill, a skipped malformed row, rows that do not state their length) takes the slow path."""
+    try:
+        fast = run(
+            "SELECT count() AS n FROM bench_span_values WHERE run_id = {run_id:UUID}",
+            {"run_id": rid},
+        )
+        if not fast or not int(fast[0]["n"]):
+            return "v_bench_spans"
+        raw = run(
+            "SELECT sum(iterations) AS n FROM benchmark_runs WHERE run_id = {run_id:UUID} AND mapContains(measurements, 'dur_ns')",
+            {"run_id": rid},
+        )
+    except Exception as err:  # noqa: BLE001 -- only a missing optional table is expected
+        if "bench_span_values" not in str(err) or not any(
+            m in str(err).lower()
+            for m in ("unknown table", "doesn't exist", "unknown_table")
+        ):
+            raise
+        return "v_bench_spans"
+    return (
+        "v_bench_spans_fast"
+        if raw and int(raw[0]["n"] or 0) == int(fast[0]["n"])
+        else "v_bench_spans"
+    )
 
 
 def spans(run, run_id, now=None, view="summary", rank=None, step=None, repeat=None, prompt=None, lane=None, layer=None,
@@ -1566,30 +1622,36 @@ def spans(run, run_id, now=None, view="summary", rank=None, step=None, repeat=No
     offset = bounded(offset, "offset", 0, 0, 10_000_000)
     conds, p = [], {"run_id": rid}
     for name, val, col, typ in (("rank", rank, "g.rank", "UInt16"), ("step", step, "step", "UInt32"), ("repeat", repeat, "g.repeat", "UInt16"),
-                                ("layer", layer, "layer", "Int16"), ("lane", lane, "b.lane", "String"), ("prompt", prompt, "g.prompt", "String")):  # fmt: skip
+                                ("layer", layer, "layer", "Int16"), ("lane", lane, "g.lane", "String"), ("prompt", prompt, "g.prompt", "String")):  # fmt: skip
         if val is not None:
             conds.append(f"{col} = {{{name}:{typ}}}")
             p[name] = val if typ == "String" else int(val)
     if min_dur_ns:
         conds.append("dur_ns >= {mind:Int64}")
         p["mind"] = int(min_dur_ns)
-    inv = invalidations(run, {rid}).get(rid, [])
-    bad = sorted(
-        {
-            h["repeat"]
-            for h in inv
-            if h["state"] == "invalidated" and h["repeat"] is not None
-        }
-    )
-    if bad:
-        conds.append("g.repeat NOT IN {bad_repeats:Array(UInt16)}")
-        p["bad_repeats"] = bad
-    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    where = "".join(f" AND {c}" for c in conds)
+    frm = f"FROM {_span_source(run, rid)} AS g WHERE g.run_id = {{run_id:UUID}}"
     avail = run(
-        f"SELECT count() AS n, uniqExact(g.rank) AS ranks, uniqExact(step) AS steps, groupUniqArray(b.lane) AS lanes {SPAN_UNNEST}",
+        f"SELECT count() AS n, uniqExact(g.rank) AS ranks, uniqExact(step) AS steps, groupUniqArray(g.lane) AS lanes {frm}",
         {"run_id": rid},
     )
     if not avail or int(avail[0]["n"]) == 0:
+        whole = any(
+            h["state"] == "invalidated"
+            and h["benchmark_id"] is None
+            and h["repeat"] is None
+            for h in invalidations(run, {rid}).get(rid, [])
+        )
+        if whole and run(
+            "SELECT 1 AS x FROM benchmark_runs WHERE run_id = {run_id:UUID} AND mapContains(measurements, 'dur_ns') LIMIT 1",
+            {"run_id": rid},
+        ):
+            raise ApiError(
+                410,
+                "run_invalidated",
+                "the run is invalidated; its spans are not served",
+                run_id=rid,
+            )
         return envelope(
             {"lanes": [], "kernels": [], "spans": []},
             now,
@@ -1597,26 +1659,14 @@ def spans(run, run_id, now=None, view="summary", rank=None, step=None, repeat=No
             no_data=True,
             reason="no span rows for this run",
         )
-    if any(
-        h["state"] == "invalidated"
-        and h["benchmark_id"] is None
-        and h["repeat"] is None
-        for h in inv
-    ):
-        raise ApiError(
-            410,
-            "run_invalidated",
-            "the run is invalidated; its spans are not served",
-            run_id=rid,
-        )
     data = {"available": {"spans": int(avail[0]["n"]), "ranks": int(avail[0]["ranks"]), "steps": int(avail[0]["steps"]), "lanes": sorted(avail[0]["lanes"])},
             "filters": {k: v for k, v in p.items() if k not in ("run_id", "bad_repeats")}}  # fmt: skip
     if view == "timeline":
         if rank is None or step is None:
             raise ApiError(400, "bad_parameter", "view=timeline needs rank and step")
         rows = run(
-            f"""SELECT g.rank AS rank, g.repeat AS repeat, step, seq, parent_seq, depth, layer, b.lane AS lane, b.name AS name, start_ns, dur_ns
-                {SPAN_UNNEST} {where} ORDER BY start_ns, seq, g.repeat, g.prompt, g.rank LIMIT {{lim:UInt32}} OFFSET {{off:UInt32}}""",
+            f"""SELECT g.rank AS rank, g.repeat AS repeat, step, seq, parent_seq, depth, layer, g.lane AS lane, g.name AS name, start_ns, dur_ns
+                {frm} {where} ORDER BY start_ns, seq, g.repeat, g.prompt, g.rank LIMIT {{lim:UInt32}} OFFSET {{off:UInt32}}""",
             {**p, "lim": limit + 1, "off": offset},
         )
         data["spans"] = [
@@ -1628,12 +1678,12 @@ def spans(run, run_id, now=None, view="summary", rank=None, step=None, repeat=No
         ]
         return envelope(data, now, 300, truncated=len(rows) > limit)
     lanes = run(
-        f"""SELECT g.rank AS rank, b.lane AS lane, count() AS n, sum(dur_ns) AS total_ns, max(dur_ns) AS max_ns, avg(dur_ns) AS mean_ns,
-                   quantile(0.95)(dur_ns) AS p95_ns {SPAN_UNNEST} {where} GROUP BY rank, lane ORDER BY rank, lane LIMIT 1000""", p)  # fmt: skip
+        f"""SELECT g.rank AS rank, g.lane AS lane, count() AS n, sum(dur_ns) AS total_ns, max(dur_ns) AS max_ns, avg(dur_ns) AS mean_ns,
+                   quantile(0.95)(dur_ns) AS p95_ns {frm} {where} GROUP BY rank, lane ORDER BY rank, lane LIMIT 1000""", p)  # fmt: skip
     kern = run(
-        f"""SELECT b.lane AS lane, b.name AS name, count() AS n, sum(dur_ns) AS total_ns, avg(dur_ns) AS mean_ns, max(dur_ns) AS max_ns,
+        f"""SELECT g.lane AS lane, g.name AS name, count() AS n, sum(dur_ns) AS total_ns, avg(dur_ns) AS mean_ns, max(dur_ns) AS max_ns,
                    quantile(0.95)(dur_ns) AS p95_ns, argMax(g.rank, dur_ns) AS slowest_rank, uniqExact(g.rank) AS ranks
-            {SPAN_UNNEST} {where} GROUP BY lane, name ORDER BY total_ns DESC, lane, name LIMIT {{lim:UInt32}} OFFSET {{off:UInt32}}""",
+            {frm} {where} GROUP BY lane, name ORDER BY total_ns DESC, lane, name LIMIT {{lim:UInt32}} OFFSET {{off:UInt32}}""",
         {
             **p,
             "lim": (top if view == "summary" else limit) + 1,
@@ -1660,7 +1710,7 @@ def spans(run, run_id, now=None, view="summary", rank=None, step=None, repeat=No
             "shortest_collective_rank": min(col, key=lambda k: (col[k], k)) if col else None,
         }  # fmt: skip
         by_layer = run(
-            f"""SELECT g.rank AS rank, layer, sum(dur_ns) AS total_ns {SPAN_UNNEST} {where + (" AND " if where else "WHERE ")}b.lane = 'collective' AND layer >= 0
+            f"""SELECT g.rank AS rank, layer, sum(dur_ns) AS total_ns {frm} {where} AND g.lane = 'collective' AND layer >= 0
                 GROUP BY rank, layer ORDER BY rank, layer LIMIT 100000""", p)  # fmt: skip
         data["collective_by_layer"] = [
             {

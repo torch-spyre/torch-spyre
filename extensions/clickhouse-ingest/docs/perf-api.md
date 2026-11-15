@@ -188,7 +188,7 @@ versions are listed (`v_bench_references`, schema 86); a published version whose
 | overview, suites | `benchmark_metric_verdicts` (partition `toYYYYMM(ts)`), `v_invalidated_runs`, `benchmarks` | verdict `ts` window (max 30 d + lookback 90 d), `LIMIT` 500 / 20000 |
 | series | verdicts, `benchmark_runs` (component, benchmark, backend, `ts`), `v_artifact_results_published`, `v_artifacts`, `artifact_tags` | window, `component = c` primary-key prefix, run id lists, `LIMIT` |
 | run, environment | `benchmark_runs WHERE run_id = x` (no component known, generic exclusion search), placements, schema 81 views | one run |
-| steps, spans | `benchmark_runs WHERE run_id = x` unnested server-side | one run, `max_rows` / `limit` |
+| steps, spans | schema 87 views (`v_bench_step_records`, `v_bench_step_headline`, `v_bench_step_outliers`, `v_bench_spans`), or `v_bench_spans_fast` (schema 90) when it holds every span of the run; invalidated repeats are dropped by the views | one run, `max_rows` / `limit` |
 | compare | as run, plus verdicts window for `effect` | run ids / window |
 | references | `v_bench_references`, then `benchmark_runs WHERE run_id = <reference verdict run>` | reference list is small; values one run |
 
