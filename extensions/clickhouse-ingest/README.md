@@ -239,8 +239,7 @@ covers an isolated lab, an air-gapped host, a person testing by hand, or a vLLM 
 disconnected system.
 - `--offline` writes a **bundle** instead of connecting.
 - `--upload` puts the bundle in the Artifactory inbox.
-- The `v2-results-relay` job (spyre-frameworks, every 15 minutes) records it with
-  `results --from-bundle`.
+- A scheduled `relay` job (every 15 minutes) records it with `results --from-bundle`.
 
 The recording goes through the path a connected run takes: `results` for JUnit, and `vllm.py`
 for vLLM bench JSON (the module spyre-inference's live perf ingest uses). So the rows link to the
@@ -255,6 +254,21 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
 | compatibility | `results --check [<dir\|tgz>]` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
+
+### The relay
+
+`python -m spyre_clickhouse_ingest relay [--apply]` is the job that records the inbox. It needs no checkout of any
+other repository: it lists the inbox with Artifactory AQL (`ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`, a path template with `{arch}`; `ARTIFACTORY_TOKEN`, with `ARTIFACTORY_USER` for basic
+auth), ingests each bundle with `results --from-bundle --strict --channel-trust <trust of the uploading account>`, and
+moves it to `processed/` or `rejected/` (+ `REJECTED.json`). Without `--apply` it ingests with `--dry-run` and moves
+nothing. Each ingested bundle also gets one `published` row in `result_uploads` (written before the move, keyed by the
+run, so a repeat or a race adds nothing), which lets the dashboard retract a relay upload like any other. An
+Artifactory account listed with `--ci-account` is recorded as trust `ci`, every other as `external`; a bundle's run key
+never decides trust. `--trusted-job-prefix` (repeatable) limits which CI-looking run keys are accepted.
+`--backfill-processed` writes the missing rows for bundles already in `processed/`; `--no-record-uploads` skips the
+row when the login lacks INSERT on `result_uploads`. A bundle whose row cannot be written is reported
+`unrecordable`, stays in the inbox and is retried.
 
 A **connected** run records every kind directly with the same flags, no `--offline`:
 
