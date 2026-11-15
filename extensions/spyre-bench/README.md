@@ -36,11 +36,14 @@ spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-examp
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
 spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
 spyre-bench gen-schemas --check
+spyre-bench analyze --help
 spyre-bench plan --catalog examples/run-demo --central examples/central --purpose nightly --arch x86_64 \
     --reference-node --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan.json
 spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
 spyre-bench verdict --run-id <uuid> --store clickhouse --json
 ```
+
+The `runners` declared by the kernel and comms packs name entry points supplied by the producer packages, not shipped here; `run` executes each Benchmark's own `run.command`.
 
 `validate` exits 0 when valid and 2 otherwise; `gen-schemas --check` exits 1 when the schemas are stale and `gen-schemas` writes only inside a source checkout unless you pass `--out DIR`. `explain` shows a case with every reference resolved: identity inputs,
 the Environment request, series and reuse keys, and the plan record. `gen-schemas` regenerates
