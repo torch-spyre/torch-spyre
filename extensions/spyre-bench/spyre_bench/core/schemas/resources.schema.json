@@ -3550,6 +3550,17 @@
      "type": "object",
      "additionalProperties": false,
      "properties": {
+      "applies_to": {
+       "type": "array",
+       "items": {
+        "enum": [
+         "perf",
+         "quality"
+        ]
+       },
+       "minItems": 1,
+       "description": "test types the policy judges; default [perf]. A quality policy replaces the clean, qualification, cv and warm-up requirements with the gates listed per row; mixed lists are rejected"
+      },
       "purposes": {
        "type": "object",
        "additionalProperties": {
@@ -3600,6 +3611,13 @@
              "required",
              "optional"
             ]
+           },
+           "gates": {
+            "type": "array",
+            "items": {
+             "$ref": "#/$defs/metric"
+            },
+            "description": "quality policies: pack gate ids evaluated for the row, e.g. llm.records_complete"
            }
           },
           "description": "gates a result must pass to earn `valid`; failing one caps the validity (qualification: unqualified_env, clean: shared_env, the rest: suspect)"
@@ -4169,6 +4187,54 @@
         "metric"
        ],
        "description": "a table of per-cell statistics over `by` within each `across` combination; metric may be derive.name"
+      },
+      "reference": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "case": {
+         "$ref": "#/$defs/case_name"
+        },
+        "value": {
+         "type": "number"
+        },
+        "stderr": {
+         "type": "number",
+         "minimum": 0
+        },
+        "n": {
+         "type": "integer",
+         "minimum": 1
+        },
+        "label": {
+         "type": "string",
+         "description": "abstract name of an inline reference, e.g. cpu-fp32-ref"
+        },
+        "stderr_metric": {
+         "$ref": "#/$defs/metric"
+        },
+        "tolerance": {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "stderr": {
+           "type": "number",
+           "minimum": 0,
+           "description": "allowed shortfall in combined standard errors; a single run is `regressed` only from 4 combined standard errors, a smaller shortfall past the allowance is `suspected`"
+          },
+          "abs": {
+           "type": "number",
+           "minimum": 0,
+           "description": "practical floor: a shortfall below it is never worse"
+          }
+         },
+         "description": "at least one of stderr, abs; both set = the larger allowance"
+        }
+       },
+       "required": [
+        "tolerance"
+       ],
+       "description": "quality: compare the score of each selected Result with a reference (the Result of `case`, or an inline value with its stderr or n); `metric` is the score. Advisory: never gates, and a Result whose validity is suspect or invalid is reported as such, never as regressed"
       }
      },
      "required": [
