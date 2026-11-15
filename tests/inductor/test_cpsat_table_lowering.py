@@ -265,6 +265,19 @@ def test_a_literal_gates_its_term_instead_of_widening_a_table():
     _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
 
 
+def test_a_gate_whose_rest_is_constant_is_a_coefficient():
+    model, buffer_map, divisions, s = _buffers({"a": {"tile_a": [1, 2, 4, 8, 16]}})
+    sym_map = {"is_lx_a": model.new_bool_var("is_lx_a")}
+    lit = sympy.Symbol("is_lx_a", integer=True)
+    # With the literal off the tile term drops out: this is 2c * (1 - is_lx).
+    c = 131072
+    expr = 2 * (1 - lit) * (-c * lit + c * lit / s["tile_a"] + c)
+    lowered = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
+    assert _element_sizes(model, 0) == []
+    choices = {divisions["a"]: range(5), sym_map["is_lx_a"]: (0, 1)}
+    _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
+
+
 def test_an_expression_it_cannot_table_leaves_the_model_unchanged():
     model = cp_model.CpModel()
     names = "wxyz"

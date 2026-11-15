@@ -765,9 +765,11 @@ class _TableLowering:
 
     def _split_gate(self, node):
         """``(literal symbol, value it is on at, the rest with it fixed)`` for a
-        product with a 0/1 literal or one minus it as a factor, or a relayout
-        charge (its literal times a price by division); None when there is none,
-        or the rest is then a constant (a plain coefficient)."""
+        product with a factor of one 0/1 literal that is 0 at one of its values
+        (the literal, one minus it, or a multiple of either), or a relayout
+        charge (its literal times a price by division); None when there is none.
+        The rest can be a constant even where the product names other inputs:
+        (1 - x) * (c - c * x / t) is c * (1 - x), whatever t is."""
         if isinstance(node, RelayoutCharge):
             literal = node.args[0]
             if literal.is_Symbol and literal.name in self._literals:
@@ -776,23 +778,35 @@ class _TableLowering:
         if not node.is_Mul:
             return None
         for i, arg in enumerate(node.args):
-            gate = None
-            if arg.is_Symbol and arg.name in self._literals:
-                gate = (arg, 1)
-            elif arg.is_Add and len(arg.free_symbols) == 1:
-                (sym,) = arg.free_symbols
-                if sym.name in self._literals and sympy.expand(arg - (1 - sym)) == 0:
-                    gate = (sym, 0)
-            if gate is None:
+            if len(arg.free_symbols) != 1:
                 continue
-            rest = sympy.Mul(*(a for j, a in enumerate(node.args) if j != i))
-            rest = rest.xreplace({gate[0]: gate[1]})
-            if rest.free_symbols:
-                return gate[0], gate[1], rest
+            (sym,) = arg.free_symbols
+            if sym.name not in self._literals:
+                continue
+            off, on = (
+                arg.xreplace({sym: v}) for v in (sympy.Integer(0), sympy.Integer(1))
+            )
+            if off == 0 and on != 0:
+                gate, scale = 1, on
+            elif on == 0 and off != 0:
+                gate, scale = 0, off
+            else:
+                continue
+            rest = scale * sympy.Mul(*(a for j, a in enumerate(node.args) if j != i))
+            return sym, gate, rest.xreplace({sym: gate})
         return None
 
     def _emit_gated(self, gate, factor, coeff):
         sym, on, rest = gate
+        if factor is None and not rest.free_symbols:
+            # A constant times the literal (or one minus it): a coefficient on it.
+            value = float(rest)
+            out = _Linear()
+            index = self._inputs[self._symbol_input[sym.name]]
+            out.add(
+                _Indexed(np.array([0.0, value] if on else [value, 0.0]), index), coeff
+            )
+            return out
         inner = self.emit(rest, factor, coeff)
         if inner is None:
             return None
