@@ -69,8 +69,10 @@ jobs:
         include:
           - repo: hf-adapters
             advisory: false
+            extra_inputs: '{}'
           - repo: spyre-inference
             advisory: true
+            extra_inputs: '{"image_rpms":"true"}'
     env:
       GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
@@ -99,6 +101,7 @@ jobs:
         id: dispatch
         with:
           repository: torch-spyre/${{ matrix.repo }}
+          extra_inputs: ${{ matrix.extra_inputs }}
           token: ${{ steps.app-token.outputs.token }}
           torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}

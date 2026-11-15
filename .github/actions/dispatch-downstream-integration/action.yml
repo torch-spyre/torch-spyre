@@ -28,6 +28,10 @@ inputs:
     description: Token that can read torch-spyre PRs
     required: false
     default: ${{ github.token }}
+  extra_inputs:
+    description: JSON object of extra dispatch inputs for this repo (for example {"image_rpms":"true"})
+    required: false
+    default: '{}'
   timeout_minutes:
     description: How long to wait for the downstream run
     required: false
@@ -40,6 +44,9 @@ outputs:
   run_url:
     description: URL of the downstream run
     value: ${{ steps.run.outputs.run_url }}
+  conclusion:
+    description: Conclusion of the downstream run (empty if it did not finish)
+    value: ${{ steps.run.outputs.conclusion }}
 
 runs:
   using: composite
@@ -77,15 +84,20 @@ runs:
         COMPANION_REPOSITORY: ${{ steps.test-with.outputs.repository }}
         HASH_SOURCE: ${{ inputs.hash_source }}
         TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        EXTRA_INPUTS: ${{ inputs.extra_inputs }}
       run: |
         set -euo pipefail
         hash=$(printf '%s' "$HASH_SOURCE" | sha256sum | cut -c1-16)
         ref=$(gh api "repos/${REPO}" --jq .default_branch)
+        # Pin the sibling's own code to one commit, so every job of the run tests the same sources.
+        sibling_sha=$(gh api "repos/${REPO}/commits/${ref}" --jq .sha)
         body=$(jq -n --arg ref "$ref" --arg sha "$TORCH_SPYRE_REF" --arg hash "$hash" \
-          --arg cref "$COMPANION_REF" --arg crepo "$COMPANION_REPOSITORY" \
+          --arg cref "$COMPANION_REF" --arg crepo "$COMPANION_REPOSITORY" --arg ssha "$sibling_sha" \
+          --argjson extra "$EXTRA_INPUTS" \
           '{ref: $ref, return_run_details: true,
             inputs: ({triggering_repo: "torch-spyre", triggering_sha: $sha, torch_spyre_ref: $sha, pr_url_hash: $hash}
-              + (if $cref != "" then {ref: $cref, repository: $crepo} else {} end))}')
+              + (if $cref != "" then {ref: $cref, repository: $crepo} else {ref: $ssha} end)
+              + $extra)}')
         resp=$(gh api -X POST "repos/${REPO}/actions/workflows/integration-tests.yaml/dispatches" --input - <<<"$body")
         run_id=$(jq -er .workflow_run_id <<<"$resp")
         # A cancelled or failed waiter must not leave the sibling run consuming Spyre runners.
@@ -93,7 +105,7 @@ runs:
         trap '[ "$completed" = 1 ] || gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null 2>&1 || true' EXIT
         trap 'exit 1' INT TERM
         url=$(jq -er .html_url <<<"$resp")
-        { echo "run_id=${run_id}"; echo "run_url=${url}"; } >> "$GITHUB_OUTPUT"
+        { echo "run_id=${run_id}"; echo "run_url=${url}"; echo "sibling_ref=${COMPANION_REF:-$sibling_sha}"; } >> "$GITHUB_OUTPUT"
         echo "dispatched ${url}"
 
         deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
@@ -120,8 +132,32 @@ runs:
           fi
           sleep 60 & wait $!
         done
+        echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
         if [ "$conclusion" != success ]; then
           echo "::error::${REPO} integration tests concluded '${conclusion}': ${url}"
           exit 1
         fi
         echo "${REPO} integration tests passed: ${url}"
+    - name: Summarize
+      if: always()
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        RUN_URL: ${{ steps.run.outputs.run_url }}
+        SIBLING_REF: ${{ steps.run.outputs.sibling_ref }}
+        COMPANION_REPOSITORY: ${{ steps.test-with.outputs.repository }}
+        CONCLUSION: ${{ steps.run.outputs.conclusion }}
+        OUTCOME: ${{ steps.run.outcome }}
+      run: |
+        {
+          echo "### Downstream integration: ${REPO}"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Downstream run | ${RUN_URL:-(not dispatched)} |"
+          echo "| Result | ${CONCLUSION:-${OUTCOME}} |"
+          echo "| torch-spyre under test | \`${TORCH_SPYRE_REF}\` |"
+          echo "| ${REPO##*/} commit | \`${SIBLING_REF:-(unknown)}\`${COMPANION_REPOSITORY:+ from Test-With companion \`${COMPANION_REPOSITORY}\`} |"
+          echo "| Suite | integration |"
+        } >> "$GITHUB_STEP_SUMMARY"
