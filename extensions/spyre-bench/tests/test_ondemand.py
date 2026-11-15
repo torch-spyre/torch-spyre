@@ -544,5 +544,96 @@ class Cli(unittest.TestCase):
         self.assertEqual(capture(cli_main, ["ondemand", "authorize", "--facts", str(ff)])[0], 2)
 
 
+class State(unittest.TestCase):
+    def test_roundtrip_inside_a_comment(self):
+        st = {"request": req().to_dict(), "pinned_sha": SHA, "estimate_device_hours": 3.0}
+        body = "hello\n" + od.encode_state(st) + "\nmore"
+        self.assertEqual(od.decode_state(body), st)
+
+    def test_garbage_and_oversize_are_none(self):
+        for body in [
+            "",
+            "no state",
+            od.STATE_OPEN + " !!! -->",
+            od.STATE_OPEN + " e30= ",
+            od.STATE_OPEN + " " + "A" * 9000 + " -->",
+        ]:
+            with self.subTest(body[:30]):
+                self.assertIsNone(od.decode_state(body))
+
+    def test_non_object_state_is_none(self):
+        import base64
+
+        raw = base64.b64encode(b"[1,2]").decode()
+        self.assertIsNone(od.decode_state(f"{od.STATE_OPEN} {raw} -->"))
+
+    def test_markdown_embeds_state_once_and_keeps_marker_first(self):
+        pv = od.build_preview(
+            plan_doc("--purpose", "pr", "--subject-id", SUBJECT), req(), GH, notes=["reuse is looked up at dispatch"]
+        )
+        text = od.render_markdown(pv, state={"pinned_sha": SHA})
+        self.assertTrue(text.startswith(od.PREVIEW_MARKER))
+        self.assertEqual(text.count(od.STATE_OPEN), 1)
+        self.assertIn("reuse is looked up at dispatch", text)
+        self.assertEqual(od.decode_state(text), {"pinned_sha": SHA})
+
+
+class Confirm(unittest.TestCase):
+    def test_confirm_clears_the_band_but_not_the_limit(self):
+        self.assertEqual(od.authorize(facts(estimate_device_hours=3, confirmed=True)).state, "admit")
+        self.assertEqual(od.authorize(facts(estimate_device_hours=5, confirmed=True)).state, "deny")
+
+    def test_confirm_needs_write_even_on_ghe_member(self):
+        a = {"login": "m", "permission": "read", "association": "MEMBER"}
+        d = od.authorize(facts(host="ghe", actor=a, estimate_device_hours=30, confirmed=True))
+        self.assertEqual(d.state, "deny")
+
+    def test_confirm_on_a_moved_head_is_denied(self):
+        d = od.authorize(facts(estimate_device_hours=3, confirmed=True, pinned_sha=SHA2))
+        self.assertEqual(d.state, "deny")
+
+
+class EngineRequestCli(unittest.TestCase):
+    def test_prints_the_request_the_planner_reads(self):
+        rf = TMP / "ondemand-r2.json"
+        rf.write_text(json.dumps(od.parse_flags({"bench": "op_add_fp16", "budget": "2"}).to_dict()))
+        code, out, _ = capture(
+            cli_main,
+            [
+                "ondemand",
+                "engine-request",
+                "--request",
+                str(rf),
+                "--product",
+                "spyre-inference",
+                "--subject-id",
+                SUBJECT,
+            ],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["subject"], {"artifact_id": SUBJECT})
+        self.assertEqual(
+            capture(cli_main, ["ondemand", "engine-request", "--request", str(rf), "--product", "torch-spyre"])[0], 2
+        )
+
+    def test_env_json(self):
+        rf = TMP / "ondemand-r3.json"
+        rf.write_text(json.dumps(od.parse_flags({"bench": "decoder@sanity", "reuse": "only"}).to_dict()))
+        code, out, _ = capture(cli_main, ["ondemand", "env", "--request", str(rf), "--product", "spyre-inference"])
+        self.assertEqual(code, 0)
+        env = json.loads(out)
+        self.assertEqual((env["BENCH_SUITES"], env["BENCH_TIER"], env["BENCH_REUSE"]), ("decoder", "sanity", "only"))
+        self.assertNotIn("BENCH_SELECTION", env)
+
+    def test_error_text_is_neutralised(self):
+        c = TMP / "ondemand-bad.txt"
+        c.write_text("/bench @team`x`<b>=1")
+        code, _, err = capture(cli_main, ["ondemand", "parse", "--comment-file", str(c)])
+        self.assertEqual(code, 2)
+        self.assertNotIn("<b>", err)
+        self.assertNotIn("`", err)
+        self.assertNotIn("@team", err)
+
+
 if __name__ == "__main__":
     unittest.main()

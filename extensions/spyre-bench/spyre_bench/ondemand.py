@@ -20,11 +20,13 @@ callers (a PR-comment workflow, the internal comment bot) fetch the facts, call 
   spyre-bench ondemand parse     --comment-file F --host H            comment -> request.json
   spyre-bench ondemand authorize --facts F                            request + actor + PR facts -> decision.json
   spyre-bench ondemand preview   --plan P --request R [--format md]   plan.json -> preview comment / JSON
+  spyre-bench ondemand engine-request | env | state                    request -> plan request / BENCH_* / hidden state
 
 Grammar, policy table and the threat model: docs/README.md ("On-demand benchmarks for a PR").
 """
 
 import argparse
+import base64
 import difflib
 import hashlib
 import json
@@ -518,7 +520,8 @@ def authorize(facts):
 
     facts: host, now, actor{login, permission, association}, pr{number, base_repo, head_repo, head_sha},
     pinned_sha (the sha recorded when the request was made; '' for a fresh one), request (to_dict form),
-    estimate_device_hours (None before the plan exists), approval (dict or None), history (rows for `admission`).
+    estimate_device_hours (None before the plan exists), approval (dict or None), history (rows for `admission`),
+    confirmed (the `/bench confirm` of a request whose estimate needed one).
     """
     policy = POLICIES[facts["host"]]
     req = OnDemandRequest.from_dict(facts["request"])
@@ -548,6 +551,8 @@ def authorize(facts):
         ok, why = approval_valid(approval, head, req, now, policy)
         if not ok:
             return deny(f"fork pull request: {why}")
+    if facts.get("confirmed") and not has_write(actor):
+        return deny("only a commenter with write access can confirm a run")
     limit = budget_limit(req, policy)
     est = facts.get("estimate_device_hours")
     needs_confirm = False
@@ -555,6 +560,7 @@ def authorize(facts):
         ok, needs_confirm = check_budget(float(est), limit, policy)
         if not ok:
             return deny(f"plan needs {float(est):g} device-hours, over the {limit:g} limit for this request")
+        needs_confirm = needs_confirm and not facts.get("confirmed")
     reasons, cancel = admission(
         facts.get("history") or [],
         {
@@ -623,11 +629,37 @@ def bench_env(req, product, subject_id="", environment=""):
     return env
 
 
+STATE_OPEN, STATE_CLOSE, STATE_MAX = "<!-- spyre-bench-state:", "-->", 8192
+
+
+def encode_state(state):
+    """A request's state as a hidden comment line, so a bot comment is the only store a confirm needs."""
+    raw = base64.b64encode(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).decode()
+    return f"{STATE_OPEN} {raw} {STATE_CLOSE}"
+
+
+def decode_state(text):
+    """The state in a comment body, or None. The caller must only pass comments the bot itself wrote."""
+    start = str(text or "").find(STATE_OPEN)
+    if start < 0:
+        return None
+    end = text.find(STATE_CLOSE, start)
+    raw = text[start + len(STATE_OPEN) : end].strip() if end > 0 else ""
+    if not raw or len(raw) > STATE_MAX:
+        return None
+    try:
+        out = json.loads(base64.b64decode(raw, validate=True))
+    except ValueError:
+        return None
+    return out if isinstance(out, dict) else None
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Preview: what the PR comment and the dashboard show before cards are taken.
 
 _ORDER = {"run": 0, "reuse": 1, "skip": 2}
 _MAX_ROWS = 40
+_REASON_TEXT = {"reuse_needs_subject": "runs unless reusable; reuse is looked up when the run starts"}
 _UNSAFE = regex.compile(r"[\x00-\x1f\x7f`<>|\\]")
 
 
@@ -685,7 +717,7 @@ def _asked_vs_planned(req, plan):
     return rows
 
 
-def build_preview(plan, req, policy=None, queue=None, dashboard_url="", now=None):
+def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()):
     """The preview as data (the dashboard consumes this; `render_markdown` is the same data as text)."""
     s, est = plan["summary"], plan.get("estimate") or {}
     hours = float(est.get("device_hours") or 0.0)
@@ -719,6 +751,7 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", now=None
             for c in cases
         ],
         "dashboard_url": dashboard_url,
+        "notes": [safe(n, 200) for n in notes],
     }
     body["digest"] = hashlib.sha256(
         json.dumps({k: body[k] for k in ("counts", "estimate", "diff", "cases")}, sort_keys=True).encode()
@@ -726,10 +759,10 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", now=None
     return body
 
 
-def render_markdown(preview, public=True, command="/bench"):
+def render_markdown(preview, public=True, command="/bench", state=None):
     """The PR comment. Stable layout, one marker so the same comment is edited in place."""
     c, e, b = preview["counts"], preview["estimate"], preview["budget"]
-    out = [PREVIEW_MARKER, "### Benchmark plan"]
+    out = [PREVIEW_MARKER] + ([encode_state(state)] if state else []) + ["### Benchmark plan"]
     out.append(f"**run {c['run']} · reuse {c['reuse']} · skip {c['skip']}** of {c['cases']} cases")
     out.append(f"Estimate: {e['device_hours']:g} device-hours (about {e['wall_min']:g} min of measuring).")
     if b.get("limit_device_hours") is not None:
@@ -750,9 +783,9 @@ def render_markdown(preview, public=True, command="/bench"):
     if preview["cases"]:
         out += ["", "| action | case | repeats | note |", "|---|---|---|---|"]
         for case in preview["cases"][:_MAX_ROWS]:
-            note = safe(case["reason"], 100) or (
-                f"reused from {safe(case['reused_from'], 40)}" if case["reused_from"] else ""
-            )
+            note = _REASON_TEXT.get(case["reason"]) or safe(case["reason"], 100)
+            if not note and case["reused_from"]:
+                note = f"reused from {safe(case['reused_from'], 40)}"
             out.append(f"| {case['action']} | {safe(case['name'], 90)} | {case['repeats'] or ''} | {note} |")
         if len(preview["cases"]) > _MAX_ROWS:
             out.append(f"| | …and {len(preview['cases']) - _MAX_ROWS} more | | |")
@@ -760,6 +793,7 @@ def render_markdown(preview, public=True, command="/bench"):
         out += ["", f"Details: {safe(preview['dashboard_url'], 200)}"]
     elif preview.get("dashboard_url"):
         out += ["", f"Dashboard (sign-in required): {safe(preview['dashboard_url'], 200)}"]
+    out += ["", *[f"_{n}_" for n in preview.get("notes", [])]]
     out += ["", f"<sub>plan {preview['digest']}</sub>"]
     return "\n".join(out) + "\n"
 
@@ -801,13 +835,33 @@ def _cmd_authorize(a):
 def _cmd_preview(a):
     req = OnDemandRequest.from_dict(_load(a.request))
     queue = json.loads(a.queue) if a.queue else None
-    pv = build_preview(_load(a.plan), req, POLICIES[a.host], queue, a.dashboard_url or "")
+    pv = build_preview(_load(a.plan), req, POLICIES[a.host], queue, a.dashboard_url or "", a.note)
+    state = json.loads(a.state) if a.state else None
     print(
-        render_markdown(pv, public=a.host == "github.com", command=a.command)
+        render_markdown(pv, public=a.host == "github.com", command=a.command, state=state)
         if a.format == "md"
         else json.dumps(pv, sort_keys=True)
     )
     return cliutil.EXIT_OK
+
+
+def _cmd_engine_request(a):
+    req = OnDemandRequest.from_dict(_load(a.request))
+    subject = {"artifact_id": a.subject_id} if a.subject_id else None
+    print(json.dumps(engine_request(req, a.product, subject, a.environment or ""), sort_keys=True))
+    return cliutil.EXIT_OK
+
+
+def _cmd_env(a):
+    req = OnDemandRequest.from_dict(_load(a.request))
+    print(json.dumps(bench_env(req, a.product, a.subject_id or "", a.environment or ""), sort_keys=True))
+    return cliutil.EXIT_OK
+
+
+def _cmd_state(a):
+    state = decode_state(sys.stdin.read())
+    print(json.dumps(state))
+    return cliutil.EXIT_OK if state else cliutil.EXIT_NOTHING
 
 
 def parser():
@@ -822,6 +876,20 @@ def parser():
     p = sub.add_parser("authorize", help="facts.json -> decision (exit 0 allowed, 2 denied)")
     p.add_argument("--facts", required=True)
     p.set_defaults(fn=_cmd_authorize)
+    p = sub.add_parser("engine-request", help="request.json -> the Run request for `spyre-bench plan --request`")
+    p.add_argument("--request", required=True)
+    p.add_argument("--product", required=True)
+    p.add_argument("--subject-id")
+    p.add_argument("--environment")
+    p.set_defaults(fn=_cmd_engine_request)
+    p = sub.add_parser("env", help="request.json -> the BENCH_* variables for `make bench-plan` as JSON")
+    p.add_argument("--request", required=True)
+    p.add_argument("--product", required=True)
+    p.add_argument("--subject-id")
+    p.add_argument("--environment")
+    p.set_defaults(fn=_cmd_env)
+    p = sub.add_parser("state", help="comment body on stdin -> the hidden state, exit 4 when there is none")
+    p.set_defaults(fn=_cmd_state)
     p = sub.add_parser("preview", help="plan.json + request.json -> preview")
     p.add_argument("--plan", required=True)
     p.add_argument("--request", required=True)
@@ -830,6 +898,8 @@ def parser():
     p.add_argument("--queue", help="JSON object of queue facts to show")
     p.add_argument("--dashboard-url")
     p.add_argument("--command", default="/bench")
+    p.add_argument("--note", action="append", default=[], help="a line shown under the table (repeatable)")
+    p.add_argument("--state", help="JSON object stored in the comment for a later /bench confirm")
     p.set_defaults(fn=_cmd_preview)
     return ap
 
@@ -839,10 +909,10 @@ def main(argv=None):
     try:
         return a.fn(a)
     except UsageError as e:
-        print(f"error: {e}", file=sys.stderr)
+        print(f"error: {safe(e, 300)}", file=sys.stderr)
         return cliutil.EXIT_INVALID
     except (OSError, ValueError, KeyError) as e:
-        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"error: {type(e).__name__}: {safe(e, 300)}", file=sys.stderr)
         return cliutil.EXIT_INVALID
 
 
