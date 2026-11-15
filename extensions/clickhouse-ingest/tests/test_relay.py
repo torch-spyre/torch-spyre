@@ -209,7 +209,7 @@ def test_bundles_are_found_under_root_only():
     found = relay.bundles(
         [
             {**item, "path": f"{ROOT}/inbox/{AID}"},
-            {**item, "path": f"zsp/{ROOT}/inbox/{AID}"},
+            {**item, "path": f"other/{ROOT}/inbox/{AID}"},
         ],
         "inbox",
     )
@@ -685,3 +685,21 @@ def test_main_needs_the_deployments_location(monkeypatch, tmp_path):
         relay.main(
             ["--work", str(tmp_path / "w"), "--summary", str(tmp_path / "s.json")]
         )
+
+
+def test_without_trusted_prefixes_no_ci_looking_run_key_is_accepted(wired):
+    assert wired("--apply")["args"].trusted_job_prefix == [relay.NO_JOB_KEYS]
+    assert wired("--apply", "--trusted-job-prefix", "jobs/")[
+        "args"
+    ].trusted_job_prefix == ["jobs/"]
+
+
+def test_the_row_records_the_trust_the_ingest_applied(tmp_path):
+    folder = f"{ROOT}/inbox/{AID}/b-fvt"
+    order = []
+    client = FakeClickHouse(order)
+    outcome = (0, {**REPORT, "trust": "external"})
+    uploads = relay.UploadLog(client, "spy")
+    relay.Relay(FakeArtifactory(_dir(folder)), _args(ci_account=["jdoe"]), ingest=lambda local, argv: outcome,
+                now=NOW, uploads=uploads).run(tmp_path)  # fmt: skip
+    assert client.rows[0]["props"]["trust"] == "external"

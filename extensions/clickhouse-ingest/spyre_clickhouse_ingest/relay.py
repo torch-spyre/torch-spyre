@@ -58,6 +58,9 @@ UNRECORDABLE = "unrecordable"
 # The fingerprint of a folder bundle's listing at the previous poll, on its bundle.json.
 LISTING_PROP = "v2relay.listing"
 CHANNEL = "relay"
+# Accepts no CI-looking run key: none starts with '#'. The default when no --trusted-job-prefix is given, so an
+# uploader cannot place a bundle under a CI run.
+NO_JOB_KEYS = "#"
 
 
 def upload_id_of(run_id: str) -> str:
@@ -72,7 +75,7 @@ def upload_id_of(run_id: str) -> str:
 def trust_of(uploader: str, ci_accounts) -> str:
     """`ci` only for an Artifactory account listed as a CI credential, else `external`. Derived from
     the credential, never from the bundle (its run key is the uploader's own claim); no account
-    maps to `lab` yet (upload-channels design, C10)."""
+    maps to `lab` yet."""
     return "ci" if uploader and uploader in ci_accounts else "external"
 
 
@@ -365,7 +368,7 @@ class Relay:
                     }
                 return {**entry, "outcome": "waiting", "reason": unsettled}
         local = self.fetch(b, work)
-        argv = ["--strict", "--uploader", b["uploader"], "--bundle-url", self.art.url(processed),
+        argv = ["--strict", "--uploader", b["uploader"] or "unknown", "--bundle-url", self.art.url(processed),
                 "--expect-key", b["key"],
                 "--channel-trust", trust_of(b["uploader"], self.args.ci_account)]  # fmt: skip
         for prefix in self.args.trusted_job_prefix:
@@ -425,7 +428,7 @@ class Relay:
             artifact_id=report["artifact_id"], run_id=rid, format=fmt, result_kind=result_kind,
             test_type=report["test_type"], arch=report["arch"], filename=Path(b["rel"]).name,
             size_bytes=size, content_sha256=report["bundle_sha256"], bundle_url=url,
-            props={"channel": CHANNEL, "trust": trust_of(b["uploader"], self.args.ci_account),
+            props={"channel": CHANNEL, "trust": report.get("trust") or trust_of(b["uploader"], self.args.ci_account),
                    "ingest_status": report.get("status", ""), "bundle_key": b["key"],
                    "relay_run": os.environ.get("BUILD_URL", ""), **props},
         )  # fmt: skip
@@ -571,7 +574,7 @@ def main(argv=None) -> int:
     parser.add_argument("--processed", default="processed")
     parser.add_argument("--rejected", default="rejected")
     parser.add_argument("--trusted-job-prefix", action="append", default=None,
-                        help="repeatable: accept a CI-looking run key only from these job prefixes; default none")  # fmt: skip
+                        help="repeatable: accept a CI-looking run key only from these job prefixes; default none: no CI-looking run key is accepted")  # fmt: skip
     parser.add_argument("--stale-hours", type=float, default=24.0,
                         help="reject a bundle still incomplete after this long")  # fmt: skip
     parser.add_argument("--no-record-uploads", action="store_true",
@@ -583,7 +586,7 @@ def main(argv=None) -> int:
     parser.add_argument("--work", default="v2-results-work")
     parser.add_argument("--summary", default="v2-results-relay.json")
     args = parser.parse_args(argv)
-    args.trusted_job_prefix = args.trusted_job_prefix or []
+    args.trusted_job_prefix = args.trusted_job_prefix or [NO_JOB_KEYS]
     token = os.environ.get("ARTIFACTORY_TOKEN", "")
     if not token:
         sys.exit("[error] ARTIFACTORY_TOKEN is unset")
