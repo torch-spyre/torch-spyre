@@ -149,6 +149,22 @@ def test_a_min_max_is_indexed_by_its_ladder_rung():
     _assert_exact(model, {}, buffer_map, expr, choices, lowered)
 
 
+def test_a_min_of_literal_sums_stays_linear_in_the_objective():
+    model, buffer_map, divisions, s = _buffers({"a": {"tile_a": list(range(1, 41))}})
+    names = [f"is_lx_{i}" for i in range(5)]
+    sym_map = {n: model.new_bool_var(n) for n in names}
+    lits = [sympy.Symbol(n, integer=True) for n in names]
+    reads = 70 - 3 * lits[0] - 5 * lits[1] + 2 * (1 - lits[2]) * (8 - 4 / s["tile_a"])
+    writes = 90 - 7 * lits[3] - 2 * lits[4] - 4 * lits[2]
+    expr = sympy.Rational(3, 7) * sympy.Min(reads, writes)
+    lowered = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
+    # One table over the Min's inputs would hold 2**5 * 40 entries; kept
+    # linear, the literal terms cost none and the tile term 2 * 40.
+    assert max(_element_sizes(model, 0)) <= 80
+    choices = {divisions["a"]: (0, 1, 39), **{sym_map[n]: (0, 1) for n in names}}
+    _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
+
+
 def test_a_product_of_four_maxes_over_shared_buffers_folds():
     menus = {
         b: {f"split_{b}": [1, 2, 4, 8, 16, 32], f"tile_{b}": [1, 2, 1, 4, 2, 1]}

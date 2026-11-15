@@ -80,6 +80,10 @@ TABLE_CAP = int(os.environ.get("CPSAT_TABLE_CAP", "8192"))
 # Largest scaled entry, so that sums of thousands of entries stay in int64.
 _MAX_ENTRY = 2**50
 _MAX_BOUND = 2**62
+# The linear form of a node replaces its table only when the table is this many
+# times larger: a rank's small domain searches faster than a lin_max over wide
+# values, so a near tie keeps the table (2.5x slower solve on a GQA objective).
+_LINEAR_MARGIN = 2
 # Values equal to this many significant digits are one value.
 _SIGNIFICANT_DIGITS = 12
 
@@ -293,6 +297,7 @@ class _TableLowering:
         self._ranks: dict = {}
         self._pairs: dict = {}
         self._joint: dict = {}
+        self._linear_cost: dict = {}
         self._count = 0
         self._map_inputs(sym_map, buffer_map)
 
@@ -566,7 +571,8 @@ class _TableLowering:
                 self._model.add_max_equality(target, exprs)
             return target
 
-        entries = sum(o.entries for o in operands)
+        # An operand clamped to one rung needs no table.
+        entries = sum(o.entries for o, r in zip(operands, rungs) if min(r) != max(r))
         index = _Index(build, entries, len(ladder))
         fold = self._fold_factor(node, is_min, ladder, bound)
         return _Indexed(np.asarray(ladder), index, ranked=True, fold=fold)
@@ -695,8 +701,11 @@ class _TableLowering:
     def emit(self, node, factor: Optional[_Indexed] = None, coeff: float = 1.0):
         """``coeff * factor * node`` as a _Linear, or None. A sum is never one
         table in the objective, and a factor goes into it term by term unless
-        one table over the whole sum and the factor is smaller."""
+        one table over the whole sum and the factor is smaller. A node is one
+        table only when that is smaller than its linear form (rule 3)."""
         ix = None if node.is_Add and factor is None else self.indexed(node)
+        if ix is not None and factor is None and self._prefers_linear(node, ix):
+            ix = None
         if ix is not None:
             term = ix if factor is None else self._pair(ix, factor)
             if term is not None and not (
@@ -714,6 +723,43 @@ class _TableLowering:
         if self.failure is None:
             self.failure = f"cannot lower {type(node).__name__}: {str(node)[:120]}"
         return None
+
+    def _linear_entries(self, node) -> float:
+        """Entries ``node`` needs in the objective, a sum and a Min/Max kept
+        linear where that is smaller than their table; inf when it cannot be
+        lowered."""
+        if node in self._linear_cost:
+            return self._linear_cost[node]
+        if not node.free_symbols:
+            cost = 0.0
+        elif node.is_Add:
+            cost = sum(self._linear_entries(a) for a in node.args)
+        else:
+            ix = self.indexed(node)
+            tabled = math.inf if ix is None else self._table_entries(ix)
+            if isinstance(node, (sympy.Min, sympy.Max)):
+                linear = sum(self._linear_entries(a) for a in node.args)
+            elif node.is_Mul and sum(not a.is_Number for a in node.args) == 1:
+                (rest,) = [a for a in node.args if not a.is_Number]
+                linear = self._linear_entries(rest)
+            else:
+                linear = math.inf
+            cost = linear if _LINEAR_MARGIN * linear < tabled else tabled
+        self._linear_cost[node] = cost
+        return cost
+
+    def _prefers_linear(self, node, ix: _Indexed) -> bool:
+        return _LINEAR_MARGIN * self._linear_entries(node) < self._table_entries(ix)
+
+    @staticmethod
+    def _table_entries(ix: _Indexed) -> int:
+        """Entries ``ix`` costs as an objective term: none for its own list
+        when that list is affine in its index (``_build`` makes it linear)."""
+        if ix.index is None:
+            return 0
+        steps = np.diff(ix.values)
+        affine = len(steps) == 0 or np.allclose(steps, steps[0], rtol=0, atol=1e-9)
+        return ix.index.entries + (0 if affine else len(ix.values))
 
     def _distributed_size(self, node, factor) -> int:
         """Entries ``factor`` pushed into the terms of the sum ``node`` needs."""
@@ -736,6 +782,8 @@ class _TableLowering:
         same_index: dict = {}
         for term in node.args:
             ix = self.indexed(term)
+            if ix is not None and factor is None and self._prefers_linear(term, ix):
+                ix = None
             if ix is None or ix.index is None:
                 part = self.emit(term, factor, coeff)
                 if part is None:
@@ -756,6 +804,10 @@ class _TableLowering:
     def _emit_product(self, node, factor, coeff):
         """Indexed factors multiply into one; a single factor too wide to index
         takes that product pushed into it."""
+        variable = [a for a in node.args if not a.is_Number]
+        if factor is None and len(variable) == 1:
+            numbers = math.prod(float(a) for a in node.args if a.is_Number)
+            return self.emit(variable[0], None, coeff * numbers)
         wide = []
         items = []
         for a in node.args:
