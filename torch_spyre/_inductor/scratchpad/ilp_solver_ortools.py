@@ -131,7 +131,7 @@ else:
         cp_model = None
         _CP_MODEL_IMPORT_ERROR = str(exc)
 
-from torch_spyre._inductor.scratchpad.cpsat_expr_printer import cost_expr_to_cpsat
+from torch_spyre._inductor.scratchpad.cpsat_table_lowering import cost_expr_to_cpsat
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
