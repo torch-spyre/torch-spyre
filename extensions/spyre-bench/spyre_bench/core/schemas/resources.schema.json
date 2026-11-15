@@ -3262,7 +3262,8 @@
             "none",
             "device_local",
             "per_device",
-            "explicit"
+            "explicit",
+            "platform"
            ]
           },
           "cpus": {

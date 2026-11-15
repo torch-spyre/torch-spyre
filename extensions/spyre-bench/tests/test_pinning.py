@@ -383,7 +383,13 @@ class Observer(unittest.TestCase):
     def test_launcher_stage_is_not_judged_and_not_a_sample(self):
         fake_proc(self.proc, {100: (5, "taskset", {100: "0-7"})})
         self.env(100, cmdline=["/usr/bin/taskset", "-c", "0-1", "python"])
-        self.assertIsNone(self.verify({"policy": "explicit", "cpus": "0-1"}, markers=()))
+        ours = "\0".join(["/usr/bin/taskset", "-c", "0-1"])
+        self.assertIsNone(self.verify({"policy": "explicit", "cpus": "0-1"}, markers=(ours,)))
+        self.env(100, cmdline=["/usr/bin/taskset", "-c", "2-3", "python"])  # the benchmark's own taskset is judged
+        self.assertEqual(
+            self.verify({"policy": "explicit", "cpus": "0-1"}, markers=(ours,))["run.exec.pinning_verified"], "false"
+        )
+        self.env(100, cmdline=["/usr/bin/taskset", "-c", "0-1", "python"])
         self.assertEqual(self.verify({"policy": "explicit", "cpus": "0-1"})["run.exec.pinning_verified"], "false")
         self.env(100, cmdline=["bash", "/x/pin-wrapper.sh", "python"])
         self.assertIsNone(self.verify({"policy": "explicit", "cpus": "0-1"}, markers=("/x/pin-wrapper.sh",)))
@@ -507,6 +513,45 @@ class Planning(unittest.TestCase):
         self.assertTrue(engine.pin_problems({"policy": "none", "launcher": "taskset"}, 1))
         self.assertTrue(engine.pin_problems({"policy": "per_device", "cpus_by_device": ["x"]}, 1))
         self.assertTrue(engine.pin_problems({"policy": "per_device", "cpus_by_device": "0-3"}, 1))
+
+
+class PlatformPolicy(unittest.TestCase):
+    def test_platform_is_recorded_and_never_judged(self):
+        p = pp.resolve({"policy": "platform"})
+        self.assertEqual((p.policy, p.source, p.apply, p.prefix("taskset")), ("platform", "platform", False, []))
+        proc = Path(tempfile.mkdtemp(dir=TMP))
+        fake_proc(proc, {100: (5, "run", {100: "0-7"}), 101: (100, "w", {101: "0-1"})})
+        r = placement.verify_pinning(p.observer_request(), 100, (), proc, proc)
+        self.assertEqual(
+            (r["run.exec.cpu_pinning"], r["run.exec.cpu_set_source"], r["run.exec.pinning_verified"]),
+            ("platform", "platform", "unknown"),
+        )
+        self.assertNotIn("run.exec.pinning_violations", r)
+
+    def test_platform_cannot_be_required_verified(self):
+        self.assertTrue(engine.pin_problems({"policy": "platform", "require_verified": True}, 1))
+        self.assertEqual(engine.pin_problems({"policy": "platform"}, 0), [])
+        self.assertEqual(engine.PIN_LABEL, "env.label.cpu_pinning")
+
+    def test_platform_gets_its_own_series_label(self):
+        cat = engine.Catalog([str(DEMO)], [], [])
+        env = engine.overlay_pinning(cat.effective("Environment", "node-a-unpinned"), {"policy": "platform"})
+        self.assertEqual(cat.env_labels(env)[engine.PIN_LABEL], "platform")
+        self.assertNotEqual(
+            engine.request_digest(cat, "node-a-unpinned", {"policy": "platform"}),
+            engine.request_digest(cat, "node-a-unpinned", None),
+        )
+        self.assertEqual(
+            engine.request_digest(cat, "node-a-unpinned", None), cat.digest("Environment", "node-a-unpinned")
+        )
+
+    def test_a_benchmark_that_pins_itself_is_judged_by_its_masks(self):
+        proc = Path(tempfile.mkdtemp(dir=TMP))
+        fake_proc(proc, {100: (5, "taskset", {100: "0-1"})})
+        (proc / "100" / "cmdline").write_bytes(b"taskset\0-c\0000-1\0python\0")
+        ours = "\0".join(["/usr/bin/taskset", "-c", "2-3"])
+        r = placement.verify_pinning({"policy": "explicit", "cpus": "2-3"}, 100, (), proc, proc, markers=(ours,))
+        self.assertEqual(r["run.exec.pinning_verified"], "false")
 
 
 class Prepare(unittest.TestCase):

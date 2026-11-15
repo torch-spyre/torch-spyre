@@ -55,7 +55,9 @@ class Prepared:
 
     def markers(self, repeat_dir):
         """Wrapper paths the observer treats as the launcher stage; None when the engine does not launch the tree."""
-        return (self.wrapper_path(repeat_dir),) if self.launches else None
+        if not self.launches:
+            return None
+        return (self.wrapper_path(repeat_dir), "\0".join(self.plan.prefix(self.tool)))
 
     def wrap(self, argv, repeat_dir, uses_wrapper):
         """argv behind the launcher prefix; writes the wrapper file when the command names {pin_wrapper}."""

@@ -355,7 +355,7 @@ def parser():
     ap.add_argument("--store", choices=("none", "clickhouse"), help="reuse lookup source (BENCH_STORE, default none)")
     ap.add_argument(
         "--cpu-pinning",
-        choices=("none", "device_local", "per_device", "explicit"),
+        choices=pinning_plan.POLICIES,
         help="request this CPU pinning policy, replacing the Environment's own (BENCH_CPU_PINNING)",
     )
     ap.add_argument("--cpu-set", help="CPU list for --cpu-pinning explicit (BENCH_CPU_SET)")

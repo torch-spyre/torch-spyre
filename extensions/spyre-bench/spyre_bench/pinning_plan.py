@@ -39,7 +39,7 @@ SMTS = ("primary_only", "siblings", "both")
 SPREAD_SCOPES = ("all", "socket")
 LAYOUTS = ("tree", "ranks")
 LAUNCHERS = ("taskset", "numactl")
-POLICIES = ("none", "device_local", "per_device", "explicit")
+POLICIES = ("none", "device_local", "per_device", "explicit", "platform")
 ASSIGN_KEYS = ("cores_per_device", "spread", "smt", "reserve", "reserve_cpus", "spread_scope", "llc_align")
 
 
@@ -453,6 +453,8 @@ def resolve(request, topology=None, device_numa=()):
     required = bool(req.get("require_verified"))
     if policy == "none":
         return PinPlan("none", "none", require_verified=required)
+    if policy == "platform":
+        return PinPlan("platform", "platform", require_verified=required)  # the stack pins itself: nothing to launch
     common = {"layout": layout, "launcher": launcher, "require_verified": required}
     nodes = _device_nodes(device_numa)
 

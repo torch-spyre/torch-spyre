@@ -33,11 +33,10 @@ from pathlib import Path
 
 import regex as re
 
-POLICIES = ("none", "device_local", "per_device", "explicit")
+POLICIES = ("none", "device_local", "per_device", "explicit", "platform")
 MAX_CPU = 16383
 LIST = re.compile(r"[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*")
 ROOT_CGROUPS = ("", "0::/")
-LAUNCHER_TOOLS = ("taskset", "numactl")
 
 
 def parse_cpu_list(text):
@@ -120,12 +119,17 @@ def starttime(pid, proc="/proc"):
 
 
 def launcher_stage(proc, pid, markers=()):
-    """True while a process is still the pinning tool or the rank wrapper (markers: paths of generated wrappers)."""
+    """True while a process is still the engine's own pinning tool or rank wrapper.
+
+    markers: wrapper paths, and launcher prefixes joined with NUL; a benchmark that runs taskset/numactl itself is not
+    the launcher stage and is judged by its masks like any other process.
+    """
     try:
         argv = [a for a in (proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if a]
     except OSError:
         return False
-    return bool(argv) and (os.path.basename(argv[0]) in LAUNCHER_TOOLS or any(a in markers for a in argv[:3]))
+    joined = "\0".join(argv)
+    return bool(argv) and any(joined.startswith(m) if "\0" in m else m in argv[:3] for m in markers)
 
 
 def read_affinities(root_pid, proc="/proc", expected_starttime=None, markers=None):
@@ -222,6 +226,8 @@ def resolve_requested(request, device_numa=(), sys_root="/sys"):
     policy = (request or {}).get("policy", "none")
     if policy == "none":
         return None, "none"
+    if policy == "platform":
+        return None, "platform"  # pinned by the platform in-process: recorded, never judged
     if (request or {}).get("unresolved"):
         return None, "unresolved"
     if policy == "explicit":
