@@ -49,6 +49,16 @@ QUALITY_METRICS = frozenset(
     "exact_match acc_norm lm_eval_acc rouge1 rouge2 rougeL bleu_4 meteor ndcg_at_10 spearman "
     "accuracy v_measure retrieval_pct".split()
 )
+# Engine quality metrics. The diagnostic ones (standard errors, counts, error shares) support a score
+# and are never judged or counted themselves.
+QUALITY_PREFIXES = ("llm.eval.", "llm.parity.")
+DIAGNOSTIC_SUFFIXES = (
+    "_stderr",
+    ".n_samples",
+    ".error_frac",
+    ".truncated_frac",
+    ".invalid_frac",
+)
 DEFAULT_MIN_REPEATS = 3
 _MISSING = (
     "unknown_table",
@@ -97,6 +107,24 @@ def _ident(value):
 
 def _in(ids):
     return ", ".join(f"toUUID('{i}')" for i in ids)
+
+
+def is_diagnostic(metric):
+    """A companion of a quality score: its standard error, sample count or error share."""
+    suffix = next((s for s in DIAGNOSTIC_SUFFIXES if metric.endswith(s)), None)
+    if suffix is None:
+        return False
+    return (
+        metric.startswith(QUALITY_PREFIXES) or metric[: -len(suffix)] in QUALITY_METRICS
+    )
+
+
+def is_quality_metric(metric):
+    return (
+        metric in QUALITY_METRICS
+        or metric.startswith(QUALITY_PREFIXES)
+        or is_diagnostic(metric)
+    )
 
 
 def _num(v):
@@ -242,12 +270,12 @@ class VerdictReader:
         ttype = {}
         rows = self._optional(
             "v_benchmark_results_enriched",
-            f"SELECT toString(t.run_id) AS run_id, any(t.test_type) AS test_type FROM v_benchmark_results_enriched AS t "
+            f"SELECT toString(t.run_id) AS run_id, groupUniqArray(t.test_type) AS test_type FROM v_benchmark_results_enriched AS t "
             f"WHERE {where} GROUP BY t.run_id",
             "kind falls back to the metric name",
         )
         for r in rows or []:
-            ttype[r["run_id"]] = r["test_type"]
+            ttype[r["run_id"]] = set(r["test_type"])
         return {"noise": noise, "inval": inval, "props": props, "ttype": ttype}
 
     def _result(self, r, ctx):
@@ -276,14 +304,29 @@ class VerdictReader:
         n_repeats = noise["n_repeats"] if noise else None
         view_verdict = VIEW_STATUS.get(r["status"], r["status"])
         verdict, reason = view_verdict, r["reason"]
+        # A run that mixes test types is classed by metric name; only an all-quality run is quality by type.
+        is_quality = ctx["ttype"].get(run) == {"quality"} or is_quality_metric(metric)
+        unjudged = not validity or "" in p.get("validity", [])
         if view_verdict == "regressed":
-            if n_repeats is not None and n_repeats < self.min_repeats:
+            # A score is one value over n samples, so the repeat-count and repeat-noise caps do not apply; instead
+            # nothing may be called a regression unless the data behind it was judged and is trustworthy.
+            if (
+                not is_quality
+                and n_repeats is not None
+                and n_repeats < self.min_repeats
+            ):
                 verdict, reason = "suspected", "few_repeats"
+            elif is_quality and suspect_hits:
+                verdict, reason = "suspected", "suspect_data"
+            elif is_quality and (unjudged or trust == "external"):
+                verdict, reason = (
+                    "suspected",
+                    "validity_unknown" if unjudged else "trust_external",
+                )
             elif validity and validity not in REGRESSION_VALIDITY:
                 verdict, reason = "suspected", f"validity_{validity}"
-            elif noise and noise["is_suspect"]:
+            elif not is_quality and noise and noise["is_suspect"]:
                 verdict, reason = "suspected", "suspect_repeats"
-        is_quality = ctx["ttype"].get(run) == "quality" or metric in QUALITY_METRICS
         series = {
             k: r[k]
             for k in ("component", "benchmark_id", "backend", "arch", "source_job")
@@ -295,6 +338,7 @@ class VerdictReader:
             "input_shapes": r["input_shapes"],
             "metric": metric,
             "kind": "quality" if is_quality else "perf",
+            "diagnostic": is_diagnostic(metric),
             "tier": r["tier"],
             "higher_is_better": bool(r["higher_is_better"]),
             "verdict": verdict,
@@ -337,13 +381,29 @@ class VerdictReader:
 
     @staticmethod
     def _finish(report):
-        live = [r for r in report["results"] if not r["invalidated"]]
+        judged = [r for r in report["results"] if not r.get("diagnostic")]
+        live = [r for r in judged if not r["invalidated"]]
         counts = {v: 0 for v in VERDICTS}
+        by_kind = {}
         for r in live:
             counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+            k = by_kind.setdefault(
+                r["kind"], {"counts": {v: 0 for v in VERDICTS}, "actionable": 0}
+            )
+            k["counts"][r["verdict"]] = k["counts"].get(r["verdict"], 0) + 1
+            k["actionable"] += int(
+                r["verdict"] in ("regressed", "suspected")
+                and r["tier"] != "informational"
+            )
+        for r in judged:
+            k = by_kind.setdefault(
+                r["kind"], {"counts": {v: 0 for v in VERDICTS}, "actionable": 0}
+            )
+            k["invalidated"] = k.get("invalidated", 0) + int(r["invalidated"])
         report["summary"] = {
             "counts": counts,
-            "invalidated": len(report["results"]) - len(live),
+            "by_kind": by_kind,
+            "invalidated": len(judged) - len(live),
             "reasons": {
                 k: sum(
                     1 for r in live if r["verdict"] == "suspected" and r["reason"] == k
@@ -380,6 +440,7 @@ def actionable(report, kind=None):
         r
         for r in report["results"]
         if not r["invalidated"]
+        and not r.get("diagnostic")
         and r["verdict"] in ("regressed", "suspected")
         and r["tier"] != "informational"
         and (kind is None or r["kind"] == kind)
@@ -394,6 +455,8 @@ REASON_TEXT = {
     "suspect_data": "the run is flagged suspect and is kept out of baselines",
     "purpose_not_baseline": "the run's purpose is not baseline-eligible and it is kept out of baselines",
     "few_repeats": "too few valid repeats to call a regression",
+    "validity_unknown": "no policy judged the data behind this score, so it cannot be called a regression",
+    "trust_external": "the score came from an external source and is not trusted to call a regression",
 }
 
 
@@ -414,6 +477,7 @@ def _cell(v, nd=3):
 
 
 def to_markdown(report, limit=20):
+    """Every kind, with values and baselines: internal use only, never posted on a public pull request."""
     s = report["summary"]
     out = [f"Verdicts for {', '.join(report['runs']) or 'no run'}", ""]
     out += [f"- {k}: {v}" for k, v in s["counts"].items() if v]
@@ -426,7 +490,7 @@ def to_markdown(report, limit=20):
     ]
     out += [""] + [f"Note: {n}" for n in report["notes"]]
     rows = sorted(
-        report["results"],
+        (r for r in report["results"] if not r.get("diagnostic")),
         key=lambda r: (VERDICTS.index(r["verdict"]), -(r["worse_pct"] or 0)),
     )
     if rows:
