@@ -222,6 +222,8 @@ def resolve_requested(request, device_numa=(), sys_root="/sys"):
     policy = (request or {}).get("policy", "none")
     if policy == "none":
         return None, "none"
+    if (request or {}).get("unresolved"):
+        return None, "unresolved"
     if policy == "explicit":
         try:
             return [parse_cpu_list(request["cpus"])], "explicit"

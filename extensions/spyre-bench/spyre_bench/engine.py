@@ -2555,7 +2555,11 @@ def pin_problems(pin, accelerators):
         out.append("host.cpu_pinning: give cpus_by_device or assign, not both")
     if pin.get("layout") == "ranks" and not ("cpus_by_device" in pin or "assign" in pin):
         out.append("host.cpu_pinning: layout ranks needs cpus_by_device or assign")
-    for key, lists in (("cpus", [pin["cpus"]] if "cpus" in pin else []), ("cpus_by_device", pin.get("cpus_by_device"))):
+    by = pin.get("cpus_by_device")
+    if by is not None and not (isinstance(by, list) and all(isinstance(x, str) for x in by)):
+        out.append("host.cpu_pinning.cpus_by_device: a list of CPU list strings")
+        by = None
+    for key, lists in (("cpus", [pin["cpus"]] if "cpus" in pin else []), ("cpus_by_device", by)):
         for x in lists or []:
             try:
                 parse_cpu_list(x)
@@ -2693,6 +2697,8 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
     for c in chosen:
         env_name = request.get("environment") or c["environment"]
         env = cat.effective("Environment", env_name) if env_name else None
+        if env is None and request.get("cpu_pinning"):
+            raise PlanError(f"{c['name']}: a cpu_pinning request needs the case to have an Environment")
         if env is not None and request.get("cpu_pinning"):
             env = overlay_pinning(env, request["cpu_pinning"])
             if problems := pin_problems(request["cpu_pinning"], cat.accelerator_count(env)):
