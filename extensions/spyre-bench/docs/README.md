@@ -425,6 +425,46 @@ one occurs (exit 1); exit 2 for bad flags or a store failure, never a silent pas
 the measured values. Output: `verdict_schema: bench.verdict/1` with `summary`, `benchmarks[]` (worst status per
 benchmark: regressed, suspected, improved, no_baseline, pass) and `verdicts[]`.
 
+## Uploading results
+
+```bash
+spyre-bench upload results/bench                       # seal and check; prints what would be sent (dry run)
+spyre-bench upload results/bench --apply --wait        # put it in the results inbox and wait for the relay
+spyre-bench upload bundle.tgz --apply                  # send a bundle sealed elsewhere, unchanged
+```
+
+`upload` is for results measured outside CI: a lab host, a developer machine, a partner's machine. The engine writes
+no rows. The command seals the run directory (every `result.json` under it) into a `bench` bundle through the
+ingest's offline module, checks it, and prints the run key, case and repeat counts, both digests and a receipt id
+(`RCPT-...`). Without `--apply` nothing leaves the machine. With it, the bundle is put in the Artifactory inbox
+(`--base-url`, `--repo`, `--root` or `ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`; `ARTIFACTORY_TOKEN` or `~/.netrc`) and the relay records it; `--wait [MIN]` polls for
+its outcome. The dashboard's upload page takes the same bundle if you have a login. `--via api` is refused: the
+dashboard accepts a browser login only.
+
+| Flag | Effect |
+|---|---|
+| `--seal-trust lab\|external` | where the results came from (default `external`); the receiving channel records the trust and a label can only lower it |
+| `--redact-host`, `--redact-user` | leave the sealing host and user out of the bundle |
+| `--ended-at`, `--arch`, `--test-type perf\|quality` | end time (ISO-8601 with a zone), where it ran (default `run.json`, else the host), the tier |
+| `--out` | where to write the sealed bundle (default `RESULTS_DIR/upload/bundle.tgz`) |
+
+Rules that follow from the receiving side:
+
+- **Upgrade the connected ingest first.** The sealing host's ingest must not be newer than the receiving one, and
+  `upload` needs one that knows `bench` bundles; an older one is reported with that advice.
+- **Times carry a zone.** A time without one is read as UTC, whatever the sealing machine's zone; pass `--ended-at`
+  with an explicit zone when the tests ran elsewhere.
+- **The whole ingest package must be installed** (`spyre-bench[ingest]`, or its wheel in an air-gapped kit). The
+  vendored identity module that derives benchmark ids (see the adapter contract) is not enough, because sealing reads
+  `bundle.schema.json` beside the offline module.
+- **Re-sending is safe.** The run key is the engine run id, so sealing the same results again is the same run; the
+  receiving side skips repeats it has and rejects a repeat whose content changed.
+- **Keys the receiving channel owns** (`run.trust` and others) are dropped from the sealed copy, with a warning.
+
+Exit codes: 0 sent or dry run, 2 invalid input or a rejected bundle, 5 the transfer failed.
+Bundle format and trust rules: `extensions/clickhouse-ingest/docs/bench-bundles.md`.
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
