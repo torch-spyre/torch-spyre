@@ -95,7 +95,15 @@ def _labels(result, pinning):
     return labels
 
 
-def incomparable(a, b, pinning=True):
+def _relaxed(relax, key):
+    return any(p == key or (p.endswith("*") and key.startswith(p[:-1])) for p in relax)
+
+
+def _strict(labels, relax):
+    return {k: v for k, v in labels.items() if not _relaxed(relax, k)}
+
+
+def incomparable(a, b, pinning=True, relax=()):
     """Why two Results cannot be combined: empty means same subject, environment, node and pinning.
 
     pinning=False leaves the pinning policy out (the compared dimension itself); a Result whose own repeats disagree
@@ -103,15 +111,15 @@ def incomparable(a, b, pinning=True):
     """
     sa, sb = a["status"], b["status"]
     why = [f"mixed cpu pinning within {_case(r)}" for r in (a, b) if len(_pinnings(r)) > 1]
-    if sa["subject"]["artifact_id"] != sb["subject"]["artifact_id"]:
+    if sa["subject"]["artifact_id"] != sb["subject"]["artifact_id"] and not _relaxed(relax, "subject.id"):
         why.append("different subject")
-    if sa["environment"]["env_id"] != sb["environment"]["env_id"]:
+    if sa["environment"]["env_id"] != sb["environment"]["env_id"] and not _relaxed(relax, "env.id"):
         why.append("different env_id")
-    if _labels(a, pinning) != _labels(b, pinning):
+    if _strict(_labels(a, pinning), relax) != _strict(_labels(b, pinning), relax):
         why.append("different environment labels")
     if sa["environment"].get("observations", {}).get("env.node") != sb["environment"].get("observations", {}).get(
         "env.node"
-    ):
+    ) and not _relaxed(relax, "env.node"):
         why.append("different node")
     if pinning and _pinnings(a) != _pinnings(b):
         why.append("different cpu pinning")
@@ -273,8 +281,11 @@ def _reading(effect, direction):
     return "better" if (effect < 0) == (direction == "lower_is_better") else "worse"
 
 
-def compare(cmp_, rows, unit="1", direction=None):
-    """Per (across, by) cell: n, mean, median, cv_pct, effect_pct vs the baseline cell, within_noise, reading."""
+def compare(cmp_, rows, unit="1", direction=None, relax=()):
+    """Per (across, by) cell: n, mean, median, cv_pct, effect_pct vs the baseline cell, within_noise, reading.
+
+    relax: attributes (subject.id, env.id, env.node, env.label.<k>, trailing * allowed) that may differ between cells,
+    for a comparison whose point is that difference (card count, build); a cell itself still holds one Result."""
     across = cmp_.get("across", [])
     cells = {}
     for row in rows:
@@ -284,7 +295,7 @@ def compare(cmp_, rows, unit="1", direction=None):
         _check_cell(key, group)
     for (ctx, by), group in cells.items():
         for other in [k[1] for k in cells if k[0] == ctx and k[1] != by]:
-            why = incomparable(cells[(ctx, other)][0]["results"][0], group[0]["results"][0], pinning=False)
+            why = incomparable(cells[(ctx, other)][0]["results"][0], group[0]["results"][0], pinning=False, relax=relax)
             if why:
                 raise AnalysisError(
                     f"compare: cells {other!r} and {by!r} are not comparable: {', '.join(why)}; "
@@ -380,7 +391,9 @@ def analyze(spec, results, metrics=None):
             rows, unit, base_metric = _plain_rows(results, m, warn), _unit(results, m), m
         if not rows:
             raise AnalysisError(f"compare: no values of {m}")
-        report["compare"] = compare(cmp_, rows, unit, metrics.get(base_metric, {}).get("direction"))
+        report["compare"] = compare(
+            cmp_, rows, unit, metrics.get(base_metric, {}).get("direction"), spec.get("relax", [])
+        )
     report["warnings"] = warn
     return report
 
