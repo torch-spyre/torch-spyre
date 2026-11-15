@@ -79,6 +79,9 @@ CASES = [
     ({"purpose": "pr", "bench": "sanity"}, "ghe", WRITER),
     ({"bench": "sanity", "purpose": "nightly"}, "ghe", WRITER),
     ({"bench-reuse": "only"}, "ghe", WRITER),
+    ({"bench": "sanity", "sha": "abcdef1"}, "github.com", WRITER),
+    ({"bench": "sanity", "sha": "ABC"}, "github.com", WRITER),
+    ({"bench": "@org/team"}, "ghe", WRITER),
     ({"bench": "sanity", "bench-budjet": "3"}, "ghe", WRITER),
 ]
 

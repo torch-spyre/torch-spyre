@@ -33,6 +33,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -72,6 +73,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -115,6 +117,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -153,10 +156,12 @@
        "suites": [
         "decoder",
         "startup"
-       ]
+       ],
+       "tier": "sanity"
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -209,6 +214,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -261,6 +267,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -306,6 +313,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -347,6 +355,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -391,6 +400,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -432,6 +442,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -475,6 +486,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -535,6 +547,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -580,6 +593,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -626,6 +640,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -702,6 +717,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -745,6 +761,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -786,6 +803,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -829,6 +847,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "main"
    },
    "violations": []
@@ -870,6 +889,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "build:orch#12"
    },
    "violations": []
@@ -889,7 +909,7 @@
    "host": "ghe"
   },
   "out": {
-   "error": "vs='tomorrow': main, nightly or build:<job>#<n>"
+   "error": "vs='tomorrow': main, nightly or build: job # n"
   }
  },
  {
@@ -928,6 +948,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -969,6 +990,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1014,6 +1036,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -1057,6 +1080,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1134,6 +1158,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1177,6 +1202,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -1218,6 +1244,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -1259,6 +1286,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1334,6 +1362,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1375,6 +1404,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -1414,6 +1444,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": [
@@ -1530,7 +1561,7 @@
    "host": "ghe"
   },
   "out": {
-   "error": "selection 'a,b@core': use 'suite+suite@tier' or a comma list of cases, not both"
+   "error": "selection 'a,b@\u200bcore': use 'suite+suite@\u200btier' or a comma list of cases, not both"
   }
  },
  {
@@ -1569,6 +1600,7 @@
       }
      }
     ],
+    "sha": "",
     "vs": "nightly"
    },
    "violations": []
@@ -1604,7 +1636,82 @@
    "host": "ghe"
   },
   "out": {
-   "error": "bench-* flags need a selection: bench=<selection>"
+   "error": "bench-* flags need a selection: bench= selection"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "sha": "abcdef1"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "sanity",
+     "sha": "abcdef1"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "sanity",
+      "product": "spyre-inference",
+      "selection": {
+       "tier": "sanity"
+      }
+     }
+    ],
+    "sha": "abcdef1",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "sha": "ABC"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "sha='ABC': 7 to 40 lower-case hex characters of the head commit"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "@org/team"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "suite '': letters, digits, '.', '_' and '-' only"
   }
  },
  {

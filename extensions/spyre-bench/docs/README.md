@@ -650,8 +650,9 @@ pick      := tier | suite ("+" suite)* ["@" tier] | case ("," case)* | "#" selec
 tier      := sanity | core | extended
 ```
 
-A bare word that is not a tier is a case or Selection name. A suite pick without `@tier` plans `sanity`, and the
-preview says so. Products: `torch-spyre`, `hf-adapters`, `spyre-inference` (default), `spyre-comms`. The command must
+A bare word that is not a tier is a case or Selection name (a single suite is written `suite@tier`). A suite pick
+without `@tier` is made explicit as `sanity`, and the preview says so. Cases and Selections carry their own tier, so the
+host's tier limit is checked on the plan (`authorize` with `stage: planned` and the plan), not on the words. Products: `torch-spyre`, `hf-adapters`, `spyre-inference` (default), `spyre-comms`. The command must
 start a line; lines inside code fences, quotes or indented are ignored.
 
 | Flag (`bench-` prefix optional) | Values | Default |
@@ -665,6 +666,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | `max-wait` | `45m`, `1h`, ... (with `clean=true`) | 30m, capped at 60m |
 | `env` | an Environment name | the preset's |
 | `budget` | device-hours; lowers the cap, never raises it | the cap |
+| `sha` | 7 to 40 hex characters of the head commit you reviewed; required for a fork head | none |
 
 ### Policy
 
@@ -679,15 +681,20 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | budget per PR per 24 h | 8 | 96 |
 
 Numbers are proposals until catalogs carry real `est` values. An estimate above half the limit needs `/bench confirm`;
-above the limit nothing runs. One active request per PR: a new one cancels the older one, and cancelled work does not
-count against the window. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
+above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
+access may cancel anyone's, others are refused while another user's request runs). Row states `active`, `previewed`,
+`launched`, `admit` and `needs_confirm` are live; `cancelled`, `denied`, `rejected` and `deny` are dead, and dead work
+does not count against the window, but still counts toward the hourly rate and the daily clean quota. A history row
+with a non-finite or negative estimate fails closed. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
 at once overall.
 
 ### Fork pull requests and the pinned sha
 
 - A request is made for one full head sha, recorded with it. If the PR head moves, the request is refused; a new
   comment is a new request and a new permission check.
-- A fork head runs only with an approval: the comment of a write-access user is the approval, recorded as
+- A fork head runs only if the comment names the commit (`sha=`, a prefix of the current head) and the commenter has
+  write access; this is what makes the approval about the commit that was reviewed rather than the one that was
+  force-pushed a moment before the comment. The comment is the approval, recorded as
   `{sha, approver, permission, request_digest, granted_at}`. It is valid for that sha, that request (by digest) and 72 h.
   An approval by someone without write access, for another sha or for a changed request is rejected.
 - The measuring job gets `sandbox_profile`: no secrets, no registry or store credentials, checkout of the pinned sha,
@@ -699,7 +706,11 @@ at once overall.
 minutes), `reasons`, `queue`, `budget` (limit, needs_confirm, over), `asked`, `diff` (what you asked versus what will
 run, with the reason), `cases` (sorted: run, reuse, skip, then name) and a `digest`. `--format md` renders the same
 data as a PR comment that starts with a marker so it is edited in place. Text that came from a plan or a comment is
-stripped of control characters, backticks, tags, pipes and mentions before it is put in a table.
+stripped of control and bidirectional characters, backticks, tags, pipes, link and image syntax, and issue references,
+`@` is neutralised and URL schemes are broken, before it is put in a table; `RequestError` messages get the lighter
+form (`neutral`). The JSON preview carries the raw plan strings: a dashboard must escape them. A confirm
+(`/bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha` and, for a
+fork, the recorded approval; the confirmer must have write access.
 
 ## Running the tests
 
