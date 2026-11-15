@@ -176,17 +176,10 @@ def test_a_skipped_run_needs_no_plan(chdb_session):
         {"mode": "apply", "status": "planned"},
         {"mode": "plan", "status": "applied"},
         {"mode": "plan", "status": "partial"},
-        {"plan_digest": "AB" * 32},
-        {"plan_digest": "ab" * 31},
-        {"plan_digest": ""},
         {"run_id": "   "},
-        {"mode": "apply", "status": "started", "plan_digest": ""},
         {"mode": "plan", "status": "started"},
         {"mode": "apply", "status": "started", "deleted_files": 1},
         {"mode": "apply", "status": "started", "failed_files": 1},
-        {"mode": "apply", "status": "applied", "plan_digest": ""},
-        {"mode": "apply", "status": "failed", "plan_digest": ""},
-        {"mode": "apply", "status": "partial", "plan_digest": "", "failed_files": 1},
         {"days": 3651},
         {"days": 70000},
         {"keep": 1001},
@@ -237,3 +230,20 @@ def test_equal_ts_rows_both_land(chdb_session):
     _insert(s, _row(ts="2026-11-12 01:00:00"))
     _insert(s, _row(ts="2026-11-12 01:00:00", mode="apply", status="started"))
     assert _rows(s, "SELECT count() AS n FROM artifact_sweep_runs") == [{"n": 2}]
+
+
+@pytest.mark.parametrize(
+    ("bad", "constraint"),
+    [
+        ({"plan_digest": "AB" * 32}, "chk_digest"),
+        ({"plan_digest": "ab" * 31}, "chk_digest"),
+        ({"plan_digest": ""}, "chk_digest_needed"),
+        ({"mode": "apply", "status": "started", "plan_digest": ""}, "chk_digest_needed"),
+        ({"mode": "apply", "status": "applied", "plan_digest": ""}, "chk_digest_needed"),
+        ({"mode": "apply", "status": "partial", "plan_digest": "", "failed_files": 1}, "chk_digest_needed"),
+        ({"mode": "apply", "status": "failed", "plan_digest": ""}, "chk_digest_needed"),
+    ],
+)  # fmt: skip
+def test_digest_rows_trip_the_digest_constraint(chdb_session, bad, constraint):
+    with pytest.raises(Exception, match=rf"{constraint}\b.*violated"):
+        _insert(chdb_session, _row(**bad))
