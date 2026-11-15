@@ -61,6 +61,14 @@ without renumbering it:
 | `88` | anchor (baseline) views |
 | `89` | invalidation preview |
 
+Behaviour notes for consumers of the stack:
+
+- A run with no eligible samples (all invalidated, or only excluded record types) has no row in
+  `v_benchmark_gate` / `v_perf_regression_gate`; treat a missing row as "no verdict", not a pass.
+- Record types in `benchmark_excluded_record_types` no longer get verdicts; history already in
+  `benchmark_metric_verdicts` is kept, new refreshes skip them.
+- `benchmark_baseline_purposes` is a view: editing it changes baseline eligibility for all history.
+
 The new tables are append-only and the rest are views, so rolling back is dropping the new views
 and reverting the edited ones.
 
