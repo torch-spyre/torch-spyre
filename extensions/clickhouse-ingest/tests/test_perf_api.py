@@ -772,3 +772,36 @@ def test_a_forged_cursor_is_a_400_and_boolean_flags_parse(db):
 def test_steps_consistency_has_one_entry_per_rank(db):
     c = api.steps(db, TP4, NOW)["data"]["consistency"]
     assert sorted(x["rank"] for x in c) == [0, 1, 2, 3]
+
+
+def test_steps_headline_and_outliers_from_the_views_equal_the_python_derivation(db):
+    via_views = api.steps(db, TP4, NOW)["data"]
+    via_python = api.steps(db, TP4, NOW, _views=False)["data"]
+    assert via_views["headline"] == via_python["headline"]
+    assert via_views["outliers"] == via_python["outliers"] and via_views["outliers"]
+
+
+def test_spans_from_the_fast_table_equal_the_view(db, monkeypatch):
+    assert api._span_source(db, TP4) == "v_bench_spans_fast"
+    fast = [
+        api.spans(db, TP4, NOW, view=v, rank=2, step=3)["data"]
+        for v in ("summary", "kernels", "timeline")
+    ]
+    monkeypatch.setattr(api, "_span_source", lambda run, rid: "v_bench_spans")
+    slow = [
+        api.spans(db, TP4, NOW, view=v, rank=2, step=3)["data"]
+        for v in ("summary", "kernels", "timeline")
+    ]
+    assert fast == slow and fast[2]["spans"]
+
+
+def test_span_source_falls_back_only_when_the_optional_table_is_missing():
+    def missing(sql, params=None):
+        raise RuntimeError("Unknown table expression identifier 'bench_span_values'")
+
+    def transient(sql, params=None):
+        raise RuntimeError("Connection reset by peer")
+
+    assert api._span_source(missing, TP4) == "v_bench_spans"
+    with pytest.raises(RuntimeError):
+        api._span_source(transient, TP4)

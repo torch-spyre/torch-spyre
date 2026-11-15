@@ -640,7 +640,7 @@ def load(tables, sink, batch=5000):
 
 SCHEMA_FILES = (
     "10-functional-tests", "20-artifacts", "30-benchmarks", "49-result-uploads", "50-artifact-views", "60-benchmark-views",
-    "62-benchmark-verdicts", "81-bench-environments", "82-run-placements", "83-result-invalidations", "85-benchmark-verdict-views", "86-bench-references",
+    "62-benchmark-verdicts", "81-bench-environments", "82-run-placements", "83-result-invalidations", "85-benchmark-verdict-views", "86-bench-references", "87-bench-trace-views", "90-bench-span-values",
 )  # fmt: skip
 
 
