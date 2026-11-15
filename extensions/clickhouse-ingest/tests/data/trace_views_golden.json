@@ -1,0 +1,270 @@
+{
+ "collective_layer_0_3": [
+  {
+   "layer": 0,
+   "ns": 3038700,
+   "rank": 0
+  },
+  {
+   "layer": 3,
+   "ns": 1939200,
+   "rank": 0
+  },
+  {
+   "layer": 0,
+   "ns": 1945300,
+   "rank": 1
+  },
+  {
+   "layer": 3,
+   "ns": 1971200,
+   "rank": 1
+  },
+  {
+   "layer": 0,
+   "ns": 2642600,
+   "rank": 2
+  },
+  {
+   "layer": 3,
+   "ns": 2003200,
+   "rank": 2
+  },
+  {
+   "layer": 0,
+   "ns": 2674800,
+   "rank": 3
+  },
+  {
+   "layer": 3,
+   "ns": 2035200,
+   "rank": 3
+  }
+ ],
+ "cross_rank_pos_1_2_31": [
+  {
+   "awaited_rank": 2,
+   "busy": 247.75,
+   "cold": 1,
+   "compute": 242.75,
+   "fastest_rank": 0,
+   "pos": 1,
+   "slowest_rank": 2,
+   "step": "ttft",
+   "total": 408,
+   "wait": 147.25
+  },
+  {
+   "awaited_rank": 2,
+   "busy": 108.24583240522624,
+   "cold": 1,
+   "compute": 103.24583240522624,
+   "fastest_rank": 0,
+   "pos": 2,
+   "slowest_rank": 2,
+   "step": "itl_0001",
+   "total": 168.49583240522622,
+   "wait": 47.25
+  },
+  {
+   "awaited_rank": 1,
+   "busy": 133.08511458792168,
+   "cold": 0,
+   "compute": 128.08511458792168,
+   "fastest_rank": 0,
+   "pos": 31,
+   "slowest_rank": 2,
+   "step": "itl_0030",
+   "total": 268.3351145879217,
+   "wait": 122.25
+  }
+ ],
+ "headline": [
+  {
+   "headline": 167.9728104779045,
+   "kind": "itl",
+   "n_ranks": 4,
+   "n_warm_steps": 62,
+   "rank_skew": 8,
+   "rule": "max",
+   "rule_declared": 1,
+   "slowest_rank": 2
+  },
+  {
+   "headline": null,
+   "kind": "ttft",
+   "n_ranks": 4,
+   "n_warm_steps": 0,
+   "rank_skew": null,
+   "rule": "max",
+   "rule_declared": 1,
+   "slowest_rank": null
+  }
+ ],
+ "lag_pos_5": [
+  {
+   "is_awaited_rank": 0,
+   "lag": 0,
+   "rank": 0,
+   "total": 160.2470566755693,
+   "wait": 50,
+   "wait_spread_share": 1
+  },
+  {
+   "is_awaited_rank": 0,
+   "lag": 2,
+   "rank": 1,
+   "total": 162.2470566755693,
+   "wait": 48,
+   "wait_spread_share": 1
+  },
+  {
+   "is_awaited_rank": 1,
+   "lag": 8,
+   "rank": 2,
+   "total": 168.2470566755693,
+   "wait": 42,
+   "wait_spread_share": 1
+  },
+  {
+   "is_awaited_rank": 0,
+   "lag": 1,
+   "rank": 3,
+   "total": 161.2470566755693,
+   "wait": 49,
+   "wait_spread_share": 1
+  }
+ ],
+ "outliers": [
+  {
+   "excess": 100.36230411001719,
+   "excess_compute": 0.36230411001720597,
+   "excess_host": -1.4210854715202004e-14,
+   "excess_wait": 100,
+   "median": 159.9728104779045,
+   "rank": 0,
+   "step": "itl_0030",
+   "value": 260.3351145879217,
+   "z": 198.15545736847614
+  },
+  {
+   "excess": 100.36230411001719,
+   "excess_compute": 100.36230411001719,
+   "excess_host": 0,
+   "excess_wait": 0,
+   "median": 161.9728104779045,
+   "rank": 1,
+   "step": "itl_0030",
+   "value": 262.3351145879217,
+   "z": 198.15545736847614
+  },
+  {
+   "excess": 100.36230411001719,
+   "excess_compute": 0.36230411001720597,
+   "excess_host": -1.4210854715202004e-14,
+   "excess_wait": 100,
+   "median": 167.9728104779045,
+   "rank": 2,
+   "step": "itl_0030",
+   "value": 268.3351145879217,
+   "z": 198.15545736847614
+  },
+  {
+   "excess": 100.36230411001719,
+   "excess_compute": 0.36230411001720597,
+   "excess_host": -1.4210854715202004e-14,
+   "excess_wait": 100,
+   "median": 160.9728104779045,
+   "rank": 3,
+   "step": "itl_0030",
+   "value": 261.3351145879217,
+   "z": 198.15545736847614
+  }
+ ],
+ "spans_by_lane": [
+  {
+   "lane": "collective",
+   "mx": 1128700,
+   "n": 5120,
+   "ns": 82910700,
+   "rank": 0
+  },
+  {
+   "lane": "collective",
+   "mx": 20500,
+   "n": 5120,
+   "ns": 83065300,
+   "rank": 1
+  },
+  {
+   "lane": "collective",
+   "mx": 668600,
+   "n": 5120,
+   "ns": 85010600,
+   "rank": 2
+  },
+  {
+   "lane": "collective",
+   "mx": 668800,
+   "n": 5120,
+   "ns": 86290800,
+   "rank": 3
+  },
+  {
+   "lane": "device",
+   "mx": 100000,
+   "n": 5120,
+   "ns": 307200000,
+   "rank": 0
+  },
+  {
+   "lane": "device",
+   "mx": 101000,
+   "n": 5120,
+   "ns": 309760000,
+   "rank": 1
+  },
+  {
+   "lane": "device",
+   "mx": 102000,
+   "n": 5120,
+   "ns": 312320000,
+   "rank": 2
+  },
+  {
+   "lane": "device",
+   "mx": 103000,
+   "n": 5120,
+   "ns": 314880000,
+   "rank": 3
+  },
+  {
+   "lane": "host",
+   "mx": 15000,
+   "n": 5120,
+   "ns": 51200000,
+   "rank": 0
+  },
+  {
+   "lane": "host",
+   "mx": 15000,
+   "n": 5120,
+   "ns": 51200000,
+   "rank": 1
+  },
+  {
+   "lane": "host",
+   "mx": 15000,
+   "n": 5120,
+   "ns": 51200000,
+   "rank": 2
+  },
+  {
+   "lane": "host",
+   "mx": 15000,
+   "n": 5120,
+   "ns": 51200000,
+   "rank": 3
+  }
+ ]
+}
