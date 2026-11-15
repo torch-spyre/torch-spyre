@@ -218,6 +218,190 @@ at least as high as requested, enough un-invalidated repeats and an age within `
 `engine.excluded_repeats`, `engine.active_invalidations`, `engine.qualification_current`, `engine.validity_of`,
 `engine.select_baseline` and `engine.judge`.
 
+## Planning from the command line
+
+`spyre-bench plan` turns a request into `plan.json`: the cases a selection expands to, their stored ids, and for each
+case `run`, `reuse` or `skip` with the reason. It never runs anything.
+
+```bash
+spyre-bench plan --catalog benchmarks --central shared --purpose nightly --subject-id <artifact-uuid> \
+    --select smoke --reuse if_valid --env-id <env_id> --store clickhouse --out plan.json
+```
+
+Flags (each with its `BENCH_*` env twin): `--catalog` (`BENCH_DIR`), `--central` (`BENCH_CENTRAL`), `--pack`
+(`BENCH_PACK`), `--purpose` (`BENCH_PURPOSE`), `--environment` (`BENCH_ENVIRONMENT`), `--select`/`--selection`
+(`BENCH_SELECTION`), `--cases` (`BENCH_CASES`), `--tier` (`BENCH_TIER`), `--suite` (`BENCH_SUITES`), `--type`
+(`BENCH_TYPE`), `--subject-id` (`BENCH_SUBJECT_ID`), `--reuse` (`BENCH_REUSE`), `--force` (`BENCH_FORCE`), `--max-age`
+(`BENCH_MAX_AGE`), `--set` (`BENCH_SET`), `--budget` (`BENCH_BUDGET`), `--arch` (`BENCH_ARCH`), `--devices`
+(`BENCH_DEVICES`), `--nodes` (`BENCH_NODES`), `--reference-node` (`BENCH_REFERENCE_NODE`), `--env-id`
+(`BENCH_ENV_ID`), `--store` (`BENCH_STORE`), `--request` (`BENCH_REQUEST`), `--out` (`BENCH_PLAN_OUT`), `--json`.
+Precedence: flag, env twin, request file (`--request`, the engine request shape), default. `--select` and `--cases`
+work as a pair: a flag of either beats both env twins, which are not merged with it.
+
+- **Reuse** needs the same subject artifact, the same `env_id` (or the Selection's label keys), the same pinning label,
+  validity at least the purpose floor, enough repeats and an age within `--max-age`. A stored row that lacks `env.id` or
+  `run.validity` props is unknown and means `run`. `--reuse` on the command line overrides a Selection's own rule
+  (`reuse.override: true` in the request); `--force` and `--max-age` need a reuse mode too. No reuse setting anywhere is
+  `never`, and then the store is never read.
+- **Budget** is judged on the final pass (a reused case costs nothing) and must be a finite number >= 0.
+- **Capacity** is unchecked unless `--devices CLASS=N` or `--nodes` is given (`leg.devices`/`leg.nodes` are `null` in
+  plan.json then). A case that needs a reference node is skipped unless `--reference-node`.
+- **List flags.** `--suite`, `--force`, `--set`, `--central` and `--pack` fall back to their env twins when the flag is
+  absent; the flag wins. `--set` merges env and flags per key.
+- **Store.** `--store none` (default) or `clickhouse`: read-only through `clickhouse_connect`
+  (`pip install 'spyre-bench[clickhouse]'`), connection from `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`,
+  `CLICKHOUSE_PASS`, `CLICKHOUSE_SECURE`, and the database from `BENCH_CLICKHOUSE_DB`, else `CLICKHOUSE_DB_V2`, else
+  `CLICKHOUSE_DB`. The interface is `spyre_bench.store.Store`; `MemoryStore` is the in-memory one for tests. Invalidation
+  events are not read yet.
+- **Exit codes.** 0 planned, 2 invalid request or catalog, 4 every case skipped, 5 the store failed while a lookup was
+  needed.
+
+`plan.json` (`plan_schema: bench.plan/1`) holds `producer.engine` (`version`, `plan_schema`, `identity_version`), the
+normalised `request`, the `leg`, a `summary` and `cases[]`. Each case carries the engine's plan record plus `benchmark`,
+`id_mode`, `id_profile`, `labels`, `pinning`, `command`, `ingest` and `allow_empty`. `identity_version` is bumped with any change to how
+an id is derived; `run` refuses a plan made under another one.
+
+### Command templates
+
+A Benchmark states how to run its cases with `run.command`, an argv array (never a shell string), and optionally
+`run.ingest`. Neither is identity. Tokens are `{name}`; `{{` and `}}` are literal braces.
+
+| Phase | Tokens |
+|---|---|
+| `plan` (case values) | `{case}`, `{benchmark}`, `{component}`, `{environment}`, and every identity value by dotted name (`{case.op}`, `{case.shape}`, `{case.load.iterations}`, `{system.precision}`); a list joins with `,`. An unknown token is a plan error |
+| `run` | `{run_id}`, `{subject_id}`, `{arch}`, `{repeat}` (from 1), `{repeats}` (the case's total repeats, cold plus warm for `cache: both`), `{cache}`, `{profile_level}`, `{raw_dir}`, `{repeat_dir}`, `{out_dir}`, `{python}` |
+
+A command's environment is an allowlist, matched case-insensitively: `PATH HOME USER LOGNAME SHELL TMPDIR TMP TEMP TERM TZ VIRTUAL_ENV CI LD_LIBRARY_PATH LANG LANGUAGE PWD HOSTNAME NODE_NAME`; proxies (`HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY`, either case); certificates (`SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE`); build (`MAKEFLAGS MAKELEVEL MFLAGS CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LIBRARY_PATH CPATH`); caches (`HF_HOME HF_HUB_CACHE HF_HUB_OFFLINE TRANSFORMERS_OFFLINE TRANSFORMERS_CACHE`); and the prefixes `LC_ PYTHON SPYRE_ OMP_ MKL_ OPENBLAS_ NUMEXPR_ XDG_ CUDA_ TORCH_ VLLM_ KMP_ GOMP_ HF_DATASETS_ CMAKE_ CCACHE_`, plus any `--pass-env-prefix PREFIX` (repeatable; `BENCH_PASS_ENV_PREFIXES`, comma list; matched case-insensitively on both sides). Two filters apply to every name inherited this way, prefixes included. (1) A name with a WHOLE segment (split on `_ - .`) in `TOKEN PASS PASSWD PW SECRET KEY CRED CREDENTIAL AUTH COOKIE BEARER DSN PAT SESSION PRIVATE CERTKEY APIKEY SECRETKEY PRIVKEY PRIVATEKEY ACCESSKEY AUTHKEY PASSPHRASE` is withheld (`SPYRE_BYPASS`, `SPYRE_KEYBOARD`, `PWD` pass; `SPYRE_KEY` does not). (2) A value that embeds URL credentials (`scheme://user:pw@host`, empty user included) or is token-shaped is withheld: a JWT, a `Bearer`/`Basic` credential, a vendor prefix (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `hf_`, `xox?-`, `AKIA`, `glpat-`, `npm_`, `AIza`, `ya29.`, `pypi-`), base64 with `=` padding, or a 32+ character alphanumeric run (no `_`, `-`, `.` or `/`) that mixes letters and digits. UUIDs, dashed host names, paths and pure hex runs (a commit sha, a digest) are not token-shaped. Every withheld name is listed in `status.json` notes with its reason (`secret-looking name` or `credential-looking value`), never the value. The engine's own `BENCH_RUN_ID`, `BENCH_CASE`, `BENCH_REPEAT`, `BENCH_REPEATS`, `BENCH_CACHE`, `BENCH_PROFILE_LEVEL`, `BENCH_RAW_DIR`, `BENCH_REPEAT_DIR`, `BENCH_SUBJECT_ID` and `BENCH_QUIET` are added. Nothing else (inherited `BENCH_*`, `CLICKHOUSE_*`, tokens, ...) reaches a command unless named with `--pass-env NAME` (repeatable; `BENCH_PASS_ENV`, comma list), which passes the variable as it is, secret-looking name or value included (a name matching a passed prefix but secret-looking still needs `--pass-env`). `run.allow_empty: true` declares that a command that exits 0 with no raw output
+and no `metrics.json` is fine. `examples/run-demo` is a runnable catalog with a stub command.
+
+## Running a plan
+
+```bash
+spyre-bench run --plan plan.json --out results/bench --catalog benchmarks --central shared [--ingest] [--store clickhouse]
+```
+
+`run` executes every `run` case, one subprocess per repeat (twice the repeats for `cache: both`, cold then warm), each
+in its own session so a timeout, an interrupt or SIGTERM kills the whole process group (SIGKILL); stragglers of a
+finished command are killed with it (a pid-reuse window of microseconds remains, because the group leader is already
+reaped). `plan.json` is trusted input: its `command` and `ingest` argv run as written, after every record is
+shape-checked. `--out` is made absolute first (commands run in `--workdir`). Engine-owned files (`run.json`, `plan.redacted.json`, `case.json`, `status.json`, `result.json`) are written to a new temp name (`O_CREAT|O_EXCL|O_NOFOLLOW`) that then replaces the target, and every directory from `--out` down to the file is checked with `lstat` first, so a link a benchmark plants, before or while it runs, at the file or at a directory above it (`cases`, `cases/<slug>`, `raw`, `repeat-N`) is replaced and never written through; `case.json` and `plan.redacted.json` are rewritten after the benchmarks have run. Log files are opened `O_NOFOLLOW`. A benchmark can still delete or swap its own case directory (that case then fails `no_output`); it cannot make the engine write outside `--out`. `run` owns `cases/<slug>` under `--out`: it
+deletes `raw/`, `repeat-*` and `result.json` there, and the previous `run.json` and `ingest/`, before running; until a
+run finishes `run.json` says `exit_reason: incomplete`, so an aborted run never looks like the last one's success.
+Numbers and the env file are validated before anything is written. It needs no catalog to execute; with `--catalog` it
+also verifies that every selected planned case still derives the planned `benchmark_id` and builds an engine Result per
+case.
+
+Flags: `--plan` (`BENCH_PLAN`), `--catalog` (`BENCH_DIR`; none by default), `--central` (`BENCH_CENTRAL`), `--pack`
+(`BENCH_PACK`), `--case` (repeatable, `run` cases only), `--out` (`RESULTS_DIR`, `BENCH_OUT`; default `results/bench`),
+`--workdir` (`BENCH_WORKDIR`, cwd of every command), `--env-file` (`BENCH_ENV_FILE`), `--run-id` (`BENCH_RUN_ID`, then
+`RUN_ID` when it is a UUID), `--force-new-run`, `--ingest/--no-ingest` (`BENCH_INGEST=1`), `--ingest-cmd`
+(`BENCH_INGEST_CMD`), `--ingest-timeout`, `--ingest-pass-env` (`BENCH_INGEST_PASS_ENV`), `--ingest-python`
+(`BENCH_INGEST_PYTHON`), `--ingest-pythonpath` (`BENCH_INGEST_PYTHONPATH`), `--store` (`BENCH_STORE`), `--landed-wait`,
+`--timeout` (a cap in seconds), `--pass-env` (`BENCH_PASS_ENV`), `--pass-env-prefix` (`BENCH_PASS_ENV_PREFIXES`),
+`--max-log-bytes` (16 MiB per log; the rest is drained and dropped with a marker), `--max-metrics-bytes` (8 MiB; a
+larger `metrics.json` is ignored with a note), `--max-raw-bytes` (1 GiB; over it a `result_notes` warning), `--quiet`,
+`--dry-run`, `--json`.
+
+```text
+results/bench/
+  run.json                bench.run/1 manifest: counts, per-case status, ingest, rows_landed, exit_reason
+  plan.redacted.json      the plan with secrets redacted (not runnable)
+  cases/<slug>-<hash8>/
+    case.json  raw/       {raw_dir}: what the command writes for the ingest to read
+    repeat-001/           {repeat_dir}: status.json, stdout.log, stderr.log, optional metrics.json
+    result.json           engine Result
+  ingest/ingest-<n>.log
+```
+
+- **Sidecar.** A command may write `{repeat_dir}/metrics.json` = `{"samples": {"<metric>": [finite numbers]},
+  "props": {...}, "warmup_discarded": N}`; Result samples come only from it, the engine parses no producer format.
+- **Silent commands.** A case whose repeats all exit 0 but leave `raw/` empty is `failed`, reason `no_output`, with
+  `--ingest`; without it too, unless a repeat wrote a `metrics.json` or the Benchmark sets `run.allow_empty: true`.
+- **Probe file.** `--env-file` = `{"fingerprint": {"env.fp.x": "v"}, "observations": {}, "node": "n", "qualified": true,
+  "clean": {"exclusive": "observed"}}`; `qualified` must be a JSON boolean. Keys outside the registry are dropped and
+  noted in `result_notes`. Without a file, and for what the file leaves out, the facts are unknown and lower validity
+  (no qualification, no placement, unknown cleanliness), never raise it. A path that cannot be read, or is not a
+  well-typed JSON object, is exit 2.
+- **Pinning.** When the Environment requests `host.cpu_pinning`, the process tree is sampled while it runs and the worst
+  sample is recorded as `run.exec.*` on the repeat.
+- **Secrets.** Every `argv` the engine writes or prints (results directory, `plan --json`, `--dry-run`) is redacted by
+  whole name segment and value shape: values of `--token`, `--password`, `--pw`, `--auth`, `--bearer`, `--cookie`,
+  `--dsn`, `--key`/`--access-key`/`--api-key`, `-p x`/`-p=x`/`-px`, `--user a:b`/`-u a:b`; bare `NAME value` pairs and
+  `NAME=value` words with a secret name, also inside a word (`--env=HF_TOKEN=x`, `-DPASSWORD=x`, `sh -c "export
+  TOKEN=x"`, `Password=x;`); URL credentials (empty user too); Authorization/Cookie headers and Bearer/Basic values;
+  JSON secret pairs; and token-shaped words. `--passes`, `--author`, `MONKEY_PATCH=1`, `--jenkins-run-key`, UUIDs and
+  host names and pure hex runs (a commit sha) are left alone, as are `--max-tokens 128`, `--auth-mode x` and `--ssh-key-path p`.
+  Also hidden: quoted values, `password: x`, dict-style pairs, `-pass x`, `-u x`, and all of it inside `sh -c "..."`. A secret of no
+  recognisable shape in free text is not caught. The file `plan --out` writes
+  is not redacted (`run` executes it, and refuses a plan holding `<redacted>`): keep secrets out of `run.command`, use
+  `--pass-env`. Environment values are never written. A command's log that cannot be written (full disk) fails the
+  repeat (`log_write_failed`) without blocking it; output a detached process writes after the command exits is dropped.
+- **Ingest.** The engine writes no database rows. With `--ingest`, only for cases that are `ok`, it runs the ingest
+  (own session, killed with its children on timeout or interrupt) after the last benchmark has finished. Isolation:
+  stdin is `/dev/null`; the working directory is a fresh empty `<out>/ingest/cwd-XXXX` and `HOME` a fresh empty
+  `<out>/ingest/home-XXXX` (the engine recreates `<out>/ingest` with mode 0700 at that moment, removing whatever a
+  benchmark left there without following links; logs are opened `O_EXCL|O_NOFOLLOW`); the default argv uses `-I`, which
+  ignores `PYTHON*`, the user site and the cwd; the environment is the benchmark allowlist without `PYTHON*`, plus
+  `CLICKHOUSE_*`, `INGEST_*`, `PYTHONSAFEPATH=1` and `--ingest-pass-env NAME` (only that way do `HOME`, `PYTHON*` or a
+  credential-carrying proxy reach it). The package must be importable by the interpreter, which a default ingest probes before anything runs: `--ingest-python PATH`, or
+  for a dev checkout `--ingest-pythonpath DIR` (outside `--workdir` and `--out`, judged by realpath; the argv becomes
+  `-s -P` with `PYTHONPATH` set to exactly those directories); a probe that fails is exit 2. A custom `--ingest-cmd` is trusted code with the same environment and directory. A benchmark's own interpreter may load a
+  `usercustomize` module it planted in the user site (HOME is allowlisted for benchmarks): that is acceptable, a benchmark is
+  untrusted by design and holds no secrets; the ingest is the process that must not. A process a benchmark detached with
+  `setsid` can still write where it knows the path: the isolation is against the benchmark's files, not a hostile
+  same-user process. Logs: `ingest/ingest-<n>.log` (stdout) and `.stderr.log`, capped.
+  Resolution: `--ingest-cmd`, else the case's `run.ingest`, else the profile default (`python -I -m
+  spyre_clickhouse_ingest results ...`): `perf-kernel` uses `--xml-dir` and threads `--run-id <the engine's run id>`;
+  `vllm`/`vllm-sweep` use `--vllm-results-dir` and `generic`/engine mode `--benchmarks-dir --component <plan
+  component>`, both with `--trigger-type perf` and `--jenkins-run-key
+  manual:spyre-bench:<engine run id>-<16 hex of the case name>`. **Every case gets its own run key** (the ingest
+  refuses a second bundle under one key), so N ok bundle cases mean N invocations and N stored run ids. **The stored
+  run_id is not the engine's:** the bundle profiles derive it from the run key and ignore `--run-id`, so the engine
+  reads the ingest's report (the last stdout line that is a JSON object, with a string `run_id` and status
+  `ingested`, `duplicate` or `would-ingest`) and records `stored_run_ids` in `run.json`; any other report, or none
+  from a default bundle ingest, is a failure (exit 5; a failed ingest's `reason` is recorded), and
+  `cases_ingested`/`cases_failed` say which cases landed. Use `spyre-bench verdict --run-dir <out>`. A retry is not
+  idempotent (the ingest stamps `ended_at`, so identical raw output is a different bundle): use a new `--run-id` or
+  `--force-new-run`. A run that ingests refuses a `--run-id` an earlier run in the same `--out` may have ingested
+  under; a run that does not ingest repeats ids freely; two runs in different directories that share `RUN_ID` are not
+  detected. Tokens: `{python} {run_id} {run_key} {subject_id} {arch} {component} {raw_dir} {out_dir} {case}
+  {profile}`. Tests drive the real bundle-ingest code with 2 and 3 cases per profile and a mixed plan (warehouse
+  faked), build real offline bundles from the defaults and parse all four with the ingest's own argument parser when
+  it is importable. The engine's tests do not run the ingest against a live ClickHouse.
+- **Rows landed.** With `--ingest` and `--store clickhouse`, the engine polls `benchmark_runs` for each stored run id (up
+  to `--landed-wait` seconds): every `ok` ingest-mode case's `benchmark_id` must be present, and the run must hold at
+  least one other benchmark id per `ok` engine-mode case (their ids are the ingest's, which the engine cannot know), so
+  a partial ingest fails. Otherwise exit 1, reason `no_rows_landed`. Without a store, or without `--ingest`, the check
+  is `unchecked`, not passed (`run.json` says why; `--ingest` without a store also warns on stderr).
+
+| Exit | Meaning |
+|---|---|
+| 0 | every executed case ok, or the plan held only `reuse` cases |
+| 1 | a case failed, `no_rows_landed`, or a Result failed its shape or id check or could not be built (`result_invalid`) |
+| 2 | invalid plan, flags, env file or catalog, a missing input file; `engine_skew` (plan format or identity version differs) |
+| 4 | nothing ran and the plan was not all-reuse |
+| 5 | an ingest invocation failed, timed out or gave no report, the store failed, or the disk failed |
+| 130, 143 | Ctrl-C, SIGTERM (children killed first; no traceback) |
+
+Precedence: 2, 5, 1, 4, 0. Every command and ingest argv is rendered before the first case runs, so a bad token exits 2
+with nothing executed. `--dry-run` prints the rendered commands and creates and runs nothing (exit 1 if a case has no
+command, 4 if nothing would run).
+
+## Verdicts
+
+```bash
+spyre-bench verdict --run-dir results/bench --json [--fail-on regressed] [--require-rows] [--quiet]
+spyre-bench verdict --run-id <stored-uuid>   # or an engine run id of a run.json found in --run-dir / RESULTS_DIR
+spyre-bench verdict --artifact <uuid>        # the artifact's newest run that has verdict rows
+```
+
+Reads `v_benchmark_metric_verdicts` and prints, per benchmark and metric, `pass` (the view's `unchanged`), `regressed`,
+`improved`, `suspected` or `no_baseline`, with the tier, reason, baseline size and values. The engine never decides a
+verdict and the command never gates: exit 0 (also for a run with no verdict rows) unless `--fail-on` names statuses and
+one occurs (exit 1); exit 2 for bad flags or a store failure, never a silent pass. `--quiet` (`BENCH_QUIET=1`) drops
+the measured values. Output: `verdict_schema: bench.verdict/1` with `summary`, `benchmarks[]` (worst status per
+benchmark: regressed, suspected, improved, no_baseline, pass) and `verdicts[]`.
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
