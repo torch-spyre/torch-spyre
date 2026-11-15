@@ -409,3 +409,6 @@ tools/cost_model/sweep_records.json.part
 # OpSpec lab outputs
 captured/
 op_spec_out/
+
+# spyre-bench output of `make bench-*`
+/bench-results/
