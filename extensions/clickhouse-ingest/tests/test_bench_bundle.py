@@ -643,3 +643,145 @@ def test_a_placement_update_can_replace_devices_and_needs_an_existing_run(tmp_pa
 def test_a_bad_placement_update_is_refused_at_seal(tmp_path, update, problem):
     with pytest.raises(offline.BundleError, match=problem):
         admin_bundle(tmp_path, "bench-placement", {"updates": [update]})
+
+
+def test_per_repeat_props_cannot_skip_the_downgrade(tmp_path, db):
+    r = result()
+    r["status"]["repeats"][0]["props"] = {
+        "run.purpose": "official",
+        "run.validity": "valid",
+    }
+    ingest(
+        seal(tmp_path, run_dir(tmp_path, r), "b.tgz", "--seal-trust", "lab"),
+        trust="lab",
+    )
+    row = "SELECT props['run.purpose'], props['run.validity'], props['claim.run.purpose'] FROM benchmark_runs WHERE props['run.repeat'] = '1'"
+    assert db.rows(row) == [("on-demand", "unknown", "official")]
+
+
+def test_two_cases_that_share_one_id_are_refused_at_ingest(tmp_path, db):
+    a, b = result(), result()
+    b["status"]["case"]["disc"] = {"batch": "4", "x": "Foo"}
+    c = result()
+    c["status"]["case"]["disc"] = {"batch": "4", "x": "foo"}
+    c["status"]["case"]["disc_keys"] = ["batch"]
+    b["status"]["case"]["disc_keys"] = ["batch"]
+    b["metadata"]["name"] += "-b"
+    out = seal(tmp_path, run_dir(tmp_path, b, c), "b.tgz")
+    with pytest.raises(offline.BundleError, match="two cases share one id"):
+        ingest(out)
+
+
+def test_ci_describes_an_environment_a_lower_channel_registered_first(tmp_path, db):
+    ingest(
+        seal(tmp_path, run_dir(tmp_path, result()), "b.tgz", "--seal-trust", "none"),
+        trust="external",
+    )
+    assert db.rows("SELECT labels FROM v_environment_fingerprints") == [
+        ({"env.label.origin": "external"},)
+    ]
+    ci = result()
+    ci["metadata"]["name"] = f"{RUN[:-1]}0.decode"
+    rep = ingest(
+        seal(
+            tmp_path, run_dir(tmp_path, ci, name="ci"), "c.tgz", "--seal-trust", "none"
+        ),
+        trust="ci",
+    )
+    assert rep["new_environments"] == 1
+    assert db.rows("SELECT labels FROM v_environment_fingerprints") == [
+        ({"env.label.node.class": "std"},)
+    ]
+
+
+def test_a_lower_channel_cannot_lift_a_runs_trust_by_adding_to_it(tmp_path, db):
+    ev = ingest(
+        seal(tmp_path, run_dir(tmp_path, result()), "b.tgz", "--seal-trust", "none"),
+        trust="ci",
+    )
+    more = result(samples=((10.0, 11.0), (12.0,), (10.5,), (10.7,)))
+    rep = ingest(
+        seal(
+            tmp_path, run_dir(tmp_path, more, name="m"), "m.tgz", "--seal-trust", "none"
+        ),
+        trust="external",
+    )
+    assert (rep["trust"], rep["new_repeats"]) == ("external", 1)
+    assert ev["run_id"] == rep["run_id"]
+
+
+def test_a_failed_repeat_does_not_make_every_resend_new(tmp_path, db):
+    r = result()
+    r["status"]["repeats"].append(
+        {
+            "run.repeat": 9,
+            "status": "failed",
+            "samples": {},
+            "placement": {"nodes": [NODE]},
+        }
+    )
+    out = seal(tmp_path, run_dir(tmp_path, r))
+    assert ingest(out)["status"] == "ingested"
+    assert ingest(out)["status"] == "duplicate"
+    assert ingest(out, dry_run=True)["status"] == "duplicate"
+
+
+def test_a_pass_needs_enough_repeats_in_the_same_environment(tmp_path, db):
+    ev = ingest(
+        seal(
+            tmp_path,
+            run_dir(tmp_path, result(samples=((10.0,), (10.1,)))),
+            "b.tgz",
+            "--seal-trust",
+            "none",
+        ),
+        trust="ci",
+    )
+    RUN_ID[0] = ev["run_id"]
+    with pytest.raises(offline.BundleError, match="at least 3 repeats"):
+        ingest(admin_bundle(tmp_path, "bench-qualification", qual()), trust="ci")
+    other = {
+        "records": [
+            {**qual()["records"][0], "env_id": "eeeeeeee-0000-5000-8000-000000000002"}
+        ]
+    }
+    with pytest.raises(offline.BundleError, match="another environment"):
+        ingest(
+            admin_bundle(tmp_path, "bench-qualification", other, "o.tgz"), trust="ci"
+        )
+
+
+def test_a_large_invalidation_previews_instead_of_raising(tmp_path, db):
+    for _ in range(51):
+        db.insert("run_placements", [(str(uuid.uuid4()), 0, None, ENV, str(uuid.uuid4()), ["big"], [], [], {}, {})],
+                  ["run_id", "repeat", "started_at", "env_id", "placement_id", "nodes", "devices", "links", "clean", "props"])  # fmt: skip
+    out = admin_bundle(tmp_path, "bench-invalidation", event(node="big"))
+    assert ingest(out, trust="lab", dry_run=True)["needs_confirm"] == [51]
+
+
+@pytest.mark.parametrize("edit,problem", [
+    (lambda r: r["status"]["repeats"][0].update(started_at="garbage"), "started_at"),
+    (lambda r: r["status"]["repeats"][0].update(iterations="x"), "iterations"),
+    (lambda r: r["status"]["repeats"][0]["placement"].update(links="ab"), "links"),
+    (lambda r: r["status"]["case"].update(disc_keys="batch"), "disc_keys"),
+])  # fmt: skip
+def test_malformed_result_fields_are_rejected_not_retried(tmp_path, edit, problem):
+    r = result()
+    edit(r)
+    with pytest.raises(offline.BundleError, match=problem) as err:
+        seal(tmp_path, run_dir(tmp_path, r))
+    assert err.value.code == offline.REJECTED
+
+
+@pytest.mark.parametrize("event_edit,problem", [
+    ({"scope_kind": "run", "scope": {"run_id": "x"}}, "run_id is a UUID"),
+    ({"scope_kind": "run", "scope": {"run_id": RUN, "repeat": 1}}, "neither benchmark_id nor repeat"),
+    ({"scope": {"node": "n", "repeat": 70000}}, "repeat is a count"),
+])  # fmt: skip
+def test_a_malformed_invalidation_is_rejected_at_seal(tmp_path, event_edit, problem):
+    with pytest.raises(offline.BundleError, match=problem):
+        admin_bundle(
+            tmp_path,
+            "bench-invalidation",
+            {"events": [{**event()["events"][0], **event_edit}]},
+        )
