@@ -48,6 +48,22 @@ Applying them in filename order works from an empty database.
 | `85-benchmark-verdict-views.sql` | `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `v_perf_regression_gate` (they skip invalidated runs and keep suspect or non-baseline-purpose runs out of baselines) | 20, 49, 60, 62, 83 |
 | `86-bench-references.sql` | `v_bench_references` | 20, 49, 50 |
 
+### Benchmark schema stack (81-89)
+
+Numbers 81-86 land together in the `feat/bench-schema` stack, in this order: environments,
+placements and invalidations (81-84), reader exclusion (edits to 50/52/55/60/62/70 plus migration
+025), verdict views (85), references view (86). Later benchmark work extends the stack
+without renumbering it:
+
+| reserved | for |
+|---|---|
+| `87` | trace views |
+| `88` | anchor (baseline) views |
+| `89` | invalidation preview |
+
+The new tables are append-only and the rest are views, so rolling back is dropping the new views
+and reverting the edited ones.
+
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
 | column | values |
