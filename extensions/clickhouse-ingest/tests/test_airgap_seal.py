@@ -17,6 +17,7 @@
 labels, one time-zone rule, the compatibility check and the printable receipt."""
 
 import json
+import tarfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -650,3 +651,35 @@ def test_channel_trust_is_also_refused_with_validate_only_and_check(tmp_path, ca
     ):
         assert cli(["results", "--channel-trust", "ci", *extra]) == offline.REJECTED
         assert "--channel-trust applies to --from-bundle" in capsys.readouterr().out
+
+
+def test_sealing_survives_a_uid_with_no_passwd_entry(tmp_path, monkeypatch):
+    def nobody():
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.setattr(offline.getpass, "getuser", nobody)
+    monkeypatch.setenv("USER", "container-user")
+    sealed = _seal(tmp_path, "u", JUNIT)
+    assert json.loads((sealed / "bundle.json").read_text())["runner"]["user"] == (
+        "container-user"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(tarfile, "FilterError"),
+    reason="tarfile filters need 3.12 or a backport",
+)
+def test_a_tar_filter_refusal_is_an_unsafe_member_not_a_bad_archive(
+    tmp_path, monkeypatch
+):
+    bundle_dir = _minimal(tmp_path)
+    tgz = offline.pack(bundle_dir, tmp_path / "x.tgz")
+
+    def refuse(self, *a, **k):
+        raise tarfile.OutsideDestinationError(tarfile.TarInfo("x"), "/elsewhere")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", refuse)
+    with pytest.raises(offline.BundleError) as err:
+        with offline.opened(tgz):
+            pass
+    assert "unsafe member" in str(err.value)

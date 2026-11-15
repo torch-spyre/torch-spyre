@@ -107,6 +107,18 @@ class BundleError(Exception):
         self.code = code
 
 
+def current_user() -> str:
+    """The login name; a container UID with no passwd entry falls back to $USER/$LOGNAME, then the uid."""
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return (
+            os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or str(getattr(os, "getuid", lambda: "unknown")())
+        )
+
+
 def kit_version() -> str:
     try:
         from importlib.metadata import version
@@ -671,6 +683,8 @@ def opened(path: Path):
                     tar.extractall(tmp, filter="data")
                 except TypeError:
                     tar.extractall(tmp)
+        except getattr(tarfile, "FilterError", ()) as err:
+            raise BundleError(f"{path.name}: unsafe member ({err})") from None
         except tarfile.TarError as err:
             raise BundleError(f"{path.name}: not a tar archive ({err})") from None
         top = Path(tmp)
@@ -878,7 +892,7 @@ def write(args, validate_times: bool = True) -> Path:
     if not getattr(args, "redact_host", False):
         runner["host"] = socket.gethostname()
     if not getattr(args, "redact_user", False):
-        runner["user"] = getpass.getuser()
+        runner["user"] = current_user()
     if runner:
         meta["runner"] = runner
     out = (

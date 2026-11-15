@@ -305,7 +305,7 @@ On a host without network access, use either:
   `--redact-host` and `--redact-user` leave them out. `--redact-host` also blanks the
   `hostname` attribute (either quote style) of JUnit `<testsuite>` elements in `results/*.xml`,
   byte for byte otherwise, and reports how many it blanked and which files still contain the
-  host name (for example in `system-out`). Redaction does not cover JUnit `<properties>`, `system-out`,
+  host name (for example in `system-out`). `--redact-host` scans only `results/`, not `attachments/`. Redaction does not cover JUnit `<properties>`, `system-out`,
   `run_url` or attachments, and the host-name check does not read non-ASCII-compatible XML
   (such as UTF-16) or reliably tell a short host name from other text; the digest also depends on `producer.version` and, in a `.tgz`,
   on the zlib build. An `--append-to-run` round carries the run's earlier trust forward when it has none of its
@@ -331,7 +331,7 @@ On a host without network access, use either:
     append-only, so no merge can drop an older verdict's trust.
 - **Time zones.** A JUnit timestamp without a zone is read as UTC (a warning says so whenever
   a time is taken from such a file), whatever the sealing host's zone; the dashboard reads it
-  the same way. This is a change: sealing used to read it in the sealing host's local zone.
+  the same way, so the sealing host's zone does not matter.
   For `--offline`, `--triggered-at`/`--ended-at` must carry a zone, and an end before the
   start is clamped to the start with a warning.
 - **Compatibility.** `results --check` prints the schema versions, kinds and trust labels this
