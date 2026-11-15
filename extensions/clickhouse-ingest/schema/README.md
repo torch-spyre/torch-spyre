@@ -46,6 +46,7 @@ Applying them in filename order works from an empty database.
 | `83-result-invalidations.sql` | `result_invalidations`, `v_invalidation_state`, `v_invalidated_runs` | 49, 82 |
 | `84-bench-views.sql` | `v_bench_attrs`, `v_bench_results` | 20, 30, 49, 60, 81, 82, 83 |
 | `85-benchmark-verdict-views.sql` | `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `v_perf_regression_gate` (they skip invalidated runs and keep suspect or non-baseline-purpose runs out of baselines) | 20, 49, 60, 62, 83 |
+| `86-bench-references.sql` | `v_bench_references` | 20, 49, 50 |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
