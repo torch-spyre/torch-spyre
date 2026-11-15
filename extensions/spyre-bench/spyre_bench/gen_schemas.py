@@ -241,6 +241,32 @@ DEFS = {
         },
         desc="run attributes: never identity; overridable at run time",
     ),
+    "identity": obj(
+        {
+            "mode": {"enum": ["engine", "ingest"]},
+            "profile": {
+                "enum": ["perf-kernel", "vllm", "vllm-sweep", "generic"],
+                "description": "which ingest producer's key list is hashed; default perf-kernel",
+            },
+            "component": s(description="the ingest's component; lower-case, validated by the engine"),
+            "name": s(description="the ingest's benchmark name; lower-case, underscores allowed"),
+            "tags": arr(s(minLength=1, maxLength=63), description="identity tags only; groupings are run props"),
+            "discriminators": arr(
+                obj(
+                    {
+                        "key": s(),
+                        "value": SCALAR,
+                        "from": s(description="a case.*, system.* or input.* identity value"),
+                        "join": s(description="joins a list value into the discriminator string"),
+                    },
+                    required=("key",),
+                ),
+                description="the ingest's discriminator keys in order; each takes a literal value or a from reference",
+            ),
+        },
+        required=("mode",),
+        desc="how the stored benchmark_id is derived: engine (default when absent) or ingest (BenchmarkId.derive)",
+    ),
     "profile": obj(
         {
             "supported": arr({"enum": ["off", "light", "full"]}, minItems=1),
@@ -496,6 +522,11 @@ SPECS = {
             "variants": arr(ref("variant"), minItems=1),
             "matrix": ref("matrix"),
             "derive": ref("derive"),
+            "identity": ref("identity"),
+            "est_hours": num(
+                minimum=0,
+                description="cost hint for an external planner: wall-clock hours of all cases; never identity",
+            ),
         },
         required=("type", "level", "system", "workload"),
         desc="a TEMPLATE: exactly one of variants, matrix, derive expands it into cases; a case id is its benchmark_id",
@@ -1048,6 +1079,11 @@ RESULT_SHAPE = obj(
                         "tags": arr(s()),
                         "disc": {"type": "object", "additionalProperties": s()},
                         "props": {"type": "object", "additionalProperties": s()},
+                        "id_mode": {"enum": ["ingest"]},
+                        "disc_keys": arr(s()),
+                        "engine_id": s(description="engine-native hash kept beside an ingest id; never a join key"),
+                        "benchmark": s(description="the Benchmark name; analyses select on it, not on the ingest name"),
+                        "case": s(description="the case name"),
                     },
                     required=("benchmark_id",),
                 ),

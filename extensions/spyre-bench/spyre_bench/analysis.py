@@ -345,6 +345,11 @@ def _unit(results, metric):
     )
 
 
+def select_results(results, benchmarks):
+    """Results of the named Benchmarks; an ingest-mode Result keeps the Benchmark name apart from the ingest name."""
+    return [r for r in results if r["status"]["case"].get("benchmark", r["status"]["case"]["name"]) in benchmarks]
+
+
 def analyze(spec, results, metrics=None):
     """Report for an Analysis spec over Result documents; raises AnalysisError when the inputs cannot be combined.
 
@@ -352,7 +357,7 @@ def analyze(spec, results, metrics=None):
     """
     metrics = metrics or {}
     sel = set(spec["select"]["benchmarks"])
-    results = [r for r in results if r["status"]["case"]["name"] in sel]
+    results = select_results(results, sel)
     if not results:
         raise AnalysisError(f"no Result of {sorted(sel)}")
     derive, cmp_ = spec.get("derive"), spec.get("compare")

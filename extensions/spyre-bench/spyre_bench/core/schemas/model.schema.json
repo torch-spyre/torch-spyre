@@ -780,6 +780,85 @@
    },
    "description": "run attributes: never identity; overridable at run time"
   },
+  "identity": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "mode": {
+     "enum": [
+      "engine",
+      "ingest"
+     ]
+    },
+    "profile": {
+     "enum": [
+      "perf-kernel",
+      "vllm",
+      "vllm-sweep",
+      "generic"
+     ],
+     "description": "which ingest producer's key list is hashed; default perf-kernel"
+    },
+    "component": {
+     "type": "string",
+     "description": "the ingest's component; lower-case, validated by the engine"
+    },
+    "name": {
+     "type": "string",
+     "description": "the ingest's benchmark name; lower-case, underscores allowed"
+    },
+    "tags": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63
+     },
+     "description": "identity tags only; groupings are run props"
+    },
+    "discriminators": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "value": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "from": {
+        "type": "string",
+        "description": "a case.*, system.* or input.* identity value"
+       },
+       "join": {
+        "type": "string",
+        "description": "joins a list value into the discriminator string"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     },
+     "description": "the ingest's discriminator keys in order; each takes a literal value or a from reference"
+    }
+   },
+   "required": [
+    "mode"
+   ],
+   "description": "how the stored benchmark_id is derived: engine (default when absent) or ingest (BenchmarkId.derive)"
+  },
   "profile": {
    "type": "object",
    "additionalProperties": false,
