@@ -363,10 +363,13 @@ class _TableLowering:
             if len(values) > self._cap:
                 return
             lo = int(values[0])
-            if len(values) == int(values[-1]) - lo + 1:
-                build = (lambda v=var: v) if lo == 0 else (lambda v=var, lo=lo: v - lo)
-            else:
-                build = lambda v=var, vals=values: self._position_of(v, vals)  # noqa: E731
+            contiguous = len(values) == int(values[-1]) - lo + 1
+
+            def build(v=var, lo=lo, vals=values, contiguous=contiguous):
+                if contiguous:
+                    return v - lo if lo else v
+                return self._position_of(v, vals)
+
             self._inputs[key] = _Index(build, 0, len(values))
         self._symbol_input[name] = key
         self._symbol_values[name] = values
@@ -517,8 +520,8 @@ class _TableLowering:
         if isinstance(node, (sympy.Min, sympy.Max)):
             return self._extremum(node)
         if node.is_Mul:
-            factors = [self.indexed(a) for a in node.args]
-            return None if None in factors else self._product(factors)
+            factors = self._indexed_all(node.args)
+            return None if factors is None else self._product(factors)
         if node.is_Add:
             return self._same_index_sum(node)
         variable = [a for a in node.args if a.free_symbols]
@@ -527,9 +530,19 @@ class _TableLowering:
                 return self._function_of(node, variable[0])
         return None
 
+    def _indexed_all(self, nodes) -> Optional[list]:
+        """Every one of ``nodes`` indexed, or None when one is too wide."""
+        out = []
+        for node in nodes:
+            ix = self.indexed(node)
+            if ix is None:
+                return None
+            out.append(ix)
+        return out
+
     def _same_index_sum(self, node) -> Optional[_Indexed]:
-        terms = [self.indexed(a) for a in node.args]
-        if None in terms:
+        terms = self._indexed_all(node.args)
+        if terms is None:
             return None
         indexes = {t.index for t in terms if t.index is not None}
         if len(indexes) != 1:
@@ -570,17 +583,20 @@ class _TableLowering:
     def _extremum(self, node) -> Optional[_Indexed]:
         """Rule 1: a Min/Max of indexed operands is the rung of their clamped
         values on its ladder."""
-        operands = [self.indexed(a) for a in node.args]
-        if None in operands:
+        operands = self._indexed_all(node.args)
+        if operands is None:
             return None
         is_min = isinstance(node, sympy.Min)
         ladder, bound = clamped_ladder([o.values for o in operands], is_min)
         if len(ladder) > self._cap:
             self.failure = f"a Min/Max ladder of {len(ladder)} values"
             return None
-        rungs = [rungs_on(ladder, bound, o.values, is_min) for o in operands]
-        if None in rungs:
-            return None
+        rungs = []
+        for o in operands:
+            rung = rungs_on(ladder, bound, o.values, is_min)
+            if rung is None:
+                return None
+            rungs.append(rung)
 
         def build():
             exprs = [
@@ -604,17 +620,18 @@ class _TableLowering:
     def _fold_factor(self, node, is_min, ladder, bound) -> Optional[FoldFactor]:
         operands = []
         for arg in node.args:
-            if not arg.free_symbols:
-                rungs = rungs_on(ladder, bound, [float(arg)], is_min)
-                keys = ()
-            else:
-                keys = self._keys_of(arg)
-                if keys is None or self._joint_size(keys) > self._cap:
+            keys: tuple = ()
+            if arg.free_symbols:
+                found = self._keys_of(arg)
+                if found is None or self._joint_size(found) > self._cap:
                     return None
+                keys = found
                 values = self._evaluate(arg, keys)
-                rungs = (
-                    None if values is None else rungs_on(ladder, bound, values, is_min)
-                )
+                if values is None:
+                    return None
+                rungs = rungs_on(ladder, bound, values, is_min)
+            else:
+                rungs = rungs_on(ladder, bound, [float(arg)], is_min)
             if rungs is None:
                 return None
             operands.append((keys, tuple(rungs)))
@@ -655,11 +672,12 @@ class _TableLowering:
         size = len(ra.values) * len(rb.values)
         if size > self._cap:
             return None
-        cache_key = (ra.index, rb.index)
+        index_a, index_b = ra.index, rb.index
+        cache_key = (index_a, index_b)
         if cache_key not in self._pairs:
             n = len(rb.values)
             self._pairs[cache_key] = _Index(
-                lambda: self._aux(ra.index.expr() * n + rb.index.expr(), size, "pair"),
+                lambda: self._aux(index_a.expr() * n + index_b.expr(), size, "pair"),
                 ra.entries + rb.entries,
                 size,
             )
@@ -943,12 +961,15 @@ class _TableLowering:
                 return None
             lo, hi = lo + min(table), hi + max(table)
         for is_min, operands in lin.extrema:
-            bounds = [self._bounds(o) for o in operands]
-            if None in bounds:
-                return None
+            operand_bounds = []
+            for operand in operands:
+                found = self._bounds(operand)
+                if found is None:
+                    return None
+                operand_bounds.append(found)
             pick = min if is_min else max
-            lo += pick(b[0] for b in bounds)
-            hi += pick(b[1] for b in bounds)
+            lo += pick(b[0] for b in operand_bounds)
+            hi += pick(b[1] for b in operand_bounds)
         for factor, inner in lin.switched.values():
             bounds = self._bounds(inner)
             if bounds is None:
@@ -977,7 +998,7 @@ class _TableLowering:
             # Each operand behind a variable of its own: a long sum of literals
             # inside lin_max makes CP-SAT's presolve run out of memory.
             exprs = [self._operand(o) for o in operands]
-            lo, hi = self._bounds(_Linear(extrema=[(is_min, operands)]))
+            lo, hi = self._checked_bounds(_Linear(extrema=[(is_min, operands)]))
             self._count += 1
             target = self._model.new_int_var(lo, hi, f"extremum_{self._count}")
             if is_min:
@@ -1008,7 +1029,7 @@ class _TableLowering:
         v, P = floor(p * w / q) for w = inner and p / q = v to 1/q."""
         # Two values (a literal's) take the sum itself; more share one variable.
         w = self._build(inner) if len(factor.values) <= 2 else self._operand(inner)
-        bounds = self._bounds(inner)
+        bounds = self._checked_bounds(inner)
         q = self._switch_scale(factor, bounds)
         ps = [round(v * q) for v in factor.values]
         ends = [(p * b) // q for p in ps for b in bounds]
@@ -1016,6 +1037,7 @@ class _TableLowering:
         product = self._model.new_int_var(
             min(ends), max(ends), f"switched_{self._count}"
         )
+        assert factor.index is not None  # a switched factor has more than one value
         for p, literal in zip(ps, self._value_literals_of(factor.index)):
             if q == 1:
                 self._model.add(product == p * w).only_enforce_if(literal)
@@ -1043,11 +1065,17 @@ class _TableLowering:
             self._value_literals[index] = literals
         return self._value_literals[index]
 
+    def _checked_bounds(self, lin: _Linear) -> tuple[int, int]:
+        """Bounds of a _Linear that ``lower`` already checked before building."""
+        bounds = self._bounds(lin)
+        assert bounds is not None
+        return bounds
+
     def _operand(self, lin: _Linear):
         expr = self._build(lin)
         if isinstance(expr, (int, cp_model.IntVar)):
             return expr
-        lo, hi = self._bounds(lin)
+        lo, hi = self._checked_bounds(lin)
         self._count += 1
         var = self._model.new_int_var(lo, hi, f"operand_{self._count}")
         self._model.add(var == expr)
