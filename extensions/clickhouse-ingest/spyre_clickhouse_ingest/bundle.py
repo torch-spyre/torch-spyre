@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import sendnn, vllm
+from . import bench_invalidation, sendnn, vllm
 from .identity import DerivedId, RunId
 from .offline import (
     FAILED,
@@ -280,6 +280,8 @@ def receipt_text(report: dict) -> str:
 
 
 def _ingest(root: Path, args) -> dict:
+    if bench_invalidation.is_bundle(root):
+        return bench_invalidation.ingest(root, args)
     meta = check(root)
     key = run_key(meta)
     if not is_manual(key) and args.trusted_job_prefix:
