@@ -14,6 +14,7 @@ This guide shows how to request it, how the engine applies and checks it, how to
 | `device_local` | runs the command's process tree on the CPUs of the NUMA node(s) the devices hang off |
 | `per_device` | each device gets its own CPUs: `assign` (generated from the host topology), `cpus_by_device` (lists you give), or neither (the stack under test pins itself and the engine only checks) |
 | `explicit` | runs the tree on the CPU list in `cpus` |
+| `platform` | the serving stack pins its own workers in-process; the engine launches nothing, records the policy and the observed `cpu_set`, and never judges it (`pinning_verified: unknown`, `cpu_set_source: platform`); `require_verified` is not valid with it |
 
 Three ways to say it; the first one wins over the next for one plan:
 
@@ -71,16 +72,26 @@ effect". Limits: only affinity masks are compared (a narrower container cpuset o
 orphan outside the command's process group, session and cgroup is not seen. A command shorter than about a second may
 finish before it is sampled; keep benchmark commands alive for at least a few samples (warmup does this naturally).
 
-### Stacks that pin themselves
+### Stacks that pin themselves: `platform`
 
-A serving stack may pin its own workers (each worker to the CPUs of its device's NUMA node, at start-up, unless the
-process is already confined to fewer CPUs). Request `per_device` with no `assign` and no `cpus_by_device`: the engine
-launches nothing and verifies that every thread sits inside one device's node (`cpu_set_source: device_numa`). Request
-`explicit`, `device_local` or generated `per_device` to override the stack: a process already confined by the engine's
-launcher is left alone by such a stack. A baseline with the stack's own pinning switched off needs an opt-out in the stack. Until it has one, a `none` request
-means only "the engine applied nothing": the observer records `run.exec.cpu_set` (what the tree was actually allowed on),
-so the unpinned-versus-pinned table is still honest about what each run really did, but record the stack version with
-the run and do not read a `none` run of a self-pinning stack as an unpinned baseline.
+A serving stack may pin its own workers (each to the CPUs of its device's NUMA node, at start-up, unless the process
+is already confined to fewer CPUs) and offer no switch to turn that off. After that change `none` no longer means
+"unpinned": the same benchmark on the same node would measure the pinned behaviour under an unpinned label, and a
+series would step by the effect size on the day the stack changes. Request `platform` for a stack version that pins
+itself. The derived series label `env.label.cpu_pinning` then reads `platform`, which is a different series from
+`none`: history before the change stays `none`, runs after it are `platform`, and neither is judged against the other
+(reuse and baselines refuse a stored row with another pinning label). The engine cannot see inside the stack's
+process start-up, so `platform` is recorded, never verified; the observed `cpu_set` shows what the tree was allowed on.
+
+Rules of thumb: pick the policy per stack version (the Environment or the request names it; do not infer it); keep the
+`none` history running only for stack versions that do not pin; to measure the stack's pinning against the engine's,
+request `explicit`/`device_local`/generated `per_device` (a stack that leaves an already-confined process alone keeps the
+engine's choice). `per_device` with no `assign` and no `cpus_by_device` is a different thing: the engine verifies that
+each thread sits inside one device's node, which is only meaningful when the stack is known to do exactly that.
+
+A benchmark command that runs `taskset` or `numactl` itself is not the engine's launcher: its processes are judged by
+their masks like any other, so it is `true` when it narrows inside the requested set, `false` when it leaves it. To
+state that the command pins itself, request `platform`.
 
 ### Measuring the effect
 

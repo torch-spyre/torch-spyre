@@ -615,7 +615,9 @@ def build_case_result(cat, rec, outcome, ctx):
         envf.get("observations") or {},
         rec.get("labels") or {},
         reps,
-        request={"name": env_name, "spec_digest": cat.digest("Environment", env_name)} if env_name else None,
+        request={"name": env_name, "spec_digest": engine.request_digest(cat, env_name, rec.get("pinning"))}
+        if env_name
+        else None,
         validity=validity,
         pinning=rec.get("pinning"),
     )

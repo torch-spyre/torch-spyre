@@ -2544,13 +2544,13 @@ def pin_problems(pin, accelerators):
     out, policy = [], pin["policy"]
     if (policy == "explicit") != ("cpus" in pin):
         out.append("host.cpu_pinning: cpus is required for, and only valid with, policy explicit")
-    if pin.get("require_verified") and policy == "none":
-        out.append("host.cpu_pinning: require_verified needs a policy other than none")
+    if pin.get("require_verified") and policy in ("none", "platform"):
+        out.append(f"host.cpu_pinning: require_verified needs a policy the engine can verify, not {policy}")
     for key in ("cpus_by_device", "assign", "layout"):
         if key in pin and policy != "per_device":
             out.append(f"host.cpu_pinning: {key} is only valid with policy per_device")
-    if "launcher" in pin and policy == "none":
-        out.append("host.cpu_pinning: launcher needs a policy other than none")
+    if "launcher" in pin and policy in ("none", "platform"):
+        out.append(f"host.cpu_pinning: launcher is not valid with policy {policy}")
     if "cpus_by_device" in pin and "assign" in pin:
         out.append("host.cpu_pinning: give cpus_by_device or assign, not both")
     if pin.get("layout") == "ranks" and not ("cpus_by_device" in pin or "assign" in pin):
@@ -2580,6 +2580,12 @@ def overlay_pinning(env, pin):
     if not pin:
         return env
     return {**env, "host": {**(env.get("host") or {}), "cpu_pinning": pin}}
+
+
+def request_digest(cat, name, pin):
+    """spec_digest of an Environment as requested: the authored one with a request-level pinning block laid over it."""
+    env = cat.effective("Environment", name)
+    return hid("spec", normal_env(overlay_pinning(env, pin))) if env is not None else None
 
 
 def normal_env(env):

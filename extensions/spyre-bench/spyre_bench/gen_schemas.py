@@ -699,7 +699,7 @@ SPECS = {
                     "resources": obj({"cpu": integer(minimum=1), "memory": s(pattern=r"^[0-9]+(Mi|Gi|Ti)$")}),
                     "cpu_pinning": obj(
                         {
-                            "policy": {"enum": ["none", "device_local", "per_device", "explicit"]},
+                            "policy": {"enum": ["none", "device_local", "per_device", "explicit", "platform"]},
                             "cpus": s(
                                 pattern=CPU_LIST, description="CPU list such as 0-7,16; only for policy explicit"
                             ),
