@@ -29,13 +29,12 @@ linear. Four rules keep every list short:
    tuples that can occur together (``fold_reachable``);
 3. a node whose inputs fit the cap takes the cheaper of one table over those
    inputs and the form built from its parts;
-4. a factor times a node too wide to pair with it is switched on the
-   factor's value: the node is one integer w, and while the factor is at its
-   value v the product is floor(p * w / q), p / q being v to 1/q, held by two
-   enforced inequalities per value, so no table crosses factor and node;
-5. a 0/1 literal times the rest of a product gates it: the rest is lowered
-   with the literal fixed on, and a variable equals it while the literal is
-   on and 0 otherwise, so no table has to read the literal.
+4. a product whose factor cannot share a table with the rest is switched on
+   the factor's value: the rest is one integer w, and one literal per value v
+   holds the product at floor(p * w / q), p / q being v to 1/q (exactly v * w
+   when every value is whole), so no table crosses factor and rest. A 0/1
+   literal times anything is the two-value case, the rest lowered with the
+   literal fixed where it is on: the product is 0 or the rest.
 
 The whole objective is planned before anything is added to the model, so
 ``lower_cost_with_tables`` returns None with the model untouched when a node
@@ -263,10 +262,9 @@ class _Linear:
     constant: float = 0.0
     tables: dict = field(default_factory=dict)
     extrema: list = field(default_factory=list)
-    # (literal name, value it is on at) -> the _Linear it gates
-    gated: dict = field(default_factory=dict)
-    # (ranked factor, _Linear) products switched on the factor's value
-    switched: list = field(default_factory=list)
+    # (factor index, factor values) -> [factor, _Linear]: products switched on
+    # the factor's value, those over one factor summed into one
+    switched: dict = field(default_factory=dict)
 
     def add(self, term: _Indexed, coeff: float) -> None:
         if term.index is None:
@@ -282,11 +280,13 @@ class _Linear:
             acc = self.tables.get(index)
             self.tables[index] = values if acc is None else acc + values
         self.extrema.extend(other.extrema)
-        for gate, inner in other.gated.items():
-            if gate not in self.gated:
-                self.gated[gate] = _Linear()
-            self.gated[gate].extend(inner)
-        self.switched.extend(other.switched)
+        for key, (factor, inner) in other.switched.items():
+            self.switch(key, factor, inner)
+
+    def switch(self, key, factor: "_Indexed", inner: "_Linear") -> None:
+        if key not in self.switched:
+            self.switched[key] = [factor, _Linear()]
+        self.switched[key][1].extend(inner)
 
 
 def _relayout_charge(lit, division, *prices):
@@ -720,7 +720,7 @@ class _TableLowering:
         entries = sum(len(s.next_state) for s in steps)
         return _Indexed(values, _Index(build, entries, len(states)))
 
-    # ---- the objective (rules 4, 5) ---------------------------------------------
+    # ---- the objective (rule 4) -------------------------------------------------
 
     def emit(self, node, factor: Optional[_Indexed] = None, coeff: float = 1.0):
         """``coeff * factor * node`` as a _Linear, or None. A sum is never one
@@ -759,8 +759,9 @@ class _TableLowering:
         inner = self.emit(node, None, coeff)
         if inner is None:
             return None
+        rank = self._rank(factor)
         out = _Linear()
-        out.switched.append((self._rank(factor), inner))
+        out.switch((rank.index, tuple(rank.values)), rank, inner)
         return out
 
     def _split_gate(self, node):
@@ -810,8 +811,10 @@ class _TableLowering:
         inner = self.emit(rest, factor, coeff)
         if inner is None:
             return None
+        indicator = np.array([0.0, 1.0] if on else [1.0, 0.0])
+        index = self._inputs[self._symbol_input[sym.name]]
         out = _Linear()
-        out.gated[(sym.name, on)] = inner
+        out.switch((index, tuple(indicator)), _Indexed(indicator, index), inner)
         return out
 
     def _linear_entries(self, node) -> float:
@@ -946,18 +949,12 @@ class _TableLowering:
             pick = min if is_min else max
             lo += pick(b[0] for b in bounds)
             hi += pick(b[1] for b in bounds)
-        for inner in lin.gated.values():
-            bounds = self._bounds(inner)
-            if bounds is None:
-                return None
-            lo += min(0, bounds[0])
-            hi += max(0, bounds[1])
-        for factor, inner in lin.switched:
+        for factor, inner in lin.switched.values():
             bounds = self._bounds(inner)
             if bounds is None:
                 return None
             q = self._switch_scale(factor, bounds)
-            if q < _MIN_SWITCH_SCALE:
+            if q < _MIN_SWITCH_SCALE and q != 1:
                 self.failure = "a switched product too wide for its factor's precision"
                 return None
             ends = [(round(v * q) * w) // q for v in factor.values for w in bounds]
@@ -988,28 +985,29 @@ class _TableLowering:
             else:
                 self._model.add_max_equality(target, exprs)
             total += target
-        for (name, on), inner in lin.gated.items():
-            total += self._gated(self._literals[name], on, inner)
-        for factor, inner in lin.switched:
+        for factor, inner in lin.switched.values():
             total += self._switched(factor, inner)
         return total
 
     @staticmethod
     def _switch_scale(factor: _Indexed, bounds) -> int:
-        """The finest power of two q with every p * w (p = factor value * q)
-        inside int64 with room to spare."""
+        """1 when every factor value is whole; else the finest power of two q
+        with every p * w (p = factor value * q) inside int64 with room to spare."""
+        if np.all(factor.values == np.round(factor.values)):
+            return 1
         widest = max(abs(bounds[0]), abs(bounds[1]), 1) * max(
             float(np.max(np.abs(factor.values))), 1.0
         )
         q = _MAX_SWITCH_SCALE
-        while q > 1 and widest * q >= _MAX_SWITCH_PRODUCT:
+        while q > 2 and widest * q >= _MAX_SWITCH_PRODUCT:
             q //= 2
         return q
 
     def _switched(self, factor: _Indexed, inner: _Linear):
         """``factor * inner`` as a variable P: while the factor is at its value
         v, P = floor(p * w / q) for w = inner and p / q = v to 1/q."""
-        w = self._operand(inner)
+        # Two values (a literal's) take the sum itself; more share one variable.
+        w = self._build(inner) if len(factor.values) <= 2 else self._operand(inner)
         bounds = self._bounds(inner)
         q = self._switch_scale(factor, bounds)
         ps = [round(v * q) for v in factor.values]
@@ -1019,14 +1017,21 @@ class _TableLowering:
             min(ends), max(ends), f"switched_{self._count}"
         )
         for p, literal in zip(ps, self._value_literals_of(factor.index)):
-            self._model.add(q * product <= p * w).only_enforce_if(literal)
-            self._model.add(q * product >= p * w - (q - 1)).only_enforce_if(literal)
+            if q == 1:
+                self._model.add(product == p * w).only_enforce_if(literal)
+            else:
+                self._model.add(q * product <= p * w).only_enforce_if(literal)
+                self._model.add(q * product >= p * w - (q - 1)).only_enforce_if(literal)
         return product
 
     def _value_literals_of(self, index: _Index) -> list:
-        """One literal per value of ``index``, exactly one of them true."""
+        """One literal per value of ``index``, exactly one of them true; a 0/1
+        variable is its own pair."""
         if index not in self._value_literals:
             position = index.expr()
+            if isinstance(position, cp_model.IntVar) and position.is_boolean:
+                self._value_literals[index] = [~position, position]
+                return self._value_literals[index]
             literals = [
                 self._model.new_bool_var(f"value_{self._count}_{i}")
                 for i in range(index.size)
@@ -1037,17 +1042,6 @@ class _TableLowering:
             self._model.add_exactly_one(literals)
             self._value_literals[index] = literals
         return self._value_literals[index]
-
-    def _gated(self, literal, on, inner: _Linear):
-        """A variable equal to ``inner`` while ``literal`` is ``on``, else 0."""
-        expr = self._build(inner)
-        lo, hi = self._bounds(inner)
-        self._count += 1
-        var = self._model.new_int_var(min(0, lo), max(0, hi), f"gated_{self._count}")
-        active = literal if on else ~literal
-        self._model.add(var == expr).only_enforce_if(active)
-        self._model.add(var == 0).only_enforce_if(~active)
-        return var
 
     def _operand(self, lin: _Linear):
         expr = self._build(lin)
