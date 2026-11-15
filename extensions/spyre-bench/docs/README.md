@@ -563,7 +563,8 @@ label is a series label; a row without the label counts as `none`.
 
 **Observation.** `spyre_bench.placement.verify_pinning(request, pid, device_numa)` reads `/proc` and `/sys` (Linux
 only), compares every thread of the process tree with the requested set and returns the `run.exec.*` properties;
-`placement.validity_facts` feeds `engine.validity_of`. The tree is the root's descendants plus every process in its
+`placement.validity_facts` feeds `engine.validity_of`. `run` calls it for every repeat of a case that asks for pinning
+(or verification) and launches the tree under the requested policy first (`pinning_run`, `pinning_plan`). The tree is the root's descendants plus every process in its
 process group, session or (non-root) cgroup, so a re-parented worker is still judged; start your benchmark in its own
 session or cgroup so unrelated processes do not count. In the root cgroup (a private cgroup namespace) a cgroup
 cannot tie a worker to the root, so any process outside the tree that was re-parented to pid 1 makes the result
@@ -593,9 +594,11 @@ spyre-bench validate examples/pinning-demo
 spyre-bench analyze pinning-effect --catalog examples/pinning-demo --results results.json [--json]
 ```
 
-`examples/pinning-demo` is the end-to-end pattern: one latency Benchmark at two output lengths, node-a and node-b
-Environments with and without `device_local` pinning, and the `pinning-effect` Analysis. The Results come from the
-launcher; the tests build synthetic ones.
+`examples/pinning-demo` is the end-to-end pattern: a latency Benchmark at two output lengths (single process and
+two ranks), node-a and node-b Environments with and without `device_local` pinning, a stub command and the
+`pinning-effect` Analysis; `run` applies the request and records the placement. See [pinning.md](pinning.md) for the
+user guide (policies, per-device lists, `{pin_wrapper}`, reading the effect table, `unknown`/`suspect`), the measurement
+matrix script `scripts/bench-pinning-matrix` and the developer notes.
 
 `relax:` on an Analysis lets `compare` combine cells that differ in the attributes it names (`subject.id`, `env.id`,
 `env.node`, `env.label.<k>`, a trailing `*` allowed, a bare `*` relaxes nothing), for a comparison whose point is that
