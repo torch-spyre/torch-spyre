@@ -316,8 +316,8 @@ Things to know before sealing:
   - `--redact-host` also blanks the `hostname` attribute of JUnit `<testsuite>` elements in `results/*.xml`
     (the rest of each file is kept byte for byte). The seal prints `[info] blanked N testsuite hostname
     attribute(s)`, and `[warn] the sealing host name is still in [...]` for any result file that still contains it.
-  - **Redaction is partial.** It does not touch JUnit `<properties>`, `system-out`, `run_url`, attachments or
-    other kinds' result files, and the leftover-name check does not read UTF-16 XML or reliably tell a short host
+  - **Redaction is partial.** `--redact-host` scans only `results/`, never `attachments/`. It does not touch JUnit
+    `<properties>`, `system-out`, `run_url`, attachments or other kinds' result files, and the leftover-name check does not read UTF-16 XML or reliably tell a short host
     name from other text. Review the files yourself; act on every `[warn]`.
   - Test it on a throwaway bundle first: `tar -xzOf x.tgz bundle.json` shows what `runner` holds.
 - **Size.** The connected side limits the size of an upload, the unpacked size and the file count; these are
@@ -588,9 +588,10 @@ Handling:
   sealer into the bundle, so they detect accidental corruption only: anyone who edits a file can recompute them. They do not
   authenticate who made it. The uploader's identity and your custody notes are the authenticity record. Signing is not
   implemented. The `trust` label and the receipt id are equally self-attested.
-- Treat a bundle from a site as untrusted input on the connected side: the dashboard and the ingest refuse path
-  traversal, links and devices in archives, refuse unsafe XML, and cap size; do not unpack it by hand outside a scratch
-  directory.
+- Treat a bundle from a site as untrusted input on the connected side. The ingest refuses archive members with an
+  absolute path, `..`, links or devices, but it does not limit the unpacked size or file count and does not guard
+  XML parsing against hostile DOCTYPE or entity content; any such limits in the dashboard or relay are outside this
+  repository. Do not unpack a bundle by hand outside a scratch directory.
 - Do not send customer or partner names in free-text fields unless the uploader asks for them; use the site identifier.
 
 ## Versioning and compatibility
