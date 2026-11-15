@@ -318,3 +318,28 @@ def test_the_stdout_report_of_a_real_ingest_run_is_what_we_parse():
     )
     assert rc == 0 and report["status"] == "ingested"
     assert invalidate.INGEST_ARGV[0] == sys.executable
+
+
+def test_the_ingest_writes_to_the_database_the_preview_read(monkeypatch):
+    monkeypatch.setenv("BENCH_CLICKHOUSE_DB", "sandbox_me")
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "other_db")
+    monkeypatch.setenv("BENCH_INVALIDATION_CONFIRM_ABOVE", "500")
+    r = Runner()
+    invalidate.ingest_bundle(".", "amy", runner=r)
+    env = r.calls[0][1]["env"]
+    assert env["CLICKHOUSE_DB_V2"] == "sandbox_me" and env["BENCH_INVALIDATION_CONFIRM_ABOVE"] == "500"
+
+
+def test_a_timeout_or_a_statusless_report_is_not_success(capsys):
+    def slow(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    rc, *_ = run(["--device", "SN1", *CODE, "--apply"], runner=slow, capsys=capsys)
+    assert rc == 5
+    rc, *_ = run(["--device", "SN1", *CODE, "--apply"], runner=Runner(out="{}"), capsys=capsys)
+    assert rc == 5
+
+
+def test_json_output_stays_one_document(capsys):
+    rc, *_, out = run(["--device", "SN1", *CODE, "--json"], capsys=capsys)
+    assert rc == 0 and json.loads(out.out)["invalidation_id"] == INV

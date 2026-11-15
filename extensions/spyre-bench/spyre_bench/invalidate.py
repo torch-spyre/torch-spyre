@@ -118,7 +118,7 @@ def build_event(a, be, client):
             raise UsageError(f"no invalidation {a.id}")
         ev = {k: stored[k] for k in ("invalidation_id", "scope_kind", "scope", "window_from", "window_to")}
         ev["state"] = "restored" if a.action == "restore" else a.state
-        if ev["state"] not in (*SETTABLE, "restored"):
+        if ev["state"] not in SETTABLE and a.action == "set" or ev["state"] is None:
             raise UsageError(f"--state is required: one of {', '.join(SETTABLE)}")
     return {**ev, **reason_fields(a)}
 
@@ -159,6 +159,8 @@ def render_preview(p, ev):
             f"  {c['ts']}  {c['name']}  {c['metric']}  {c['before']} -> {c['after']}"
             for c in vc["rows"][:SHOWN_CHANGES]
         ]
+    if not p["matched_runs"]:
+        lines.append("warning: this scope matches no runs (check the id, node or serial and the window)")
     if p["needs_confirm"]:
         lines.append(
             f"confirmation required: {p['matched_runs']} runs is more than {p['threshold']}; token {p['confirm_token']}"
@@ -169,18 +171,22 @@ def render_preview(p, ev):
 def ingest_bundle(bundle_dir, who, runner=subprocess.run):
     """Run the ingest on a bundle; returns (exit code, its JSON report or {})."""
     env = planfile.ingest_env(os.environ, (), tempfile.gettempdir())
-    if "CLICKHOUSE_DB_V2" not in env:
-        db = cliutil.env("BENCH_CLICKHOUSE_DB") or cliutil.env("CLICKHOUSE_DB_V2")
-        if db:
-            env["CLICKHOUSE_DB_V2"] = db
-    proc = runner(
-        [*INGEST_ARGV, str(bundle_dir), "--uploader", who],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=INGEST_TIMEOUT,
-        stdin=subprocess.DEVNULL,
-    )
+    db = cliutil.env("BENCH_CLICKHOUSE_DB") or cliutil.env("CLICKHOUSE_DB_V2") or cliutil.env("CLICKHOUSE_DB")
+    if db:  # the database the preview read is the one the write goes to
+        env["CLICKHOUSE_DB_V2"] = db
+    if cliutil.env("BENCH_INVALIDATION_CONFIRM_ABOVE"):
+        env["BENCH_INVALIDATION_CONFIRM_ABOVE"] = cliutil.env("BENCH_INVALIDATION_CONFIRM_ABOVE")
+    try:
+        proc = runner(
+            [*INGEST_ARGV, str(bundle_dir), "--uploader", who],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=INGEST_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return -1, {"reason": f"the ingest exceeded {INGEST_TIMEOUT}s; the event may or may not be recorded"}
     report = {}
     for line in reversed((proc.stdout or "").splitlines()):
         try:
@@ -190,6 +196,8 @@ def ingest_bundle(bundle_dir, who, runner=subprocess.run):
         if isinstance(doc, dict):
             report = doc
             break
+    if proc.returncode != 0 and not report.get("reason"):
+        report["reason"] = ((proc.stderr or "").strip().splitlines() or ["no output"])[-1][:300]
     return proc.returncode, report
 
 
@@ -219,15 +227,20 @@ def do_write(a, ev, p, be, runner):
         / f"{cliutil.utc_stamp().replace(':', '')}-{p['invalidation_id'][:8]}-{ev['state']}"
     )
     be.write_bundle(out, [ev], uploader=actor(a))
-    print(f"bundle: {out}")
+    note = sys.stderr if a.json else sys.stdout
+    print(f"invalidation {p['invalidation_id']}; bundle: {out}", file=note)
     if a.bundle_only:
         print(
             "not ingested (--bundle-only); record it with: python -m spyre_clickhouse_ingest results --from-bundle "
-            + str(out)
+            + str(out),
+            file=note,
         )
         return cliutil.EXIT_OK
     rc, report = ingest_bundle(out, actor(a), runner)
     print(json.dumps(report, sort_keys=True))
+    if rc == 0 and report.get("status") not in ("ingested", "duplicate"):
+        rc = 1
+        report.setdefault("reason", "the ingest reported no status")
     if rc != 0:
         print(f"error: the ingest exited {rc}: {report.get('reason', 'see its output')}", file=sys.stderr)
         return cliutil.EXIT_INVALID if rc == 2 else cliutil.EXIT_STORE
@@ -240,7 +253,7 @@ def do_change(a, be, st, runner):
     p = be.preview(client, ev)
     print(json.dumps({**p, "event": ev}, indent=1, default=str) if a.json else render_preview(p, ev))
     if not a.apply:
-        if not p["noop"]:
+        if not p["noop"] and not a.json:
             print(
                 "dry run: nothing written; add --apply"
                 + (f" --confirm {p['confirm_token']}" if p["needs_confirm"] else "")
