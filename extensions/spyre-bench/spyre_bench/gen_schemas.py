@@ -703,6 +703,30 @@ SPECS = {
                             "cpus": s(
                                 pattern=CPU_LIST, description="CPU list such as 0-7,16; only for policy explicit"
                             ),
+                            "cpus_by_device": arr(
+                                s(pattern=CPU_LIST),
+                                minItems=1,
+                                description="one CPU list per device, in device order; per_device only",
+                            ),
+                            "assign": obj(
+                                {
+                                    "cores_per_device": integer(minimum=1),
+                                    "spread": {"enum": ["pack", "spread", "round_robin"]},
+                                    "smt": {"enum": ["primary_only", "siblings", "both"]},
+                                    "reserve": integer(minimum=0),
+                                    "reserve_cpus": s(pattern=CPU_LIST),
+                                    "spread_scope": {"enum": ["all", "socket"]},
+                                    "llc_align": BOOL,
+                                },
+                                required=("cores_per_device",),
+                                desc="per_device only: generate the lists at run time from the host topology",
+                            ),
+                            "layout": {
+                                "enum": ["tree", "ranks"],
+                                "description": "tree: pin the command's process tree; ranks: also pin each rank by "
+                                "LOCAL_RANK behind {pin_wrapper} (per_device only)",
+                            },
+                            "launcher": {"enum": ["taskset", "numactl"], "description": "tool that applies the CPUs"},
                             "require_verified": {
                                 "type": "boolean",
                                 "description": "a violated or unobservable placement caps the result at suspect",

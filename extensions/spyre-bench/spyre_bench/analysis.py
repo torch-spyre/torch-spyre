@@ -14,7 +14,10 @@
 
 """Evaluate the `derive:` and `compare:` blocks of an Analysis over stored Results.
 
-  spyre-bench analyze ANALYSIS --catalog DIR --results FILE.json [--pack DIR]... [--central DIR]... [--json]
+  spyre-bench analyze ANALYSIS --catalog DIR --results PATH... [--pack DIR]... [--central DIR]... [--json]
+
+PATH is a JSON file (a list of Results or one Result) or the output directory of `spyre-bench run`; repeat --results to
+combine runs (for example one run per pinning policy).
 
 derive combines two cases of one subject and environment per repeat pair; compare tabulates a metric (or the derived
 one) by a run/label/observation attribute within each `across` combination. A cell may hold only one Result (add
@@ -28,6 +31,7 @@ import json
 import math
 import statistics
 import sys
+from pathlib import Path
 
 from spyre_bench import engine
 
@@ -39,7 +43,9 @@ class AnalysisError(Exception):
 
 
 def _case(result):
-    return result["metadata"]["name"]
+    """The case name an Analysis refers to; a Result built by `run` is named after its run and labels the case."""
+    meta = result["metadata"]
+    return (meta.get("labels") or {}).get("bench.case") or meta["name"]
 
 
 def _props(result, repeat):
@@ -401,11 +407,24 @@ def analyze(spec, results, metrics=None):
     return report
 
 
+def load_results(paths):
+    """Result documents from JSON files and `run` output directories (cases/*/result.json)."""
+    out = []
+    for p in paths:
+        p = Path(p)
+        docs = [json.loads(f.read_text()) for f in sorted(p.glob("cases/*/result.json"))] if p.is_dir() else None
+        if docs is None:
+            doc = json.loads(p.read_text())
+            docs = doc if isinstance(doc, list) else [doc]
+        out += docs
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
     ap.add_argument("--catalog", required=True)
-    ap.add_argument("--results", required=True)
+    ap.add_argument("--results", required=True, action="append", help="Results JSON or a run output directory")
     ap.add_argument("--pack", action="append", default=[])
     ap.add_argument("--central", action="append", default=[])
     ap.add_argument("--json", action="store_true")
@@ -419,8 +438,7 @@ def main(argv=None):
         print(f"error: no Analysis named {a.name!r}", file=sys.stderr)
         return 2
     try:
-        with open(a.results) as f:
-            report = analyze(doc.spec, json.load(f), cat.reg.metrics)
+        report = analyze(doc.spec, load_results(a.results), cat.reg.metrics)
     except (AnalysisError, OSError, ValueError, KeyError) as x:
         print(f"error: {x}", file=sys.stderr)
         return 2
