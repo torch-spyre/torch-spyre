@@ -2544,8 +2544,12 @@ def pin_problems(pin, accelerators):
     out, policy = [], pin["policy"]
     if (policy == "explicit") != ("cpus" in pin):
         out.append("host.cpu_pinning: cpus is required for, and only valid with, policy explicit")
-    if pin.get("require_verified") and policy in ("none", "platform"):
-        out.append(f"host.cpu_pinning: require_verified needs a policy the engine can verify, not {policy}")
+    if pin.get("require_verified") and policy == "none":
+        out.append("host.cpu_pinning: require_verified needs a policy other than none")
+    if pin.get("require_verified") and policy == "platform":
+        out.append(
+            "host.cpu_pinning: require_verified cannot be met by policy platform (the engine does not verify it)"
+        )
     for key in ("cpus_by_device", "assign", "layout"):
         if key in pin and policy != "per_device":
             out.append(f"host.cpu_pinning: {key} is only valid with policy per_device")
