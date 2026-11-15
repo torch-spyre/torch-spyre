@@ -499,6 +499,19 @@ Exit codes: 0 sent or dry run, 2 invalid input, missing configuration or a rejec
 the relay did not answer within `--wait` (status `waiting`: the bundle is in the inbox but not yet confirmed).
 Bundle format and trust rules: `extensions/clickhouse-ingest/docs/bench-bundles.md`.
 
+## Invalidations
+
+```bash
+spyre-bench invalidate (--run ID [--benchmark ID [--repeat N]] | --node N | --device SERIAL | --placement ID) [--from T --to T] \
+    --reason-code C --reason TEXT [--state suspect|invalidated] [--apply [--confirm [TOKEN]]]
+spyre-bench invalidate restore ID --reason-code C --reason TEXT [--apply]    # also: set ID --state ..., list, show ID
+```
+
+The default is a preview: the store is read and the runs, series, benchmarks, repeats and verdict changes are printed;
+nothing is written. `--apply` records one event through a `bench-invalidation` bundle and the ingest (which owns the
+matching view, the state machine and the 50-run confirmation threshold). Needs `spyre-bench[ingest,clickhouse]`. Exit 0
+ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incident-runbook.md](incident-runbook.md).
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
