@@ -23,7 +23,6 @@ Exit codes: 0 ingested or already ingested, 1 failed (retry), 2 rejected, 3 inco
 """
 
 import contextlib
-import getpass
 import json
 import os
 import sys
@@ -40,6 +39,7 @@ from .offline import (
     BundleError,
     benchmark_entries,
     check,
+    current_user,
     digest,
     effective_trust,
     inbox_keys,
@@ -293,6 +293,11 @@ def _ingest(root: Path, args) -> dict:
             f"its folder {args.expect_key!r} is not its artifact_id or sha256-<image digest> "
             f"({sorted(inbox_keys(meta))})"
         )
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    if TRUST_PROP in extra:
+        raise BundleError(
+            f"{TRUST_PROP} is assigned by the receiving channel, not passed in"
+        )
     from .client import ClickHouse, ClickHouseEnv
 
     db = ClickHouseEnv.target_database()
@@ -311,7 +316,7 @@ def _ingest(root: Path, args) -> dict:
             raise
         r, via = create_artifact(client, db, meta, args.dry_run), "create_artifact"
     sha = digest(root)
-    uploader = args.uploader or meta.get("uploader") or getpass.getuser()
+    uploader = args.uploader or meta.get("uploader") or current_user()
     meta.setdefault("arch", DerivedId.arch(r.arch))
     meta.setdefault("component", r.component)
     meta["run_key"] = key or f"{MANUAL_PREFIX}{uploader}:{sha}"
@@ -322,11 +327,6 @@ def _ingest(root: Path, args) -> dict:
     aid, rid = r.artifact_id, run_id(meta)
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
               "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
-    extra = dict(getattr(args, "bundle_prop", None) or [])
-    if TRUST_PROP in extra:
-        raise BundleError(
-            f"{TRUST_PROP} is assigned by the receiving channel, not passed in"
-        )
     trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
     if trust:
         report["trust"] = trust
