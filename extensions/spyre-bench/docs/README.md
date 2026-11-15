@@ -628,6 +628,79 @@ Ingest: a quality case that uses the `generic` identity profile is handed to the
 Per-architecture differences (which cases run, card limits, models to skip) belong in data next to the product repo's
 definitions, selected by an architecture name that only names a file. Nothing in a command, Makefile or workflow branches on it.
 
+## On-demand benchmarks for a PR
+
+`spyre-bench ondemand` is the trusted half of a PR-comment run: it turns a comment into an engine request, decides
+whether the commenter and the request are allowed, and renders the plan as a preview. It is pure data in, data out:
+the caller (a workflow or a comment bot) fetches the facts (permissions, head sha, earlier requests) and acts on the
+answer. Run it from the engine installed from the base repository's default branch, never from the PR head.
+
+```bash
+spyre-bench ondemand parse     --comment-file comment.txt --host github.com   # request + policy violations
+spyre-bench ondemand authorize --facts facts.json                              # decision; exit 2 when denied
+spyre-bench ondemand preview   --plan plan.json --request request.json --format md|json
+```
+
+### Grammar
+
+```text
+/bench <selection> [key=value ...]        /bench confirm        /bench cancel
+selection := [product ":"] pick (";" [product ":"] pick)*
+pick      := tier | suite ("+" suite)* ["@" tier] | case ("," case)* | "#" selection-name
+tier      := sanity | core | extended
+```
+
+A bare word that is not a tier is a case or Selection name. A suite pick without `@tier` plans `sanity`, and the
+preview says so. Products: `torch-spyre`, `hf-adapters`, `spyre-inference` (default), `spyre-comms`. The command must
+start a line; lines inside code fences, quotes or indented are ignored.
+
+| Flag (`bench-` prefix optional) | Values | Default |
+|---|---|---|
+| `purpose` | `pr` only | `pr` |
+| `reuse` | `if_valid`, `never`, `prefer`, `only` | `if_valid` |
+| `force` | case names, or `all` | none (needs a reuse mode other than `never`) |
+| `profile` | `off`, `light`, `full` | `off` |
+| `vs` | `main`, `nightly`, `build:<job>#<n>` | `nightly` |
+| `clean` | `true`, `false` | `false` (needs write access) |
+| `max-wait` | `45m`, `1h`, ... (with `clean=true`) | 30m, capped at 60m |
+| `env` | an Environment name | the preset's |
+| `budget` | device-hours; lowers the cap, never raises it | the cap |
+
+### Policy
+
+| | github.com | internal host |
+|---|---|---|
+| tiers | `sanity` | `sanity`, `core` |
+| `reuse=never`, `force=all`, `profile=light`, `env=` | refused | allowed |
+| `extended`, `profile=full` | refused (ops request only) | refused |
+| who may ask | write permission, checked by API | write permission or org membership |
+| `clean=true` | write permission | write permission |
+| budget per request (device-hours) | 4 | 12 (`sanity`), 48 (`core`) |
+| budget per PR per 24 h | 8 | 96 |
+
+Numbers are proposals until catalogs carry real `est` values. An estimate above half the limit needs `/bench confirm`;
+above the limit nothing runs. One active request per PR: a new one cancels the older one, and cancelled work does not
+count against the window. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
+at once overall.
+
+### Fork pull requests and the pinned sha
+
+- A request is made for one full head sha, recorded with it. If the PR head moves, the request is refused; a new
+  comment is a new request and a new permission check.
+- A fork head runs only with an approval: the comment of a write-access user is the approval, recorded as
+  `{sha, approver, permission, request_digest, granted_at}`. It is valid for that sha, that request (by digest) and 72 h.
+  An approval by someone without write access, for another sha or for a changed request is rejected.
+- The measuring job gets `sandbox_profile`: no secrets, no registry or store credentials, checkout of the pinned sha,
+  results leave through a trusted post step, provenance `fork`, never baseline-eligible.
+
+### Preview
+
+`preview --format json` (`bench.preview/1`) carries `counts` (run, reuse, skip), `estimate` (device-hours, wall
+minutes), `reasons`, `queue`, `budget` (limit, needs_confirm, over), `asked`, `diff` (what you asked versus what will
+run, with the reason), `cases` (sorted: run, reuse, skip, then name) and a `digest`. `--format md` renders the same
+data as a PR comment that starts with a marker so it is edited in place. Text that came from a plan or a comment is
+stripped of control characters, backticks, tags, pipes and mentions before it is put in a table.
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,

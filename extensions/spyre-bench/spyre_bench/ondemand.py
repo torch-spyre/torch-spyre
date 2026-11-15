@@ -1,0 +1,850 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""On-demand benchmarks for a pull request: the comment grammar, admission policy and fork safety.
+
+Everything here is a pure function over plain data: no network, no clock (callers pass `now`), no files. The
+callers (a PR-comment workflow, the internal comment bot) fetch the facts, call these, and act on the decision.
+
+  spyre-bench ondemand parse     --comment-file F --host H            comment -> request.json
+  spyre-bench ondemand authorize --facts F                            request + actor + PR facts -> decision.json
+  spyre-bench ondemand preview   --plan P --request R [--format md]   plan.json -> preview comment / JSON
+
+Grammar, policy table and the threat model: docs/README.md ("On-demand benchmarks for a PR").
+"""
+
+import argparse
+import difflib
+import hashlib
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+import regex
+
+from spyre_bench import cliutil
+from spyre_bench.cliutil import UsageError
+
+PRODUCTS = ("torch-spyre", "hf-adapters", "spyre-inference", "spyre-comms")
+DEFAULT_PRODUCT = "spyre-inference"
+TIERS = ("sanity", "core", "extended")
+REUSE_MODES = ("if_valid", "never", "prefer", "only")
+PROFILES = ("off", "light", "full")
+VS_FIXED = ("main", "nightly")
+HOSTS = ("github.com", "ghe")
+PURPOSE = "pr"
+PREVIEW_SCHEMA = "bench.preview/1"
+PREVIEW_MARKER = "<!-- spyre-bench-preview/1 -->"
+WRITE_PERMISSIONS = ("write", "maintain", "admin")
+MEMBER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+
+NAME = regex.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+DURATION = regex.compile(r"([1-9][0-9]{0,3})([smh])")
+SHA = regex.compile(r"[0-9a-f]{40}")
+_KEYS = ("bench", "purpose", "reuse", "force", "profile", "vs", "clean", "env", "max-wait", "budget")
+_UNIT = {"s": 1, "m": 60, "h": 3600}
+
+
+class RequestError(UsageError):
+    """A comment that cannot become a request: the message is safe to post back to the PR."""
+
+
+@dataclass(frozen=True)
+class Policy:
+    """What a host lets a commenter ask for. Numbers are proposals until real `est` values exist."""
+
+    host: str
+    tiers: tuple
+    reuse_modes: tuple
+    force_all: bool
+    profiles: tuple
+    custom_env: bool
+    budget_device_hours: dict  # tier -> cap for one request
+    pr_window_device_hours: float  # all requests on one PR within `window`
+    per_user_per_hour: int
+    max_wait_default_s: int
+    max_wait_cap_s: int
+    clean_per_user: int
+    clean_per_user_per_day: int
+    clean_cluster: int
+    confirm_fraction: float = 0.5
+    window: timedelta = timedelta(hours=24)
+    approval_ttl: timedelta = timedelta(hours=72)
+
+
+POLICIES = {
+    "github.com": Policy(
+        host="github.com",
+        tiers=("sanity",),
+        reuse_modes=("if_valid", "prefer", "only"),
+        force_all=False,
+        profiles=("off",),
+        custom_env=False,
+        budget_device_hours={"sanity": 4.0},
+        pr_window_device_hours=8.0,
+        per_user_per_hour=6,
+        max_wait_default_s=1800,
+        max_wait_cap_s=3600,
+        clean_per_user=1,
+        clean_per_user_per_day=3,
+        clean_cluster=2,
+    ),
+    "ghe": Policy(
+        host="ghe",
+        tiers=("sanity", "core"),
+        reuse_modes=REUSE_MODES,
+        force_all=True,
+        profiles=("off", "light"),
+        custom_env=True,
+        budget_device_hours={"sanity": 12.0, "core": 48.0},
+        pr_window_device_hours=96.0,
+        per_user_per_hour=6,
+        max_wait_default_s=1800,
+        max_wait_cap_s=3600,
+        clean_per_user=1,
+        clean_per_user_per_day=3,
+        clean_cluster=2,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class OnDemandRequest:
+    """A parsed `/bench` or `/spyre-test bench=` request, before any policy or catalog check."""
+
+    selections: tuple  # ((product, {"tier"?, "suites"?, "cases"?}, as_asked), ...)
+    purpose: str = PURPOSE
+    reuse: str = "if_valid"
+    force: tuple = ()
+    profile: str = "off"
+    vs: str = "nightly"
+    clean: bool = False
+    env: str = ""
+    max_wait_s: int = 0
+    budget: float = 0.0
+    asked: dict = field(default_factory=dict)  # the flags as written, for the "asked vs planned" diff
+
+    def to_dict(self):
+        return {
+            "purpose": self.purpose,
+            "selections": [{"product": p, "selection": s, "as_asked": a} for p, s, a in self.selections],
+            "reuse": self.reuse,
+            "force": list(self.force),
+            "profile": self.profile,
+            "vs": self.vs,
+            "clean": self.clean,
+            "env": self.env,
+            "max_wait_s": self.max_wait_s,
+            "budget": self.budget,
+            "asked": self.asked,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        return OnDemandRequest(
+            selections=tuple((s["product"], s["selection"], s.get("as_asked", "")) for s in d["selections"]),
+            purpose=d.get("purpose", PURPOSE),
+            reuse=d.get("reuse", "if_valid"),
+            force=tuple(d.get("force") or ()),
+            profile=d.get("profile", "off"),
+            vs=d.get("vs", "nightly"),
+            clean=bool(d.get("clean")),
+            env=d.get("env", ""),
+            max_wait_s=int(d.get("max_wait_s") or 0),
+            budget=float(d.get("budget") or 0.0),
+            asked=d.get("asked") or {},
+        )
+
+    @property
+    def tiers(self):
+        return [s.get("tier", "sanity") for _, s, _ in self.selections]
+
+
+def _did_you_mean(word, choices):
+    hit = difflib.get_close_matches(word, list(choices), n=1, cutoff=0.6)
+    return f"; did you mean '{hit[0]}'" if hit else ""
+
+
+def _name(word, what):
+    if not NAME.fullmatch(word or ""):
+        raise RequestError(f"{what} {word!r}: letters, digits, '.', '_' and '-' only")
+    return word
+
+
+def parse_one_selection(text):
+    """`tier` | `suite[+suite][@tier]` | `case[,case]` | `#name` -> (selection dict, as_asked text)."""
+    text = text.strip()
+    if not text:
+        raise RequestError("empty selection")
+    if text.startswith("#"):
+        return {"cases": [_name(text[1:], "selection name")]}, text
+    if "@" in text or "+" in text:
+        suites, _, tier = text.partition("@")
+        if "," in suites or "@" in tier:
+            raise RequestError(f"selection {text!r}: use 'suite+suite@tier' or a comma list of cases, not both")
+        out = {"suites": [_name(s, "suite") for s in suites.split("+")]}
+        if "@" in text:
+            if tier not in TIERS:
+                raise RequestError(f"tier {tier!r} is not one of {', '.join(TIERS)}{_did_you_mean(tier, TIERS)}")
+            out["tier"] = tier
+        return out, text
+    if text in TIERS:
+        return {"tier": text}, text
+    return {"cases": [_name(c, "case") for c in text.split(",")]}, text
+
+
+def parse_selection(text, default_product=DEFAULT_PRODUCT):
+    """`[product:]selection[;[product:]selection]` -> ((product, selection, as_asked), ...)."""
+    out, seen = [], set()
+    for part in str(text or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        product, sep, rest = part.partition(":")
+        if sep:
+            if product not in PRODUCTS:
+                raise RequestError(f"unknown product {product!r}{_did_you_mean(product, PRODUCTS)}")
+        else:
+            product, rest = default_product, part
+        if product in seen:
+            raise RequestError(f"product {product!r} appears twice: join its selections in one")
+        seen.add(product)
+        sel, asked = parse_one_selection(rest)
+        out.append((product, sel, asked))
+    if not out:
+        raise RequestError("bench= needs a selection, for example bench=sanity")
+    return tuple(out)
+
+
+def parse_duration(text):
+    m = DURATION.fullmatch(str(text or ""))
+    if not m:
+        raise RequestError(f"duration {text!r}: use a number and s, m or h, such as 45m")
+    return int(m.group(1)) * _UNIT[m.group(2)]
+
+
+def _truthy(text, key):
+    word = str(text).strip().lower()
+    if word in ("true", "yes", "1", "on"):
+        return True
+    if word in ("false", "no", "0", "off"):
+        return False
+    raise RequestError(f"{key}={text!r}: use true or false")
+
+
+def _canonical_key(raw):
+    key = raw[len("bench-") :] if raw.startswith("bench-") else raw
+    if key not in _KEYS:
+        raise RequestError(f"unknown flag {raw!r}{_did_you_mean(key, _KEYS)}")
+    return key
+
+
+def parse_flags(flags, default_product=DEFAULT_PRODUCT):
+    """The flag family as a mapping (`bench`, `bench-reuse`/`reuse`, ...) -> OnDemandRequest. Shape checks only."""
+    got = {}
+    for raw, value in dict(flags).items():
+        key = _canonical_key(str(raw))
+        if key in got:
+            raise RequestError(f"flag {key!r} given twice")
+        got[key] = str(value)
+    if "bench" not in got:
+        raise RequestError("bench-* flags need a selection: bench=<selection>")
+    purpose = got.get("purpose", PURPOSE)
+    if purpose != PURPOSE:
+        raise RequestError(f"purpose={purpose!r}: a comment can only ask for purpose 'pr'")
+    reuse = got.get("reuse", "if_valid")
+    if reuse not in REUSE_MODES:
+        raise RequestError(f"reuse={reuse!r}: one of {', '.join(REUSE_MODES)}{_did_you_mean(reuse, REUSE_MODES)}")
+    force = tuple(dict.fromkeys(_name(c, "force case") for c in cliutil.csv(got.get("force", ""))))
+    if "all" in force and len(force) > 1:
+        raise RequestError("force=all cannot be combined with case names")
+    if force and reuse == "never":
+        raise RequestError("force has no effect with reuse=never: everything runs already")
+    profile = got.get("profile", "off")
+    if profile not in PROFILES:
+        raise RequestError(f"profile={profile!r}: one of {', '.join(PROFILES)}")
+    vs = got.get("vs", "nightly")
+    if vs not in VS_FIXED and not regex.fullmatch(r"build:[A-Za-z0-9._/-]{1,80}#[0-9]{1,9}", vs):
+        raise RequestError(f"vs={vs!r}: main, nightly or build:<job>#<n>")
+    env = got.get("env", "")
+    if env:
+        _name(env, "env")
+    budget = 0.0
+    if "budget" in got:
+        try:
+            budget = float(got["budget"])
+        except ValueError:
+            raise RequestError(f"budget={got['budget']!r}: a number of device-hours") from None
+        if not budget > 0 or budget == float("inf"):
+            raise RequestError("budget must be a positive, finite number of device-hours")
+    max_wait = parse_duration(got["max-wait"]) if "max-wait" in got else 0
+    clean = _truthy(got["clean"], "clean") if "clean" in got else False
+    if max_wait and not clean:
+        raise RequestError("max-wait only applies with clean=true")
+    return OnDemandRequest(
+        selections=parse_selection(got["bench"], default_product),
+        reuse=reuse,
+        force=force,
+        profile=profile,
+        vs=vs,
+        clean=clean,
+        env=env,
+        max_wait_s=max_wait,
+        budget=budget,
+        asked={k: got[k] for k in sorted(got)},
+    )
+
+
+@dataclass(frozen=True)
+class Command:
+    kind: str  # run | confirm | cancel
+    flags: dict
+    line: str
+
+
+def parse_command(text, command="/bench"):
+    """The first `command` line outside code fences and quotes -> Command, or None when there is none.
+
+    `/bench <selection> [key=value ...]`, `/bench confirm`, `/bench cancel`. A first token without `=` is the selection.
+    """
+    fenced = False
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if fenced or not (line.startswith(command + " ") or line.rstrip() == command):
+            continue
+        tokens = line[len(command) :].split()
+        if len(tokens) > 40 or len(line) > 1000:
+            raise RequestError("command too long")
+        if tokens in (["confirm"], ["cancel"]):
+            return Command(tokens[0], {}, line.strip())
+        flags = {}
+        for i, tok in enumerate(tokens):
+            key, sep, value = tok.partition("=")
+            if not sep:
+                if i != 0:
+                    raise RequestError(f"{tok!r}: expected key=value")
+                key, value = "bench", tok
+            if key in flags:
+                raise RequestError(f"flag {key!r} given twice")
+            flags[key] = value
+        return Command("run", flags, line.strip())
+    return None
+
+
+def check_policy(req, policy, actor=None):
+    """Host and actor gates on a parsed request. Returns a list of violation messages (empty = allowed)."""
+    bad = []
+    for product, sel, _ in req.selections:
+        tier = sel.get("tier", "sanity")
+        if tier not in policy.tiers:
+            where = "internal requests only" if tier == "core" else "ops requests only"
+            bad.append(f"tier '{tier}' for {product} is not available here ({where})")
+    if req.reuse not in policy.reuse_modes:
+        bad.append(f"reuse={req.reuse} is not available here")
+    if "all" in req.force and not policy.force_all:
+        bad.append("force=all is not available here: name the cases")
+    if req.profile not in policy.profiles:
+        bad.append(f"profile={req.profile} is not available here")
+    if req.env and not policy.custom_env:
+        bad.append("env= is not available here: the environment is fixed by the workflow")
+    if req.max_wait_s > policy.max_wait_cap_s:
+        bad.append(f"max-wait is capped at {policy.max_wait_cap_s // 60}m")
+    if req.clean and actor is not None and not has_write(actor):
+        bad.append("clean=true needs write access to the repository")
+    if req.budget and req.budget > max(policy.budget_device_hours.values()):
+        bad.append(f"budget {req.budget:g} exceeds the host cap {max(policy.budget_device_hours.values()):g}")
+    return bad
+
+
+def has_write(actor):
+    return str((actor or {}).get("permission", "")).lower() in WRITE_PERMISSIONS
+
+
+def invoker_allowed(actor, policy):
+    """Who may ask at all. github.com: write permission, checked by API; GHE: any org member association."""
+    if has_write(actor):
+        return True
+    return policy.host == "ghe" and str((actor or {}).get("association", "")).upper() in MEMBER_ASSOCIATIONS
+
+
+def budget_limit(req, policy):
+    """Device-hours one request may plan: the largest tier asked, capped by an explicit budget= (never raised by it)."""
+    cap = max(policy.budget_device_hours.get(t, 0.0) for t in req.tiers)
+    return min(cap, req.budget) if req.budget else cap
+
+
+def check_budget(estimate_hours, limit, policy):
+    """-> (ok, needs_confirm). Over the limit never runs; above `confirm_fraction` of it needs a confirm."""
+    if estimate_hours > limit:
+        return False, False
+    return True, estimate_hours > limit * policy.confirm_fraction
+
+
+@dataclass(frozen=True)
+class Approval:
+    """A pinned-sha approval: who allowed which head sha to run, for which request, and until when."""
+
+    sha: str
+    approver: str
+    permission: str
+    request_digest: str
+    granted_at: str
+    request_id: str = ""
+
+    def to_dict(self):
+        return dict(self.__dict__)
+
+
+def request_digest(req):
+    body = json.dumps({k: v for k, v in req.to_dict().items() if k != "asked"}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def make_approval(actor, head_sha, req, now, request_id=""):
+    """The approval a write-access commenter gives by commenting. Refuses anything else or a non-sha."""
+    if not has_write(actor):
+        raise RequestError("only a commenter with write access can approve a run")
+    if not SHA.fullmatch(str(head_sha or "")):
+        raise RequestError("the head sha must be a full 40-character commit id")
+    return Approval(head_sha, actor["login"], actor["permission"], request_digest(req), _iso(now), request_id)
+
+
+def approval_valid(approval, head_sha, req, now, policy):
+    """-> (ok, reason). The approval must match the exact head sha, the exact request, and be fresh."""
+    if approval is None:
+        return False, "no approval on record"
+    if approval.sha != head_sha:
+        return False, "the PR head moved since the approval: a new request is needed"
+    if approval.request_digest != request_digest(req):
+        return False, "the approval was given for a different request"
+    if str(approval.permission).lower() not in WRITE_PERMISSIONS:
+        return False, "the approver did not have write access"
+    if _parse(now) - _parse(approval.granted_at) > policy.approval_ttl:
+        return False, "the approval expired"
+    return True, ""
+
+
+def sandbox_profile(is_fork):
+    """What the measuring job may touch. Constant for forks; the same floor applies to same-repo runs."""
+    return {
+        "secrets": False,
+        "registry_write": False,
+        "store_credentials": False,
+        "checkout": "pinned_sha",
+        "engine_source": "base_default_branch",
+        "provenance": "fork" if is_fork else "branch",
+        "baseline_eligible": False,
+        "results_via": "trusted_post_step",
+    }
+
+
+def _parse(ts):
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+
+
+def _iso(ts):
+    return _parse(ts).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass
+class Decision:
+    state: str  # admit | needs_confirm | deny
+    reasons: list = field(default_factory=list)
+    cancel: list = field(default_factory=list)  # request ids to cancel (superseded)
+    pinned_sha: str = ""
+    approval: dict = None
+    sandbox: dict = None
+    limit_device_hours: float = 0.0
+
+    @property
+    def allowed(self):
+        return self.state in ("admit", "needs_confirm")
+
+    def to_dict(self):
+        return dict(self.__dict__, allowed=self.allowed)
+
+
+def admission(history, new, now, policy):
+    """Supersede and rate rules over earlier requests. `history` rows: id, pr, user, ts, state, est, clean.
+
+    One active perf request per PR (the new one cancels it); a window cap on estimated device-hours per PR that does
+    not count cancelled work; a per-user hourly rate; and clean-run quotas. Returns (reasons, cancel_ids).
+    """
+    now = _parse(now)
+    live = [h for h in history if h.get("state") not in ("cancelled", "denied", "rejected")]
+    cancel = [h["id"] for h in live if h["pr"] == new["pr"] and h.get("state") in ("active", "previewed", "launched")]
+    kept = [h for h in live if h["id"] not in cancel]
+    reasons = []
+    in_window = [h for h in kept if h["pr"] == new["pr"] and now - _parse(h["ts"]) <= policy.window]
+    spent = sum(float(h.get("est") or 0) for h in in_window)
+    if spent + new["est"] > policy.pr_window_device_hours:
+        reasons.append(
+            f"PR window budget: {spent:g} device-hours already planned in {policy.window.total_seconds() / 3600:g}h, "
+            f"cap {policy.pr_window_device_hours:g}"
+        )
+    hour = [h for h in history if h["user"] == new["user"] and now - _parse(h["ts"]) <= timedelta(hours=1)]
+    if len(hour) >= policy.per_user_per_hour:
+        reasons.append(f"rate limit: {policy.per_user_per_hour} requests per user per hour")
+    if new.get("clean"):
+        mine = [h for h in kept if h["user"] == new["user"] and h.get("clean")]
+        if sum(1 for h in mine if h.get("state") in ("active", "previewed", "launched")) >= policy.clean_per_user:
+            reasons.append(f"clean quota: {policy.clean_per_user} concurrent clean request per user")
+        if sum(1 for h in mine if now - _parse(h["ts"]) <= timedelta(days=1)) >= policy.clean_per_user_per_day:
+            reasons.append(f"clean quota: {policy.clean_per_user_per_day} clean requests per user per day")
+        if sum(1 for h in kept if h.get("clean") and h.get("state") in ("active", "launched")) >= policy.clean_cluster:
+            reasons.append(f"clean quota: {policy.clean_cluster} clean requests running at once")
+    return reasons, cancel
+
+
+def authorize(facts):
+    """The whole gate for one request, from facts the caller fetched from the API.
+
+    facts: host, now, actor{login, permission, association}, pr{number, base_repo, head_repo, head_sha},
+    pinned_sha (the sha recorded when the request was made; '' for a fresh one), request (to_dict form),
+    estimate_device_hours (None before the plan exists), approval (dict or None), history (rows for `admission`).
+    """
+    policy = POLICIES[facts["host"]]
+    req = OnDemandRequest.from_dict(facts["request"])
+    actor, pr, now = facts.get("actor") or {}, facts["pr"], facts["now"]
+    is_fork = pr["head_repo"] != pr["base_repo"]
+    head = pr["head_sha"]
+
+    def deny(*reasons):
+        return Decision("deny", list(reasons), sandbox=sandbox_profile(is_fork), pinned_sha=head)
+
+    if not invoker_allowed(actor, policy):
+        return deny("the commenter is not allowed to run benchmarks on this repository")
+    if not SHA.fullmatch(str(head)):
+        return deny("the PR head is not a full commit id")
+    if facts.get("pinned_sha") and facts["pinned_sha"] != head:
+        return deny("the PR head moved since this request was made: comment again to run the new commit")
+    violations = check_policy(req, policy, actor)
+    if violations:
+        return deny(*violations)
+    approval = None
+    if is_fork:
+        # A fork runs only the exact sha a write-access commenter approved; the approval is the comment itself.
+        recorded = facts.get("approval")
+        approval = Approval(**recorded) if recorded else None
+        if approval is None and has_write(actor):
+            approval = make_approval(actor, head, req, now, str(facts.get("request_id", "")))
+        ok, why = approval_valid(approval, head, req, now, policy)
+        if not ok:
+            return deny(f"fork pull request: {why}")
+    limit = budget_limit(req, policy)
+    est = facts.get("estimate_device_hours")
+    needs_confirm = False
+    if est is not None:
+        ok, needs_confirm = check_budget(float(est), limit, policy)
+        if not ok:
+            return deny(f"plan needs {float(est):g} device-hours, over the {limit:g} limit for this request")
+    reasons, cancel = admission(
+        facts.get("history") or [],
+        {
+            "pr": pr["number"],
+            "user": actor.get("login", ""),
+            "est": float(est or 0),
+            "clean": req.clean,
+        },
+        now,
+        policy,
+    )
+    if reasons:
+        return deny(*reasons)
+    state = "needs_confirm" if needs_confirm else "admit"
+    why = (
+        [f"estimate above {int(policy.confirm_fraction * 100)}% of the limit: confirm to run"] if needs_confirm else []
+    )
+    return Decision(state, why, cancel, head, approval.to_dict() if approval else None, sandbox_profile(is_fork), limit)
+
+
+def engine_request(req, product, subject=None, environment=""):
+    """The engine Run request for one product of the parsed request (what `spyre-bench plan --request` reads)."""
+    for p, sel, _ in req.selections:
+        if p == product:
+            break
+    else:
+        raise KeyError(product)
+    selection = {k: v for k, v in sel.items() if v}
+    out = {"purpose": req.purpose, "selection": {**selection, "type": "perf"}}
+    if subject:
+        out["subject"] = subject
+    if req.env or environment:
+        out["environment"] = req.env or environment
+    out["reuse"] = {"mode": req.reuse, "override": True, **({"force": list(req.force)} if req.force else {})}
+    if req.budget:
+        out["budget"] = {"device_hours": req.budget}
+    if req.profile != "off":
+        out["overrides"] = {"profile_level": req.profile}
+    return out
+
+
+def bench_env(req, product, subject_id="", environment=""):
+    """The BENCH_* twins of engine_request, for `make bench-plan` / `make bench-run`."""
+    for p, sel, _ in req.selections:
+        if p == product:
+            break
+    else:
+        raise KeyError(product)
+    env = {"BENCH_PURPOSE": req.purpose, "BENCH_REUSE": req.reuse}
+    if sel.get("cases"):
+        env["BENCH_SELECTION"] = ",".join(sel["cases"])
+    if sel.get("tier"):
+        env["BENCH_TIER"] = sel["tier"]
+    if sel.get("suites"):
+        env["BENCH_SUITES"] = ",".join(sel["suites"])
+    if req.force:
+        env["BENCH_FORCE"] = ",".join(req.force)
+    if req.budget:
+        env["BENCH_BUDGET"] = f"{req.budget:g}"
+    if req.env or environment:
+        env["BENCH_ENVIRONMENT"] = req.env or environment
+    if req.profile != "off":
+        env["BENCH_SET"] = f"run.profile_level={req.profile}"
+    if subject_id:
+        env["BENCH_SUBJECT_ID"] = subject_id
+    return env
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Preview: what the PR comment and the dashboard show before cards are taken.
+
+_ORDER = {"run": 0, "reuse": 1, "skip": 2}
+_MAX_ROWS = 40
+_UNSAFE = regex.compile(r"[\x00-\x1f\x7f`<>|\\]")
+
+
+def safe(text, limit=160):
+    """Text from a plan or a comment, made safe to put in a table cell: no mentions, tags, pipes or control chars."""
+    s = _UNSAFE.sub(" ", str(text)).replace("@", "@​").replace("\n", " ").strip()
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _asked_vs_planned(req, plan):
+    """Rows where what the commenter wrote is not what will happen, each with the reason."""
+    rows = []
+    s = plan["summary"]
+    planned_req = plan.get("request") or {}
+    for product, sel, as_asked in req.selections:
+        if "tier" not in sel and sel.get("suites"):
+            rows.append(
+                {"field": f"{product} tier", "asked": "(none)", "planned": "sanity", "why": "suites default to sanity"}
+            )
+    mode = ((planned_req.get("reuse") or {}).get("mode")) or "never"
+    if mode != req.reuse:
+        rows.append({"field": "reuse", "asked": req.reuse, "planned": mode, "why": "the engine did not apply it"})
+    forced = set(req.force) - {"all"}
+    known = {c["name"] for c in plan["cases"]}
+    for name in sorted(forced - known):
+        rows.append({"field": "force", "asked": name, "planned": "(not in selection)", "why": "no such case planned"})
+    for name in sorted(forced & known):
+        case = next(c for c in plan["cases"] if c["name"] == name)
+        if case["action"] != "run":
+            rows.append(
+                {"field": "force", "asked": name, "planned": case["action"], "why": safe(case.get("reason", ""))}
+            )
+    if req.clean:
+        not_clean = [
+            c["name"] for c in plan["cases"] if c["action"] == "run" and not (c.get("clean") or {}).get("requested")
+        ]
+        if not_clean:
+            rows.append(
+                {
+                    "field": "clean",
+                    "asked": "true",
+                    "planned": "not requested on %d case(s)" % len(not_clean),
+                    "why": "the plan carries no clean request for them",
+                }
+            )
+    if req.profile != "off":
+        levels = {c.get("profile_level", "off") for c in plan["cases"] if c["action"] == "run"}
+        if levels and levels != {req.profile}:
+            rows.append(
+                {"field": "profile", "asked": req.profile, "planned": ",".join(sorted(levels)), "why": "per case"}
+            )
+    if s["skip"]:
+        by = ", ".join(f"{n} {safe(r, 60)}" for r, n in sorted(s["reasons"].items()))
+        rows.append({"field": "cases", "asked": f"{s['cases']} cases", "planned": f"{s['skip']} skipped", "why": by})
+    return rows
+
+
+def build_preview(plan, req, policy=None, queue=None, dashboard_url="", now=None):
+    """The preview as data (the dashboard consumes this; `render_markdown` is the same data as text)."""
+    s, est = plan["summary"], plan.get("estimate") or {}
+    hours = float(est.get("device_hours") or 0.0)
+    limit = budget_limit(req, policy) if policy else None
+    needs_confirm = False
+    over = False
+    if policy and limit is not None:
+        ok, needs_confirm = check_budget(hours, limit, policy)
+        over = not ok
+    cases = sorted(plan["cases"], key=lambda c: (_ORDER.get(c["action"], 9), c["name"]))
+    body = {
+        "schema": PREVIEW_SCHEMA,
+        "purpose": plan.get("purpose"),
+        "counts": {"cases": s["cases"], "run": s["run"], "reuse": s["reuse"], "skip": s["skip"]},
+        "estimate": {"device_hours": hours, "wall_min": float(est.get("wall_min") or 0.0)},
+        "reasons": dict(sorted(s["reasons"].items())),
+        "queue": queue or {},
+        "budget": {"limit_device_hours": limit, "needs_confirm": needs_confirm, "over": over},
+        "asked": req.asked,
+        "diff": _asked_vs_planned(req, plan),
+        "cases": [
+            {
+                "name": c["name"],
+                "action": c["action"],
+                "reason": c.get("reason", ""),
+                "repeats": c.get("repeats"),
+                "est_min": c.get("est_min"),
+                "reused_from": c.get("reused_from"),
+                "environment": c.get("environment"),
+            }
+            for c in cases
+        ],
+        "dashboard_url": dashboard_url,
+    }
+    body["digest"] = hashlib.sha256(
+        json.dumps({k: body[k] for k in ("counts", "estimate", "diff", "cases")}, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return body
+
+
+def render_markdown(preview, public=True, command="/bench"):
+    """The PR comment. Stable layout, one marker so the same comment is edited in place."""
+    c, e, b = preview["counts"], preview["estimate"], preview["budget"]
+    out = [PREVIEW_MARKER, "### Benchmark plan"]
+    out.append(f"**run {c['run']} · reuse {c['reuse']} · skip {c['skip']}** of {c['cases']} cases")
+    out.append(f"Estimate: {e['device_hours']:g} device-hours (about {e['wall_min']:g} min of measuring).")
+    if b.get("limit_device_hours") is not None:
+        out.append(f"Limit for this request: {b['limit_device_hours']:g} device-hours.")
+    q = preview.get("queue") or {}
+    if q:
+        out.append("Queue: " + ", ".join(f"{safe(k, 30)} {safe(v, 40)}" for k, v in sorted(q.items())) + ".")
+    if b.get("over"):
+        out.append("**Over the limit: nothing will run.** Narrow the selection or ask for a smaller tier.")
+    elif b.get("needs_confirm"):
+        out.append(f"**Confirm to run:** reply `{command} confirm` (write access needed). Nothing runs until then.")
+    if preview["diff"]:
+        out += ["", "**You asked for / will run**", "", "| item | asked | planned | why |", "|---|---|---|---|"]
+        out += [
+            f"| {safe(d['field'], 40)} | {safe(d['asked'], 60)} | {safe(d['planned'], 60)} | {safe(d['why'], 100)} |"
+            for d in preview["diff"]
+        ]
+    if preview["cases"]:
+        out += ["", "| action | case | repeats | note |", "|---|---|---|---|"]
+        for case in preview["cases"][:_MAX_ROWS]:
+            note = safe(case["reason"], 100) or (
+                f"reused from {safe(case['reused_from'], 40)}" if case["reused_from"] else ""
+            )
+            out.append(f"| {case['action']} | {safe(case['name'], 90)} | {case['repeats'] or ''} | {note} |")
+        if len(preview["cases"]) > _MAX_ROWS:
+            out.append(f"| | …and {len(preview['cases']) - _MAX_ROWS} more | | |")
+    if preview.get("dashboard_url") and not public:
+        out += ["", f"Details: {safe(preview['dashboard_url'], 200)}"]
+    elif preview.get("dashboard_url"):
+        out += ["", f"Dashboard (sign-in required): {safe(preview['dashboard_url'], 200)}"]
+    out += ["", f"<sub>plan {preview['digest']}</sub>"]
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# CLI
+
+
+def _load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _cmd_parse(a):
+    with open(a.comment_file) as f:
+        cmd = parse_command(f.read(), a.command)
+    if cmd is None:
+        print(json.dumps({"command": None}))
+        return cliutil.EXIT_NOTHING
+    if cmd.kind != "run":
+        print(json.dumps({"command": cmd.kind}))
+        return cliutil.EXIT_OK
+    req = parse_flags(cmd.flags, a.default_product)
+    print(
+        json.dumps(
+            {"command": "run", "request": req.to_dict(), "policy_violations": check_policy(req, POLICIES[a.host])}
+        )
+    )
+    return cliutil.EXIT_OK
+
+
+def _cmd_authorize(a):
+    facts = _load(a.facts)
+    decision = authorize(facts)
+    print(json.dumps(decision.to_dict(), sort_keys=True))
+    return cliutil.EXIT_OK if decision.allowed else cliutil.EXIT_INVALID
+
+
+def _cmd_preview(a):
+    req = OnDemandRequest.from_dict(_load(a.request))
+    queue = json.loads(a.queue) if a.queue else None
+    pv = build_preview(_load(a.plan), req, POLICIES[a.host], queue, a.dashboard_url or "")
+    print(
+        render_markdown(pv, public=a.host == "github.com", command=a.command)
+        if a.format == "md"
+        else json.dumps(pv, sort_keys=True)
+    )
+    return cliutil.EXIT_OK
+
+
+def parser():
+    ap = argparse.ArgumentParser(prog="spyre-bench ondemand", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="verb", required=True)
+    p = sub.add_parser("parse", help="comment text -> request")
+    p.add_argument("--comment-file", required=True)
+    p.add_argument("--host", choices=HOSTS, default="github.com")
+    p.add_argument("--command", default="/bench")
+    p.add_argument("--default-product", default=DEFAULT_PRODUCT)
+    p.set_defaults(fn=_cmd_parse)
+    p = sub.add_parser("authorize", help="facts.json -> decision (exit 0 allowed, 2 denied)")
+    p.add_argument("--facts", required=True)
+    p.set_defaults(fn=_cmd_authorize)
+    p = sub.add_parser("preview", help="plan.json + request.json -> preview")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--request", required=True)
+    p.add_argument("--host", choices=HOSTS, default="github.com")
+    p.add_argument("--format", choices=("md", "json"), default="md")
+    p.add_argument("--queue", help="JSON object of queue facts to show")
+    p.add_argument("--dashboard-url")
+    p.add_argument("--command", default="/bench")
+    p.set_defaults(fn=_cmd_preview)
+    return ap
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    try:
+        return a.fn(a)
+    except UsageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return cliutil.EXIT_INVALID
+    except (OSError, ValueError, KeyError) as e:
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return cliutil.EXIT_INVALID
+
+
+if __name__ == "__main__":
+    sys.exit(main())
