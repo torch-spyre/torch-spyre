@@ -40,7 +40,17 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from spyre_bench import cliutil, engine, ingest_adapter, pinning_plan, pinning_run, placement, planfile, store as stores
+from spyre_bench import (
+    cliutil,
+    engine,
+    ingest_adapter,
+    pinning_plan,
+    pinning_run,
+    placement,
+    planfile,
+    quality,
+    store as stores,
+)
 from spyre_bench.cliutil import UsageError
 
 POLL_S = 0.5
@@ -55,7 +65,7 @@ BUNDLE_TAIL = [
     "--arch",
     "{arch}",
     "--trigger-type",
-    "perf",
+    "{test_type}",
     "--jenkins-run-key",
     "{run_key}",
     "--schema",
@@ -590,8 +600,16 @@ def build_case_result(cat, rec, outcome, ctx):
     ]
     purpose = ctx["plan"].get("purpose") or ""
     validity = None
-    policy = cat.policy.spec if cat.policy else None
-    if policy and purpose in policy["purposes"]:
+    pol_doc = cat.policy_of(case)
+    policy = pol_doc.spec if pol_doc else None
+    if policy and purpose in policy["purposes"] and case["type"] == "quality":
+        ok = [r for r in outcome["_repeats"] if r["status"] == "ok"]
+        want = quality.expected(case)
+        state, reasons = quality.validity_of(
+            policy, purpose, [quality.repeat_facts(r, want) for r in ok], measured=any(r["samples"] for r in ok)
+        )
+        validity = (state, reasons, purpose, "internal")
+    elif policy and purpose in policy["purposes"]:
         ok = [r for r in outcome["_repeats"] if r["status"] == "ok"]
         facts = {
             "measured": any(r["samples"] for r in ok),
@@ -670,6 +688,7 @@ def ingest_commands(outcomes, recs, ctx):
             "out_dir": ctx["out"],
             "case": rec["name"],
             "profile": profile,
+            "test_type": rec.get("test_type") or "perf",
         }
         custom = bool(ctx["ingest_cmd"] or rec.get("ingest"))
         try:

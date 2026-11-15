@@ -33,7 +33,7 @@ from pathlib import Path
 import regex as re
 import yaml
 
-from spyre_bench import ingest_adapter, pinning_plan, placement
+from spyre_bench import ingest_adapter, pinning_plan, placement, quality
 from spyre_bench.ingest_adapter import IngestUnavailable
 from spyre_bench.placement import parse_cpu_list
 
@@ -844,6 +844,7 @@ class Catalog:
         self.groupings = {g["name"]: g for g in self.project.spec.get("groupings", DEFAULT_GROUPINGS)}
         self.component = self.project.spec.get("component", self.project.name)
         self.policy = None
+        self.quality_policy = None
         for d in [self.project] + [x for x in cdocs if x.kind == "Project"]:
             for want in d.spec["packs"]:
                 found = self.reg.find(want["name"], packs)
@@ -1669,6 +1670,7 @@ class Catalog:
                 if c["sys"].get(f_) is not None:
                     self.get(kind, c["sys"][f_], w, f"system.{f_}")
             self._check_case_metrics(c, t, w)
+            self.errors += [f"{w}: {e}" for e in quality.case_errors(c)]
             env = None
             if c["environment"]:
                 env = self.effective("Environment", c["environment"], w, "environment")
@@ -1821,6 +1823,7 @@ class Catalog:
                         self.errors.append(f"{w}: {p!r} is in both {seen[p]} and {k}")
                     seen[p] = k
             self._check_derive_compare(d)
+            self.errors += quality.reference_errors(sp, {c["name"] for c in self.cases}, self.reg.metrics, w)
             dec = sp.get("decompose")
             if dec:
                 linked = {
@@ -1867,10 +1870,25 @@ class Catalog:
 
     # ------------------------------------------------------------- validity policy and expectations
     def _check_policies(self):
-        pols = self.of("ValidityPolicy")
+        allp = self.of("ValidityPolicy")
+        pols = []
+        quals = []
+        for d in allp:
+            kinds = set(d.spec.get("applies_to") or ["perf"])
+            if kinds == {"quality"}:
+                quals.append(d)
+            elif kinds == {"perf"}:
+                pols.append(d)
+            else:
+                self.errors.append(f"{d.where}: applies_to must be [perf] or [quality], not a mixed list")
         want = self.project.spec.get("validity_policy")
         if want:
             self.policy = self.get("ValidityPolicy", want, self.project.where, "validity_policy")
+            if self.policy is not None and id(self.policy) in {id(q) for q in quals}:
+                self.errors.append(
+                    f"{self.project.where}: validity_policy names a quality policy; it must be a perf one"
+                )
+                self.policy = None
         elif len(pols) == 1:
             self.policy = pols[0]
         elif len(pols) > 1:
@@ -1881,12 +1899,24 @@ class Catalog:
                 self.errors.append(
                     f"{self.project.where}: {len(pols)} ValidityPolicies loaded; set Project.spec.validity_policy"
                 )
+        if len(quals) == 1:
+            self.quality_policy = quals[0]
+        elif len(quals) > 1:
+            local = [d for d in quals if id(d) in self.local]
+            if len(local) == 1:
+                self.quality_policy = local[0]
+            else:
+                self.errors.append(f"{self.project.where}: {len(quals)} quality ValidityPolicies loaded; keep one")
+        for d in quals:
+            self.errors += quality.policy_errors(d, self.reg)
         for d in pols:
             for name, row in d.spec["purposes"].items():
                 w = f"{d.where} purposes.{name}"
                 if name not in self.reg.vocab["purposes"]:
                     self.errors.append(f"{w}: not a registered purpose {sorted(self.reg.vocab['purposes'])}")
                 req = row["requires"]
+                if "gates" in req:
+                    self.errors.append(f"{w}: requires.gates belongs to a quality policy (applies_to: [quality])")
                 if name == "pr" and (row["baseline"] or row["reference"]):
                     self.errors.append(f"{w}: a PR run can never be a baseline or reference")
                 if row["reference"]:
@@ -1931,12 +1961,16 @@ class Catalog:
                     self.errors.append(f"{w}: a rolling baseline needs window and purposes")
                 if b.get("min_n", 1) > b.get("window", 1):
                     self.errors.append(f"{w}: min_n exceeds window")
+                pols = {id(p): p for p in (self.policy_of(c) for c in hit) if p} or (
+                    {id(self.policy): self.policy} if self.policy else {}
+                )
                 for pu in b.get("purposes", []):
-                    row = (self.policy.spec["purposes"].get(pu)) if self.policy else None
-                    if self.policy and (row is None or not row["baseline"]):
-                        self.errors.append(
-                            f"{w}: baseline purpose {pu!r} is not baseline-eligible in the ValidityPolicy"
-                        )
+                    for pol in pols.values():
+                        row = pol.spec["purposes"].get(pu)
+                        if row is None or not row["baseline"]:
+                            self.errors.append(
+                                f"{w}: baseline purpose {pu!r} is not baseline-eligible in ValidityPolicy/{pol.name}"
+                            )
             elif b.get("window") or b.get("purposes"):
                 self.errors.append(f"{w}: window/purposes apply to a rolling baseline only")
 
@@ -1969,6 +2003,10 @@ class Catalog:
             if k in ("Environment", "NodeClass", "ValidityPolicy", "Expectation")
         ]
 
+    def policy_of(self, c):
+        """The ValidityPolicy that judges a case: the quality one for a quality case, else the perf one."""
+        return self.quality_policy if c["type"] == "quality" else self.policy
+
     def validity_view(self, c, purpose, env=None):
         """What a case needs to earn each validity under the policy, and which expectations judge it."""
         out = {
@@ -1983,13 +2021,14 @@ class Catalog:
                 for d in self.expectations_for(c)
             ]
         }
-        if self.policy and purpose in self.policy.spec["purposes"]:
-            row = self.policy.spec["purposes"][purpose]
+        pol = self.policy_of(c)
+        if pol and purpose in pol.spec["purposes"]:
+            row = pol.spec["purposes"][purpose]
             out["policy"] = {
-                "name": self.policy.name,
-                "spec_digest": self.digest("ValidityPolicy", self.policy.name),
+                "name": pol.name,
+                "spec_digest": self.digest("ValidityPolicy", pol.name),
                 "purpose": purpose,
-                "floor": effective_floor(self.policy.spec, purpose, env),
+                "floor": effective_floor(pol.spec, purpose, env),
                 "requires": row["requires"],
                 "baseline": row["baseline"],
                 "reference": row["reference"],
@@ -2665,9 +2704,12 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
         raise PlanError("\n".join(cat.errors))
     now = now or datetime.now(timezone.utc)
     pol = cat.policy.spec if cat.policy else None
-    if pol and request.get("purpose") and request["purpose"] not in pol["purposes"]:
+    known = set((pol or {}).get("purposes", {})) | set(
+        (cat.quality_policy.spec["purposes"] if cat.quality_policy else {})
+    )
+    if (pol or cat.quality_policy) and request.get("purpose") and request["purpose"] not in known:
         raise PlanError(
-            f"purpose {request['purpose']!r} is not in ValidityPolicy/{cat.policy.name} ({sorted(pol['purposes'])})"
+            f"purpose {request['purpose']!r} is not in ValidityPolicy/{(cat.policy or cat.quality_policy).name} ({sorted(known)})"
         )
     sel, ov = request.get("selection") or {}, request.get("overrides") or {}
     sels = {d.name: d for d in cat.docs if d.kind == "Selection"}
@@ -2741,6 +2783,12 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
 
 
 def _plan_case(cat, c, env_name, env, request, ov, s, leg, existing, invalidations, now):
+    pol = cat.policy_of(c)
+    if pol and request.get("purpose") and request["purpose"] not in pol.spec["purposes"]:
+        raise PlanError(
+            f"purpose {request['purpose']!r} is not in ValidityPolicy/{pol.name} ({sorted(pol.spec['purposes'])}), "
+            f"which judges case {c['name']}"
+        )
     ids = cat.ids(c)
     t = cat.reg.types.get(("Workload", c["workload"]["type"]), {})
     required, _ = cat.case_metrics(c, t)
@@ -2784,7 +2832,9 @@ def _plan_case(cat, c, env_name, env, request, ov, s, leg, existing, invalidatio
         "run_props": {
             **cat.run_props(c),
             **({"run.purpose": request["purpose"]} if request.get("purpose") else {}),
-            **({"run.validity_policy": cat.digest("ValidityPolicy", cat.policy.name)} if cat.policy else {}),
+            **(
+                {"run.validity_policy": cat.digest("ValidityPolicy", cat.policy_of(c).name)} if cat.policy_of(c) else {}
+            ),
             "run.profile_level": level,
         },
         "action": "skip" if reason else "run",
@@ -2827,7 +2877,9 @@ def _plan_case(cat, c, env_name, env, request, ov, s, leg, existing, invalidatio
                 "labels": labels,
                 "repeats": repeats,
                 "environment": match.get("environment", "id"),
-                "floor": effective_floor(cat.policy.spec if cat.policy else None, request.get("purpose"), env),
+                "floor": effective_floor(
+                    cat.policy_of(c).spec if cat.policy_of(c) else None, request.get("purpose"), env
+                ),
                 "max_age": seconds(cfg["max_age"]) if cfg.get("max_age") else None,
                 "prefer": cfg["mode"] == "prefer",
             }
@@ -2940,6 +2992,7 @@ def build_result(
         "tags": ident["tags"],
         "disc": ident["disc"],
         "props": ident["props"],
+        **({"case": case["name"]} if case["type"] == "quality" else {}),
     }
     if ingest:
         case_block = {
@@ -2985,7 +3038,11 @@ def build_result(
             "repeats": reps,
             "aggregate": aggregate(reps, units, statistic, outliers),
             "reused_from": reused_from,
-            **_validity_block(cat, pinning_capped(validity, pinning, reps)),
+            **_validity_block(
+                cat,
+                validity if case["type"] == "quality" else pinning_capped(validity, pinning, reps),
+                cat.policy_of(case),
+            ),
         },
     }
 
@@ -3017,12 +3074,13 @@ def pinning_capped(validity, pinning, repeats):
     )
 
 
-def _validity_block(cat, validity):
+def _validity_block(cat, validity, policy=None):
     """validity = (state, reasons, purpose, trust) from validity_of(); stored as run.validity / run.validity_policy."""
-    if not validity or not cat.policy:
+    policy = policy or cat.policy
+    if not validity or not policy:
         return {}
     state, reasons, purpose, trust = validity
-    dg = cat.digest("ValidityPolicy", cat.policy.name)
+    dg = cat.digest("ValidityPolicy", policy.name)
     return {
         "validity": {"state": state, "reasons": reasons, "policy_digest": dg, "purpose": purpose},
         "run_props": {"run.validity": state, "run.validity_policy": dg, "run.purpose": purpose, "run.trust": trust},

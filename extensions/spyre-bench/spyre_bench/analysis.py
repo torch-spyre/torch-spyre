@@ -33,7 +33,7 @@ import statistics
 import sys
 from pathlib import Path
 
-from spyre_bench import engine
+from spyre_bench import engine, quality
 
 PIN_KEY = "run.exec.cpu_pinning"
 
@@ -377,7 +377,7 @@ def analyze(spec, results, metrics=None):
     """
     metrics = metrics or {}
     sel = set(spec["select"]["benchmarks"])
-    results = select_results(results, sel)
+    everything, results = results, select_results(results, sel)
     if not results:
         raise AnalysisError(f"no Result of {sorted(sel)}")
     derive, cmp_ = spec.get("derive"), spec.get("compare")
@@ -403,6 +403,8 @@ def analyze(spec, results, metrics=None):
         report["compare"] = compare(
             cmp_, rows, unit, metrics.get(base_metric, {}).get("direction"), spec.get("relax", [])
         )
+    if spec.get("reference"):
+        report["reference"] = quality.reference_report(spec, everything, results, metrics)
     report["warnings"] = warn
     return report
 

@@ -264,6 +264,7 @@ def decorate(cat, rec, errors, request=None):
         "benchmark": c["benchmark"],
         "id_mode": rec.get("id_mode", "engine"),
         "id_profile": ingest["profile"] if ingest else None,
+        **({"test_type": c["type"]} if c["type"] != "perf" else {}),
         "labels": cat.env_labels(env) if env else {},
         "pinning": engine.pin_block(env),
         "command": command or None,

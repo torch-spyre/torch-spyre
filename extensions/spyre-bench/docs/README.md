@@ -518,6 +518,116 @@ ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incide
 `spyre-bench reference` turns a run into a comparison target, seals it as a `bench-reference` bundle, submits it for
 approval and compares later runs with it, informationally and never as a baseline: [`references.md`](references.md).
 
+## Quality
+
+A quality Benchmark (`type: quality`) records a score over n samples: accuracy of an eval, or agreement with a reference
+output. Its result is advisory and carries no clean-node or timing requirement; what makes a score trustworthy is the
+data behind it.
+
+### What a quality command writes
+
+The command writes the usual `metrics.json` sidecar into `{repeat_dir}`. For the `llm/lm-eval` workload:
+
+| Key | Meaning |
+|---|---|
+| `samples["llm.eval.exact_match"]` (or `acc`, `acc_norm`, `f1`) | the score, one value per repeat |
+| `samples["llm.eval.<metric>_stderr"]` | the harness's standard error; without it the engine derives a binomial one from `llm.eval.n_samples` |
+| `samples["llm.eval.n_samples"]`, `error_frac`, `truncated_frac` | what was scored, how many requests failed, how many generations were cut |
+| `props["run.quality.dataset_digest"]` | digest of the question list that was scored |
+| `props["run.quality.harness"]`, `harness_version`, `protocol` | the harness, its version, and the digest the harness computed over task version, prompt and filter pipeline. Recorded, never authored |
+| `props["run.quality.model_revision"]` | the model commit |
+| `props["run.quality.temperature"]`, `seed` | how it sampled; `seed` is a run attribute, never identity |
+
+Per-question 0/1 vectors do not go in `samples`: the views reduce an array to one number. Keep them as an attachment next
+to the Result and record its digest in `run.quality.samples_digest`.
+
+### Gates and the quality ValidityPolicy
+
+A `ValidityPolicy` with `applies_to: [quality]` replaces the clean, qualification, cv and warm-up requirements with
+`requires.gates`, a list of pack gates evaluated for the row. A policy is either perf or quality; mixed lists are rejected,
+and Project `validity_policy` names the perf one. A quality case is judged by the quality policy, so the same purposes
+(`pr`, `nightly`, `reference`, ...) can list different gates for the two kinds.
+
+| Gate | Fails when | Caps at | Reason |
+|---|---|---|---|
+| `llm.dataset_digest` | the reported digest differs from the input's `expect.selection_digest` | invalid | `dataset_mismatch` (`dataset_unreported`; `dataset_unpinned` suspect when the input declares none) |
+| `llm.records_complete` | `n_samples` differs from `expect.records` | invalid | `records_incomplete` (`records_unreported`; `records_undeclared` suspect) |
+| `llm.no_errors` | `error_frac` is not 0 | invalid | `infrastructure` |
+| `llm.no_truncation` | `truncated_frac` is above 1% | suspect | `truncation` |
+| `llm.harness_pinned` | harness version or protocol is not recorded | suspect | `protocol_unpinned` |
+| `llm.model_pinned` | no model revision | suspect | `model_unpinned` |
+| `llm.determinism` | a greedy case sampled, or a sampled case has no seed | suspect | `sampling_in_greedy_case`, `seed_unpinned` |
+
+A gate whose input the command did not report caps at suspect with an `*_unreported` or `*_undeclared` reason
+(`errors_unreported`, `truncation_unreported`, `records_undeclared`, `dataset_unpinned`) rather than passing; `llm.determinism`
+also reports `sampling_in_greedy_case` and `sampling_mismatch` (the temperature that ran is not the one declared). Only the first
+input of a workload that carries `expect` is checked.
+
+A purpose with `reference: true` still needs `floor: valid` and `baseline: true`, but may leave out the clean and
+qualification requirements as long as it lists the five data gates `dataset_digest`, `records_complete`, `no_errors`,
+`harness_pinned` and `model_pinned`. `max_cv_pct` and `discard_warmup` are rejected on a quality row. A greedy case
+(`eval.temperature: 0`) must not set `eval.seed`.
+
+### Comparing a score with a reference
+
+An Analysis with a `reference` block compares each selected Result with a reference, in combined standard errors:
+
+```yaml
+kind: Analysis
+metadata: {name: quality-vs-reference}
+spec:
+  select: {benchmarks: [eval-questions]}
+  metric: llm.eval.exact_match
+  vary: [system.backend]
+  reference: {case: eval_questions_demoa_ref_l8, tolerance: {stderr: 3, abs: 0.02}}
+```
+
+`reference` is the Result of one case (`case`), or an inline `value` with its `stderr` or `n` and an abstract `label`.
+Per row: `pass`, `improved`, `regressed`, `suspected` (`single_run`), `no_power`, `no_stderr`, `invalid`. The allowance is the
+larger of `stderr` x combined standard error and `abs`. `regressed` needs a shortfall past the allowance and at least four
+combined standard errors; a smaller shortfall past it is `suspected`. When `abs` is set and the run cannot resolve it
+(1.645 combined standard errors above `abs`) the row is `no_power`. A Result whose validity is `invalid` or `suspect` is
+reported as such and is never `regressed`. See `examples/quality-demo` and `spyre-bench analyze`.
+
+With more than one repeat the engine aggregates the median of the per-repeat scores and of their standard errors; repeats are
+not pooled, so for a greedy case (the same samples again) the standard error stays the single-run one, and for a sampled
+case it is conservative. A Result no policy judged is reported `suspected` (`validity_unjudged`), and so is every row compared
+with a reference Result that is not `valid` (`reference_not_valid`). At p = 0 or 1 the binomial standard error uses a half-count
+shrink so a perfect score is never taken to have zero noise.
+
+Ingest: a quality case that uses the `generic` identity profile is handed to the ingest with `--trigger-type quality`
+(the `{test_type}` ingest token).
+
+### Adding a quality benchmark, dataset or metric
+
+`examples/quality-demo` is a runnable catalog of one quality case and its reference case; start from it.
+
+1. **The question list.** Declare an `Asset` with `integrity.files` (a sha256 per file) and a `Dataset` over it with a named
+   subset (`limit`, `order`). A subset is a fixed list, never "whatever the loader yields first": the same questions in the
+   same order are what make two runs comparable. A new file digest is a new input identity, hence a new series.
+2. **The Benchmark.** `type: quality`, a `llm/lm-eval` (or `llm/parity`) workload whose `inputs[].expect` states how many
+   records the run must score (`records`) and the digest of the selection (`selection_digest`, `sha256:...`). Set
+   `eval.temperature: 0` for a greedy case and leave `seed` out; a sampled case sets both and the gate `llm.determinism`
+   needs the seed recorded. List the metrics the case records under `metrics.required`.
+3. **The command.** `run.command` writes `metrics.json` into `{repeat_dir}` (see "What a quality command writes"). Report the
+   dataset digest of what it actually scored and every pin it knows; leave out what it does not know rather than guessing,
+   because a missing pin is what the gates look for. A command that cannot count errors must not write `error_frac`.
+4. **A metric.** Register it in the pack (`metrics:`) with a unit, a `direction`, `category: quality` for a score and
+   `diagnostic` for what supports one (standard error, counts, error shares), and the `statistic`. A score needs a
+   direction to be compared; a diagnostic has none and is never judged. Name the standard error `<metric>_stderr` so the
+   engine finds it, or let it derive a binomial one from `llm.eval.n_samples`.
+5. **Which gates.** The quality ValidityPolicy (central) lists gates per purpose. Start a new case under `pr` with
+   `llm.records_complete` and add the others as the command learns to report what they check. A quality reference purpose
+   must list the five data gates.
+6. **Identity.** With the `generic` ingest profile every prop of the benchmarks file is an identity key; list the same keys,
+   sorted, as `identity.discriminators` and keep seeds, concurrency and anything else about the run out of it. The id of the
+   engine and of the ingest must agree; a test that derives both for each case catches drift.
+7. **Judge it.** Add an `Analysis` with a `reference` block and run `spyre-bench analyze`. Use `abs` for the smallest change
+   that matters in practice and read `no_power` as "this many questions cannot resolve it".
+
+Per-architecture differences (which cases run, card limits, models to skip) belong in data next to the product repo's
+definitions, selected by an architecture name that only names a file. Nothing in a command, Makefile or workflow branches on it.
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
