@@ -275,7 +275,8 @@
 {"d":"2026-11-09","arch":"x86_64","runs":1,"runs_linked":0,"runs_missing_result":0,"runs_missing_cases":1,"runs_no_case_output":0,"coverage":0},
 {"d":"2026-11-10","arch":"x86_64","runs":2,"runs_linked":0,"runs_missing_result":0,"runs_missing_cases":2,"runs_no_case_output":0,"coverage":0},
 {"d":"2026-11-11","arch":"x86_64","runs":2,"runs_linked":0,"runs_missing_result":0,"runs_missing_cases":2,"runs_no_case_output":0,"coverage":0},
-{"d":"2026-11-12","arch":"x86_64","runs":2,"runs_linked":0,"runs_missing_result":0,"runs_missing_cases":2,"runs_no_case_output":0,"coverage":0}
+{"d":"2026-11-12","arch":"x86_64","runs":2,"runs_linked":0,"runs_missing_result":0,"runs_missing_cases":2,"runs_no_case_output":0,"coverage":0},
+{"d":"2026-11-15","arch":"","runs":1,"runs_linked":0,"runs_missing_result":1,"runs_missing_cases":0,"runs_no_case_output":0,"coverage":0}
 ],
 "subscription_artifacts": [
 {"a":"08d9cb6f-587f-5bad-93bd-fd4b4ea76b7f","subscription_id":"wild","component":"torch-spyre"},
