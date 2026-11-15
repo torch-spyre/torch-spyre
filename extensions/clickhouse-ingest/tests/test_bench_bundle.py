@@ -660,7 +660,7 @@ def test_per_repeat_props_cannot_skip_the_downgrade(tmp_path, db):
 
 
 def test_two_cases_that_share_one_id_are_refused_at_ingest(tmp_path, db):
-    a, b = result(), result()
+    b = result()
     b["status"]["case"]["disc"] = {"batch": "4", "x": "Foo"}
     c = result()
     c["status"]["case"]["disc"] = {"batch": "4", "x": "foo"}
