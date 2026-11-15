@@ -32,8 +32,7 @@ Applying them in filename order works from an empty database.
 | `58-ci-event-records.sql` | `poller_decisions`, `ci_write_failures`, `merge_queue_events` | — |
 | `59-ci-request-views.sql` | `v_ci_requests`, `v_ci_cell_durations` | 20, 42, 50 |
 | `60-benchmark-views.sql` | `benchmark_excluded_record_types`, `v_benchmark_runs_measured`, 5 `v_benchmark_*` views | 20, 30, 50 |
-| `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
-| `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
+| `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `benchmark_baseline_purposes`, `benchmark_metric_verdicts` + its refreshable MV | 60, 85 (the MV reads `v_benchmark_metric_verdicts`; refreshable MVs are created last) |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
 | `65-insight-reports.sql` | `insight_reports`, `v_insight_reports` | — |
 | `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
@@ -46,6 +45,7 @@ Applying them in filename order works from an empty database.
 | `82-run-placements.sql` | `run_placements`, `v_run_placements_effective`, `v_run_devices` | — |
 | `83-result-invalidations.sql` | `result_invalidations`, `v_invalidation_state`, `v_invalidated_runs` | 49, 82 |
 | `84-bench-views.sql` | `v_bench_attrs`, `v_bench_results` | 20, 30, 49, 60, 81, 82, 83 |
+| `85-benchmark-verdict-views.sql` | `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `v_perf_regression_gate` (they skip invalidated runs and keep suspect or non-baseline-purpose runs out of baselines) | 20, 49, 60, 62, 83 |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
