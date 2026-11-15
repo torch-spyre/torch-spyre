@@ -2,7 +2,8 @@
 
 A catalog engine for benchmarks: it validates `bench/v1alpha1` YAML catalogs, expands benchmark templates into cases,
 derives their identity, and plans runs with reuse, invalidation and qualification rules. It is a library plus a small
-CLI; it does not execute benchmarks.
+CLI: `plan` marks each case run, reuse or skip, `run` executes a plan's declared commands and hands the raw outputs to
+the ingest, and `verdict` prints the stored verdict of a run. It writes no database rows itself.
 
 > **Concepts, kinds and naming:** [`docs/README.md`](docs/README.md).
 
@@ -22,6 +23,7 @@ Not published; install from the checkout.
 uv pip install extensions/spyre-bench                 # PyYAML + regex
 uv pip install "extensions/spyre-bench[jsonschema]"   # full Draft 2020-12 validation
 uv pip install "extensions/spyre-bench[ingest]"       # stored benchmark_id of ingest-mode Benchmarks (checkout only)
+uv pip install "extensions/spyre-bench[clickhouse]"   # the read-only ClickHouse store (reuse lookup, rows landed, verdict)
 ```
 
 Without `jsonschema` the engine falls back to a stdlib validator that covers the schema subset the core schemas use.
@@ -34,6 +36,10 @@ spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-examp
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
 spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
 spyre-bench gen-schemas --check
+spyre-bench plan --catalog examples/run-demo --central examples/central --purpose nightly --arch x86_64 \
+    --reference-node --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan.json
+spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
+spyre-bench verdict --run-id <uuid> --store clickhouse --json
 ```
 
 `validate` exits 0 when valid and 2 otherwise; `gen-schemas --check` exits 1 when the schemas are stale and `gen-schemas` writes only inside a source checkout unless you pass `--out DIR`. `explain` shows a case with every reference resolved: identity inputs,
@@ -57,6 +63,7 @@ plan = engine.plan(cat, {"purpose": "pr", "selection": {"tier": "sanity"}}, leg)
 |---|---|
 | `spyre_bench/engine.py` | registry, catalog validation, case expansion, identity, plan, reuse, invalidation, qualification, validity |
 | `spyre_bench/validate.py`, `explain.py`, `analysis.py`, `gen_schemas.py`, `cli.py` | the CLI verbs (`analysis.py` also evaluates `derive` and `compare`) |
+| `spyre_bench/plan.py`, `run.py`, `verdict.py`, `store.py`, `planfile.py`, `cliutil.py` | the `plan`, `run` and `verdict` verbs, the stores behind them (none, ClickHouse, in-memory), the `plan.json` constants and token templates, shared CLI plumbing |
 | `spyre_bench/ingest_adapter.py`, `ids.py` | the only import of the ingest derivation; the `ids` verb |
 | `spyre_bench/placement.py` | observed CPU placement (`run.exec.*`) from `/proc` and `/sys` |
 | `spyre_bench/core/` | the core pack and the generated JSON Schemas (one per authored kind, plus tool-output shapes) |

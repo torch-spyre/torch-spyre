@@ -916,6 +916,28 @@
     },
     "fresh_cache": {
      "type": "boolean"
+    },
+    "allow_empty": {
+     "type": "boolean",
+     "description": "a run that exits 0 without raw output or metrics.json is not a failure"
+    },
+    "command": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     },
+     "minItems": 1,
+     "description": "argv with {tokens}; see docs/README.md (Running)"
+    },
+    "ingest": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     },
+     "minItems": 1,
+     "description": "argv of the ingest hand-off, same tokens"
     }
    },
    "description": "run attributes: never identity; overridable at run time"
