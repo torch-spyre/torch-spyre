@@ -43,8 +43,13 @@ FROM
                0 AS non_smoke
         FROM test_case_runs
         WHERE run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted' AND NOT is_round)
-          AND run_id NOT IN (SELECT run_id FROM artifact_results
-                             WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE component = 'reference'))
+          -- Mirrors the per-artifact results filter: drop a run only if every verdict it has is a
+          -- reference's. The nil run_id is a placeholder shared by unrelated rows, never a run.
+          AND (run_id IN (SELECT run_id FROM artifact_results
+                          WHERE artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference'))
+               OR run_id NOT IN (SELECT run_id FROM artifact_results
+                                 WHERE run_id != toUUID('00000000-0000-0000-0000-000000000000')
+                                   AND artifact_id IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')))
           AND props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds)
         GROUP BY run_id
     )

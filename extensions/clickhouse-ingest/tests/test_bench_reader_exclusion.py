@@ -520,3 +520,39 @@ def test_rows_with_no_artifact_behind_them_are_kept(setting, base, extra):
     # The exclusion tests a joined column; an unjoined row must survive it, with or without nulls.
     for snap in (base, extra):
         assert snap["facts"][setting] == [{"tags": 1, "results": 1, "bench": 1}]
+
+
+COVERAGE = "SELECT runs, runs_linked, runs_missing_result, runs_missing_cases FROM v_run_coverage"
+
+
+def coverage_with(extra_verdicts, case_runs):
+    c = build(extras=True)
+    try:
+        c.insert("artifact_results", extra_verdicts)
+        c.insert("test_case_runs", [{"run_id": r, "test_case_id": u("tc"),
+                                     "component": "spyre-inference", "status": "passed"}
+                                    for r in case_runs])  # fmt: skip
+        return c.rows(COVERAGE)
+    finally:
+        c.s.close()
+
+
+def test_a_run_with_reference_and_normal_verdicts_keeps_its_cases():
+    # Only the normal verdict counts, so its cases must too: no false runs_missing_cases.
+    run = u("mixed-run")
+    base = coverage_with(
+        [verdict(A_SI, run, "2026-11-09 13:30:00", "functional", "unit")], [run]
+    )
+    both = coverage_with(
+        [verdict(A_SI, run, "2026-11-09 13:30:00", "functional", "unit"),
+         verdict(A_REF, run, "2026-11-09 13:31:00", "functional", "unit")],
+        [run],
+    )  # fmt: skip
+    assert both == base
+
+
+def test_a_nil_run_reference_verdict_does_not_hide_other_nil_run_cases():
+    nil = "00000000-0000-0000-0000-000000000000"
+    with_ref = coverage_with([verdict(A_REF, nil, "2026-11-09 13:40:00")], [nil])
+    without = coverage_with([], [nil])
+    assert with_ref == without
