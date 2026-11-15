@@ -115,3 +115,18 @@ A kit that writes a newer `schema_version` or a field this ingest does not know 
 ingest first, then ship the new kit; `results --check <bundle>` says what is missing. `spyre-bench upload` needs the
 whole ingest package on the sealing host (`offline.py` reads `bundle.schema.json` beside it); the vendored
 `spyre_clickhouse_ingest.identity` module that only derives benchmark ids is not enough for it.
+
+## Limits (read before relying on it)
+
+- **`env_id` is a claim.** The receiving side does not recompute it from the fingerprint (the engine's `validate` does).
+  A lower channel can name another environment's id; its runs then carry that `env.id` but keep their own `run.trust`,
+  so a trust-filtered series, and the qualification check (which needs a CI-trusted evidence run measured in that
+  environment), do not accept them. A fingerprint row first written by a lower channel is described again when CI sends
+  the same `env_id`.
+- **A run keeps the lowest trust of what was added to it.** Adding repeats to a CI run through a lower channel supersedes
+  the verdict with the lower trust; keep manual run keys distinct from CI's.
+- **Failed repeats** (`status` other than `ok`, no samples) have no `benchmark_runs` row, so they are not compared on a
+  re-send; the run's verdict records that a case had no ok repeat.
+- **Placements are one row per repeat number.** Cases of one run that share a repeat number are merged
+  (`placement.merged`), and a later bundle adding a case at an existing repeat does not change the stored placement; use
+  a `bench-placement` update for that.

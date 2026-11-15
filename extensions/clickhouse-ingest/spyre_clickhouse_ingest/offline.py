@@ -631,6 +631,10 @@ def bench_result(path: Path) -> dict:
     for key in ("component", "name"):
         if not isinstance(case.get(key), str) or not case[key].strip():
             raise BundleError(f"{where}: status.case.{key} is required")
+    if not isinstance(case.get("disc_keys", []), list) or not all(
+        isinstance(k, str) for k in case.get("disc_keys", [])
+    ):
+        raise BundleError(f"{where}: status.case.disc_keys is a list of strings")
     if not isinstance(case.get("tags", []), list):
         raise BundleError(f"{where}: status.case.tags is a list")
     _strmap(case.get("disc"), f"{where} status.case.disc")
@@ -669,6 +673,18 @@ def bench_result(path: Path) -> dict:
         _reserved(r.get("props") or {}, f"{at} props")
         _strmap(r.get("props"), f"{at} props")
         _strmap(r.get("clean"), f"{at} clean")
+        if r.get("started_at") is not None:
+            try:
+                _ts(str(r["started_at"]))
+            except ValueError:
+                raise BundleError(f"{at}: started_at is not an ISO-8601 time") from None
+        n_it = r.get("iterations", 0)
+        if not isinstance(n_it, int) or isinstance(n_it, bool) or n_it < 0:
+            raise BundleError(f"{at}: iterations is a count")
+        if not isinstance(r.get("placement", {}).get("links", []), list) or not all(
+            isinstance(x, str) for x in r.get("placement", {}).get("links", [])
+        ):
+            raise BundleError(f"{at}: placement.links is a list of strings")
         samples = r.get("samples") or {}
         if not isinstance(samples, dict):
             raise BundleError(f"{at}: samples maps a metric to its values")
@@ -751,8 +767,17 @@ def check_admin(root: Path, meta: dict, results: list) -> None:
             for key in ("name", "spec_digest"):
                 if not isinstance(r.get(key), str) or not r[key].strip():
                     raise BundleError(f"{at}: {key} is required")
-            if not isinstance(r.get("spec", {}), dict):
-                raise BundleError(f"{at}: spec is an object")
+            spec = r.get("spec", {})
+            if not isinstance(spec, dict) or not all(
+                isinstance(spec.get(k, {}), dict)
+                for k in ("labels", "policy", "host_profile", "qualification")
+            ):
+                raise BundleError(
+                    f"{at}: spec is an object whose labels, policy, host_profile and qualification are objects"
+                )
+        source = json.loads(path.read_text()).get("source", {})
+        if not isinstance(source, dict):
+            raise BundleError(f"{path.name}: source is an object")
     elif kind == "bench-qualification":
         for i, r in enumerate(_records(path, "records")):
             at = f"{path.name} records[{i}]"
@@ -829,6 +854,22 @@ def check_admin(root: Path, meta: dict, results: list) -> None:
                     raise BundleError(
                         f"{at}: scope_kind {e['scope_kind']} needs scope.{key}"
                     )
+            for key in ("run_id", "benchmark_id"):
+                if scope.get(key) is not None and not UUID_RE.match(str(scope[key])):
+                    raise BundleError(f"{at}: scope.{key} is a UUID")
+            if e["scope_kind"] == "run" and (
+                scope.get("benchmark_id") or scope.get("repeat") is not None
+            ):
+                raise BundleError(
+                    f"{at}: a run scope names neither benchmark_id nor repeat"
+                )
+            rep_n = scope.get("repeat")
+            if rep_n is not None and (
+                not isinstance(rep_n, int)
+                or isinstance(rep_n, bool)
+                or not 0 <= rep_n <= MAX_REPEAT
+            ):
+                raise BundleError(f"{at}: scope.repeat is a count")
             for key in ("window_from", "window_to"):
                 if scope.get(key) and not _date_time(str(scope[key])):
                     raise BundleError(
