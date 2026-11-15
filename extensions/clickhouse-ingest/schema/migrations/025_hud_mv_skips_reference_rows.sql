@@ -1,6 +1,7 @@
 -- RERUNNABLE
 -- oss_ci_benchmark_v3_mv skips comparison-target rows (run.ref_only), which share benchmark_runs
 -- with measurements. Rows already projected are kept; no such rows existed before this migration.
+-- DROP then CREATE is not atomic: benchmark_runs inserts in the gap are not projected, so run it quiet.
 DROP VIEW IF EXISTS oss_ci_benchmark_v3_mv;
 
 CREATE MATERIALIZED VIEW oss_ci_benchmark_v3_mv TO oss_ci_benchmark_v3 AS
