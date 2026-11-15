@@ -82,6 +82,13 @@ window has that gate; `improved` counts passing series with an improved metric),
 `invalidated_runs_in_window`. A series is (component, arch, benchmark, backend, source_job). SQL: stored verdicts over
 the lookback, rolled up as `v_benchmark_gate`, newest run per series, `run_id NOT IN` whole-run invalidations.
 
+Anchored status (schema 88, see "Anchored baseline" below): each tile also carries `anchored {regressed, suspected, improved, unchanged,
+no_anchor}`, series (benchmark x backend x source_job) in the window counted by the worst newest anchored verdict over their blocking and
+advisory metrics; and `data.persistent_regressions[]` lists the metrics whose newest anchored verdict is `regressed` (at most 50, longest
+first): `arch, component, benchmark_id, name, backend, source_job, metric, tier, worse_pct, since_ts, n_exceeding_runs, days_exceeding,
+anchor_version`. SQL: `v_benchmark_anchored_verdicts` (a live view, not the stored history) bounded by the lookback and filtered by
+arch/component. A tile counts series (benchmark x backend x source_job); the list has one entry per regressed metric, so a series with two regressed metrics counts once and is listed twice. A database without schema 88 returns zero counts, an empty list and `meta.notes`; a database with 88 but without one of its dependencies (86, 83) is an error, not a note.
+
 ### `GET /perf/suites`  (L1)
 
 | Param | Default | Meaning |
@@ -116,6 +123,17 @@ env_id, env_changed, purpose, validity, invalidation_state, invalidations[]` and
 worse_pct, floor_pct, n_baseline, score, band {low, high, center}, baseline_includes_invalidated[], policy_version}`. The band is
 `baseline_value * (1 +/- floor_pct/100)`; the worse side is the regression threshold. Errors: `404 unknown_benchmark|unknown_series`,
 `422 not_a_measurement_series` for trace record types.
+
+Anchored baseline (schema 88): `data.anchor` is `{state: "none"}` when the series has no current anchor (and `unavailable`, with `meta.notes`, on
+a database without schema 88); otherwise `{state: "anchored", artifact_id, ref_key, version, value, n_samples, from, accepted_by,
+accepted_at, from_run_id, source_job, floor_pct, band {low, high, center}, latest, persistent}`. `latest` is the newest point's anchored
+verdict and `persistent` is true when it is `regressed`. Every point has `anchored`, null when there is no anchor, else `{status, reason,
+anchor_value, delta_pct, worse_pct, floor_pct, since_ts, n_exceeding_runs, days_exceeding, version}`: `status` is `regressed`,
+`suspected`, `improved`, `unchanged` or `no_anchor` (before the anchor's time); `reason` is `anchor_regressed`, `anchor_improved`,
+`anchor_unchanged`, `no_anchor`, or the rolling view's `single_run`, `suspect_data`, `purpose_not_baseline`. `since_ts` and
+`n_exceeding_runs` describe the unbroken streak of eligible runs over the anchored floor while the point is over it. `summary` gains
+`last_anchored_status`; both describe the newest valid point and are null (not the run before) when that point has no anchored row yet. The rolling `verdict` is unchanged and still answers "got worse recently"; `anchored` answers "worse than the
+accepted normal, and since when".
 
 ### `GET /perf/runs/{run_id}`  (L3)
 
@@ -181,12 +199,23 @@ comparability_verdict` (`comparable` when every `ref.comparability.*` is `same`,
 any is `incompatible`). With `key`: `{reference, values[{benchmark_id, name, backend, metric, value, n, terms}]}`. Only published
 versions are listed (`v_bench_references`, schema 86); a published version whose key has no tag row yet is `untagged`.
 
+### Anchored baseline
+
+The rolling baseline (previous 20 eligible runs) absorbs a persistent shift: after about 20 runs at the new level the rolling verdict is
+`unchanged` again and the regression goes quiet. The anchored verdict (`v_benchmark_anchored_verdicts`, schema 88) compares the same
+runs with a fixed accepted baseline, a current reference version marked `ref.anchor = 1` (an approved reference, or a run accepted as the
+new normal), with the same noise rule (floor = max(policy floor, 2 x 1.4826 x MAD% of the anchor's samples), `regressed` needs two
+consecutive eligible runs over, suspect or off-purpose runs capped at `suspected`). Only runs after the anchor's time are compared.
+These endpoints read the live view, not the stored history, so they are bounded by series and window; unlike the rolling verdict there is
+no stored history of anchored verdicts, and a history rewritten by accepting a new anchor is the intended behaviour.
+
 ## Bounds, per endpoint
 
 | Endpoint | Tables read | Bound |
 |---|---|---|
 | overview, suites | `benchmark_metric_verdicts` (partition `toYYYYMM(ts)`), `v_invalidated_runs`, `benchmarks` | verdict `ts` window (max 30 d + lookback 90 d), `LIMIT` 500 / 20000 |
 | series | verdicts, `benchmark_runs` (component, benchmark, backend, `ts`), `v_artifact_results_published`, `v_artifacts`, `artifact_tags` | window, `component = c` primary-key prefix, run id lists, `LIMIT` |
+| overview (anchored), series (anchor line) | `v_benchmark_anchored_verdicts`, `v_benchmark_anchor` (schema 88: live; the series read is filtered by component, benchmark, arch, backend, metric, run time) | lookback window, `LIMIT` 20000 |
 | run, environment | `benchmark_runs WHERE run_id = x` (no component known, generic exclusion search), placements, schema 81 views | one run |
 | steps, spans | `benchmark_runs WHERE run_id = x` unnested server-side | one run, `max_rows` / `limit` |
 | compare | as run, plus verdicts window for `effect` | run ids / window |

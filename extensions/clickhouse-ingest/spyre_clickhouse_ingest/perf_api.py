@@ -242,6 +242,35 @@ FROM ({latest_verdicts(extra, cols)})
 GROUP BY run_id, benchmark_id, component, backend, arch, source_job"""
 
 
+def anchored_read(run, sql, params):
+    """Rows of the anchored views (schema 88), or None when the database predates them."""
+    try:
+        return run(sql, params)
+    except (
+        Exception
+    ) as e:  # clickhouse_connect and chdb word the missing-object error differently
+        if "v_benchmark_anchor" in str(e) and any(
+            m in str(e)
+            for m in (
+                "UNKNOWN_TABLE",
+                "Unknown table",
+                "doesn't exist",
+                "does not exist",
+            )
+        ):
+            return None
+        raise
+
+
+def anchor_status(r):
+    """The point-level anchored verdict from a v_benchmark_anchored_verdicts row."""
+    return {
+        "status": r["status"], "reason": r["reason"], "anchor_value": rnd(num(r["anchor_value"])), "delta_pct": rnd(num(r["delta_pct"]), 1),
+        "worse_pct": rnd(num(r["worse_pct"]), 1), "floor_pct": rnd(num(r["floor_pct"]), 1), "since_ts": iso(r["since_ts"]) if r["since_ts"] else None,
+        "n_exceeding_runs": int(r["n_exceeding_runs"] or 0), "days_exceeding": int(r["days_exceeding"] or 0), "version": r["version"] or None,
+    }  # fmt: skip
+
+
 def invalidations(run, run_ids):
     """{run_id: [hit]} from v_invalidated_runs (run, run_benchmark, node/device/placement scopes, retracted uploads)."""
     if not run_ids:
@@ -445,6 +474,7 @@ def overview(
         p,
     )
     bmap = {(r["run_arch"], r["run_component"]): int(r["n"]) for r in bad}
+    anchored, persistent, anote = _overview_anchored(run, p, flt)
     rmap = {(r["arch"], r["component"]): r for r in runs}
     tiles = []
     for s in series:
@@ -463,9 +493,68 @@ def overview(
             "coverage": {"seen_in_window": int(s["n_in_window"]), "known_in_lookback": int(s["n_known"]),
                          "ratio": rnd(int(s["n_in_window"]) / int(s["n_known"]), 3) if int(s["n_known"]) else None},
             "runs_in_window": int(r.get("n_runs", 0)), "invalidated_runs_in_window": bmap.get((s["arch"], s["component"]), 0),
+            "anchored": anchored.get((s["arch"], s["component"]), dict(ANCHORED_ZERO)),
         })  # fmt: skip
-    return envelope({"tiles": tiles}, now, 60, window={"from": iso(win_from), "to": iso(now), "lookback_days": lookback},
-                    no_data=not tiles)  # fmt: skip
+    return envelope({"tiles": tiles, "persistent_regressions": persistent}, now, 60,
+                    window={"from": iso(win_from), "to": iso(now), "lookback_days": lookback}, no_data=not tiles,
+                    **({"notes": anote} if anote else {}))  # fmt: skip
+
+
+ANCHORED_ZERO = {
+    "regressed": 0,
+    "suspected": 0,
+    "improved": 0,
+    "unchanged": 0,
+    "no_anchor": 0,
+}
+
+
+def _overview_anchored(run, p, flt, limit=50):
+    """Per tile: series by their newest anchored verdict (blocking and advisory metrics only), and the persistent regressions."""
+    rows = anchored_read(
+        run,
+        f"""SELECT arch, component, benchmark_id, any(name) AS name, backend, source_job, metric, any(tier) AS tier,
+                   max(run_ts) AS last_ts, argMax(status, (run_ts, run_id)) AS st, argMax(worse_pct, (run_ts, run_id)) AS worse_pct,
+                   argMax(since_ts, (run_ts, run_id)) AS since_ts, argMax(n_exceeding_runs, (run_ts, run_id)) AS n_exceeding_runs,
+                   argMax(days_exceeding, (run_ts, run_id)) AS days_exceeding, argMax(version, (run_ts, run_id)) AS version
+            FROM v_benchmark_anchored_verdicts
+            WHERE run_ts >= {{t_from:DateTime}} AND run_ts < {{t_to:DateTime}} {flt}
+            GROUP BY arch, component, benchmark_id, backend, source_job, metric
+            HAVING last_ts >= {{w_from:DateTime}} AND tier IN ('blocking', 'advisory')
+            ORDER BY arch, component, benchmark_id, backend, source_job, metric LIMIT 20000""",
+        p,
+    )
+    if rows is None:
+        return {}, [], ["schema 88 (anchored verdicts) is not applied"]
+    note = (
+        ["anchored counts are truncated at 20000 series x metrics"]
+        if len(rows) >= 20000
+        else None
+    )
+    order = ("regressed", "suspected", "improved", "unchanged", "no_anchor")
+    series = {}
+    for r in rows:
+        k = (
+            r["arch"],
+            r["component"],
+            str(r["benchmark_id"]),
+            r["backend"],
+            r["source_job"],
+        )
+        series.setdefault(k, []).append(r)
+    tiles, persistent = {}, []
+    for k, rs in series.items():
+        worst = min((r["st"] for r in rs), key=order.index)
+        tiles.setdefault((k[0], k[1]), dict(ANCHORED_ZERO))[worst] += 1
+        for r in rs:
+            if r["st"] == "regressed":
+                persistent.append({
+                    "arch": k[0], "component": k[1], "benchmark_id": k[2], "name": r["name"], "backend": k[3], "source_job": k[4],
+                    "metric": r["metric"], "tier": r["tier"], "worse_pct": rnd(num(r["worse_pct"]), 1), "since_ts": iso(r["since_ts"]),
+                    "n_exceeding_runs": int(r["n_exceeding_runs"]), "days_exceeding": int(r["days_exceeding"]), "anchor_version": r["version"],
+                })  # fmt: skip
+    persistent.sort(key=lambda x: (-x["days_exceeding"], x["name"] or "", x["metric"]))
+    return tiles, persistent[:limit], note
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -809,6 +898,9 @@ def series(run, benchmark_id, now=None, metric=None, arch=None, backend=None, so
             highlight=False,
         )
         points.append(pt)
+    anchor_line, anchor_notes = _attach_anchor(
+        run, points, p, comp, bid, sel, start, end
+    )
     if not flag(include_invalid):
         points = [pt for pt in points if pt["invalidation_state"] != "invalidated"]
     cvs = [pt["noise_cv_pct"] for pt in points if pt["noise_cv_pct"] is not None]
@@ -839,7 +931,11 @@ def series(run, benchmark_id, now=None, metric=None, arch=None, backend=None, so
             "last_status": (points[-1]["verdict"] or {}).get("status")
             if points
             else None,
+            "last_anchored_status": ((anchor_line or {}).get("latest") or {}).get(
+                "status"
+            ),
         },  # fmt: skip
+        "anchor": anchor_line,
     }
     if reference_key:
         try:
@@ -853,7 +949,71 @@ def series(run, benchmark_id, now=None, metric=None, arch=None, backend=None, so
         window={"from": iso(start), "to": iso(end)},
         series_options=options,
         truncated=len(vrows) >= limit,
+        **({"notes": anchor_notes} if anchor_notes else {}),
     )
+
+
+def _attach_anchor(run, points, p, comp, bid, sel, start, end):
+    """The series' current anchor and each point's anchored verdict (schema 88); no anchor is a state, not an error."""
+    q = {
+        **p,
+        "a": sel["arch"],
+        "b": sel["backend"],
+        "j": sel["source_job"],
+        "m": sel["metric"],
+    }
+    keyed = " AND component = {c:String} AND benchmark_id = {bid:UUID} AND arch = {a:String} AND backend = {b:String} AND metric = {m:String}"
+    for pt in points:
+        pt["anchored"] = None
+    anc = anchored_read(
+        run,
+        f"""SELECT anchor_artifact_id, ref_key, version, anchor_from, accepted_by, accepted_at, from_run_id, n_samples, anchor_value,
+                   anchor_mad, source_job
+            FROM v_benchmark_anchor WHERE source_job IN ({{j:String}}, '') {keyed}
+            ORDER BY source_job DESC LIMIT 1""",
+        q,
+    )
+    if anc is None:
+        return {"state": "unavailable"}, [
+            "schema 88 (anchored verdicts) is not applied"
+        ]
+    if not anc:
+        return {"state": "none"}, None
+    a = anc[0]
+    rows = anchored_read(
+        run,
+        f"""SELECT run_id, status, reason, anchor_value, delta_pct, worse_pct, floor_pct, since_ts, n_exceeding_runs, days_exceeding, version
+            FROM v_benchmark_anchored_verdicts
+            WHERE source_job = {{j:String}} {keyed} AND run_ts >= {{t_from:DateTime}} AND run_ts < {{t_to:DateTime}}
+            ORDER BY run_ts DESC, run_id LIMIT 20000""",
+        q,
+    )
+    by = {str(r["run_id"]): r for r in rows or []}
+    for pt in points:
+        r = by.get(pt["run_id"])
+        pt["anchored"] = anchor_status(r) if r else None
+    base = num(a["anchor_value"])
+    floor = next(
+        (num(r["floor_pct"]) for r in rows or [] if r["status"] != "no_anchor"),
+        None,
+    )
+    newest = next(
+        (pt for pt in reversed(points) if pt["invalidation_state"] != "invalidated"),
+        None,
+    )
+    last = (
+        newest["anchored"] if newest else None
+    )  # no anchored row yet is unknown, not the run before
+    return {
+        "state": "anchored", "artifact_id": str(a["anchor_artifact_id"]), "ref_key": a["ref_key"], "version": a["version"],
+        "value": rnd(base), "n_samples": int(a["n_samples"]), "from": iso(a["anchor_from"]), "accepted_by": a["accepted_by"] or None,
+        "accepted_at": a["accepted_at"] or None, "from_run_id": a["from_run_id"] or None, "source_job": a["source_job"] or None,
+        "floor_pct": rnd(floor, 1),
+        "band": None if not base or floor is None else
+            {"low": rnd(base * (1 - floor / 100)), "high": rnd(base * (1 + floor / 100)), "center": rnd(base)},
+        "latest": last,
+        "persistent": bool(last and last["status"] == "regressed"),
+    }, None  # fmt: skip
 
 
 def _bench_head(bm, bid):
