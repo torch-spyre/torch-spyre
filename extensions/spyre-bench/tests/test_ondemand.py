@@ -735,6 +735,16 @@ class EngineRequestCli(unittest.TestCase):
         self.assertEqual((env["BENCH_SUITES"], env["BENCH_TIER"], env["BENCH_REUSE"]), ("decoder", "sanity", "only"))
         self.assertNotIn("BENCH_SELECTION", env)
 
+    def test_sanitize_reads_stdin(self):
+        import io
+        from unittest import mock
+
+        with mock.patch("sys.stdin", io.StringIO("see [a](http://x) @team `c`\n")):
+            code, out, _ = capture(cli_main, ["ondemand", "sanitize"])
+        self.assertEqual(code, 0)
+        for bad in ("](", "@team", "`", "://"):
+            self.assertNotIn(bad, out)
+
     def test_error_text_is_neutralised(self):
         c = TMP / "ondemand-bad.txt"
         c.write_text("/bench @team`x`<b>=1")

@@ -20,7 +20,7 @@ callers (a PR-comment workflow, the internal comment bot) fetch the facts, call 
   spyre-bench ondemand parse     --comment-file F --host H            comment -> request.json
   spyre-bench ondemand authorize --facts F                            request + actor + PR facts -> decision.json
   spyre-bench ondemand preview   --plan P --request R [--format md]   plan.json -> preview comment / JSON
-  spyre-bench ondemand engine-request | env | state                    request -> plan request / BENCH_* / hidden state
+  spyre-bench ondemand engine-request | env | state | sanitize         request -> plan request / BENCH_* / hidden state / inert text
 
 Grammar, policy table and the threat model: docs/README.md ("On-demand benchmarks for a PR").
 """
@@ -1004,6 +1004,11 @@ def _cmd_env(a):
     return cliutil.EXIT_OK
 
 
+def _cmd_sanitize(a):
+    print(safe(sys.stdin.read(a.limit * 4), a.limit))
+    return cliutil.EXIT_OK
+
+
 def _cmd_state(a):
     state = decode_state(sys.stdin.read())
     print(json.dumps(state))
@@ -1034,6 +1039,9 @@ def parser():
     p.add_argument("--subject-id")
     p.add_argument("--environment")
     p.set_defaults(fn=_cmd_env)
+    p = sub.add_parser("sanitize", help="stdin -> the same text made inert for a PR comment")
+    p.add_argument("--limit", type=int, default=600)
+    p.set_defaults(fn=_cmd_sanitize)
     p = sub.add_parser("state", help="comment body on stdin -> the hidden state, exit 4 when there is none")
     p.set_defaults(fn=_cmd_state)
     p = sub.add_parser("preview", help="plan.json + request.json -> preview")
