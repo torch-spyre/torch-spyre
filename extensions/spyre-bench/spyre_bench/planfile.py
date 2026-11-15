@@ -43,6 +43,7 @@ RUN_TOKENS = (
     "repeat_dir",
     "out_dir",
     "python",
+    "pin_wrapper",
 )
 INGEST_TOKENS = (
     "python",

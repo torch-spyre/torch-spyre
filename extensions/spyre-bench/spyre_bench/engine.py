@@ -33,7 +33,7 @@ from pathlib import Path
 import regex as re
 import yaml
 
-from spyre_bench import ingest_adapter, placement
+from spyre_bench import ingest_adapter, pinning_plan, placement
 from spyre_bench.ingest_adapter import IngestUnavailable
 from spyre_bench.placement import parse_cpu_list
 
@@ -1173,17 +1173,7 @@ class Catalog:
                 self.errors.append(f"{w}: host.clean.max_hold must be positive")
         pin = pin_block(env)
         if pin:
-            if (pin["policy"] == "explicit") != ("cpus" in pin):
-                self.errors.append(f"{w}: host.cpu_pinning: cpus is required for, and only valid with, policy explicit")
-            if pin.get("require_verified") and pin["policy"] == "none":
-                self.errors.append(f"{w}: host.cpu_pinning: require_verified needs a policy other than none")
-            if "cpus" in pin:
-                try:
-                    parse_cpu_list(pin["cpus"])
-                except ValueError as x:
-                    self.errors.append(f"{w}: host.cpu_pinning.cpus: {x}")
-            if pin["policy"] in ("device_local", "per_device") and not self.accelerator_count(env):
-                self.errors.append(f"{w}: host.cpu_pinning: policy {pin['policy']} needs an accelerator request")
+            self.errors += [f"{w}: {x}" for x in pin_problems(pin, self.accelerator_count(env))]
             if "cpu_pinning" in (env.get("labels") or {}):
                 self.errors.append(f"{w}: labels.cpu_pinning is derived from host.cpu_pinning; remove it")
         if host.get("node_class"):
@@ -2549,6 +2539,45 @@ def pin_block(env):
     return pin if isinstance(pin, dict) and isinstance(pin.get("policy"), str) else None
 
 
+def pin_problems(pin, accelerators):
+    """What is wrong with a host.cpu_pinning block, as messages (empty when it is consistent)."""
+    out, policy = [], pin["policy"]
+    if (policy == "explicit") != ("cpus" in pin):
+        out.append("host.cpu_pinning: cpus is required for, and only valid with, policy explicit")
+    if pin.get("require_verified") and policy == "none":
+        out.append("host.cpu_pinning: require_verified needs a policy other than none")
+    for key in ("cpus_by_device", "assign", "layout"):
+        if key in pin and policy != "per_device":
+            out.append(f"host.cpu_pinning: {key} is only valid with policy per_device")
+    if "launcher" in pin and policy == "none":
+        out.append("host.cpu_pinning: launcher needs a policy other than none")
+    if "cpus_by_device" in pin and "assign" in pin:
+        out.append("host.cpu_pinning: give cpus_by_device or assign, not both")
+    if pin.get("layout") == "ranks" and not ("cpus_by_device" in pin or "assign" in pin):
+        out.append("host.cpu_pinning: layout ranks needs cpus_by_device or assign")
+    for key, lists in (("cpus", [pin["cpus"]] if "cpus" in pin else []), ("cpus_by_device", pin.get("cpus_by_device"))):
+        for x in lists or []:
+            try:
+                parse_cpu_list(x)
+            except ValueError as e:
+                out.append(f"host.cpu_pinning.{key}: {e}")
+    if "assign" in pin:
+        try:
+            pinning_plan.Policy.from_dict(pin["assign"])
+        except (pinning_plan.PinningError, TypeError) as e:
+            out.append(f"host.cpu_pinning.assign: {e}")
+    if policy in ("device_local", "per_device") and not accelerators:
+        out.append(f"host.cpu_pinning: policy {policy} needs an accelerator request")
+    return out
+
+
+def overlay_pinning(env, pin):
+    """The Environment with host.cpu_pinning replaced by a request-level block (None leaves it as is)."""
+    if not pin:
+        return env
+    return {**env, "host": {**(env.get("host") or {}), "cpu_pinning": pin}}
+
+
 def normal_env(env):
     """An explicit cpu_pinning policy none (not required verified) means the same request as no block: both digest alike."""
     pin = pin_block(env)
@@ -2664,6 +2693,10 @@ def plan(cat, request, leg, existing=(), invalidations=(), now=None):
     for c in chosen:
         env_name = request.get("environment") or c["environment"]
         env = cat.effective("Environment", env_name) if env_name else None
+        if env is not None and request.get("cpu_pinning"):
+            env = overlay_pinning(env, request["cpu_pinning"])
+            if problems := pin_problems(request["cpu_pinning"], cat.accelerator_count(env)):
+                raise PlanError(f"{c['name']}: {'; '.join(problems)}")
         if env_name and env is not None and (env.get("host") or {}).get("arch") not in (None, leg["arch"]):
             continue
         records.append(

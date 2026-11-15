@@ -1446,7 +1446,7 @@ class PinningTests(unittest.TestCase):
         out.mkdir(exist_ok=True)
         seen = []
 
-        def fake_verify(request, pid, device_numa):
+        def fake_verify(request, pid, device_numa, **_):
             seen.append((request["policy"], device_numa))
             return {"run.exec.pinning_verified": "true", "run.exec.cpu_pinning": request["policy"]}
 

@@ -190,7 +190,7 @@ class Examples(unittest.TestCase):
             "kernel-demo": 5,
             "comms-demo": 5,
             "postgres-demo": 7,
-            "pinning-demo": 2,
+            "pinning-demo": 4,
             "trace-demo": 3,
             "central": 0,
         }
