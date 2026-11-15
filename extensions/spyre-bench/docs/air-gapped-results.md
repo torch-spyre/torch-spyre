@@ -50,30 +50,31 @@ and how it is recorded.
 
 ## What exists today and what is planned
 
-The bundle format and the commands marked **available** ship in `extensions/clickhouse-ingest`. Anything marked
-**planned** or **proposed** does not exist yet; the guide mentions it only so a site can plan, and gives the
-workaround that works today.
+Everything marked **available** ships in `extensions/clickhouse-ingest`. Anything marked **planned** or
+**proposed** does not exist yet; the guide mentions it only so a site can plan, and gives the workaround that
+works today.
 
-"Available" means on the main branch today. Work in progress on a separate branch (deterministic sealing, redaction,
-a trust label, UTC handling, a compatibility preflight, receipts) is **planned** until it is merged; do not rely on any of
-it.
-
-> **Warning: a flag that does not exist is silently ignored.** The sealer prints
-> `[warn] not recorded in a bundle: --redact` (or whichever flag) and carries on, exit code 0, producing a normal
-> bundle. If you see a `[warn] not recorded in a bundle` line, **that flag had no effect.** Check the output of every
-> seal for this line.
+> **Warning: an unknown flag is silently ignored.** The sealer prints
+> `[warn] not recorded in a bundle: --attach foo` (the flag and its value), carries on with exit code 0 and
+> produces a normal bundle. If you see this line, **that flag had no effect.** Check the output of every seal
+> for it. A misspelt prefix of a real flag is different: `--redact` matches both `--redact-host` and
+> `--redact-user`, so it is refused with `ambiguous option` and exit code 2.
 
 | Capability | Command or place | Status |
 |---|---|---|
 | Seal a bundle from JUnit, vLLM bench, perf-suite report, generic benchmark rows or per-table rows | `SEAL --offline --out <bundle> ...` | available |
+| Same results, same host, same kit: same bundle digest and same `.tgz` bytes | seal | available (see [Step 5](#step-5-seal)) |
+| Leave the sealing host and user out of the bundle | `--redact-host`, `--redact-user` | available (partial, see Step 5) |
+| Label where the results came from | `--seal-trust lab\|external` | available |
 | Run the sealer with the standard library only | `SEAL="python offline.py"` (one file plus `bundle.schema.json`) | available |
 | Validate a bundle with no network | `results --from-bundle <bundle> --validate-only` | available |
+| Ask what an ingest accepts, and whether it can read a bundle | `results --check [<bundle>]` | available |
 | Put a bundle in the results inbox | `results --upload <bundle> [--wait]` | available |
-| Record a bundle on the connected side | `results --from-bundle <bundle> --strict` (add `--dry-run` to preview) | available |
+| Record a bundle on the connected side | `results --from-bundle <bundle> --strict` (add `--dry-run` to preview) | available; prints a receipt id |
 | Dashboard upload page: inspect, missing-field prompts, preview, publish or hold for review, retract | the dashboard's Uploads page | available (one bundle per upload) |
-| Engine-level collection verbs, a version and compatibility check, receipts, batch upload, a kit build script | various | planned |
-| Metadata redaction (`--redact`), size caps (`--max-bytes`), split bundles (`--split`), attaching files (`--attach`) | seal flags | proposed (none exist) |
-| Deterministic sealing (the same results always give the same bundle digest) | seal | proposed (not true today, see [Step 5](#step-5-seal)) |
+| Engine-level collection verbs, batch upload, a kit build script | various | planned |
+| Size caps (`--max-bytes`), split bundles (`--split`), attaching files (`--attach`), a site field | seal flags, manifest | proposed (none exist) |
+| Signing | seal | not implemented |
 
 ## The flow in one picture
 
@@ -160,13 +161,15 @@ pip install --no-deps --no-index spyre_clickhouse_ingest-*.whl     # Python 3.11
 ```
 
 Then seal and validate one throwaway bundle from sample results (steps 5 and 6) before the campaign starts.
+The two-file kit has no installed package, so it records `producer.version` as `unknown`; the wheel records its version.
 
 Version rule: **pin the kit by a version range, never by a commit.** Record the kit version in the
 transfer notes. The upload side accepts bundles from an older kit as long as `schema_version` is not newer than
-the ingest it runs; see [Versioning and compatibility](#versioning-and-compatibility).
+the ingest it runs, and the connected side must know every key the kit writes; see
+[Versioning and compatibility](#versioning-and-compatibility). Before the campaign, ask the connected side to run
+`results --check <your throwaway bundle>` (it prints `compatible` and names what to upgrade if not).
 
-A kit for the planned engine-level tooling (a single archive or a wheelhouse, with a version and compatibility
-statement) is **planned**; a build script for it does not exist.
+A single kit archive or wheelhouse with a build script is **planned**; none exists.
 
 ## Step 2: prepare the inputs
 
@@ -196,9 +199,9 @@ Nothing here is a secret.
 | Test type (tier) | `--trigger-type` | `perf` or `quality` for benchmark rows, otherwise the tier of the tests (`smoke`, `regression`, ...) |
 | Suite owner | `--component` | for `benchmarks` and `tables` kinds |
 | Site identifier | see below | free text such as `site-a` |
-| Trust level | not set by the site | derived by the connected side from how the bundle arrives |
+| Trust label | `--seal-trust lab\|external` (default `external`) | a claim only; the connected side decides the level recorded, see [Trust](#trust-and-what-a-site-cannot-claim) |
 
-The manifest has no dedicated site field today, and a manifest with an unknown key is rejected. Until one exists, put
+The manifest has no dedicated site field, and a manifest with a key the schema does not list is rejected. Until one exists, put
 the site name in the transfer notes and give it to the uploader, who records it as "measured by / on behalf of"
 in the upload form. A `site` field is **proposed**; do not add it by hand.
 
@@ -270,7 +273,13 @@ SEAL --from-bundle site-a-run1 --validate-only      # must print "valid"; record
 ```
 
 The digest now differs from the one printed when you sealed: record the one printed by this validation. This is an
-edit after sealing, which is allowed only by the recipes in this guide.
+edit after sealing, which is allowed only by the recipes in this guide. Then pack the folder; a `.tgz` of the same
+folder has the same digest:
+
+```bash
+(cd site-a-run1 && tar -czf ../site-a-run1.tgz *)
+SEAL --from-bundle site-a-run1.tgz --validate-only
+```
 
 ## Step 5: seal
 
@@ -292,33 +301,25 @@ sha256 covers every file's path and content, `bundle.json` included, and is **th
 
 Things to know before sealing:
 
-- **Seal once, then copy the file.** Sealing stamps the sealing time and the sealing machine into
-  `bundle.json`, so sealing the same results twice (in different seconds, which is the usual case) gives two different digests, and the connected side treats
-  them as two runs. If an upload is lost, send the same `.tgz` again. Never re-seal to retry. Making sealing
-  deterministic is **proposed**.
-- **Metadata about the sealing machine is recorded.** `bundle.json` gets a `runner` block with the host name and
-  user name. If you must not disclose them, seal to a **folder** (`--out site-a-run1`, no `.tgz`), delete the `runner`
-  key from `bundle.json`, validate the folder, and only then pack it:
-
-  ```bash
-  SEAL --from-bundle site-a-run1 --validate-only     # note the NEW bundle_sha256: the edit changed it
-  # bsdtar (macOS, tested): no user or group name in the archive
-  (cd site-a-run1 && tar --uid 0 --gid 0 --uname '' --gname '' -czf ../site-a-run1.tgz *)
-  # GNU tar (Linux; flags from its manual, not tested here)
-  (cd site-a-run1 && tar --owner=0 --group=0 --numeric-owner -czf ../site-a-run1.tgz *)
-  SEAL --from-bundle site-a-run1.tgz --validate-only # same digest as the folder
-  ```
-
-  Use one of the two `tar` lines. `*` packs `bundle.json`, `results` and `attachments` if present. **A `.tgz` written
-  by the sealer itself carries your user name in its tar headers**, so for a redacted bundle always pack the folder
-  yourself with the flags above.
-
-  Removing `runner` changes the bundle digest, so **do not compare it with the digest printed at seal time**: record
-  the one printed by this validation. JUnit files can carry a `hostname` attribute and logs can carry names and paths;
-  the sealer does not touch result files or attachments.
-
-  > **Warning: `--redact` does not exist.** It is proposed only. `SEAL --offline ... --redact` prints
-  > `[warn] not recorded in a bundle: --redact`, exits 0 and writes a bundle that still contains the host and user name.
+- **Sealing is repeatable.** No seal time is written, and the `.tgz` carries no times, owners or modes. Sealing the same
+  results again gives the same bundle sha256 and the same `.tgz` bytes, provided these are also the same: the sealing
+  host and user (unless redacted), the kit version (`producer.version`), the flags, and the zlib build in the
+  `.tgz`. A re-seal after a lost upload is therefore a duplicate, not a second run. Still, **seal once and copy the
+  file** when you can: a different host, kit version or zlib gives a different digest, which the connected side
+  treats as a different run.
+- **`ended_at` is the end of the last JUnit suite**, or `--ended-at <ISO time with zone>` if given, or absent. It is
+  not the time of sealing. `--triggered-at` and `--ended-at` must carry a zone; an end before the start is clamped to
+  the start with a warning.
+- **The sealing host and user are recorded** in the `runner` block of `bundle.json`. To leave them out, add
+  `--redact-host` and/or `--redact-user` to the seal command. Redaction changes the digest, and the seal prints
+  the digest of the redacted bundle, so there is nothing to re-validate or repack.
+  - `--redact-host` also blanks the `hostname` attribute of JUnit `<testsuite>` elements in `results/*.xml`
+    (the rest of each file is kept byte for byte). The seal prints `[info] blanked N testsuite hostname
+    attribute(s)`, and `[warn] the sealing host name is still in [...]` for any result file that still contains it.
+  - **Redaction is partial.** It does not touch JUnit `<properties>`, `system-out`, `run_url`, attachments or
+    other kinds' result files, and the leftover-name check does not read UTF-16 XML or reliably tell a short host
+    name from other text. Review the files yourself; act on every `[warn]`.
+  - Test it on a throwaway bundle first: `tar -xzOf x.tgz bundle.json` shows what `runner` holds.
 - **Size.** The connected side limits the size of an upload, the unpacked size and the file count; these are
   deployment settings shown on the upload page. The sealer does not check them. Keep traces out of the bundle
   unless needed, and send large attachments separately by agreement with the uploader. Size caps and splitting
@@ -344,6 +345,13 @@ is the uploader's preview (below).
 Exit codes: `0` valid, `2` rejected (fix the bundle), `3` incomplete (a listed file is missing), `1` failed.
 
 Compare the printed `bundle_sha256` with the one printed when you sealed. If they differ, the bundle changed.
+This check detects **accidental** corruption (a bad copy, a repacked archive). It is not tamper-proof: the digests
+are written by the sealer into the bundle itself, so anyone who edits the files can recompute them and the
+bundle will still validate. See [Security notes](#security-notes).
+
+To ask whether the connected side's ingest can read the bundle at all, run `results --check site-a-run1.tgz` there:
+it prints the schema versions, kinds and trust labels the ingest accepts and, for the bundle, `"compatible": true`, or
+`false` with `problems` and exit `2`.
 
 Record, for the transfer notes: the file name, `sha256sum` of the file, the bundle sha256, the kit version, and the
 site identifier. `sha256sum` of the `.tgz` file and the bundle sha256 are different numbers: the first guards the
@@ -400,8 +408,9 @@ python -m spyre_clickhouse_ingest results --from-bundle site-a-run1.tgz --strict
 ```
 
 Exit `0` means recorded or already recorded; `1` is a failure worth retrying; `2` means rejected; `3` means incomplete.
-The JSON report lists `run_id`, `artifact_id`, `bundle_sha256` and `status` (`ingested`, `duplicate` or
-`would-ingest`).
+The JSON report lists `run_id`, `artifact_id`, `bundle_sha256`, `status` (`ingested`, `duplicate` or
+`would-ingest`) and, when recorded, `trust` and `receipt`. `--channel-trust ci|lab|external` is for the operator
+running the ingest; see [Trust](#trust-and-what-a-site-cannot-claim).
 
 ### Results inbox
 
@@ -428,6 +437,7 @@ A receipt is what lets the site prove that its results arrived and match.
 
 | Receipt item | Where it comes from | Site checks against |
 |---|---|---|
+| Receipt id | `RCPT-XXXX-XXXX-XXXX-XXXX`, printed on stderr and in the CLI report's `receipt` by `--from-bundle` | recomputed by the site, below |
 | Upload id | dashboard response and "My uploads" | recorded in `TRANSFER.txt` |
 | Run id | dashboard response, CLI JSON report | the run page |
 | Content sha256 | dashboard response; `bundle_sha256` in the CLI report | the bundle sha256 printed at seal and validate |
@@ -439,7 +449,10 @@ Stop and re-transfer.
 
 After a `published` upload, open the subject's page and confirm the run is listed with the expected test type and
 counts. A `pending` upload is not recorded until approved; it expires if nobody decides (the deployment sets the time).
-A printable receipt is **proposed**.
+The receipt id is the first 16 hex digits of sha256(`<bundle sha256>`, a NUL byte, `<upload id>`), grouped in fours. The
+upload id is whatever was passed as `--bundle-prop upload_id=<id>` (empty otherwise), so anyone holding the bundle
+digest and the upload id can recompute it. A duplicate or `--dry-run` prints no receipt. The receipt is a
+reference for asking about a run; it is not a signature.
 
 ## Corrections, duplicates and retraction
 
@@ -482,62 +495,78 @@ The sealer writes the rest. The fields:
 | `create_artifact` | `{component, name?}`: record an image the program did not build; needs `image` and `arch` |
 | `component`, `arch`, `test_type` | suite owner, architecture, tier |
 | `run_key` | normally left out; a Jenkins-style key is refused on the dashboard because every upload is its own run |
-| `started_at`, `ended_at` | ISO-8601 with a zone; `ended_at` is the time of sealing, not of the run |
-| `runner`, `env`, `notes` | free text maps and notes; `runner` is filled with the sealing machine's host and user |
+| `started_at`, `ended_at` | ISO-8601 with a zone; from the JUnit suites, `--triggered-at` / `--ended-at`, or absent |
+| `runner`, `env`, `notes` | free text maps and notes; `runner` holds the sealing machine's host and user unless `--redact-host` / `--redact-user` leave them out |
+| `trust` | `lab` or `external` (default `external`; `ci` is refused); a claim, see [Trust](#trust-and-what-a-site-cannot-claim) |
+| `producer` | `{name, version}` of the kit that sealed it, read by `results --check <bundle>` |
 | `uploader` | leave unset |
 | `sealed_at`, `tags`, `tag_family`, `run_url`, `workflow`, `jenkins_run_key`, `artifact` | optional; a site leaves them out (`artifact` is an older spelling of `artifact_id`/`image`; tags are for CI run keys only) |
 | `files` | list of `{path, sha256}` for every file except `bundle.json`; when present, a file that is missing, extra or changed rejects the bundle |
 | `perf` | `vllm` kind only: model, parallelism and shape context |
 
-Fields a future version may add (a site identifier, a producer and compatibility block) are not in the schema and are
-rejected if added by hand.
+The schema is closed: any key it does not list (for example a site identifier) is rejected, including when added by hand.
 
 The bundle sha256 is `sha256` over lines of `path`, a NUL, the file's sha256 and a newline, for every file sorted by
-path with `bundle.json` included.
+path with `bundle.json` included. It is self-attested: the sealer writes it, so it detects accidental change only.
 
 ## Trust and what a site cannot claim
 
-- **Trust is decided by the connected side, from how the bundle arrives, never by what the bundle says.** Treat results
-  from a site as outside results: stored and comparable, but not baselines. Today the dashboard has no separate trust
-  label; the protection is review before publishing (see Step 8). A stronger label is planned.
+- **The site labels; the connected side decides.** `--seal-trust lab|external` (default `external`) is written
+  as `trust` in `bundle.json`. It is a claim. On `--from-bundle` the recorded level is the lower of the bundle's label
+  and the level the receiving channel assigns, stored as `run.trust` on the run's verdict. A bundle can lower its
+  trust, never raise it; `ci` is refused in a bundle. Treat results from a site as outside results: stored and
+  comparable, but not baselines. The other protection is review before publishing (see Step 8).
+- **`--channel-trust ci|lab|external`** is the trusted-operator flag of `--from-bundle` and of the direct vllm, sendnn,
+  benchmarks and tables ingests. Whoever can run the ingest can assert a level, as they can already write the database.
+  It is an error when sealing, uploading, with `--validate-only`, with `--check`, and on the direct JUnit path.
+  A labelled bundle ingested with no channel level is recorded as `external`.
 - **Claims about exclusive use of the machine are claims.** A site may write "ran alone on the machine"; the connected
   side cannot verify it.
 - **Do not set reserved keys.** Keys that look like server-set fields (anything under `run.` or `ref.`) are not accepted
-  from a bundle.
+  from a bundle. `run.trust` in benchmark or table rows (`props`, `run_props`), in `--bundle-prop` and in
+  `--result-prop` is refused.
 - **Comparison data** generated offline (for example outputs from a reference implementation, or published figures) is
   a separate, planned kind of upload. Do not send it as measurements.
 - **Nothing gates.** Results from a site never block a build, a pull request or a promotion.
 
+### Trust semantics
+
+These describe what the code does today; some of it may change.
+
+- **Upgrade receivers first.** Every bundle the sealer now writes carries `trust` (default `external`) and `producer`,
+  and the bundle schema rejects keys it does not list. An ingest that predates this change refuses such a bundle
+  (`results --check <bundle>` says `fields this ingest does not know` and exits `2`). Upgrade the connected side
+  before any site seals with the new kit; there is no flag to omit the keys.
+- **Appending to a run lowers trust, partially.** An `--append-to-run` round reads `run.trust` from the run's published
+  earlier verdicts (retracted rounds do not count) and records the lowest of those and its own. Earlier rows that carry
+  no `run.trust` are ignored, not treated as the lowest or highest level. If no earlier row has one, the round's own
+  value is recorded as it is.
+- **No `run.trust` means not labelled, not trusted.** A bundle with neither a label nor a channel level records no
+  `run.trust`. Readers must treat a missing value as unknown, never as trusted.
+
 ## Time and clocks
 
 - Timestamps in a manifest are UTC (`...Z`) or carry an explicit offset; one without a zone is rejected.
-- Test frameworks often write a timestamp **without** a zone. The sealer reads it as the **sealing machine's local
-  time**, so seal on the machine that ran the tests, with its clock and time zone correct. If you seal elsewhere, pass
-  the run's real start time with `--triggered-at <ISO-8601 with zone>`.
-- The dashboard reads a zone-less file timestamp as UTC and says so in the preview. Do not rely on that: use
-  explicit zones.
+- Test frameworks often write a timestamp **without** a zone. The sealer reads it as **UTC**, whatever the sealing
+  machine's zone, and prints `[warn] N JUnit timestamp(s) carry no time zone; read as UTC` whenever it takes a time from
+  such a file. The dashboard reads a zone-less file timestamp the same way. If the tests ran in another zone, the
+  recorded time is wrong by the offset: pass the real times with `--triggered-at` and `--ended-at`
+  (ISO-8601 **with a zone**), or make the test run write zoned timestamps.
 - **Check the site clock** before a run (`date -u`) against a trusted reference and note the offset in `TRANSFER.txt`.
-  The connected side does not check for skew today; a skew warning for timestamps far in the past or future is **proposed**.
-- `ended_at` is the sealing time. Do not use it as the run's end.
+  The connected side does not check for skew; a skew warning is **proposed**.
+- `ended_at` is the end of the last JUnit suite (its start plus its `time`), or `--ended-at`. It is not the sealing time.
 
-Worked example. A JUnit file says `<testsuite timestamp="2026-11-13T10:00:00">` with no zone. The tests ran in a
-zone that is 5 hours 30 minutes ahead of UTC. Sealing that file gives `started_at` depending on the **sealing
-machine's** zone:
-
-| Sealing machine's zone | `started_at` written | Right? |
-|---|---|---|
-| the test machine's zone (UTC+05:30) | `2026-11-13T04:30:00Z` | yes |
-| UTC | `2026-11-13T10:00:00Z` | no: 5.5 hours late |
-| UTC-05:00 | `2026-11-13T15:00:00Z` | no: 10.5 hours late |
-
-If you must seal elsewhere, give the real start with an explicit zone:
+Worked example. A JUnit file says `<testsuite timestamp="2026-11-13T10:00:00" time="5">` with no zone. The tests ran
+in a zone 5 hours 30 minutes ahead of UTC, so the real start was `2026-11-13T04:30:00Z`. Sealing that file, on any
+machine, gives `started_at` `2026-11-13T10:00:00Z` (5.5 hours late) and `ended_at` `2026-11-13T10:00:05Z`. To
+record the real times:
 
 ```bash
-SEAL --offline --out site-a-run1.tgz ... --triggered-at 2026-11-13T10:00:00+05:30
+SEAL --offline --out site-a-run1.tgz ... --triggered-at 2026-11-13T10:00:00+05:30 --ended-at 2026-11-13T10:00:05+05:30
 ```
 
 `--triggered-at 2026-11-13T10:00:00` (no zone) is refused:
-`bundle.json.started_at: '2026-11-13T10:00:00' is not an ISO-8601 time with a zone`.
+`--triggered-at '2026-11-13T10:00:00' is not an ISO-8601 time with a zone`.
 
 ## Security notes
 
@@ -545,7 +574,7 @@ What a bundle **contains**:
 
 - every result file you gave it, byte for byte;
 - everything under `attachments/`, byte for byte;
-- the sealing machine's host name and user name (`runner`), and, in a `.tgz` the sealer wrote, the user name again in the tar headers;
+- the sealing machine's host name and user name (`runner`), unless you passed `--redact-host` / `--redact-user` (the `.tgz` itself holds no owner names or times);
 - whatever your results contain: JUnit files may carry a `hostname` attribute, logs may carry paths, user names,
   addresses, environment variables and command lines.
 
@@ -554,9 +583,11 @@ the model weights, or anything outside the files you passed. It makes no network
 
 Handling:
 
-- Review attachments for secrets and names before sealing; the sealer does not scrub them.
-- The bundle is integrity-protected, not secret: the sha256 detects change, it does not authenticate who made it. The
-  uploader's identity and your custody notes are the authenticity record. Signing is not implemented.
+- Review attachments and result files for secrets and names before sealing; the sealer does not scrub them. `--redact-host` blanks only the JUnit `testsuite` `hostname` attribute.
+- The bundle is **not secret and not tamper-proof.** The sha256 values (`files[]` and the bundle digest) are written by the
+  sealer into the bundle, so they detect accidental corruption only: anyone who edits a file can recompute them. They do not
+  authenticate who made it. The uploader's identity and your custody notes are the authenticity record. Signing is not
+  implemented. The `trust` label and the receipt id are equally self-attested.
 - Treat a bundle from a site as untrusted input on the connected side: the dashboard and the ingest refuse path
   traversal, links and devices in archives, refuse unsafe XML, and cap size; do not unpack it by hand outside a scratch
   directory.
@@ -568,8 +599,8 @@ Handling:
 |---|---|
 | Bundle `schema_version` | `1` today. The ingest refuses a bundle with a larger number than it knows. Older bundles keep working. |
 | Kit version | pin by range (for example `>=0.1,<0.2`), never by commit. A kit older than the connected side's ingest is fine; a newer kit that writes a newer `schema_version` is rejected until the connected side upgrades. |
-| Unknown manifest keys | rejected. Upgrade the connected side first when a kit adds keys. |
-| Other compatibility information (identity, plan and pack versions) | a compatibility check is planned; today only `schema_version` is checked |
+| Unknown manifest keys | rejected. The kit now always writes `trust` and `producer`, so an older ingest refuses every new bundle: upgrade the connected side first. |
+| Compatibility check | `results --check <bundle>` reports `schema_version`, unknown keys and whether the bundle validates; exit `2` when not compatible. Identity, plan and pack versions are not checked. |
 | Order of upgrades | upgrade the **connected side first**, then ship a new kit to sites. Never the reverse. |
 | Changing a benchmark's identity attributes | starts a new series; do not "fix" a case by editing its parameters at the site. |
 
@@ -582,12 +613,16 @@ version in `TRANSFER.txt`.
 |---|---|---|
 | `bundle.json: needs artifact_id or image` | no subject given | add `--artifact id:<uuid>` or `--artifact image:<repo>@sha256:<digest>` with `--arch` |
 | `bundle.json.arch: 'arm64' is not one of [...]` | `--arch` omitted and the sealing host reports an unsupported name | pass `--arch` explicitly |
-| `sha256 mismatch: [...]` | a file changed after sealing, or a transfer corrupted it | re-copy the file; if it still fails, re-seal from the original results once |
+| `sha256 mismatch: [...]` | a file changed after sealing, or a transfer corrupted it | re-copy the file; if it still fails, re-seal from the original results (same host and kit give the same digest) |
 | `listed file(s) missing: [...]` (exit 3) | a file was dropped when copying a folder | copy the whole folder, or send the `.tgz` |
 | `file(s) not in files[]` | something (usually a log under `attachments/`) was added to the folder after sealing | remove it and ship it beside the bundle, or list it in `files[]` (see Step 4) |
-| `[warn] not recorded in a bundle: --x` | you passed a flag the sealer does not have (for example `--redact`); it had **no effect** | remove the flag and use the documented workaround |
+| `[warn] not recorded in a bundle: --x` | you passed a flag the sealer does not have (for example `--attach`); it had **no effect** | remove the flag; see the proposed items in the capability table |
+| `ambiguous option: --redact could match ...` (exit 2) | an abbreviated flag | write `--redact-host` and/or `--redact-user` |
+| `--channel-trust applies to --from-bundle ...` | the flag was given while sealing, uploading or validating | drop it; it belongs to recording a bundle |
+| `--check stands alone` / `--check wants a bundle path` | `--check` combined with another mode, or given an empty value | run `results --check [<bundle>]` by itself |
+| `fields this ingest does not know` or `schema_version ... is newer` (from `--check`, exit 2) | the connected ingest is older than the kit | upgrade the connected side, or re-seal with an older kit |
 | `pip` refuses the wheel (`requires a different Python`) | the wheel needs Python 3.11 or newer | use the two-file kit (`python offline.py`) |
-| `unknown key 'site'` (or any key) | a field the schema does not have | remove it; use the transfer notes |
+| `unknown key 'site'` (or any key) | a field the schema does not have, or an ingest older than the kit (`trust`, `producer`) | remove it; for `trust`/`producer` upgrade the connected side |
 | `<name>: unsafe member` | the archive holds a path outside the folder, a link or a device | re-pack from inside the folder with `tar -czf x.tgz *` |
 | `a junit bundle holds results/*.xml only` | results of another kind in the folder | one kind per bundle |
 | `no <testcase> in any results/*.xml` | empty or wrong XML | check the test run actually produced results |
@@ -596,7 +631,7 @@ version in `TRANSFER.txt`.
 | `bundle.json names uploader 'x', not you` | `uploader` is set in the manifest | remove the key |
 | `run key '...' names a CI run` | `run_key` set to a CI-style key | remove `run_key` |
 | `identical to upload <id> ...` (warning) | the same content was uploaded before | do not upload it again; retract the earlier one only if it was wrong |
-| `run ... is already recorded by another run or bundle` | a hand-set `run_key` was reused with different content (a default key includes the digest, so a re-seal is a new run instead) | remove the hand-set `run_key`, or decide which bundle is right and retract or ask an administrator |
+| `run ... is already recorded by another run or bundle` | a hand-set `run_key` was reused with different content (a default key includes the digest, so a bundle with different content is a new run instead) | remove the hand-set `run_key`, or decide which bundle is right and retract or ask an administrator |
 | upload stays `pending` | the deployment holds outside uploads for review | ask a reviewer; it expires if nobody decides |
 | `413 upload is over N bytes` | bundle or unpacked size over the deployment cap | remove traces, send them separately, or ask for a larger cap |
 | `this form was already submitted` | double submit | open "My uploads"; it is probably there |
@@ -613,17 +648,20 @@ version in `TRANSFER.txt`.
 **Which command works today for results with repeats and placement?** Seal the raw output with one of the existing
 kinds (`benchmarks` or `tables`). A dedicated kind is planned; do not hand-write its manifest.
 
-**Can we seal on a machine other than the one that ran the tests?** Yes, if the results are copied there intact; pass
-`--triggered-at` with an explicit time zone for JUnit files.
+**Can we seal on a machine other than the one that ran the tests?** Yes, if the results are copied there intact. The sealing
+machine's zone no longer matters (zone-less JUnit times are read as UTC); pass `--triggered-at` and `--ended-at` with
+an explicit zone if the tests ran in another zone. The sealing host is recorded in `runner` unless redacted.
 
-**We sealed twice by mistake.** Send only one. If both were uploaded, retract one.
+**We sealed twice by mistake.** On the same host with the same kit and flags the two bundles are identical; send one. If they differ (another host, kit version or flags), send only one; if both were uploaded, retract one.
 
 **Can the same results be used by several programs?** A bundle is recorded once. Sending it to two different
 databases is the connected side's business.
 
 **Can we see our results afterwards?** Through the uploader. The site has no access.
 
-**How do we know a result is not a baseline?** Ask the uploader how outside uploads are handled in the deployment; today they should be held for review before publishing.
+**How do we know a result is not a baseline?** Results from a site are recorded as `external` or `lab`, never `ci`, but a missing `run.trust` means not labelled, not trusted. Ask the uploader how outside uploads are handled; they should be held for review before publishing.
+
+**Can the digest prove the bundle was not altered on purpose?** No. It is self-attested and catches accidental corruption only.
 
 **Is a bundle encrypted?** No. Encrypt the media if your rules require it; the connected side decrypts before upload.
 

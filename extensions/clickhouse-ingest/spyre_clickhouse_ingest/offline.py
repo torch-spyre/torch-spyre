@@ -24,7 +24,8 @@
 Standard library only (Python 3.9+), with no package import: it runs from a copied wheel
 (`pip install --no-deps`) or as this file plus bundle.schema.json beside it
 (`python offline.py --offline ...`). `results --from-bundle <x>` (bundle.py) is the online
-half, which the v2-results relay runs. See the README, "Offline results bundles".
+half, which the v2-results relay runs. The sha256s in a bundle are self-attested: they detect
+accidental corruption, not tampering. See the README, "Offline results bundles".
 """
 
 import argparse

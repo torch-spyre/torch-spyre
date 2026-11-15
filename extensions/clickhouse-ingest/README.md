@@ -372,7 +372,7 @@ Everything else is optional (`--offline` writes most of it):
 | `kind`, `perf` | `junit`; for vllm, `{model, tensor_parallel, input_len, output_len, cards, head_sha, head_branch, state}` |
 | `run_url`, `workflow`, `runner`, `env`, `notes`, `uploader`, `sealed_at`, `tag_family`, `tags` | unset (tags for Jenkins keys only) |
 
-The bundle sha256 covers every file's path and content, bundle.json included. Ingest refuses a
+The bundle sha256 covers every file's path and content, bundle.json included. The sha256 values are written by the sealer into the bundle, so they catch accidental corruption, not tampering: anyone who edits the files can recompute them. Ingest refuses a
 run_key that already has another run's or bundle's results. The verdict's `props` carry
 `source=bundle`, `uploader` (the Artifactory account that uploaded it), `bundle_sha256` and
 `bundle_url`; `bundle_url` is also the `run_url` when the bundle names none.
