@@ -2,7 +2,9 @@
 -- a later attempt is a new row. 'started' is the claim an apply writes before deleting; its final row (applied,
 -- partial or failed) follows, and a lone started row means the run died mid-way: treat the digest as possibly
 -- partially applied. A digest with any started, applied, partial or failed apply row is spent and needs a fresh plan;
--- a failure before the claim is written as refused. Rows can repeat when a writer retries: do not rely on exact counts.
+-- a failure before the claim is written as refused, so an apply failed row always carries the digest. The apply-once
+-- check is a read only: it assumes a single applier serialized by the caller's lock. Rows can repeat when a writer
+-- retries: do not rely on exact counts.
 -- plan_digest is the sha256 of the plan; a plan row's props carry plan_build.
 CREATE TABLE IF NOT EXISTS artifact_sweep_runs
 (
@@ -28,7 +30,7 @@ CREATE TABLE IF NOT EXISTS artifact_sweep_runs
     CONSTRAINT chk_mode    CHECK mode IN ('plan', 'apply'),
     CONSTRAINT chk_status  CHECK (status = 'planned' AND mode = 'plan') OR (status IN ('started', 'applied', 'partial') AND mode = 'apply') OR status IN ('refused', 'failed', 'skipped'),
     CONSTRAINT chk_digest  CHECK match(plan_digest, '^([0-9a-f]{64})?$'),
-    CONSTRAINT chk_digest_needed CHECK status NOT IN ('planned', 'started', 'applied', 'partial') OR plan_digest != '',
+    CONSTRAINT chk_digest_needed CHECK plan_digest != '' OR status IN ('refused', 'skipped') OR (status = 'failed' AND mode = 'plan'),
     CONSTRAINT chk_days    CHECK days BETWEEN 0 AND 3650,
     CONSTRAINT chk_keep    CHECK keep BETWEEN 0 AND 1000,
     CONSTRAINT chk_plan_counts CHECK mode = 'apply' OR (deleted_files = 0 AND failed_files = 0),

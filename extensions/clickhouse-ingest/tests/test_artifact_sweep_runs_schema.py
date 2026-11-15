@@ -185,6 +185,7 @@ def test_a_skipped_run_needs_no_plan(chdb_session):
         {"mode": "apply", "status": "started", "deleted_files": 1},
         {"mode": "apply", "status": "started", "failed_files": 1},
         {"mode": "apply", "status": "applied", "plan_digest": ""},
+        {"mode": "apply", "status": "failed", "plan_digest": ""},
         {"mode": "apply", "status": "partial", "plan_digest": "", "failed_files": 1},
         {"days": 3651},
         {"days": 70000},
@@ -207,4 +208,32 @@ def test_rows_are_never_rewritten(chdb_session):
     s = chdb_session
     _insert(s, _row())
     _insert(s, _row(mode="apply", status="applied", deleted_files=5))
+    assert _rows(s, "SELECT count() AS n FROM artifact_sweep_runs") == [{"n": 2}]
+
+
+def test_a_required_columns_only_insert_gets_defaults(chdb_session):
+    s = chdb_session
+    s.query(
+        "INSERT INTO artifact_sweep_runs (run_id, mode, status, plan_digest) FORMAT JSONEachRow\n"
+        + json.dumps(
+            {
+                "run_id": "j#1",
+                "mode": "plan",
+                "status": "planned",
+                "plan_digest": DIGEST,
+            }
+        )
+    )
+    got = _rows(
+        s,
+        "SELECT days, keep, reason, toString(audit_uuid) != '00000000-0000-0000-0000-000000000000' AS has_uuid,"
+        " ts > toDateTime64('2020-01-01', 3, 'UTC') AS has_ts FROM artifact_sweep_runs",
+    )
+    assert got == [{"days": 0, "keep": 0, "reason": "", "has_uuid": 1, "has_ts": 1}]
+
+
+def test_equal_ts_rows_both_land(chdb_session):
+    s = chdb_session
+    _insert(s, _row(ts="2026-11-12 01:00:00"))
+    _insert(s, _row(ts="2026-11-12 01:00:00", mode="apply", status="started"))
     assert _rows(s, "SELECT count() AS n FROM artifact_sweep_runs") == [{"n": 2}]
