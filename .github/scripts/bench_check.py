@@ -76,10 +76,27 @@ def flagged(rows):
     )
 
 
+def persistent(rows):
+    """Live rows regressed against the accepted baseline (schema 88): the rolling verdict may have absorbed the shift."""
+    found = [
+        r
+        for r in rows
+        if (r.get("anchored") or {}).get("verdict") == "regressed"
+        and r["tier"] != "informational"
+    ]
+    return sorted(
+        found,
+        key=lambda r: (
+            -(r["anchored"].get("days_exceeding") or 0),
+            -(r["anchored"].get("worse_pct") or 0),
+        ),
+    )
+
+
 def conclusion(rows, run_broken=""):
     if run_broken:
         return "failure"
-    if flagged(rows):
+    if flagged(rows) or persistent(rows):
         return "neutral"
     return (
         "neutral"
@@ -149,6 +166,22 @@ def summary_text(
         )
     if show_values:
         lines += [f"Note: {cell(n)}" for n in report["notes"]]
+    pers = persistent(rows)
+    if pers:
+        lines += [
+            "",
+            f"**Persistent regressions** (worse than the accepted baseline, still open): {len(pers)}",
+        ]
+        for r in pers[:limit]:
+            a = r["anchored"]
+            since = f" since {cell(a['since_ts'][:10])}" if a.get("since_ts") else ""
+            worse = f", {fmt(a.get('worse_pct'))}% worse" if show_values else ""
+            lines.append(
+                f"- {cell(r['name'])} {cell(r['metric'])}: regressed vs anchor v{cell(a.get('version') or '?')}{since} "
+                f"({a.get('n_exceeding_runs', 0)} runs){worse}, rolling verdict `{cell(r['verdict'])}`"
+            )
+        if len(pers) > limit:
+            lines.append(f"- {len(pers) - limit} more not shown.")
     top = flagged(rows)
     reasons = sorted(
         {r["reason"] for r in top if r["verdict"] == "suspected" and r["reason"]}
@@ -184,11 +217,12 @@ def summary_text(
 
 
 def annotations(rows, path, cap, show_values=False):
-    """Warnings for regressed, notices for suspected; none without a file path to attach them to."""
+    """Warnings for regressed (and persistent), notices for suspected; none without a file path to attach them to."""
     if not path:
         return []
     out = []
-    for r in flagged(rows)[: max(0, min(cap, MAX_ANNOTATIONS))]:
+    top = flagged(rows)
+    for r in top:
         out.append(
             {
                 "path": path,
@@ -206,7 +240,27 @@ def annotations(rows, path, cap, show_values=False):
                 ),
             }
         )
-    return out
+    shown = {id(r) for r in top}
+    for r in persistent(rows):
+        if id(r) in shown:
+            continue
+        a = r["anchored"]
+        out.append(
+            {
+                "path": path,
+                "start_line": 1,
+                "end_line": 1,
+                "annotation_level": "warning",
+                "title": f"regressed vs anchor: {r['name']} {r['metric']}"[:255],
+                "message": (
+                    f"{fmt(a.get('worse_pct'))}% worse than the accepted baseline {fmt(a.get('anchor_value'))} "
+                    if show_values
+                    else "regressed against the accepted baseline "
+                )
+                + f"since {(a.get('since_ts') or '?')[:10]} ({a.get('n_exceeding_runs', 0)} runs).",
+            }
+        )
+    return out[: max(0, min(cap, MAX_ANNOTATIONS))]
 
 
 def title(concl, rows):
@@ -214,6 +268,8 @@ def title(concl, rows):
         return TITLES[concl]
     if not rows:
         return "No benchmark results to judge"
+    if concl == "neutral" and not flagged(rows) and persistent(rows):
+        return "Advisory: persistent regression against the accepted baseline"
     if concl == "neutral" and not flagged(rows):
         return "No baseline yet"
     return TITLES[concl]

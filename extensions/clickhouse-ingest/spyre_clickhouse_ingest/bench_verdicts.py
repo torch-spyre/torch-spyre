@@ -35,6 +35,7 @@ SCHEMA = "bench-verdicts/v1"
 VERDICTS = ("regressed", "suspected", "improved", "pass", "no_baseline")
 # The view's "unchanged" is reported as "pass".
 VIEW_STATUS = {"unchanged": "pass"}
+ANCHORED_VERDICTS = ("regressed", "suspected", "improved", "pass", "no_anchor")
 # Validity states ordered worst first, as in the engine; only these may support a `regressed`.
 VALIDITY_ORDER = (
     "invalid",
@@ -97,6 +98,11 @@ def _ident(value):
 
 def _in(ids):
     return ", ".join(f"toUUID('{i}')" for i in ids)
+
+
+def _since(v):
+    """A streak start, or None for NULL or the epoch default of a streak with no eligible run yet."""
+    return None if not v or str(v).startswith(("NULL", "1970")) else v
 
 
 def _num(v):
@@ -169,6 +175,7 @@ class VerdictReader:
         if rows is None:
             return self._finish(report)
         ctx = self._context(ids)
+        ctx["anchored"] = self._anchored(ids, arch)
         report["results"] = [self._result(r, ctx) for r in rows]
         seen = {r["run_id"] for r in rows}
         report["excluded_runs"] = sorted(
@@ -207,6 +214,30 @@ class VerdictReader:
                 "no verdict rows for these run ids (unknown id, nothing ingested, or no match for --arch)"
             )
         return self._finish(report)
+
+    def _anchored(self, ids, arch):
+        """Anchored verdicts (schema 88) by series and metric; an empty dict when the view is missing."""
+        rows = self._optional(
+            "v_benchmark_anchored_verdicts",
+            "SELECT toString(run_id) AS run_id, toString(benchmark_id) AS benchmark_id, component, backend, arch, "
+            "source_job, metric, status, reason, version, anchor_value, current_value, delta_pct, worse_pct, floor_pct, "
+            "toString(since_ts) AS since_ts, n_exceeding_runs, days_exceeding "
+            f"FROM v_benchmark_anchored_verdicts AS t WHERE t.run_id IN ({_in(ids)})"
+            + (f" AND t.arch = '{_ident(arch)}'" if arch else ""),
+            "apply schema 86 and 88; persistent regressions are not reported",
+        )
+        return {
+            (
+                r["run_id"],
+                r["benchmark_id"],
+                r["component"],
+                r["backend"],
+                r["arch"],
+                r["source_job"],
+                r["metric"],
+            ): r
+            for r in rows or []
+        }
 
     def _context(self, ids):
         where = f"t.run_id IN ({_in(ids)})"
@@ -283,6 +314,22 @@ class VerdictReader:
                 verdict, reason = "suspected", f"validity_{validity}"
             elif noise and noise["is_suspect"]:
                 verdict, reason = "suspected", "suspect_repeats"
+        anchored = self._anchored_result(
+            ctx["anchored"].get(
+                (
+                    run,
+                    bench,
+                    r["component"],
+                    r["backend"],
+                    r["arch"],
+                    r["source_job"],
+                    metric,
+                )
+            ),
+            n_repeats,
+            validity,
+            noise,
+        )
         is_quality = ctx["ttype"].get(run) == "quality" or metric in QUALITY_METRICS
         series = {
             k: r[k]
@@ -333,6 +380,37 @@ class VerdictReader:
             ),
             "invalidation_reason": hits[0]["reason_code"] if hits else "",
             "suspect_invalidation": bool(suspect_hits),
+            "anchored": anchored,
+        }
+
+    def _anchored_result(self, a, n_repeats, validity, noise):
+        """The anchored verdict of a row with the reader's evidence caps; None when the series has no anchored row."""
+        if a is None:
+            return None
+        view_status = VIEW_STATUS.get(a["status"], a["status"])
+        verdict, reason = view_status, a["reason"]
+        if view_status == "regressed":
+            if n_repeats is not None and n_repeats < self.min_repeats:
+                verdict, reason = "suspected", "few_repeats"
+            elif validity and validity not in REGRESSION_VALIDITY:
+                verdict, reason = "suspected", f"validity_{validity}"
+            elif noise and noise["is_suspect"]:
+                verdict, reason = "suspected", "suspect_repeats"
+        return {
+            "verdict": "no_anchor" if view_status == "no_anchor" else verdict,
+            "view_verdict": view_status,
+            "reason": reason,
+            "version": a["version"] or None,
+            "anchor_value": _num(a["anchor_value"]),
+            "value": _num(a["current_value"]),
+            "delta_pct": _num(a["delta_pct"]),
+            "worse_pct": _num(a["worse_pct"]),
+            "floor_pct": _num(a["floor_pct"]),
+            "since_ts": _since(a["since_ts"])
+            if view_status in ("regressed", "suspected")
+            else None,
+            "n_exceeding_runs": int(a["n_exceeding_runs"] or 0),
+            "days_exceeding": int(a["days_exceeding"] or 0),
         }
 
     @staticmethod
@@ -356,6 +434,11 @@ class VerdictReader:
                     }
                 )
             },
+            "anchored": {
+                v: sum(1 for r in live if (r["anchored"] or {}).get("verdict") == v)
+                for v in ANCHORED_VERDICTS
+            },
+            "persistent": len(persistent(report)),
             "actionable": sum(
                 1
                 for r in live
@@ -387,6 +470,32 @@ def actionable(report, kind=None):
     return sorted(
         rows, key=lambda r: (r["verdict"] != "regressed", -(r["worse_pct"] or 0))
     )
+
+
+def persistent(report, kind=None):
+    """Live, non-informational rows `regressed` against the accepted baseline, longest first. The rolling verdict may have
+    absorbed them already, which is what this list is for."""
+    rows = [
+        r
+        for r in report["results"]
+        if not r["invalidated"]
+        and (r.get("anchored") or {}).get("verdict") == "regressed"
+        and r["tier"] != "informational"
+        and (kind is None or r["kind"] == kind)
+    ]
+    return sorted(
+        rows,
+        key=lambda r: (
+            -r["anchored"]["days_exceeding"],
+            -(r["anchored"]["worse_pct"] or 0),
+        ),
+    )
+
+
+def persistent_since(r):
+    a = r["anchored"]
+    when = f" since {a['since_ts'][:10]}" if a["since_ts"] else ""
+    return f", regressed vs anchor{when} ({a['n_exceeding_runs']} runs, {a['days_exceeding']} days)"
 
 
 REASON_TEXT = {
@@ -425,6 +534,18 @@ def to_markdown(report, limit=20):
         if reason_text(k)
     ]
     out += [""] + [f"Note: {n}" for n in report["notes"]]
+    pers = persistent(report)
+    if pers:
+        out += [
+            "Persistent regressions (worse than the accepted baseline, whatever the rolling verdict says):",
+            "",
+        ]
+        out += [
+            f"- {r['name']} {r['metric']}: {_cell(r['anchored']['worse_pct'])}% worse than baseline v{r['anchored']['version']}"
+            f"{persistent_since(r)}"
+            for r in pers[:limit]
+        ]
+        out.append("")
     rows = sorted(
         report["results"],
         key=lambda r: (VERDICTS.index(r["verdict"]), -(r["worse_pct"] or 0)),
