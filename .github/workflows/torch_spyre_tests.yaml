@@ -246,6 +246,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           torch_spyre_ref: ${{ github.sha }}
           hash_source: ${{ github.event.merge_group.head_ref }}
+          merge_group_ref: ${{ github.event.merge_group.head_ref }}
 
   # Posts the required "Spyre Test (amd64)" context on merge-queue entries and on PRs where GHA ran
   # the suite and owns the check; the name only matches then, so a skipped run can never satisfy it.

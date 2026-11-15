@@ -20,6 +20,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
   statuses: write
 
 jobs:
@@ -33,6 +34,7 @@ jobs:
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
     runs-on: ubuntu-latest
     outputs:
+      number: ${{ steps.pr.outputs.number }}
       run: ${{ steps.pr.outputs.run }}
       sha: ${{ steps.pr.outputs.sha }}
       url: ${{ steps.pr.outputs.url }}
@@ -48,9 +50,11 @@ jobs:
             perm=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${COMMENTER}/permission" --jq .permission || echo none)
             case "$perm" in admin|maintain|write) ;; *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
           fi
-          echo "run=true" >> "$GITHUB_OUTPUT"
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '"sha=" + .head.sha, "url=" + .html_url' >> "$GITHUB_OUTPUT"
+          {
+            echo "run=true"
+            echo "number=${PR_NUMBER}"
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"sha=" + .head.sha, "url=" + .html_url'
+          } >> "$GITHUB_OUTPUT"
 
   downstream-integration:
     name: Integration (${{ matrix.repo }})
@@ -98,6 +102,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}
+          pr_number: ${{ needs.resolve.outputs.number }}
       - name: Report result
         if: always()
         continue-on-error: true
