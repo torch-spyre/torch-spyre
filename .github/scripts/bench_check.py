@@ -21,6 +21,13 @@ itself did not complete). Token: GITHUB_TOKEN or GH_TOKEN, never printed. `--dry
 payload and needs no token.
 
     bench_check.py --report r.json --repo owner/name --sha <sha> --arch x86_64 [--kind perf]
+
+`Spyre Quality (<arch>)` shows state and counts only unless `--detail` is given: no score, no baseline, and no
+verdict word that reveals a movement, because the check is read on public pull requests. It is `success`
+when results were recorded and `neutral` when there was nothing to record; only `--run-broken` makes it
+`failure`. `--detail` (internal repositories) lists the flagged rows with their verdict words; measured
+values, baselines and notes appear only when `--show-values` is also given, as on the perf check. A quality row
+that is invalid or suspect is never reported as regressed.
 """
 
 import argparse
@@ -42,6 +49,8 @@ REASON_TEXT = {
     "purpose_not_baseline": "the run's purpose is not baseline-eligible and it is kept out of baselines",
     "few_repeats": "too few valid repeats to call a regression",
     "suspect_repeats": "some repeats are flagged suspect",
+    "validity_unknown": "no policy judged the data behind this score, so it cannot be called a regression",
+    "trust_external": "the score came from an external source and is not trusted to call a regression",
 }
 TITLES = {
     "success": "No regressions",
@@ -54,14 +63,27 @@ def check_name(kind, arch):
     return f"{KINDS[kind]} ({arch})"
 
 
+TRUSTED = ("unqualified_env", "shared_env", "valid")
+
+
 def rows_of(report, kind, arch=None):
+    """Live rows of one kind. Defence in depth: a quality row is never `regressed` unless its data was judged
+    and trusted, whatever the report says (an older reader or a hand-built report may not have enforced it)."""
     return [
-        r
+        _guard(r)
         for r in report["results"]
         if r["kind"] == kind
         and not r["invalidated"]
+        and not r.get("diagnostic")
         and (arch is None or r["series"]["arch"] in ("", arch))
     ]
+
+
+def _guard(r):
+    if r["kind"] == "quality" and r["verdict"] == "regressed":
+        if r.get("validity") not in TRUSTED or r.get("trust") == "external":
+            return {**r, "verdict": "suspected", "reason": "validity_unknown"}
+    return r
 
 
 def flagged(rows):
@@ -93,9 +115,11 @@ def persistent(rows):
     )
 
 
-def conclusion(rows, run_broken=""):
+def conclusion(rows, run_broken="", kind="perf", detail=True):
     if run_broken:
         return "failure"
+    if kind == "quality" and not detail:
+        return "success" if rows else "neutral"
     if flagged(rows) or persistent(rows):
         return "neutral"
     return (
@@ -142,8 +166,37 @@ def fmt(v):
     return "" if v is None else f"{v:.4g}"
 
 
+def counts_summary(report, rows, name, run_broken, kind, arch):
+    """State and counts only: how many cases were recorded and how many results were set aside."""
+    cases = len({r["benchmark_id"] for r in rows})
+    lines = [f"**{name}** is advisory and not a required check."]
+    if run_broken:
+        lines.append(f"The run did not complete: {cell(run_broken)}")
+    lines += ["", f"{cases} case(s) recorded." if rows else "No results for this run."]
+    set_aside = sum(
+        1
+        for r in report["results"]
+        if r["invalidated"]
+        and r["kind"] == kind
+        and not r.get("diagnostic")
+        and r["series"]["arch"] in ("", arch)
+    )
+    if set_aside:
+        lines.append(f"{set_aside} invalidated result(s) are excluded.")
+    lines.append("Details are on the dashboard.")
+    return "\n".join(lines)
+
+
 def summary_text(
-    report, rows, name, template, arch, limit, run_broken, show_values=False
+    report,
+    rows,
+    name,
+    template,
+    arch,
+    limit,
+    run_broken,
+    show_values=False,
+    kind="perf",
 ):
     counts = {}
     for r in rows:
@@ -156,16 +209,19 @@ def summary_text(
         ", ".join(f"{n} {v}" for v, n in sorted(counts.items()))
         or "No results for this run."
     )
-    if report["summary"]["invalidated"]:
-        lines.append(
-            f"{report['summary']['invalidated']} invalidated result(s) are excluded."
-        )
-    if report.get("excluded_runs"):
-        lines.append(
-            f"{len(report['excluded_runs'])} invalidated run(s) have no verdicts."
-        )
-    if show_values:
-        lines += [f"Note: {cell(n)}" for n in report["notes"]]
+    own = report["summary"].get("by_kind", {}).get(kind, {}).get("invalidated")
+    if own is None:
+        own = report["summary"]["invalidated"]
+    if own:
+        lines.append(f"{own} invalidated result(s) are excluded.")
+    # Run-wide lines name runs and views of every kind: kept off a check when the report also holds quality rows.
+    if not any(r["kind"] == "quality" for r in report["results"]):
+        if report.get("excluded_runs"):
+            lines.append(
+                f"{len(report['excluded_runs'])} invalidated run(s) have no verdicts."
+            )
+        if show_values:
+            lines += [f"Note: {cell(n)}" for n in report["notes"]]
     pers = persistent(rows)
     if pers:
         lines += [
@@ -263,11 +319,13 @@ def annotations(rows, path, cap, show_values=False):
     return out[: max(0, min(cap, MAX_ANNOTATIONS))]
 
 
-def title(concl, rows):
+def title(concl, rows, kind="perf", detail=True):
     if concl == "failure":
         return TITLES[concl]
     if not rows:
         return "No benchmark results to judge"
+    if kind == "quality" and not detail:
+        return "Quality results recorded"
     if concl == "neutral" and not flagged(rows) and persistent(rows):
         return "Advisory: persistent regression against the accepted baseline"
     if concl == "neutral" and not flagged(rows):
@@ -278,11 +336,13 @@ def title(concl, rows):
 def build_payload(report, kind, arch, sha, args):
     rows = rows_of(report, kind, arch)
     name = check_name(kind, arch)
-    concl = conclusion(rows, args.run_broken)
+    detail = kind != "quality" or getattr(args, "detail", False)
+    shown = getattr(args, "show_values", False)
+    concl = conclusion(rows, args.run_broken, kind, detail)
     template = args.dashboard_url_template or os.environ.get(
         "BENCH_DASHBOARD_URL_TEMPLATE", ""
     )
-    top = flagged(rows)
+    top = flagged(rows) if detail else []
     url = link(template, top[0], report, arch) if top else ""
     return {
         "name": name,
@@ -290,7 +350,7 @@ def build_payload(report, kind, arch, sha, args):
         "status": "completed",
         "conclusion": concl,
         "output": {
-            "title": title(concl, rows),
+            "title": title(concl, rows, kind, detail),
             "summary": summary_text(
                 report,
                 rows,
@@ -299,14 +359,16 @@ def build_payload(report, kind, arch, sha, args):
                 arch,
                 args.top,
                 args.run_broken,
-                getattr(args, "show_values", False),
-            ),
+                shown,
+                kind,
+            )
+            if detail
+            else counts_summary(report, rows, name, args.run_broken, kind, arch),
             "annotations": annotations(
-                rows,
-                args.annotation_path,
-                args.max_annotations,
-                getattr(args, "show_values", False),
-            ),
+                rows, args.annotation_path, args.max_annotations, shown
+            )
+            if detail
+            else [],
         },
         **({"details_url": url} if url else {}),
     }
@@ -407,6 +469,11 @@ def main(argv=None):
         "--show-values",
         action="store_true",
         help="include measured values, percentages and report notes; off by default so a public check carries none",
+    )
+    ap.add_argument(
+        "--detail",
+        action="store_true",
+        help="quality check: list flagged rows (verdict words, no values unless --show-values too); never on public pull requests",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
