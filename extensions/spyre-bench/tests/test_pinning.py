@@ -506,6 +506,7 @@ class Planning(unittest.TestCase):
         self.assertTrue(engine.pin_problems({"policy": "per_device", "assign": {"cores_per_device": 0}}, 1))
         self.assertTrue(engine.pin_problems({"policy": "none", "launcher": "taskset"}, 1))
         self.assertTrue(engine.pin_problems({"policy": "per_device", "cpus_by_device": ["x"]}, 1))
+        self.assertTrue(engine.pin_problems({"policy": "per_device", "cpus_by_device": "0-3"}, 1))
 
 
 class Prepare(unittest.TestCase):
@@ -523,6 +524,18 @@ class Prepare(unittest.TestCase):
             },
         )
         self.assertTrue(p.notes)
+
+    def test_missing_tool_is_unknown_not_a_violation(self):
+        with mock.patch.object(pinning_run.sys, "platform", "linux"):
+            p = pinning_run.prepare(
+                {"policy": "explicit", "cpus": "0-3", "require_verified": True}, which=lambda t: None
+            )
+        self.assertFalse(p.launches)
+        self.assertEqual(p.observer_request(), {"policy": "explicit", "require_verified": True, "unresolved": True})
+        proc = Path(tempfile.mkdtemp(dir=TMP))
+        fake_proc(proc, {100: (5, "run", {100: "0-7"})})
+        r = placement.verify_pinning(p.observer_request(), 100, (), proc, proc)
+        self.assertEqual((r["run.exec.pinning_verified"], r["run.exec.cpu_set_source"]), ("unknown", "unresolved"))
 
     def test_golden_wrap_with_a_fake_tool(self):
         with mock.patch.object(pinning_run.sys, "platform", "linux"):
@@ -618,13 +631,14 @@ class EndToEnd(unittest.TestCase):
                 (s["pinning"]["run.exec.pinning_verified"], s["pinning"]["run.exec.cpu_set"]), ("true", want)
             )
 
-    def test_unpinned_run_with_a_requirement_is_a_violation(self):
+    def test_missing_tool_runs_unpinned_and_unknown(self):
         want = pp.format_cpu_list(self.lo)
         with mock.patch("spyre_bench.pinning_run.shutil.which", return_value=None):
             _, st = self.run_policy(
                 "decode", "--cpu-pinning", "explicit", "--cpu-set", want, "--require-pinning", name="notool"
             )
-        self.assertEqual({s["pinning"]["run.exec.pinning_verified"] for s in st}, {"false"})
+        self.assertEqual({s["pinning"]["run.exec.pinning_verified"] for s in st}, {"unknown"})
+        self.assertEqual({s["pinning"]["run.exec.cpu_set_source"] for s in st}, {"unresolved"})
         self.assertTrue(all(s["argv"][0] != "taskset" for s in st))
 
     def test_device_local_second_device_node(self):

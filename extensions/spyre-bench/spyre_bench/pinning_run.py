@@ -100,5 +100,5 @@ def prepare(request, device_numa="", sys_root="/sys", which=None):
         if not tool:
             why = f"{plan.launcher} not found" if sys.platform.startswith("linux") else "needs Linux"
             notes.append(f"cpu_pinning {plan.policy}: not applied, {why}")
-            plan = replace(plan, apply=False, source="unresolved", reason=why)
+            plan = replace(plan, apply=False, source="unresolved", reason=why, union=None, by_device=None)
     return Prepared(plan, tool, notes)

@@ -24,6 +24,8 @@ HOST: a scheduler's resource slice may report -1 for a device's node.
   python -m spyre_bench.pinning_plan --devices 0:0,1:1 --cores-per-device 4 [--topology topo.json] [--layout ranks]
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import shlex
@@ -370,6 +372,8 @@ class PinPlan:
     def observer_request(self):
         """The request block the observer (placement.verify_pinning) judges the process tree against."""
         req = {"policy": self.policy, "require_verified": self.require_verified}
+        if self.source == "unresolved":
+            return {**req, "unresolved": True}
         if self.by_device is not None:
             # layout tree pins the whole tree to the union, so that is the one set a thread must be inside
             lists = list(self.by_device) if self.layout == "ranks" else [self.union]
