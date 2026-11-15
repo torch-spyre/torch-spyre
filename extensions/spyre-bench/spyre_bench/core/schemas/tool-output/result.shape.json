@@ -63,6 +63,29 @@
        "additionalProperties": {
         "type": "string"
        }
+      },
+      "id_mode": {
+       "enum": [
+        "ingest"
+       ]
+      },
+      "disc_keys": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "engine_id": {
+       "type": "string",
+       "description": "engine-native hash kept beside an ingest id; never a join key"
+      },
+      "benchmark": {
+       "type": "string",
+       "description": "the Benchmark name; analyses select on it, not on the ingest name"
+      },
+      "case": {
+       "type": "string",
+       "description": "the case name"
       }
      },
      "required": [

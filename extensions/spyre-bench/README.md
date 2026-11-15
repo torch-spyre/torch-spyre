@@ -9,8 +9,10 @@ CLI; it does not execute benchmarks.
 ## Why identity is derived
 
 `benchmark_id` is a uuid5 over the same id namespace as `extensions/clickhouse-ingest`, so the engine and the ingest
-agree on the id for the same benchmark without coordinating. A test cross-checks `engine.benchmark_id` against
-`spyre_clickhouse_ingest.identity.BenchmarkId`.
+agree on the namespace without coordinating. A test cross-checks `engine.benchmark_id` against
+`spyre_clickhouse_ingest.identity.BenchmarkId`. To reproduce the ids the ingest already stores, a Benchmark declares
+`identity: {mode: ingest, ...}` and the engine calls the ingest derivation through one adapter (`spyre-bench[ingest]`);
+see [`docs/README.md`](docs/README.md#ingest-identity).
 
 ## Install
 
@@ -19,6 +21,7 @@ Not published; install from the checkout.
 ```bash
 uv pip install extensions/spyre-bench                 # PyYAML + regex
 uv pip install "extensions/spyre-bench[jsonschema]"   # full Draft 2020-12 validation
+uv pip install "extensions/spyre-bench[ingest]"       # stored benchmark_id of ingest-mode Benchmarks (checkout only)
 ```
 
 Without `jsonschema` the engine falls back to a stdlib validator that covers the schema subset the core schemas use.
@@ -29,6 +32,7 @@ Without `jsonschema` the engine falls back to a stdlib validator that covers the
 spyre-bench validate examples/llm-demo --central examples/central
 spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-example
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
+spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
 spyre-bench gen-schemas --check
 ```
 
@@ -53,12 +57,13 @@ plan = engine.plan(cat, {"purpose": "pr", "selection": {"tier": "sanity"}}, leg)
 |---|---|
 | `spyre_bench/engine.py` | registry, catalog validation, case expansion, identity, plan, reuse, invalidation, qualification, validity |
 | `spyre_bench/validate.py`, `explain.py`, `analysis.py`, `gen_schemas.py`, `cli.py` | the CLI verbs (`analysis.py` also evaluates `derive` and `compare`) |
+| `spyre_bench/ingest_adapter.py`, `ids.py` | the only import of the ingest derivation; the `ids` verb |
 | `spyre_bench/placement.py` | observed CPU placement (`run.exec.*`) from `/proc` and `/sys` |
 | `spyre_bench/core/` | the core pack and the generated JSON Schemas (one per authored kind, plus tool-output shapes) |
 | `spyre_bench/packs/` | built-in packs: `llm-serving`, `spyre`, `kernel`, `comms` |
 | `spyre_bench/demo.py` | builds `examples/results/` from synthetic samples (`python -m spyre_bench.demo --check`) |
 | `examples/` | synthetic catalogs, a third-party pack, requests and tool-output samples |
-| `tests/` | the engine test suite |
+| `tests/` | the engine test suite; `tests/golden/` pins the engine ids and the ingest conformance table |
 
 ## Tests
 

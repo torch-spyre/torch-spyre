@@ -60,19 +60,26 @@ def explain(cat, name, a):
         if not sets:
             try:
                 rec = engine.plan(cat, req, leg_of(view) if view else {"arch": "x86_64"})["cases"][0]
-            except engine.PlanError as x:
+            except (engine.PlanError, engine.IngestUnavailable) as x:
                 rec = {"error": str(x)}
         req_c = cat.case_metrics(c)
         series = {
             k: view["labels"][k] for k in cat.project.spec.get("series_labels", []) if view and k in view["labels"]
         }
+        ingest = cat.ingest_inputs(c)
+        try:
+            ids = cat.ids(c)
+        except engine.IngestUnavailable as x:
+            ids = {"benchmark_id": None, "id_unavailable": str(x)}
         doc = {
             "case": c["name"],
             "benchmark": c["benchmark"],
             "entry_file": c["entry_file"],
             "owner": c["owner"],
-            "benchmark_id": cat.ids(c)["benchmark_id"],
+            **ids,
             "identity": ident,
+            **({"ingest_identity": ingest} if ingest else {}),
+            **({"est_hours": c["est_hours"]} if c.get("est_hours") is not None else {}),
             "run_props": cat.run_props(c),
             "system": {"name": c["system"], **c["sys"]},
             "workload": c["workload"],
@@ -88,7 +95,9 @@ def explain(cat, name, a):
         doc["validity"] = cat.validity_view(c, a.purpose, cat.effective("Environment", env_name) if env_name else None)
         if view:
             doc["environment"] = view
-            doc["series_key"] = engine.series_key(doc["benchmark_id"], series) if series else None
+            doc["series_key"] = (
+                engine.series_key(doc["benchmark_id"], series) if series and doc["benchmark_id"] else None
+            )
             doc["reuse_key"] = {
                 "benchmark_id": doc["benchmark_id"],
                 "subject_id": a.subject or "<artifact id at plan time>",
