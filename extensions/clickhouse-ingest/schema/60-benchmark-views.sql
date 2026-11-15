@@ -2,9 +2,9 @@
 -- backend ratio v1 stored as a column. Regression verdicts are 62-benchmark-verdicts.sql.
 
 -- Record types that are not a benchmark's own measurement series: a comparison target
--- (reference) or a run's internal trace. The trend, backend-compare and verdict views skip them;
--- v_benchmark_results_enriched keeps these for readers of the trace; it drops only runs marked
--- as references (v_benchmark_runs_measured), never a case by its record_type.
+-- (reference) or a run's internal trace. The trend, backend-compare and verdict views skip them by
+-- record_type; v_benchmark_results_enriched keeps cases of these types (readers of the trace) and
+-- drops only runs marked as references (v_benchmark_runs_measured).
 CREATE VIEW IF NOT EXISTS benchmark_excluded_record_types AS
 SELECT * FROM values(
     'record_type String',

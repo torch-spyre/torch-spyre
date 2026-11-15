@@ -43,6 +43,8 @@ FROM
                0 AS non_smoke
         FROM test_case_runs
         WHERE run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted' AND NOT is_round)
+          AND run_id NOT IN (SELECT run_id FROM artifact_results
+                             WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE component = 'reference'))
           AND props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds)
         GROUP BY run_id
     )
