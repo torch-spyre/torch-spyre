@@ -15,6 +15,12 @@ agree on the namespace without coordinating. A test cross-checks `engine.benchma
 `identity: {mode: ingest, ...}` and the engine calls the ingest derivation through one adapter (`spyre-bench[ingest]`);
 see [`docs/README.md`](docs/README.md#ingest-identity).
 
+## First consumer
+
+`benchmarks/` at the repository root is the torch-spyre catalog. Its Benchmarks use `identity: {mode: ingest,
+profile: perf-kernel}` and a conformance check recomputes their ids with the ingest's own `report.xml` parser
+(`make bench-check-ids`); the advisory `bench-nightly` workflow runs it. See [`benchmarks/README.md`](../../benchmarks/README.md).
+
 ## Install
 
 Not published; install from the checkout.

@@ -7,17 +7,22 @@ benchmarks, not where or when they run. The catalog is advisory; nothing here ga
 |---|---|
 | `project.yaml` | Project, the `ops` Suite, the `one-device` Environment request and the named Selections |
 | `systems.yaml` | the operator library under test |
-| `ops/<operation>.yaml` | one Benchmark per operation name; the file name is the Benchmark name |
-| `legacy-ids.golden.tsv` | ids the ingest derives from each Benchmark's `legacy.*` annotations (synthetic rows) |
-| `tools/check_legacy_ids.py` | recomputes that table with `spyre_clickhouse_ingest` and compares |
+| `ops/<operation>.yaml` | one Benchmark per operation name, expanded over input shapes into cases (`<operation>_<shape token>`) |
+| `ingest-ids.golden.tsv` | ids the ingest writes for each case's report, kernel and total rows (synthetic fixtures) |
+| `tools/check_identity_ids.py` | conformance check: recomputes the table with `spyre_clickhouse_ingest` and compares |
+| `tools/run_kernel_case.py` | the command of an `ops` case: runs the repo's perf entry point once per run and keeps the case's own rows of `report.xml` |
+| `tools/collect_ingest_xml.py` | gathers the `report.xml` of every case that ran ok, flat, for the XML ingest |
+| `tools/bench_stub.py` | card-free stand-in for the `plan`, `run`, `verdict` and `report` verbs (smoke runs) |
+| `tests/` | pytest suite for the conformance check, the make targets and the on-demand workflow |
 
 ## Commands
 
 ```bash
 make bench-validate                      # schema, packs, cross-resource rules
-make bench-explain CASE=matmul           # one case with its ids
-make bench-check-ids                     # legacy id inputs against the ingest derivation
-make bench-list bench-plan bench-run bench-smoke bench-report
+make bench-explain CASE=matmul_s1        # one case with its ids
+make bench-check-ids                     # identity blocks against the ingest derivation
+make bench-list bench-plan bench-run bench-verdict bench-smoke bench-report
+make bench-nightly-smoke                 # plan -> run -> verdict -> report with the stub, no cards
 ```
 
 These targets require the `spyre-bench` package. Until torch-spyre#6298 is merged, install it from that PR
@@ -28,23 +33,96 @@ uv pip install 'spyre-bench @ git+https://github.com/torch-spyre/torch-spyre@mai
 ```
 
 When the engine is not installed, or lacks the verb a target needs, the target prints a notice and exits 0. Setting
-`BENCH_REQUIRED` to any non-empty value (including `0`) turns that into exit 2. `BENCH_ARCH`, `BENCH_CARDS` and
-`BENCH_QUEUE` are passed through to the engine unchanged; the Makefile never branches on them.
+`BENCH_REQUIRED` to any non-empty value (including `0`) turns that into exit 2. The request is the `BENCH_*`
+variables, which the engine also reads from the environment: `BENCH_PURPOSE`, `BENCH_ENVIRONMENT`,
+`BENCH_SELECTION`, `BENCH_CASES`, `BENCH_TIER`, `BENCH_SUITES`, `BENCH_SUBJECT`, `BENCH_SUBJECT_ID`, `BENCH_REUSE`,
+`BENCH_SET`, `BENCH_PLAN`, `BENCH_INGEST`, `BENCH_INVOKER`, `BENCH_CLEAN`, `BENCH_MAX_WAIT`, `BENCH_MAX_HOLD`,
+`BENCH_LEASE_FILE`. `BENCH_ARCH`, `BENCH_CARDS` and `BENCH_QUEUE` are passed through unchanged; the Makefile never
+branches on them. `BENCH_RESULTS_DIR` (default `bench-results/`) holds the run output and, under `plan/`, the plan (`BENCH_PLAN_FILE`); `bench-run` plans first unless `BENCH_PLAN` names a plan. `bench-run`
+prefixes the engine with `SENPERFORMANCE=2` unless the caller set it, as `make tests TEST_TYPE=perf` does.
 
 ## Identity
 
-The ingest keeps writing every benchmark id (`BenchmarkId`: component, operation name, tags and the
-`record_type`, `config_name`, `input_shapes`, `run_mode`, `kernel_name`, `is_total` discriminators, with compiled
-kernel names reduced to `<stem>@<rank>`). The `legacy.*` annotations record the discriminators a Benchmark
-declares, so editing one is visible as a golden-table failure. Shapes and kernel names come from the runner at
-run time. The golden rows are synthetic: empty tags, no `config_name`, one fixed shape and made-up kernel
-names, matching the shape of today's op rows in `results.py`; model rows and real shapes are not covered. The engine's own `benchmark_id` hashes different keys and is not the ingest id.
+Every Benchmark carries an `identity` block (`mode: ingest`, `profile: perf-kernel`), so the engine's stored
+`benchmark_id` is the id the ingest writes for the same row. The block lists the six discriminators the perf-suite
+parser hashes, in its order: `record_type: op`, an empty `config_name`, `input_shapes`, `run_mode: op_benchmark`, and
+the empty `kernel_name` and `is_total` of an operation-level row. `input_shapes` comes from the case's
+`workload.flags.input_shapes`, the shape string exactly as the perf suite names it in `report.xml`. Compiled-kernel
+and total rows are not cases: the ingest parser keeps writing them, and their ids are pinned in the golden table.
 
-## Cadence
+`make bench-check-ids` (and the `bench-conformance` workflow) derive the ids twice, once from the definitions through
+the engine and once by running the ingest's own `report.xml` parser over a synthetic report, and fail when they
+differ, when an id in the golden table moves, or when a definition declares a `schedule` or lacks `est_hours`.
+Changing an id on purpose means `python benchmarks/tools/check_identity_ids.py --update` and a reviewed golden diff.
+The golden rows are synthetic: one fixed shape per case and made-up kernel names; model rows and real shapes are not
+covered.
 
-`schedule.*` annotations on a Selection state the preferred cadence (`nightly`, `weekly`), the fallback, a
-priority and an optional runtime estimate. They move to a `schedule` block when the engine defines one.
+## Cost and cadence
+
+`spec.est_hours` on a Benchmark is the only cost hint. When and how often a Selection runs belongs to whoever invokes
+it (a workflow, a scheduler, a developer), never to these files.
+
+## Nightly and weekly runs (Jenkins) and the on-demand workflow
+
+Nightly and weekly runs are triggered from Jenkins presets, because they must run on the nightly-built image; the
+`make bench-*` targets are what Jenkins calls. `.github/workflows/bench-on-demand.yml` is the manual route
+(`workflow_dispatch` only, no schedule) on the labelled x86 card runners the repo's perf job uses: validate and
+identity conformance, then plan, run, collect, ingest and verdict. It is advisory throughout (`continue-on-error`,
+never a required check) and serialised by a concurrency group.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `ref` | the dispatch ref | branch, tag or SHA to check out |
+| `selection` | `ops-core` | Selection of this catalog to run |
+| `clickhouse_env` | `dev` | `prod` only when set explicitly; prod never falls back to the dev secrets |
+| `ingest` | `true` | write the rows; `false` runs and prints verdicts only |
+| `smoke` | `false` | stub engine on a hosted runner: no cards, no secrets used, nothing ingested |
+
+Each case's `report.xml` is ingested by the existing XML parser, so stored ids are the ones the identity check pins.
+In the workflow, rows reach ClickHouse through the `ingest-xml-to-clickhouse` action and the `CLICKHOUSE_*` secrets
+(`*_DEV` for dev), inline on the runner; results are never uploaded as workflow artifacts and the log carries stage
+outcomes and counts, not measurements. The rows are written under the workflow name `bench-on-demand`, so their series
+(which keys on the producing job) does not mix with the perf job's. Use `make bench-nightly-smoke` or a `smoke`
+dispatch to exercise the wiring without hardware.
+
+### What a Jenkins invoker has to provide
+
+The targets assume no GitHub Actions state: paths are relative to the checkout (`BENCH_RESULTS_DIR`, default
+`bench-results/`, may be absolute), nothing reads runner variables, and the composite action is not needed.
+
+1. **Checkout** of the ref under test at the repo root (the `Makefile`, `mk/`, `benchmarks/` and the perf entry point
+   `make tests TEST_TYPE=perf` that `run_kernel_case.py` calls, so `spyre-perf-suite` must be on `PATH` as in the
+   image).
+2. **Engine**: `spyre-bench` with `plan`, `run`, `verdict` and the ingest package importable (`uv pip install
+   ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml` into a venv of its own; pass `BENCH=<venv>/bin/spyre-bench`).
+   The benchmark command gets an allowlisted environment only: list any extra non-secret names the card setup exports
+   in `BENCH_PASS_ENV`.
+3. **Request variables**: `BENCH_PURPOSE` (`nightly` or `weekly`), `BENCH_SELECTION`, `BENCH_ENVIRONMENT=one-device`,
+   `BENCH_REUSE=never`, `BENCH_SUBJECT_ID` (the artifact id of the image under test), `BENCH_INVOKER=jenkins`,
+   `BENCH_QUIET=1`, `BENCH_REQUIRED=1`.
+4. **Steps**: `make bench-validate bench-check-ids`, `make bench-run BENCH_INGEST=0` (plans first), then collect and
+   ingest, then `make bench-verdict BENCH_RUN_ID=<the id passed to --run-id below>`.
+5. **Collect**: `python3 benchmarks/tools/collect_ingest_xml.py bench-results bench-results/ingest-xml`; it prints the
+   engine `run_id`.
+6. **Ingest** (what the composite action runs, called directly; `CLICKHOUSE_HOST` and `CLICKHOUSE_PASS` are required,
+   `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`, `CLICKHOUSE_DB` and `CLICKHOUSE_DB_V2` as the target needs, and
+   `INGEST_SCHEMA=v2`):
+
+   ```bash
+   python -m spyre_clickhouse_ingest results --xml-dir bench-results/ingest-xml --workflow <series name> \
+     --branch <branch> --sha <sha> --run-id <engine run_id> --jenkins-run-key <job>-<build> --trigger-type perf \
+     --arch x86_64 --component torch-spyre --artifact-id <artifact id> --schema v2
+   ```
+
+   `--run-id` must be the engine run id (the ingest threads a valid UUID verbatim, so the verdict can find the rows).
+   `--workflow` is the series name: it becomes `source_job`, so use a name distinct from the perf legs'.
+7. **Verdict** reads the same `CLICKHOUSE_*` connection; the target exits 2 when no stored run id is known or the
+   verdict has no rows.
 
 ## Runner
 
-Cases run through the runner the Project names, `kernel-bench`, a neutral runner name.
+Cases run through the runner the Project names, `kernel-bench`, a neutral runner name. An `ops` case's command is
+`python3 benchmarks/tools/run_kernel_case.py --op <op> --shape <input_shapes> --suite-dir <dir> --raw-dir <dir>`; set it
+as `spec.run.command` (argv array with the engine's `{case.*}`, `{out_dir}` and `{raw_dir}` tokens) with an engine whose
+Benchmark schema has that field. The shape strings in `ops/*.yaml` are fixtures: a case whose op and shape the perf
+report does not contain fails with exit 3 instead of ingesting a row, so replace them with the report's own strings.

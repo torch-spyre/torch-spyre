@@ -3,11 +3,23 @@ torch-spyre	matmul	report	1_512_4096__4096_4096		ca0a80b2-3610-59d3-9af2-1ec7325
 torch-spyre	matmul	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	e756b63d-6012-5617-b487-9d3c52cbee47
 torch-spyre	matmul	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	a1ffc1ca-20c0-5d91-a36d-8089f1fbcb9f
 torch-spyre	matmul	total	1_512_4096__4096_4096	Total	be8a6293-d023-525c-a8c5-6adc506940f6
+torch-spyre	matmul	report	1_128_1024__1024_1024		d33cbdae-ec75-514c-bb5d-76a9fb727a52
+torch-spyre	matmul	kernel	1_128_1024__1024_1024	spyre_kernel_v1_fused_add#2@2	d5bde1d2-c697-5b48-932a-1c1f7786f043
+torch-spyre	matmul	kernel	1_128_1024__1024_1024	spyre_kernel_v1_fused_add#2@1	55da5b98-30c3-5df3-8f65-ed085ef50a14
+torch-spyre	matmul	total	1_128_1024__1024_1024	Total	49cd6f33-721e-5be3-a8b0-29076f4f6bba
 torch-spyre	pointwise_add	report	1_512_4096__4096_4096		a3f641e5-1e92-55b6-b530-dc2245fedb9f
 torch-spyre	pointwise_add	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	78c588c1-cf56-54bd-9aec-9303029400ec
 torch-spyre	pointwise_add	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	587dd475-2a20-54c6-ad6f-bc1254b4473b
 torch-spyre	pointwise_add	total	1_512_4096__4096_4096	Total	9f8e8621-e431-5061-8ec8-9825e543d853
+torch-spyre	pointwise_add	report	1_128_1024__1_128_1024		0043e3e3-01f8-569b-9707-6cc276aec1e4
+torch-spyre	pointwise_add	kernel	1_128_1024__1_128_1024	spyre_kernel_v1_fused_add#2@2	bb7f0b26-3e47-5816-bae7-a1d587c93b31
+torch-spyre	pointwise_add	kernel	1_128_1024__1_128_1024	spyre_kernel_v1_fused_add#2@1	4e832b83-bab1-57c9-90d1-aaa4af44c5b5
+torch-spyre	pointwise_add	total	1_128_1024__1_128_1024	Total	e6e10db2-a668-502a-a226-fa77eaded984
 torch-spyre	softmax	report	1_512_4096__4096_4096		c754d519-198d-5492-92c5-783284305245
 torch-spyre	softmax	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	7256b70e-6c9a-5ba8-9003-f544fc58557d
 torch-spyre	softmax	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	ad0d8be5-ba49-52ac-a5f6-a12fabd90a9b
 torch-spyre	softmax	total	1_512_4096__4096_4096	Total	6d14e18d-2e0d-5660-a8f2-2b563daec032
+torch-spyre	softmax	report	1_128_1024		f7fa1f2f-6f1b-5f43-9347-c447fda0b40d
+torch-spyre	softmax	kernel	1_128_1024	spyre_kernel_v1_fused_add#2@2	26dedab9-3bcb-5cbe-82fb-aa4250615584
+torch-spyre	softmax	kernel	1_128_1024	spyre_kernel_v1_fused_add#2@1	558bef01-a7fd-5d90-92e1-93af8c2eb483
+torch-spyre	softmax	total	1_128_1024	Total	b5552874-e45c-5fdf-becf-d3fcadfd0722

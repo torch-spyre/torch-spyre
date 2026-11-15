@@ -48,7 +48,7 @@ metadata:
   description: One case, one repeat; never ingested.
 spec:
   cases:
-    - matmul
+    - matmul_s1
   run:
     repeats_min: 1
 ---
@@ -57,10 +57,6 @@ kind: Selection
 metadata:
   name: ops-sanity
   description: Smallest operator set a PR may request.
-  annotations:
-    schedule.preferred: nightly
-    schedule.fallback: weekly
-    schedule.priority: '80'
 spec:
   selector:
     suites:
@@ -74,11 +70,6 @@ kind: Selection
 metadata:
   name: ops-core
   description: Default operator set.
-  annotations:
-    schedule.preferred: nightly
-    schedule.fallback: weekly
-    schedule.est_hours: '1.5'
-    schedule.priority: '80'
 spec:
   selector:
     suites:
@@ -92,9 +83,6 @@ kind: Selection
 metadata:
   name: ops-extended
   description: Every declared operator.
-  annotations:
-    schedule.preferred: weekly
-    schedule.priority: '40'
 spec:
   selector:
     suites:
