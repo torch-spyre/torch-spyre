@@ -1478,8 +1478,8 @@ class TestMatmulPaddingNaN(unittest.TestCase):
 
 
 # (activation shape, kernel shape) for each layout batchmatmul is lowered from.
-# N (the kernel's last dim) is never a multiple of the 64-element fp16 stick, so
-# the kernel and the output carry padding columns.
+# N (the kernel's last dim) is never a multiple of the stick (64 elements at
+# fp16, 32 at fp32), so the kernel and the output carry padding columns.
 MATMUL_NAN_PAD_CASES = {
     "2d": ((64, 128), (128, 100)),
     "decode_m1": ((1, 256), (256, 438)),  # 7 sticks of N, split over cores
@@ -1496,6 +1496,8 @@ MATMUL_NAN_PAD_CASES = {
 
 MATMUL_NAN_PAD_CORES = [1, 4, 32]
 
+MATMUL_NAN_PAD_DTYPES = [torch.float16]
+
 # Reading back the padding of an M=1 output fails in the copy to the host (out
 # of bounds for its storage), so a padding check cannot see the decode case;
 # test_chained_matmul covers it through the visible values instead.
@@ -1505,12 +1507,14 @@ MATMUL_NAN_PAD_READBACK_CASES = [
 ]
 
 
-def _stick_padded(n: int) -> int:
-    elems = get_elem_in_stick(torch.float16)
+def _stick_padded(n: int, dtype: torch.dtype) -> int:
+    elems = get_elem_in_stick(dtype)
     return math.ceil(n / elems) * elems
 
 
-def _nan_padded_kernel(shape: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+def _nan_padded_kernel(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
     """A spyre kernel of ``shape`` whose padding columns hold NaN.
 
     The tensor is built on the host at the stick-padded width with NaN past the
@@ -1518,7 +1522,7 @@ def _nan_padded_kernel(shape: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tens
     sits in the device padding. Returns the device tensor and its CPU values.
     """
     *lead, k, n = shape
-    full = torch.randn(*lead, k, _stick_padded(n), dtype=torch.float16)
+    full = torch.randn(*lead, k, _stick_padded(n, dtype), dtype=dtype)
     full[..., n:] = float("nan")
     device = try_reinterpret_host_shape(full.to("spyre"), [*lead, k, n])
     return device, full[..., :n].clone()
@@ -1556,21 +1560,24 @@ class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
 
     def _assert_padding_is_zero(self, result: torch.Tensor):
         *lead, n = result.shape
-        full = try_reinterpret_host_shape(result, [*lead, _stick_padded(n)]).cpu()
+        full = try_reinterpret_host_shape(
+            result, [*lead, _stick_padded(n, result.dtype)]
+        ).cpu()
         padding = full[..., n:]
         self.assertTrue(
             (padding == 0).all().item(),
             f"output padding is not 0 (masked to 0): {padding.unique()}",
         )
 
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
     @parametrize("cores", MATMUL_NAN_PAD_CORES)
     @parametrize("kernel", ["graph_input", "computed_hbm", "computed_lx"])
     @parametrize("case", MATMUL_NAN_PAD_READBACK_CASES)
-    def test_padded_kernel_columns(self, case, kernel, cores) -> None:
+    def test_padded_kernel_columns(self, case, kernel, cores, dtype) -> None:
         a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
         torch.manual_seed(0)
-        a_cpu = torch.randn(a_shape, dtype=torch.float16)
-        w_spyre, w_cpu = _nan_padded_kernel(w_shape)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
 
         if kernel == "graph_input":
 
@@ -1624,16 +1631,17 @@ class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
         self._assert_close_to_cpu(result, fn(a_cpu.float(), w_cpu.float()))
         self._assert_padding_is_zero(result)
 
+    @parametrize("dtype", MATMUL_NAN_PAD_DTYPES)
     @parametrize("cores", MATMUL_NAN_PAD_CORES)
     @parametrize("memory", ["hbm", "lx"])
     @parametrize("case", list(MATMUL_NAN_PAD_CASES))
-    def test_chained_matmul(self, case, memory, cores) -> None:
+    def test_chained_matmul(self, case, memory, cores, dtype) -> None:
         """``(x @ w) @ y``: the first output's padding becomes the second K."""
         a_shape, w_shape = MATMUL_NAN_PAD_CASES[case]
         torch.manual_seed(0)
-        a_cpu = torch.randn(a_shape, dtype=torch.float16)
-        w_spyre, w_cpu = _nan_padded_kernel(w_shape)
-        y_cpu = torch.randn(w_shape[-1], 64, dtype=torch.float16)
+        a_cpu = torch.randn(a_shape, dtype=dtype)
+        w_spyre, w_cpu = _nan_padded_kernel(w_shape, dtype)
+        y_cpu = torch.randn(w_shape[-1], 64, dtype=dtype)
 
         def fn(x, w, y):
             return (x @ w) @ y
