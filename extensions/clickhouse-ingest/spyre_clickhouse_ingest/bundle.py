@@ -32,6 +32,7 @@ from types import SimpleNamespace
 from . import bench_invalidation, sendnn, vllm
 from .identity import DerivedId, RunId
 from .offline import (
+    ADMIN_KINDS,
     FAILED,
     MANUAL_PREFIX,
     STATUS,
@@ -311,6 +312,8 @@ def _ingest(root: Path, args) -> dict:
             client.set_client_setting("readonly", "2")
     except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
         raise BundleError(f"spyre_v2 unreachable: {err}", FAILED) from None
+    if meta.get("kind") in ADMIN_KINDS:
+        return _ingest_admin(client, db, root, meta, args, extra)
     try:
         r, via = resolve_artifact(client, db, meta)
     except BundleError:
@@ -333,6 +336,10 @@ def _ingest(root: Path, args) -> dict:
     if trust:
         report["trust"] = trust
     report["receipt"] = receipt_id(sha, extra.get("upload_id", ""))
+    if meta.get("kind") == "bench":
+        return _ingest_bench(
+            client, db, root, meta, args, report, aid, rid, extra, uploader, sha
+        )
     seen, files = existing_run(client, db, rid, meta["component"])
     names = {Path(p).name for p in (root / "results").iterdir()}
     append = getattr(args, "append_to_run", False)
@@ -385,6 +392,52 @@ def _ingest(root: Path, args) -> dict:
             f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
         )
     return {**report, "status": "ingested"}
+
+
+def _ingest_bench(
+    client, db, root, meta, args, report, aid, rid, extra, uploader, sha
+) -> dict:
+    from . import bench_bundle
+
+    if getattr(args, "append_to_run", False):
+        raise BundleError(
+            "--append-to-run is for the other kinds: a bench bundle's repeats are idempotent, "
+            "so re-send the bundle with more repeats"
+        )
+    props = {**extra, "source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
+             "bundle_url": args.bundle_url}  # fmt: skip
+    try:
+        out = bench_bundle.ingest(
+            client, db, root, meta, aid, rid, props, report, args.dry_run
+        )
+    except BundleError:
+        raise
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes are keyed by content
+        raise BundleError(f"bench write failed: {err!r}", FAILED) from None
+    if out["status"] == "ingested" and not verdict_recorded(
+        client, db, aid, rid, meta["test_type"]
+    ):
+        raise BundleError(
+            f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
+        )
+    return out
+
+
+def _ingest_admin(client, db, root, meta, args, extra) -> dict:
+    from . import bench_bundle
+
+    sha = digest(root)
+    uploader = args.uploader or meta.get("uploader") or current_user()
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    try:
+        out = bench_bundle.ingest_admin(
+            client, db, root, meta, args, trust, uploader, sha, args.dry_run
+        )
+    except BundleError:
+        raise
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the records are keyed
+        raise BundleError(f"{meta['kind']} write failed: {err!r}", FAILED) from None
+    return {**out, "receipt": receipt_id(sha, extra.get("upload_id", ""))}
 
 
 def write_junit(db, root, meta, aid, rid, props, strict) -> None:
