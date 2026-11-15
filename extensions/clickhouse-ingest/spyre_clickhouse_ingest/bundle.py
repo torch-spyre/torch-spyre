@@ -425,7 +425,9 @@ def _ingest_admin(client, db, root, meta, args, extra) -> dict:
     from . import bench_bundle
 
     sha = digest(root)
-    uploader = args.uploader or meta.get("uploader") or current_user()
+    uploader = (
+        args.uploader or current_user()
+    )  # the verified login, never a name the bundle gives
     trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
     try:
         out = bench_bundle.ingest_admin(

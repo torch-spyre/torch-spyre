@@ -40,13 +40,15 @@ from .bench_tables import (
 from .identity import BenchmarkId, DerivedId
 from .offline import (
     BundleError,
+    effective_trust,
     bench_result,
     content_digest,
     _ts,
 )
-from .writer import insert_artifact_result, upload_row_props
+from .writer import ArtifactWriter, insert_artifact_result, upload_row_props
 
 LARGE_INVALIDATION = 50
+MIN_EVIDENCE_REPEATS = 3
 LOW_TRUST_PURPOSES = {"lab": ("on-demand", "investigate"), "external": ("external",)}
 DOWNGRADED_PURPOSE = {"lab": "on-demand", "external": "external"}
 CLEAN_CLAIMS = ("enforced", "observed")
@@ -57,7 +59,15 @@ def _s(bag) -> dict:
 
 
 def _utc(value):
-    return _ts(value).astimezone(timezone.utc) if value else None
+    """A time as UTC; one without a zone is read as UTC, whatever this host's zone."""
+    if not value:
+        return None
+    when = _ts(value)
+    return (
+        when.replace(tzinfo=timezone.utc)
+        if when.tzinfo is None
+        else when.astimezone(timezone.utc)
+    )
 
 
 def placement_id(nodes, devices, links) -> str:
@@ -135,8 +145,14 @@ def build(root: Path, trust: str) -> dict:
         )
         for r in st["repeats"]:
             n = r["run.repeat"]
+            if any(x["bid"] == bid and x["repeat"] == n for x in repeats):
+                raise BundleError(
+                    f"{path.name}: repeat {n} of benchmark {bid} appears twice (two cases share one id)"
+                )
             clean = _s(r.get("clean"))
-            stored_props, stored_clean = downgrade(trust, run_props, clean)
+            stored_props, stored_clean = downgrade(
+                trust, {**run_props, **_s(r.get("props"))}, clean
+            )
             samples = {
                 k: [float(x) for x in (v if isinstance(v, list) else [v])]
                 for k, v in (r.get("samples") or {}).items()
@@ -152,7 +168,7 @@ def build(root: Path, trust: str) -> dict:
             repeats.append({
                 "bid": bid, "component": component, "backend": backend, "file": path.name, "repeat": n,
                 "env_id": env_id, "status": str(r.get("status", "ok")), "samples": samples,
-                "iterations": int(r.get("iterations") or 0), "props": {**stored_props, **_s(r.get("props"))},
+                "iterations": int(r.get("iterations") or 0), "props": stored_props,
                 "started_at": _utc(r.get("started_at")),
                 "sha": repeat_hash({
                     "bid": bid, "repeat": n, "env": env_id, "status": r.get("status", "ok"), "samples": samples,
@@ -200,9 +216,24 @@ def known(client, db: str, table: str, column: str, ids: list) -> set:
     return {str(r[0]) for r in rows}
 
 
+def known_ci_envs(client, db: str, ids: list) -> set:
+    """The environments whose fingerprint row a CI channel already wrote."""
+    rows = client.query(
+        f"SELECT DISTINCT env_id FROM {db}.environment_fingerprints "
+        "WHERE env_id IN {ids:Array(UUID)} AND props['run.trust'] = 'ci'",
+        parameters={"ids": ids},
+    ).result_rows
+    return {str(r[0]) for r in rows}
+
+
 def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
     """Record a bench bundle; `report` carries the run, artifact and trust the caller derived."""
+    from .bundle import prior_trust
+
     trust = report.get("trust") or "external"
+    earlier = prior_trust(client, db, aid, rid, meta["test_type"])
+    if earlier:  # a run only keeps the lowest trust of anything added to it
+        trust = effective_trust(trust, earlier)
     report["trust"] = trust
     plan = build(root, trust)
     held, placed = recorded(client, db, rid)
@@ -217,9 +248,21 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
             raise BundleError(
                 f"repeat {r['repeat']} of benchmark {r['bid']} is already recorded under run {rid} with different content"
             )
+    fresh = [
+        r for r in fresh if r["samples"]
+    ]  # a repeat with no samples has no row to compare
     have_envs = known(
         client, db, "environment_fingerprints", "env_id", list(plan["envs"])
     )
+    if (
+        trust == "ci"
+    ):  # an environment first seen through a lower channel is described again by CI
+        have_envs = known_ci_envs(client, db, list(plan["envs"]))
+    prior = client.query(
+        f"SELECT count() FROM {db}.artifact_results WHERE artifact_id = {{a:UUID}} AND run_id = {{r:UUID}} "
+        "AND test_type = {t:String} AND state != 'running'",
+        parameters={"a": aid, "r": rid, "t": meta["test_type"]},
+    ).result_rows[0][0]
     have_cases = known(client, db, "benchmarks", "benchmark_id", list(plan["cases"]))
     new_envs = [e for e in plan["envs"] if e not in have_envs]
     new_cases = [b for b in plan["cases"] if b not in have_cases]
@@ -233,7 +276,9 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
     if dry_run:
         return {
             **report,
-            "status": "would-ingest" if fresh or new_places else "duplicate",
+            "status": "would-ingest"
+            if fresh or new_places or not prior
+            else "duplicate",
         }
     content = content_digest(root)
     base = {"run.trust": trust, "run.content_sha256": content, "run.bundle_sha256": report["bundle_sha256"],
@@ -261,7 +306,7 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
          "measurements": r["samples"], "iterations": r["iterations"],
          "props": {**r["props"], **base, "report_kind": "bench", "source_file": r["file"], "run.repeat": str(r["repeat"]),
                    "run.repeat_status": r["status"], "env.id": r["env_id"], "run.row_sha256": r["sha"]}}
-        for r in fresh if r["samples"]
+        for r in fresh
     ]  # fmt: skip
     schema.BenchmarkRuns.insert(client, runs, db=db)
     report["benchmark_runs"] = len(runs)
@@ -271,11 +316,10 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
         if not any(r["bid"] == c and r["status"] == "ok" for r in plan["repeats"])
     }
     state = "failed" if bad else "passed"
-    prior = client.query(
-        f"SELECT count() FROM {db}.artifact_results WHERE artifact_id = {{a:UUID}} AND run_id = {{r:UUID}} "
-        "AND test_type = {t:String} AND state != 'running'",
-        parameters={"a": aid, "r": rid, "t": meta["test_type"]},
-    ).result_rows[0][0]
+    if prior:  # the verdict over the whole run: a failure an earlier bundle recorded is not undone
+        state, _ = ArtifactWriter.over_prior(
+            client, db, aid, rid, meta["test_type"], state, 0.0
+        )
     if not (fresh or new_places) and prior:
         return {**report, "status": "duplicate"}
     insert_artifact_result(
@@ -394,7 +438,7 @@ def evidence(client, db: str, rec: dict) -> tuple:
     rid = rec["evidence_run_id"]
     metric = rec.get("metric") or only_metric(client, db, rid)
     rows = client.query(
-        "SELECT toUInt16OrZero(props['run.repeat']), measurements[{m:String}], props['run.trust'] "
+        "SELECT toUInt16OrZero(props['run.repeat']), measurements[{m:String}], props['run.trust'], props['env.id'] "
         f"FROM {db}.benchmark_runs WHERE run_id = {{r:UUID}} AND has(mapKeys(measurements), {{m:String}})",
         parameters={"r": rid, "m": metric},
     ).result_rows
@@ -402,6 +446,10 @@ def evidence(client, db: str, rec: dict) -> tuple:
         raise BundleError(f"evidence run {rid} holds no {metric!r} rows")
     if {r[2] for r in rows} != {"ci"}:
         raise BundleError(f"evidence run {rid} is not a CI-trusted run")
+    if {r[3] for r in rows} != {rec["env_id"]}:
+        raise BundleError(
+            f"evidence run {rid} was measured in another environment than {rec['env_id']}"
+        )
     on_node = client.query(
         f"SELECT count() FROM {db}.run_placements WHERE run_id = {{r:UUID}} AND has(nodes, {{n:String}})",
         parameters={"r": rid, "n": rec["node"]},
@@ -409,8 +457,12 @@ def evidence(client, db: str, rec: dict) -> tuple:
     if not on_node:
         raise BundleError(f"evidence run {rid} was not placed on {rec['node']}")
     per = {}
-    for repeat, samples, _ in rows:
+    for repeat, samples, _, _ in rows:
         per.setdefault(repeat, []).extend(samples)
+    if len(per) < MIN_EVIDENCE_REPEATS and rec["outcome"] == "pass":
+        raise BundleError(
+            f"a pass needs at least {MIN_EVIDENCE_REPEATS} repeats; evidence run {rid} has {len(per)}"
+        )
     return cv_pct([statistics.median(v) for v in per.values()]), len(per)
 
 
@@ -481,7 +533,7 @@ def matched_runs(client, db: str, scope_kind: str, scope: dict) -> int:
 
 
 def invalidations(client, db, root, uploader, sha, dry_run, confirm) -> dict:
-    events, rows, counts = records(root, "events"), [], []
+    events, rows, counts, needs = records(root, "events"), [], [], []
     base = datetime.now(timezone.utc)
     for i, e in enumerate(events):
         scope = e.get("scope") or {}
@@ -495,6 +547,9 @@ def invalidations(client, db, root, uploader, sha, dry_run, confirm) -> dict:
         if latest and latest[0][0] == e["state"]:
             continue
         if e["state"] != "restored" and count > LARGE_INVALIDATION and confirm != count:
+            if dry_run:
+                needs.append(count)
+                continue
             raise BundleError(
                 f"event {i} covers {count} runs (more than {LARGE_INVALIDATION}): preview with --dry-run, "
                 f"then confirm with --confirm-runs {count}"
@@ -511,7 +566,8 @@ def invalidations(client, db, root, uploader, sha, dry_run, confirm) -> dict:
     if not dry_run:
         ResultInvalidations.insert(client, rows, db=db)
     return {"status": ("would-ingest" if dry_run else "ingested") if rows else "duplicate",
-            "new_records": len(rows), "matched_runs": counts}  # fmt: skip
+            "new_records": len(rows), "matched_runs": counts,
+            **({"needs_confirm": needs} if needs else {})}  # fmt: skip
 
 
 def placement_updates(client, db, root, sha, dry_run) -> dict:
