@@ -29,8 +29,10 @@ linear. Four rules keep every list short:
    tuples that can occur together (``fold_reachable``);
 3. a node whose inputs fit the cap takes the cheaper of one table over those
    inputs and the form built from its parts;
-4. a short factor times a node too wide to index is pushed into the node's
-   sums and Min/Max operands, a negative factor turning a Min into a Max;
+4. a factor times a node too wide to pair with it is switched on the
+   factor's value: the node is one integer w, and while the factor is at its
+   value v the product is floor(p * w / q), p / q being v to 1/q, held by two
+   enforced inequalities per value, so no table crosses factor and node;
 5. a 0/1 literal times the rest of a product gates it: the rest is lowered
    with the literal fixed on, and a variable equals it while the literal is
    on and 0 otherwise, so no table has to read the literal.
@@ -87,6 +89,12 @@ _MAX_BOUND = 2**62
 # times larger: a rank's small domain searches faster than a lin_max over wide
 # values, so a near tie keeps the table (2.5x slower solve on a GQA objective).
 _LINEAR_MARGIN = 2
+# A switched product's factor values are held to 1/q, q a power of two at most
+# _MAX_SWITCH_SCALE and at least _MIN_SWITCH_SCALE, with every p * w kept under
+# _MAX_SWITCH_PRODUCT so CP-SAT's int64 sums cannot overflow.
+_MAX_SWITCH_SCALE = 2**24
+_MIN_SWITCH_SCALE = 2**16
+_MAX_SWITCH_PRODUCT = 2**60
 # Values equal to this many significant digits are one value.
 _SIGNIFICANT_DIGITS = 12
 
@@ -257,6 +265,8 @@ class _Linear:
     extrema: list = field(default_factory=list)
     # (literal name, value it is on at) -> the _Linear it gates
     gated: dict = field(default_factory=dict)
+    # (ranked factor, _Linear) products switched on the factor's value
+    switched: list = field(default_factory=list)
 
     def add(self, term: _Indexed, coeff: float) -> None:
         if term.index is None:
@@ -276,6 +286,7 @@ class _Linear:
             if gate not in self.gated:
                 self.gated[gate] = _Linear()
             self.gated[gate].extend(inner)
+        self.switched.extend(other.switched)
 
 
 def _relayout_charge(lit, division, *prices):
@@ -308,6 +319,7 @@ class _TableLowering:
         self._pairs: dict = {}
         self._joint: dict = {}
         self._linear_cost: dict = {}
+        self._value_literals: dict = {}
         self._count = 0
         self._map_inputs(sym_map, buffer_map)
 
@@ -708,36 +720,48 @@ class _TableLowering:
         entries = sum(len(s.next_state) for s in steps)
         return _Indexed(values, _Index(build, entries, len(states)))
 
-    # ---- the objective (rule 4) -------------------------------------------------
+    # ---- the objective (rules 4, 5) ---------------------------------------------
 
     def emit(self, node, factor: Optional[_Indexed] = None, coeff: float = 1.0):
         """``coeff * factor * node`` as a _Linear, or None. A sum is never one
-        table in the objective, and a factor goes into it term by term unless
-        one table over the whole sum and the factor is smaller. A node is one
-        table only when that is smaller than its linear form (rule 3)."""
+        table in the objective, a node is one table only when that is smaller
+        than its linear form (rule 3), and a factor that cannot pair with the
+        node in one table is switched on its value (rule 4)."""
         gate = self._split_gate(node)
         if gate is not None:
             return self._emit_gated(gate, factor, coeff)
-        ix = None if node.is_Add and factor is None else self.indexed(node)
-        if ix is not None and factor is None and self._prefers_linear(node, ix):
-            ix = None
-        if ix is not None:
-            term = ix if factor is None else self._pair(ix, factor)
-            if term is not None and not (
-                node.is_Add and self._distributed_size(node, factor) < len(term.values)
-            ):
-                out = _Linear()
-                out.add(term, coeff)
-                return out
+        out = _Linear()
+        if factor is not None:
+            ix = self.indexed(node)
+            term = None if ix is None else self._pair(ix, factor)
+            if term is None:
+                return self._emit_switched(node, factor, coeff)
+            out.add(term, coeff)
+            return out
+        ix = None if node.is_Add else self.indexed(node)
+        if ix is not None and not self._prefers_linear(node, ix):
+            out.add(ix, coeff)
+            return out
         if node.is_Add:
-            return self._emit_sum(node, factor, coeff)
+            return self._emit_sum(node, coeff)
         if node.is_Mul:
-            return self._emit_product(node, factor, coeff)
+            return self._emit_product(node, coeff)
         if isinstance(node, (sympy.Min, sympy.Max)):
-            return self._emit_extremum(node, factor, coeff)
+            return self._emit_extremum(node, coeff)
+        if ix is not None:
+            out.add(ix, coeff)
+            return out
         if self.failure is None:
             self.failure = f"cannot lower {type(node).__name__}: {str(node)[:120]}"
         return None
+
+    def _emit_switched(self, node, factor, coeff):
+        inner = self.emit(node, None, coeff)
+        if inner is None:
+            return None
+        out = _Linear()
+        out.switched.append((self._rank(factor), inner))
+        return out
 
     def _split_gate(self, node):
         """``(literal symbol, value it is on at, the rest with it fixed)`` for a
@@ -815,34 +839,18 @@ class _TableLowering:
         affine = len(steps) == 0 or np.allclose(steps, steps[0], rtol=0, atol=1e-9)
         return ix.index.entries + (0 if affine else len(ix.values))
 
-    def _distributed_size(self, node, factor) -> int:
-        """Entries ``factor`` pushed into the terms of the sum ``node`` needs."""
-        per_index: dict = {}
-        for term in node.args:
-            ix = self.indexed(term)
-            if ix is not None and ix.index is not None:
-                acc = per_index.get(ix.index)
-                per_index[ix.index] = ix.values if acc is None else acc + ix.values
-        width = len(self._rank(factor).values)
-        return sum(
-            len(self._rank(_Indexed(values, index)).values) * width
-            for index, values in per_index.items()
-        )
-
-    def _emit_sum(self, node, factor, coeff):
-        """A sum stays linear. Terms over one index are summed into one list
-        before the factor is pushed in."""
+    def _emit_sum(self, node, coeff):
+        """A sum stays linear. Terms over one index are summed into one list."""
         out = _Linear()
         same_index: dict = {}
         for term in node.args:
             ix = self.indexed(term)
             if ix is not None and (
-                self._split_gate(term) is not None
-                or (factor is None and self._prefers_linear(term, ix))
+                self._split_gate(term) is not None or self._prefers_linear(term, ix)
             ):
                 ix = None
             if ix is None or ix.index is None:
-                part = self.emit(term, factor, coeff)
+                part = self.emit(term, None, coeff)
                 if part is None:
                     return None
                 out.extend(part)
@@ -850,19 +858,14 @@ class _TableLowering:
                 acc = same_index.get(ix.index)
                 same_index[ix.index] = ix.values if acc is None else acc + ix.values
         for index, values in same_index.items():
-            summed = _Indexed(values, index)
-            term = summed if factor is None else self._pair(summed, factor)
-            if term is None:
-                self.failure = "a factor too long to push into a sum's terms"
-                return None
-            out.add(term, coeff)
+            out.add(_Indexed(values, index), coeff)
         return out
 
-    def _emit_product(self, node, factor, coeff):
+    def _emit_product(self, node, coeff):
         """Indexed factors multiply into one; a single factor too wide to index
-        takes that product pushed into it."""
+        is multiplied by that product (rule 4)."""
         variable = [a for a in node.args if not a.is_Number]
-        if factor is None and len(variable) == 1:
+        if len(variable) == 1:
             numbers = math.prod(float(a) for a in node.args if a.is_Number)
             return self.emit(variable[0], None, coeff * numbers)
         wide = []
@@ -879,7 +882,7 @@ class _TableLowering:
         folded = self._fold_too_long([ix for _, ix in items])
         kept = {id(ix) for ix in folded}
         nodes = {id(ix): a for a, ix in items if id(ix) in kept}
-        acc = factor
+        acc = None
         for ix in sorted(folded, key=lambda i: len(self._rank(i).values)):
             joined = ix if acc is None else self._pair(acc, ix)
             if joined is not None:
@@ -898,24 +901,14 @@ class _TableLowering:
             return None
         return self.emit(wide[0], acc, coeff)
 
-    def _emit_extremum(self, node, factor, coeff):
-        """A Min/Max too wide to index stays a lin_min/lin_max; a factor of one
-        sign moves into its operands."""
-        sign = 1.0
-        if factor is not None:
-            if np.all(factor.values >= 0):
-                sign = 1.0
-            elif np.all(factor.values <= 0):
-                sign = -1.0
-            else:
-                self.failure = "a factor of both signs times a wide Min/Max"
-                return None
-        operands = [self.emit(a, factor, coeff) for a in node.args]
+    def _emit_extremum(self, node, coeff):
+        """A Min/Max too wide to index stays a lin_min/lin_max; a negative
+        coefficient turns a Min into a Max."""
+        operands = [self.emit(a, None, coeff) for a in node.args]
         if None in operands:
             return None
-        is_min = isinstance(node, sympy.Min) == (sign * coeff >= 0)
         out = _Linear()
-        out.extrema.append((is_min, operands))
+        out.extrema.append((isinstance(node, sympy.Min) == (coeff >= 0), operands))
         return out
 
     # ---- building the objective ---------------------------------------------------
@@ -945,6 +938,16 @@ class _TableLowering:
                 return None
             lo += min(0, bounds[0])
             hi += max(0, bounds[1])
+        for factor, inner in lin.switched:
+            bounds = self._bounds(inner)
+            if bounds is None:
+                return None
+            q = self._switch_scale(factor, bounds)
+            if q < _MIN_SWITCH_SCALE:
+                self.failure = "a switched product too wide for its factor's precision"
+                return None
+            ends = [(round(v * q) * w) // q for v in factor.values for w in bounds]
+            lo, hi = lo + min(ends), hi + max(ends)
         if max(abs(lo), abs(hi)) > _MAX_BOUND:
             self.failure = "an objective bound past int64"
             return None
@@ -973,7 +976,53 @@ class _TableLowering:
             total += target
         for (name, on), inner in lin.gated.items():
             total += self._gated(self._literals[name], on, inner)
+        for factor, inner in lin.switched:
+            total += self._switched(factor, inner)
         return total
+
+    @staticmethod
+    def _switch_scale(factor: _Indexed, bounds) -> int:
+        """The finest power of two q with every p * w (p = factor value * q)
+        inside int64 with room to spare."""
+        widest = max(abs(bounds[0]), abs(bounds[1]), 1) * max(
+            float(np.max(np.abs(factor.values))), 1.0
+        )
+        q = _MAX_SWITCH_SCALE
+        while q > 1 and widest * q >= _MAX_SWITCH_PRODUCT:
+            q //= 2
+        return q
+
+    def _switched(self, factor: _Indexed, inner: _Linear):
+        """``factor * inner`` as a variable P: while the factor is at its value
+        v, P = floor(p * w / q) for w = inner and p / q = v to 1/q."""
+        w = self._operand(inner)
+        bounds = self._bounds(inner)
+        q = self._switch_scale(factor, bounds)
+        ps = [round(v * q) for v in factor.values]
+        ends = [(p * b) // q for p in ps for b in bounds]
+        self._count += 1
+        product = self._model.new_int_var(
+            min(ends), max(ends), f"switched_{self._count}"
+        )
+        for p, literal in zip(ps, self._value_literals_of(factor.index)):
+            self._model.add(q * product <= p * w).only_enforce_if(literal)
+            self._model.add(q * product >= p * w - (q - 1)).only_enforce_if(literal)
+        return product
+
+    def _value_literals_of(self, index: _Index) -> list:
+        """One literal per value of ``index``, exactly one of them true."""
+        if index not in self._value_literals:
+            position = index.expr()
+            literals = [
+                self._model.new_bool_var(f"value_{self._count}_{i}")
+                for i in range(index.size)
+            ]
+            for i, literal in enumerate(literals):
+                self._model.add(position == i).only_enforce_if(literal)
+                self._model.add(position != i).only_enforce_if(~literal)
+            self._model.add_exactly_one(literals)
+            self._value_literals[index] = literals
+        return self._value_literals[index]
 
     def _gated(self, literal, on, inner: _Linear):
         """A variable equal to ``inner`` while ``literal`` is ``on``, else 0."""

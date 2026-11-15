@@ -184,22 +184,41 @@ def test_a_product_of_four_maxes_over_shared_buffers_folds():
     _assert_exact(model, {}, buffer_map, expr, choices, lowered)
 
 
-def test_a_negative_factor_turns_a_wide_min_into_a_max():
+def test_a_factor_too_wide_to_pair_is_switched_on_its_value():
     model, buffer_map, divisions, s = _buffers({"a": {"split_a": [1, 2, 4, 8]}})
     x, y = sympy.symbols("x y", integer=True, nonnegative=True)
     sym_map = {"x": model.new_int_var(0, 50, "x"), "y": model.new_int_var(0, 50, "y")}
     derate = sympy.Max(1, 4 / s["split_a"] ** 0.5)
     expr = 1000 - 2 * sympy.Min(10 * x + 7, 6 * y + 20) * derate
-    # At this cap each operand times the derate fits (51 * 4 entries), the
-    # Min's 83-rung ladder times the derate does not, so the derate is pushed
-    # into the Min's operands.
+    # The Min's 83-rung ladder times the derate's 4 values passes the cap, so
+    # the product is switched on the derate's value; the negative coefficient
+    # turns the Min inside it into a Max.
     lowered = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=250)
     assert lowered is not None
+    assert max(_element_sizes(model, 0), default=0) <= 83
     assert any(c.has_lin_max() for c in model.proto.constraints)
     choices = {
         divisions["a"]: range(4),
         sym_map["x"]: (0, 1, 5, 50),
         sym_map["y"]: (0, 3, 50),
+    }
+    _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
+
+
+def test_a_switched_product_holds_inside_a_min():
+    menu = [1, 2, 3, 5, 8, 13, 21]
+    model, buffer_map, divisions, s = _buffers({"a": {"split_a": menu}})
+    x, y = sympy.symbols("x y", integer=True, nonnegative=True)
+    sym_map = {"x": model.new_int_var(0, 40, "x"), "y": model.new_int_var(0, 40, "y")}
+    derate = 1 + 3 / s["split_a"]
+    expr = sympy.Min(derate * (3 * x + 5 * y), 150 + x)
+    # x + y spans 41 * 41 inputs, past the cap, so the derate cannot pair.
+    lowered = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=1000)
+    assert lowered is not None
+    choices = {
+        divisions["a"]: range(len(menu)),
+        sym_map["x"]: (0, 7, 40),
+        sym_map["y"]: (0, 11, 40),
     }
     _assert_exact(model, sym_map, buffer_map, expr, choices, lowered)
 
