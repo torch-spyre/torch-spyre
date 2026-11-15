@@ -401,3 +401,102 @@ def test_one_failing_kind_does_not_stop_the_other(tmp_path, monkeypatch, capsys)
     assert len(posted) == 2
     out = capsys.readouterr().out
     assert "%0A" in out and "line2" in out.replace("%0A", "") and "\nline2" not in out
+
+
+def anchored_row(verdict, name="op-a", rolling="pass", tier="blocking", **a):
+    r = row(rolling, name=name, tier=tier)
+    r["anchored"] = {
+        "verdict": verdict, "version": "2", "since_ts": "2026-11-01 02:00:00", "n_exceeding_runs": 12, "days_exceeding": 11,
+        "worse_pct": 12.3, "anchor_value": 10.0, **a,
+    }  # fmt: skip
+    return r
+
+
+def test_a_persistent_regression_keeps_the_check_neutral_though_the_rolling_verdict_passes():
+    rep = report(anchored_row("regressed"), row("pass", name="op-b"))
+    p = payload(rep)
+    assert p["conclusion"] == "neutral"
+    assert (
+        p["output"]["title"]
+        == "Advisory: persistent regression against the accepted baseline"
+    )
+    assert "**Persistent regressions**" in p["output"]["summary"]
+    assert (
+        "op-a kernel_mean_ms: regressed vs anchor v2 since 2026-11-01 (12 runs), rolling verdict `pass`"
+        in p["output"]["summary"]
+    )
+    assert "12.3% worse" not in p["output"]["summary"]
+    shown = payload(rep, show_values=True)["output"]["summary"]
+    assert "(12 runs), 12.3% worse, rolling verdict `pass`" in shown
+    assert "op-b" not in p["output"]["summary"].split("Persistent regressions")[1]
+
+
+def test_only_a_regressed_anchored_verdict_counts_and_informational_and_invalidated_rows_never_do():
+    for verdict in ("suspected", "improved", "pass", "no_anchor"):
+        assert payload(report(anchored_row(verdict)))["conclusion"] == "success"
+    assert (
+        payload(report(anchored_row("regressed", tier="informational")))["conclusion"]
+        == "success"
+    )
+    inv = anchored_row("regressed")
+    inv["invalidated"] = True
+    assert payload(report(inv, row("pass", name="op-b")))["conclusion"] == "success"
+
+
+def test_a_report_without_anchored_keys_reads_as_before():
+    assert payload(report(row("pass")))["conclusion"] == "success"
+    assert "Persistent" not in payload(report(row("pass")))["output"]["summary"]
+
+
+def test_persistent_regressions_are_annotated_as_warnings_within_the_cap():
+    rep = report(
+        *[anchored_row("regressed", name=f"op-{i}", days_exceeding=i) for i in range(5)]
+    )
+    ann = payload(rep, annotation_path="README.md", max_annotations=3)["output"][
+        "annotations"
+    ]
+    assert len(ann) == 3 and {a["annotation_level"] for a in ann} == {"warning"}
+    assert [a["title"] for a in ann][0] == "regressed vs anchor: op-4 kernel_mean_ms"
+    assert (
+        ann[0]["message"]
+        == "regressed against the accepted baseline since 2026-11-01 (12 runs)."
+    )
+    shown = payload(rep, annotation_path="README.md", show_values=True)["output"][
+        "annotations"
+    ]
+    assert shown[0]["message"].startswith(
+        "12.3% worse than the accepted baseline 10 since 2026-11-01"
+    )
+
+
+def test_a_flagged_and_persistent_row_is_annotated_once():
+    r = anchored_row("regressed", rolling="regressed")
+    ann = payload(report(r), annotation_path="README.md")["output"]["annotations"]
+    assert len(ann) == 1 and ann[0]["title"].startswith("regressed: ")
+
+
+def test_the_persistent_list_is_capped_at_top_and_says_how_many_are_hidden():
+    rep = report(*[anchored_row("regressed", name=f"op-{i}") for i in range(4)])
+    s = payload(rep, top=2)["output"]["summary"]
+    assert s.count("regressed vs anchor v2") == 2 and "2 more not shown" in s
+
+
+def test_rolling_flagged_rows_keep_their_annotation_when_persistent_ones_fill_the_cap():
+    rep = report(
+        *[anchored_row("regressed", name=f"op-p{i}") for i in range(3)],
+        row("regressed", name="op-new"),
+    )
+    ann = payload(rep, annotation_path="README.md", max_annotations=2)["output"][
+        "annotations"
+    ]
+    assert [a["title"] for a in ann][0] == "regressed: op-new kernel_mean_ms"
+    assert len(ann) == 2
+
+
+def test_a_null_days_exceeding_does_not_break_the_ordering():
+    rep = report(
+        anchored_row("regressed", name="op-a", days_exceeding=None),
+        anchored_row("regressed", name="op-b", days_exceeding=4),
+    )
+    s = payload(rep)["output"]["summary"]
+    assert s.index("op-b") < s.index("op-a")
