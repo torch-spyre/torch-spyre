@@ -42,7 +42,7 @@ try:
 except ImportError:  # not POSIX: no cross-process lock, the rename check still refuses a taken slug
     fcntl = None
 
-SLOT = re.compile(r"^slot-(\d{2})$")
+SLOT = re.compile(r"^slot-([0-9]{2})$")
 SLOT_LIMIT = 90
 SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 CLAIM = ".claim-"
@@ -109,7 +109,7 @@ def sha256_file(path):
 
 def write_meta_file(path, text):
     """Write then rename, so a reader sees the whole file or none."""
-    tmp = f"{path}.tmp"
+    tmp = os.path.join(os.path.dirname(path), ".dataset.json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
@@ -168,14 +168,20 @@ class DirStore:
         p = self._file(loc, rel)
         if p.is_symlink() or not p.is_file():
             return None
-        return sha256_file(p)
+        try:
+            return sha256_file(p)
+        except OSError as e:
+            raise StoreError(f"{loc}: cannot read a stored file ({type(e).__name__})") from None
 
     def read(self, loc, rel):
         p = self._file(loc, rel)
         if p.is_symlink() or not p.is_file():
             return None
-        with os.fdopen(open_regular(p), "rb") as f:
-            return f.read(READ_CAP + 1)[:READ_CAP]
+        try:
+            with os.fdopen(open_regular(p), "rb") as f:
+                return f.read(READ_CAP + 1)[:READ_CAP]
+        except OSError as e:
+            raise StoreError(f"{loc}: cannot read a stored file ({type(e).__name__})") from None
 
     @contextmanager
     def _lock(self):
@@ -323,10 +329,6 @@ class HttpStore:
         for i, it in enumerate(items, 1):
             self._put(slug, it, f"{slug}: upload item {i}")
         contested("recheck")
-        for i, it in enumerate(items, 1):
-            if self.file_info(slug, it.rel) != (it.sha256, it.size):
-                self._drop(slug, mark)
-                raise StoreError(f"{slug}: uploaded item {i} does not read back with its digest")
         text = meta_for(slug)
         self._put(
             slug,
@@ -336,6 +338,9 @@ class HttpStore:
         back = self._call("GET", self._url(slug, dm.FILE), f"{slug}/{dm.FILE}")
         if back != text.encode():
             raise StoreError(f"{slug}: {dm.FILE} does not read back as written; run dataset check")
+        for i, it in enumerate(items, 1):
+            if self.file_info(slug, it.rel) != (it.sha256, it.size):
+                raise StoreError(f"{slug}: uploaded item {i} does not read back with its digest; run dataset check")
         self._drop(slug, mark)
         return slug
 
