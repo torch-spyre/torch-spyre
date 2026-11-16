@@ -1,7 +1,7 @@
 name: Dispatch downstream integration tests
 description: >-
   Dispatches a sibling repo's integration-tests.yaml on its default branch, testing the given
-  torch-spyre ref, and waits for that exact run; fails unless it succeeds.
+  torch-spyre ref, and (unless wait is 'false') waits for that exact run; fails unless it succeeds.
 
 inputs:
   repository:
@@ -36,6 +36,12 @@ inputs:
     description: How long to wait for the downstream run
     required: false
     default: '240'
+  wait:
+    description: >-
+      When 'false', return as soon as the downstream run is dispatched and leave it running (an informational run
+      that is neither awaited nor cancelled with this job).
+    required: false
+    default: 'true'
 
 outputs:
   run_id:
@@ -45,7 +51,7 @@ outputs:
     description: URL of the downstream run
     value: ${{ steps.run.outputs.run_url }}
   conclusion:
-    description: Conclusion of the downstream run (empty if it did not finish)
+    description: Conclusion of the downstream run (empty if it did not finish, or when wait is 'false')
     value: ${{ steps.run.outputs.conclusion }}
 
 runs:
@@ -85,6 +91,7 @@ runs:
         HASH_SOURCE: ${{ inputs.hash_source }}
         TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         EXTRA_INPUTS: ${{ inputs.extra_inputs }}
+        WAIT: ${{ inputs.wait }}
       run: |
         set -euo pipefail
         hash=$(printf '%s' "$HASH_SOURCE" | sha256sum | cut -c1-16)
@@ -107,6 +114,12 @@ runs:
         url=$(jq -er .html_url <<<"$resp")
         { echo "run_id=${run_id}"; echo "run_url=${url}"; echo "sibling_ref=${COMPANION_REF:-$sibling_sha}"; } >> "$GITHUB_OUTPUT"
         echo "dispatched ${url}"
+
+        if [ "$WAIT" != true ]; then
+          completed=1
+          echo "not waiting for ${url} (informational)"
+          exit 0
+        fi
 
         deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
         failures=0
@@ -149,14 +162,19 @@ runs:
         COMPANION_REPOSITORY: ${{ steps.test-with.outputs.repository }}
         CONCLUSION: ${{ steps.run.outputs.conclusion }}
         OUTCOME: ${{ steps.run.outcome }}
+        WAIT: ${{ inputs.wait }}
       run: |
+        result="${CONCLUSION:-${OUTCOME}}"
+        if [ "$WAIT" != true ] && [ "$OUTCOME" = success ]; then
+          result="dispatched, not awaited (informational)"
+        fi
         {
           echo "### Downstream integration: ${REPO}"
           echo ""
           echo "| | |"
           echo "|---|---|"
           echo "| Downstream run | ${RUN_URL:-(not dispatched)} |"
-          echo "| Result | ${CONCLUSION:-${OUTCOME}} |"
+          echo "| Result | ${result} |"
           echo "| torch-spyre under test | \`${TORCH_SPYRE_REF}\` |"
           echo "| ${REPO##*/} commit | \`${SIBLING_REF:-(unknown)}\`${COMPANION_REPOSITORY:+ from Test-With companion \`${COMPANION_REPOSITORY}\`} |"
           echo "| Suite | integration |"
