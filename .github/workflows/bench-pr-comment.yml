@@ -1,12 +1,13 @@
 name: bench-pr-comment
-# Runs for other comments are named apart so the per-user rate limit counts only /bench requests.
+# Runs for other comments are named apart so the per-user rate limit counts only /spyre-bench requests.
 run-name: >-
-  ${{ ((github.event_name == 'issue_comment' && !(contains(github.event.comment.body, '/bench ') || endsWith(github.event.comment.body, '/bench')))
+  ${{ ((github.event_name == 'issue_comment' && !(contains(github.event.comment.body, '/spyre-bench ') || endsWith(github.event.comment.body, '/spyre-bench')
+  || contains(github.event.comment.body, '/bench ') || endsWith(github.event.comment.body, '/bench')))
   || (github.event_name == 'pull_request_target' && github.event.label.name != 'bench')) && 'bench-pr-comment (ignored)'
   || format('bench-pr-comment pr={0} by={1}', github.event.issue.number || github.event.pull_request.number, github.event.comment.user.login || github.event.sender.login)
   }}
 
-# `/bench <selection> [key=value ...]` on a pull request, or the `bench` label: authorize -> preview comment ->
+# `/spyre-bench <selection> [key=value ...]` (`/bench` is the deprecated spelling) on a pull request, or the `bench` label: authorize -> preview comment ->
 # dispatch bench-on-demand (same-repository heads) or bench-on-demand-fork (fork heads, no secrets, nothing stored).
 # Grammar, policy and threat model: extensions/spyre-bench/docs/README.md ("On-demand benchmarks for a PR") and
 # docs/source/contributing/bench_on_demand.md.
@@ -34,11 +35,13 @@ jobs:
   # Nothing past this job runs, and nothing is posted, for a commenter who cannot write.
   gate:
     name: Can the commenter write?
+    # Dark until the owner sets the repository variable BENCH_ONDEMAND_ENABLED to 'true' (and enables the engine policy file).
     if: >-
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+      vars.BENCH_ONDEMAND_ENABLED == 'true' && ((github.event_name == 'issue_comment' && github.event.issue.pull_request != null
       && github.event.comment.user.type != 'Bot'
-      && (contains(github.event.comment.body, '/bench ') || endsWith(github.event.comment.body, '/bench')))
-      || (github.event_name == 'pull_request_target' && github.event.label.name == 'bench')
+      && (contains(github.event.comment.body, '/spyre-bench ') || endsWith(github.event.comment.body, '/spyre-bench') || contains(github.event.comment.body,
+      '/bench ') || endsWith(github.event.comment.body, '/bench')))
+      || (github.event_name == 'pull_request_target' && github.event.label.name == 'bench'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -76,7 +79,7 @@ jobs:
       PR: ${{ github.event.issue.number || github.event.pull_request.number }}
       ACTOR: ${{ github.event.comment.user.login || github.event.sender.login }}
       ASSOCIATION: ${{ github.event.comment.author_association || '' }}
-      COMMENT_BODY: ${{ github.event.comment.body || '/bench sanity' }}
+      COMMENT_BODY: ${{ github.event.comment.body || '/spyre-bench sanity' }}
       W: ${{ github.workspace }}/.bench-request
       RUN_ID: ${{ github.run_id }}
     steps:
@@ -146,7 +149,7 @@ jobs:
             echo
             sed -e 's/^error: //' "$W/parse.err" | "$BENCH" ondemand sanitize --limit 600
             echo
-            echo "Usage: \`/bench <selection> [reuse=...] [force=...]\`; \`/bench confirm\`; \`/bench cancel\`."
+            echo "Usage: \`/spyre-bench <selection> [reuse=...] [force=...]\`; \`/spyre-bench confirm\`; \`/spyre-bench cancel\`."
           } > "$W/body.md"
           gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/body.md" > /dev/null
 
@@ -202,7 +205,7 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # The user the limit is charged to is the requester: the commenter, or whoever asked before a /bench confirm.
+      # The user the limit is charged to is the requester: the commenter, or whoever asked before a /spyre-bench confirm.
       - name: Count this user's recent requests
         if: ${{ steps.go.outputs.go == 'true' }}
         env:
@@ -213,7 +216,7 @@ jobs:
           user="${ACTOR}"
           if [ "${KIND}" = confirm ]; then user=$(jq -r '.requester.login // ""' "$W/state.json"); fi
           since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
-          # Rate: this user's /bench requests in the last hour. They count toward the hourly limit only (rate rows).
+          # Rate: this user's /spyre-bench requests in the last hour. They count toward the hourly limit only (rate rows).
           gh run list --workflow bench-pr-comment.yml --user "${user}" --created ">=${since}" --limit 200 --json databaseId,createdAt,displayTitle \
             | jq --arg actor "${user}" --arg self "${RUN_ID}" \
               '[.[] | select((.databaseId | tostring) != $self and (.displayTitle | endswith(" by=" + $actor)))
@@ -395,7 +398,7 @@ jobs:
               -f ref="${HEAD_SHA}" -f repository="${HEAD_REPO}" -f pr_number="${PR}" -f requested_by="${ACTOR}" \
               -f bench_env="$(jq -c . "$W/bench-env.json")"
           fi
-          gh api "repos/${REPO}/issues/${PR}/comments" -f body="Benchmark run started for ${HEAD_SHA:0:12}. A newer /bench request on this pull request cancels it; /bench cancel stops it." > /dev/null
+          gh api "repos/${REPO}/issues/${PR}/comments" -f body="Benchmark run started for ${HEAD_SHA:0:12}. A newer /spyre-bench request on this pull request cancels it; /spyre-bench cancel stops it." > /dev/null
 
   # The label is a one-shot trigger: take it off whatever happened, so it can be applied again.
   unlabel:
