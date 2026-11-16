@@ -346,6 +346,57 @@ def test_a_ci_channel_keeps_purpose_validity_labels_and_clean_claims(tmp_path, d
     ]
 
 
+def test_a_ci_bundle_files_its_rows_in_the_workflow_series(tmp_path, db):
+    src = run_dir(tmp_path, result(), result("prefill"))
+    ci = seal(
+        tmp_path,
+        src,
+        "ci.tgz",
+        "--seal-trust",
+        "none",
+        "--workflow",
+        "jenkins-comp-bench-s390x",
+    )
+    ingest(ci, trust="ci")
+    assert db.rows(
+        "SELECT DISTINCT extract(props['source_file'], '^([^/]+)/') FROM benchmark_runs"
+    ) == [("jenkins-comp-bench-s390x",)]
+
+
+def test_a_lower_channel_cannot_name_a_series(tmp_path, db):
+    src = run_dir(tmp_path, result())
+    ingest(
+        seal(tmp_path, src, "lab.tgz", "--workflow", "jenkins-comp-bench-s390x"),
+        trust="lab",
+    )
+    assert db.rows(
+        "SELECT DISTINCT extract(props['source_file'], '^([^/]+)/') FROM benchmark_runs"
+    ) == [("",)]
+
+
+def test_a_connected_results_run_ingests_a_bench_dir_as_the_channel_says(
+    tmp_path, db, capsys
+):
+    from spyre_clickhouse_ingest.__main__ import main as cli
+
+    src = run_dir(tmp_path, result())
+    common = ["results", "--bench-dir", str(src), "--arch", "x86_64", "--trigger-type", "perf",
+              "--workflow", "jenkins-comp-bench-s390x", "--run-url", "https://ci/run/1"]  # fmt: skip
+    assert cli([*common, "--channel-trust", "ci"]) == 0
+    assert db.rows(
+        "SELECT DISTINCT props['run.trust'], extract(props['source_file'], '^([^/]+)/') FROM benchmark_runs"
+    ) == [("ci", "jenkins-comp-bench-s390x")]
+    assert cli(common) == 0
+    assert "duplicate" in capsys.readouterr().out
+
+
+def test_a_series_name_with_a_slash_is_refused_for_a_ci_channel(tmp_path, db):
+    src = run_dir(tmp_path, result())
+    out = seal(tmp_path, src, "bad.tgz", "--seal-trust", "none", "--workflow", "a/b")
+    with pytest.raises(offline.BundleError, match="series name"):
+        ingest(out, trust="ci")
+
+
 def test_the_sealed_bundles_own_label_can_only_lower_the_channel(tmp_path, db):
     ingest(
         seal(tmp_path, run_dir(tmp_path, result()), "l.tgz", "--seal-trust", "lab"),
