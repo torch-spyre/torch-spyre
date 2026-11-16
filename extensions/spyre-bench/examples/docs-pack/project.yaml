@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Not built in: validate with  spyre-bench validate examples/docs-pack --pack examples/packs/docs-queue
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: docs-pack, owner: example-team}
+spec:
+  component: docs-pack
+  packs: [{name: docs-queue, version: "0.1"}]
+  default_suites: [queue]
+  default_environment: broker-host
+  visibility: public
+  series_labels: [env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: queue}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke}
+spec:
+  cases: [produce_small_p1]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: broker-pool}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: broker}}
+  host_profile: {governor: performance}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: broker-host}
+spec:
+  devices:
+    requests: [{name: cpus, device_class: cpu/socket, count: 1}]
+  host: {node_class: broker-pool, arch: x86_64, exclusive: false}
+  labels: {node.class: broker-pool}
+  policy: {validity_floor: shared_env}

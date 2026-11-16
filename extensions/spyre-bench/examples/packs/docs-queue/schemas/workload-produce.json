@@ -1,0 +1,27 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/docs-queue/workload-produce.json",
+ "title": "mq/produce",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "message_bytes": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "acks": {
+   "enum": [
+    "none",
+    "leader",
+    "all"
+   ]
+  },
+  "progress_s": {
+   "type": "integer",
+   "minimum": 1
+  }
+ },
+ "required": [
+  "message_bytes"
+ ]
+}

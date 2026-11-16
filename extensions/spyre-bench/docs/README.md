@@ -1,5 +1,8 @@
 # spyre-bench concepts
 
+> **Writing definitions?** The end-to-end developer guides (benchmarks, environments, data, metrics, analyses, packs,
+> safe commands, debugging, contributing) are in [`dev/`](dev/README.md). This page is the reference they link to.
+
 ## The model in one page
 
 A **catalog** is a folder of YAML documents. Each document has an envelope (`apiVersion: bench/v1alpha1`, `kind`,
