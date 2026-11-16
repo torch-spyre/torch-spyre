@@ -1185,6 +1185,7 @@ def compare_view(cmp):
         if t
         else None,
         "cap": cmp["cap"],
+        "subject_artifact": cmp.get("subject_artifact", ""),
         "counts": cmp["counts"],
         "estimate": cmp["estimate"],
         "cases": [
@@ -1273,7 +1274,7 @@ _REFUSAL_PUBLIC = {  # fixed wording: a public comment never repeats an artifact
     "store_unavailable": "the result store did not answer",
     "no_store": "no result store is configured",
 }
-_CMP_WORD = {"ready": "both sides stored", "will_run_other": "other side runs", "cannot_compare": "cannot compare"}
+_CMP_WORD = {"ready": "other side stored", "will_run_other": "other side runs", "cannot_compare": "cannot compare"}
 
 
 def _render_compare(cv, public):
@@ -1282,7 +1283,7 @@ def _render_compare(cv, public):
     t = cv.get("target") or {}
     where = "" if public or not t else f" ({safe(t.get('source'), 20)} {safe(str(t.get('artifact_id'))[:8], 8)})"
     out = [
-        f"**Compared with {safe(cv['vs'], 80)}**{where}: ready {c['ready']} · other side runs {c['will_run_other']} · cannot compare {c['cannot_compare']}"
+        f"**Compared with {safe(cv['vs'], 80)}**{where}: other side stored {c['ready']} · other side runs {c['will_run_other']} · cannot compare {c['cannot_compare']}"
     ]
     out.append("A PR run is advisory (`suspected` at most) and never becomes a baseline.")
     if cv["status"] != "ok":
@@ -1444,7 +1445,7 @@ def _cmd_compare(a):
         expect_artifact=a.expect_artifact or "",
     )
     print(json.dumps(doc, sort_keys=True))
-    if a.expect_digest and doc["digest"] != a.expect_digest:
+    if (a.expect_digest and doc["digest"] != a.expect_digest) or (a.expect_artifact and doc["status"] != "ok"):
         print("error: the comparison changed since the preview", file=sys.stderr)
         return cliutil.EXIT_INVALID
     return cliutil.EXIT_OK

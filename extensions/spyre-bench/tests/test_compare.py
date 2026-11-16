@@ -397,6 +397,7 @@ class Preview(unittest.TestCase):
         internal = od.render_markdown(pv, public=False)
         public = od.render_markdown(pv, public=True)
         self.assertIn("Compared with tag:t1", internal)
+        self.assertIn("other side stored", internal)
         self.assertIn(OTHER[:8], internal)
         self.assertNotIn(OTHER[:8], public)
         self.assertIn("never becomes a baseline", public)
@@ -484,7 +485,9 @@ class Cli(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertIn("changed since the preview", err)
             self.assertEqual(call(*base, "--expect-digest", doc["digest"])[0], 0)
-            self.assertNotEqual(call(*base, "--expect-artifact", OLDER)[0], 1, "reported in the document")
+            self.assertEqual(
+                call(*base, "--expect-artifact", OLDER)[0], 2, "a moved target fails the run, not just the document"
+            )
             moved = json.loads(call(*base, "--expect-artifact", OLDER)[1])
             self.assertEqual(moved["refusal"]["code"], "target_moved")
             code, _, err = call(*base, "--relax-labels", "env.label.*", "--host", "github.com")
@@ -625,6 +628,17 @@ class ReviewFindings(unittest.TestCase):
         pv = od.build_preview(p, od.parse_flags({"bench": "sanity", "vs": "tag:t1"}), GHE, cmp=doc)
         self.assertFalse(pv["budget"]["estimate_known"])
         self.assertIs(run("tag:t1", [row("a")], [target(OTHER, tags=["t1"])])["estimate"]["known"], True)
+
+    def test_amd64_and_x86_64_are_the_same_platform_and_main_skips_the_subject(self):
+        doc = run("main", [row("a")], [target(OTHER, arch="amd64")])
+        self.assertEqual(doc["status"], "ok")
+        doc = run("main", [row("a", OLDER, run="r2", days=1)], [target(SUBJ), target(OLDER, days=1)])
+        self.assertEqual(doc["target"]["artifact_id"], OLDER)
+        self.assertEqual(run("artifact:" + SUBJ, [], [target(SUBJ)])["refusal"]["code"], "vs_is_subject")
+
+    def test_the_compare_view_names_the_subject_artifact(self):
+        d = run("tag:t1", [row("a")], [target(OTHER, tags=["t1"])])
+        self.assertEqual(od.compare_view(d)["subject_artifact"], SUBJ)
 
 
 class RealPlan(unittest.TestCase):

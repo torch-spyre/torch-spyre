@@ -755,8 +755,7 @@ spyre-bench ondemand compare --plan plan.json --request request.json --product s
 spyre-bench ondemand preview --plan plan.json --request request.json --compare compare.json
 ```
 
-`compare` prints a `bench.compare/1` document: the resolved target, the cap, and per case one of `ready` (both sides
-stored), `will_run_other` (the other side will be measured; `other_requests` holds the engine request for those
+`compare` prints a `bench.compare/1` document: the resolved target, the cap, and per case one of `ready` (the other side is stored; this run's side is reused or will run), `will_run_other` (the other side will be measured; `other_requests` holds the engine request for those
 cases) or `cannot_compare` with the reason; counts; the device-hours of both sides (`estimate.known` is false when a case has
 no usable estimate, and the preview then treats the estimate as unknown); and a `digest`. The preview adds
 the other side's device-hours to the estimate the budget is judged on and shows a compare section (ids only on the
