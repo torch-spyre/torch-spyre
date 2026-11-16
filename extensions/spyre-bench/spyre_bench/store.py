@@ -63,6 +63,10 @@ class Store:
         """Active invalidation events for these runs (none are readable yet)."""
         return []
 
+    def invalidated_runs(self, run_ids):
+        """The subset of run_ids with an active run-scope invalidation; raises StoreError when this store cannot tell."""
+        raise StoreError(f"store {self.name!r} cannot report invalidations")
+
     def check(self):
         """Raise StoreError if the store cannot possibly work (missing settings); never connects."""
 
@@ -102,6 +106,14 @@ class Store:
         """A query client on the store's database, for readers that ship their own SQL (invalidate)."""
         raise StoreError(f"store {self.name!r} has no query client")
 
+    def registered(self, benchmark_ids):
+        """The subset of benchmark_ids already registered, or None when this store cannot tell."""
+        return None
+
+    def reference_values(self, key, version="current"):
+        """Value rows (dicts) of one reference version from v_bench_reference_values; version is "current" or an int."""
+        raise StoreError(f"store {self.name!r} holds no references")
+
 
 class NullStore(Store):
     pass
@@ -124,6 +136,9 @@ class MemoryStore(Store):
         anchors=None,
         windows=None,
         cases=None,
+        known=None,
+        references=(),
+        invalidated=None,
     ):
         self.cases = cases if cases is not None else []
         self.windows = windows if windows is not None else []
@@ -131,6 +146,9 @@ class MemoryStore(Store):
         self.series = series if series is not None else {}
         self.anchors = anchors if anchors is not None else []
         self.results = list(results)
+        self.known = known
+        self.invalidated = invalidated
+        self.references = list(references)
         self.landed_ids = landed if landed is not None else {}
         self.verdicts = verdicts if verdicts is not None else {}
         self.runs = runs if runs is not None else {}
@@ -186,6 +204,24 @@ class MemoryStore(Store):
             r for r in self.anchors
             if (r["component"], r["arch"], r["backend"], r["source_job"]) == (component, arch, backend, source_job)
         ]  # fmt: skip
+
+    def invalidated_runs(self, run_ids):
+        self._check("invalidated_runs")
+        if self.invalidated is None:
+            return super().invalidated_runs(run_ids)
+        return set(run_ids) & set(self.invalidated)
+
+    def registered(self, benchmark_ids):
+        self._check("registered")
+        return None if self.known is None else set(benchmark_ids) & set(self.known)
+
+    def reference_values(self, key, version="current"):
+        self._check("reference_values")
+        rows = [r for r in self.references if r["ref_key"] == key]
+        want = {"current": lambda r: r.get("state") == "current"}.get(
+            version, lambda r: str(r["version"]) == str(version)
+        )
+        return [r for r in rows if want(r)]
 
 
 def connection_settings(env=None):
@@ -337,6 +373,41 @@ class ClickHouseStore(Store):
             {"artifact": artifact},
         )
         return rows[0]["run_key"] if rows else None
+
+    def invalidated_runs(self, run_ids):
+        ok = {u for u in (_uuid_or_none(r) for r in run_ids) if u}
+        bad = sorted(str(r) for r in run_ids if _uuid_or_none(r) is None)
+        if bad:
+            raise StoreError(f"run id(s) {bad} are not UUIDs, so their invalidation cannot be checked")
+        if not ok:
+            return set()
+        rows = self._rows(
+            "SELECT DISTINCT toString(run_id) AS run_key FROM {db}.v_invalidated_runs "
+            "WHERE state = 'invalidated' AND run_id IN {ids:Array(UUID)}",
+            {"ids": sorted(ok)},
+        )
+        return {r["run_key"] for r in rows}
+
+    def registered(self, benchmark_ids):
+        ids = sorted({i for i in (_uuid_or_none(b) for b in benchmark_ids) if i})
+        found = set()
+        for start in range(0, len(ids), ID_BATCH):
+            rows = self._rows(
+                "SELECT DISTINCT toString(benchmark_id) AS benchmark_key FROM {db}.benchmarks "
+                "WHERE benchmark_id IN {ids:Array(UUID)}",
+                {"ids": ids[start : start + ID_BATCH]},
+            )
+            found |= {r["benchmark_key"] for r in rows}
+        return found
+
+    def reference_values(self, key, version="current"):
+        where = "state = 'current'" if version == "current" else "version = {version:String}"
+        return self._rows(
+            "SELECT ref_key, version, state, toString(artifact_id) AS artifact_id, origin, label, comparability, "
+            "clean, warnings, component, toString(benchmark_id) AS benchmark_id, backend, measurements, iterations, "
+            "row_props FROM {db}.v_bench_reference_values WHERE ref_key = {key:String} AND " + where,
+            {"key": key, "version": str(version)},
+        )
 
     def verdict_rows(self, run_id):
         run = _uuid_or_none(run_id)
