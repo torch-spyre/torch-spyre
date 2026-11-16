@@ -142,8 +142,19 @@ def test_an_existing_bundle_is_sent_as_it_is(run_dir, real_ingest, monkeypatch, 
 
 def test_a_directory_without_results_and_a_missing_path_are_invalid(tmp_path, real_ingest, capsys):
     (tmp_path / "empty").mkdir()
-    assert upload.main([str(tmp_path / "empty")]) == 2
+    assert upload.main([str(tmp_path / "empty"), "--arch", "x86_64"]) == 2
+    assert "no bench Result" in capsys.readouterr().out
     assert upload.main([str(tmp_path / "nope")]) == 2
+    assert "no such file" in capsys.readouterr().err
+
+
+def test_a_missing_token_is_configuration_and_out_must_be_a_tgz(run_dir, real_ingest, monkeypatch, tmp_path, capsys):
+    for var in ("ARTIFACTORY_TOKEN",):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.netrc
+    args = ["--apply", "--base-url", "https://art.example.com", "--repo", "r", "--root", "{arch}/x"]
+    assert upload.main([str(run_dir), *args]) == 2
+    assert upload.main([str(run_dir), "--out", str(tmp_path / "folder")]) == 2
 
 
 def test_via_api_is_refused_with_the_reason(run_dir, capsys):
