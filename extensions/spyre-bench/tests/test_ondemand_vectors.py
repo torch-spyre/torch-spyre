@@ -27,6 +27,29 @@ from pathlib import Path
 from spyre_bench import ondemand as od
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "ondemand-vectors.json"
+COMMANDS_GOLDEN = Path(__file__).resolve().parent / "golden" / "ondemand-command-vectors.json"
+COMMAND_TEXTS = [
+    "/spyre-bench sanity",
+    "/bench sanity",
+    "please\n/spyre-bench decoder+startup@sanity reuse=only force=a_1\nthanks",
+    "/spyre-bench torch-spyre:a,b budget=3 sha=abcdef123456",
+    "/spyre-bench sanity type=quality",
+    "/spyre-bench sanity TEST_TYPE=quality",
+    "/spyre-bench sanity test_type=perf",
+    "/spyre-bench sanity arch=ppc64le",
+    "/spyre-bench confirm",
+    "/spyre-bench cancel",
+    "/spyre-bench confirm now",
+    "/spyre-bench sanity reuse",
+    "/spyre-bench sanity reuse=only reuse=never",
+    "/spyre-benchmark sanity",
+    "  /spyre-bench sanity",
+    "> /spyre-bench sanity",
+    "```\n/spyre-bench sanity\n```",
+    "<!-- /spyre-bench sanity -->",
+    "no command here",
+    "/spyre-bench",
+]
 WRITER = {"login": "dev1", "permission": "write", "association": "COLLABORATOR"}
 READER = {"login": "rando", "permission": "read", "association": "NONE"}
 
@@ -106,7 +129,22 @@ def build():
     ]
 
 
+def command_vector(text):
+    try:
+        cmd = od.parse_command(text)
+    except od.RequestError as e:
+        return {"error": str(e)}
+    return {"kind": None} if cmd is None else {"kind": cmd.kind, "flags": cmd.flags}
+
+
+def build_commands():
+    return [{"in": {"text": t}, "out": command_vector(t)} for t in COMMAND_TEXTS]
+
+
 class Vectors(unittest.TestCase):
+    def test_command_golden_matches_the_engine(self):
+        self.assertEqual(json.loads(COMMANDS_GOLDEN.read_text()), build_commands(), "run with --refresh")
+
     def test_golden_matches_the_engine(self):
         self.assertEqual(
             json.loads(GOLDEN.read_text()), build(), "run this file with --refresh after an intended change"
@@ -122,6 +160,7 @@ class Vectors(unittest.TestCase):
 if __name__ == "__main__":
     if "--refresh" in sys.argv:
         GOLDEN.write_text(json.dumps(build(), indent=1, sort_keys=True) + "\n")
+        COMMANDS_GOLDEN.write_text(json.dumps(build_commands(), indent=1, sort_keys=True) + "\n")
         print(f"wrote {GOLDEN}")
     else:
         unittest.main()

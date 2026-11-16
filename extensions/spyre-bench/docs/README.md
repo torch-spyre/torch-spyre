@@ -641,10 +641,29 @@ spyre-bench ondemand authorize --facts facts.json                              #
 spyre-bench ondemand preview   --plan plan.json --request request.json --format md|json
 ```
 
+### Command, switches and modes
+
+The command is `/spyre-bench` on both hosts (`/bench` is accepted as a deprecated spelling on github.com). On the internal
+host it is an alias that the comment bot rewrites to `/spyre-test` with `TEST_TYPE=perf` (`type=quality` gives
+`TEST_TYPE=quality`), so there is one execution path; `/spyre-test TEST_TYPE=perf` also works directly. Triggerers are
+those of `/spyre-test`; no separate allow-list.
+
+Two switches sit at the top of `spyre_bench/ondemand_policy.json` and ship off:
+
+| Switch | Off (shipped) | On |
+|---|---|---|
+| `enabled` | the feature is dark: nothing is admitted, the bots say so | requests are processed |
+| `enforce_budgets` | the device-hour limits, the unknown-cost rule, the per-PR window and the supersede counting only REPORT "would have been refused" (in the preview, in `Decision.would_refuse` and in the `ci_requests` row, `bench.would_refuse`) and the request proceeds | the same findings refuse the request, and a plan above half the limit needs a confirm |
+
+Always enforced in either mode: tier limits (`core` and `extended`), head pinning, the fork `sha=` approval, who may
+trigger, the start-of-run PR re-check, the per-user rate limit and the clean quotas. Both hosts are switched on
+together: flip `enabled` in the engine file and in the internal copy (and the GitHub repository variable
+`BENCH_ONDEMAND_ENABLED`), updating the pinned digest.
+
 ### Grammar
 
 ```text
-/bench <selection> [key=value ...]        /bench confirm        /bench cancel
+/spyre-bench <selection> [key=value ...]    /spyre-bench confirm    /spyre-bench cancel
 selection := [product ":"] pick (";" [product ":"] pick)*
 pick      := tier | suite ("+" suite)* ["@" tier] | case ("," case)* | "#" selection-name
 tier      := sanity | core | extended
@@ -666,6 +685,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | `max-wait` | `45m`, `1h`, ... (with `clean=true`) | the placer's default; capped at 60m |
 | `env` | an Environment name | the preset's |
 | `budget` | device-hours; lowers the cap, never raises it | the cap |
+| `type` | `perf` (default), `quality` (internal only); also spelled `TEST_TYPE` | `perf` |
 | `sha` | 7 to 40 hex characters of the head commit you reviewed; a fork head needs at least 12 | none |
 
 ### Policy
@@ -680,7 +700,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | budget per request (device-hours) | 4 | 12 (`sanity`), 48 (`core`) |
 | budget per PR per 24 h | 8 | 96 |
 
-The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a byte copy; both repos pin the file's sha-256 in a test, so changing a limit means updating the file, the digest and the copy together). An estimate above half the limit needs `/bench confirm`;
+The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a byte copy; both repos pin the file's sha-256 in a test, so changing a limit means updating the file, the digest and the copy together). An estimate above half the limit needs `/spyre-bench confirm`;
 above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
 access may cancel anyone's, others are refused while another user's request runs). History rows are normalised
 (pull request numbers compared as text, states case-insensitively). A state that is not dead or finished is live
@@ -722,7 +742,7 @@ data as a PR comment that starts with a marker so it is edited in place. Text th
 stripped of control and bidirectional characters, backticks, tags, pipes, link and image syntax, and issue references,
 `@` is neutralised and URL schemes are broken, before it is put in a table; `RequestError` messages get the lighter
 form (`neutral`). The JSON preview carries the raw plan strings: a dashboard must escape them. A confirm
-(`/bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha`,
+(`/spyre-bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha`,
 `requested_at` (no older than 24 hours) and, for a fork, the recorded approval; the confirmer must have write access.
 `authorize` re-validates the request it is given (shape, enums, names, sha) and at `stage: planned` refuses to admit
 without a plan that has cases, because the tier limit of case and Selection picks can only be judged there.
