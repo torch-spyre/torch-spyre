@@ -38,20 +38,40 @@ DEVICE = ("node", "serial", "pci", "firmware", "link")
 
 
 class Chdb:
-    """A chdb session behind the clickhouse_connect calls the writers make."""
+    """A chdb session behind the clickhouse_connect calls the writers make. chdb shares one engine across sessions
+    and tests, so every table and view of the schema files is dropped before and after each test."""
 
     def __init__(self):
         self.s = session.Session()
-        self.name = f"t{uuid.uuid4().hex[:10]}"  # chdb shares one engine across sessions: one database per test
-        self.s.query(f"CREATE DATABASE {self.name}")
-        self.s.query(f"USE {self.name}")
-        for name in FILES:
-            for stmt in SchemaApplier.statements(
-                (SCHEMA_DIR / f"{name}.sql").read_text()
-            ):
-                self.s.query(stmt)
-        self.s.query("INSERT INTO artifacts (artifact_id, component, kind, artifact_name, arch, origin, props) VALUES "
-                     f"('{AID}', 'comp', 'image', 'img', 'x86_64', 'upstream', map())")  # fmt: skip
+        statements = [
+            st
+            for name in FILES
+            for st in SchemaApplier.statements((SCHEMA_DIR / f"{name}.sql").read_text())
+        ]
+        self.objects = [
+            (m.group(1), m.group(2))
+            for st in statements
+            if (
+                m := re.match(
+                    r"\s*CREATE\s+(TABLE|VIEW|MATERIALIZED VIEW)\s+IF NOT EXISTS\s+(\w+)",
+                    st,
+                )
+            )
+        ]
+        self.name = "default"
+        self.drop()
+        for st in statements:
+            self.s.query(st)
+        self.s.query(
+            "INSERT INTO artifacts (artifact_id, component, kind, artifact_name, arch, origin, props) VALUES "
+            f"('{AID}', 'comp', 'image', 'img', 'x86_64', 'upstream', map())"
+        )
+
+    def drop(self):
+        for kind, name in reversed(self.objects):
+            self.s.query(
+                f"DROP {'VIEW' if 'VIEW' in kind else 'TABLE'} IF EXISTS {name}"
+            )
 
     @staticmethod
     def lit(v):
@@ -111,8 +131,7 @@ def db(monkeypatch):
         bundle, "resolve_artifact", lambda *a, **k: (found, "artifact_id")
     )
     yield d
-    d.s.query("USE default")  # the engine is shared with later tests: leave no current database behind
-    d.s.query(f"DROP DATABASE IF EXISTS {d.name}")
+    d.drop()
 
 
 def result(
