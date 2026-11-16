@@ -211,6 +211,8 @@ from .work_division import (
     ge,
     piecewise,
     _and,
+    _or,
+    _not,
     _ceil,
     _is_sym,
 )
@@ -2138,15 +2140,12 @@ def _matmul_split_preference_us(o, axes) -> float | sympy.Expr:
     # SymPy condition the branches below (and the preferences) carry.
     whole = _and(ge(call_batch, 1), eq(_ceil(call_batch), call_batch))
     B = piecewise((call_batch, whole), (B, True))
-    shared_weight = (
-        True
-        if broadcast
-        else piecewise((eq(call_batch, 1), whole), (shared_weight, True))
+    # One whole call shares the weight when it is a single matmul; otherwise
+    # keep the buffer's flag. Built from And/Or/Not: a Piecewise of conditions
+    # is not a SymPy Boolean, so ``sympy.And`` would reject it.
+    shared_weight = broadcast or _or(
+        _and(whole, eq(call_batch, 1)), _and(_not(whole), shared_weight)
     )
-    if isinstance(shared_weight, sympy.Piecewise):
-        # A Piecewise of conditions is not a SymPy Boolean, so ``sympy.And``
-        # (``_in_decode_delivery_scope``) rejects it; the ITE form is one.
-        shared_weight = shared_weight.rewrite(sympy.ITE)
     return trip * _wd_matmul_split_preference_us(
         (B, b),
         m_axis,

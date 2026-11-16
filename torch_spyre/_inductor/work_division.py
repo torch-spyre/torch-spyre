@@ -2284,6 +2284,26 @@ def _and(*args):
     return sympy.And(*undecided) if undecided else True
 
 
+def _or(*args):
+    """``or``, symbolic-aware, the dual of :func:`_and`: decided terms give a
+    Python ``bool``; only undecided relations are left in a ``sympy.Or``."""
+    undecided = []
+    for a in args:
+        if a in [sympy.true, True]:
+            return True
+        if isinstance(a, sympy.Basic) and a is not sympy.false:
+            undecided.append(a)
+    return sympy.Or(*undecided) if undecided else False
+
+
+def _not(arg):
+    """``not``, symbolic-aware: ``sympy.Not`` for an undecided SymPy condition,
+    a Python ``bool`` otherwise."""
+    if isinstance(arg, sympy.Basic) and arg not in (sympy.true, sympy.false):
+        return sympy.Not(arg)
+    return not arg
+
+
 def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
