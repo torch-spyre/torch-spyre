@@ -21,8 +21,8 @@ golden table, so an edit that would start a new series fails here.
 
     python benchmarks/tools/check_identity_ids.py [--update]
 
-Needs pyyaml, regex, lxml, clickhouse-connect and the spyre-bench package; exits 0 with a notice when a module
-is missing unless BENCH_REQUIRED is set. Kernel names are synthetic fixtures; shapes, models and configs are the perf suite's own.
+Needs pyyaml, regex, lxml, clickhouse-connect and the spyre-bench package; exits 2 when a module is
+missing unless BENCH_OPTIONAL is set (and BENCH_REQUIRED is not). Kernel names are synthetic fixtures; shapes, models and configs are the perf suite's own.
 """
 
 import argparse
@@ -292,10 +292,12 @@ def main(argv=None):
         code, msgs = check(update=args.update)
     except ImportError as e:
         print(
-            f"notice: identity conformance skipped, missing module: {e.name}",
+            f"notice: identity conformance skipped, missing module: {e.name} "
+            "(install: uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml)",
             file=sys.stderr,
         )
-        return 2 if os.environ.get("BENCH_REQUIRED") else 0
+        soft = os.environ.get("BENCH_OPTIONAL") and not os.environ.get("BENCH_REQUIRED")
+        return 0 if soft else 2
     for m in msgs:
         print(m, file=sys.stderr if code else sys.stdout)
     if code:

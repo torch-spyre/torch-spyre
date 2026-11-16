@@ -102,7 +102,7 @@ repos:
         pass_filenames: false
       - id: bench-validate
         name: Validate benchmark definitions
-        entry: make -s bench-validate
+        entry: make -s bench-validate BENCH_OPTIONAL=1
         language: system
         files: ^(benchmarks/.*\.ya?ml|mk/bench\.mk)$
         pass_filenames: false
