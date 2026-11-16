@@ -306,6 +306,33 @@ jobs:
     needs: [decide-spyre-test, changes, run-tests, downstream-hf-adapters]
     if: always() && (github.event_name == 'merge_group' || github.event_name == 'pull_request')
     steps:
+      # Fork PR runs cannot read repo variables, so the owns decision above is false for them. spyre_test_status.yaml
+      # runs in the base repo, applies the variables there and posts the PR-head status from this verdict.
+      - name: Record the suite verdict
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          RUN_TESTS: ${{ needs.run-tests.result }}
+          CHANGES: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code_changed }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [ "$RUN_TESTS" = success ]; then verdict=success
+          elif [ "$RUN_TESTS" = skipped ] && [ "$CHANGES" = success ] && [ "$CODE_CHANGED" = false ]; then verdict=success
+          elif [ "$RUN_TESTS" = skipped ] && [ "$CHANGES" = success ]; then verdict=skipped
+          else verdict=failure
+          fi
+          echo "verdict=${verdict}"
+          printf '%s %s' "$verdict" "$ATTEMPT" > verdict.txt
+      - name: Upload the suite verdict
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spyre-test-verdict
+          path: verdict.txt
+          retention-days: 1
+          overwrite: true
       - name: GHA does not own this check here
         if: ${{ needs.decide-spyre-test.outputs.owns != 'true' }}
         run: echo "Jenkins owns the Spyre Test (amd64) check here."
