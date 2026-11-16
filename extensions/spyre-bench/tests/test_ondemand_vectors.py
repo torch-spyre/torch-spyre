@@ -137,11 +137,41 @@ def command_vector(text):
     return {"kind": None} if cmd is None else {"kind": cmd.kind, "flags": cmd.flags}
 
 
+REWRITE_GOLDEN = Path(__file__).resolve().parent / "golden" / "ondemand-rewrite-vectors.json"
+REWRITE_TEXTS = [t for t in COMMAND_TEXTS if "confirm" not in t and "cancel" not in t and "reuse\n" not in t] + [
+    "/spyre-bench sanity preset=nightly",
+    "/spyre-bench sanity arch=amd64,s390x type=quality",
+    "/spyre-bench sanity max-wait=45m clean=true budget=3 sha=abcdef1 env=e1 profile=light vs=main purpose=pr",
+]
+
+
+def build_rewrites():
+    out = []
+    for t in REWRITE_TEXTS:
+        try:
+            cmd = od.parse_command(t)
+            out.append({"in": {"text": t}, "out": None if cmd is None else od.to_spyre_test(cmd)})
+        except od.RequestError as e:
+            out.append({"in": {"text": t}, "out": {"error": str(e)}})
+    return out
+
+
 def build_commands():
     return [{"in": {"text": t}, "out": command_vector(t)} for t in COMMAND_TEXTS]
 
 
 class Vectors(unittest.TestCase):
+    def test_rewrite_golden_matches_the_engine(self):
+        self.assertEqual(json.loads(REWRITE_GOLDEN.read_text()), build_rewrites(), "run with --refresh")
+
+    def test_default_preset_and_explicit_preset_win(self):
+        by = {v["in"]["text"]: v["out"] for v in build_rewrites()}
+        self.assertEqual(by["/spyre-bench sanity"], "/spyre-test preset=perf-only bench=sanity TEST_TYPE=perf")
+        self.assertEqual(
+            by["/spyre-bench sanity preset=nightly"], "/spyre-test bench=sanity preset=nightly TEST_TYPE=perf"
+        )
+        self.assertNotIn("preset=perf-only", by["/spyre-bench sanity arch=amd64,s390x type=quality"])
+
     def test_command_golden_matches_the_engine(self):
         self.assertEqual(json.loads(COMMANDS_GOLDEN.read_text()), build_commands(), "run with --refresh")
 
@@ -160,6 +190,7 @@ class Vectors(unittest.TestCase):
 if __name__ == "__main__":
     if "--refresh" in sys.argv:
         GOLDEN.write_text(json.dumps(build(), indent=1, sort_keys=True) + "\n")
+        REWRITE_GOLDEN.write_text(json.dumps(build_rewrites(), indent=1, sort_keys=True) + "\n")
         COMMANDS_GOLDEN.write_text(json.dumps(build_commands(), indent=1, sort_keys=True) + "\n")
         print(f"wrote {GOLDEN}")
     else:
