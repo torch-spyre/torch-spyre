@@ -513,6 +513,11 @@ nothing is written. `--apply` records one event through a `bench-invalidation` b
 matching view, the state machine and the 50-run confirmation threshold). Needs `spyre-bench[ingest,clickhouse]`. Exit 0
 ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incident-runbook.md](incident-runbook.md).
 
+## References
+
+`spyre-bench reference` turns a run into a comparison target, seals it as a `bench-reference` bundle, submits it for
+approval and compares later runs with it, informationally and never as a baseline: [`references.md`](references.md).
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
