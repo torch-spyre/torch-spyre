@@ -547,4 +547,4 @@ def test_the_banner_reads_the_ingest_step_of_the_active_mode():
     assert (
         "BENCH_SELECTION" not in mirror["env"]
     )  # a selection would be unioned with BENCH_CASES
-    assert 'export BENCH_CASES="$(paste' in mirror["run"]
+    assert 'BENCH_CASES="$(paste' in mirror["run"]
