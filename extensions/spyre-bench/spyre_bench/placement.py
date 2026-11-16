@@ -128,7 +128,7 @@ def launcher_stage(proc, pid, markers=()):
         argv = [a for a in (proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if a]
     except OSError:
         return False
-    joined = "\0".join(argv)
+    joined = "\0".join(argv) + "\0"
     return bool(argv) and any(joined.startswith(m) if "\0" in m else m in argv[:3] for m in markers)
 
 
