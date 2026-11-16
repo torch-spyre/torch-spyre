@@ -1016,7 +1016,9 @@ class RequestLog(unittest.TestCase):
 
     def test_row_content(self):
         row = self.row(request_id="018f0000-0000-7000-8000-000000000001")
-        self.assertEqual(json.loads(row["subjects"]), {"comment_url": "", "head_sha": SHA, "pr": 7, "repo": "o/r"})
+        self.assertEqual(
+            json.loads(row["subjects"]), {"comment_url": "", "head_sha": SHA, "host": "ghe", "pr": 7, "repo": "o/r"}
+        )
         self.assertEqual([c["name"] for c in json.loads(row["cells_requested"])], ["op_add_fp16"])
         self.assertEqual(json.loads(row["estimate"])["limit"], 12.0)
         self.assertEqual(row["modes"], ["perf"])
@@ -1036,38 +1038,46 @@ class RequestLog(unittest.TestCase):
         self.assertNotIn("](", row["error"])
         self.assertLessEqual(len(row["error"]), 500)
 
+    def hrow(self, id_, state, pr=7, hours=3, repo="o/r", host="ghe", ts="2026-11-16 09:00:00.123"):
+        return {"id": id_, "user": "dev1", "state": state, "ts": ts,
+                "subjects": json.dumps({"pr": pr, "repo": repo, "host": host}), "estimate": json.dumps({"device_hours": hours})}  # fmt: skip
+
     def test_history_maps_states_and_feeds_admission(self):
         rows = [
-            {
-                "id": "a",
-                "user": "dev1",
-                "state": "launched",
-                "subjects": json.dumps({"pr": 7}),
-                "estimate": json.dumps({"device_hours": 3}),
-                "ts": "2026-11-16T09:00:00Z",
-            },
-            {
-                "id": "b",
-                "user": "dev1",
-                "state": "failed",
-                "subjects": json.dumps({"pr": 7}),
-                "estimate": json.dumps({"device_hours": 7}),
-                "ts": "2026-11-16T08:00:00Z",
-            },
-            {
-                "id": "c",
-                "user": "dev1",
-                "state": "denied",
-                "subjects": json.dumps({"pr": 7}),
-                "estimate": json.dumps({"device_hours": 90}),
-                "ts": "2026-11-16T08:00:00Z",
-            },
+            self.hrow("a", "launched"),
+            self.hrow("b", "failed", hours=7, ts="2026-11-16T08:00:00Z"),
+            self.hrow("c", "denied", hours=90),
         ]
-        hist = od.history_from_ci_requests(rows)
+        hist = od.history_from_ci_requests(rows, "ghe", now=NOW)
         self.assertEqual([h["state"] for h in hist], ["launched", "done", "denied"])
         d = od.authorize(planned(history=hist, estimate_device_hours=1))
         self.assertEqual(d.cancel, ["a"])
         self.assertEqual(d.state, "admit")
+
+    def test_naive_clickhouse_timestamps_are_read_as_utc(self):
+        hist = od.history_from_ci_requests([self.hrow("a", "launched", ts="2026-11-16 09:00:00")], "ghe", now=NOW)
+        self.assertEqual(hist[0]["ts"], "2026-11-16T09:00:00Z")
+
+    def test_other_hosts_and_other_repos_do_not_collide(self):
+        rows = [self.hrow("a", "launched", host="github.com"), self.hrow("b", "launched", repo="x/other")]
+        hist = od.history_from_ci_requests(rows, "ghe", now=NOW)
+        self.assertEqual([h["id"] for h in hist], ["b"])
+        self.assertEqual(od.authorize(planned(history=hist, estimate_device_hours=1)).cancel, [])
+        self.assertEqual(
+            od.authorize(planned(history=[dict(hist[0], repo="o/r")], estimate_device_hours=1)).cancel, ["b"]
+        )
+
+    def test_a_launched_request_ends_after_the_longest_job(self):
+        hist = od.history_from_ci_requests(
+            [self.hrow("a", "launched", ts="2026-11-16T01:00:00Z", hours=7)], "ghe", now=NOW
+        )
+        self.assertEqual(hist[0]["state"], "done")
+        self.assertEqual(od.authorize(planned(history=hist, estimate_device_hours=1)).cancel, [])
+
+    def test_the_history_query_takes_the_estimate_of_the_latest_event_that_has_one(self):
+        self.assertIn("argMaxIf(estimate, ts, estimate != '')", od.HISTORY_SQL)
+        row = od.ci_request_row(req(), "launched", "dev1", host="ghe", pr=7, repo="o/r", head_sha=SHA)
+        self.assertEqual(row["estimate"], "")
 
     def test_unreadable_rows_raise_instead_of_passing(self):
         for row in (
@@ -1075,7 +1085,15 @@ class RequestLog(unittest.TestCase):
             {"id": "x"},
         ):
             with self.assertRaises(od.RequestError):
-                od.history_from_ci_requests([row])
+                od.history_from_ci_requests([row], "ghe", now=NOW)
+
+    def test_the_policy_file_digest_is_pinned_so_the_internal_copy_must_follow(self):
+        import hashlib
+        from pathlib import Path
+
+        digest = hashlib.sha256(Path(od.__file__).with_name("ondemand_policy.json").read_bytes()).hexdigest()
+        # The internal poller pins the same digest for its copy (pipelines/lib/bench_policy.json): change both together.
+        self.assertEqual(digest, "af46f722ffebb8ddfdbde01cff894f4b91554ceefe9c362216a0063affc3212a")
 
     def test_limits_come_from_one_json_file(self):
         import json as j
