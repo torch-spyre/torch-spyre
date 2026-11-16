@@ -88,6 +88,16 @@ runs:
         EXTRA_INPUTS: ${{ inputs.extra_inputs }}
       run: |
         set -euo pipefail
+        # Only the two sibling repos may be dispatched, and a Test-With companion must be a fork or branch of that
+        # same repo at a full SHA; anything else (a typo included) fails before any API call.
+        [[ "$REPO" =~ ^torch-spyre/(hf-adapters|spyre-inference)$ ]] \
+          || { echo "::error::refusing to dispatch to '${REPO}'"; exit 1; }
+        [[ "$TORCH_SPYRE_REF" =~ ^[0-9a-f]{40}$ ]] \
+          || { echo "::error::torch_spyre_ref '${TORCH_SPYRE_REF}' is not a full commit SHA"; exit 1; }
+        if [ -n "$COMPANION_REPOSITORY$COMPANION_REF" ]; then
+          [[ "$COMPANION_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/(hf-adapters|spyre-inference)$ && "${COMPANION_REPOSITORY##*/}" == "${REPO##*/}" && "$COMPANION_REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Test-With companion '${COMPANION_REPOSITORY}@${COMPANION_REF}' does not match ${REPO}"; exit 1; }
+        fi
         hash=$(printf '%s' "$HASH_SOURCE" | sha256sum | cut -c1-16)
         ref=$(gh api "repos/${REPO}" --jq .default_branch)
         # Pin the sibling's own code to one commit, so every job of the run tests the same sources.
