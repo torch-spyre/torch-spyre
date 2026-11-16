@@ -30,10 +30,10 @@ from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
-from torch_spyre._inductor.propagate_layouts import PropArg
+from torch_spyre._inductor.propagate_layouts import PropArg, qfp8wt_layout
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 
@@ -506,3 +506,186 @@ def test_compute_size1_restickify_layout_indirect_access():
     # Each stick holds one element; host stride 1 maps to the single host dim.
     assert list(result.device_size) == [512, 8, 64]
     assert list(result.stride_map) == [1, 64, 0]
+
+
+def test_stick_dims_is_last_dim_for_padded_2d_host_tensor():
+    # The constructor pads a [4, 64] tensor to [1, 4, 64]: stick is the last dim.
+    stl = SpyreTensorLayout([4, 64], torch.float16)
+    assert list(stl.device_size) == [1, 4, 64]
+    assert pass_utils.stick_dims(stl) == [2]
+
+
+def test_stick_dims_for_host_qfp8wt_layout_is_single_stick():
+    # The host-shape constructor does not expand QFP8WT: its device shape is a
+    # single 128-element stick. The [2, 64] split is applied in spyre_mem.cpp.
+    stl = SpyreTensorLayout(
+        [256, 128], [128, 1], torch.float8_e4m3fn, [0, 1], ElementArrangement.QFP8WT
+    )
+    assert list(stl.device_size) == [1, 256, 128]
+    assert pass_utils.stick_dims(stl) == [2]
+
+
+def test_device_coordinates_returns_stick_coord_at_stick_dim():
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    stl = SpyreTensorLayout([4, 64], [64, 1], torch.float16, [0, 1])
+    dep = MemoryDep("x", d0 * 64 + d1, (d0, d1), (4, 64))
+    coords = pass_utils.device_coordinates(stl, dep, None)
+    assert coords[2] == d1
+
+
+def test_device_coordinates_rejects_unsupported_stick_expr():
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    stl = SpyreTensorLayout([4, 64], [64, 1], torch.float16, [0, 1])
+    dep = MemoryDep("x", d0 * 64 + d1 * 2, (d0, d1), (4, 32))
+    with pytest.raises(pass_utils.Unsupported, match="Unexpected stick expression"):
+        pass_utils.device_coordinates(stl, dep, None)
+    assert pass_utils.try_device_coordinates(stl, dep, None) is None
+
+
+def test_stick_dims_ignores_size_one_dim_below_stick_size():
+    # Device [2, 1, 32] fp16: dim 1 has size 1 and stride 32, which is below the
+    # 64-element stick. Size-one dims are never sticks, so dim 1 is skipped; dims
+    # 0 and 2 hold the full stick (2 * 32 = 64).
+    stl = SpyreTensorLayout(
+        [2, 1, 32], [32, 32, 1], pass_utils.get_device_dtype(torch.float16), {}
+    )
+    assert pass_utils.stick_dims(stl) == [0, 2]
+
+
+def _qfp8wt_layout(k, n):
+    # The production QFP8WT layout: device [N/64, K/2, 64, 2], the DCI order that
+    # spyre_mem.cpp expands. The stick is the 64-wide N dim and the 2-wide K dim.
+    return qfp8wt_layout([k, n], [n, 1], torch.float8_e4m3fn)
+
+
+def test_stick_dims_returns_both_dims_of_qfp8wt_stick():
+    stl = _qfp8wt_layout(256, 128)
+    assert list(stl.device_size) == [2, 128, 64, 2]
+    assert stl.elems_per_stick() == 128
+    assert pass_utils.stick_dims(stl) == [2, 3]
+
+
+def test_device_coordinates_accepts_qfp8wt_two_dim_stick():
+    # The QFP8WT stick spans two device dims, each driven by its own variable:
+    # N -> the 64-wide dim (Mod(n, 64)), K -> the 2-wide dim (Mod(k, 2)).
+    k, n = sympy.symbols("k n", integer=True, nonnegative=True)
+    stl = _qfp8wt_layout(256, 128)
+    dep = MemoryDep("x", k * 128 + n, (k, n), (256, 128))
+    coords = pass_utils.device_coordinates(stl, dep, None)
+    assert coords[2] == sympy.Mod(n, 64)
+    assert coords[3] == sympy.Mod(k, 2)
+
+
+def test_stick_dims_rejects_stride_not_dividing_eps():
+    # Stride 12 on dim 0 does not divide the 64-element stick.
+    stl = SpyreTensorLayout(
+        [4, 3, 4], [12, 4, 1], pass_utils.get_device_dtype(torch.float16), {}
+    )
+    with pytest.raises(pass_utils.Unsupported, match="does not divide"):
+        pass_utils.stick_dims(stl)
+
+
+def test_stick_dims_rejects_stick_not_covering_eps():
+    # Device [2, 16] fp16: the stick dims hold 32 elements, not a full 64.
+    stl = SpyreTensorLayout(
+        [2, 16], [16, 1], pass_utils.get_device_dtype(torch.float16), {}
+    )
+    with pytest.raises(pass_utils.Unsupported, match="expected a full stick"):
+        pass_utils.stick_dims(stl)
+
+
+def test_device_coordinates_rejects_qfp8wt_wrong_modulus_on_two_wide_dim():
+    # Index k*64 + n over [256, 128] gives the 2-wide dim floor(Mod(k, 4) / 2),
+    # not Mod(k, 2), so the stick check rejects it.
+    k, n = sympy.symbols("k n", integer=True, nonnegative=True)
+    stl = _qfp8wt_layout(256, 128)
+    dep = MemoryDep("x", k * 64 + n, (k, n), (256, 128))
+    with pytest.raises(pass_utils.Unsupported, match="Unexpected stick expression"):
+        pass_utils.device_coordinates(stl, dep, None)
+    assert pass_utils.try_device_coordinates(stl, dep, None) is None
+
+
+def test_device_coordinates_rejects_qfp8wt_scaled_coord_on_64_wide_dim():
+    # Index k*128 + 2*n over [256, 64] gives the 64-wide dim 2*Mod(n, 32), not
+    # Mod(n, 64), so the stick check rejects it.
+    k, n = sympy.symbols("k n", integer=True, nonnegative=True)
+    stl = _qfp8wt_layout(256, 128)
+    dep = MemoryDep("x", k * 128 + 2 * n, (k, n), (256, 64))
+    with pytest.raises(pass_utils.Unsupported, match="Unexpected stick expression"):
+        pass_utils.device_coordinates(stl, dep, None)
+    assert pass_utils.try_device_coordinates(stl, dep, None) is None
+
+
+def test_device_coordinates_accepts_qfp8wt_non_square_stick():
+    # K=512, N=256 expands to [256, 4, 2, 64]: the stick coordinates are
+    # Mod(k, 2) and Mod(n, 64), and the outer coordinates are floor(k/2), floor(n/64).
+    k, n = sympy.symbols("k n", integer=True, nonnegative=True)
+    stl = _qfp8wt_layout(512, 256)
+    assert list(stl.device_size) == [4, 256, 64, 2]
+    dep = MemoryDep("x", k * 256 + n, (k, n), (512, 256))
+    coords = pass_utils.device_coordinates(stl, dep, None)
+    assert coords[0] == sympy.floor(n / 64)
+    assert coords[1] == sympy.floor(k / 2)
+    assert coords[2] == sympy.Mod(n, 64)
+    assert coords[3] == sympy.Mod(k, 2)
+
+
+def test_stick_dims_for_standard_layout_split_across_two_dims():
+    # Device [4, 2, 32] with stride [64, 32, 1]: the 2 and 32 dims hold the
+    # 64-element fp16 stick, while the outermost dim has size 4 and stride 64.
+    stl = SpyreTensorLayout(
+        [4, 2, 32], [64, 32, 1], pass_utils.get_device_dtype(torch.float16), {}
+    )
+    assert list(stl.device_size) == [4, 2, 32]
+    assert stl.elems_per_stick() == 64
+    assert pass_utils.stick_dims(stl) == [1, 2]
+
+
+def test_device_coordinates_without_stick_check_skips_qfp8wt_rejection():
+    # Same wrong-modulus index as the two-wide-dim case: with the check disabled
+    # the coordinates are returned rather than raising.
+    k, n = sympy.symbols("k n", integer=True, nonnegative=True)
+    stl = _qfp8wt_layout(256, 128)
+    dep = MemoryDep("x", k * 64 + n, (k, n), (256, 128))
+    coords = pass_utils.device_coordinates(stl, dep, None, check_stick_expr=False)
+    assert len(coords) == 4
+    assert coords[3] == sympy.floor(sympy.Mod(k, 4) / 2)
+
+
+def test_stick_dims_is_empty_when_no_dim_is_below_stick_size():
+    # Device [1, 1] has no size > 1 dim, so there is no stick dimension.
+    stl = SpyreTensorLayout(
+        [1, 1], [-1, -1], pass_utils.get_device_dtype(torch.float16), {}
+    )
+    assert pass_utils.stick_dims(stl) == []
+
+
+def test_align_tensors_keeps_qfp8wt_two_dim_stick_unsplit():
+    # QFP8WT weight [K/2, N/64, 2, 64]: the stick is the trailing dims [2, 64],
+    # carrying Mod(k, 2) and Mod(n, 64). align_tensors must keep that run
+    # unsplit and leave the device size and coordinates of the stick intact.
+    from torch_spyre._inductor.views import align_tensors
+
+    k, n = sympy.symbols("k n")
+    iteration_space = {k: (sympy.Integer(8), 1), n: (sympy.Integer(128), 1)}
+    tensor = {
+        "size": [
+            sympy.Integer(4),
+            sympy.Integer(2),
+            sympy.Integer(2),
+            sympy.Integer(64),
+        ],
+        "coordinates": [
+            sympy.floor(k / 2),
+            sympy.floor(n / 64),
+            sympy.Mod(k, 2),
+            sympy.Mod(n, 64),
+        ],
+        # fp8 stick: 128 bytes = 128 elements, i.e. [2, 64].
+        "elems_per_stick": 128,
+    }
+    _, tensors, _ = align_tensors(iteration_space, [tensor])
+    (aligned,) = tensors
+    # The stick run is the last two device dims: size 2 then 64, unsplit.
+    assert aligned["size"][-2:] == [2, 64]
+    assert aligned["coordinates"][-2:] == [sympy.Mod(k, 2), sympy.Mod(n, 64)]

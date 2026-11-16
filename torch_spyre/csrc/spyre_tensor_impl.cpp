@@ -308,7 +308,22 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
   TORCH_CHECK(bits > 0, "No device element width for data format ",
               static_cast<int>(device_dtype));
   uint64_t size_bytes = (elems * bits + 7) / 8;
-  for (int i = static_cast<int>(device_size.size()) - 2; i >= 0; i--) {
+  // A stick can span several trailing device dims (QFP8WT's [2, 64]): take the
+  // innermost dims whose sizes multiply to elems as the stick, the same rule as
+  // trailing_stick_dims in pass_utils.py, and multiply only the dims outside
+  // it. A single-dim stick keeps the one-dim rule below.
+  int stick_dims = 1;
+  int64_t stick_extent = 1;
+  const int rank = static_cast<int>(device_size.size());
+  for (int k = rank - 1; k >= 0 && stick_extent < static_cast<int64_t>(elems);
+       k--) {
+    if (device_size[k] == 1) continue;
+    stick_extent *= device_size[k];
+    if (k == rank - 1) continue;
+    stick_dims = rank - k;
+  }
+  if (stick_extent != static_cast<int64_t>(elems)) stick_dims = 1;
+  for (int i = rank - stick_dims - 1; i >= 0; i--) {
     // A wrapped product would size an allocation far smaller than the shape
     // it must hold, so fail instead of returning it.
     TORCH_CHECK(

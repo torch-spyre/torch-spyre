@@ -1166,14 +1166,15 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(out.device_size), [2, 1, 1, 128])
         self.assertEqual(list(out.stride_map), [64, 128, 64, 1])
 
-    def test_qfp8wt_layout_puts_k_next_to_the_stick(self):
-        """qfp8wt's QFP8WT output pairs K with N in a 2D stick, but the device
-        layout records only a 1D stick of N. The layout places K directly
-        outside the stick, so K is device dim -2 at every rank and readers can
-        take it from there. Rank 2 keeps its existing layout."""
+    def test_qfp8wt_layout_has_a_two_dim_stick(self):
+        """A QFP8WT tensor [..., K, N] has the device layout
+        [..., N/64, K/2, 64, 2]: the 2D [2, 64] stick is the last two device
+        dims, so every consumer finds it from the layout. The stride_map is
+        [..., 64, 2 * s_k, 1, s_k] and valid_elements record N and K."""
         from torch._inductor.ir import FixedLayout
 
         from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.pass_utils import stick_dims
         from torch_spyre._inductor.propagate_layouts import _qfp8wt_stl
 
         def contiguous(size):
@@ -1185,10 +1186,16 @@ class TestSpyreTensorLayout(TestCase):
 
         cases = {
             # host [..., K, N]: (expected device_size, expected stride_map)
-            (128, 256): ([2, 128, 128], [128, 256, 1]),
-            (4, 128, 64): ([4, 1, 128, 128], [8192, 64, 64, 1]),
-            (2, 12, 128, 128): ([2, 12, 1, 128, 128], [196608, 16384, 128, 128, 1]),
-            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [0, 98304, 128, 384, 1]),
+            (128, 256): ([4, 64, 64, 2], [64, 512, 1, 256]),
+            (4, 128, 64): ([4, 1, 64, 64, 2], [8192, 64, 128, 1, 64]),
+            (2, 12, 128, 128): (
+                [2, 12, 2, 64, 64, 2],
+                [196608, 16384, 64, 256, 1, 128],
+            ),
+            (1, 12, 256, 384): (
+                [1, 12, 6, 128, 64, 2],
+                [1179648, 98304, 64, 768, 1, 384],
+            ),
         }
         cpu = torch.device("cpu")
         for size, (device_size, stride_map) in cases.items():
@@ -1201,9 +1208,9 @@ class TestSpyreTensorLayout(TestCase):
                 self.assertEqual(out.element_arrangement, ElementArrangement.QFP8WT)
                 self.assertEqual(list(out.device_size), device_size)
                 self.assertEqual(list(out.stride_map), stride_map)
-                # K: device dim -2, with K's host stride.
-                self.assertEqual(out.device_size[-2], size[-2])
-                self.assertEqual(out.stride_map[-2], contiguous(size)[-2])
+                rank = len(device_size)
+                self.assertEqual(stick_dims(out), [rank - 2, rank - 1])
+                self.assertEqual(list(out.device_size[-2:]), [64, 2])
 
     def test_explicit_layout_rejects_malformed_device_size(self):
         """The explicit (device_size, stride_map) constructor validates the one

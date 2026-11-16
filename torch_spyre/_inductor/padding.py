@@ -89,7 +89,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -730,6 +730,11 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     out_layout = op.get_layout()
     write_dep = _write_dep(op)
     stl = out_layout.device_layout
+    if stl.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT layout's 2D stick is already a whole [2, 64] stick, so no
+        # device dim needs padding to a stick multiple. Padding picks the
+        # innermost dim (K/2 here), which is not a stick multiple to grow.
+        return
 
     if old_sym is None:
         _pad_elided_dim(op)

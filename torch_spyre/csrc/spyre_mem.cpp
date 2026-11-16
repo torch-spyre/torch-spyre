@@ -63,7 +63,6 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     -> std::vector<int> {
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
-  const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
 
   std::vector<int64_t> max_stride_le(device_rank, 0);
   std::vector<int> dim_map(device_rank, -1);
@@ -89,8 +88,21 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     }
   }
 
-  if (dim_map[stick_dim_index] != -1) {
-    dim_map[stick_dim_index] = dim_map[device_rank - 1];
+  // The dim that counts the sticks of the innermost device dim is the nearest
+  // outer dim whose stride equals one innermost-dim extent. It tiles the same
+  // host dim as the innermost dim, even when a host stride falls between the
+  // two (a folded or padded host dim). Found from the layout, not from a fixed
+  // position, so layouts with a multi-dim stick are not assumed to be rank-3.
+  if (device_rank > 1 && stride_map[device_rank - 1] > 0 &&
+      dim_map[device_rank - 1] != -1) {
+    const int64_t tile_stride =
+        device_sizes[device_rank - 1] * stride_map[device_rank - 1];
+    for (int j = device_rank - 2; j >= 0; j--) {
+      if (stride_map[j] == tile_stride) {
+        if (dim_map[j] != -1) dim_map[j] = dim_map[device_rank - 1];
+        break;
+      }
+    }
   }
 
   return dim_map;
@@ -786,67 +798,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       cpu_strides = dma_strides;
     }
   }
-  // FP8 multi-dim stick layout uses specialized DCI generation
-  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
-    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
-    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
-    std::reverse(device_sizes.begin(), device_sizes.end());
+  dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                      device_offset, stl, host2device);
 
-    const int64_t eps = stl.elems_per_stick();
-    const int64_t si = 2;
-    const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
-    const int64_t N = cpu_sizes[0];
-    const int64_t K = cpu_sizes[1];
-
-    // Expanded device shape: [si, so, K/si, N/so]
-    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
-    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
-    const int64_t dim2 = K / si;
-    const int64_t dim3 = N / so;
-
-    // Host strides for the expanded layout
-    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
-    //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
-
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
-    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
-
-    DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = host2device ? host_strides : device_strides;
-    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-    dcsi.offset_src_ = host2device ? cpu_offset : 0;
-    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
-    dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
-    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
-    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-  } else {
-    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                        device_offset, stl, host2device);
-
-    // Reverse PyTorch ordering
-    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
-    std::reverse(device_sizes.begin(), device_sizes.end());
-    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
-  }
+  // Reverse PyTorch ordering
+  std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+  std::reverse(device_sizes.begin(), device_sizes.end());
+  dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+  dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
     std::stringstream s;

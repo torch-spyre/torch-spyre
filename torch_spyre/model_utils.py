@@ -83,7 +83,6 @@ from torch import nn
 
 from torch_spyre._C import (
     DataFormats,
-    ElementArrangement,
     SpyreTensorLayout,
     copy_tensor,
     current_device,
@@ -304,17 +303,17 @@ def _dma_to_spyre_fp8_kernel(
 
     _ensure_spyre_runtime()
 
-    # Note: contiguity is NOT required here. The QFP8WT branch in generate_dci
-    # (spyre_mem.cpp) derives host strides analytically from K and N — it does
-    # not use the CPU tensor's actual strides. This means a non-contiguous view
-    # (e.g. p.t()) is safe to pass directly, avoiding a CPU memcpy.
-    layout = SpyreTensorLayout(
-        list(weight.shape),  # host_size: [K, N] = [in_features, out_features]
-        list(weight.stride()),  # host_strides: row-major [N, 1]
-        torch.float8_e4m3fn,
-        [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
-        ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
-    )
+    # The device layout comes from the same helper as the compiler's
+    # _qfp8wt_stl, so the uploaded weight and the compiled kernel agree on the
+    # [2, 64] stick. The generic host/device copy derives its geometry from the
+    # CPU tensor's strides and the layout's stride_map, so the two must agree:
+    # make a transposed view (e.g. p.t()) row-major [N, 1] first.
+    from torch_spyre._inductor.propagate_layouts import qfp8wt_layout
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    K, N = weight.shape
+    layout = qfp8wt_layout([K, N], [N, 1], torch.float8_e4m3fn)
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), torch.float8_e4m3fn, layout
     )
@@ -557,8 +556,8 @@ def _upload_parameter(
         )
         # nn.Linear stores weight as [out_features, in_features] = [N, K].
         # The fp8_linear_kernel expects [K, N] on Spyre (see _kernel_weight_splits).
-        # Pass p.t() directly — no .contiguous() needed since the QFP8WT DMA
-        # path ignores the CPU tensor's actual strides (see _dma_to_spyre_fp8_kernel).
+        # p.t() is a strided view; _dma_to_spyre_fp8_kernel makes it row-major
+        # because the host/device copy reads the CPU strides.
         return _dma_to_spyre_fp8_kernel(p.t()), "fp8_kernel"
     if is_linear and name == "weight" and p.ndim == 2:
         logger.debug(
