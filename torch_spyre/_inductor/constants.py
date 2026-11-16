@@ -172,6 +172,7 @@ SPYRE_FP32_OPS = [
     "rsqrt",
     "topkvalue",
     "topkindex",
+    "non_zero_pos_to_idx",
     "floor",
     "to_dtype",
     "maximum",
@@ -238,6 +239,11 @@ TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 # topkindex counts in the input dtype, and fp16 holds integers exactly only up to
 # this many elements along the search dim (#5847).
 FP16_TOPK_MAX_DIM = 1024
+
+NON_ZERO_POS_TO_IDX_OP = "non_zero_pos_to_idx"
+SCAN_OPS = frozenset({NON_ZERO_POS_TO_IDX_OP})
+# Integer counters are exact in fp16 only up to 2048.
+NON_ZERO_POS_TO_IDX_MAX_LEN = 2048
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

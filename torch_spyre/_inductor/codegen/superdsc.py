@@ -47,6 +47,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
+    SCAN_OPS,
     SPYRE_INT32_OPS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
@@ -166,6 +167,8 @@ class SDSCSpec:
     input_coord_sizes: dict = dataclasses.field(default_factory=dict)
     emit_memorg_padding: bool = False
     completed_producer_cores: tuple[int, ...] = ()
+    # SDSC label of the scanned dim (scanDim_); None for non-scan ops.
+    scan_dim: Symbol | None = None
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -2294,6 +2297,22 @@ def _topk_injected_dims(
     return injected
 
 
+def _scan_dim_label(op_spec: OpSpec, symbol_mapping: dict) -> Symbol:
+    """SDSC label of the dim a scan op runs along, from its iteration space.
+
+    The label comes from ``symbol_mapping``, never from the host position: the
+    iteration-space order is not the host order (a 64x128 scan over dim 0 emits
+    ``mb_=128, out_=64``).
+    """
+    name = op_spec.op_info.get("scan_dim")
+    if name is None:
+        raise Unsupported(f"{op_spec.op}: op_info has no scan_dim")
+    for sym in op_spec.iteration_space:
+        if sym.name == name:
+            return symbol_mapping[sym]
+    raise Unsupported(f"{op_spec.op}: scan dim {name} is not in the iteration space")
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
@@ -2396,6 +2415,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
+    scan_dim = None
+    if op_spec.op in SCAN_OPS:
+        scan_dim = _scan_dim_label(op_spec, symbol_mapping)
     if op_spec.core_id_to_work_slice is None:
         raise ValueError("OpSpec is missing its finalized core mapping")
     core_id_to_work_slice = {
@@ -2930,6 +2952,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
             completed_producer_cores=op_spec.completed_producer_cores,
+            scan_dim=scan_dim,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.

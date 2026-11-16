@@ -50,6 +50,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    Scan,
     Scatter,
     StorageBox,
     TensorBox,
@@ -59,7 +60,12 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
 from torch.utils._sympy.functions import FloorDiv
-from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
+from torch._inductor.dependencies import (
+    MemoryDep,
+    ReadWrites,
+    index_vars_squeeze,
+    is_indirect,
+)
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -2445,8 +2451,10 @@ def _scatter_iteration_space(rw: ReadWrites) -> dict[sympy.Symbol, sympy.Expr]:
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Scatter):
         return _scatter_iteration_space(n.read_writes)
-    elif isinstance(n.node.data, Pointwise):
-        # The iteration space of a Pointwise is that of its output
+    elif isinstance(n.node.data, (Pointwise, Scan)):
+        # The iteration space of a Pointwise is that of its output. A Scan's
+        # output index also carries the scan symbol, so its write dep already
+        # covers every loop (see find_scan_var for which one is the scan).
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
@@ -2473,7 +2481,7 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     rw = op_read_writes(op)
     if isinstance(op.data, Scatter):
         return _scatter_iteration_space(rw)
-    elif isinstance(op.data, Pointwise):
+    elif isinstance(op.data, (Pointwise, Scan)):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
@@ -4615,6 +4623,97 @@ def is_topk(op: Operation) -> bool:
         and isinstance(op.data, Reduction)
         and op.data.reduction_type in TOPK_OPS
     )
+
+
+def is_scan(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing an ``ir.Scan``."""
+    return isinstance(op, ComputedBuffer) and isinstance(op.data, Scan)
+
+
+def _scan_reindexed(data: Scan) -> tuple[list[sympy.Expr], sympy.Symbol]:
+    """A ``Scan``'s full output-ordered index and its scan symbol.
+
+    ``Scan.reindex(pointwise_index, scan_index)`` is the IR's own map from the
+    two loop groups to the host-ordered index handed to ``inner_fn``. It is fed
+    the dep-style symbols ``index_vars_squeeze`` mints (as ``insert_restickify``
+    does), where a unit dim is a literal 0, so the result has one entry per host
+    dim and the scan symbol sits at the scan axis.
+    """
+    if len(data.scan_ranges) != 1:
+        raise Unsupported(f"scan with {len(data.scan_ranges)} scan dims")
+    (pointwise, scan), _ = index_vars_squeeze(
+        data.get_pointwise_size(), data.get_reduction_size(), prefix="d"
+    )
+    full = list(data.reindex(pointwise, scan))
+    sym = scan[0]
+    if not isinstance(sym, sympy.Symbol) or full.count(sym) != 1:
+        raise Unsupported(f"scan reindex {full} does not place scan index {scan}")
+    return full, sym
+
+
+def scan_axis(op: ComputedBuffer) -> int:
+    """Output dim a ``Scan`` runs along, from the node's own ``reindex``."""
+    if not isinstance(op.data, Scan):
+        raise Unsupported(f"{op.get_name()} is not a scan")
+    full, sym = _scan_reindexed(op.data)
+    return full.index(sym)
+
+
+def scan_space_position(op: ComputedBuffer) -> int:
+    """Position of the scan dim among the output's non-unit dims.
+
+    The iteration space has no entry for a unit dim (``index_vars_squeeze``
+    drops it), so this is the scan axis minus the unit dims before it.
+    """
+    if not isinstance(op.data, Scan):
+        raise Unsupported(f"{op.get_name()} is not a scan")
+    full, sym = _scan_reindexed(op.data)
+    return sum(1 for e in full[: full.index(sym)] if e != 0)
+
+
+def find_scan_var(op: ComputedBuffer, rw: "ReadWrites | None" = None) -> sympy.Symbol:
+    """Iteration symbol of the dim a ``Scan`` scans, in the namespace of ``rw``.
+
+    The analogue of ``find_reduction_var`` for a scan, resting on the same
+    convention the repo uses for reductions: ``index_vars_squeeze`` drops unit
+    dims, then numbers the pointwise loops before the scan loop, and Spyre never
+    merges loops (``noop_simplify_loops_impl``), so the scan loop is the last
+    one of the write dep. Its extent must be the scan extent and the loop count
+    must be the non-unit pointwise dims plus one; anything else is rejected.
+    """
+    data = op.data
+    if not isinstance(data, Scan):
+        raise Unsupported(f"{op.get_name()} is not a scan")
+    if len(data.scan_ranges) != 1:
+        raise Unsupported(f"{op.get_name()}: scan with {len(data.scan_ranges)} dims")
+    loops = list(next(iter((rw or op_read_writes(op)).writes)).ranges.items())
+    n_pointwise = sum(1 for r in data.ranges if r != 1)
+    if len(loops) != n_pointwise + 1 or loops[-1][1] != data.scan_ranges[0]:
+        raise Unsupported(
+            f"{op.get_name()}: write loops {loops} are not {n_pointwise} pointwise "
+            f"loops followed by the scan loop of extent {data.scan_ranges[0]}"
+        )
+    return loops[-1][0]
+
+
+def scan_ordered_space(
+    space: dict[sympy.Symbol, Any], scan_sym: sympy.Symbol, position: int
+) -> dict[sympy.Symbol, Any]:
+    """Order a Scan's iteration space by output dim, outermost first.
+
+    A Scan's write dep lists its pointwise vars before the scan var, so the
+    iteration-space order is not the output dim order unless the scan dim is
+    last. Positional SDSC labels follow this order. The pointwise vars keep
+    their relative order, so the scan var is moved to ``position`` (from
+    ``scan_space_position``: the scan axis among the non-unit output dims).
+    """
+    if scan_sym not in space:
+        raise Unsupported(f"scan symbol {scan_sym} is not in {list(space)}")
+    rest = [sym for sym in space if sym != scan_sym]
+    if not 0 <= position <= len(rest):
+        raise Unsupported(f"scan position {position} out of range for {list(space)}")
+    rest.insert(position, scan_sym)
+    return {sym: space[sym] for sym in rest}
 
 
 def is_keep_by_index(op: Operation) -> bool:

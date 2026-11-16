@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
     ReinterpretView,
+    Scan,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -4133,7 +4134,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return [_upstream_core_division(graph, op)]
 
         if not isinstance(op, ComputedBuffer) or not isinstance(
-            op.data, (Pointwise, Reduction)
+            op.data, (Pointwise, Scan, Reduction)
         ):
             return fixed(), False
         try:

@@ -43,6 +43,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scan,
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
@@ -444,7 +445,7 @@ class GraphEditor:
 
     @staticmethod
     def is_rewritable_consumer(op: Operation):
-        """An op that wraps a Pointwise or Reduction.
+        """An op that wraps a Pointwise, Scan or Reduction.
 
         We encounter a FallbackKernel with some frequency, and that would be really useful to
         support as well. But the straightforward approach doesn't work, i.e.,
@@ -459,12 +460,12 @@ class GraphEditor:
 
             inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
 
-        So instead we just allow ops that wrap a Pointwise or Reduction.  The
+        So instead we just allow ops that wrap a Pointwise, Scan or Reduction.  The
         exceptions are the rewritable collectives and their waits in
         :meth:`replace_post_loop_accesses`, where that swap is the complete
         rewrite because their codegen reads only ``inputs[0]``.
         """
-        return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
+        return hasattr(op, "data") and isinstance(op.data, Pointwise | Scan | Reduction)
 
     @staticmethod
     def _sole_operand_name(op: Operation) -> str | None:
@@ -495,7 +496,7 @@ class GraphEditor:
     def is_repointable_access(op: Operation, name: str) -> bool:
         """Whether :meth:`replace_post_loop_accesses` can move ``op`` off ``name``.
 
-        A rewritable collective or a wait on ``name``, or a Pointwise/Reduction
+        A rewritable collective or a wait on ``name``, or a Pointwise/Scan/Reduction
         loop (whose loads are renamed) that does not write ``name`` in place:
         renaming its loads would leave it reading ``new`` and writing ``name``.
         """
@@ -592,8 +593,8 @@ class GraphEditor:
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str
     ) -> None:
-        """Replace one buffer load in a pointwise or reduction loop."""
-        assert isinstance(old_loop.data, Pointwise | Reduction)
+        """Replace one buffer load in a pointwise, scan or reduction loop."""
+        assert isinstance(old_loop.data, Pointwise | Scan | Reduction)
         new_loop = self._create_loop_hack_inner_fn(
             old_loop.data, name_map={old_name: new_name}
         )
@@ -611,18 +612,26 @@ class GraphEditor:
 
     def _create_loop_hack_inner_fn(
         self,
-        old_loop: Pointwise | Reduction,
+        old_loop: Pointwise | Scan | Reduction,
         name_map: dict[str, str],
-    ) -> Pointwise | Reduction:
+    ) -> Pointwise | Scan | Reduction:
         """Use ops_handler to swap the name of buffers"""
 
-        def new_inner_fn(*args):
-            # Pointwise has 1 pos arg index while Reduction has 2, i.e. (index, rindex)
-            with V.set_ops_handler(self._NameSwapHandler(V.ops, name_map)):
-                return old_loop.inner_fn(*args)
+        def swap(fn):
+            def new_fn(*args):
+                # Pointwise has 1 pos arg index while Reduction has 2, i.e.
+                # (index, rindex); Scan takes one full index.
+                with V.set_ops_handler(self._NameSwapHandler(V.ops, name_map)):
+                    return fn(*args)
+
+            return new_fn
 
         kwargs = {k: getattr(old_loop, k) for k in old_loop.__dataclass_fields__.keys()}
-        kwargs["inner_fn"] = new_inner_fn
+        kwargs["inner_fn"] = swap(old_loop.inner_fn)
+        if isinstance(old_loop, Scan):
+            # Scan.store_reduction loads through ``inner_fns`` (one per output
+            # dtype), not ``inner_fn``, so swap the names in every one of them.
+            kwargs["inner_fns"] = tuple(swap(fn) for fn in old_loop.inner_fns)
         new_loop = old_loop.__class__(**kwargs)
         # Additional attr that are not included in dataclass_fields. NOTE it relies on a
         # special method to force reset attrs of a frozen dataclas, see ir.Loops.create()

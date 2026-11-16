@@ -69,7 +69,9 @@ from .pass_utils import (
     device_coordinates,
     indirect_forbidden_split_syms,
     is_restickify_coords,
+    is_scan,
     op_read_writes,
+    find_scan_var,
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
@@ -144,6 +146,7 @@ def collect_work_division_constraints(
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
+        scan_split_domains,
         keep_by_index_k_split_constraint,
         keep_by_index_pinned_search_space_vars,
         keep_by_index_search_adjacent_blocked_vars,
@@ -805,6 +808,25 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
         )
     allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def scan_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Keep the scanned dim of an ``ir.Scan`` whole on one core.
+
+    A prefix scan carries state along its dim, and the backend does not combine
+    partial scans across cores. The scan var is present in the output index, so
+    it is not in ``ctx.reduction_vars`` (the set ``topk_split_domains`` pins);
+    ``find_scan_var`` names it directly.
+    """
+    if not is_scan(ctx.op):
+        return ConstraintResult()
+    sym = find_scan_var(ctx.op)
+    if sym not in ctx.it_space:
+        raise Unsupported(
+            f"{ctx.op.get_name()} (scan): scan symbol {sym} is not in the "
+            f"iteration space {list(ctx.it_space)}"
+        )
+    return ConstraintResult(allowed_splits={sym: frozenset({1})})
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:

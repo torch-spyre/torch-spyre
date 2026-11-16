@@ -23,7 +23,7 @@ from torch._inductor.utils import (
     sympy_product,
 )
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import NoneLayout
+from torch._inductor.ir import NoneLayout, Scan
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -36,7 +36,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
-from .pass_utils import iteration_space
+from .pass_utils import iteration_space, find_scan_var
 from .logging_utils import get_inductor_logger
 from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
@@ -608,10 +608,21 @@ class SuperDSCScheduling(BaseScheduling):
         """Run one operation's body through the kernel's handlers."""
 
         symbols = list(iteration_space(snode))
-        index_vars = [
-            symbols[: len(snode._body.iter_vars)],
-            symbols[len(snode._body.iter_vars) :],
-        ]
+        n_iter = len(snode._body.iter_vars)
+        if isinstance(snode.node.data, Scan):
+            # The scan symbol is the reduction-style group. ``find_scan_var``
+            # takes it as the last write loop; move it out of the pointwise
+            # group so the body sees (pointwise, [scan]).
+            scan_sym = find_scan_var(snode.node, snode.read_writes)  # type: ignore[arg-type]
+            pointwise = [sym for sym in symbols if sym != scan_sym]
+            if len(pointwise) != n_iter:
+                raise Unsupported(
+                    f"{snode.get_name()} (scan): {len(pointwise)} pointwise symbols "
+                    f"for {n_iter} body iter vars"
+                )
+            index_vars = [pointwise, [scan_sym]]
+        else:
+            index_vars = [symbols[:n_iter], symbols[n_iter:]]
         kernel.scheduled_nodes.append(snode)
         try:
             snode.codegen(index_vars)

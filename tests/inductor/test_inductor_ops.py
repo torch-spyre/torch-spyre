@@ -1298,6 +1298,18 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
+def _nonzero_pattern(shape, density, seed):
+    """Non-zero fp16 integers at ``density`` of positions, zeros elsewhere.
+
+    Integer values keep the counter exact; the zero pattern is what the scan
+    depends on, so ``density`` 0 and 1 give the all-zero and all-non-zero cases.
+    """
+    g = torch.Generator().manual_seed(seed)
+    vals = torch.randint(1, 100, shape, generator=g).to(torch.float16)
+    keep = torch.rand(shape, generator=g) < density
+    return torch.where(keep, vals, torch.zeros_like(vals))
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -2521,6 +2533,75 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "the cast's fp32 value lacks the second stick of a stick pair "
                     "(#3999), so the indices come back wrong on some runs"
                 ),
+            },
+        },
+        ("test_non_zero_pos_to_idx", "test_non_zero_pos_to_idx_cpu"): {
+            "param_sets": {
+                "2d_dim0_padm1": (
+                    _nonzero_pattern((64, 256), 0.5, seed=1),
+                    0,
+                    -1.0,
+                ),
+                "2d_dim1_pad0": (
+                    _nonzero_pattern((64, 256), 0.5, seed=2),
+                    1,
+                    0.0,
+                ),
+                "2d_dimlast_padm1": (
+                    _nonzero_pattern((64, 256), 0.3, seed=3),
+                    -1,
+                    -1.0,
+                ),
+                "3d_dim1_padm1": (
+                    _nonzero_pattern((4, 64, 128), 0.5, seed=4),
+                    1,
+                    -1.0,
+                ),
+                "3d_dimlast_pad0": (
+                    _nonzero_pattern((4, 64, 128), 0.5, seed=5),
+                    -1,
+                    0.0,
+                ),
+                "2d_all_zero": (
+                    _nonzero_pattern((64, 256), 0.0, seed=6),
+                    1,
+                    -1.0,
+                ),
+                "2d_all_nonzero": (
+                    _nonzero_pattern((64, 256), 1.0, seed=7),
+                    1,
+                    -1.0,
+                ),
+                # Scan dim not a multiple of the 64-element stick.
+                "2d_dim1_unaligned": (
+                    _nonzero_pattern((64, 200), 0.5, seed=8),
+                    1,
+                    -1.0,
+                ),
+                "2d_dim0_unaligned": (
+                    _nonzero_pattern((130, 64), 0.5, seed=9),
+                    0,
+                    -1.0,
+                ),
+                # Scan dim wider than one stick.
+                "2d_dim1_wide": (
+                    _nonzero_pattern((8, 1024), 0.5, seed=10),
+                    1,
+                    -1.0,
+                ),
+                "3d_dim0_padm1": (
+                    _nonzero_pattern((64, 4, 128), 0.5, seed=11),
+                    0,
+                    -1.0,
+                ),
+                "dim_over_fp16_exact": (
+                    _nonzero_pattern((2, 2112), 0.5, seed=13),
+                    1,
+                    -1.0,
+                ),
+            },
+            "expect_raise": {
+                "dim_over_fp16_exact": "largest exact fp16 counter",
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -11691,6 +11772,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             x,
             run_eager=False,
         )
+
+    def test_non_zero_pos_to_idx_cpu(self, x, dim: int, padval: float):
+        # Reference is the registered CPU kernel; exact match since the counter
+        # is an integer no larger than the scan dim (well under fp16's 2048).
+        def fn(x):
+            return torch.ops.spyre.non_zero_pos_to_idx(x, dim, padval)
+
+        self.compare_with_cpu(fn, x, run_eager=False, atol=0, rtol=0)
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)

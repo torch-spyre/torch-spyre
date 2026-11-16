@@ -106,7 +106,7 @@ REDUCTION_OPS = (
 
 DTYPE_OPS = DtypeOpTable.op_names()
 
-SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
+SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP}) | constants.SCAN_OPS
 
 BINARY_OPS = frozenset(
     {
@@ -255,6 +255,7 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_stick_constraints(op_spec, stage)
     _check_completed_reduction_route(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
+    _check_scan_constraints(op_spec, stage)
 
 
 def _check_completed_reduction_route(op_spec: OpSpec, stage: str) -> None:
@@ -657,6 +658,8 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_norm(op_spec, stage)
     elif op in TOPK_OPS:
         _check_stick_topk(op_spec, stage)
+    elif op in constants.SCAN_OPS:
+        _check_stick_scan(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
     elif op in constants.CONV_OPS:
@@ -800,6 +803,52 @@ def _check_stick_topk(op_spec: OpSpec, stage: str) -> None:
             f"stick symbols={stick_syms!r}, forbidden={forbidden_syms!r}",
             stage,
         )
+
+
+def _scan_dim_sym(op_spec: OpSpec) -> sympy.Symbol:
+    """The iteration symbol a scan op runs along, from op_info['scan_dim']."""
+    name = op_spec.op_info.get("scan_dim")
+    for sym in op_spec.iteration_space:
+        if name is not None and sym.name == name:
+            return sym
+    raise OpSpecValidationError(
+        op_spec,
+        "scan op has no scan dim in its iteration space",
+        f"op_info scan_dim={name!r}, iteration_space={list(op_spec.iteration_space)}",
+        "after_simplification",
+    )
+
+
+def _check_scan_constraints(op_spec: OpSpec, stage: str) -> None:
+    """Scan ops: the scanned dim is one iteration dim, and it is not split.
+
+    A prefix scan carries state along its dim, so no core may hold a part of it.
+    """
+    if op_spec.op not in constants.SCAN_OPS:
+        return
+    scan_sym = _scan_dim_sym(op_spec)
+    _, split = op_spec.iteration_space[scan_sym]
+    if split != 1:
+        raise OpSpecValidationError(
+            op_spec,
+            "scan dim must not be split across cores",
+            f"scan dim {scan_sym} has split {split}",
+            stage,
+        )
+
+
+def _check_stick_scan(op_spec: OpSpec, stage: str) -> None:
+    """Scan ops: the scanned dim may not be part of any arg's stick."""
+    scan_sym = _scan_dim_sym(op_spec)
+    for arg in op_spec.args:
+        if scan_sym in _arg_stick_syms(arg):
+            raise OpSpecValidationError(
+                op_spec,
+                "scan dim must not be in the stick",
+                f"arg {arg.arg_index} stick {_arg_stick_syms(arg)!r} contains "
+                f"scan dim {scan_sym}",
+                stage,
+            )
 
 
 def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:

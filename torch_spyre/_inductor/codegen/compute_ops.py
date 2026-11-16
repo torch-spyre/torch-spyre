@@ -1859,6 +1859,11 @@ def generate_sdsc(
                                     "attributes_": {
                                         "dataFormat_": sdsc_spec.data_format.name,
                                         "fidelity_": "regular",
+                                        **(
+                                            {"scanDim_": str(sdsc_spec.scan_dim)}
+                                            if sdsc_spec.scan_dim is not None
+                                            else {}
+                                        ),
                                     },
                                     "location": "Inner",
                                     "inputLabeledDs": [

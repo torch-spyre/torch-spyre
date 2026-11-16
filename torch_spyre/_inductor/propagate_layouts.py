@@ -39,6 +39,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scan,
     ScatterFallback,
     StorageBox,
     TensorBox,
@@ -102,12 +103,15 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
+    is_scan,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
     non_stick_reduction_vars,
     output_is_indirectly_mutated,
     op_read_writes,
+    scan_axis,
+    find_scan_var,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
 )
@@ -2539,6 +2543,73 @@ def _topk_layouts(
     return results
 
 
+def _scan_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layouts for an ``ir.Scan``: same shape as the input, scan dim off the stick.
+
+    The hardware cannot scan along the stick. Unlike a reduction var, the scan
+    var is present in the output index, so ``find_reduction_var`` does not
+    apply; ``find_scan_var`` identifies it. An input whose stick carries the scan
+    var is restickified (``forbidden_stick_sym``) onto another dim.
+    """
+    _check_supported_input_sticks(args, "scan")
+    x = args[0]
+    sym = find_scan_var(op)  # type: ignore[arg-type]
+    axis = scan_axis(op)  # type: ignore[arg-type]
+    # The scan symbol must name the same iteration variable in the input and
+    # output deps, or the stick pin below would silently match nothing.
+    if sym not in x.dep.index.free_symbols or sym not in output_dep.index.free_symbols:
+        raise Unsupported(
+            f"{op.get_name()} (scan): scan symbol {sym} is not shared by the input "
+            f"index {x.dep.index} and output index {output_dep.index}"
+        )
+    out_coords = host_coordinates(output, output_dep, None)
+    stick_size = get_elem_in_stick(output.dtype)
+
+    # Candidate output stick dims: a stick that is already off the scan dim
+    # passes through; a stick on the scan dim must move to any other dim,
+    # preferring ones that need no padding.
+    off_scan_dims = [d for d in range(len(output.size)) if d != axis]
+    aligned, unaligned = _dims_by_alignment(off_scan_dims, output.size, stick_size)
+    out_stick_dims: list[int] = []
+    for stl in x.layouts:
+        coords = try_device_coordinates(stl, x.dep, None)
+        if coords is None:
+            continue
+        stick_expr = coords[-1]
+        if sym in stick_expr.free_symbols:
+            candidates = aligned or unaligned
+        else:
+            match = matching_dim(out_coords, stick_expr)
+            candidates = [] if match is None else [match]
+        out_stick_dims.extend(d for d in candidates if d not in out_stick_dims)
+    if not out_stick_dims:
+        raise Unsupported(
+            f"{op.get_name()} (scan): no dim other than the scan dim {axis} of "
+            f"{list(output.size)} can carry the stick"
+        )
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    results = [
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            output.dtype,
+            [d for d in range(len(output.size)) if d != stick_dim] + [stick_dim],
+        )
+        for stick_dim in out_stick_dims
+    ]
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, forbidden_stick_sym=sym
+    )
+    return results
+
+
 def _compact_layout(
     op: Operation,
     output: FixedLayout,
@@ -2690,6 +2761,9 @@ def compute_layouts(
 
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
+
+    if is_scan(op):
+        return _scan_layouts(op, output, output_dep, args)
 
     if is_keep_by_index(op):
         return _keep_by_index_layouts(op, output, output_dep, args)
@@ -3856,7 +3930,7 @@ def propagate_spyre_tensor_layouts(
                     )
                     op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
-            elif isinstance(op.data, (Pointwise, Reduction)):
+            elif isinstance(op.data, (Pointwise, Reduction, Scan)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
@@ -4102,7 +4176,7 @@ def propagate_mutation_layouts(
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
-        if isinstance(n.node.data, (Pointwise, Reduction)):
+        if isinstance(n.node.data, (Pointwise, Scan, Reduction)):
             real = n.node.layout.real_layout()
             if isinstance(real, FixedTiledLayout) and _real_layout_matches_op_size(
                 n.node, real
