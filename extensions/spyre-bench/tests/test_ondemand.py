@@ -265,7 +265,7 @@ class Approvals(unittest.TestCase):
 
 FORKREQ = lambda **kw: req(sha=SHA[:12], **kw)  # noqa: E731
 PLAN_OK = {
-    "cases": [{"name": "c", "action": "run", "run_props": {"run.tier": "sanity"}}],
+    "cases": [{"name": "c", "action": "run", "est_min": 5.0, "run_props": {"run.tier": "sanity"}}],
     "estimate": {"device_hours": 1},
 }
 
@@ -394,7 +394,7 @@ class Authorize(unittest.TestCase):
 
     def test_plan_cases_are_checked_against_the_host_tiers(self):
         plan = {
-            "cases": [{"name": "a", "action": "run", "run_props": {"run.tier": "core"}}],
+            "cases": [{"name": "a", "action": "run", "est_min": 5, "run_props": {"run.tier": "core"}}],
             "estimate": {"device_hours": 1},
         }
         d = od.authorize(planned(estimate_device_hours=1, plan=plan))
@@ -405,7 +405,41 @@ class Authorize(unittest.TestCase):
         plan["cases"][0]["run_props"] = {"run.tier": "sanity"}
         self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=plan)).state, "admit")
         plan["cases"][0].update(action="reuse", run_props={"run.tier": "core"})
+        self.assertEqual(
+            od.authorize(planned(estimate_device_hours=1, plan=plan)).state, "deny", "a reused case may run"
+        )
+        plan["cases"][0].update(action="skip")
         self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=plan)).state, "admit")
+
+    def test_a_run_case_without_an_estimate_is_unknown_cost_and_denied(self):
+        for est in (None, 0, 0.0, -1, float("nan"), "5"):
+            case = {"name": "a", "action": "run", "run_props": {"run.tier": "sanity"}}
+            if est is not None:
+                case["est_min"] = est
+            plan = {"cases": [case], "estimate": {"device_hours": 0.0}}
+            d = od.authorize(planned(estimate_device_hours=0, plan=plan))
+            self.assertEqual(d.state, "deny", est)
+            self.assertIn("no run estimate", d.reasons[0])
+        reuse = {
+            "cases": [{"name": "a", "action": "reuse", "run_props": {"run.tier": "sanity"}}],
+            "estimate": {"device_hours": 0},
+        }
+        self.assertEqual(od.authorize(planned(estimate_device_hours=0, plan=reuse)).state, "admit")
+
+    def test_window_rows_can_skip_the_rate_limit_count(self):
+        rows = [
+            {
+                "id": f"r{i}",
+                "pr": 9,
+                "user": "dev1",
+                "ts": "2026-11-16T09:30:00Z",
+                "state": "done",
+                "est": 0,
+                "rate": False,
+            }
+            for i in range(8)
+        ]
+        self.assertEqual(od.authorize(facts(history=rows)).state, "admit")
 
     def test_case_picks_do_not_pick_their_own_tier_budget(self):
         r = od.parse_flags({"bench": "a_case"})
@@ -924,6 +958,20 @@ class Hardening(unittest.TestCase):
         self.assertEqual(row.count("|"), 5)
         self.assertNotIn("@team", row)
 
+    def test_budget_and_vs_reject_odd_spellings(self):
+        for bad in ("1_0", "\u0661\u0662", " 3"):
+            with self.assertRaises(od.RequestError):
+                req(budget=bad)
+        for bad in ("build:../x#1", "build:a/../b#1", "build:/x#1"):
+            with self.assertRaises(od.RequestError):
+                req(vs=bad)
+        self.assertEqual(req(vs="build:orch/main#12").vs, "build:orch/main#12")
+
+    def test_entities_are_defanged(self):
+        for text in ("&#x40;octocat", "&commat;octocat", "a&amp;b"):
+            self.assertNotIn("&", od.safe(text))
+            self.assertNotIn("&", od.neutral(text))
+
     def test_sha_flag(self):
         self.assertEqual(req(sha="abcdef1").sha, "abcdef1")
         for bad in ("abc", "ABCDEF1", "xyz1234", "a" * 41):
@@ -939,9 +987,9 @@ class Hardening(unittest.TestCase):
         self.assertIsNone(od.decode_state(f"{od.STATE_OPEN} {deep} -->") if len(deep) <= od.STATE_MAX else None)
 
     def test_env_carries_clean_and_exact_budget(self):
-        r = od.parse_flags({"bench": "sanity", "clean": "true", "max-wait": "45m", "budget": "0.1234567"})
+        r = od.parse_flags({"bench": "sanity", "clean": "true", "max-wait": "45m", "budget": "0.123456"})
         env = od.bench_env(r, "spyre-inference")
-        self.assertEqual((env["BENCH_CLEAN"], env["BENCH_MAX_WAIT"], env["BENCH_BUDGET"]), ("1", "2700s", "0.1234567"))
+        self.assertEqual((env["BENCH_CLEAN"], env["BENCH_MAX_WAIT"], env["BENCH_BUDGET"]), ("1", "2700s", "0.123456"))
 
 
 class RequestLog(unittest.TestCase):

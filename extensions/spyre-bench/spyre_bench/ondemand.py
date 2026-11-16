@@ -66,8 +66,8 @@ _UNIT = {"s": 1, "m": 60, "h": 3600}
 
 _CONTROL = regex.compile(r"[\x00-\x1f\x7f`<>\\]")
 _INVISIBLE = regex.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]")
-_MARKUP = regex.compile(r"[|\[\]()!*~]")
-_LINKISH = regex.compile(r"[\[\]!]")
+_MARKUP = regex.compile(r"[|\[\]()!*~&]")
+_LINKISH = regex.compile(r"[\[\]!&]")
 _REF = regex.compile(r"#(?=[0-9])")
 
 
@@ -178,7 +178,9 @@ class OnDemandRequest:
     def _validate(self):
         if self.reuse not in REUSE_MODES or self.profile not in PROFILES:
             raise RequestError("the stored request has an unknown reuse mode or profile")
-        if self.vs not in VS_FIXED and not regex.fullmatch(r"build:[A-Za-z0-9._/-]{1,80}#[0-9]{1,9}", self.vs):
+        if self.vs not in VS_FIXED and (
+            ".." in self.vs or not regex.fullmatch(r"build:[A-Za-z0-9][A-Za-z0-9._/-]{0,79}#[0-9]{1,9}", self.vs)
+        ):
             raise RequestError("the stored request has a bad vs")
         if self.sha and not SHA_PREFIX.fullmatch(self.sha):
             raise RequestError("the stored request has a bad sha")
@@ -334,7 +336,9 @@ def parse_flags(flags, default_product=DEFAULT_PRODUCT):
     if profile not in PROFILES:
         raise RequestError(f"profile={profile!r}: one of {', '.join(PROFILES)}")
     vs = got.get("vs", "nightly")
-    if vs not in VS_FIXED and not regex.fullmatch(r"build:[A-Za-z0-9._/-]{1,80}#[0-9]{1,9}", vs):
+    if vs not in VS_FIXED and (
+        ".." in vs or not regex.fullmatch(r"build:[A-Za-z0-9][A-Za-z0-9._/-]{0,79}#[0-9]{1,9}", vs)
+    ):
         raise RequestError(f"vs={vs!r}: main, nightly or build:<job>#<n>")
     env = got.get("env", "")
     if env:
@@ -342,6 +346,8 @@ def parse_flags(flags, default_product=DEFAULT_PRODUCT):
     budget = 0.0
     if "budget" in got:
         try:
+            if not got["budget"].isascii() or "_" in got["budget"] or got["budget"] != got["budget"].strip():
+                raise ValueError
             budget = float(got["budget"])
         except ValueError:
             raise RequestError(f"budget={got['budget']!r}: a number of device-hours") from None
@@ -607,7 +613,11 @@ def admission(history, new, now, policy):
             f"PR window budget: {spent:g} device-hours already planned in {policy.window.total_seconds() / 3600:g}h, "
             f"cap {policy.pr_window_device_hours:g}"
         )
-    hour = [h for h in history if h["user"] == new["user"] and now - _parse(h["ts"]) <= timedelta(hours=1)]
+    hour = [
+        h
+        for h in history
+        if h["user"] == new["user"] and h.get("rate", True) and now - _parse(h["ts"]) <= timedelta(hours=1)
+    ]
     if len(hour) >= policy.per_user_per_hour:
         reasons.append(f"rate limit: {policy.per_user_per_hour} requests per user per hour")
     if new.get("clean"):
@@ -626,11 +636,17 @@ def plan_violations(plan, policy):
     where a tier limit is enforced for them; a case without a tier cannot be judged and is refused."""
     bad = []
     for c in plan.get("cases") or []:
-        if str(c.get("action", "")).lower() in ("reuse", "skip"):
+        action = str(c.get("action", "")).lower()
+        if action == "skip":
             continue
+        name = safe(c.get("name"), 60)
+        # A reused result can turn out invalid by the time the run starts, and then the case runs: judge it as if it will.
         tier = (c.get("run_props") or {}).get("run.tier")
         if tier not in policy.tiers:
-            bad.append(f"case {safe(c.get('name'), 60)} has tier '{safe(tier or 'none', 20)}', not available here")
+            bad.append(f"case {name} has tier '{safe(tier or 'none', 20)}', not available here")
+        est = c.get("est_min")
+        if action != "reuse" and not (isinstance(est, (int, float)) and math.isfinite(est) and est > 0):
+            bad.append(f"case {name} declares no run estimate (run.est), so its cost is unknown")
     return bad[:5]
 
 
