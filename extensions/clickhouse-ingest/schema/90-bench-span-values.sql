@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS bench_span_values
     parent_seq      Int32,
     depth           UInt8,
     layer           Int16,
-    start_ns        Int64 CODEC(Delta, ZSTD(1)),
+    start_ns        Int64 CODEC(Delta(8), ZSTD(1)),
     dur_ns          Int64 CODEC(ZSTD(1)),
     ts              DateTime,
     audit_timestamp DateTime64(3)
