@@ -75,6 +75,30 @@ def catalog_rows(cases):
     return rows
 
 
+def unclaimed_kernels(report_dir, runner, cases):
+    """Kernel-breakdown testcases of the directory that no declared case claims (the legacy ingest stores them)."""
+    owners = [
+        runner.Case(op=inp["name"], shape=inp["disc"]["input_shapes"])
+        if inp["disc"]["record_type"] != "model"
+        else runner.Case(
+            model=inp["name"],
+            config=inp["disc"]["config_name"],
+            mode=inp["disc"]["run_mode"],
+        )
+        for _, inp, _ in cases
+    ]
+    lost = 0
+    for xml in sorted(report_dir.glob("*.xml")):
+        root = ET.parse(xml).getroot()
+        if xml.name == "report.xml" or not runner.is_kernel_xml(root):
+            continue
+        lost += sum(
+            not any(o.owns_tags(runner.tags_of(tc)) for o in owners)
+            for tc in root.iter("testcase")
+        )
+    return lost
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("report_dir", type=Path)
@@ -95,7 +119,10 @@ def main(argv=None):
     for label, rows in (("not declared", undeclared), ("absent", absent)):
         for row in rows:
             print(f"  {label}: {' | '.join(row)}")
-    return 1 if undeclared and args.strict else 0
+    lost = unclaimed_kernels(args.report_dir, runner, ids.declared())
+    if lost:
+        print(f"  {lost} kernel-breakdown testcases match no declared case")
+    return 1 if (undeclared or lost) and args.strict else 0
 
 
 if __name__ == "__main__":

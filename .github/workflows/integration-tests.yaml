@@ -132,7 +132,8 @@ on:
           Perf only: off (default) | side-by-side | replace. See _test_matrix.yaml; side-by-side adds
           the benchmarks/ catalog's rows next to the legacy perf ingest, replace stores them instead.
         required: false
-        type: string
+        type: choice
+        options: [off, side-by-side, replace]
         default: off
 
 concurrency:

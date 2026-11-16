@@ -149,8 +149,8 @@ on:
         description: >-
           Perf job only: off (default, nothing changes) | side-by-side (also feed the same report.xml through the
           benchmarks/ catalog and ingest it under bench-<workflow> with the engine's run id) | replace (skip the
-          legacy ingest and store the catalog's rows under the legacy workflow name and run id; fails on a report
-          row no case declares). v2 only.
+          legacy ingest and store the catalog's rows under the legacy workflow name and run id, both schemas; fails on a report
+          row no case declares).
         required: false
         type: string
         default: off
@@ -980,14 +980,15 @@ jobs:
 
       # bench_mode != off: the report just produced, split into the benchmarks/ catalog's cases (no second suite run).
       - name: Install uv (bench mirror)
-        if: ${{ inputs.bench_mode != 'off' }}
+        if: ${{ !cancelled() && contains(fromJSON('["side-by-side","replace"]'), inputs.bench_mode) }}
+        continue-on-error: ${{ inputs.bench_mode != 'replace' }}
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: latest-known
 
       - name: Mirror the perf report through the bench catalog
         id: bench-mirror
-        if: ${{ !cancelled() && inputs.bench_mode != 'off' && steps.confirm-report.outcome == 'success' }}
+        if: ${{ !cancelled() && contains(fromJSON('["side-by-side","replace"]'), inputs.bench_mode) && steps.confirm-report.outcome == 'success' }}
         continue-on-error: ${{ inputs.bench_mode != 'replace' }}
         env:
           BENCH_MODE: ${{ inputs.bench_mode }}
@@ -1049,7 +1050,7 @@ jobs:
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
-          schema: v2
+          schema: ${{ inputs.bench_mode == 'replace' && 'both' || 'v2' }}
 
       # Four honesty lines. Echo only — never upload report.xml (public
       # artifacts would leak benchmark numbers).
@@ -1058,7 +1059,7 @@ jobs:
         env:
           EXEC_OUTCOME: ${{ steps.run-perf.outcome }}
           REPORT_OUTCOME: ${{ steps.confirm-report.outcome }}
-          INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+          INGEST_OUTCOME: ${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.ingest.outcome }}
           BENCH_MODE: ${{ inputs.bench_mode }}
           BENCH_MIRROR_OUTCOME: ${{ steps.bench-mirror.outcome }}
           BENCH_INGEST_OUTCOME: ${{ steps.bench-ingest.outcome }}
