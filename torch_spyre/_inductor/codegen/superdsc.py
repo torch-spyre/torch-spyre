@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
+    FP8TODL16_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -1589,6 +1590,20 @@ def _create_sdsc_tensors(
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
 
+        # QFP8WT tensors are stored as sticks of 2 K rows x 64 N columns, so the
+        # K axis (device coordinate -2) advances one stick per *pair* of rows.
+        # The device-coordinate offset counts rows; it is halved below to count
+        # sticks.
+        qfp8wt_k_sym = None
+        if (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            and op_spec.op != FP8TODL16_OP
+            and len(arg.device_coordinates) >= 2
+        ):
+            _k_syms = arg.device_coordinates[-2].subs(symbol_mapping).free_symbols
+            if len(_k_syms) == 1:
+                qfp8wt_k_sym = next(iter(_k_syms))
+
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             # A tiled-away loop role may survive as a constant physical axis.
@@ -1716,6 +1731,13 @@ def _create_sdsc_tensors(
                 and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
+                if dim == qfp8wt_k_sym:
+                    if dim_offset % 2:
+                        raise ValueError(
+                            f"QFP8WT tensor sliced at odd K offset {dim_offset}; "
+                            "the 2-row stick cannot start mid-pair"
+                        )
+                    dim_offset //= 2
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
@@ -1733,12 +1755,24 @@ def _create_sdsc_tensors(
                 # dims that actually carry a window entry are suppressed; a pool's
                 # other dims (mb/out) keep the normal backGap.
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
+                # A QFP8WT block axis (neither K nor the stick) that the op
+                # visits one block of: the block's start address is already in
+                # offsets[dim]; the backend lays 2D-stick blocks out with the
+                # stick dim outermost, so a gap here would stretch the stride
+                # between the stick's 64-column groups.
+                _qfp8wt_single_block = (
+                    qfp8wt_k_sym is not None
+                    and dim != qfp8wt_k_sym
+                    and dim != stick_dim
+                    and it_dim_size == 1
+                )
                 if (
                     not _is_conv(op_spec.op)
                     and not _pool_window_dim
                     and dev_dim_size > it_dim_size
                 ):
-                    backGap[dim] = dev_dim_size - it_dim_size
+                    if not _qfp8wt_single_block:
+                        backGap[dim] = dev_dim_size - it_dim_size
                 elif (
                     dim != stick_dim
                     and dim not in reduced_dims
@@ -1832,31 +1866,22 @@ def _create_sdsc_tensors(
         effective_stick = [real_stick]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for QFP8WT KERNEL tensors.
-        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
-        # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
-        # tensor as input but uses a 1D flat FP8 input.
-        # Scatter ops (index_copy_) are lowered as IDENTITY_OP with indirect access;
-        # emit 2D-stick HBM layout for their output (scatter destination) when it
-        # carries QFP8WT EA.
+        # Special handling for QFP8WT KERNEL tensors: the element arrangement
+        # alone selects the 2D stick [2, stick_size/2], whatever the op (matmul
+        # weight, quantization, or an identity op such as a scatter or gather
+        # with or without indirect access). The one exception is fp8todl16,
+        # which carries a QFP8WT-arranged tensor as input but uses a 1D flat FP8
+        # input.
+        # Both sides of a scatter (source and destination) must use the 2D
+        # stick, so that both treat pairs of K-elements as one 2-element outer
+        # stick; otherwise the 1D-stick source wins the OUTPUT-label race in
+        # get_indirect_layout_label and the destination records the wrong size.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        # QFP8WT indirect-access (scatter): both the scatter source (is_input=True)
-        # and destination (is_input=False) tensors must use the 2D-stick HBM layout
-        # so that both sides treat pairs of K-elements as one 2-element outer stick
-        # ([2, stick_size/2]).  Restricting to not arg.is_input would register the
-        # source with a 1D-stick layout, which wins the OUTPUT-label race in
-        # get_indirect_layout_label and prevents the destination from recording the
-        # correct 2D-stick size.
-        is_qfp8wt_indirect = (
-            arg.element_arrangement == ElementArrangement.QFP8WT
-            and op_spec.op == IDENTITY_OP
-            and has_indirect_access
-        )
         if (
             arg.element_arrangement == ElementArrangement.QFP8WT
-            and op_spec.op in ("batchmatmulfp8", "qfp8wt")
-        ) or is_qfp8wt_indirect:
+            and op_spec.op != FP8TODL16_OP
+        ):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # The 2D stick packs 2 values of the weight's K dim against 64 of

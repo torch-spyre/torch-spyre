@@ -2278,3 +2278,73 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
         # atol=2e-1: the full fill+score+softmax+P·V pipeline accumulates
         # rounding error across two fp16 matmuls and FP8 quantization noise.
         torch.testing.assert_close(result.cpu(), expected, atol=2e-1, rtol=0.0)
+
+
+class TestFp8Qfp8wtSliceCopy:
+    """Copies into a QFP8WT buffer that are not indirect and not full-extent.
+
+    A QFP8WT tensor is stored as 2D sticks of 2 K rows x 64 N columns, laid out
+    ``[N/64][K/2]``.  Whatever the op, the element arrangement alone selects that
+    2D stick, so a plain ``copy_`` into a slice of such a tensor must address
+    whole K-row pairs and whole 64-column groups.  Each test copies a QFP8WT
+    weight into a zero-filled buffer in pieces and checks that a following
+    ``_scaled_mm`` reads the buffer exactly as it reads the original weight.
+    """
+
+    _SCALED_MM = dict(scale_a=None, scale_b=None, bias=None, out_dtype=torch.float16)
+
+    def _operands(self, k: int, n: int):
+        gen = torch.Generator().manual_seed(1234)
+        a = (torch.randn(128, k, generator=gen) * 0.5).to(torch.float16)
+        b = (torch.randn(k, n, generator=gen) * 0.5).to(torch.float16)
+        scale_a = torch.tensor([1.0], dtype=torch.float16)
+        scale_b = torch.max(torch.abs(b)).reshape(1).to(torch.float16)
+        a_d, b_d, sa_d, sb_d = (t.to(DEVICE) for t in (a, b, scale_a, scale_b))
+        qa = torch.compile(lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s))(
+            a_d, sa_d
+        )
+        qb = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s)
+        )(b_d, sb_d)
+        expected = torch.compile(
+            lambda x, y: torch.ops.aten._scaled_mm(x, y, **self._SCALED_MM)
+        )(qa, qb)
+        buf = torch.zeros(k, n, dtype=torch.float8_e4m3fn).to(DEVICE)
+        return qa, qb, buf, expected.cpu().float()
+
+    def test_qfp8wt_full_copy(self):
+        """A full-extent copy_ into a QFP8WT buffer is read back unchanged."""
+        qa, qb, buf, expected = self._operands(128, 128)
+
+        def fn(qa, qb, buf):
+            return torch.ops.aten._scaled_mm(qa, buf.copy_(qb), **self._SCALED_MM)
+
+        result = torch.compile(fn)(qa, qb, buf).cpu().float()
+        torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
+
+    def test_qfp8wt_row_slice_copy(self):
+        """Two K-row halves: the second starts at a K-pair offset (row 64 is
+        stick 32 of each 64-column group, not stick 64)."""
+        qa, qb, buf, expected = self._operands(128, 128)
+
+        def fn(qa, qb, buf):
+            buf[:64].copy_(qb[:64])
+            buf[64:].copy_(qb[64:])
+            return torch.ops.aten._scaled_mm(qa, buf, **self._SCALED_MM)
+
+        result = torch.compile(fn)(qa, qb, buf).cpu().float()
+        torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
+
+    def test_qfp8wt_column_block_copy(self):
+        """Two 128-column blocks of a 256-column weight: the block axis is
+        visited one block at a time and must not stretch the stride between the
+        stick's 64-column groups."""
+        qa, qb, buf, expected = self._operands(128, 256)
+
+        def fn(qa, qb, buf):
+            buf[:, :128].copy_(qb[:, :128])
+            buf[:, 128:].copy_(qb[:, 128:])
+            return torch.ops.aten._scaled_mm(qa, buf, **self._SCALED_MM)
+
+        result = torch.compile(fn)(qa, qb, buf).cpu().float()
+        torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
