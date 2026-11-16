@@ -97,7 +97,7 @@ to learn which tier a run's leg was dispatched for.
 
 Comparison targets are not measurements: a `benchmark_runs` row with `run.ref_only = '1'` (or
 `run.record_type = 'reference'`) is dropped by `v_benchmark_runs_measured`, which the benchmark views
-read, and by the HUD projection (an MV cannot read a view). The trend, backend-compare and verdict
+read, and by the HUD projection (an MV cannot read a view), which also skips `report_kind = 'bench'` rows (migration 028). The trend, backend-compare and verdict
 views also skip the record types in `benchmark_excluded_record_types`; the artifact, tag, coverage and
 dispatch views skip `component = 'reference'` artifacts and `tag_family = 'reference'` tags.
 

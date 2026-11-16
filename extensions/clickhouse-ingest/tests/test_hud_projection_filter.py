@@ -44,6 +44,7 @@ def test_the_migration_recreates_the_mv_as_the_schema_file_defines_it():
     [
         ("spyre", "model", "vllm-benchmark/1/serve.json", True, "vllm"),
         ("spyre", "model", "vllm-benchmark/1/serve.json", True, ""),
+        ("spyre", "model", "vllm-benchmark/1/serve.json", True, "-"),
         ("spyre", "model", "serve.json", False, "bench"),
         ("spyre", "model", "ci-job/serve.json", False, "bench"),
         ("whatif", "model", "vllm-benchmark/1/serve.json", False, "vllm"),
@@ -80,10 +81,11 @@ def test_only_measured_model_rows_reach_the_hud(
         "INSERT INTO benchmarks (benchmark_id, component, name, props) VALUES "
         f"('{bid}', 'spyre-inference', 'serve_x', map('record_type', '{record_type}', 'model', 'm'))"
     )
+    kind_pair = f", 'report_kind', '{report_kind}'" if report_kind != "-" else ""
     s.query(
         "INSERT INTO benchmark_runs (run_id, benchmark_id, component, backend, measurements, props) "
         f"VALUES ('{rid}', '{bid}', 'spyre-inference', '{backend}', map('ttft_ms', [1.0]), "
-        f"map('source_file', '{source_file}', 'arch', 'x86_64', 'report_kind', '{report_kind}'))"
+        f"map('source_file', '{source_file}', 'arch', 'x86_64'{kind_pair}))"
     )
     n = s.query("SELECT count() FROM oss_ci_benchmark_v3", "CSV").data()
     n = n.decode() if isinstance(n, bytes) else n
