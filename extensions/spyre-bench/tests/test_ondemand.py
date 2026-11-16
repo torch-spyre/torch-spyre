@@ -25,6 +25,18 @@ from spyre_bench import ondemand as od
 from spyre_bench.cli import main as cli_main
 from test_run import SUBJECT, TMP, capture, plan_doc, plan_main
 
+ENFORCED = {"enabled": True, "enforce_budgets": True}
+
+
+def setUpModule():
+    """Most tests exercise the enforcing mode; the shipped file is dark and report-only (see Modes)."""
+    od.SETTINGS.update(ENFORCED)
+
+
+def tearDownModule():
+    od.SETTINGS.update(od._load_settings())
+
+
 SHA = "a" * 40
 SHA2 = "b" * 40
 NOW = "2026-11-16T10:00:00Z"
@@ -168,6 +180,27 @@ class Command(unittest.TestCase):
 
     def test_crlf(self):
         self.assertEqual(od.parse_command("/bench sanity\r\nmore").flags, {"bench": "sanity"})
+
+    def test_spyre_bench_is_the_command_and_bench_the_deprecated_alias(self):
+        a = od.parse_command("/spyre-bench sanity reuse=only")
+        b = od.parse_command("/bench sanity reuse=only")
+        self.assertEqual(a.flags, b.flags)
+        self.assertEqual(od.parse_command("/spyre-bench confirm").kind, "confirm")
+        self.assertIsNone(od.parse_command("/spyre-benchmark sanity"))
+
+    def test_type_flag_and_the_test_type_spelling(self):
+        self.assertEqual(req().type, "perf")
+        self.assertNotIn("type", req().to_dict())
+        q = od.parse_flags({"bench": "sanity", "TEST_TYPE": "quality"})
+        self.assertEqual((q.type, q.to_dict()["type"]), ("quality", "quality"))
+        self.assertEqual(od.parse_flags({"bench": "sanity", "test_type": "perf"}).type, "perf")
+        with self.assertRaises(od.RequestError):
+            od.parse_flags({"bench": "sanity", "type": "nope"})
+        self.assertEqual(od.engine_request(q, "spyre-inference")["selection"]["type"], "quality")
+        self.assertEqual(od.bench_env(q, "spyre-inference")["BENCH_TYPE"], "quality")
+        self.assertTrue(od.check_policy(q, GH))
+        self.assertEqual(od.check_policy(q, GHE), [])
+        self.assertEqual(od.OnDemandRequest.from_dict(q.to_dict()), q)
 
     def test_custom_command(self):
         self.assertEqual(od.parse_command("/spyre-test bench=sanity", "/spyre-test").flags, {"bench": "sanity"})
@@ -662,7 +695,7 @@ class Preview(unittest.TestCase):
         self.assertIn("nothing will run", od.render_markdown(od.build_preview(plan, req(), GH)))
         plan["estimate"]["device_hours"] = 3.0
         text = od.render_markdown(od.build_preview(plan, req(), GH))
-        self.assertIn("`/bench confirm`", text)
+        self.assertIn("`/spyre-bench confirm`", text)
         self.assertIn("3 device-hours", text)
 
     def test_untrusted_text_cannot_inject(self):
@@ -1121,7 +1154,7 @@ class RequestLog(unittest.TestCase):
 
         digest = hashlib.sha256(Path(od.__file__).with_name("ondemand_policy.json").read_bytes()).hexdigest()
         # The internal poller pins the same digest for its copy (pipelines/lib/bench_policy.json): change both together.
-        self.assertEqual(digest, "af46f722ffebb8ddfdbde01cff894f4b91554ceefe9c362216a0063affc3212a")
+        self.assertEqual(digest, "940828fc7c653b01090df19b75120ccdc0d2684d39d2fcc8fe8770131b82b82d")
 
     def test_limits_come_from_one_json_file(self):
         import json as j
@@ -1133,6 +1166,97 @@ class RequestLog(unittest.TestCase):
             self.assertEqual(pol.pr_window_device_hours, raw[host]["pr_window_device_hours"])
         self.assertEqual(od.POLICIES["github.com"].budget_device_hours, {"sanity": 4.0})
         self.assertEqual(od.POLICIES["ghe"].budget_device_hours, {"sanity": 12.0, "core": 48.0})
+
+
+class Modes(unittest.TestCase):
+    """The shipped policy file is dark (`enabled` false) and report-only (`enforce_budgets` false)."""
+
+    def setUp(self):
+        self.saved = dict(od.SETTINGS)
+
+    def tearDown(self):
+        od.SETTINGS.clear()
+        od.SETTINGS.update(self.saved)
+
+    def over_budget_facts(self):
+        case = {
+            "name": "a",
+            "action": "run",
+            "est_min": 5,
+            "timeout_min": 60,
+            "accelerators": 1,
+            "run_props": {"run.tier": "sanity"},
+        }
+        return planned(estimate_device_hours=9, plan={"cases": [case], "estimate": {"device_hours": 9}})
+
+    def test_the_shipped_file_is_dark_and_report_only(self):
+        fresh = od._load_settings()
+        self.assertEqual(fresh, {"enabled": False, "enforce_budgets": False})
+
+    def test_dark_admits_nothing(self):
+        od.SETTINGS.update(enabled=False)
+        d = od.authorize(facts())
+        self.assertEqual(d.state, "deny")
+        self.assertIn("not enabled", d.reasons[0])
+
+    def test_report_only_proceeds_but_records_what_would_have_been_refused(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=False)
+        d = od.authorize(self.over_budget_facts())
+        self.assertEqual(d.state, "admit")
+        self.assertTrue(any("over the 4 limit" in w for w in d.would_refuse))
+
+    def test_enforcing_refuses_the_same_request(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=True)
+        d = od.authorize(self.over_budget_facts())
+        self.assertEqual(d.state, "deny")
+        self.assertTrue(d.would_refuse)
+
+    def test_report_only_does_not_ask_for_a_confirm(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=False)
+        self.assertEqual(od.authorize(planned(estimate_device_hours=3)).state, "admit")
+
+    def test_unknown_cost_and_window_are_report_only_too(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=False)
+        case = {"name": "a", "action": "run", "run_props": {"run.tier": "sanity"}}
+        d = od.authorize(planned(estimate_device_hours=0, plan={"cases": [case], "estimate": {"device_hours": 0}}))
+        self.assertEqual(d.state, "admit")
+        self.assertTrue(any("no run estimate" in w for w in d.would_refuse))
+        rows = [{"id": "r", "pr": 7, "user": "dev1", "ts": "2026-11-16T09:00:00Z", "state": "done", "est": 7}]
+        d = od.authorize(planned(history=rows, estimate_device_hours=3))
+        self.assertEqual(d.state, "admit")
+        self.assertTrue(any("PR window" in w for w in d.would_refuse))
+
+    def test_everything_else_stays_enforced_in_report_only_mode(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=False)
+        core = {
+            "cases": [{"name": "a", "action": "run", "est_min": 5, "run_props": {"run.tier": "core"}}],
+            "estimate": {"device_hours": 1},
+        }
+        self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=core)).state, "deny")
+        self.assertEqual(od.authorize(facts(actor=READER)).state, "deny")
+        self.assertEqual(od.authorize(facts(head_repo="x/r")).state, "deny")
+        self.assertEqual(od.authorize(facts(pinned_sha=SHA2)).state, "deny")
+        rate = [
+            {"id": f"r{i}", "pr": 100 + i, "user": "dev1", "ts": "2026-11-16T09:30:00Z", "state": "done", "est": 0}
+            for i in range(6)
+        ]
+        self.assertEqual(od.authorize(facts(history=rate)).state, "deny")
+
+    def test_preview_says_report_only(self):
+        od.SETTINGS.update(enabled=True, enforce_budgets=False)
+        plan = plan_doc("--purpose", "pr", "--subject-id", SUBJECT, "--tier", "sanity")
+        plan["estimate"]["device_hours"] = 9.0
+        text = od.render_markdown(od.build_preview(plan, req(), GH))
+        self.assertIn("Report only", text)
+        self.assertNotIn("nothing will run", text.lower())
+        od.SETTINGS.update(enforce_budgets=True)
+        self.assertIn("nothing will run", od.render_markdown(od.build_preview(plan, req(), GH)).lower())
+
+    def test_usage_is_recorded_either_way(self):
+        row = od.ci_request_row(
+            req(), "previewed", "dev1", host="ghe", pr=7, repo="o/r", head_sha=SHA, would_refuse=["over the limit"]
+        )
+        self.assertEqual(row["props"]["bench.would_refuse"], "over the limit")
 
 
 if __name__ == "__main__":

@@ -57,7 +57,9 @@ MEMBER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 NAME = regex.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 DURATION = regex.compile(r"([1-9][0-9]{0,3})([smh])")
 SHA = regex.compile(r"[0-9a-f]{40}")
-_KEYS = ("bench", "purpose", "reuse", "force", "profile", "vs", "clean", "env", "max-wait", "budget", "sha")
+_KEYS = ("bench", "purpose", "reuse", "force", "profile", "vs", "clean", "env", "max-wait", "budget", "sha", "type")
+TYPES = ("perf", "quality")
+COMMANDS = ("/spyre-bench", "/bench")  # /bench is the deprecated spelling on github.com
 SHA_PREFIX = regex.compile(r"[0-9a-f]{7,40}")
 FORK_SHA_MIN = 12
 CONFIRM_TTL = timedelta(hours=24)
@@ -99,6 +101,7 @@ class Policy:
     host: str
     tiers: tuple
     reuse_modes: tuple
+    types: tuple
     force_all: bool
     profiles: tuple
     custom_env: bool
@@ -122,13 +125,20 @@ def _load_policies():
     out = {}
     for host in HOSTS:
         d = raw[host]
-        for key in ("tiers", "reuse_modes", "profiles"):
+        for key in ("tiers", "reuse_modes", "profiles", "types"):
             d[key] = tuple(d[key])
         out[host] = Policy(host=host, **d)
     return out
 
 
+def _load_settings():
+    with open(Path(__file__).with_name("ondemand_policy.json"), encoding="utf-8") as f:
+        raw = json.load(f)
+    return {"enabled": bool(raw["enabled"]), "enforce_budgets": bool(raw["enforce_budgets"])}
+
+
 POLICIES = _load_policies()
+SETTINGS = _load_settings()  # tests and callers may override per process; the file is the default
 
 
 @dataclass(frozen=True)
@@ -145,6 +155,7 @@ class OnDemandRequest:
     env: str = ""
     max_wait_s: int = 0
     budget: float = 0.0
+    type: str = "perf"  # perf | quality (TEST_TYPE)
     sha: str = ""  # head commit (7-40 hex) the commenter reviewed; required for a fork head
     asked: dict = field(default_factory=dict)  # the flags as written, for the "asked vs planned" diff
 
@@ -162,6 +173,7 @@ class OnDemandRequest:
             "budget": self.budget,
             "sha": self.sha,
             "asked": self.asked,
+            **({"type": self.type} if self.type != "perf" else {}),
         }
 
     @staticmethod
@@ -176,6 +188,8 @@ class OnDemandRequest:
         return req
 
     def _validate(self):
+        if self.type not in TYPES:
+            raise RequestError("the stored request has an unknown type")
         if self.reuse not in REUSE_MODES or self.profile not in PROFILES:
             raise RequestError("the stored request has an unknown reuse mode or profile")
         if self.vs not in VS_FIXED and (
@@ -221,6 +235,7 @@ class OnDemandRequest:
             max_wait_s=int(d.get("max_wait_s") or 0),
             budget=float(d.get("budget") or 0.0),
             sha=str(d.get("sha") or ""),
+            type=str(d.get("type") or "perf"),
             asked=d.get("asked") or {},
         )
 
@@ -305,7 +320,9 @@ def _truthy(text, key):
 
 
 def _canonical_key(raw):
-    key = raw[len("bench-") :] if raw.startswith("bench-") else raw
+    key = raw.lower().replace("_", "-")
+    key = key[len("bench-") :] if key.startswith("bench-") else key
+    key = "type" if key == "test-type" else key
     if key not in _KEYS:
         raise RequestError(f"unknown flag {raw!r}{_did_you_mean(key, _KEYS)}")
     return key
@@ -353,6 +370,9 @@ def parse_flags(flags, default_product=DEFAULT_PRODUCT):
             raise RequestError(f"budget={got['budget']!r}: a number of device-hours") from None
         if not budget > 0 or budget == float("inf"):
             raise RequestError("budget must be a positive, finite number of device-hours")
+    ttype = got.get("type", "perf").lower()
+    if ttype not in TYPES:
+        raise RequestError(f"type={got['type']!r}: one of {', '.join(TYPES)}")
     sha = got.get("sha", "")
     if sha and not SHA_PREFIX.fullmatch(sha):
         raise RequestError(f"sha={sha!r}: 7 to 40 lower-case hex characters of the head commit")
@@ -371,6 +391,7 @@ def parse_flags(flags, default_product=DEFAULT_PRODUCT):
         max_wait_s=max_wait,
         budget=budget,
         sha=sha,
+        type=ttype,
         asked={k: got[k] for k in sorted(got)},
     )
 
@@ -382,11 +403,13 @@ class Command:
     line: str
 
 
-def parse_command(text, command="/bench"):
+def parse_command(text, command=None):
     """The first `command` line outside code fences and quotes -> Command, or None when there is none.
 
-    `/bench <selection> [key=value ...]`, `/bench confirm`, `/bench cancel`. A first token without `=` is the selection.
+    `/spyre-bench <selection> [key=value ...]`, `/spyre-bench confirm`, `/spyre-bench cancel`; `/bench` is the deprecated
+    spelling. A first token without `=` is the selection. `command` (one spelling) overrides the defaults.
     """
+    commands = (command,) if command else COMMANDS
     fence, hidden = "", False
     for line in str(text or "").replace("\r\n", "\n").split("\n"):
         stripped = line.strip()
@@ -399,9 +422,12 @@ def parse_command(text, command="/bench"):
         if hidden:
             hidden = "-->" not in line
             continue
-        if fence or "<!--" in line or not (line.startswith(command + " ") or line.rstrip() == command):
+        if fence or "<!--" in line:
             continue
-        tokens = line[len(command) :].split()
+        used = next((c for c in commands if line.startswith(c + " ") or line.rstrip() == c), None)
+        if used is None:
+            continue
+        tokens = line[len(used) :].split()
         if len(tokens) > 40 or len(line) > 1000:
             raise RequestError("command too long")
         if tokens[:1] in (["confirm"], ["cancel"]):
@@ -430,6 +456,8 @@ def check_policy(req, policy, actor=None):
         if tier not in policy.tiers:
             where = "internal requests only" if tier == "core" else "ops requests only"
             bad.append(f"tier '{tier}' for {product} is not available here ({where})")
+    if req.type not in policy.types:
+        bad.append(f"type={req.type} is not available here")
     if req.reuse not in policy.reuse_modes:
         bad.append(f"reuse={req.reuse} is not available here")
     if "all" in req.force and not policy.force_all:
@@ -564,6 +592,7 @@ class Decision:
     approval: dict = None
     sandbox: dict = None
     limit_device_hours: float = 0.0
+    would_refuse: list = field(default_factory=list)  # budget findings reported but not enforced
 
     @property
     def allowed(self):
@@ -573,6 +602,7 @@ class Decision:
         return dict(self.__dict__, allowed=self.allowed)
 
 
+SOFT_PREFIXES = ("PR window budget", "another user's benchmark request")
 LIVE_STATES = ("active", "previewed", "launched", "admit", "needs_confirm")
 DEAD_STATES = ("cancelled", "denied", "rejected", "deny")
 FINISHED_STATES = ("done", "completed", "finished", "failed")
@@ -640,21 +670,27 @@ def admission(history, new, now, policy):
 
 
 def plan_violations(plan, policy):
-    """Cases of a plan that the host does not allow. Cases and named selections carry their own tier, so this is
-    where a tier limit is enforced for them; a case without a tier cannot be judged and is refused."""
+    """Cases of a plan that the host does not allow (always enforced). Cases and named selections carry their own tier,
+    so this is where a tier limit is enforced for them; a case without a tier cannot be judged and is refused. A reused
+    result can turn out invalid by the time the run starts, and then the case runs: judge it as if it will."""
+    bad = []
+    for c in plan.get("cases") or []:
+        if str(c.get("action", "")).lower() == "skip":
+            continue
+        tier = (c.get("run_props") or {}).get("run.tier")
+        if tier not in policy.tiers:
+            bad.append(f"case {safe(c.get('name'), 60)} has tier '{safe(tier or 'none', 20)}', not available here")
+    return bad[:5]
+
+
+def plan_cost_issues(plan):
+    """Run cases whose cost is unknown (no run estimate). Refused when budgets are enforced, reported otherwise."""
     bad = []
     for c in plan.get("cases") or []:
         action = str(c.get("action", "")).lower()
-        if action == "skip":
-            continue
-        name = safe(c.get("name"), 60)
-        # A reused result can turn out invalid by the time the run starts, and then the case runs: judge it as if it will.
-        tier = (c.get("run_props") or {}).get("run.tier")
-        if tier not in policy.tiers:
-            bad.append(f"case {name} has tier '{safe(tier or 'none', 20)}', not available here")
         est = c.get("est_min")
-        if action != "reuse" and not (isinstance(est, (int, float)) and math.isfinite(est) and est > 0):
-            bad.append(f"case {name} declares no run estimate (run.est), so its cost is unknown")
+        if action not in ("reuse", "skip") and not (isinstance(est, (int, float)) and math.isfinite(est) and est > 0):
+            bad.append(f"case {safe(c.get('name'), 60)} declares no run estimate (run.est), so its cost is unknown")
     return bad[:5]
 
 
@@ -688,8 +724,21 @@ def authorize(facts):
     head = str(pr.get("head_sha", ""))
     is_fork = not _same_repo(pr.get("head_repo", ""), pr.get("base_repo", "-"))
 
+    would = []
+
     def deny(*reasons):
-        return Decision("deny", list(reasons), sandbox=sandbox_profile(is_fork), pinned_sha=head)
+        return Decision(
+            "deny", list(reasons), sandbox=sandbox_profile(is_fork), pinned_sha=head, would_refuse=list(would)
+        )
+
+    if not SETTINGS["enabled"]:
+        return deny("on-demand benchmarks are not enabled yet")
+    enforce = SETTINGS["enforce_budgets"]
+
+    def soft(msg):
+        """A budget finding: refuses when budgets are enforced, otherwise recorded as 'would have been refused'."""
+        would.append(msg)
+        return deny(msg) if enforce else None
 
     if not invoker_allowed(who, policy):
         return deny("the commenter is not allowed to run benchmarks on this repository")
@@ -742,10 +791,16 @@ def authorize(facts):
     if planned and isinstance(facts.get("plan"), dict):
         plan_est = _finite_hours((facts["plan"].get("estimate") or {}).get("device_hours"))
         if plan_est is None:
-            return deny("the plan has no usable estimate in device-hours")
+            denied = soft("the plan has no usable estimate in device-hours")
+            if denied:
+                return denied
+            plan_est = 0.0
         est = plan_est if est is None else max(est, plan_est)
     if planned and est is None:
-        return deny("the plan has no usable estimate in device-hours")
+        denied = soft("the plan has no usable estimate in device-hours")
+        if denied:
+            return denied
+        est = 0.0
     if facts.get("estimate_device_hours") is not None and est is None:
         return deny("the estimate is not a finite number of device-hours")
     needs_confirm = False
@@ -756,6 +811,10 @@ def authorize(facts):
         bad = plan_violations(plan, policy)
         if bad:
             return deny(*bad)
+        for msg in plan_cost_issues(plan):
+            denied = soft(msg)
+            if denied:
+                return denied
         # The estimate is declared by the catalog; the timeouts bound what a case can actually take.
         worst = sum(
             float(c.get("timeout_min") or 0) * float(c.get("accelerators") or 1) / 60
@@ -763,13 +822,17 @@ def authorize(facts):
             if str(c.get("action", "")).lower() not in ("reuse", "skip")
         )
         if worst > limit:
-            return deny(
+            denied = soft(
                 f"the plan's timeouts allow up to {worst:g} device-hours, over the {limit:g} limit for this request"
             )
+            if denied:
+                return denied
         ok, needs_confirm = check_budget(est, limit, policy)
         if not ok:
-            return deny(f"plan needs {est:g} device-hours, over the {limit:g} limit for this request")
-        needs_confirm = needs_confirm and not confirmed
+            denied = soft(f"plan needs {est:g} device-hours, over the {limit:g} limit for this request")
+            if denied:
+                return denied
+        needs_confirm = needs_confirm and not confirmed and enforce
     own = str(facts.get("request_id") or "")
     reasons, cancel = admission(
         [h for h in facts.get("history") or [] if not own or str(h.get("id")) != own],
@@ -784,13 +847,22 @@ def authorize(facts):
         now,
         policy,
     )
-    if reasons:
-        return deny(*reasons)
+    hard = [r for r in reasons if not r.startswith(SOFT_PREFIXES)]
+    if hard:
+        return deny(*hard)
+    for r in (r for r in reasons if r.startswith(SOFT_PREFIXES)):
+        denied = soft(r)
+        if denied:
+            return denied
+    if not enforce:
+        cancel = [c for c in cancel]  # supersede of the requester's own live request still applies
     state = "needs_confirm" if needs_confirm else "admit"
     why = (
         [f"estimate above {int(policy.confirm_fraction * 100)}% of the limit: confirm to run"] if needs_confirm else []
     )
-    return Decision(state, why, cancel, head, approval.to_dict() if approval else None, sandbox_profile(is_fork), limit)
+    return Decision(
+        state, why, cancel, head, approval.to_dict() if approval else None, sandbox_profile(is_fork), limit, would
+    )
 
 
 def engine_request(req, product, subject=None, environment=""):
@@ -801,7 +873,7 @@ def engine_request(req, product, subject=None, environment=""):
     else:
         raise KeyError(product)
     selection = {k: v for k, v in sel.items() if v}
-    out = {"purpose": req.purpose, "selection": {**selection, "type": "perf"}}
+    out = {"purpose": req.purpose, "selection": {**selection, "type": req.type}}
     if subject:
         out["subject"] = subject
     if req.env or environment:
@@ -821,7 +893,11 @@ def bench_env(req, product, subject_id="", environment=""):
             break
     else:
         raise KeyError(product)
-    env = {"BENCH_PURPOSE": req.purpose, "BENCH_REUSE": req.reuse}
+    env = {
+        "BENCH_PURPOSE": req.purpose,
+        "BENCH_REUSE": req.reuse,
+        **({"BENCH_TYPE": req.type} if req.type != "perf" else {}),
+    }
     if sel.get("cases"):
         env["BENCH_SELECTION"] = ",".join(sel["cases"])
     if sel.get("tier"):
@@ -873,7 +949,20 @@ def _uuid7(now=None):
 
 
 def ci_request_row(
-    req, state, actor, *, host, pr, repo, head_sha, plan=None, request_id="", comment_url="", error="", now=None
+    req,
+    state,
+    actor,
+    *,
+    host,
+    pr,
+    repo,
+    head_sha,
+    plan=None,
+    request_id="",
+    comment_url="",
+    error="",
+    now=None,
+    would_refuse=(),
 ):
     """One ci_requests row (append-only; one per event). `plan` is a plan.json, `actor` the login that caused the event."""
     if state not in CI_STATES:
@@ -895,7 +984,7 @@ def ci_request_row(
         ),
         "preset": "bench-pr",
         "arches": [str(a) for a in ((plan or {}).get("leg") or {}).get("arch", "").split()] or [],
-        "modes": ["perf"],
+        "modes": [req.type],
         "cells_requested": json.dumps([brief(c) for c in cases if c.get("action") == "run"]),
         "cells_skipped": json.dumps([brief(c) for c in cases if c.get("action") == "reuse"]),
         "cells_blocked": json.dumps([brief(c) for c in cases if c.get("action") not in ("run", "reuse")]),
@@ -912,7 +1001,14 @@ def ci_request_row(
         else "",
         "canonical": json.dumps(req.to_dict(), sort_keys=True),
         "error": neutral(error, 500),
-        "props": {"bench.host": host, "bench.purpose": req.purpose, "bench.digest": (pv or {}).get("digest", "")},
+        "props": {
+            "bench.host": host,
+            "bench.purpose": req.purpose,
+            "bench.digest": (pv or {}).get("digest", ""),
+            "bench.enforced": str(SETTINGS["enforce_budgets"]).lower(),
+            # What the budgets would have refused, recorded whether or not they are enforced: this is the usage record.
+            "bench.would_refuse": neutral("; ".join(map(str, would_refuse)), 500),
+        },
     }
 
 
@@ -1052,6 +1148,9 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
     if policy and limit is not None and known is not None:
         ok, needs_confirm = check_budget(hours, limit, policy)
         over = not ok
+    enforced = SETTINGS["enforce_budgets"]
+    needs_confirm = needs_confirm and enforced
+    would = plan_cost_issues(plan) if policy else []
     cases = sorted(plan["cases"], key=lambda c: (_ORDER.get(c["action"], 9), c["name"]))
     body = {
         "schema": PREVIEW_SCHEMA,
@@ -1066,6 +1165,8 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
             "over": over,
             "estimate_known": known is not None,
             "violations": violations,
+            "enforced": enforced,
+            "cost_issues": would,
         },
         "asked": req.asked,
         "diff": _asked_vs_planned(req, plan),
@@ -1090,7 +1191,7 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
     return body
 
 
-def render_markdown(preview, public=True, command="/bench", state=None):
+def render_markdown(preview, public=True, command="/spyre-bench", state=None):
     """The PR comment. Stable layout, one marker so the same comment is edited in place."""
     c, e, b = preview["counts"], preview["estimate"], preview["budget"]
     out = [PREVIEW_MARKER] + ([encode_state(state)] if state else []) + ["### Benchmark plan"]
@@ -1103,7 +1204,16 @@ def render_markdown(preview, public=True, command="/bench", state=None):
         out.append("Queue: " + ", ".join(f"{safe(k, 30)} {safe(v, 40)}" for k, v in sorted(q.items())) + ".")
     for v in b.get("violations") or []:
         out.append(f"**Not allowed:** {safe(v, 160)}")
-    if not b.get("estimate_known", True):
+    report_only = not b.get("enforced", True)
+    issues = [safe(i, 160) for i in b.get("cost_issues") or []]
+    if b.get("violations"):
+        out.append("**Nothing will run** until the selection fits this host.")
+    elif report_only and (b.get("over") or issues or not b.get("estimate_known", True)):
+        out.append(
+            "**Report only:** budgets are not enforced yet. This would have been refused (over the limit or cost unknown); it runs anyway."
+        )
+        out += [f"- {i}" for i in issues]
+    elif not b.get("estimate_known", True):
         out.append("**The plan has no usable estimate: nothing will run.**")
     elif b.get("over"):
         out.append("**Over the limit: nothing will run.** Narrow the selection or ask for a smaller tier.")
@@ -1176,7 +1286,7 @@ def _cmd_preview(a):
     pv = build_preview(_load(a.plan), req, POLICIES[a.host], queue, a.dashboard_url or "", a.note)
     state = json.loads(a.state) if a.state else None
     print(
-        render_markdown(pv, public=a.host == "github.com", command=a.command, state=state)
+        render_markdown(pv, public=a.host == "github.com", command=a.command or "/spyre-bench", state=state)
         if a.format == "md"
         else json.dumps(pv, sort_keys=True)
     )
@@ -1251,7 +1361,7 @@ def parser():
     p = sub.add_parser("parse", help="comment text -> request")
     p.add_argument("--comment-file", required=True)
     p.add_argument("--host", choices=HOSTS, default="github.com")
-    p.add_argument("--command", default="/bench")
+    p.add_argument("--command", default=None)
     p.add_argument("--default-product", default=DEFAULT_PRODUCT)
     p.set_defaults(fn=_cmd_parse)
     p = sub.add_parser("authorize", help="facts.json -> decision (exit 0 allowed, 2 denied)")
@@ -1281,6 +1391,7 @@ def parser():
     p.add_argument("--request-id")
     p.add_argument("--comment-url")
     p.add_argument("--error")
+    p.add_argument("--would-refuse", action="append", help="a budget finding to record (repeatable)")
     p.set_defaults(fn=_cmd_record)
     p = sub.add_parser("history", help="v_ci_requests rows (JSON file) -> admission history rows")
     p.add_argument("--rows", required=True)
@@ -1301,7 +1412,7 @@ def parser():
     p.add_argument("--format", choices=("md", "json"), default="md")
     p.add_argument("--queue", help="JSON object of queue facts to show")
     p.add_argument("--dashboard-url")
-    p.add_argument("--command", default="/bench")
+    p.add_argument("--command", default=None)
     p.add_argument("--note", action="append", default=[], help="a line shown under the table (repeatable)")
     p.add_argument("--state", help="JSON object stored in the comment for a later /bench confirm")
     p.set_defaults(fn=_cmd_preview)

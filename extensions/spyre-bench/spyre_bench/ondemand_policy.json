@@ -1,5 +1,7 @@
 {
- "_note": "The one place the on-demand limits live (device-hours, counts, seconds). Proposals accepted as starting values; change them here. The internal poller keeps a copy checked against this file by a test.",
+ "_note": "The one place the on-demand limits and switches live (device-hours, counts, seconds). `enabled` false = the feature is dark: nothing is admitted. `enforce_budgets` false = the device-hour limits, the per-PR window and supersede counting only REPORT 'would have been refused' and proceed; tier limits, head pinning, fork sha=, writer-only trigger and the start-of-run PR re-check always apply. The internal poller keeps a byte copy; both repos pin its sha-256 in a test.",
+ "enabled": false,
+ "enforce_budgets": false,
  "github.com": {
   "tiers": [
    "sanity"
@@ -23,7 +25,10 @@
   "max_wait_cap_s": 3600,
   "clean_per_user": 1,
   "clean_per_user_per_day": 3,
-  "clean_cluster": 2
+  "clean_cluster": 2,
+  "types": [
+   "perf"
+  ]
  },
  "ghe": {
   "tiers": [
@@ -52,6 +57,10 @@
   "max_wait_cap_s": 3600,
   "clean_per_user": 1,
   "clean_per_user_per_day": 3,
-  "clean_cluster": 2
+  "clean_cluster": 2,
+  "types": [
+   "perf",
+   "quality"
+  ]
  }
 }
