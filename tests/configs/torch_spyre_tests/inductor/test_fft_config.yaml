@@ -1,0 +1,12 @@
+test_suite_config:
+  labels: [unit, regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestFFT::test_dft_forward
+            - TestFFT::test_dft_inverse
+            - TestFFT::test_fft_matches_reference
+            - TestFFT::test_ifft_roundtrip
+          mode: mandatory_success

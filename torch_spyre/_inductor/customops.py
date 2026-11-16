@@ -14,6 +14,7 @@
 
 from typing import Optional, Sequence
 
+import numpy as np
 import torch
 import torch._dynamo
 import torch._higher_order_ops.effects
@@ -37,6 +38,43 @@ def tile_dim_marker(x: torch.Tensor, dim: int) -> torch.Tensor:
 @tile_dim_marker.register_fake
 def _(x: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+def _interleaved_dft_matrix(n: int, inverse: bool, dtype: torch.dtype) -> torch.Tensor:
+    """``(2n, 2n)`` real interleaved DFT matrix for :func:`dft`.
+
+    Each complex DFT entry ``W[j, k] = exp(-2*pi*i*j*k/n)`` (``conj/n`` for the
+    inverse) is expanded into the real block ``[[Re, Im], [-Im, Re]]`` so that a
+    complex DFT runs as a real matmul. Built with numpy so the strided assembly
+    stays a plain constant, opaque to the FX tracer in the spyre::dft
+    decomposition.
+    """
+    w = np.fft.fft(np.eye(n))
+    if inverse:
+        w = np.conj(w) / n
+    m = np.empty((2 * n, 2 * n), dtype=np.float32)
+    m[0::2, 0::2], m[0::2, 1::2] = w.real, w.imag
+    m[1::2, 0::2], m[1::2, 1::2] = -w.imag, w.real
+    return torch.from_numpy(m).to(dtype)
+
+
+@torch.library.custom_op("spyre::dft", mutates_args=())
+def dft(u: torch.Tensor, inverse: bool) -> torch.Tensor:
+    """Real interleaved DFT: ``(..., 2n) -> (..., 2n)``.
+
+    ``u`` carries complex values as interleaved real pairs
+    ``[re0, im0, re1, im1, ...]``. On Spyre this lowers to a single real
+    ``matmul`` (see ``dft_decomp`` in ``decompositions.py``); the eager body is
+    the CPU reference.
+    """
+    n = u.shape[-1] // 2
+    w = _interleaved_dft_matrix(n, inverse, u.dtype).to(u.device)
+    return u @ w
+
+
+@dft.register_fake
+def _(u: torch.Tensor, inverse: bool) -> torch.Tensor:
+    return torch.empty_like(u)
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")

@@ -30,6 +30,8 @@ from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
+from torch_spyre.ops import fft as spyre_fft
+from torch_spyre.ops import ifft as spyre_ifft
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -15119,6 +15121,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
+
+
+class TestFFT(unittest.TestCase):
+    """DFT via matmul: the spyre::dft op and the fft/ifft host wrappers.
+
+    spyre::dft takes a real interleaved tensor (``[re0, im0, re1, ...]``) and
+    lowers to a single matmul, so -- like the conv/avgpool op tests -- it is
+    checked with ``compare_with_cpu`` (run_eager=False: Spyre has no eager dft
+    kernel, only the decomposed/compiled path). The complex fft/ifft wrappers
+    are then checked end-to-end against ``torch.fft``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    def test_dft_forward(self):
+        def fn(u):
+            return torch.ops.spyre.dft(u, False)
+
+        u = cached_randn((3, 128), dtype=torch.float16)  # interleaved real, n=64
+        compare_with_cpu(fn, u, atol=0.5, rtol=0.1, run_eager=False)
+
+    def test_dft_inverse(self):
+        def fn(u):
+            return torch.ops.spyre.dft(u, True)
+
+        u = cached_randn((3, 128), dtype=torch.float16)
+        compare_with_cpu(fn, u, atol=0.5, rtol=0.1, run_eager=False)
+
+    def test_fft_matches_reference(self):
+        # End-to-end vs torch.fft (validates the interleaved DFT matrix), for
+        # powers of two and a prime. Bounded against the spectrum peak: fp16
+        # cancellation hurts per-element accuracy on near-zero outputs, so the
+        # standard FFT-roundoff measure is relative to peak magnitude (~0.5%
+        # observed; a wrong transform is >100%).
+        for n in (64, 97, 256):
+            with self.subTest(n=n):
+                x = torch.randn(3, n, dtype=torch.complex64)
+                ref = torch.fft.fft(x)
+                err = (spyre_fft(x) - ref).abs().max().item()
+                self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_roundtrip(self):
+        x = torch.randn(2, 128, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
 
 if __name__ == "__main__":
     unittest.main()
