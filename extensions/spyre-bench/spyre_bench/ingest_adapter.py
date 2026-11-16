@@ -108,7 +108,9 @@ def offline():
         raise IngestUnavailable(f"{OFFLINE_MODULE} is not importable ({type(e).__name__}: {e}); {HINT}") from e
     missing = [n for n in OFFLINE_NEEDS if not hasattr(mod, n)]
     if missing:
-        raise IngestUnavailable(f"{OFFLINE_MODULE} lacks {missing}: it predates bench bundles; {UPGRADE_HINT}")
+        raise IngestUnavailable(
+            f"{OFFLINE_MODULE} ({getattr(mod, '__file__', 'unknown path')}) lacks {missing}: it predates bench bundles; {UPGRADE_HINT}"
+        )
     return mod
 
 
