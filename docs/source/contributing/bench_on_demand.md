@@ -29,6 +29,8 @@ estimate in device-hours, what you asked for versus what will run, and the reaso
 the limit waits for `/spyre-bench confirm`; a plan above the limit does not run. When the run finishes a second comment gives
 the outcome of each stage. No measured values are posted on a public pull request.
 
+This workflow route measures on x86 only. The internal comment-bot to Jenkins route (the same `/spyre-bench` command) covers amd64, ppc64le and s390x.
+
 ## Switches (shipped off)
 
 The route is dark until two things are on together: the repository variable `BENCH_ONDEMAND_ENABLED` is `true` and the
