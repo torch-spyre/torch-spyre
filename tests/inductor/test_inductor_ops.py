@@ -14463,7 +14463,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x
 
         def tensor_value(x, index):
-            return torch.index_fill(x, 0, index, torch.tensor(3.0, device=x.device))
+            # value in x's dtype: an f32 value would be converted to f16 by a
+            # device-to-device copy_, which writes wrong values on Spyre today.
+            value = torch.tensor(3.0, dtype=x.dtype, device=x.device)
+            return torch.index_fill(x, 0, index, value)
 
         cases = {
             "functional": (functional, cached_randn((67, 256))),
