@@ -20,6 +20,7 @@ trusted input: whoever can write the store path decides what is public. A missin
 error, never a fallback. Offline `validate` never calls this module.
 """
 
+import http.client
 import json
 import os
 import urllib.error
@@ -54,7 +55,7 @@ class DatasetMeta:
 
 
 def check_slug(slug):
-    if not isinstance(slug, str) or not SLUG.match(slug):
+    if not isinstance(slug, str) or not SLUG.fullmatch(slug):
         raise DatasetMetaError(f"dataset slug {slug!r} is not a valid slug")
     return slug
 
@@ -64,7 +65,7 @@ def parse(text, slug):
     check_slug(slug)
     try:
         doc = json.loads(text)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise DatasetMetaError(f"{slug}/{FILE}: not valid JSON ({type(e).__name__})") from None
     if not isinstance(doc, dict):
         raise DatasetMetaError(f"{slug}/{FILE}: must be a JSON object")
@@ -100,10 +101,26 @@ class DirSource:
             raise DatasetMetaError(f"{slug}/{FILE}: cannot read it ({type(e).__name__})") from None
 
 
-class HttpSource:
-    """Metadata over HTTP from an Artifactory-style store: GET <base>/<root>/<slug>/dataset.json with a bearer token."""
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would forward the bearer token to another host."""
 
-    def __init__(self, base, root, token="", urlopen=urllib.request.urlopen):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _open(req, timeout):
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
+class HttpSource:
+    """Metadata over HTTPS from an Artifactory-style store: GET <base>/<root>/<slug>/dataset.json with a bearer token.
+
+    Plain http, other schemes and redirects are refused so the token only goes to the configured https host.
+    """
+
+    def __init__(self, base, root, token="", urlopen=_open):
+        if not base.lower().startswith("https://"):
+            raise DatasetMetaError("the dataset store endpoint must be an https:// URL")
         self.url = f"{base.rstrip('/')}/{root.strip('/')}" if root else base.rstrip("/")
         self.token = token
         self.urlopen = urlopen
@@ -118,7 +135,7 @@ class HttpSource:
         except urllib.error.HTTPError as e:
             what = "not found in the dataset store" if e.code == 404 else f"the store answered HTTP {e.code}"
             raise DatasetMetaError(f"{slug}/{FILE}: {what}") from None
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError, http.client.HTTPException, ValueError) as e:
             raise DatasetMetaError(f"{slug}/{FILE}: cannot fetch it ({type(e).__name__})") from None
 
 
@@ -136,7 +153,7 @@ def _ref(value, env, what):
     raise DatasetMetaError(f"store {what} is not set")
 
 
-def source_for_store(store_spec, env=None, urlopen=urllib.request.urlopen):
+def source_for_store(store_spec, env=None, urlopen=_open):
     """The metadata source of a Store spec: core/filesystem -> DirSource, core/artifactory -> HttpSource."""
     env = os.environ if env is None else env
     kind = store_spec.get("type")
@@ -159,7 +176,10 @@ def read(source, slug):
 
 
 def check_assets(meta, asset_specs):
-    """The metadata digest, when set, must be one the dataset's Assets declare (a manifest or a file digest)."""
+    """The metadata digest, when set, must be one the dataset's Assets declare (a manifest or a file digest).
+
+    Assets that declare none (a pinned revision, a generator) cannot vouch for it, so such a dataset.json omits sha256.
+    """
     if not meta.sha256:
         return
     known = set()
@@ -167,8 +187,8 @@ def check_assets(meta, asset_specs):
         integ = spec.get("integrity") or {}
         known |= {f.get("sha256") for f in integ.get("files") or []} | {(integ.get("manifest") or {}).get("sha256")}
     known.discard(None)
-    if known and meta.sha256 not in known:
-        raise DatasetMetaError(f"{meta.slug}/{FILE}: sha256 matches none of the digests the Asset declares")
+    if meta.sha256 not in known:
+        raise DatasetMetaError(f"{meta.slug}/{FILE}: sha256 matches none of the digests the Assets declare")
 
 
 class Labels:
