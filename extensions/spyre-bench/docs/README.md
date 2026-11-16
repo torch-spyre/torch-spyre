@@ -680,7 +680,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | budget per request (device-hours) | 4 | 12 (`sanity`), 48 (`core`) |
 | budget per PR per 24 h | 8 | 96 |
 
-The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a copy that a test compares with it). An estimate above half the limit needs `/bench confirm`;
+The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a byte copy; both repos pin the file's sha-256 in a test, so changing a limit means updating the file, the digest and the copy together). An estimate above half the limit needs `/bench confirm`;
 above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
 access may cancel anyone's, others are refused while another user's request runs). History rows are normalised
 (pull request numbers compared as text, states case-insensitively). A state that is not dead or finished is live
@@ -707,7 +707,7 @@ at once overall.
 
 `ondemand record` builds the `ci_requests` row for one event of a request (`channel` is `comment`, `target_kind` `pr`;
 states `previewed`, `launched`, `denied`, `rejected`, `failed`, `cancelled`; migration 028 widens the channel check).
-`ondemand history` turns `v_ci_requests` rows (`spyre_bench.ondemand.HISTORY_SQL`) into the history `authorize` reads, so the
+`ondemand history` turns `v_ci_requests` rows (`spyre_bench.ondemand.HISTORY_SQL`, read straight from `ci_requests`; keyed by host, repository and PR; a launched request counts as done after 6 hours because the log has no completion event) into the history `authorize` reads, so the
 per-PR window, the supersede rule and the clean quotas count from the log where it exists. A row that cannot be read
 raises: admission stops until the log is fixed. The GitHub route has no store credentials and so records nothing;
 it counts the user's runs from its own run list instead. A same-repository head needs no `sha=`; a confirm refuses a

@@ -547,7 +547,8 @@ def sandbox_profile(is_fork):
 def _parse(ts):
     if isinstance(ts, datetime):
         return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    out = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    return out if out.tzinfo else out.replace(tzinfo=timezone.utc)
 
 
 def _iso(ts):
@@ -600,13 +601,20 @@ def admission(history, new, now, policy):
     now = _parse(now)
     history = [dict(h, pr=str(h.get("pr")), state=str(h.get("state", "")).lower()) for h in history]
     live = [h for h in history if h["state"] not in DEAD_STATES]
-    here = [h for h in live if h["pr"] == str(new["pr"]) and h["state"] not in FINISHED_STATES]
+
+    def mine(h):
+        return (
+            f"{str(h.get('repo') or new.get('repo', '')).lower()}#{h['pr']}"
+            == f"{str(new.get('repo', '')).lower()}#{new['pr']}"
+        )
+
+    here = [h for h in live if mine(h) and h["state"] not in FINISHED_STATES]
     reasons = []
     cancel = [h["id"] for h in here if h["user"] == new["user"] or new.get("can_supersede")]
     if len(cancel) < len(here):
         reasons.append("another user's benchmark request is still running on this pull request")
     kept = [h for h in live if h["id"] not in cancel]
-    in_window = [h for h in kept if h["pr"] == str(new["pr"]) and now - _parse(h["ts"]) <= policy.window]
+    in_window = [h for h in kept if mine(h) and now - _parse(h["ts"]) <= policy.window]
     spent = sum(_hours(h.get("est")) for h in in_window)
     if spent + new["est"] > policy.pr_window_device_hours:
         reasons.append(
@@ -756,6 +764,7 @@ def authorize(facts):
         facts.get("history") or [],
         {
             "pr": pr["number"],
+            "repo": pr.get("base_repo", ""),
             "user": who.get("login", ""),
             "est": est or 0.0,
             "clean": req.clean,
@@ -831,9 +840,14 @@ def bench_env(req, product, subject_id="", environment=""):
 CI_STATES = ("previewed", "launched", "denied", "rejected", "failed", "cancelled")
 CI_CHANNEL = "comment"
 HISTORY_SQL = (
-    "SELECT toString(request_id) AS id, requested_by AS user, state, subjects, estimate, requested_at AS ts "
-    "FROM v_ci_requests WHERE channel = 'comment' AND target_kind = 'pr' AND requested_at >= now() - INTERVAL 2 DAY"
+    # Straight from the log, not v_ci_requests: the estimate of the latest event that carries one (a later event
+    # written without a plan must not turn a 90 device-hour request into 0).
+    "SELECT toString(request_id) AS id, argMin(actor, ts) AS user, argMax(state, ts) AS state, "
+    "argMin(subjects, ts) AS subjects, argMaxIf(estimate, ts, estimate != '') AS estimate, min(ts) AS ts "
+    "FROM ci_requests WHERE channel = 'comment' AND target_kind = 'pr' AND ts >= now() - INTERVAL 2 DAY "
+    "GROUP BY request_id"
 )
+LAUNCH_TTL = timedelta(hours=6)  # a launched request has no completion event; past the longest job it counts as done
 
 
 def _uuid7(now=None):
@@ -861,11 +875,12 @@ def ci_request_row(
         "request_id": request_id or _uuid7(now),
         "plan_id": (pv or {}).get("digest", ""),
         "state": state,
-        "actor": str(actor)[:200],
+        "actor": neutral(actor, 200),
         "channel": CI_CHANNEL,
         "target_kind": "pr",
         "subjects": json.dumps(
-            {"repo": repo, "pr": int(pr), "head_sha": head_sha, "comment_url": comment_url}, sort_keys=True
+            {"repo": repo, "pr": int(pr), "head_sha": head_sha, "comment_url": comment_url, "host": host},
+            sort_keys=True,
         ),
         "preset": "bench-pr",
         "arches": [str(a) for a in ((plan or {}).get("leg") or {}).get("arch", "").split()] or [],
@@ -881,7 +896,9 @@ def ci_request_row(
                 "limit": budget_limit(req, POLICIES[host]),
             },
             sort_keys=True,
-        ),
+        )
+        if plan
+        else "",
         "canonical": json.dumps(req.to_dict(), sort_keys=True),
         "error": neutral(error, 500),
         "props": {"bench.host": host, "bench.purpose": req.purpose, "bench.digest": (pv or {}).get("digest", "")},
@@ -892,18 +909,25 @@ _HISTORY_STATE = {"previewed": "previewed", "launched": "launched", "denied": "d
                   "cancelled": "cancelled", "failed": "done"}  # fmt: skip
 
 
-def history_from_ci_requests(rows):
-    """v_ci_requests rows (HISTORY_SQL) -> the history rows `admission` reads. A row it cannot read raises, so a damaged
-    log blocks admission rather than waving a request through."""
+def history_from_ci_requests(rows, host, now=None):
+    """HISTORY_SQL rows -> the history rows `admission` reads, for one host only. A row it cannot read raises, so a
+    damaged log blocks admission rather than waving a request through. A launched request older than LAUNCH_TTL is done."""
+    now = _parse(now) if now else datetime.now(timezone.utc)
     out = []
     for r in rows:
         try:
             subj = json.loads(r.get("subjects") or "{}")
+            if subj["host"] != host:
+                continue
             est = json.loads(r.get("estimate") or "{}")
+            ts = _parse(r["ts"])
+            state = _HISTORY_STATE.get(str(r["state"]).lower(), "unknown")
+            if state == "launched" and now - ts > LAUNCH_TTL:
+                state = "done"
+            hours = est.get("device_hours")
             out.append(
-                {"id": str(r["id"]), "pr": subj["pr"], "user": str(r["user"]), "ts": r["ts"],
-                 "state": _HISTORY_STATE.get(str(r["state"]).lower(), "unknown"),
-                 "est": est.get("device_hours") if est.get("device_hours") is not None else 0,
+                {"id": str(r["id"]), "pr": subj["pr"], "repo": str(subj["repo"]).lower(), "user": str(r["user"]),
+                 "ts": _iso(ts), "state": state, "est": hours if hours is not None else 0,
                  "clean": bool(est.get("clean"))}
             )  # fmt: skip
         except (KeyError, TypeError, ValueError, AttributeError):
@@ -1182,7 +1206,7 @@ def _cmd_record(a):
 
 
 def _cmd_history(a):
-    print(json.dumps(history_from_ci_requests(_load(a.rows)), sort_keys=True))
+    print(json.dumps(history_from_ci_requests(_load(a.rows), a.host), sort_keys=True))
     return cliutil.EXIT_OK
 
 
@@ -1236,6 +1260,7 @@ def parser():
     p.set_defaults(fn=_cmd_record)
     p = sub.add_parser("history", help="v_ci_requests rows (JSON file) -> admission history rows")
     p.add_argument("--rows", required=True)
+    p.add_argument("--host", choices=HOSTS, required=True)
     p.set_defaults(fn=_cmd_history)
     p = sub.add_parser("sanitize", help="stdin -> the same text made inert for a PR comment")
     p.add_argument("--limit", type=int, default=600)
