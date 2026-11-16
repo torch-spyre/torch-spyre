@@ -426,6 +426,30 @@ class Authorize(unittest.TestCase):
         }
         self.assertEqual(od.authorize(planned(estimate_device_hours=0, plan=reuse)).state, "admit")
 
+    def test_a_tiny_estimate_with_a_long_timeout_is_bounded_by_the_timeout(self):
+        case = {
+            "name": "a",
+            "action": "run",
+            "est_min": 0.02,
+            "timeout_min": 600,
+            "accelerators": 1,
+            "run_props": {"run.tier": "sanity"},
+        }
+        plan = {"cases": [case], "estimate": {"device_hours": 0.0003}}
+        d = od.authorize(planned(estimate_device_hours=0.0003, plan=plan))
+        self.assertEqual(d.state, "deny")
+        self.assertIn("timeouts allow", d.reasons[0])
+        case["timeout_min"] = 30
+        self.assertEqual(od.authorize(planned(estimate_device_hours=0.0003, plan=plan)).state, "admit")
+        case.update(timeout_min=100, accelerators=4)
+        self.assertEqual(od.authorize(planned(estimate_device_hours=0.0003, plan=plan)).state, "deny")
+
+    def test_a_request_is_not_its_own_history(self):
+        own = self.history(id="r9", state="previewed", est=3)
+        d = od.authorize(planned(history=own, request_id="r9", estimate_device_hours=3))
+        self.assertEqual(d.cancel, [])
+        self.assertEqual(od.authorize(planned(history=own, estimate_device_hours=3)).cancel, ["r9"])
+
     def test_window_rows_can_skip_the_rate_limit_count(self):
         rows = [
             {

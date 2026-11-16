@@ -756,12 +756,23 @@ def authorize(facts):
         bad = plan_violations(plan, policy)
         if bad:
             return deny(*bad)
+        # The estimate is declared by the catalog; the timeouts bound what a case can actually take.
+        worst = sum(
+            float(c.get("timeout_min") or 0) * float(c.get("accelerators") or 1) / 60
+            for c in plan.get("cases") or []
+            if str(c.get("action", "")).lower() not in ("reuse", "skip")
+        )
+        if worst > limit:
+            return deny(
+                f"the plan's timeouts allow up to {worst:g} device-hours, over the {limit:g} limit for this request"
+            )
         ok, needs_confirm = check_budget(est, limit, policy)
         if not ok:
             return deny(f"plan needs {est:g} device-hours, over the {limit:g} limit for this request")
         needs_confirm = needs_confirm and not confirmed
+    own = str(facts.get("request_id") or "")
     reasons, cancel = admission(
-        facts.get("history") or [],
+        [h for h in facts.get("history") or [] if not own or str(h.get("id")) != own],
         {
             "pr": pr["number"],
             "repo": pr.get("base_repo", ""),
