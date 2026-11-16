@@ -296,25 +296,30 @@ def test_the_legacy_perf_ingest_is_skipped_only_in_replace_mode():
     assert steps["ingest"]["with"]["schema"] == "both"
 
 
-@pytest.mark.parametrize("step", ["bench-mirror", "bench-ingest"])
-def test_the_mirror_is_advisory_except_when_it_replaces_the_legacy_ingest(step):
+@pytest.mark.parametrize("step", ["bench-mirror", "bench-ingest-dir"])
+def test_the_mirror_is_advisory_outside_replace(step):
     s = perf_steps()[step]
-    assert s["continue-on-error"] == "${{ inputs.bench_mode != 'replace' }}"
+    assert s["continue-on-error"] in (True, "${{ inputs.bench_mode != 'replace' }}")
     assert "side-by-side" in perf_steps()["bench-mirror"]["if"]
 
 
-def test_the_mirror_ingests_under_its_own_series_next_to_the_legacy_one():
-    with_ = perf_steps()["bench-ingest"]["with"]
+def test_side_by_side_files_a_connected_ci_run_in_its_own_series():
+    with_ = perf_steps()["bench-ingest-dir"]["with"]
+    assert with_["workflow"] == "${{ format('bench-{0}', github.workflow) }}"
+    assert with_["channel-trust"] == "ci" and with_["schema"] == "v2"
+    assert "run-id" not in with_ and "purpose" not in with_
     assert (
-        with_["workflow"]
-        == "${{ inputs.bench_mode == 'replace' && github.workflow || format('bench-{0}', github.workflow) }}"
-    )
-    assert with_["run-id"] == "${{ steps.bench-mirror.outputs.ingest_run_id }}"
-    assert (
-        "replace" in with_["schema"]
-        and "v2" in with_["schema"]
-        and "purpose" not in with_
+        "inputs.bench_mode == 'side-by-side'" in perf_steps()["bench-ingest-dir"]["if"]
     )
     mirror = perf_steps()["bench-mirror"]
     assert mirror["env"]["BENCH_INGEST"] == "0"
     assert mirror["env"]["BENCH_SUITE_FROM"] == "${{ env.RESULTS_DIR }}"
+
+
+def test_replace_keeps_the_legacy_series_run_id_and_both_schemas():
+    step = perf_steps()["bench-ingest"]
+    assert "inputs.bench_mode == 'replace'" in step["if"]
+    assert "continue-on-error" not in step
+    with_ = step["with"]
+    assert with_["workflow"] == "${{ github.workflow }}"
+    assert with_["run-id"] == "${{ inputs.run_id }}" and with_["schema"] == "both"

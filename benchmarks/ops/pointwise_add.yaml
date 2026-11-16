@@ -29,6 +29,8 @@ spec:
       - '{out_dir}/suite'
       - --raw-dir
       - '{raw_dir}'
+      - --repeat-dir
+      - '{repeat_dir}'
   identity:
     mode: ingest
     profile: perf-kernel
