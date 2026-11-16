@@ -1083,7 +1083,7 @@ class RunSafetyTests(unittest.TestCase):
         killed = []
 
         class Hung:
-            pid = 1
+            pid = 2**22 + 1  # never a live group; a stray killpg must not reach pid 1 (init) or the runner
             stdout = stderr = None
 
             def wait(self, timeout=None):
@@ -1109,6 +1109,7 @@ class RunSafetyTests(unittest.TestCase):
             mock.patch.object(run_cmd, "kill_group", killed.append),
             mock.patch.object(run_cmd, "reap_group", lambda proc: None),
             mock.patch.object(run_cmd, "Capture", Pump),
+            mock.patch("os.killpg", side_effect=AssertionError("the test must not signal a process group")),
         ):
             with self.assertRaises(KeyboardInterrupt):
                 run_cmd.run_ingest(
