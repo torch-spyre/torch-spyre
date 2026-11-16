@@ -358,7 +358,7 @@ def test_a_kernel_tag_spelled_differently_from_the_report_name_still_matches(tmp
     case = runner.Case(op="matmul", shape=MM)
     assert case.owns_tags({"op": "matmul", "input_shape": "1x512x4096x4096x1024"})
     assert not case.owns_tags({"op": "matmul", "input_shape": "4x1x4096x4096x1024"})
-    assert runner.Case(model="Granite", config="c", mode="m").owns_tags(
+    assert runner.Case(model="granite", config="c", mode="m").owns_tags(
         {"op": "granite_x", "config": "c", "mode": "m"}
     )
 
@@ -372,3 +372,67 @@ def test_strict_coverage_fails_on_a_kernel_testcase_no_case_claims(suite, tmp_pa
     (tmp_path / "report.xml").write_text(ids.report_xml(ids.declared()))
     (tmp_path / "kernels.xml").write_text(KERNELS.replace("matmul", "nosuchop"))
     assert coverage.main([str(tmp_path), "--strict"]) == 1
+
+
+def test_a_report_without_model_rows_lists_only_the_declared_cases_it_holds(tmp_path):
+    pytest.importorskip("lxml")
+    pytest.importorskip("clickhouse_connect")
+    pytest.importorskip("spyre_bench")
+    ids = load("check_identity_ids")
+    coverage = load("check_report_coverage")
+    ops = [c for c in ids.declared() if c[1]["disc"]["record_type"] == "op"]
+    (tmp_path / "report.xml").write_text(ids.report_xml(ops))
+    listed = tmp_path / "cases.txt"
+    assert coverage.main([str(tmp_path), "--strict", "--cases-file", str(listed)]) == 0
+    names = listed.read_text().split()
+    assert sorted(names) == sorted(c[0] for c in ops) and len(names) == 19
+
+
+def test_strict_coverage_fails_on_an_xml_no_case_can_carry(tmp_path):
+    pytest.importorskip("lxml")
+    pytest.importorskip("clickhouse_connect")
+    pytest.importorskip("spyre_bench")
+    ids = load("check_identity_ids")
+    coverage = load("check_report_coverage")
+    (tmp_path / "report.xml").write_text(ids.report_xml(ids.declared()))
+    (tmp_path / "extra.xml").write_text("<testsuites><testsuite/></testsuites>")
+    assert coverage.main([str(tmp_path), "--strict"]) == 1
+
+
+def test_the_zero_rule_covers_the_whole_report_and_cpu_stands_in_for_wall_clock():
+    def tc(metric, value, op="a"):
+        return f'<testcase classname="perf.benchmark" name="perf_{op}_{metric}_ms_[[1]]" time="{value}"/>'
+
+    tree = runner.ET.ElementTree(
+        runner.ET.fromstring(
+            "<testsuites><testsuite>"
+            + tc("runtime", 0.0, "a")
+            + tc("runtime", 2.0, "b")
+            + tc("cpu", 3.0, "b")
+            + "</testsuite></testsuites>"
+        )
+    )
+    assert runner.uncaptured(tree) == set()
+    only = runner.ET.ElementTree(
+        runner.ET.fromstring(
+            "<testsuites><testsuite>" + tc("runtime", 0.0) + "</testsuite></testsuites>"
+        )
+    )
+    assert runner.uncaptured(only) == {"runtime_ms"}
+    assert runner.samples_of(tree, ())["total_duration_ms"] == [3.0]
+
+
+def test_two_shapes_with_the_same_digits_are_a_lint_failure(tool_ids=None):
+    ids = load("check_identity_ids")
+    a = (
+        "x_a",
+        {"name": "x", "disc": {"record_type": "op", "input_shapes": "[[1, 2], [3]]"}},
+        "",
+    )
+    b = (
+        "x_b",
+        {"name": "x", "disc": {"record_type": "op", "input_shapes": "[[1], [2, 3]]"}},
+        "",
+    )
+    assert ids.shape_collisions([a, b])
+    assert not ids.shape_collisions([a])

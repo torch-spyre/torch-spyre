@@ -54,20 +54,20 @@ def report_rows(report, runner):
                 rows.add(
                     (
                         "model",
-                        runner.model_name(tags, op).lower(),
+                        runner.model_name(tags, op),
                         tags.get("config", ""),
                         tags.get("mode", ""),
                     )
                 )
             else:
-                rows.add(("op", op.lower(), m["shapes"] or ""))
+                rows.add(("op", op, m["shapes"] or ""))
     return rows
 
 
 def catalog_rows(cases):
     rows = set()
     for _, inp, _ in cases:
-        disc, name = inp["disc"], inp["name"].lower()
+        disc, name = inp["disc"], inp["name"]
         if disc["record_type"] == "model":
             rows.add(("model", name, disc["config_name"], disc["run_mode"]))
         else:
@@ -90,7 +90,13 @@ def unclaimed_kernels(report_dir, runner, cases):
     lost = 0
     for xml in sorted(report_dir.glob("*.xml")):
         root = ET.parse(xml).getroot()
-        if xml.name == "report.xml" or not runner.is_kernel_xml(root):
+        if xml.name == "report.xml":
+            continue
+        if not runner.is_kernel_xml(root):
+            print(
+                f"  not a kernel breakdown nor the report, not carried by any case: {xml.name}"
+            )
+            lost += 1
             continue
         lost += sum(
             not any(o.owns_tags(runner.tags_of(tc)) for o in owners)
@@ -103,6 +109,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("report_dir", type=Path)
     ap.add_argument("--strict", action="store_true")
+    ap.add_argument(
+        "--cases-file",
+        type=Path,
+        help="write the names of the declared cases the report holds, one per line",
+    )
     args = ap.parse_args(argv)
     runner = load("run_kernel_case")
     ids = load("check_identity_ids")
@@ -111,6 +122,15 @@ def main(argv=None):
         print(f"no report.xml in {args.report_dir}", file=sys.stderr)
         return 2
     have, declared = report_rows(report, runner), catalog_rows(ids.declared())
+    cases = ids.declared()
+    if args.cases_file:
+        args.cases_file.write_text(
+            "".join(
+                f"{name}\n"
+                for name, inp, _ in cases
+                if next(iter(catalog_rows([(name, inp, None)]))) in have
+            )
+        )
     undeclared, absent = sorted(have - declared), sorted(declared - have)
     print(
         f"report rows {len(have)}; declared by the catalog {len(have & declared)}; "
@@ -119,7 +139,7 @@ def main(argv=None):
     for label, rows in (("not declared", undeclared), ("absent", absent)):
         for row in rows:
             print(f"  {label}: {' | '.join(row)}")
-    lost = unclaimed_kernels(args.report_dir, runner, ids.declared())
+    lost = unclaimed_kernels(args.report_dir, runner, cases)
     if lost:
         print(f"  {lost} kernel-breakdown testcases match no declared case")
     return 1 if (undeclared or lost) and args.strict else 0

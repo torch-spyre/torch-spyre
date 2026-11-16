@@ -81,7 +81,7 @@ never a required check) and serialised by a concurrency group.
 | Input | Default | Meaning |
 |---|---|---|
 | `ref` | the dispatch ref | branch, tag or SHA to check out |
-| `selection` | `perf-core` | Selection of this catalog to run |
+| `selection` | `ops-core` | Selection of this catalog to run |
 | `clickhouse_env` | `dev` | `prod` only when set explicitly; prod never falls back to the dev secrets |
 | `ingest` | `true` | write the rows; `false` runs and prints verdicts only |
 | `smoke` | `false` | stub engine on a hosted runner: no cards, no secrets used, nothing ingested |

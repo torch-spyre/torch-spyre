@@ -323,3 +323,19 @@ def test_replace_keeps_the_legacy_series_run_id_and_both_schemas():
     with_ = step["with"]
     assert with_["workflow"] == "${{ github.workflow }}"
     assert with_["run-id"] == "${{ inputs.run_id }}" and with_["schema"] == "both"
+
+
+def test_the_banner_reads_the_ingest_step_of_the_active_mode():
+    env = [
+        s
+        for s in yaml.safe_load(MATRIX.read_text())["jobs"]["perf"]["steps"]
+        if s.get("name") == "Perf ingest banners"
+    ][0]["env"]
+    assert env["BENCH_INGEST_OUTCOME"] == (
+        "${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.bench-ingest-dir.outcome }}"
+    )
+    mirror = perf_steps()["bench-mirror"]
+    assert (
+        "BENCH_SELECTION" not in mirror["env"]
+    )  # a selection would be unioned with BENCH_CASES
+    assert 'export BENCH_CASES="$(paste' in mirror["run"]

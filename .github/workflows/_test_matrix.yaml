@@ -995,7 +995,6 @@ jobs:
           ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
           BENCH_PURPOSE: on-demand
           BENCH_ENVIRONMENT: one-device
-          BENCH_SELECTION: perf-core
           BENCH_REUSE: never
           BENCH_INVOKER: gha
           BENCH_QUIET: '1'
@@ -1012,7 +1011,11 @@ jobs:
           make bench-validate bench-check-ids
           strict=""
           if [ "${BENCH_MODE}" = "replace" ]; then strict="--strict"; fi
-          python3 benchmarks/tools/check_report_coverage.py "${RESULTS_DIR}" ${strict}
+          python3 benchmarks/tools/check_report_coverage.py "${RESULTS_DIR}" ${strict} \
+            --cases-file "${GITHUB_WORKSPACE}/bench-cases.txt"
+          # Only the cases whose rows this report holds: a declared series the suite no longer emits is not a failure.
+          export BENCH_CASES="$(paste -sd, "${GITHUB_WORKSPACE}/bench-cases.txt")"
+          [ -n "${BENCH_CASES}" ] || { echo "::error::the report holds no declared case"; exit 1; }
           make bench-run BENCH_RESULTS_DIR="${GITHUB_WORKSPACE}/bench-results"
           python3 benchmarks/tools/collect_ingest_xml.py "${GITHUB_WORKSPACE}/bench-results" \
             "${GITHUB_WORKSPACE}/bench-results/ingest-xml" --github-output
@@ -1083,7 +1086,7 @@ jobs:
           INGEST_OUTCOME: ${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.ingest.outcome }}
           BENCH_MODE: ${{ inputs.bench_mode }}
           BENCH_MIRROR_OUTCOME: ${{ steps.bench-mirror.outcome }}
-          BENCH_INGEST_OUTCOME: ${{ steps.bench-ingest.outcome || steps.bench-ingest-dir.outcome }}
+          BENCH_INGEST_OUTCOME: ${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.bench-ingest-dir.outcome }}
         run: |
           if [ "${EXEC_OUTCOME}" = "success" ]; then
             EXEC=PASS
