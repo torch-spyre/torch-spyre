@@ -102,7 +102,13 @@ python -m spyre_clickhouse_ingest results --bench-dir RESULTS_DIR --arch s390x -
 The GitHub composite action `ingest-xml-to-clickhouse` takes the same as `bench-dir` and `channel-trust`; a
 Jenkins job uses the `v2Results(benchDir: ...)` step. `--workflow` names the regression verdict series
 (the first segment of each row's `source_file`) and is honoured only for `ci`; a lower channel files its
-rows without one. Without `--channel-trust` the run is recorded as `external`.
+rows without one. An empty `--workflow` is the unprefixed series (what the vLLM rows use today); any other
+value is the legacy `--workflow` string as it is (no `/`, no control characters, at most 128 characters). Without
+`--channel-trust` the run is recorded as `external`.
+
+The series and trust of a run are those of its first send: re-sending the same results with another workflow or
+a higher trust is a `duplicate` and changes nothing. The action refuses `channel-trust: ci` on `pull_request`,
+`pull_request_target` and `workflow_run` events, and `bench-dir` combined with another results input.
 
 ## Qualification and invalidation
 
