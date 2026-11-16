@@ -114,6 +114,13 @@ run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-
 `<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
 scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
 `ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--purpose nightly|weekly|merge|on-demand|pr-check|...` records why a perf `report.xml` run happened as the
+run prop `run.purpose` on `benchmark_runs` (lower-cased; it never enters the benchmark id). Only `nightly`,
+`weekly` and `merge` runs join the rolling verdict baselines (`benchmark_baseline_purposes`); a run with another
+purpose is judged but capped at `suspected`, and a run without the prop stays eligible. It is accepted for the
+`--xml-dir`/`--xml-file` path only; the other input kinds refuse it rather than drop it. On that path it exits 2
+when no row could carry it (`--schema` without v2, `CLICKHOUSE_DB_V2` unset, v2 benchmark tables absent) and
+warns per file when the file is a plain test report or was already ingested.
 `--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
 Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
