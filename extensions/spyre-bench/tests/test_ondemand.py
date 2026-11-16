@@ -264,7 +264,10 @@ class Approvals(unittest.TestCase):
 
 
 FORKREQ = lambda **kw: req(sha=SHA[:12], **kw)  # noqa: E731
-PLAN_OK = {"cases": [{"name": "c", "action": "run", "run_props": {"run.tier": "sanity"}}]}
+PLAN_OK = {
+    "cases": [{"name": "c", "action": "run", "run_props": {"run.tier": "sanity"}}],
+    "estimate": {"device_hours": 1},
+}
 
 
 def planned(**kw):
@@ -347,6 +350,27 @@ class Authorize(unittest.TestCase):
         self.assertEqual(od.authorize(planned(estimate_device_hours=3)).state, "needs_confirm")
         self.assertEqual(od.authorize(planned(estimate_device_hours=1)).state, "admit")
 
+    def test_unknown_stage_denies(self):
+        for stage in ("plan", "Planned", "", None, 3):
+            self.assertEqual(od.authorize(facts(stage=stage, estimate_device_hours=1)).state, "deny", stage)
+
+    def test_sha_must_match_even_on_the_same_repo(self):
+        self.assertEqual(od.authorize(facts(request=req(sha="bbbbbbb"))).state, "deny")
+        self.assertEqual(od.authorize(facts(request=req(sha=SHA[:7]))).state, "admit")
+
+    def test_plan_cases_with_odd_actions_are_still_checked(self):
+        for action in ("RUN", "", None, "launch"):
+            case = {"name": "c", "run_props": {"run.tier": "extended"}}
+            if action is not None:
+                case["action"] = action
+            plan = {"cases": [case]}
+            self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=plan)).state, "deny", action)
+
+    def test_the_plans_own_estimate_wins_over_a_smaller_claim(self):
+        plan = dict(PLAN_OK, estimate={"device_hours": 9})
+        self.assertEqual(od.authorize(planned(estimate_device_hours=0, plan=plan)).state, "deny")
+        self.assertEqual(od.authorize(planned(estimate_device_hours=1, plan=dict(PLAN_OK, estimate={}))).state, "deny")
+
     def test_planned_stage_needs_the_plan(self):
         for plan in (None, {}, {"cases": []}, "x"):
             with self.subTest(plan):
@@ -359,13 +383,20 @@ class Authorize(unittest.TestCase):
         self.assertEqual(od.authorize(planned(history=big, estimate_device_hours=1)).state, "deny")
 
     def test_planned_stage_needs_a_usable_estimate(self):
-        for est in (None, float("nan"), -1, "x", float("inf")):
+        for est in (float("nan"), -1, "x", float("inf")):
             with self.subTest(est):
                 self.assertEqual(od.authorize(planned(estimate_device_hours=est)).state, "deny")
         self.assertEqual(od.authorize(facts(estimate_device_hours=float("nan"))).state, "deny")
+        self.assertEqual(od.authorize(planned()).state, "admit", "the plan's own estimate is used when none is given")
+        self.assertEqual(
+            od.authorize(planned(plan={"cases": PLAN_OK["cases"]})).state, "deny", "a plan without an estimate"
+        )
 
     def test_plan_cases_are_checked_against_the_host_tiers(self):
-        plan = {"cases": [{"name": "a", "action": "run", "run_props": {"run.tier": "core"}}]}
+        plan = {
+            "cases": [{"name": "a", "action": "run", "run_props": {"run.tier": "core"}}],
+            "estimate": {"device_hours": 1},
+        }
         d = od.authorize(planned(estimate_device_hours=1, plan=plan))
         self.assertEqual(d.state, "deny")
         self.assertIn("tier 'core'", d.reasons[0])
@@ -867,6 +898,12 @@ class Hardening(unittest.TestCase):
             {"selections": [{"product": "nope", "selection": {}, "as_asked": ""}]},
             {"selections": [{"product": "torch-spyre", "selection": {"tier": "huge"}, "as_asked": ""}]},
             {"selections": []},
+            {
+                "selections": [
+                    {"product": "torch-spyre", "selection": {"tier": "sanity", "types": ["x"]}, "as_asked": ""}
+                ]
+            },
+            {"selections": [{"product": "torch-spyre", "selection": {"cases": "abc"}, "as_asked": ""}]},
             {"max_wait_s": -1},
         ):
             with self.subTest(patch), self.assertRaises(od.RequestError):
