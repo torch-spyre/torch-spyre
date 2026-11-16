@@ -1211,7 +1211,8 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
     s, est = plan["summary"], plan.get("estimate") or {}
     known = _finite_hours(est.get("device_hours"))
     if known is not None and cmp:
-        known += float((cmp.get("estimate") or {}).get("other_device_hours") or 0.0)
+        other = cmp.get("estimate") or {}
+        known = known + float(other.get("other_device_hours") or 0.0) if other.get("known", True) else None
     hours = known if known is not None else 0.0
     limit = budget_limit(req, policy) if policy else None
     needs_confirm = False
@@ -1265,6 +1266,13 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
     return body
 
 
+_REFUSAL_PUBLIC = {  # fixed wording: a public comment never repeats an artifact id or a stored name
+    "vs_not_found": "nothing matches that",
+    "vs_not_allowed": "that kind of comparison is not available here",
+    "target_moved": "the comparison target changed since the preview",
+    "store_unavailable": "the result store did not answer",
+    "no_store": "no result store is configured",
+}
 _CMP_WORD = {"ready": "both sides stored", "will_run_other": "other side runs", "cannot_compare": "cannot compare"}
 
 
@@ -1278,7 +1286,10 @@ def _render_compare(cv, public):
     ]
     out.append("A PR run is advisory (`suspected` at most) and never becomes a baseline.")
     if cv["status"] != "ok":
-        out.append(f"**Nothing to compare:** {safe((cv.get('refusal') or {}).get('message'), 160)}")
+        code = (cv.get("refusal") or {}).get("code")
+        out.append(
+            f"**Nothing to compare:** {_REFUSAL_PUBLIC.get(code, 'the comparison is not available') if public else safe((cv.get('refusal') or {}).get('message'), 160)}"
+        )
     bad = [k for k in cv["cases"] if k["state"] != "ready"][:10]
     if bad:
         out += ["", "| case | state | why |", "|---|---|---|"]

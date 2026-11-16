@@ -199,7 +199,7 @@ class Resolution(unittest.TestCase):
         self.assertEqual(req["selection"]["cases"], ["b", "c"])
         self.assertEqual(req["subject"], {"artifact_id": OTHER})
         self.assertEqual(req["reuse"]["mode"], "never")
-        self.assertEqual(doc["estimate"], {"subject_device_hours": 3.0, "other_device_hours": 2.0})
+        self.assertEqual(doc["estimate"], {"subject_device_hours": 3.0, "other_device_hours": 2.0, "known": True})
 
     def test_a_reused_or_skipped_subject_case_costs_nothing_and_a_skipped_one_cannot_compare(self):
         p = plan(
@@ -295,7 +295,15 @@ class Environment(unittest.TestCase):
 class References(unittest.TestCase):
     def ref(self, **kw):
         return target(
-            REFA, **{"source": "reference", "component": "reference", "ref_key": "ref-a", "ref_state": "current", **kw}
+            REFA,
+            **{
+                "source": "reference",
+                "component": "reference",
+                "ref_key": "ref-a",
+                "ref_state": "current",
+                "product": "spyre-inference",
+                **kw,
+            },
         )
 
     def refrow(self, name):
@@ -553,6 +561,70 @@ class SqlShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFindings(unittest.TestCase):
+    def test_main_falls_back_to_the_newest_artifact_that_has_something_usable(self):
+        results = [row("a", OTHER, validity="suspect"), row("a", OLDER, run="run-old", days=3)]
+        doc = run("main", results, [target(OTHER), target(OLDER, days=3)])
+        self.assertEqual(doc["target"]["artifact_id"], OLDER)
+        self.assertEqual(by(doc)["a"]["other"]["run_id"], "run-old")
+        doc = run("main", [row("a", OTHER, validity="suspect")], [target(OTHER), target(OLDER, days=3)])
+        self.assertEqual(
+            doc["target"]["artifact_id"], OTHER, "nothing usable anywhere: the newest is shown with its reasons"
+        )
+        self.assertEqual(by(doc)["a"]["why"], "validity_suspect")
+
+    def test_an_unknown_arch_on_either_side_is_refused(self):
+        self.assertEqual(run("main", [row("a")], [target(OTHER, arch="")])["refusal"]["code"], "vs_unusable")
+        self.assertEqual(run("main", [row("a")], [target(OTHER)], p=plan(arch=""))["refusal"]["code"], "vs_unusable")
+
+    def test_a_reference_for_another_product_is_refused(self):
+        r = References()
+        for product in ("torch-spyre", None):
+            t = r.ref(product=product) if product else {k: v for k, v in r.ref().items() if k != "product"}
+            self.assertEqual(run("ref:ref-a", [r.refrow("a")], [t])["refusal"]["code"], "vs_unusable", product)
+
+    def test_reference_values_are_refused_by_every_other_kind_and_ref_takes_only_reference_values(self):
+        leaked = row("a", purpose="reference")
+        for vs in ("tag:t1", f"artifact:{OTHER}", "main"):
+            doc = run(vs, [leaked], [target(OTHER, tags=["t1"])], purposes=("nightly", "reference"))
+            self.assertEqual(by(doc)["a"]["why"], "reference_only_via_ref", vs)
+        r = References()
+        doc = run("ref:ref-a", [row("a", REFA, run=REFA)], [r.ref()])
+        self.assertEqual(by(doc)["a"]["why"], "not_a_reference_value")
+
+    def test_a_reference_comparison_offers_no_run_to_open(self):
+        r = References()
+        doc = run(
+            "ref:ref-a", [r.refrow("a")], [r.ref()], p=plan([case("a", "reuse", "x", "run-s"), case("b"), case("c")])
+        )
+        self.assertEqual(by(doc)["a"]["other"]["run_id"], "")
+        self.assertEqual(cmp.compare_links(doc), [])
+
+    def test_the_moved_message_and_public_comment_name_no_artifact(self):
+        st = MemoryStore(results=[row("a")], targets=[target(OLDER)])
+        doc = cmp.plan_compare(
+            plan(), cmp.parse_vs("main"), st, product="spyre-inference", host_kinds=KINDS, expect_artifact=OTHER
+        )
+        self.assertEqual(doc["refusal"]["code"], "target_moved")
+        self.assertNotIn(OLDER[:8], json.dumps(doc["refusal"]))
+        self.assertNotIn(OTHER[:8], json.dumps(doc["refusal"]))
+        od.SETTINGS.update({"enabled": True, "enforce_budgets": False})
+        self.addCleanup(lambda: od.SETTINGS.update(od._load_settings()))
+        req = od.parse_flags({"bench": "sanity", "vs": "main"})
+        out = od.render_markdown(od.build_preview(plan(), req, GHE, cmp=doc), public=True)
+        self.assertIn("the comparison target changed since the preview", out)
+
+    def test_an_unusable_estimate_is_unknown_not_zero(self):
+        p = plan([case("a"), {**case("b"), "est_min": None}, {k: v for k, v in case("c").items() if k != "est_min"}])
+        doc = run("tag:t1", [], [target(OTHER, tags=["t1"])], p=p)
+        self.assertIs(doc["estimate"]["known"], False)
+        od.SETTINGS.update({"enabled": True, "enforce_budgets": False})
+        self.addCleanup(lambda: od.SETTINGS.update(od._load_settings()))
+        pv = od.build_preview(p, od.parse_flags({"bench": "sanity", "vs": "tag:t1"}), GHE, cmp=doc)
+        self.assertFalse(pv["budget"]["estimate_known"])
+        self.assertIs(run("tag:t1", [row("a")], [target(OTHER, tags=["t1"])])["estimate"]["known"], True)
 
 
 class RealPlan(unittest.TestCase):

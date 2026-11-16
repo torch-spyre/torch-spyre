@@ -22,6 +22,7 @@ reachable only through `ref:` and is a comparison target, never a baseline. Gram
 
 import hashlib
 import json
+import math
 from collections import namedtuple
 
 import regex
@@ -85,13 +86,13 @@ def _invalidated(row, events):
     return False
 
 
-def pick_target(vs, candidates, *, product, arch, subject_artifact, vs_kinds):
-    """The one candidate to compare with. `candidates` come newest first from Store.resolve_vs."""
+def usable_targets(vs, candidates, *, product, arch, subject_artifact, vs_kinds):
+    """Every candidate that may be compared with, newest first. Raises Refused when none is."""
     if vs.kind not in vs_kinds:
         raise Refused("vs_not_allowed", f"vs={vs.kind} is not available here")
     if not candidates:
         raise Refused("vs_not_found", f"nothing matches vs={vs.text}")
-    seen = set()
+    seen, out = set(), []
     for c in candidates:
         if vs.kind != "ref" and (c.get("source") == "reference" or c.get("component") == "reference"):
             raise Refused("reference_only_via_ref", "a reference is a comparison target only through ref:<key>")
@@ -99,16 +100,21 @@ def pick_target(vs, candidates, *, product, arch, subject_artifact, vs_kinds):
             if c.get("ref_state") != "current":
                 seen.add(f"reference is {c.get('ref_state') or 'not approved'}")
                 continue
+            if c.get("product") != product:
+                seen.add("another product")
+                continue
         elif c.get("component") != product:
             seen.add("another product")
             continue
         if c.get("artifact_id") == subject_artifact:
             raise Refused("vs_is_subject", "vs names the artifact being measured")
-        if c.get("arch") and arch and c["arch"] != arch:
-            seen.add(f"{c['arch']} not {arch}")
+        if not arch or c.get("arch") != arch:
+            seen.add("another or unknown architecture")
             continue
-        return c
-    raise Refused("vs_unusable", f"vs={vs.text} is unusable here: {'; '.join(sorted(seen))}")
+        out.append(c)
+    if not out:
+        raise Refused("vs_unusable", f"vs={vs.text} is unusable here: {'; '.join(sorted(seen))}")
+    return out
 
 
 def _row_issue(row, kind, *, env_id, labels, relax, events, purposes):
@@ -119,6 +125,10 @@ def _row_issue(row, kind, *, env_id, labels, relax, events, purposes):
         return "trust_external"
     if not engine.validity_at_least(row.get("validity"), "valid"):
         return f"validity_{row.get('validity') or 'unknown'}"
+    if kind == "ref" and not row.get("reference"):
+        return "not_a_reference_value"
+    if kind != "ref" and (row.get("reference") or row.get("purpose") == "reference"):
+        return "reference_only_via_ref"
     if kind == "main" and row.get("purpose") not in purposes:
         return "not_a_main_result"
     if row.get("reference"):
@@ -149,7 +159,38 @@ def _other_side(rows, kind, **kw):
 
 
 def _hours(case):
-    return case["est_min"] * (2 if case.get("cache") == "both" else 1) * (case.get("accelerators") or 0) / 60
+    """Device-hours of one case, or None when its estimate is not a usable number."""
+    est, acc = case.get("est_min"), case.get("accelerators")
+    if not isinstance(est, (int, float)) or isinstance(est, bool) or not math.isfinite(est) or est < 0:
+        return None
+    return est * (2 if case.get("cache") == "both" else 1) * (acc if isinstance(acc, (int, float)) else 0) / 60
+
+
+def _evaluate(cases, rows, events, vs, target, leg, relax, purposes):
+    """The per-case verdicts of one target."""
+    by, out = {}, []
+    for r in rows:
+        by.setdefault(r["benchmark_id"], []).append(r)
+    for c in cases:
+        if c["action"] not in ("run", "reuse"):
+            out.append(_case(c, "cannot_compare", f"subject_{c['action']}:{c.get('reason') or ''}"))
+            continue
+        row, why = _other_side(
+            by.get(c.get("benchmark_id"), []),
+            vs.kind,
+            env_id=leg.get("env_id"),
+            labels=c.get("labels") or {},
+            relax=tuple(relax),
+            events=events,
+            purposes=purposes,
+        )
+        if row:
+            out.append(_case(c, "ready", "", other=row, target=target))
+        elif vs.kind in RUNNABLE and why in _FIX:
+            out.append(_case(c, "will_run_other", why, target=target))
+        else:
+            out.append(_case(c, "cannot_compare", why))
+    return out
 
 
 def plan_compare(plan, vs, store, *, product, host_kinds, relax=(), purposes=MAIN_PURPOSES, expect_artifact=""):
@@ -182,15 +223,19 @@ def plan_compare(plan, vs, store, *, product, host_kinds, relax=(), purposes=MAI
         return refuse("no_store", "no result store is configured, so nothing can be compared")
     try:
         cands = store.resolve_vs(vs.kind, vs.value, product, purposes)
-        target = pick_target(vs, cands, product=product, arch=arch, subject_artifact=subject, vs_kinds=host_kinds)
-        if expect_artifact and target["artifact_id"] != expect_artifact:
-            raise Refused(
-                "target_moved",
-                f"vs={vs.text} now resolves to {short(target['artifact_id'])}, not {short(expect_artifact)}",
-            )
+        targets = usable_targets(vs, cands, product=product, arch=arch, subject_artifact=subject, vs_kinds=host_kinds)
+        if expect_artifact and targets[0]["artifact_id"] != expect_artifact:
+            raise Refused("target_moved", "the comparison target changed since the preview")
         ids = sorted({c["benchmark_id"] for c in cases if c.get("benchmark_id")})
-        rows = store.target_results(vs.kind, vs.value, target, ids)
-        events = store.invalidations([r["run_id"] for r in rows])
+        best = None
+        for target in targets if vs.kind == "main" else targets[:1]:
+            rows = store.target_results(vs.kind, vs.value, target, ids)
+            events = store.invalidations([r["run_id"] for r in rows])
+            out = _evaluate(cases, rows, events, vs, target, leg, relax, purposes)
+            best = best or (target, out)
+            if any(k["state"] == "ready" for k in out):
+                best = (target, out)
+                break
     except Refused as r:
         return refuse(r.code, r.message)
     except Exception as e:  # noqa: BLE001 - a store failure must read as "unavailable", never as "nothing to compare"
@@ -200,6 +245,7 @@ def plan_compare(plan, vs, store, *, product, host_kinds, relax=(), purposes=MAI
         doc["refusal"] = {"code": "store_unavailable", "message": "the result store did not answer"}
         doc["cases"] = [_case(c, "cannot_compare", "store_unavailable") for c in cases]
         return _finish(doc, cases)
+    target, doc["cases"] = best
     doc["target"] = {
         "artifact_id": target["artifact_id"],
         "source": target.get("source") or vs.kind,
@@ -208,28 +254,6 @@ def plan_compare(plan, vs, store, *, product, host_kinds, relax=(), purposes=MAI
         "role": "reference_target" if vs.kind == "ref" else "comparison_target",
         "baseline_eligible": False if vs.kind == "ref" else None,
     }
-    by = {}
-    for r in rows:
-        by.setdefault(r["benchmark_id"], []).append(r)
-    for c in cases:
-        if c["action"] not in ("run", "reuse"):
-            doc["cases"].append(_case(c, "cannot_compare", f"subject_{c['action']}:{c.get('reason') or ''}"))
-            continue
-        row, why = _other_side(
-            by.get(c.get("benchmark_id"), []),
-            vs.kind,
-            env_id=leg.get("env_id"),
-            labels=c.get("labels") or {},
-            relax=tuple(relax),
-            events=events,
-            purposes=purposes,
-        )
-        if row:
-            doc["cases"].append(_case(c, "ready", "", other=row, target=target))
-        elif vs.kind in RUNNABLE and why in _FIX:
-            doc["cases"].append(_case(c, "will_run_other", why, target=target))
-        else:
-            doc["cases"].append(_case(c, "cannot_compare", why))
     names = [k["name"] for k in doc["cases"] if k["state"] == "will_run_other"]
     if names:
         doc["other_requests"] = [
@@ -263,7 +287,7 @@ def _case(c, state, why, other=None, target=None):
     if other:
         out["other"] = {
             "artifact_id": (target or {}).get("artifact_id", ""),
-            "run_id": other["run_id"],
+            "run_id": "" if other.get("reference") else other["run_id"],
             "validity": other["validity"],
             "purpose": other.get("purpose") or "",
         }
@@ -275,15 +299,17 @@ def _case(c, state, why, other=None, target=None):
 def _finish(doc, cases):
     by = {c["name"]: c for c in cases}
     count = lambda s: sum(1 for k in doc["cases"] if k["state"] == s)  # noqa: E731
-    sub = sum(_hours(by[k["name"]]) for k in doc["cases"] if k["subject"]["action"] == "run" and k["name"] in by)
-    oth = sum(_hours(by[k["name"]]) for k in doc["cases"] if k["state"] == "will_run_other" and k["name"] in by)
+    sub_h = [_hours(by[k["name"]]) for k in doc["cases"] if k["subject"]["action"] == "run" and k["name"] in by]
+    oth_h = [_hours(by[k["name"]]) for k in doc["cases"] if k["state"] == "will_run_other" and k["name"] in by]
+    known = None not in sub_h + oth_h
+    sub, oth = sum(h or 0.0 for h in sub_h), sum(h or 0.0 for h in oth_h)
     doc["counts"] = {
         "cases": len(doc["cases"]),
         "ready": count("ready"),
         "will_run_other": count("will_run_other"),
         "cannot_compare": count("cannot_compare"),
     }
-    doc["estimate"] = {"subject_device_hours": round(sub, 2), "other_device_hours": round(oth, 2)}
+    doc["estimate"] = {"subject_device_hours": round(sub, 2), "other_device_hours": round(oth, 2), "known": known}
     doc["digest"] = hashlib.sha256(
         json.dumps(
             {k: doc[k] for k in ("vs", "status", "refusal", "target", "cases", "counts")}, sort_keys=True

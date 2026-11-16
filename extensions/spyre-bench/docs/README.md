@@ -737,14 +737,13 @@ Rules, in the order they are applied:
    reference (`reference_only_via_ref`), and `ref:` takes only the version that is `current` (retired, superseded or
    not yet approved ones are refused). A reference is a comparison target and never a baseline
    (`target.baseline_eligible` is `false`).
-3. The target must be of the same product and arch as the subject, and must not be the subject.
+3. The target must be of the same product and arch as the subject (an unknown arch on either side is refused), and must not be the subject. `vs=main` takes the newest such artifact that has a usable stored result for at least one planned case, and falls back to older ones; if none has, the newest is shown with its reasons.
 4. Per case, the newest stored result of that benchmark is the candidate. It must be `valid`, not `external` trust, and
-   not invalidated (`run` or `run_benchmark` scope, unless restored). `vs=main` additionally needs a main purpose.
+   not invalidated (`run` or `run_benchmark` scope, unless restored). `vs=main` additionally needs a main purpose. A reference value (purpose `reference`) is refused by every kind but `ref:`, and `ref:` accepts only reference values. A stored PR-purpose result may be the other side of `tag:`, `build:` and `artifact:` (it is advisory like the subject).
 5. Environment is strict by default: the stored `env_id` must equal the plan's, with the same pinning policy. A
    result from another environment is never used. `main` and `ref:` then say `cannot compare: different_environment`;
    a named artifact is measured here instead, because a result in this environment is what is missing. A plan with
-   no environment id compares nothing (`environment_unknown`). A reference carries no environment id of its own: only
-   its arch is matched, and its comparability caveats apply. `spyre-bench ondemand compare --relax-labels` matches
+   no environment id compares nothing (`environment_unknown`). A reference carries no environment id of its own: its product and arch are matched, and its comparability caveats apply. A reference has no run, so a reference comparison offers no run-to-run compare link. `spyre-bench ondemand compare --relax-labels` matches
    labels instead of the id, and only where the host allows it (`vs_relax`; the internal host). It cannot be asked
    for in a comment.
 6. The other side is measured only when the reason is that nothing usable is stored (`no_stored_result`) or the
@@ -758,7 +757,8 @@ spyre-bench ondemand preview --plan plan.json --request request.json --compare c
 
 `compare` prints a `bench.compare/1` document: the resolved target, the cap, and per case one of `ready` (both sides
 stored), `will_run_other` (the other side will be measured; `other_requests` holds the engine request for those
-cases) or `cannot_compare` with the reason; counts; the device-hours of both sides; and a `digest`. The preview adds
+cases) or `cannot_compare` with the reason; counts; the device-hours of both sides (`estimate.known` is false when a case has
+no usable estimate, and the preview then treats the estimate as unknown); and a `digest`. The preview adds
 the other side's device-hours to the estimate the budget is judged on and shows a compare section (ids only on the
 internal host). Pass `--expect-digest` (and `--expect-artifact`) at run time to refuse a comparison that moved since
 the preview: `vs=main` follows the newest nightly, so the target is pinned by the artifact id the preview showed.
