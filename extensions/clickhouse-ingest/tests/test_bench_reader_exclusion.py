@@ -292,8 +292,9 @@ def populate(c, extras):
                              "classname": "T", "name": "t"}])  # fmt: skip
     c.insert("test_case_runs", [{"run_id": fun, "test_case_id": u("tc"),
                                  "component": "spyre-inference", "status": "passed"}])  # fmt: skip
-    # Cases with no verdict at all: coverage reports them as a missing result.
-    c.insert("test_case_runs", [{"run_id": u("cases-only"), "test_case_id": u("tc"),
+    # Cases with no verdict at all: coverage reports them as a missing result. The explicit ts
+    # keeps the golden's coverage day fixed instead of following the DEFAULT now().
+    c.insert("test_case_runs", [{"run_id": u("cases-only"), "test_case_id": u("tc"), "ts": "2026-11-15 12:00:00",
                                  "component": "spyre-inference", "status": "passed"}])  # fmt: skip
     if extras:
         c.insert("test_case_runs", [{"run_id": u("ref-functional"), "test_case_id": u("tc"),
