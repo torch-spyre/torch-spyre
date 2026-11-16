@@ -73,6 +73,11 @@ class Refused(Exception):
         self.code, self.message = code, message
 
 
+def canon_arch(arch):
+    """The platform spelling the stored side uses (amd64 and x86 fold to x86_64)."""
+    return "x86_64" if str(arch) in ("amd64", "x86", "x86-64") else str(arch or "")
+
+
 def short(artifact_id):
     return str(artifact_id or "")[:8]
 
@@ -107,8 +112,10 @@ def usable_targets(vs, candidates, *, product, arch, subject_artifact, vs_kinds)
             seen.add("another product")
             continue
         if c.get("artifact_id") == subject_artifact:
+            if vs.kind == "main":
+                continue  # the artifact being measured is not a nightly to compare with
             raise Refused("vs_is_subject", "vs names the artifact being measured")
-        if not arch or c.get("arch") != arch:
+        if not arch or canon_arch(c.get("arch")) != canon_arch(arch):
             seen.add("another or unknown architecture")
             continue
         out.append(c)
@@ -222,7 +229,7 @@ def plan_compare(plan, vs, store, *, product, host_kinds, relax=(), purposes=MAI
     if store.name == "none":
         return refuse("no_store", "no result store is configured, so nothing can be compared")
     try:
-        cands = store.resolve_vs(vs.kind, vs.value, product, purposes)
+        cands = store.resolve_vs(vs.kind, vs.value, product, purposes, canon_arch(arch))
         targets = usable_targets(vs, cands, product=product, arch=arch, subject_artifact=subject, vs_kinds=host_kinds)
         if expect_artifact and targets[0]["artifact_id"] != expect_artifact:
             raise Refused("target_moved", "the comparison target changed since the preview")

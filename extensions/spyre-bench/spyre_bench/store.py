@@ -68,7 +68,7 @@ class Store:
         """The subset of run_ids with an active run-scope invalidation; raises StoreError when this store cannot tell."""
         raise StoreError(f"store {self.name!r} cannot report invalidations")
 
-    def resolve_vs(self, kind, value, product, purposes=()):
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
         """Candidate artifacts for a `vs=` target, newest first: artifact_id, component, arch, ts, source, ref_key, ref_state."""
         return []
 
@@ -180,7 +180,7 @@ class MemoryStore(Store):
     def invalidations(self, run_ids):
         return [e for e in self.events if e.get("run_id") in set(run_ids)]
 
-    def resolve_vs(self, kind, value, product, purposes=()):
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
         self._check("resolve_vs")
         want = {"build": "build", "artifact": "artifact_id", "tag": "tags", "ref": "ref_key"}.get(kind)
         out = []
@@ -390,8 +390,8 @@ class ClickHouseStore(Store):
             )
         return out
 
-    def resolve_vs(self, kind, value, product, purposes=()):
-        n = {"n": VS_CANDIDATES}
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
+        n = {"n": VS_CANDIDATES, "arch": arch}
         if kind == "artifact":
             sql = (
                 "SELECT toString(artifact_id) AS artifact_id, component, arch, ts, 'artifact' AS source, '' AS ref_key, "
@@ -409,7 +409,7 @@ class ClickHouseStore(Store):
             sql = (
                 "SELECT toString(a.artifact_id) AS artifact_id, a.component AS component, a.arch AS arch, a.ts AS ts, "
                 "'build' AS source, '' AS ref_key, '' AS ref_state FROM {db}.v_artifacts AS a "
-                "WHERE a.component = {c:String} "
+                "WHERE a.component = {c:String} AND if(a.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', a.arch) = {arch:String} "
                 "AND a.artifact_id IN (SELECT artifact_id FROM {db}.v_artifact_results_published WHERE props['orch_run_key'] = {v:String}) "
                 "ORDER BY a.ts DESC LIMIT {n:UInt32}"
             )
@@ -429,7 +429,8 @@ class ClickHouseStore(Store):
                 "SELECT toString(e.artifact_id) AS artifact_id, any(a.component) AS component, any(a.arch) AS arch, "
                 "max(e.run_ts) AS ts, 'main' AS source, '' AS ref_key, '' AS ref_state "
                 "FROM {db}.v_benchmark_results_enriched AS e INNER JOIN {db}.v_artifacts AS a ON a.artifact_id = e.artifact_id "
-                "WHERE a.component = {c:String} AND e.run_props['run.purpose'] IN {p:Array(String)} "
+                "WHERE a.component = {c:String} AND if(a.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', a.arch) = {arch:String} "
+                "AND e.run_props['run.purpose'] IN {p:Array(String)} "
                 "AND e.run_props['run.validity'] = 'valid' AND e.run_props['run.trust'] != 'external' "
                 "GROUP BY e.artifact_id ORDER BY ts DESC LIMIT {n:UInt32}"
             )
