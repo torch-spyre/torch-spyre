@@ -9,8 +9,9 @@ BENCH_CENTRAL ?=
 BENCH_BASE ?=
 BENCH_BASE_DIR ?=
 BENCH_REQUIRED ?=
+BENCH_OPTIONAL ?=
 BENCH_PURPOSE ?= on-demand
-BENCH_ENVIRONMENT ?= local
+BENCH_ENVIRONMENT ?= one-device
 BENCH_REUSE ?= never
 BENCH_INGEST ?= 0
 BENCH_INVOKER ?= shell
@@ -45,13 +46,15 @@ export BENCH_PURPOSE BENCH_ENVIRONMENT BENCH_SELECTION BENCH_CASES BENCH_TIER BE
 # Install hint: the package lives in torch-spyre#6298 until that PR is merged, then on main.
 _bench_install = uv pip install 'spyre-bench @ git+https://github.com/torch-spyre/torch-spyre@$(BENCH_ENGINE_REF)\#subdirectory=extensions/spyre-bench'
 _bench_central = $(if $(BENCH_CENTRAL),--central '$(BENCH_CENTRAL)')
-# $(call _bench_if,VERB,COMMAND): run COMMAND if the engine has VERB; otherwise print a notice and
-# exit 0, or exit 2 when BENCH_REQUIRED is set to any non-empty value (including 0).
+# Soft mode (BENCH_OPTIONAL non-empty, BENCH_REQUIRED empty) is for callers that must not fail without the engine.
+_bench_soft = $(if $(BENCH_REQUIRED),,$(BENCH_OPTIONAL))
+# $(call _bench_if,VERB,COMMAND): run COMMAND if the engine has VERB; otherwise say how to install it and exit 2,
+# or exit 0 in soft mode.
 _bench_if = if command -v $(firstword $(BENCH)) >/dev/null 2>&1 && $(BENCH) --help 2>&1 | grep -q '^  $(1) '; then \
 		$(2); \
 	else \
-		echo "bench: '$(1)' skipped: '$(BENCH)' is not installed or has no such verb ($(_bench_install))" >&2; \
-		test -z "$(BENCH_REQUIRED)"; \
+		echo "bench: '$(1)' skipped: '$(BENCH)' is not installed or has no such verb. Install spyre-bench: $(_bench_install)" >&2; \
+		test -n "$(_bench_soft)" || { echo "bench: set BENCH_OPTIONAL=1 to skip silently when the engine is absent" >&2; exit 2; }; \
 	fi
 _bench_plan_cmd = $(BENCH) plan --catalog '$(BENCH_DIR)' $(_bench_central) --out '$(BENCH_PLAN_FILE)'
 

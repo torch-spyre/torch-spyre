@@ -62,9 +62,14 @@ def old_engine(tmp_path):
     "target", ["bench-plan", "bench-run", "bench-verdict", "bench-report"]
 )
 def test_an_older_engine_is_noticed_and_tolerated(target, old_engine, tmp_path):
-    out = make(target, f"BENCH={old_engine}", f"BENCH_RESULTS_DIR={tmp_path / 'r'}")
+    base = [target, f"BENCH={old_engine}", f"BENCH_RESULTS_DIR={tmp_path / 'r'}"]
+    out = make(*base, "BENCH_OPTIONAL=1")
     assert out.returncode == 0
     assert "skipped" in out.stderr
+    strict = make(*base)
+    assert strict.returncode == 2
+    assert "Install spyre-bench: uv pip install" in strict.stderr
+    assert make(*base, "BENCH_OPTIONAL=1", "BENCH_REQUIRED=1").returncode == 2
 
 
 @pytest.mark.parametrize("value", ["1", "0", "yes"])
@@ -80,11 +85,15 @@ def test_bench_required_turns_the_notice_into_a_failure(value, old_engine, tmp_p
 
 
 def test_a_missing_engine_is_noticed_and_tolerated(tmp_path):
-    out = make(
-        "bench-validate", "BENCH=no-such-engine-binary", f"BENCH_RESULTS_DIR={tmp_path}"
-    )
+    args = [
+        "bench-validate",
+        "BENCH=no-such-engine-binary",
+        f"BENCH_RESULTS_DIR={tmp_path}",
+    ]
+    out = make(*args, "BENCH_OPTIONAL=1")
     assert out.returncode == 0
     assert "not installed" in out.stderr
+    assert make(*args).returncode == 2
 
 
 def test_the_nightly_smoke_runs_the_whole_flow_without_cards(tmp_path):
@@ -339,3 +348,23 @@ def test_the_banner_reads_the_ingest_step_of_the_active_mode():
         "BENCH_SELECTION" not in mirror["env"]
     )  # a selection would be unioned with BENCH_CASES
     assert 'BENCH_CASES="$(paste' in mirror["run"]
+
+
+def test_a_bare_validate_and_plan_work_with_the_engine_installed(tmp_path):
+    out = make("bench-validate", "bench-plan", f"BENCH_RESULTS_DIR={tmp_path / 'r'}")
+    assert out.returncode == 0, out.stderr
+    assert (tmp_path / "r" / "plan" / "plan.json").is_file()
+
+
+def test_the_default_environment_is_one_the_catalog_defines():
+    text = (ROOT / "benchmarks" / "project.yaml").read_text()
+    assert "kind: Environment\nmetadata:\n  name: one-device" in text
+    assert "BENCH_ENVIRONMENT ?= one-device" in (ROOT / "mk" / "bench.mk").read_text()
+
+
+def test_the_pre_commit_hook_stays_soft_without_the_engine():
+    config = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text())
+    hook = next(
+        h for r in config["repos"] for h in r["hooks"] if h["id"] == "bench-validate"
+    )
+    assert "BENCH_OPTIONAL=1" in hook["entry"]

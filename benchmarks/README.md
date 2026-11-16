@@ -34,8 +34,10 @@ branch; afterwards from `main`:
 uv pip install 'spyre-bench @ git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/spyre-bench'
 ```
 
-When the engine is not installed, or lacks the verb a target needs, the target prints a notice and exits 0. Setting
-`BENCH_REQUIRED` to any non-empty value (including `0`) turns that into exit 2. The request is the `BENCH_*`
+When the engine is not installed, or lacks the verb a target needs, the target prints the install command and exits 2.
+A caller that must not fail without the engine (the `bench-validate` pre-commit hook) sets `BENCH_OPTIONAL=1`, which
+turns that into a notice and exit 0; `BENCH_REQUIRED` (any non-empty value, including `0`) wins over it and keeps exit 2.
+`BENCH_ENVIRONMENT` defaults to `one-device`, the Environment this catalog defines. The request is the `BENCH_*`
 variables, which the engine also reads from the environment: `BENCH_PURPOSE`, `BENCH_ENVIRONMENT`,
 `BENCH_SELECTION`, `BENCH_CASES`, `BENCH_TIER`, `BENCH_SUITES`, `BENCH_SUBJECT`, `BENCH_SUBJECT_ID`, `BENCH_REUSE`,
 `BENCH_SET`, `BENCH_PLAN`, `BENCH_INGEST`, `BENCH_INVOKER`, `BENCH_CLEAN`, `BENCH_MAX_WAIT`, `BENCH_MAX_HOLD`,
