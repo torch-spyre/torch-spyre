@@ -21,7 +21,7 @@ import uuid
 
 import pytest
 import regex as re
-from spyre_clickhouse_ingest import bundle, client as client_mod, offline
+from spyre_clickhouse_ingest import bench_bundle, bundle, client as client_mod, offline
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
 session = pytest.importorskip("chdb.session")
@@ -388,6 +388,39 @@ def test_a_connected_results_run_ingests_a_bench_dir_as_the_channel_says(
     ) == [("ci", "jenkins-comp-bench-s390x")]
     assert cli(common) == 0
     assert "duplicate" in capsys.readouterr().out
+
+
+def test_a_legacy_workflow_name_with_spaces_is_a_series_and_none_is_the_unprefixed_one(
+    tmp_path, db
+):
+    src = run_dir(tmp_path, result())
+    ingest(
+        seal(
+            tmp_path,
+            src,
+            "a.tgz",
+            "--seal-trust",
+            "none",
+            "--workflow",
+            "Perf Suite (nightly)",
+        ),
+        trust="ci",
+    )
+    assert db.rows(
+        "SELECT DISTINCT extract(props['source_file'], '^([^/]+)/') FROM benchmark_runs"
+    ) == [("Perf Suite (nightly)",)]
+    src2 = run_dir(tmp_path, result("other"), name="run2")
+    ingest(seal(tmp_path, src2, "b.tgz", "--seal-trust", "none"), trust="ci")
+    assert db.rows(
+        "SELECT DISTINCT extract(props['source_file'], '^([^/]+)/') FROM benchmark_runs WHERE position(props['source_file'], 'other') > 0"
+    ) == [("",)]
+
+
+@pytest.mark.parametrize("bad", [5, ["a"], "a/b", "a\nb", "x" * 129])
+def test_a_malformed_workflow_is_a_rejection_for_ci_and_ignored_below(bad):
+    with pytest.raises(offline.BundleError, match="workflow"):
+        bench_bundle.series_prefix({"workflow": bad}, "ci")
+    assert bench_bundle.series_prefix({"workflow": bad}, "lab") == ""
 
 
 def test_a_series_name_with_a_slash_is_refused_for_a_ci_channel(tmp_path, db):
