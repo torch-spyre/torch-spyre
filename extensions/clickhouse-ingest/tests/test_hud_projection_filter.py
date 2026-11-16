@@ -19,7 +19,7 @@ import pytest
 import regex as re
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
-MIGRATION = SCHEMA_DIR / "migrations" / "028_hud_mv_skips_bench_rows.sql"
+MIGRATION = SCHEMA_DIR / "migrations" / "029_hud_mv_skips_bench_rows.sql"
 
 
 def _mv(sql: str) -> str:
@@ -93,11 +93,11 @@ def test_only_measured_model_rows_reach_the_hud(
 
 
 def test_the_mv_migrations_can_be_rerun():
-    # Rerunning 023 or 025 reinstalls the MV without the later filter; 028 is the way back.
+    # Rerunning 023 or 025 reinstalls the MV without the later filter; 029 is the way back.
     for n in (
         "023_hud_mv_measured_model_rows.sql",
         "025_hud_mv_skips_reference_rows.sql",
-        "028_hud_mv_skips_bench_rows.sql",
+        "029_hud_mv_skips_bench_rows.sql",
     ):
         assert SchemaApplier.RERUNNABLE.search(
             (SCHEMA_DIR / "migrations" / n).read_text()
