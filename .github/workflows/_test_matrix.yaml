@@ -145,6 +145,16 @@ on:
         type: boolean
         default: false
 
+      bench_mode:
+        description: >-
+          Perf job only: off (default, nothing changes) | side-by-side (also feed the same report.xml through the
+          benchmarks/ catalog and ingest it under bench-<workflow> with the engine's run id) | replace (skip the
+          legacy ingest and store the catalog's rows under the legacy workflow name and run id; fails on a report
+          row no case declares). v2 only.
+        required: false
+        type: string
+        default: off
+
       # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
       # override the pinned pytorch-cpu wheel with the exact PyTorch build
       # torch-spyre's _C.so is compiled against. Empty (default) = every
@@ -850,7 +860,11 @@ jobs:
           # and .github alone yields the script without it.
           sparse-checkout: |
             .github
+            Makefile
+            mk
+            benchmarks
             extensions/clickhouse-ingest
+            extensions/spyre-bench
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
@@ -931,7 +945,7 @@ jobs:
       # --trigger-type perf + 0 parsed records fails the ingest step.
       - name: Ingest perf report into ClickHouse (inline, no artifact)
         id: ingest
-        if: ${{ env.CLICKHOUSE_HOST != '' }}
+        if: ${{ env.CLICKHOUSE_HOST != '' && inputs.bench_mode != 'replace' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
           xml-dir: ${{ env.RESULTS_DIR }}
@@ -964,6 +978,79 @@ jobs:
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
           schema: both
 
+      # bench_mode != off: the report just produced, split into the benchmarks/ catalog's cases (no second suite run).
+      - name: Install uv (bench mirror)
+        if: ${{ inputs.bench_mode != 'off' }}
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Mirror the perf report through the bench catalog
+        id: bench-mirror
+        if: ${{ !cancelled() && inputs.bench_mode != 'off' && steps.confirm-report.outcome == 'success' }}
+        continue-on-error: ${{ inputs.bench_mode != 'replace' }}
+        env:
+          BENCH_MODE: ${{ inputs.bench_mode }}
+          RUN_ID_IN: ${{ inputs.run_id }}
+          ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+          BENCH_PURPOSE: on-demand
+          BENCH_ENVIRONMENT: one-device
+          BENCH_SELECTION: perf-core
+          BENCH_REUSE: never
+          BENCH_INVOKER: gha
+          BENCH_QUIET: '1'
+          BENCH_INGEST: '0'
+          BENCH_REQUIRED: '1'
+          BENCH_SUITE_FROM: ${{ env.RESULTS_DIR }}
+          BENCH_PASS_ENV: BENCH_SUITE_FROM
+        run: |
+          set -eu
+          uv venv --clear .bench-venv
+          uv pip install --python .bench-venv/bin/python ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          make bench-validate bench-check-ids
+          strict=""
+          if [ "${BENCH_MODE}" = "replace" ]; then strict="--strict"; fi
+          python3 benchmarks/tools/check_report_coverage.py "${RESULTS_DIR}" ${strict}
+          make bench-run BENCH_RESULTS_DIR="${GITHUB_WORKSPACE}/bench-results"
+          out=$(python3 benchmarks/tools/collect_ingest_xml.py "${GITHUB_WORKSPACE}/bench-results" \
+            "${GITHUB_WORKSPACE}/bench-results/ingest-xml" --github-output)
+          # replace keeps the legacy run identity (the orchestrator's uuid, else the ingest derives its own);
+          # side-by-side is its own run, so the two never share a (run_id, benchmark_id).
+          if [ "${BENCH_MODE}" = "replace" ]; then
+            echo "ingest_run_id=${RUN_ID_IN}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ingest_run_id=$(printf '%s\n' "${out}" | sed -n 's/^run_id=//p')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ingest the mirrored rows into ClickHouse (inline, no artifact)
+        id: bench-ingest
+        if: ${{ !cancelled() && env.CLICKHOUSE_HOST != '' && steps.bench-mirror.outcome == 'success' }}
+        continue-on-error: ${{ inputs.bench_mode != 'replace' }}
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          xml-dir: ${{ github.workspace }}/bench-results/ingest-xml
+          workflow: ${{ inputs.bench_mode == 'replace' && github.workflow || format('bench-{0}', github.workflow) }}
+          branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
+          sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
+          run-id: ${{ steps.bench-mirror.outputs.ingest_run_id }}
+          triggered-at: ''
+          pr-number: ''
+          trigger-type: perf
+          platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
+          torch-spyre-dir: ${{ github.workspace }}
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          schema: v2
+
       # Four honesty lines. Echo only — never upload report.xml (public
       # artifacts would leak benchmark numbers).
       - name: Perf ingest banners
@@ -972,6 +1059,9 @@ jobs:
           EXEC_OUTCOME: ${{ steps.run-perf.outcome }}
           REPORT_OUTCOME: ${{ steps.confirm-report.outcome }}
           INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+          BENCH_MODE: ${{ inputs.bench_mode }}
+          BENCH_MIRROR_OUTCOME: ${{ steps.bench-mirror.outcome }}
+          BENCH_INGEST_OUTCOME: ${{ steps.bench-ingest.outcome }}
         run: |
           if [ "${EXEC_OUTCOME}" = "success" ]; then
             EXEC=PASS
@@ -1003,6 +1093,7 @@ jobs:
           echo "report validation: ${VALIDATION}"
           echo "ClickHouse ingest: ${INGEST}"
           echo "reason: ${REASON}"
+          echo "bench mode: ${BENCH_MODE:-off}; mirror: ${BENCH_MIRROR_OUTCOME:-n/a}; bench ingest: ${BENCH_INGEST_OUTCOME:-n/a}"
 
   # v1 model-ops: delete once the dashboard reads v2 capabilities
   # ---------------------------------------------------------------------------
