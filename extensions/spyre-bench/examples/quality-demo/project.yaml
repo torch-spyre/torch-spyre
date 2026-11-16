@@ -26,7 +26,7 @@ spec:
   version: "1"
   license: MIT
   visibility: public
-  source: {uri: "hf://datasets/example-org/demo-questions", revision: 740312add88f781978c0658806c59bfa2a2e4a1e}
+  source: {uri: "hf://datasets/example-org/demo-questions", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
   integrity: {files: [{path: test.jsonl, sha256: 4f3a1c0de2b64a5f8c7e91d0b2a36f5e4d8c7b6a5f4e3d2c1b0a99887766554a}]}
 ---
 apiVersion: bench/v1alpha1
