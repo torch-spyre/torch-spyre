@@ -1723,6 +1723,116 @@
    },
    "flags": {
     "bench": "sanity",
+    "bench-vs": "build:[click](http://e.co)#1"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "vs='build: click (http:\u200b//e.co)#1': main, nightly or build: job # n"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-sha": "https://evil.example/x"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "error": "sha='https:\u200b//evil.example/x': 7 to 40 lower-case hex characters of the head commit"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "www.evil.com"
+   },
+   "host": "github.com"
+  },
+  "out": {
+   "request": {
+    "asked": {
+     "bench": "www.evil.com"
+    },
+    "budget": 0.0,
+    "clean": false,
+    "env": "",
+    "force": [],
+    "max_wait_s": 0,
+    "profile": "off",
+    "purpose": "pr",
+    "reuse": "if_valid",
+    "selections": [
+     {
+      "as_asked": "www.evil.com",
+      "product": "spyre-inference",
+      "selection": {
+       "cases": [
+        "www.evil.com"
+       ]
+      }
+     }
+    ],
+    "sha": "",
+    "vs": "nightly"
+   },
+   "violations": []
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-reuse": "![i](http://e/p.png)"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "reuse='  i (http:\u200b//e/p.png)': one of if_valid, never, prefer, only"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
+    "bench-budget": "1\u202e2"
+   },
+   "host": "ghe"
+  },
+  "out": {
+   "error": "budget='1 u202e2': a number of device-hours"
+  }
+ },
+ {
+  "in": {
+   "actor": {
+    "association": "COLLABORATOR",
+    "login": "dev1",
+    "permission": "write"
+   },
+   "flags": {
+    "bench": "sanity",
     "bench-budjet": "3"
    },
    "host": "ghe"

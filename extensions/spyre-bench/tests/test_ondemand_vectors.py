@@ -82,6 +82,11 @@ CASES = [
     ({"bench": "sanity", "sha": "abcdef1"}, "github.com", WRITER),
     ({"bench": "sanity", "sha": "ABC"}, "github.com", WRITER),
     ({"bench": "@org/team"}, "ghe", WRITER),
+    ({"bench": "sanity", "bench-vs": "build:[click](http://e.co)#1"}, "github.com", WRITER),
+    ({"bench": "sanity", "bench-sha": "https://evil.example/x"}, "github.com", WRITER),
+    ({"bench": "www.evil.com"}, "github.com", WRITER),
+    ({"bench": "sanity", "bench-reuse": "![i](http://e/p.png)"}, "ghe", WRITER),
+    ({"bench": "sanity", "bench-budget": "1\u202e2"}, "ghe", WRITER),
     ({"bench": "sanity", "bench-budjet": "3"}, "ghe", WRITER),
 ]
 
