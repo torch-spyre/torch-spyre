@@ -1757,9 +1757,9 @@ def _create_sdsc_tensors(
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
                 # A QFP8WT block axis (neither K nor the stick) that the op
                 # visits one block of: the block's start address is already in
-                # offsets[dim]; the backend lays 2D-stick blocks out with the
-                # stick dim outermost, so a gap here would stretch the stride
-                # between the stick's 64-column groups.
+                # offsets[dim].  In a 2D-stick layout the stick dim's 64-column
+                # groups are the outermost axis, so a gap here would stretch
+                # the stride between those groups.
                 _qfp8wt_single_block = (
                     qfp8wt_k_sym is not None
                     and dim != qfp8wt_k_sym
