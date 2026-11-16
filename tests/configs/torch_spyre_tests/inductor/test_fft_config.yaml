@@ -9,4 +9,7 @@ test_suite_config:
             - TestFFT::test_dft_inverse
             - TestFFT::test_fft_matches_reference
             - TestFFT::test_ifft_roundtrip
+            - TestFFT::test_fft2_matches_reference
+            - TestFFT::test_fftn_matches_reference
+            - TestFFT::test_ifftn_roundtrip
           mode: mandatory_success

@@ -14,17 +14,21 @@
 
 """Public ops for torch_spyre.
 
-``fft`` / ``ifft`` compute the discrete Fourier transform on Spyre. The device
-cannot hold complex tensors, so the complex<->real conversion and the
+``fft`` / ``ifft`` (1-D) and ``fft2`` / ``ifft2`` / ``fftn`` / ``ifftn`` (N-D)
+compute the discrete Fourier transform on Spyre; the N-D transforms are
+separable and reuse the 1-D transform along each axis. The device cannot hold
+complex tensors, so the complex<->real conversion and the
 (bitwidth-changing) fp16<->fp32 cast are done here on the host; only the real
 interleaved matmul runs on the device, via the ``spyre::dft`` custom op whose
 decomposition lowers it to ``matmul_fp16_fwd`` (see
 ``torch_spyre/_inductor/{customops,decompositions}.py``).
 """
 
+from typing import Optional, Sequence
+
 import torch
 
-__all__ = ["fft", "ifft"]
+__all__ = ["fft", "ifft", "fft2", "ifft2", "fftn", "ifftn"]
 
 # Compiled ``spyre::dft`` wrapper, one per device.
 _COMPILED: dict = {}
@@ -74,3 +78,54 @@ def fft(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
 def ifft(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
     """Inverse one-dimensional DFT along the last axis (includes 1/n)."""
     return _run_1d(x, inverse=True, device=device)
+
+
+def _run_nd(
+    x: torch.Tensor,
+    dim: Optional[Sequence[int]],
+    inverse: bool,
+    device: str,
+) -> torch.Tensor:
+    # An N-D DFT is separable: transform each axis in turn. Each axis is moved
+    # to the last position, run through the 1-D transform, and moved back. The
+    # movedim and complex handling stay on the host; only the matmuls hit the
+    # device.
+    if not torch.is_complex(x):
+        x = x.to(torch.complex64)
+    dims = tuple(range(x.ndim)) if dim is None else tuple(dim)
+    y = x
+    for d in dims:
+        y = torch.movedim(y, d, -1)
+        y = _run_1d(y, inverse, device)
+        y = torch.movedim(y, -1, d)
+    return y
+
+
+def fftn(
+    x: torch.Tensor,
+    dim: Optional[Sequence[int]] = None,
+    *,
+    device: str = "spyre",
+) -> torch.Tensor:
+    """N-dimensional DFT over ``dim`` (all axes if ``dim`` is None)."""
+    return _run_nd(x, dim, inverse=False, device=device)
+
+
+def ifftn(
+    x: torch.Tensor,
+    dim: Optional[Sequence[int]] = None,
+    *,
+    device: str = "spyre",
+) -> torch.Tensor:
+    """Inverse N-dimensional DFT over ``dim`` (all axes if ``dim`` is None)."""
+    return _run_nd(x, dim, inverse=True, device=device)
+
+
+def fft2(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
+    """Two-dimensional DFT over the last two axes."""
+    return _run_nd(x, (-2, -1), inverse=False, device=device)
+
+
+def ifft2(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
+    """Inverse two-dimensional DFT over the last two axes."""
+    return _run_nd(x, (-2, -1), inverse=True, device=device)

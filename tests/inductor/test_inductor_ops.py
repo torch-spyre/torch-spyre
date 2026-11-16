@@ -31,7 +31,10 @@ from torch._inductor.virtualized import V
 
 from torch._inductor.exc import InductorError
 from torch_spyre.ops import fft as spyre_fft
+from torch_spyre.ops import fft2 as spyre_fft2
+from torch_spyre.ops import fftn as spyre_fftn
 from torch_spyre.ops import ifft as spyre_ifft
+from torch_spyre.ops import ifftn as spyre_ifftn
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -15167,6 +15170,24 @@ class TestFFT(unittest.TestCase):
     def test_ifft_roundtrip(self):
         x = torch.randn(2, 128, dtype=torch.complex64)
         err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft2_matches_reference(self):
+        # N-D DFT is separable: fft along each of the last two axes.
+        x = torch.randn(32, 48, dtype=torch.complex64)
+        ref = torch.fft.fft2(x)
+        err = (spyre_fft2(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fftn_matches_reference(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        ref = torch.fft.fftn(x)
+        err = (spyre_fftn(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifftn_roundtrip(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        err = (spyre_ifftn(spyre_fftn(x)) - x).abs().max().item()
         self.assertLessEqual(err, 2e-2 * x.abs().max().item())
 
 
