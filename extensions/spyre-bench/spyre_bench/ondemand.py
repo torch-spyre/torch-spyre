@@ -448,6 +448,37 @@ def parse_command(text, command=None):
     return None
 
 
+def _bench_family(key):
+    k = key.lower().replace("_", "-")
+    k = k[len("bench-") :] if k.startswith("bench-") else k
+    return k in _KEYS or k == "test-type"
+
+
+def to_spyre_test(cmd):
+    """The internal `/spyre-test` line a /spyre-bench command stands for (the comment bot does the rewrite; kept here so the
+    two stay equal by the shared rewrite vectors). Perf defaults to the existing forced perf-only preset on amd64, ppc64le
+    and s390x unless the commenter chose a preset; there is no quality-only preset, so quality keeps the default preset."""
+    out = ["/spyre-test"]
+    out += [f"{k}={v}" for k, v in cmd.flags.items() if k.lower() in ("arch", "archs")]
+    ttype = "perf"
+    for key, value in cmd.flags.items():
+        k = key.lower().replace("_", "-")
+        if k in ("arch", "archs"):
+            continue
+        if k in ("type", "test-type", "bench-type"):
+            ttype = value
+        elif k == "bench":
+            out.append(f"bench={value}")
+        elif _bench_family(key):
+            out.append(f"bench-{k[len('bench-') :] if k.startswith('bench-') else k}={value}")
+        else:
+            out.append(f"{key}={value}" if value != "" else key)
+    if ttype == "perf" and not any(k.lower() == "preset" for k in cmd.flags):
+        out.insert(1 + sum(1 for k in cmd.flags if k.lower() in ("arch", "archs")), "preset=perf-only")
+    out.append(f"TEST_TYPE={ttype}")
+    return " ".join(out)
+
+
 def check_policy(req, policy, actor=None):
     """Host and actor gates on a parsed request. Returns a list of violation messages (empty = allowed)."""
     bad = []

@@ -644,8 +644,11 @@ spyre-bench ondemand preview   --plan plan.json --request request.json --format 
 ### Command, switches and modes
 
 The command is `/spyre-bench` on both hosts (`/bench` is accepted as a deprecated spelling on github.com). On the internal
-host it is an alias that the comment bot rewrites to `/spyre-test` with `TEST_TYPE=perf` (`type=quality` gives
-`TEST_TYPE=quality`), so there is one execution path; `/spyre-test TEST_TYPE=perf` also works directly. Triggerers are
+host it is an alias that the comment bot rewrites to `/spyre-test preset=perf-only TEST_TYPE=perf <everything else as written>`, so
+there is one execution path and a perf request is the existing forced perf-only run (the comment-bot to Jenkins route
+covers amd64, ppc64le and s390x, following `arch=`; only the github.com workflow route is x86). An explicit `preset=` wins.
+`type=quality` gives `TEST_TYPE=quality` with no preset: there is no quality-only preset yet (a gap), so the default preset
+and the implied `<product>:quality` tests apply. `/spyre-test TEST_TYPE=perf` also works directly. Triggerers are
 those of `/spyre-test`; no separate allow-list.
 
 Two switches sit at the top of `spyre_bench/ondemand_policy.json` and ship off:
