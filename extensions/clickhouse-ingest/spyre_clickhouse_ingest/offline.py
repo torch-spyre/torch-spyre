@@ -63,7 +63,11 @@ KINDS = {
     "sendnn": ".txt",
     "benchmarks": ".json",
     "tables": ".json",
+    "bench-reference": ".json",
 }
+# bundle kind -> result_uploads.format, where they differ; formats with no bundle kind yet are reserved.
+UPLOAD_FORMAT = {"bench-reference": "reference"}
+RESERVED_UPLOAD_FORMATS = ("bench",)
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
 # A benchmarks bundle's tiers: perf numbers, or accuracy evals.
@@ -220,7 +224,10 @@ def results_root(meta: dict, root: str = "") -> str:
 
 
 def upload_path(meta: dict, digest: str, inbox: str = "inbox", root: str = "") -> str:
-    """Its inbox folder under the generic repo; a .tgz goes at this path + .tgz."""
+    """Its inbox folder under the generic repo; a .tgz goes at this path + .tgz. A reference goes to
+    `references/`, which the relay does not read: it is held for approval, never ingested on arrival."""
+    if meta.get("kind") == "bench-reference":
+        return f"{results_root(meta, root)}/references/{bundle_name(meta, digest)}"
     key = meta.get("artifact_id") or min(inbox_keys(meta), default="<artifact_id>")
     return f"{results_root(meta, root)}/{inbox}/{key}/{bundle_name(meta, digest)}"
 
@@ -452,6 +459,48 @@ def check_sendnn(root: Path, meta: dict, results: list) -> None:
             )
 
 
+def check_reference(root: Path, meta: dict, results: list) -> None:
+    """results/reference.json alone, valid; arch (noarch, or multi) and test_type come from it."""
+    try:
+        from . import reference
+    except ImportError:
+        raise BundleError(
+            "a bench-reference bundle is checked by the package, not by offline.py copied alone"
+        ) from None
+
+    if results != [f"results/{reference.FILE}"]:
+        raise BundleError(
+            f"a bench-reference bundle holds results/{reference.FILE} only: {results}"
+        )
+    try:
+        doc = reference.load(root / results[0])
+    except (
+        ValueError,
+        RecursionError,
+    ) as err:  # JSON syntax, bad encoding, a huge integer or a deep nest
+        raise BundleError(
+            f"{reference.FILE} is not usable JSON: {err!r}"[:300]
+        ) from None
+    try:
+        errors = reference.validate(doc, root)
+    except Exception as err:  # noqa: BLE001 -- validate is total; this is the last resort, never a traceback
+        raise BundleError(f"{reference.FILE} is malformed: {err!r}") from None
+    if errors:
+        raise BundleError("; ".join(errors))
+    meta["component"] = meta.get("component") or reference.COMPONENT
+    if meta["component"] != reference.COMPONENT:
+        raise BundleError(
+            f"a bench-reference bundle is component {reference.COMPONENT}"
+        )
+    if meta["test_type"] not in ("", doc["class"]):
+        raise BundleError(
+            f"test_type {meta['test_type']!r} differs from the reference's class {doc['class']!r}"
+        )
+    if meta.get("arch", reference.arch_of(doc)) != reference.arch_of(doc):
+        raise BundleError(f"arch must be {reference.arch_of(doc)} for these values")
+    meta["test_type"], meta["arch"] = doc["class"], reference.arch_of(doc)
+
+
 def check(root: Path) -> dict:
     """Validate the bundle at `root` offline; returns bundle.json with test_type filled in."""
     path = root / BUNDLE_FILE
@@ -472,8 +521,15 @@ def check(root: Path) -> dict:
     if errors:
         raise BundleError("; ".join(errors))
     meta = normalized(meta)
-    if not specs(meta):
+    reference = meta.get("kind") == "bench-reference"
+    if reference and (specs(meta) or meta.get("create_artifact")):
+        raise BundleError(
+            "a bench-reference bundle names no artifact: it creates its own"
+        )
+    if not reference and not specs(meta):
         raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
+    if not reference and meta.get("arch") in ("noarch", "multi"):
+        raise BundleError("arch noarch and multi are for bench-reference bundles")
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
     if meta.get("create_artifact") and not (meta.get("image") and meta.get("arch")):
@@ -482,7 +538,7 @@ def check(root: Path) -> dict:
         )
     kind = meta.get("kind", "junit")
     meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
-    if not meta["test_type"]:
+    if not meta["test_type"] and not reference:
         errors.append("test_type is required (the tier: unit, regression, fvt, ...)")
     if kind == "vllm" and (meta["test_type"], meta.get("component", VLLM_COMPONENT)) != (
         "perf", VLLM_COMPONENT,
@@ -539,6 +595,8 @@ def check(root: Path) -> dict:
         check_benchmarks(root, meta, results)
     elif kind == "tables":
         check_tables(root, meta, results)
+    elif kind == "bench-reference":
+        check_reference(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -627,7 +685,15 @@ def write(args) -> Path:
         kind = "benchmarks"
     if getattr(args, "tables_dir", ""):
         kind = "tables"
-    if kind == "tables":
+    if getattr(args, "reference_dir", ""):
+        kind = "bench-reference"
+    if kind == "bench-reference":
+        if not args.reference_dir:
+            raise BundleError("--kind bench-reference needs --reference-dir")
+        src = Path(args.reference_dir)
+        results = [src / "reference.json"]
+        extra = sorted(p for p in (src / "attachments").glob("*") if p.is_file())
+    elif kind == "tables":
         if not args.tables_dir:
             raise BundleError("--kind tables needs --tables-dir")
         results, extra = sorted(Path(args.tables_dir).glob("*.json")), []
@@ -660,6 +726,8 @@ def write(args) -> Path:
     }
     meta = {"schema_version": SCHEMA_VERSION, **({"kind": kind} if kind != "junit" else {}),
             **normalized(named), "arch": _arch(args.arch)}  # fmt: skip
+    if kind == "bench-reference":
+        meta.pop("arch")  # derived from the values (noarch, or multi)
     for key, value in (
         ("component", args.component), ("test_type", args.trigger_type),
         ("run_key", args.jenkins_run_key), ("run_url", args.run_url), ("workflow", args.workflow),
@@ -803,6 +871,10 @@ def upload(path: Path, args) -> str:
     results = setting(args.root, "--root", ENV_ROOT)
     with opened(path) as root:
         meta, dig = check(root), digest(root)
+        if args.wait and meta.get("kind") == "bench-reference":
+            raise BundleError(
+                "--wait does not apply to a bench-reference bundle: it is held for approval, not relayed"
+            )
         dest = upload_path(meta, dig, args.inbox, results)
         if args.as_folder:
             # bundle.json last: the relay takes a folder only once it is there.
@@ -913,6 +985,11 @@ def add_offline_options(parser) -> None:
         "--tables-dir",
         default="",
         help='--kind tables: <table>.json files of {"rows": [...]} (implies --kind tables)',
+    )
+    g.add_argument(
+        "--reference-dir",
+        default="",
+        help="--kind bench-reference: a folder with reference.json and attachments/ (implies --kind bench-reference)",
     )
     g.add_argument("--perf", action="append", type=_pair, default=[],
                    help="vllm run context k=v: model, tensor_parallel, input_len, output_len, cards, "

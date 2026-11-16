@@ -37,7 +37,8 @@ entirely separate mechanism worth understanding on its own terms.
 5. **[Upload formats, table by table](table-formats.md)** — which file format feeds which table,
    with a copy-paste example for each, the one-JSON-file-per-table (`kind: tables`) format, what
    is identity, and the generated JSON Schemas in [`schemas/`](schemas).
-6. **[Sandboxes and the sandbox MCP server](sandbox.md)** — personal
+6. **[Reference bundles](references.md)** — the `bench-reference` kind: comparison targets on the existing tables, the file format, the approval rules and the lifecycle.
+7. **[Sandboxes and the sandbox MCP server](sandbox.md)** — personal
    `spyre_v2` copies on the dev server, seeded from prod: how to sign up,
    connect an MCP client, change schema safely, and prove a branch with
    `verify_schema` before its PR.
