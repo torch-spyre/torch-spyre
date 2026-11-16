@@ -49,8 +49,8 @@ inputs:
     description: >
       Trust this channel records for bench-dir: ci | lab | external. Empty records external. Only a
       workflow that runs on trusted code with its own ClickHouse secrets may pass ci; the action
-      refuses ci on pull_request, pull_request_target and workflow_run events (a comment-triggered
-      on-demand run passes lab). Setting it without bench-dir is an error.
+      accepts ci only on push, schedule and workflow_dispatch events (a PR- or comment-triggered
+      run passes lab); it cannot tell which code produced the results. Setting it without bench-dir is an error.
     required: false
     default: ''
   perf:
@@ -250,8 +250,9 @@ runs:
         fi
         if [ "${TRUST_G}" = ci ]; then
           case "${GITHUB_EVENT_NAME}" in
-            pull_request|pull_request_target|workflow_run)
-              echo "::error::channel-trust ci is refused for ${GITHUB_EVENT_NAME} events: the results come from code a PR author controls."
+            push|schedule|workflow_dispatch) ;;
+            *)
+              echo "::error::channel-trust ci is accepted only on push, schedule and workflow_dispatch events, not ${GITHUB_EVENT_NAME}: the results may come from code a PR author controls."
               exit 1 ;;
           esac
         fi
