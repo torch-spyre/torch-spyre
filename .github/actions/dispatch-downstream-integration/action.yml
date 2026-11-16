@@ -1,0 +1,163 @@
+name: Dispatch downstream integration tests
+description: >-
+  Dispatches a sibling repo's integration-tests.yaml on its default branch, testing the given
+  torch-spyre ref, and waits for that exact run; fails unless it succeeds.
+
+inputs:
+  repository:
+    description: owner/repo whose integration-tests.yaml is dispatched
+    required: true
+  token:
+    description: Token with actions:write on that repo
+    required: true
+  torch_spyre_ref:
+    description: torch-spyre commit the downstream suite must pin and test
+    required: true
+  hash_source:
+    description: String hashed into pr_url_hash, which keys the downstream concurrency group
+    required: true
+  pr_number:
+    description: torch-spyre PR whose body may carry a Test-With companion for this repo (optional)
+    required: false
+    default: ''
+  merge_group_ref:
+    description: Merge-queue head_ref (gh-readonly-queue/<base>/pr-<n>-<sha>); used when pr_number is empty
+    required: false
+    default: ''
+  read_token:
+    description: Token that can read torch-spyre PRs
+    required: false
+    default: ${{ github.token }}
+  extra_inputs:
+    description: JSON object of extra dispatch inputs for this repo (for example {"image_rpms":"true"})
+    required: false
+    default: '{}'
+  timeout_minutes:
+    description: How long to wait for the downstream run
+    required: false
+    default: '240'
+
+outputs:
+  run_id:
+    description: ID of the downstream run
+    value: ${{ steps.run.outputs.run_id }}
+  run_url:
+    description: URL of the downstream run
+    value: ${{ steps.run.outputs.run_url }}
+  conclusion:
+    description: Conclusion of the downstream run (empty if it did not finish)
+    value: ${{ steps.run.outputs.conclusion }}
+
+runs:
+  using: composite
+  steps:
+    - id: test-with
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.read_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        MERGE_GROUP_REF: ${{ inputs.merge_group_ref }}
+        COMPANION_REPO: ${{ inputs.repository }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [ -z "$PR_NUMBER" ]; then
+          case "$MERGE_GROUP_REF" in
+            */pr-*-*) PR_NUMBER="${MERGE_GROUP_REF##*/pr-}"; PR_NUMBER="${PR_NUMBER%%-*}" ;;
+          esac
+        fi
+        if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "ref=" >> "$GITHUB_OUTPUT"; echo "repository=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        export PR_BODY COMPANION="${COMPANION_REPO##*/}"
+        PR_BODY=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""')
+        bash "${ACTION_PATH}/resolve_test_with.sh" >> "$GITHUB_OUTPUT"
+        grep -E '^(ref|repository)=.' "$GITHUB_OUTPUT" | sed 's/^/Test-With -> /' || true
+    - id: run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repository }}
+        TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        COMPANION_REF: ${{ steps.test-with.outputs.ref }}
+        COMPANION_REPOSITORY: ${{ steps.test-with.outputs.repository }}
+        HASH_SOURCE: ${{ inputs.hash_source }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        EXTRA_INPUTS: ${{ inputs.extra_inputs }}
+      run: |
+        set -euo pipefail
+        hash=$(printf '%s' "$HASH_SOURCE" | sha256sum | cut -c1-16)
+        ref=$(gh api "repos/${REPO}" --jq .default_branch)
+        # Pin the sibling's own code to one commit, so every job of the run tests the same sources.
+        sibling_sha=$(gh api "repos/${REPO}/commits/${ref}" --jq .sha)
+        body=$(jq -n --arg ref "$ref" --arg sha "$TORCH_SPYRE_REF" --arg hash "$hash" \
+          --arg cref "$COMPANION_REF" --arg crepo "$COMPANION_REPOSITORY" --arg ssha "$sibling_sha" \
+          --argjson extra "$EXTRA_INPUTS" \
+          '{ref: $ref, return_run_details: true,
+            inputs: ({triggering_repo: "torch-spyre", triggering_sha: $sha, torch_spyre_ref: $sha, pr_url_hash: $hash}
+              + (if $cref != "" then {ref: $cref, repository: $crepo} else {ref: $ssha} end)
+              + $extra)}')
+        resp=$(gh api -X POST "repos/${REPO}/actions/workflows/integration-tests.yaml/dispatches" --input - <<<"$body")
+        run_id=$(jq -er .workflow_run_id <<<"$resp")
+        # A cancelled or failed waiter must not leave the sibling run consuming Spyre runners.
+        completed=0
+        trap '[ "$completed" = 1 ] || gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null 2>&1 || true' EXIT
+        trap 'exit 1' INT TERM
+        url=$(jq -er .html_url <<<"$resp")
+        { echo "run_id=${run_id}"; echo "run_url=${url}"; echo "sibling_ref=${COMPANION_REF:-$sibling_sha}"; } >> "$GITHUB_OUTPUT"
+        echo "dispatched ${url}"
+
+        deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
+        failures=0
+        while :; do
+          if ! out=$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq '[.status, (.conclusion // "none")] | @tsv'); then
+            failures=$((failures + 1))
+            if [ "$failures" -ge 10 ]; then
+              echo "::error::could not read ${url} after ${failures} attempts"
+              exit 1
+            fi
+            sleep 60 & wait $!
+            continue
+          fi
+          failures=0
+          IFS=$'\t' read -r status conclusion <<<"$out"
+          if [ "$status" = completed ]; then
+            completed=1
+            break
+          fi
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::timed out waiting for ${url}"
+            exit 1
+          fi
+          sleep 60 & wait $!
+        done
+        echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+        if [ "$conclusion" != success ]; then
+          echo "::error::${REPO} integration tests concluded '${conclusion}': ${url}"
+          exit 1
+        fi
+        echo "${REPO} integration tests passed: ${url}"
+    - name: Summarize
+      if: always()
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        RUN_URL: ${{ steps.run.outputs.run_url }}
+        SIBLING_REF: ${{ steps.run.outputs.sibling_ref }}
+        COMPANION_REPOSITORY: ${{ steps.test-with.outputs.repository }}
+        CONCLUSION: ${{ steps.run.outputs.conclusion }}
+        OUTCOME: ${{ steps.run.outcome }}
+      run: |
+        {
+          echo "### Downstream integration: ${REPO}"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Downstream run | ${RUN_URL:-(not dispatched)} |"
+          echo "| Result | ${CONCLUSION:-${OUTCOME}} |"
+          echo "| torch-spyre under test | \`${TORCH_SPYRE_REF}\` |"
+          echo "| ${REPO##*/} commit | \`${SIBLING_REF:-(unknown)}\`${COMPANION_REPOSITORY:+ from Test-With companion \`${COMPANION_REPOSITORY}\`} |"
+          echo "| Suite | integration |"
+        } >> "$GITHUB_STEP_SUMMARY"
