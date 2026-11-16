@@ -90,6 +90,10 @@ class Store:
         """The current anchor values of one scope (carried into a new anchor version for series not re-accepted)."""
         return []
 
+    def case_rows(self, benchmark_ids):
+        """Registered cases by id: dicts benchmark_key, component, name, tags, props (what a request's case block is rebuilt from)."""
+        return []
+
     def series_window(self, row, n):
         """The series' newest `n` baseline-eligible runs up to and including `row`'s run: dicts run_key, run_ts, samples."""
         raise StoreError(f"store {self.name!r} holds no runs")
@@ -115,7 +119,9 @@ class MemoryStore(Store):
         series=None,
         anchors=None,
         windows=None,
+        cases=None,
     ):
+        self.cases = cases if cases is not None else []
         self.windows = windows if windows is not None else []
         self.anchored = anchored
         self.series = series if series is not None else {}
@@ -165,6 +171,10 @@ class MemoryStore(Store):
             if w["series"] == (row["benchmark_key"], row["metric"], row["backend"], row["source_job"])
         ]
         return sorted(got, key=lambda w: w["run_ts"])[-n:]
+
+    def case_rows(self, benchmark_ids):
+        self._check("case_rows")
+        return [c for c in self.cases if c["benchmark_key"] in set(benchmark_ids)]
 
     def anchor_rows(self, component, arch, backend, source_job):
         self._check("anchor_rows")
@@ -386,6 +396,17 @@ class ClickHouseStore(Store):
             "AND backend = {b:String} AND source_job = {j:String} ORDER BY benchmark_key, metric",
             {"c": component, "a": arch, "b": backend, "j": source_job},
         )
+
+    def case_rows(self, benchmark_ids):
+        ids = sorted({i for i in (_uuid_or_none(b) for b in benchmark_ids) if i})
+        out = []
+        for start in range(0, len(ids), ID_BATCH):
+            out += self._rows(
+                "SELECT toString(benchmark_id) AS benchmark_key, component, name, tags, props "
+                "FROM {db}.benchmarks WHERE benchmark_id IN {ids:Array(UUID)} ORDER BY benchmark_id",
+                {"ids": ids[start : start + ID_BATCH]},
+            )
+        return out
 
 
 def open_store(name, client=None):
