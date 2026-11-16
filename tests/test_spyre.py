@@ -1278,6 +1278,22 @@ class TestSpyre(TestCase):
             torch.tensor([data[1]] * 4, dtype=torch.float16),
         )
 
+    def test_eager_expand_broadcast_reduction(self):
+        """Regression for #5237: eager sum(dim=-1) over an expand()-broadcast
+        operand used to crash the backend ("Could not find any suitable
+        dimension mapping") the same way the compiled path did. Eager
+        dispatch compiles a standalone single-op kernel over the
+        already-materialised expand output, a distinct trigger from the
+        compiled path's fused expand+sum kernel, so it needs its own check
+        even though both share the fix in superdsc.py's
+        _merged_reduction_dim_order."""
+        x = torch.randn(70, dtype=torch.float16, device="spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1)
+        expected = x.cpu().float().expand(2, 32, 70).sum(dim=-1)
+        self.assertTrue(
+            torch.allclose(actual.cpu().float(), expected, atol=0.1, rtol=0.1)
+        )
+
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
         logical values, not over-DMA the parent's full allocation."""

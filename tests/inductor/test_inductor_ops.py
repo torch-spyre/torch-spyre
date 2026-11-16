@@ -6959,6 +6959,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Regression for #5237: sum(dim=-1) over an expand()-broadcast
+        # operand. Two shapes from the issue, each covering a distinct
+        # trigger for the bug: an unaligned innermost (reduced) dim, and a
+        # stick-aligned innermost dim with several simultaneous non-trivial
+        # broadcast dims.
+        ("test_expand_broadcast_reduction", "test_expand_broadcast_reduction_base"): {
+            "param_sets": {
+                "fp16_70_to_2x32x70": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16),
+                ),
+                "fp16_1x2x1x4x1x256_to_8x2x4x4x16x256": (
+                    (8, 2, 4, 4, 16, 256),
+                    cached_randn((1, 2, 1, 4, 1, 256), dtype=torch.float16),
+                ),
+            },
+        },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
             "param_sets": {
@@ -13161,6 +13178,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_expand_broadcast_reduction_base(self, expand_shape, x):
+        # Regression for #5237: a reduction's broadcast (expand()) operand
+        # used to drop out of the op's SDSC dim order entirely, which the
+        # backend rejected as "Could not find any suitable dimension
+        # mapping". Fixed in superdsc.py's _merged_reduction_dim_order.
+        self.compare_with_cpu(lambda t: t.expand(expand_shape).sum(dim=-1), x)
 
     def test_mean_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
