@@ -110,7 +110,9 @@ def db(monkeypatch):
     monkeypatch.setattr(
         bundle, "resolve_artifact", lambda *a, **k: (found, "artifact_id")
     )
-    return d
+    yield d
+    d.s.query("USE default")  # the engine is shared with later tests: leave no current database behind
+    d.s.query(f"DROP DATABASE IF EXISTS {d.name}")
 
 
 def result(
