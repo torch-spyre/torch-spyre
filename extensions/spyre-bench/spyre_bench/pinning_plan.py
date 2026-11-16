@@ -390,6 +390,15 @@ class PinPlan:
             return [tool, f"--physcpubind={self.union}"] + ([f"--membind={_nodes(self.nodes)}"] if self.nodes else [])
         return [tool, "-c", self.union]
 
+    def stage_prefixes(self, tool):
+        """NUL-joined argv prefixes (with a trailing NUL) of the engine's own launcher processes, for the observer: the
+        outer prefix and, in a ranks layout, each rank's tool before it execs the command."""
+        words = [self.prefix(tool)]
+        if self.layout == "ranks" and self.by_device:
+            for cpus in self.by_device:
+                words.append([tool, f"--physcpubind={cpus}"] if self.launcher == "numactl" else [tool, "-c", cpus])
+        return tuple("\0".join(w) + "\0" for w in words if w)
+
     def wrapper(self, tool):
         """Text of the per-rank wrapper: pins by LOCAL_RANK (layout ranks), else passes the command through."""
         lines = ["#!/usr/bin/env bash", "set -eu"]
@@ -462,7 +471,10 @@ def resolve(request, topology=None, device_numa=()):
         return tuple(topology.nodes_of(parse_cpu_list(cpus))) if topology else ()
 
     if policy == "explicit":
-        cpus = format_cpu_list(parse_cpu_list(req["cpus"]))
+        try:
+            cpus = format_cpu_list(parse_cpu_list(req["cpus"]))
+        except (KeyError, ValueError) as e:
+            raise PinningError(f"explicit needs a valid cpus list: {e}") from e
         return PinPlan("explicit", "explicit", cpus, apply=True, nodes=known(cpus), **common)
     if policy == "device_local":
         if topology is None:
@@ -476,7 +488,10 @@ def resolve(request, topology=None, device_numa=()):
     if lists and gen:
         raise PinningError("per_device takes cpus_by_device or assign, not both")
     if lists:
-        by = tuple(format_cpu_list(parse_cpu_list(x)) for x in lists)
+        try:
+            by = tuple(format_cpu_list(parse_cpu_list(x)) for x in lists)
+        except ValueError as e:
+            raise PinningError(f"cpus_by_device: {e}") from e
         if nodes is not None and len(nodes) != len(by):
             raise PinningError(f"cpus_by_device has {len(by)} lists but the host reports {len(nodes)} device(s)")
     elif gen:

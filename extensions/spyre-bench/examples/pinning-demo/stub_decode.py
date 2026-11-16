@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A stand-in decode benchmark: synthetic latencies, 18 % cheaper per token when its CPU affinity is narrower than
+"""A stand-in decode benchmark: synthetic latencies, 25 % cheaper per token when its CPU affinity is narrower than
 the machine's. It exists to exercise pinning end to end (launcher, observer, derive, compare); it measures nothing."""
 
 import argparse
@@ -35,7 +35,7 @@ helper = threading.Thread(target=time.sleep, args=(a.hold,))
 helper.start()
 time.sleep(a.hold)
 helper.join()
-per_token = 0.020 * (0.82 if pinned else 1.0) * (1 + 0.01 * ((a.repeat * 7) % 5 - 2))
+per_token = 0.020 * (0.75 if pinned else 1.0) * (1 + 0.01 * ((a.repeat * 7) % 5 - 2))
 latency = 0.2 + a.out_len * per_token
 if os.environ.get("LOCAL_RANK", "0") == "0":
     Path(a.out, "metrics.json").write_text(json.dumps({"samples": {"llm.batch_latency.mean": [latency]}}))

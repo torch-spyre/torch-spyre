@@ -303,6 +303,17 @@ class Resolve(unittest.TestCase):
         self.assertEqual(pp.resolve({"policy": "none"}).prefix("taskset"), [])
         self.assertEqual(pp.resolve({"policy": "device_local"}, t, "").prefix("taskset"), [])
 
+    def test_stage_prefixes_cover_the_rank_tools_exactly(self):
+        p = pp.resolve({"policy": "per_device", "cpus_by_device": ["0-1", "4-5"], "layout": "ranks"})
+        self.assertEqual(p.stage_prefixes("/t"), ("/t\0-c\00-1,4-5\0", "/t\0-c\00-1\0", "/t\0-c\04-5\0"))
+        for bad in (
+            {"policy": "explicit"},
+            {"policy": "explicit", "cpus": "x"},
+            {"policy": "per_device", "cpus_by_device": ["x"]},
+        ):
+            with self.assertRaises(pp.PinningError):
+                pp.resolve(bad)
+
     def test_golden_rank_wrapper(self):
         p = pp.resolve(
             {"policy": "per_device", "assign": {"cores_per_device": 2}, "layout": "ranks"}, two_socket(), "0,1"
@@ -383,7 +394,7 @@ class Observer(unittest.TestCase):
     def test_launcher_stage_is_not_judged_and_not_a_sample(self):
         fake_proc(self.proc, {100: (5, "taskset", {100: "0-7"})})
         self.env(100, cmdline=["/usr/bin/taskset", "-c", "0-1", "python"])
-        ours = "\0".join(["/usr/bin/taskset", "-c", "0-1"])
+        ours = "\0".join(["/usr/bin/taskset", "-c", "0-1"]) + "\0"
         self.assertIsNone(self.verify({"policy": "explicit", "cpus": "0-1"}, markers=(ours,)))
         self.env(100, cmdline=["/usr/bin/taskset", "-c", "2-3", "python"])  # the benchmark's own taskset is judged
         self.assertEqual(
@@ -549,7 +560,7 @@ class PlatformPolicy(unittest.TestCase):
         proc = Path(tempfile.mkdtemp(dir=TMP))
         fake_proc(proc, {100: (5, "taskset", {100: "0-1"})})
         (proc / "100" / "cmdline").write_bytes(b"taskset\0-c\0000-1\0python\0")
-        ours = "\0".join(["/usr/bin/taskset", "-c", "2-3"])
+        ours = "\0".join(["/usr/bin/taskset", "-c", "2-3"]) + "\0"
         r = placement.verify_pinning({"policy": "explicit", "cpus": "2-3"}, 100, (), proc, proc, markers=(ours,))
         self.assertEqual(r["run.exec.pinning_verified"], "false")
 
