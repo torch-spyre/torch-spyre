@@ -477,3 +477,49 @@ def test_the_purpose_and_the_dispatcher_reach_the_scripts():
     assert plan_env["ACTOR_IN"] == "${{ github.triggering_actor }}"
     assert plan_env["DISPATCHERS_IN"] == "${{ vars.BENCH_BASELINE_DISPATCHERS }}"
     assert wf["jobs"]["bench"]["if"].count("needs.plan.result == 'success'") == 1
+
+
+MATRIX = ROOT / ".github" / "workflows" / "_test_matrix.yaml"
+INTEGRATION = ROOT / ".github" / "workflows" / "integration-tests.yaml"
+
+
+def perf_steps():
+    steps = yaml.safe_load(MATRIX.read_text())["jobs"]["perf"]["steps"]
+    return {s["id"]: s for s in steps if "id" in s}
+
+
+def test_bench_mode_is_off_by_default_and_forwarded():
+    for path in (MATRIX, INTEGRATION):
+        spec = yaml.safe_load(path.read_text())[True]
+        call = spec.get("workflow_call") or spec["workflow_dispatch"]
+        # PyYAML (1.1) reads a bare `off` as False; the Actions parser reads the string.
+        assert call["inputs"]["bench_mode"]["default"] in ("off", False)
+    run_tests = yaml.safe_load(INTEGRATION.read_text())["jobs"]["run-tests"]
+    assert run_tests["with"]["bench_mode"] == "${{ inputs.bench_mode }}"
+
+
+def test_the_legacy_perf_ingest_is_skipped_only_in_replace_mode():
+    steps = perf_steps()
+    assert "inputs.bench_mode != 'replace'" in steps["ingest"]["if"]
+    assert steps["ingest"]["with"]["workflow"] == "${{ github.workflow }}"
+    assert steps["ingest"]["with"]["schema"] == "both"
+
+
+@pytest.mark.parametrize("step", ["bench-mirror", "bench-ingest"])
+def test_the_mirror_is_advisory_except_when_it_replaces_the_legacy_ingest(step):
+    s = perf_steps()[step]
+    assert s["continue-on-error"] == "${{ inputs.bench_mode != 'replace' }}"
+    assert "inputs.bench_mode != 'off'" in perf_steps()["bench-mirror"]["if"]
+
+
+def test_the_mirror_ingests_under_its_own_series_next_to_the_legacy_one():
+    with_ = perf_steps()["bench-ingest"]["with"]
+    assert (
+        with_["workflow"]
+        == "${{ inputs.bench_mode == 'replace' && github.workflow || format('bench-{0}', github.workflow) }}"
+    )
+    assert with_["run-id"] == "${{ steps.bench-mirror.outputs.ingest_run_id }}"
+    assert with_["schema"] == "v2" and "purpose" not in with_
+    mirror = perf_steps()["bench-mirror"]
+    assert mirror["env"]["BENCH_INGEST"] == "0"
+    assert mirror["env"]["BENCH_SUITE_FROM"] == "${{ env.RESULTS_DIR }}"
