@@ -602,6 +602,107 @@ class CheckCommand(FsCase):
         self.assertNotIn(SECRET, err)
 
 
+class ReviewRound1(FsCase):
+    def test_slug_only_in_catalog_dry_run_and_apply_agree(self):
+        self.assertEqual(self.add()[0], 0)
+        shutil.rmtree(self.store / "slot-01")
+        dry = self.add("--slug", "slot-01", apply=False)
+        real = self.add("--slug", "slot-01")
+        self.assertEqual((dry[0], real[0]), (0, 0), (dry, real))
+        self.assertEqual(self.check()[0], 0)
+
+    def test_store_name_is_validated(self):
+        for bad in ("x, labels: {a: b}", "UP", "a b", "x\ny", ""):
+            rc, _, err = self.add("--store", bad, apply=False)
+            self.assertEqual(rc, 2, bad)
+            self.assertIn("--store", err)
+
+    def test_yaml_keywords_stay_strings(self):
+        for lic in ("no", "on", "null", "123"):
+            root = fresh("kw")
+            cat = make_catalog(root, fs_store_doc(self.store))
+            src = write_jsonl(root / "d.jsonl", 2 + len(lic))
+            rc, _, err = run(
+                "add",
+                str(src),
+                "--display-name",
+                "n",
+                "--license",
+                lic,
+                "--benchmarks-dir",
+                str(cat),
+                "--central",
+                str(CENTRAL),
+                "--subset",
+                "on=*.jsonl",
+                "--subset",
+                "123=*.jsonl",
+                "--apply",
+            )
+            self.assertIn(rc, (0, 2), err)
+            if rc == 0:
+                found = engine.Catalog([cat], [], [CENTRAL])
+                self.assertEqual(found.errors, [])
+                specs = [d.spec for d in found.of("Asset") if d.name.endswith("-files")]
+                self.assertEqual(specs[-1]["license"], lic)
+                self.assertEqual(sorted(found.of("Dataset")[-1].spec["subsets"]), ["123", "on"])
+
+    def test_reserved_names_any_case_and_tmp(self):
+        for name in ("Dataset.JSON", "sha256sums"):
+            d = fresh("res")
+            (d / name).write_text("x")
+            self.assertEqual(self.add(src=d)[0], 2, name)
+        d = fresh("tmp")
+        (d / "a.txt").write_text("a")
+        (d / "dataset.json.tmp").write_text("keep")
+        self.assertEqual(self.add(src=d)[0], 0)
+        self.assertEqual((self.store / "slot-01" / "dataset.json.tmp").read_text(), "keep")
+        self.assertEqual(self.check()[0], 0)
+
+    def test_check_survives_unreadable_file_without_path_leak(self):
+        self.assertEqual(self.add()[0], 0)
+        f = self.store / "slot-01" / "data.jsonl"
+        f.chmod(0)
+        try:
+            if os.access(f, os.R_OK):
+                self.skipTest("running as a user that ignores modes")
+            rc, _, err = self.check()
+        finally:
+            f.chmod(0o644)
+        self.assertEqual(rc, 2)
+        self.assertNotIn(str(self.store), err)
+
+    def test_catalog_restored_when_validation_fails_after_write(self):
+        self.assertEqual(self.add()[0], 0)
+        before = tree(self.cat)
+        real = engine.Catalog
+        calls = []
+
+        def flaky(*a, **k):
+            c = real(*a, **k)
+            calls.append(1)
+            if len(calls) >= 3:
+                c.errors.append("boom")
+            return c
+
+        other = write_jsonl(self.root / "o.jsonl", 9)
+        with mock.patch.object(engine, "Catalog", flaky):
+            rc, _, err = self.add(src=other)
+        self.assertEqual(rc, 2)
+        self.assertEqual(tree(self.cat), before)
+
+    def test_append_does_not_double_separator(self):
+        f = self.root / "x.yaml"
+        f.write_text("a: 1\n---\n")
+        da.append_docs(f, ["b: 2\n"])
+        self.assertEqual(f.read_text(), "a: 1\n---\nb: 2\n")
+
+    def test_unicode_digit_slug_refused(self):
+        rc, _, err = self.add("--slug", "slot-\u0660\u0665", apply=False)
+        self.assertEqual(rc, 2)
+        self.assertIn("--slug", err)
+
+
 # ---------------------------------------------------------------- https against a local fake server
 class Fake(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):

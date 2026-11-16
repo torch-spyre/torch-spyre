@@ -48,6 +48,7 @@ MANIFEST = "SHA256SUMS"
 SCHEMA_VERSION = 1
 MAX_BYTES, MAX_FILES, MAX_DEPTH, MAX_NAME = 20 << 30, 10000, 8, 120
 ARCHIVE_MEMBERS = 200000
+RESERVED = {dm.FILE.lower(), MANIFEST.lower()}
 SUFFIXES = {
     ".jsonl",
     ".json",
@@ -151,31 +152,36 @@ def scan(path, max_bytes=MAX_BYTES):
             for e in children:
                 rel = f"{prefix}{e.name}"
                 if e.is_symlink():
-                    raise AddError(f"refused: {rel!r} is a symlink")
+                    raise AddError(f"refused: a symlink at depth {depth}")
                 if not ds.SEGMENT.fullmatch(e.name):
-                    raise AddError(f"refused: {rel!r} has a name outside [A-Za-z0-9._-] or starts with '.'")
+                    raise AddError(f"refused: a name at depth {depth} is outside [A-Za-z0-9._-] or starts with '.'")
                 if e.is_dir(follow_symlinks=False):
                     stack.append((Path(e.path), rel + "/", depth + 1))
                 elif e.is_file(follow_symlinks=False):
                     entries.append((rel, Path(e.path)))
                 else:
-                    raise AddError(f"refused: {rel!r} is not a regular file")
+                    raise AddError(f"refused: an entry at depth {depth} is not a regular file")
                 if len(entries) > MAX_FILES:
                     raise AddError(f"more than {MAX_FILES} files")
         if not entries:
             raise AddError("the directory holds no files")
-        if any(r in (dm.FILE, MANIFEST) for r, _ in entries):
-            raise AddError(f"refused: a top-level file is named {dm.FILE} or {MANIFEST}")
+        if any(r.lower() in RESERVED for r, _ in entries):
+            raise AddError(f"refused: a top-level file is named {dm.FILE} or {MANIFEST} (any case)")
     else:
         raise AddError("PATH is not a file or directory")
     items, total = [], 0
-    for rel, p in sorted(entries):
+    for n, (rel, p) in enumerate(sorted(entries), 1):
+        try:
+            if total + os.stat(p).st_size > max_bytes:
+                raise AddError(f"input exceeds the size cap of {max_bytes} bytes (--max-bytes)")
+        except OSError:
+            raise AddError(f"cannot read entry #{n}") from None
         if p.name.lower().endswith(ARCHIVES):
             check_archive(p, rel if kind == "directory" else "archive")
         try:
             sha, size = ds.sha256_file(p)
         except (OSError, ds.StoreError) as e:
-            raise AddError(f"cannot read {rel!r} ({type(e).__name__})") from None
+            raise AddError(f"cannot read entry #{n} ({type(e).__name__})") from None
         total += size
         if total > max_bytes:
             raise AddError(f"input exceeds the size cap of {max_bytes} bytes (--max-bytes)")
@@ -219,7 +225,8 @@ def meta_doc(slug, a, plan, env, stamp):
 # ------------------------------------------------------------------ YAML text
 def q(v):
     """A YAML flow scalar: bare when plainly safe, else a JSON string (keeps digests and globs quoted)."""
-    return v if re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", v) else json.dumps(v)
+    plain = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", v) and isinstance(yaml.safe_load(v), str)
+    return v if plain else json.dumps(v)
 
 
 def store_doc(name):
@@ -259,7 +266,7 @@ def asset_doc(slug, store, plan, a, public_store):
 def dataset_doc(slug, a):
     spec = f"asset: {slug}-files, role: {a.role}"
     if a.subsets:
-        spec += ", subsets: {" + ", ".join(f"{n}: {{files: [{q(g)}]}}" for n, g in a.subsets.items()) + "}"
+        spec += ", subsets: {" + ", ".join(f"{q(n)}: {{files: [{q(g)}]}}" for n, g in a.subsets.items()) + "}"
     return f"apiVersion: bench/v1alpha1\nkind: Dataset\nmetadata: {{name: {slug}}}\nspec: {{{spec}}}\n"
 
 
@@ -277,16 +284,23 @@ def parse_subsets(raw):
 
 def append_docs(path, texts):
     """Append YAML documents, creating the file; temp file then rename."""
-    old = path.read_text(encoding="utf-8") if path.exists() else ""
-    body = old
+    body = path.read_text(encoding="utf-8") if path.exists() else ""
     for t in texts:
         if body.strip():
+            body = re.sub(r"(\n---[ \t]*)+\n*\Z", "\n", body)
             body = body.rstrip("\n") + "\n---\n" + t
         else:
             body = t
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".dataset-add-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def pending(cat, wants):
@@ -362,6 +376,8 @@ def cmd_add(a, env, urlopen, out):
     a.subsets = parse_subsets(a.subset)
     if a.slug:
         check_slug_arg(a.slug)
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9._@-]{0,126}[a-z0-9])?", a.store):
+        raise AddError("--store must be a Store name (lowercase letters, digits, . _ @ -)")
     if a.public and not a.license:
         raise AddError("--public needs --license")
     a.license = a.license or "internal"
@@ -442,19 +458,32 @@ def cmd_add(a, env, urlopen, out):
 
     if not reuse:
         stamp = cliutil.utc_stamp()
-        slug = store.publish(plan.items, lambda s: meta_doc(s, a, plan, env, stamp), slug, taken=in_repo)
+        held = in_repo - {slug} if a.slug else in_repo
+        slug = store.publish(plan.items, lambda s: meta_doc(s, a, plan, env, stamp), slug, taken=held)
         say(f"stored: {slug}")
         if slug != preview:
             todo = plan_yaml(slug)
+            errs = validate_copy(bdir, a_central(a), a_packs(a), todo)
+            if errs:
+                raise AddError(f"{slug} is stored but the result would not validate:\n" + "\n".join(errs))
     by_file = {}
     for f, t in todo:
         by_file.setdefault(f, []).append(t)
-    for f, texts in by_file.items():
-        append_docs(bdir / f, texts)
-        say(f"wrote: {bdir / f}")
-    errs = engine.Catalog([bdir], a_packs(a), a_central(a)).errors
-    if errs:
-        raise AddError("validate FAILED after the write:\n" + "\n".join(errs))
+    snap = {f: (bdir / f).read_text(encoding="utf-8") if (bdir / f).exists() else None for f in by_file}
+    try:
+        for f, texts in by_file.items():
+            append_docs(bdir / f, texts)
+            say(f"wrote: {bdir / f}")
+        errs = engine.Catalog([bdir], a_packs(a), a_central(a)).errors
+        if errs:
+            raise AddError("validate FAILED after the write (files restored):\n" + "\n".join(errs))
+    except BaseException:
+        for f, old in snap.items():
+            if old is None:
+                (bdir / f).unlink(missing_ok=True)
+            else:
+                (bdir / f).write_text(old, encoding="utf-8")
+        raise
     say(f"validate: PASS ({bdir})")
     say("Add this to a Benchmark or Workload:")
     say("  inputs:")

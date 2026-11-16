@@ -46,6 +46,9 @@ Options: `--public --license L` (the display name may be shown by tools; a priva
   absolute or link members are refused. The default cap is 20 GiB and 10000 files.
 - `--apply` needs the store credential from the environment (never from a flag), and nothing printed contains it.
 - An https store has no atomic create: a claim marker narrows concurrent adds for one slug but cannot close the race.
-  Run one add at a time against an https store; `dataset check` finds a damaged slug.
+  Run one add at a time against an https store; `dataset check` finds a damaged slug. A failed https add can leave
+  uploaded files under its slot, which then counts as taken: remove them by hand.
+- If the catalog write or its validation fails after the store was published, the catalog files are restored; rerun
+  to finish (the store entry is reused).
 
 Exit codes: 0 ok, 2 refused or invalid (messages name the slug only), 5 the store failed.
