@@ -41,7 +41,7 @@ class ChdbClient:
         )
         return SimpleNamespace(result_rows=json.loads(out.data())["data"])
 
-    def command(self, sql, parameters=None):
+    def command(self, sql, parameters=None, settings=None):
         self.s.query(self.bind(sql, parameters))
 
 

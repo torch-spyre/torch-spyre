@@ -79,6 +79,13 @@ def trust_of(uploader: str, ci_accounts) -> str:
     return "ci" if uploader and uploader in ci_accounts else "external"
 
 
+def min_trust(uploaders, ci_accounts) -> str:
+    """`ci` only when every account that wrote the bundle is a CI account."""
+    return (
+        "ci" if all(trust_of(u, ci_accounts) == "ci" for u in uploaders) else "external"
+    )
+
+
 def is_uuid(value: str) -> bool:
     try:
         return str(uuid.UUID(value)) == value
@@ -199,11 +206,17 @@ class UploadLog:
         return self._client
 
     def has(self, run_id: str) -> bool:
-        """Whether any upload event (any state, so a retracted one too) names the run."""
-        n = self._ready().query(
-            f"SELECT count() FROM {self.db}.result_uploads WHERE run_id = {{rid:UUID}}",
-            parameters={"rid": run_id},
-        ).result_rows[0][0]  # fmt: skip
+        """Whether a published or retracted upload names the run. A dashboard `failed`, `rejected`, `pending` or
+        `expired` event is not a live upload, so it does not stop the relay recording the run it just ingested."""
+        n = (
+            self._ready()
+            .query(
+                f"SELECT count() FROM {self.db}.result_uploads WHERE run_id = {{rid:UUID}} "
+                "AND state IN ('published', 'retracted')",
+                parameters={"rid": run_id},
+            )
+            .result_rows[0][0]
+        )
         return n > 0
 
     def kinds(self, artifact_id: str, run_id: str, test_type: str) -> tuple:
@@ -247,8 +260,12 @@ class UploadLog:
         )
         self._ready().command(
             f"INSERT INTO {self.db}.result_uploads ({', '.join(self.COLUMNS)}) SELECT {values} "
-            f"WHERE NOT EXISTS (SELECT 1 FROM {self.db}.result_uploads WHERE run_id = {{run_id:UUID}})",
+            f"WHERE NOT EXISTS (SELECT 1 FROM {self.db}.result_uploads WHERE run_id = {{run_id:UUID}} "
+            "AND state IN ('published', 'retracted'))",
             parameters=params,
+            settings={
+                "select_sequential_consistency": 1
+            },  # a retract on another replica must be visible
         )
 
 
@@ -335,6 +352,8 @@ class Relay:
             for it in items
         )  # fmt: skip
         b["files"] = [rel for rel, _, _ in listing]
+        # Trust follows the least trusted account that wrote any file of the folder, not only bundle.json.
+        b["uploaders"] = sorted({it.get("created_by", "") for it in items})
         self.art.download(f"{folder}/bundle.json", work / "bundle.json")
         try:
             listed = "files" in json.loads((work / "bundle.json").read_text())
@@ -370,7 +389,7 @@ class Relay:
         local = self.fetch(b, work)
         argv = ["--strict", "--uploader", b["uploader"] or "unknown", "--bundle-url", self.art.url(processed),
                 "--expect-key", b["key"],
-                "--channel-trust", trust_of(b["uploader"], self.args.ci_account)]  # fmt: skip
+                "--channel-trust", min_trust(b.get("uploaders") or [b["uploader"]], self.args.ci_account)]  # fmt: skip
         for prefix in self.args.trusted_job_prefix:
             argv += ["--trusted-job-prefix", prefix]
         if not self.args.apply:
@@ -428,7 +447,7 @@ class Relay:
             artifact_id=report["artifact_id"], run_id=rid, format=fmt, result_kind=result_kind,
             test_type=report["test_type"], arch=report["arch"], filename=Path(b["rel"]).name,
             size_bytes=size, content_sha256=report["bundle_sha256"], bundle_url=url,
-            props={"channel": CHANNEL, "trust": report.get("trust") or trust_of(b["uploader"], self.args.ci_account),
+            props={"channel": CHANNEL, "trust": report.get("trust") or min_trust(b.get("uploaders") or [b["uploader"]], self.args.ci_account),
                    "ingest_status": report.get("status", ""), "bundle_key": b["key"],
                    "relay_run": os.environ.get("BUILD_URL", ""), **props},
         )  # fmt: skip
@@ -482,7 +501,7 @@ class Relay:
             "--expect-key",
             b["key"],
             "--channel-trust",
-            trust_of(b["uploader"], self.args.ci_account),
+            min_trust(b.get("uploaders") or [b["uploader"]], self.args.ci_account),
         ]
         for prefix in self.args.trusted_job_prefix:
             argv += ["--trusted-job-prefix", prefix]

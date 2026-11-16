@@ -301,7 +301,7 @@ class FakeClickHouse:
         assert "FROM spy.artifact_results" in sql and "state != 'running'" in sql
         return SimpleNamespace(result_rows=self.verdict)
 
-    def command(self, sql, parameters=None):
+    def command(self, sql, parameters=None, settings=None):
         assert (
             sql.startswith("INSERT INTO spy.result_uploads")
             and "WHERE NOT EXISTS" in sql
@@ -509,7 +509,7 @@ def test_a_verdict_without_a_bundle_kind_is_recorded_as_junit_and_its_result_kin
 
 
 class ExitingClickHouse(FakeClickHouse):
-    def command(self, sql, parameters=None):
+    def command(self, sql, parameters=None, settings=None):
         raise SystemExit("CLICKHOUSE_PORT is not a number: 'x'")
 
 
@@ -703,3 +703,28 @@ def test_the_row_records_the_trust_the_ingest_applied(tmp_path):
     relay.Relay(FakeArtifactory(_dir(folder)), _args(ci_account=["jdoe"]), ingest=lambda local, argv: outcome,
                 now=NOW, uploads=uploads).run(tmp_path)  # fmt: skip
     assert client.rows[0]["props"]["trust"] == "external"
+
+
+def test_a_folder_is_only_ci_when_every_file_was_written_by_a_ci_account():
+    assert relay.min_trust(["svc"], ["svc"]) == "ci"
+    assert relay.min_trust(["svc", "jdoe"], ["svc"]) == "external"
+
+
+def test_only_live_upload_events_stop_the_row():
+    sqls = []
+
+    class Spy:
+        def query(self, sql, parameters=None):
+            sqls.append(sql)
+            return SimpleNamespace(result_rows=[[0]])
+
+        def command(self, sql, parameters=None, settings=None):
+            sqls.append(sql)
+            assert settings == {"select_sequential_consistency": 1}
+
+    log = relay.UploadLog(Spy(), "spy")
+    log.has(RID)
+    log.append(upload_id="u", state="published", actor="a", artifact_id=AID, run_id=RID, format="junit",
+               result_kind="functional", test_type="fvt", arch="s390x", filename="f", size_bytes=1,
+               content_sha256="c", bundle_url="u", props={"channel": "relay"})  # fmt: skip
+    assert all("state IN ('published', 'retracted')" in q for q in sqls)
