@@ -16,7 +16,9 @@
  * Portions derived from libkineto AIU plugin.
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
+#include <util/sendefs/sendefs.h>
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -216,6 +218,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollReduceSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
       return "aiuCommsCollBroadcastSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER_SETUP:
+      return "aiuCommsCollReduceScatterSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_RECORDING:
       return "aiuCommsWorkSchedPhaseRecord";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_WIREUP:
@@ -291,8 +295,10 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
       return "aiuIterationDuration";
 
-    // CBIDS 83 to 84 are reserved
-    // P2P RDMA CBIDS (85 - 91)
+    // CBID 83 is reserved
+    // P2P RDMA CBIDS (84 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND:
+      return "aiuP2PRdmaSend";
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
       return "aiuP2PRdmaMulticast";
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
@@ -368,6 +374,86 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
   }
 }
 
+// Runtime-record detail: transfer direction and conversion data formats. Newer than the other runtime fields, so detected rather than
+// assumed.
+template <class T, class = void>
+struct HasRuntimeDetailFields : std::false_type {};
+template <class T>
+struct HasRuntimeDetailFields<
+    T, std::void_t<decltype(std::declval<T&>().direction),
+                   decltype(std::declval<T&>().dtype_src),
+                   decltype(std::declval<T&>().dtype_dst)>> : std::true_type {};
+
+// dtype_src / dtype_dst carry the deeptools DataFormats value + 1; 0 = none.
+inline std::string runtimeDtypeName(uint8_t dtype) {
+  const int format = static_cast<int>(dtype) - 1;
+  if (format >= 0 &&
+      format < static_cast<int>(DataFormats::NUM_DATA_FORMATS)) {
+    return EnumsConversion::dataFormatsToString(
+        static_cast<DataFormats>(format));
+  }
+  return std::to_string(format);
+}
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addRuntimeDetailMetadata(trace_activity_type& trace_activity,
+                                     const aiupti_activity_type* activity) {
+  if constexpr (HasRuntimeDetailFields<aiupti_activity_type>::value) {
+    switch (activity->direction) {
+      case (uint8_t)AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+        trace_activity->addMetadataQuoted("direction", "HtoD");
+        break;
+      case (uint8_t)AIUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+        trace_activity->addMetadataQuoted("direction", "DtoH");
+        break;
+      default:
+        break;
+    }
+    if (activity->dtype_src != 0 || activity->dtype_dst != 0) {
+      trace_activity->addMetadataQuoted(
+          "dtype", runtimeDtypeName(activity->dtype_src) + "->" +
+                       runtimeDtypeName(activity->dtype_dst));
+    }
+  }
+}
+
+// DMA section types (raw hal DmaTypeEnum values) and, on compute records, the
+// peer set the CB names. Detected for the same reason as above.
+template <class T, class = void>
+struct HasDmaSectionFields : std::false_type {};
+template <class T>
+struct HasDmaSectionFields<T,
+                           std::void_t<decltype(std::declval<T&>().dmi_type),
+                                       decltype(std::declval<T&>().dmo_type)>>
+    : std::true_type {};
+
+template <class T, class = void>
+struct HasPeerFields : std::false_type {};
+template <class T>
+struct HasPeerFields<T, std::void_t<decltype(std::declval<T&>().peer_mask),
+                                    decltype(std::declval<T&>().peer_rank)>>
+    : std::true_type {};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addDmaSectionMetadata(trace_activity_type& trace_activity,
+                                  const aiupti_activity_type* activity) {
+  if constexpr (HasDmaSectionFields<aiupti_activity_type>::value) {
+    trace_activity->addMetadata("dmi_type",
+                                static_cast<unsigned>(activity->dmi_type));
+    trace_activity->addMetadata("dmo_type",
+                                static_cast<unsigned>(activity->dmo_type));
+  }
+  if constexpr (HasPeerFields<aiupti_activity_type>::value) {
+    if (activity->peer_mask != 0) {
+      trace_activity->addMetadataQuoted(
+          "peer_mask", fmt::format("0x{:x}", activity->peer_mask));
+    }
+    if (activity->peer_rank != UINT32_MAX) {
+      trace_activity->addMetadata("peer_rank", activity->peer_rank);
+    }
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -430,6 +516,7 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
+  addRuntimeDetailMetadata(runtime_activity, activity);
 
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
       !calibration && linked && linked->deviceId() == activity->process_id &&
@@ -481,8 +568,16 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("fence_size", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND:
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE:
       runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    // (correlation, cb_idx) identifies the CB's device record.
+    case AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP:
+      runtime_activity->addMetadata("cb_idx", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
@@ -555,6 +650,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   // Compute records always carry counters, so emit unconditionally: an
   // all-zero array here signals a counter failure rather than absence.
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  addDmaSectionMetadata(kernel_activity, activity);
 
   recordStream(kernel_activity->device, kernel_activity->resource);
   kernel_activity->log(*logger);
@@ -676,6 +772,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
   addCollMetadata(memcpy_activity, activity);
+  addDmaSectionMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,

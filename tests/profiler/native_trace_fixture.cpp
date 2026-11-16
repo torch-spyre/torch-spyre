@@ -301,6 +301,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     // Distinct nonzero payloads catch both CBID and metadata-key drift.
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER, 40, 3);
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND, 41, 5);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA, 42, 4096);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP, 43, 2);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND, 44, 1024);
   });
   module.def("emit_capture_window", [](int window) {
     at::RecordFunction origin(at::RecordScope::FUNCTION);

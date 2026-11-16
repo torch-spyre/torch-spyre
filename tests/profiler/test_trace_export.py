@@ -156,6 +156,11 @@ def test_runtime_data_metadata(native_traces):
     assert barrier["args"]["fence_size"] == 3
     assert send["name"] == "aiuLaunchP2PRdmaSend"
     assert send["args"]["num_dest_ranks"] == 5
+    dma, roundtrip, unicast = spans[42], spans[43], spans[44]
+    assert dma["args"]["bytes"] == 4096
+    assert roundtrip["args"]["cb_idx"] == 2
+    assert unicast["name"] == "aiuP2PRdmaSend"
+    assert unicast["args"]["bytes"] == 1024
 
 
 @pytest.mark.parametrize("prefix", ["reused", "scheduled-reused"])
