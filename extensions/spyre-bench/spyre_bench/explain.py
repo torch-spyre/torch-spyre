@@ -16,15 +16,17 @@
 series and reuse keys, and the plan record. A status view; never written to source.
 
   spyre-bench explain NAME --catalog DIR [--pack DIR]... [--central DIR]... [--environment ENV] [--subject ARTIFACT_ID]
-             [--set PATH=VALUE]... [--purpose P] [--json]
+             [--set PATH=VALUE]... [--purpose P] [--dataset-meta-dir DIR | --dataset-store STORE] [--json]
 NAME is a case name or a Benchmark name (all its cases). --set shows the ephemeral variant and its identity diff.
+A dataset input is labelled by its slug; with --dataset-meta-dir or --dataset-store (a Store of the catalog) its
+`<slug>/dataset.json` is read and the real name is shown only when that file says `public: true`.
 """
 
 import argparse
 import json
 import sys
 
-from spyre_bench import engine
+from spyre_bench import dataset_meta, engine
 
 
 def leg_of(view):
@@ -36,7 +38,31 @@ def leg_of(view):
     }
 
 
+def dataset_labels(cat, a):
+    """Labels over the store the flags name, or None (slugs only). Offline by default: nothing is read unasked."""
+    if isinstance(getattr(a, "dataset_meta_dir", None), str):
+        return dataset_meta.Labels(dataset_meta.DirSource(a.dataset_meta_dir))
+    if isinstance(getattr(a, "dataset_store", None), str):
+        store = cat.by.get(("Store", a.dataset_store))
+        if store is None:
+            raise dataset_meta.DatasetMetaError(f"--dataset-store {a.dataset_store!r}: no Store of that name")
+        return dataset_meta.Labels(dataset_meta.source_for_store(store.spec))
+    return None
+
+
+def input_doc(cat, i, labels):
+    ids, sel, props = cat.input_identity(i)
+    doc = dict(zip(("asset_ids", "select", "props"), (ids, sel, props)), name=i["name"])
+    if "dataset" in i:
+        slug = cat.dataset_slug(i["dataset"])
+        if labels:
+            dataset_meta.check_assets(labels.meta(slug), cat.dataset_asset_specs(i["dataset"]))
+        doc["dataset_label"] = labels.label(slug) if labels else slug
+    return doc
+
+
 def explain(cat, name, a):
+    labels = dataset_labels(cat, a)
     cases = [c for c in cat.cases if name in (c["name"], c["benchmark"])]
     if not cases:
         raise SystemExit(f"no case or Benchmark named {name!r}")
@@ -87,10 +113,7 @@ def explain(cat, name, a):
             "metrics": {"required": req_c[0], "headline": req_c[1]},
             "profile": c["profile"],
             "run": c["run"],
-            "inputs": [
-                dict(zip(("asset_ids", "select", "props"), cat.input_identity(i)), name=i["name"])
-                for i in c["workload"].get("inputs", [])
-            ],
+            "inputs": [input_doc(cat, i, labels) for i in c["workload"].get("inputs", [])],
         }
         doc["validity"] = cat.validity_view(c, a.purpose, cat.effective("Environment", env_name) if env_name else None)
         if view:
@@ -122,6 +145,9 @@ def main(argv=None):
     ap.add_argument("--set", action="append", default=[])
     ap.add_argument("--purpose", default="investigate")
     ap.add_argument("--json", action="store_true")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--dataset-meta-dir", help="directory holding <slug>/dataset.json")
+    src.add_argument("--dataset-store", help="a Store of the catalog that holds <slug>/dataset.json")
     a = ap.parse_args(argv)
     cat = engine.Catalog([a.catalog], a.pack, a.central)
     if cat.errors:
@@ -133,7 +159,7 @@ def main(argv=None):
         return 2
     try:
         docs = explain(cat, a.name, a)
-    except (KeyError, ValueError, TypeError, AttributeError, engine.PlanError) as x:
+    except (KeyError, ValueError, TypeError, AttributeError, engine.PlanError, dataset_meta.DatasetMetaError) as x:
         print(f"error: {str(x).splitlines()[0] if str(x) else type(x).__name__}", file=sys.stderr)
         return 2
     print(

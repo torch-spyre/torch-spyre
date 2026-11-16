@@ -2,7 +2,7 @@
 # Datasets add semantics over assets: role, schema, named subsets. Each subset is a `select` and has its own identity.
 apiVersion: bench/v1alpha1
 kind: Dataset
-metadata: {name: all-sequences}
+metadata: {name: slot-92}
 spec:
   asset: trace-all-files
   role: trace

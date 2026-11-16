@@ -1720,6 +1720,9 @@
     "path": {
      "type": "string"
     },
+    "slug": {
+     "$ref": "#/$defs/name"
+    },
     "uri": {
      "type": "string"
     },
@@ -1753,7 +1756,7 @@
      ]
     }
    },
-   "description": "exactly one of store+path, uri, generator"
+   "description": "exactly one of store+path, store+slug, uri, generator; a slug is the store-relative path `<slug>`"
   },
   "Project": {
    "type": "object",
@@ -2775,6 +2778,12 @@
      "type": "object",
      "additionalProperties": false,
      "properties": {
+      "slug": {
+       "$ref": "#/$defs/name"
+      },
+      "store": {
+       "$ref": "#/$defs/name"
+      },
       "asset": {
        "$ref": "#/$defs/name"
       },
@@ -2856,7 +2865,7 @@
      "required": [
       "role"
      ],
-     "description": "semantics over assets (role, schema, named subsets); `asset` is shorthand for one"
+     "description": "semantics over assets (role, schema, named subsets); `asset` is shorthand for one. `slug` (default: the name) locates `<store>/<slug>/dataset.json`, which holds the real name and whether it may be shown"
     }
    },
    "required": [

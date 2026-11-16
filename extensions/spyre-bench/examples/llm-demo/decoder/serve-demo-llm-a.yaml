@@ -37,7 +37,7 @@ spec:
       concurrency: {path: workload.load.concurrency, values: [1, 5, 16], token: "c{}"}
       data:
         - token: all
-          patch: {tier: sanity, run: {est: 22m}, workload: {inputs: [{name: prompts, dataset: all-sequences, subset: smoke-200, expect: {records: 200}}]}}
+          patch: {tier: sanity, run: {est: 22m}, workload: {inputs: [{name: prompts, dataset: slot-92, subset: smoke-200, expect: {records: 200}}]}}
         - token: trace-x
           patch: {tier: extended, run: {est: 25m}, workload: {inputs: [{name: prompts, dataset: trace-x, subset: smoke-200}]}}
         - token: trace-y

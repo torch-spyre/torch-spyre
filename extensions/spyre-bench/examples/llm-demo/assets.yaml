@@ -9,8 +9,8 @@ spec:
   version: 0000.00.00-0000000
   license: internal
   visibility: internal
-  source: {store: demo-store, path: datasets/trace/all-sequences/0000.00.00-0000000}
-  integrity: {files: [{path: all_sequences.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000c}]}
+  source: {store: demo-store, path: datasets/trace/slot-92/0000.00.00-0000000}
+  integrity: {files: [{path: trace.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000c}]}
 ---
 apiVersion: bench/v1alpha1
 kind: Asset
