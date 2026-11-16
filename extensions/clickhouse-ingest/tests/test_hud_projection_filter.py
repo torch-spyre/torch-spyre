@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The HUD projection takes measured model-level spyre-inference rows only, and the latest
+"""The HUD projection takes measured model-level spyre-inference rows only (never bench-engine rows), and the latest
 migration of the MV leaves it identical to its schema file."""
 
 import pytest
 import regex as re
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
-MIGRATION = SCHEMA_DIR / "migrations" / "025_hud_mv_skips_reference_rows.sql"
+MIGRATION = SCHEMA_DIR / "migrations" / "028_hud_mv_skips_bench_rows.sql"
 
 
 def _mv(sql: str) -> str:
@@ -40,18 +40,21 @@ def test_the_migration_recreates_the_mv_as_the_schema_file_defines_it():
 
 
 @pytest.mark.parametrize(
-    "backend, record_type, source_file, projected",
+    "backend, record_type, source_file, projected, report_kind",
     [
-        ("spyre", "model", "vllm-benchmark/1/serve.json", True),
-        ("whatif", "model", "vllm-benchmark/1/serve.json", False),
-        ("roofline", "model", "vllm-benchmark/1/serve.json", False),
-        ("spyre", "kernel", "vllm-benchmark/1/serve.json", False),
-        ("spyre", "step", "vllm-benchmark/1/serve.json", False),
-        ("spyre", "model", "optbench-c1/granite/A.json", False),
+        ("spyre", "model", "vllm-benchmark/1/serve.json", True, "vllm"),
+        ("spyre", "model", "vllm-benchmark/1/serve.json", True, ""),
+        ("spyre", "model", "serve.json", False, "bench"),
+        ("spyre", "model", "ci-job/serve.json", False, "bench"),
+        ("whatif", "model", "vllm-benchmark/1/serve.json", False, "vllm"),
+        ("roofline", "model", "vllm-benchmark/1/serve.json", False, "vllm"),
+        ("spyre", "kernel", "vllm-benchmark/1/serve.json", False, "vllm"),
+        ("spyre", "step", "vllm-benchmark/1/serve.json", False, "vllm"),
+        ("spyre", "model", "optbench-c1/granite/A.json", False, "vllm"),
     ],
 )
 def test_only_measured_model_rows_reach_the_hud(
-    backend, record_type, source_file, projected
+    backend, record_type, source_file, projected, report_kind
 ):
     session = pytest.importorskip("chdb.session")
 
@@ -80,7 +83,7 @@ def test_only_measured_model_rows_reach_the_hud(
     s.query(
         "INSERT INTO benchmark_runs (run_id, benchmark_id, component, backend, measurements, props) "
         f"VALUES ('{rid}', '{bid}', 'spyre-inference', '{backend}', map('ttft_ms', [1.0]), "
-        f"map('source_file', '{source_file}', 'arch', 'x86_64'))"
+        f"map('source_file', '{source_file}', 'arch', 'x86_64', 'report_kind', '{report_kind}'))"
     )
     n = s.query("SELECT count() FROM oss_ci_benchmark_v3", "CSV").data()
     n = n.decode() if isinstance(n, bytes) else n
@@ -88,10 +91,11 @@ def test_only_measured_model_rows_reach_the_hud(
 
 
 def test_the_mv_migrations_can_be_rerun():
-    # Rerunning 023 reinstalls the MV without the later filter; 025 is the way back.
+    # Rerunning 023 or 025 reinstalls the MV without the later filter; 028 is the way back.
     for n in (
         "023_hud_mv_measured_model_rows.sql",
         "025_hud_mv_skips_reference_rows.sql",
+        "028_hud_mv_skips_bench_rows.sql",
     ):
         assert SchemaApplier.RERUNNABLE.search(
             (SCHEMA_DIR / "migrations" / n).read_text()
