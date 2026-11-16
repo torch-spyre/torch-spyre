@@ -449,7 +449,11 @@ that stores one sample per run needs `--window N`, which pools the series' newes
 (`accept` refuses and says so otherwise). The request is the input of the reference
 machinery (reference bundle, approval, tag move): the engine writes no rows and moves no tag, so the anchor changes when the
 reference is approved, and until then `verdict` keeps comparing with the old one. `--reason` is required and recorded.
-Exit 2 bad flags, 5 store failure.
+Each value carries a `case` block (`component`, `name`, `tags`, `disc`, `disc_keys`, and `id_profile` when the Result
+has one) that rebuilds its `benchmark_id`: taken from the Results of `--run-dir` when given, else from the registered
+case; `accept` refuses, naming the ids, when a block cannot rebuild its id. `anchor` is `{role, run_id, as_of}`
+(`from_run_id` repeats `run_id` for the reference side that reads it). `reference create --from-request` consumes the file.
+Exit 1 not eligible or no case data, 2 bad flags, 5 store failure.
 
 ## Uploading results
 
