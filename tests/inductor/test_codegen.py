@@ -1455,10 +1455,11 @@ class TestMatmulReuseDims(InductorTestCase):
 
 
 class TestMatmulCoordinateMask(InductorTestCase):
-    """A matmul masks the pure-padding columns (N) of its kernel with 0.
+    """A matmul masks the pure-padding lanes of one padded dim with 0.
 
-    The masked dim is the one the output and the kernel iterate but the
-    activation does not, and the mask covers the lanes past the logical N.
+    The masked dim is N (iterated by the output and the kernel but not the
+    activation) or, failing that, K (iterated by both inputs but not the
+    output). The mask covers the lanes past the dim's logical extent.
     """
 
     def _compiled_matmul_specs(self, fn, *inputs) -> list:
@@ -1497,11 +1498,23 @@ class TestMatmulCoordinateMask(InductorTestCase):
             self._assert_masks_columns(spec, 100, 128)
 
     def test_batched_unaligned_n_and_k_masks_only_n(self):
-        # K is zero-padded by copies ahead of the matmul, so only N is masked.
+        # The backend masks one dim at a time; N wins over K.
         x = torch.randn(3, 64, 100, dtype=torch.float16)
         w = torch.randn(3, 100, 100, dtype=torch.float16)
         for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
             self._assert_masks_columns(spec, 100, 128)
+
+    def test_unaligned_k_is_masked(self):
+        # The activation's K padding lanes hold whatever its producer left
+        # there; against the kernel's zero-padded K rows, inf * 0 = NaN.
+        x = torch.randn(64, 32, dtype=torch.float16)
+        w = torch.randn(32, 64, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            (dim,) = spec.coordinate_masking
+            self.assertEqual(str(dim), "in")
+            self.assertEqual(spec.iteration_space[dim], 64)
+            self.assertEqual(spec.coordinate_masking[dim], [[32, 32]])
+            self.assertEqual(spec.constants["samv-maskvalue"], 0.0)
 
     def test_aligned_n_is_not_masked(self):
         x = torch.randn(64, 128, dtype=torch.float16)
