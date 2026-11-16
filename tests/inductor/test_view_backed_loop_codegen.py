@@ -122,6 +122,9 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
         mock.patch.object(
             kernel, "_general_tile_advance", return_value=sympy.Integer(64)
         ),
+        # The stub operation has no read/write dependencies to build the
+        # index-based advance from; this test is about the base coordinates.
+        mock.patch.object(kernel, "_index_tile_advance", return_value=None),
     ):
         arg = kernel.create_tensor_arg(False, "output", tensor)
 

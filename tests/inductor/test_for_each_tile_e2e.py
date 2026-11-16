@@ -322,6 +322,56 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             ):
                 compiled(values, indices, initial)
 
+    def test_scatter_carry_relayout_copies_are_in_the_loop(self):
+        """The mutation relayout of a scatter into a carry puts BOTH full-buffer
+        copies inside the scatter's loop ("so other carry readers observe the
+        preceding iteration's updates"), by node membership and not only by the
+        ``loop_group_id`` stamped on them.
+
+        ``reorder_nonstick_dims_mutation`` placed the copy-back by flat index after
+        the last body op, which the flat view puts at the top level; the copy then
+        claimed the loop without being in it. The pipeline's later ``expanded()``
+        round trip rebuilt nodes from ``loop_group_id`` and hid that, until
+        ``dedup_and_promote_constants`` stopped needing it. Without the fix the
+        compile fails in the scheduler ("Loop group (0,) is not contiguous"), which
+        is this test's regression signal; the assertions below say where each
+        member sits when it does not.
+
+        The loop's four members are the accumulate (``acc + value``), the copy-in,
+        the ``index_copy`` and the copy-back. The loop checker does not flag a
+        member outside its node: it checks that an op's index uses enclosing
+        variables, not that an op with a ``loop_group_id`` is inside the node."""
+        rows = 32  # a shape the runtime-index test compiles: the scatter is legal
+        generator = torch.Generator().manual_seed(930)
+        values = (torch.randn(4, rows, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        indices = torch.stack(
+            [torch.randperm(rows * 4, generator=generator)[:rows] for _ in range(4)]
+        ).to(torch.int32)
+        initial = (torch.randn(rows * 4, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        result: dict = {}
+        with (
+            config.patch(
+                backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+            ),
+            torch.inference_mode(),
+            # A cache hit would skip the pipeline this test inspects, leaving
+            # ``result`` empty.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)(
+                values.to(DEVICE_NAME), indices.to(DEVICE_NAME), initial.to(DEVICE_NAME)
+            )
+        self.assertIn("top_level", result, "the pipeline did not run")
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 4, result["in_body"])
+
     def test_scatter_carry_preserves_old_value_read_after_update(self):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
         from torch_spyre.ops.fallbacks import FallbackWarning
@@ -625,9 +675,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         and has no iteration dim, so this drives
         coarse_tile._point_splice_advance_for_dep (record the per-trip
         advance), leave the read direct (never staged into scratch),
-        _rebase_point_splice_reads (pin the index to iteration 0 so the
-        advance is not applied twice), and insert_restickify's per-dep advance
-        handover. Numerics, not just compilation: every one of those can be
+        keep the loop term in the index (per_trip_index pins it in the base
+        coordinates, so the advance is not applied twice), and
+        insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
         got wrong in a way that compiles and re-reads the same page.
 
         Two matmuls per trip and a distinct page per trip, so an advance
@@ -1076,6 +1126,45 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         )
 
 
+def _record_loop_membership(result: dict):
+    """A pre-scheduling pipeline that records, once it is done, where the ops that
+    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+
+    An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
+    constant to the head of the graph and it keeps its ``loop_info`` (see
+    ``counted_loop_path``), so it claims a loop from the top level by design.
+    ``result`` is filled in rather than kept on the class, so tests share no state.
+    """
+    from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_node import LoopNode
+
+    class _Record(CustomPreSchedulingPasses):
+        def __call__(self, graph) -> None:
+            super().__call__(graph)
+
+            def claims_a_loop(op):
+                return (
+                    not isinstance(op, SpyreConstantFallback)
+                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+                    is not None
+                )
+
+            result["top_level"] = [
+                op.get_operation_name()
+                for op in graph.operations
+                if not isinstance(op, LoopNode) and claims_a_loop(op)
+            ]
+            result["in_body"] = [
+                op.get_operation_name()
+                for node in graph.operations
+                if isinstance(node, LoopNode)
+                for op in all_ops(node.body)
+                if claims_a_loop(op)
+            ]
+
+    return _Record
+
+
 class _CollectRegions(CustomPreSchedulingPasses):
     """Pre-scheduling pipeline that records the graph's regions once it is done."""
 
@@ -1358,6 +1447,61 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
         compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
         with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
             compiled(pool, ids, init)
+
+
+# --- Slice(dim, extent) as the for_each_tile#5763 remedy --------------------
+
+SCALE_TRIPS, SCALE_WIDTH = 4, 256
+
+
+def slice_scale_row_fn(x, scale, init):
+    from torch_spyre._inductor.wsr import Slice, for_each_tile
+
+    def fn(x, scale, init):
+        def body(carry, tiles):
+            x_tile, scale_row = tiles
+            return (carry[0] + x_tile * scale_row,), None
+
+        (acc,), _ = for_each_tile(
+            body, (x, scale), dims=(0, Slice(0, extent=1)), tile_size=1, init=(init,)
+        )
+        return acc
+
+    return fn(x, scale, init)
+
+
+class TestForEachTileSliceScaleTableE2E(_DynamoResetTestCase):
+    """Slice(dim, extent) compiled on device at the exact shape issue #5763 reports.
+
+    #5763 ("for_each_tile with a short Gather index fails") gathers one row at a
+    time from a [4, 256] fp16 scale table with a 4-long index -- the same
+    sub-stick, one-element-per-trip advance ``TestForEachTileSubStickAdvanceE2E``
+    above still refuses; Gather itself is unchanged by this PR. ``Slice(0,
+    extent=1)`` is the issue's other accepted fix: a per-trip row that is really
+    just "the next row" needs no index table at all.
+    ``test_slice_extent_differs_from_tile_size`` in test_for_each_tile.py already
+    covers this through ``_assert_lowers`` -- the post-grad graph's shape only,
+    no device involved. This test compiles the issue's own [4, 256] shape through
+    the real Spyre backend, so the fix is exercised where #5763 originally
+    failed -- codegen -- and "downstream needs no change" is checked in CI, not
+    just asserted in the PR description.
+    """
+
+    def test_slice_scale_table_compiles_at_issue_shape(self):
+        x = cached_randn((SCALE_TRIPS, SCALE_WIDTH))
+        scale = cached_randn((SCALE_TRIPS, SCALE_WIDTH), differentiation=1)
+        init = torch.zeros(1, SCALE_WIDTH, dtype=torch.float16)
+
+        ref = torch.zeros(1, SCALE_WIDTH)
+        for i in range(SCALE_TRIPS):
+            ref = ref + dl16_round(x[i : i + 1].float()) * dl16_round(
+                scale[i : i + 1].float()
+            )
+
+        compiled = torch.compile(slice_scale_row_fn, backend="inductor", fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME), scale.to(DEVICE_NAME), init.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
 
 
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
@@ -2043,6 +2187,60 @@ class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
 
         torch.testing.assert_close(a.cpu().float(), ref_a, atol=0, rtol=0)
         torch.testing.assert_close(b.cpu().float(), ref_b, atol=0, rtol=0)
+
+
+def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over a varying length, so the trip count is symbolic."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * 2
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
+class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
+    """One compiled graph serves a declared range, at a second tile size.
+
+    A second body op (a plain scale) and a second granularity (32 rows) beside
+    ``tests/inductor/test_symbolic_loop_e2e.py``'s gelu at 64. The tensor is
+    declared with ``.to(DEVICE_NAME, dynamic=...)`` (#5179), so its buffer is
+    reserved at the maximum and the kernel's geometry is built there, and the
+    launch binds the logical size into the loop's dimension slot. 96 rows is
+    three trips of 32 and not a multiple of 64, so the granularity in use is
+    the declared one and not the other test's.
+    """
+
+    SPEC = {"min": 64, "max": 512, "granularity": 32}
+
+    def test_one_graph_right_at_every_size(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
+        compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
+
+        for rows in (128, 64, 512, 96, 256):
+            y.resize_((rows, 64))
+            out = compiled(y).cpu().float()
+            # Not exact: the device rounds fp16 arithmetic its own way, and a
+            # plain eager ``y * 2`` on a Spyre tensor is already one fp16 ulp off
+            # the host on about half the elements (measured 6 Nov 2026). One
+            # ulp of a value below 4 is under 4e-3, so 1e-2 is a real check of
+            # the rows and not of the rounding.
+            torch.testing.assert_close(
+                out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
 if __name__ == "__main__":
