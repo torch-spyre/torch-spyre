@@ -1014,7 +1014,8 @@ jobs:
           python3 benchmarks/tools/check_report_coverage.py "${RESULTS_DIR}" ${strict} \
             --cases-file "${GITHUB_WORKSPACE}/bench-cases.txt"
           # Only the cases whose rows this report holds: a declared series the suite no longer emits is not a failure.
-          export BENCH_CASES="$(paste -sd, "${GITHUB_WORKSPACE}/bench-cases.txt")"
+          BENCH_CASES="$(paste -sd, "${GITHUB_WORKSPACE}/bench-cases.txt")"
+          export BENCH_CASES
           [ -n "${BENCH_CASES}" ] || { echo "::error::the report holds no declared case"; exit 1; }
           make bench-run BENCH_RESULTS_DIR="${GITHUB_WORKSPACE}/bench-results"
           python3 benchmarks/tools/collect_ingest_xml.py "${GITHUB_WORKSPACE}/bench-results" \
