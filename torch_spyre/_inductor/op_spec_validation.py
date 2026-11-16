@@ -42,7 +42,7 @@ from typing import NoReturn
 import sympy
 
 from . import config, constants
-from .pass_utils import trailing_stick_dims
+from .views import stick_dims_from_size
 from .core_mapping import owner_slots, transfer_edges
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
@@ -621,7 +621,7 @@ def _arg_free_syms(arg: TensorArg) -> set[sympy.Symbol]:
 def _max_stick_dims(op_spec: OpSpec) -> int:
     """Most stick dims any arg of the op has (2 for a QFP8WT stick, else 1)."""
     counts = [
-        len(trailing_stick_dims(arg.device_size, arg.device_dtype.elems_per_stick()))
+        len(stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick()))
         for arg in op_spec.args
         if arg.device_coordinates
     ]
@@ -635,7 +635,7 @@ def _arg_stick_syms(arg: TensorArg) -> set[sympy.Symbol]:
     """
     if not arg.device_coordinates:
         return set()
-    dims = trailing_stick_dims(arg.device_size, arg.device_dtype.elems_per_stick())
+    dims = stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick())
     if len(dims) <= 1:
         # Single-stick args keep the original contract: the last coordinate.
         return arg.device_coordinates[-1].free_symbols

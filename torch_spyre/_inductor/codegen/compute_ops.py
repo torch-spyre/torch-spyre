@@ -348,15 +348,6 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
-def _layout_info_for_tensor(sdsc_spec, tensor) -> dict:
-    """Return the layout metadata to emit for a tensor.
-
-    A QFP8WT tensor's layout already carries its 2D stick (see
-    ``propagate_layouts.qfp8wt_layout``), so its metadata is emitted as-is.
-    """
-    return sdsc_spec.layouts[tensor.layout]
-
-
 def gen_coord_info_value(
     size: int,
     nsplits: int,
@@ -1593,7 +1584,7 @@ def generate_sdsc(
                                             else {}
                                         ),
                                     }
-                                )(_layout_info_for_tensor(sdsc_spec, tensor))
+                                )(sdsc_spec.layouts[tensor.layout])
                                 # Keyed by tensor.layout (the layout-role label assigned by
                                 # _get_layout_label). Two tensors share a label only when their
                                 # dim_order, stick_dim_order, and stick_size are all identical —

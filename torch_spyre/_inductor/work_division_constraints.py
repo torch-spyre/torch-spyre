@@ -276,7 +276,13 @@ def direct_read_source_stick_split_domains(
     if not coordinates or eps <= 0:
         return ConstraintResult()
 
-    stick_coord = sympy.expand(coordinates[-1])
+    # Only a single-dim stick has the canonical Mod(v, eps) coordinate; a multi-dim
+    # stick (QFP8WT's [64, 2]) splits across several coordinates and is left to
+    # adjust_it_space_for_sticks, which keeps each stick variable whole.
+    sticks = stick_dims(source_layout.device_layout)
+    if len(sticks) != 1:
+        return ConstraintResult()
+    stick_coord = sympy.expand(coordinates[sticks[0]])
     allowed_splits: dict[Symbol, frozenset[int]] = {}
     for symbol, extent_expr in ctx.it_space.items():
         if sympy.simplify(stick_coord - sympy.Mod(symbol, eps)) != 0:

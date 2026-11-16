@@ -214,12 +214,15 @@ class TestSpyreConfig(InductorTestCase):
         This is a follow up work.
         """
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        # Minimal TensorDep stand-in: the function only reads
-        # device_coords[-1], dep.name, and layout.device_layout.elems_per_stick().
+        # Minimal TensorDep stand-in: the function only reads dep.name,
+        # device_coords, and the layout's device_size and elems_per_stick()
+        # (to find the stick dims).
         fake_td = SimpleNamespace(
             dep=SimpleNamespace(name="fake_buf"),
             layout=SimpleNamespace(
-                device_layout=SimpleNamespace(elems_per_stick=lambda: 64)
+                device_layout=SimpleNamespace(
+                    device_size=[64], elems_per_stick=lambda: 64
+                )
             ),
             device_coords=[s0],
         )
@@ -228,6 +231,25 @@ class TestSpyreConfig(InductorTestCase):
                 {s0: sympy.Integer(128)}, [fake_td], {s0: (512, 64)}
             )
         self.assertIn("symbolic stick dim", str(cm.exception))
+
+    def test_iteration_extent_is_one_does_not_resolve_symbols(self):
+        """A symbolic extent is never treated as 1, and needs no active graph."""
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        x, y = sympy.symbols("x y")
+        symbol_mapping = {x: sympy.Symbol("z0"), y: sympy.Symbol("z1")}
+        op_spec = SimpleNamespace(
+            iteration_space={x: (sympy.Integer(1), 1), y: (s0, 1)}
+        )
+        self.assertTrue(
+            superdsc._iteration_extent_is_one(
+                op_spec, symbol_mapping, symbol_mapping[x]
+            )
+        )
+        self.assertFalse(
+            superdsc._iteration_extent_is_one(
+                op_spec, symbol_mapping, symbol_mapping[y]
+            )
+        )
 
     def test_inplace_op_run_call_deduplicates_args(self):
         """An inplace op (x *= 2) must not pass the same tensor twice to .run().

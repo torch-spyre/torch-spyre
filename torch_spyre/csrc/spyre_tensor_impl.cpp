@@ -310,8 +310,9 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
   uint64_t size_bytes = (elems * bits + 7) / 8;
   // A stick can span several trailing device dims (QFP8WT's [2, 64]): take the
   // innermost dims whose sizes multiply to elems as the stick, the same rule as
-  // trailing_stick_dims in pass_utils.py, and multiply only the dims outside
-  // it. A single-dim stick keeps the one-dim rule below.
+  // stick_dims_from_size in views.py, and multiply only the dims outside it.
+  // NOTE: keep this loop in sync with stick_dims_from_size. A single-dim stick
+  // keeps the one-dim rule below.
   int stick_dims = 1;
   int64_t stick_extent = 1;
   const int rank = static_cast<int>(device_size.size());

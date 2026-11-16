@@ -315,3 +315,8 @@ POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
 # for free, so the mapping stays aligned with the surviving iteration-space
 # dims.
 CONV_DIM_LABELS = ["mb", "i", "j", "out", "in", "ki", "kj"]
+
+# The QFP8WT 2D stick: 64 N elements by 2 K elements (128 bytes at fp8). The
+# device shape is [..., N/64, K/2, 64, 2]; see pass_utils.qfp8wt_layout.
+QFP8WT_STICK_N = 64
+QFP8WT_STICK_K = 2

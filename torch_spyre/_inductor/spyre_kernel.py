@@ -2218,6 +2218,8 @@ def _restickify_restore_elided_dim(op_spec) -> None:
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]
 
     def _stick_sym(arg):
+        # Restickify only takes STANDARD layouts (compute_restickify_needed
+        # rejects the rest), so the stick is the last device dim.
         syms = tuple(arg.device_coordinates[-1].free_symbols)
         assert len(syms) <= 1, f"expected 0 or 1 free symbols, got {len(syms)}"
         return syms[0] if syms else None

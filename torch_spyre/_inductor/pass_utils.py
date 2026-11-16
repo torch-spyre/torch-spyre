@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import io
 import itertools
 import math
@@ -81,6 +82,8 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
+    QFP8WT_STICK_K,
+    QFP8WT_STICK_N,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
 )
@@ -101,6 +104,7 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
+    stick_dims_from_size,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1877,69 +1881,81 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, modulus: int) -> None:
         )
 
 
-def trailing_stick_dims(device_size, elems_per_stick: int) -> list[int]:
-    """Indices of the trailing device dims that together make one stick.
+def qfp8wt_layout(
+    host_size: list[int],
+    host_strides: list[int],
+    dtype: torch.dtype,
+    k_dim: int | None = None,
+) -> SpyreTensorLayout:
+    """Device layout of a QFP8WT tensor with its 2D [2, 64] stick.
 
-    Walks the device dims from the innermost outward and keeps dims until their
-    sizes multiply to ``elems_per_stick``. A QFP8WT stick ([K/2, N/64, 2, 64])
-    is two dims; a standard stick is one.
+    ``k_dim`` is the host dim holding K, the matmul's reduction dim; it defaults
+    to host dim -2. N is always the last host dim and must be contiguous. The
+    device shape is ``[outer..., N/64, K/2, 64, 2]``: the other host dims in
+    host order, then the N tile and K tile, then the stick (64 wide N, 2 wide K).
+    ``stick_dims`` returns the last two device dims, and the stick's 2-wide dim
+    always carries K's host stride. This is the layout the generic host/device
+    copy in ``spyre_mem.cpp`` walks, from the ``stride_map``. K and N must be
+    multiples of ``QFP8WT_STICK_K`` and ``QFP8WT_STICK_N``.
+
+    Args:
+        host_size: Host sizes, K and N included.
+        host_strides: Host strides matching ``host_size``.
+        dtype: FP8 dtype of the tensor.
+        k_dim: Host dim of K; negative values count from the end.
     """
-    dims: list[int] = []
-    product = 1
-    for i in reversed(range(len(device_size))):
-        if product == elems_per_stick:
-            break
-        if device_size[i] == 1:
-            continue
-        dims.append(i)
-        product *= device_size[i]
-    if product != elems_per_stick:
-        # No run of trailing dims holds exactly one stick (a sparse layout such
-        # as [.., 97, 32]): the stick is the last dim alone.
-        return [len(device_size) - 1] if len(device_size) else []
-    return list(reversed(dims))
+    rank = len(host_size)
+    if rank < 2:
+        raise Unsupported(f"QFP8WT needs a host tensor of rank >= 2, got {rank}")
+    k_dim = rank - 2 if k_dim is None else k_dim % rank
+    if k_dim == rank - 1:
+        raise ValueError("QFP8WT K and N cannot be the same host dim")
+    outer_dims = [i for i in range(rank - 1) if i != k_dim]
+    k, n = host_size[k_dim], host_size[-1]
+    s_k, s_n = host_strides[k_dim], host_strides[-1]
+    if s_n != 1:
+        raise Unsupported(f"QFP8WT needs contiguous N, got stride {s_n}")
+    if k % QFP8WT_STICK_K != 0 or n % QFP8WT_STICK_N != 0:
+        # k // 2 and n // 64 below would truncate and drop elements silently.
+        raise Unsupported(
+            f"QFP8WT tensor [K={k}, N={n}]: K must be a multiple of "
+            f"{QFP8WT_STICK_K} and N a multiple of {QFP8WT_STICK_N} for the 2D "
+            f"[{QFP8WT_STICK_K}, {QFP8WT_STICK_N}] stick"
+        )
+    outer = [host_size[i] for i in outer_dims]
+    outer_strides = [host_strides[i] for i in outer_dims]
+    device_size = [
+        *outer,
+        n // QFP8WT_STICK_N,
+        k // QFP8WT_STICK_K,
+        QFP8WT_STICK_N,
+        QFP8WT_STICK_K,
+    ]
+    stride_map = [*outer_strides, QFP8WT_STICK_N, QFP8WT_STICK_K * s_k, s_n, s_k]
+    valid_elements: dict[tuple[int, ...], int] = {
+        (len(outer), len(outer) + 2): n,
+        (len(outer) + 1, len(outer) + 3): k,
+    }
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        get_device_dtype(dtype),
+        ElementArrangement.QFP8WT,
+        valid_elements,
+    )
 
 
 def stick_dims(stl: SpyreTensorLayout) -> list[int]:
     """Indices of the stick device dimensions of ``stl``, outermost first.
 
-    A stick dimension is a device dimension of size > 1 whose row-major stride,
-    computed from ``device_size``, is below ``elems_per_stick``. A layout's
-    stick dimensions hold exactly one full stick: their sizes multiply to
-    ``elems_per_stick``, and each stride divides ``elems_per_stick``. A layout
-    such as QFP8WT ``[K/2, N/64, 2, 64]`` has two stick dimensions, ``[2, 64]``.
-    Returns an empty list when no dimension is below the stick size.
+    A layout such as QFP8WT ``[N/64, K/2, 64, 2]`` has two stick dimensions,
+    ``[2, 64]`` in its trailing dims. Returns an empty list when no dimension is
+    below the stick size. See ``views.stick_dims_from_size`` for the definition.
 
     Raises:
-        Unsupported: a stick dimension's stride does not divide
-            ``elems_per_stick``, or the stick dimensions do not hold exactly
-            ``elems_per_stick`` elements.
+        Unsupported: the stick dimensions do not hold exactly one stick.
     """
-    elems_per_stick = stl.elems_per_stick()
-    size = list(stl.device_size)
-    stride = [1] * len(size)
-    for i in range(len(size) - 2, -1, -1):
-        stride[i] = stride[i + 1] * size[i + 1]
-    dims = [
-        i
-        for i, (d_size, d_stride) in enumerate(zip(size, stride))
-        if d_size > 1 and d_stride < elems_per_stick
-    ]
-    if not dims:
-        return dims
-    for i in dims:
-        if elems_per_stick % stride[i] != 0:
-            raise Unsupported(
-                f"stick dimension {i} of {size} has stride {stride[i]}, which does "
-                f"not divide the stick size {elems_per_stick}"
-            )
-    stick_elems = math.prod(size[i] for i in dims)
-    if stick_elems != elems_per_stick:
-        raise Unsupported(
-            f"stick dimensions {dims} of {size} hold {stick_elems} elements, "
-            f"expected a full stick of {elems_per_stick}"
-        )
-    return dims
+    return stick_dims_from_size(stl.device_size, stl.elems_per_stick(), strict=True)
 
 
 def device_coordinates(
@@ -3084,8 +3100,11 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
-STICK_RULE_POINTWISE = "pointwise"
-STICK_RULE_BMM = "bmm"
+class StickRule(enum.Enum):
+    """Op-specific rule set applied by ``stick_compatible``."""
+
+    POINTWISE = "pointwise"
+    BMM = "bmm"
 
 
 def _stick_terms_and_residue(
@@ -3113,35 +3132,33 @@ def stick_compatible(
     coords: "list[list[sympy.Expr]]",
     stls: "list[SpyreTensorLayout]",
     *,
-    op_kind: str | None = None,
+    op_kind: StickRule | None = None,
 ) -> bool:
     """Return True if all tensors are stick-compatible.
 
     coords: list of device_coordinates() results, one per tensor.
     stls: the layout of each tensor, in the same order, used to find its stick
-        dims. A stick can span several device dims (QFP8WT's [K/2, N/64, 2, 64]
+        dims. A stick can span several device dims (QFP8WT's [N/64, K/2, 64, 2]
         stick is the N and K dims), so each tensor may contribute several stick
         variables.
     op_kind: the rule set to apply on top of the stick-variable count check.
-        ``STICK_RULE_POINTWISE`` for pointwise ops, ``STICK_RULE_BMM`` for
+        ``StickRule.POINTWISE`` for pointwise ops, ``StickRule.BMM`` for
         batched matmul (``out = arg_0 @ arg_1``), or None for the count check
         alone.
 
     The count check: the tensors' stick variables, taken together, form the
     stick of one layout, with at most one stick variable per stick dim.
 
-    ``STICK_RULE_POINTWISE``: the non-empty stick terms are identical across
+    ``StickRule.POINTWISE``: the non-empty stick terms are identical across
     tensors, and a stick variable does not occur in the residue of a tensor
     with no stick term. A tensor whose stick is constant (0) therefore cannot
     take a stick variable that indexes its outer dims.
 
-    ``STICK_RULE_BMM``: non-empty stick terms are nested (one contains the
+    ``StickRule.BMM``: non-empty stick terms are nested (one contains the
     other, so an fp8 weight's [K, N] stick matches an fp16 output's N stick).
     Each tensor's stick variables do not occur in another tensor's residue.
     This forbids the arg_0 stick in out and the arg_1 stick in arg_0.
     """
-    if op_kind not in (None, STICK_RULE_POINTWISE, STICK_RULE_BMM):
-        raise ValueError(f"unknown stick rule {op_kind!r}")
     terms: list[set[sympy.Symbol]] = []
     residues: list[set[sympy.Symbol]] = []
     for dc, stl in zip(coords, stls):
@@ -3154,14 +3171,14 @@ def stick_compatible(
         return False
     if op_kind is None:
         return True
-    if op_kind == STICK_RULE_POINTWISE:
+    if op_kind == StickRule.POINTWISE:
         nonempty = {frozenset(t) for t in terms if t}
         if len(nonempty) > 1:
             return False
         return all(
             not (stick_vars & residue) for t, residue in zip(terms, residues) if not t
         )
-    # STICK_RULE_BMM
+    # StickRule.BMM
     for i, j in itertools.permutations(range(len(terms)), 2):
         both_sticked = bool(terms[i]) and bool(terms[j])
         if both_sticked and not (terms[i] <= terms[j] or terms[j] <= terms[i]):
@@ -3239,6 +3256,53 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
+def _stick_rule_for_op(
+    op: "str | None", out_stl: SpyreTensorLayout
+) -> "tuple[StickRule | None, bool]":
+    """Return the ``stick_compatible`` rule for ``op`` and a QFP8WT-producer flag.
+
+    The flag is True for a non-matmul op writing a QFP8WT output.
+    """
+    qfp8wt_producer = (
+        op is not None
+        and not _is_matmul_op(op)
+        and out_stl.element_arrangement == ElementArrangement.QFP8WT
+    )
+    if op is None or qfp8wt_producer:
+        # A QFP8WT output has two stick variables (N and K), so the pointwise
+        # rule "stick terms are identical across tensors" cannot hold against a
+        # one-variable input stick; the N check below decides instead.
+        return None, qfp8wt_producer
+    if _is_matmul_op(op):
+        return StickRule.BMM, False
+    return StickRule.POINTWISE, False
+
+
+def _qfp8wt_producer_input_is_n(
+    idc: "list[sympy.Expr]",
+    out_idc: "list[sympy.Expr]",
+    in_stl: SpyreTensorLayout,
+    out_stl: SpyreTensorLayout,
+) -> "bool | None":
+    """Whether a QFP8WT producer's input stick carries the output's N.
+
+    A QFP8WT output's stick is the last two dims of ``qfp8wt_layout``: the outer
+    one is N (64 wide), the inner one is K (2 wide). A non-matmul producer
+    writes N, so the input's stick (its innermost stick dim) must carry N. The
+    union rule of ``stick_compatible`` alone also accepts the input's K.
+
+    Returns None when the input's stick is constant: a size-1 dim carries no N,
+    and restickifying it would restore a size-1 loop dim the backend rejects, so
+    no restickify is feasible.
+    """
+    out_n_dim = stick_dims(out_stl)[0]
+    in_stick = stick_dims(in_stl)[-1]
+    in_n = idc[in_stick].free_symbols
+    if not in_n:
+        return None
+    return in_n <= out_idc[out_n_dim].free_symbols
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3306,34 +3370,13 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    qfp8wt_producer = (
-        op is not None
-        and not _is_matmul_op(op)
-        and out_stl.element_arrangement == ElementArrangement.QFP8WT
-    )
-    if op is None or qfp8wt_producer:
-        # A QFP8WT output has two stick variables (N and K), so the pointwise
-        # rule "stick terms are identical across tensors" cannot hold against a
-        # one-variable input stick; the widest-dim check below decides instead.
-        op_kind = None
-    elif _is_matmul_op(op):
-        op_kind = STICK_RULE_BMM
-    else:
-        op_kind = STICK_RULE_POINTWISE
+    op_kind, qfp8wt_producer = _stick_rule_for_op(op, out_stl)
     compatible = stick_compatible([idc, out_idc], [in_stl, out_stl], op_kind=op_kind)
     if compatible and qfp8wt_producer:
-        # A QFP8WT output's stick is the two dims [N/64, K/2, 64, 2] of
-        # qfp8wt_layout: its outer stick dim is N (the 64-wide one) and its inner
-        # stick dim is K (2-wide). A non-matmul producer writes N, so the input's
-        # stick must carry N. The union rule alone also accepts the input's K.
-        out_n_dim = stick_dims(out_stl)[0]
-        in_stick = stick_dims(in_stl)[-1]
-        in_n = idc[in_stick].free_symbols
-        if not in_n:
-            # A constant stick (a size-1 dim) carries no N, and restickifying it
-            # would restore a size-1 loop dim the backend rejects. Infeasible.
+        n_compatible = _qfp8wt_producer_input_is_n(idc, out_idc, in_stl, out_stl)
+        if n_compatible is None:
             return True, None
-        compatible = in_n <= out_idc[out_n_dim].free_symbols
+        compatible = n_compatible
     if not factorized_layout_mismatch and in_stick_offset_free and compatible:
         return False, None
 
@@ -3370,8 +3413,9 @@ def compute_restickify_needed(
     out_sticks = stick_dims(out_stl)
     target_dim: int | None
     if out_sticks and out_stl.element_arrangement == ElementArrangement.QFP8WT:
-        # A QFP8WT stick is [K/2, 64]: the input's stick is N, the 64-wide dim
+        # A QFP8WT stick is [64, 2]: the input's stick is N, the 64-wide dim
         # (the innermost dim is K, the 2-wide one).
+        # The 64-wide N dim is larger than the 2-wide K dim.
         target_dim = max(out_sticks, key=lambda d: out_stl.device_size[d])
     else:
         target_dim = out_sticks[-1] if out_sticks else None

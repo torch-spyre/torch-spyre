@@ -93,6 +93,7 @@ from torch_spyre._C import (
     spyre_empty_with_layout,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.pass_utils import qfp8wt_layout
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("model_utils")
@@ -306,10 +307,10 @@ def _dma_to_spyre_fp8_kernel(
     # The device layout comes from the same helper as the compiler's
     # _qfp8wt_stl, so the uploaded weight and the compiled kernel agree on the
     # [2, 64] stick. The generic host/device copy derives its geometry from the
-    # CPU tensor's strides and the layout's stride_map, so the two must agree:
-    # make a transposed view (e.g. p.t()) row-major [N, 1] first.
-    from torch_spyre._inductor.propagate_layouts import qfp8wt_layout
-
+    # CPU tensor's strides and the layout's stride_map, so the two must agree.
+    # Make a transposed view (e.g. p.t()) row-major [N, 1] first. This costs a
+    # CPU copy for non-contiguous weights, which the former dedicated QFP8WT
+    # copy path avoided.
     if not weight.is_contiguous():
         weight = weight.contiguous()
     K, N = weight.shape

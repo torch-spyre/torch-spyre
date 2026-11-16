@@ -668,27 +668,56 @@ class Term:
         )
 
 
-def stick_run(size: Sequence, elems_per_stick: int) -> list[int]:
-    """Device dims of the trailing stick run, outermost first.
+def stick_dims_from_size(
+    device_size: Sequence, elems_per_stick: int, *, strict: bool = False
+) -> list[int]:
+    """Indices of the stick device dims for a ``device_size``, outermost first.
 
-    Walks the dims from the innermost outward, keeping dims until their sizes
-    multiply to ``elems_per_stick``. A standard stick is its last dim; a QFP8WT
-    stick ([K/2, N/64, 2, 64]) is the last two.
+    A stick dimension is a device dim of size > 1 whose row-major stride, computed
+    from ``device_size``, is below ``elems_per_stick``. The stick dims of a valid
+    layout hold exactly one stick: their sizes multiply to ``elems_per_stick`` and
+    each stride divides it. A standard layout has one stick dim; a QFP8WT layout
+    ``[.., N/64, K/2, 64, 2]`` has two.
+
+    A layout whose stick dims do not hold exactly one stick is malformed. With
+    ``strict`` it raises ``Unsupported``; otherwise the last dim alone is
+    returned, so a caller handed a hand-built layout still gets a single stick
+    dim.
+
+    NOTE: keep in sync with the stick-extent loop in ``get_device_size_in_bytes``
+    (spyre_tensor_impl.cpp).
+
+    Raises:
+        Unsupported: ``strict`` and the layout is malformed.
     """
-    dims: list[int] = []
-    product = 1
-    for i in reversed(range(len(size))):
-        if product == elems_per_stick:
-            break
-        if int(size[i]) == 1:
-            continue
-        dims.append(i)
-        product *= int(size[i])
-    if product != elems_per_stick:
-        # The trailing dims do not hold exactly one stick (a sparse layout such
-        # as [.., 97, 32]): there is no multi-dim stick, only the last dim.
-        return [len(size) - 1]
-    return list(reversed(dims))
+    size = [int(s) for s in device_size]
+    stride = [1] * len(size)
+    for i in range(len(size) - 2, -1, -1):
+        stride[i] = stride[i + 1] * size[i + 1]
+    dims = [
+        i
+        for i, (d_size, d_stride) in enumerate(zip(size, stride))
+        if d_size > 1 and d_stride < elems_per_stick
+    ]
+    if strict and not dims:
+        return dims
+    for i in dims:
+        if elems_per_stick % stride[i] != 0:
+            if strict:
+                raise Unsupported(
+                    f"stick dimension {i} of {size} has stride {stride[i]}, which "
+                    f"does not divide the stick size {elems_per_stick}"
+                )
+            return [len(size) - 1] if size else []
+    stick_elems = math.prod(size[i] for i in dims)
+    if stick_elems != elems_per_stick:
+        if strict:
+            raise Unsupported(
+                f"stick dimensions {dims} of {size} hold {stick_elems} elements, "
+                f"expected a full stick of {elems_per_stick}"
+            )
+        return [len(size) - 1] if size else []
+    return dims
 
 
 def normalize_coordinates(
@@ -1085,7 +1114,7 @@ def align_tensors_pure(
 
     for tensor in tensors:
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
-        run = stick_run(tensor["size"], tensor["elems_per_stick"])
+        run = stick_dims_from_size(tensor["size"], tensor["elems_per_stick"])
         terms = normalize_coordinates(
             var_ranges,
             tensor["size"],
@@ -1119,9 +1148,9 @@ def align_tensors_pure(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     # per tensor, per variable: the stick sizes of its trailing stick run
-    stick_extents: list[dict] = []
+    stick_extents: list[dict[sympy.Symbol, set[int]]] = []
     for i, terms in enumerate(all_terms):
-        extents: dict = {}
+        extents: dict[sympy.Symbol, set[int]] = {}
         for term in terms[len(terms) - stick_counts[i] :]:
             if term.var is not None:
                 extents.setdefault(term.var, set()).add(int(term.dim_size))
@@ -1132,10 +1161,7 @@ def align_tensors_pure(
         # den/mod are the stick's own extent, not split points, so they are left
         # out of the split table. This covers every stick dim of the tensor (a
         # QFP8WT weight has one per dim), not only the innermost one.
-        stick_sizes_of: dict = {}
-        for term in terms[len(terms) - stick_counts[i] :]:
-            if term.var is not None:
-                stick_sizes_of.setdefault(term.var, set()).add(int(term.dim_size))
+        stick_sizes_of = stick_extents[i]
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is None:
                 continue

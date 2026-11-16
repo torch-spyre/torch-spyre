@@ -71,6 +71,7 @@ from .constants import (
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
     MATMUL_REDUCTION_OPS,
+    QFP8WT_STICK_N,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -82,6 +83,7 @@ from .ir import (
     SpyreEmptyFallback,
 )
 from .pass_utils import (
+    qfp8wt_layout,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
@@ -527,60 +529,6 @@ def _qfp8ch_stl(
         out_stride_map,
         get_device_dtype(out_dtype),
         ElementArrangement.QFP8CH,
-    )
-
-
-def qfp8wt_layout(
-    host_size: list[int],
-    host_strides: list[int],
-    dtype: torch.dtype,
-    k_dim: int | None = None,
-) -> SpyreTensorLayout:
-    """Device layout of a QFP8WT tensor with its 2D [2, 64] stick.
-
-    ``k_dim`` is the host dim holding K, the matmul's reduction dim; it defaults
-    to host dim -2. N is always the last host dim and must be contiguous. The
-    device shape is ``[outer..., N/64, K/2, 64, 2]``: the other host dims in
-    host order, then the N tile and K tile, then the stick (64 wide N, 2 wide K).
-    ``stick_dims`` returns the last two device dims, and the stick's 2-wide dim
-    always carries K's host stride. This is the layout the generic host/device
-    copy in ``spyre_mem.cpp`` walks, from the ``stride_map``. K and N must be
-    multiples of 2 and 64.
-
-    Args:
-        host_size: Host sizes, K and N included.
-        host_strides: Host strides matching ``host_size``.
-        dtype: FP8 dtype of the tensor.
-        k_dim: Host dim of K; negative values count from the end.
-    """
-    rank = len(host_size)
-    k_dim = rank - 2 if k_dim is None else k_dim % rank
-    if k_dim == rank - 1:
-        raise ValueError("QFP8WT K and N cannot be the same host dim")
-    outer_dims = [i for i in range(rank - 1) if i != k_dim]
-    k, n = host_size[k_dim], host_size[-1]
-    s_k, s_n = host_strides[k_dim], host_strides[-1]
-    assert s_n == 1, f"QFP8WT needs contiguous N, got stride {s_n}"
-    if k % 2 != 0 or n % 64 != 0:
-        # k // 2 and n // 64 below would truncate and drop elements silently.
-        raise Unsupported(
-            f"QFP8WT tensor [K={k}, N={n}]: K must be a multiple of 2 and N a "
-            "multiple of 64 for the 2D [2, 64] stick"
-        )
-    outer = [host_size[i] for i in outer_dims]
-    outer_strides = [host_strides[i] for i in outer_dims]
-    device_size = [*outer, n // 64, k // 2, 64, 2]
-    stride_map = [*outer_strides, 64, 2 * s_k, s_n, s_k]
-    valid_elements: dict[tuple[int, ...], int] = {
-        (len(outer), len(outer) + 2): n,
-        (len(outer) + 1, len(outer) + 3): k,
-    }
-    return SpyreTensorLayout(
-        device_size,
-        stride_map,
-        get_device_dtype(dtype),
-        ElementArrangement.QFP8WT,
-        valid_elements,
     )
 
 
@@ -1415,7 +1363,7 @@ def _carries_n_stick_var(
     with N on the 2-wide dim is rejected here, and layout selection fails.
     """
     return any(
-        stl.device_size[d] == 64 and stick_var in dev_coords[d].free_symbols
+        stl.device_size[d] == QFP8WT_STICK_N and stick_var in dev_coords[d].free_symbols
         for d in stick_dims(stl)
     )
 
@@ -1445,7 +1393,8 @@ def _find_quantized_candidate(
             # matmul's reduction var) on the 2-wide one.
             if not _carries_n_stick_var(stl, dev_coords, stick_var):
                 continue
-            if k_var is not None and k_var not in dev_coords[-1].free_symbols:
+            k_coord = dev_coords[stick_dims(stl)[-1]]
+            if k_var is not None and k_var not in k_coord.free_symbols:
                 continue
         elif (
             reduction_type == BATCH_MATMUL_FP8_OP or ea in STAGGERED_EAS
