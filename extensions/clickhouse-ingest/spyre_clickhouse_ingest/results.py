@@ -1920,6 +1920,7 @@ def main(argv=None, assigned_trust=""):
         or args.sendnn_report
         or args.benchmarks_dir
         or args.tables_dir
+        or getattr(args, "bench_dir", "")
     ):
         sys.exit(
             "--purpose is recorded for the perf report.xml ingest only (--xml-dir/--xml-file); "
