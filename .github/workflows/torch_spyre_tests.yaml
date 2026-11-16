@@ -244,7 +244,7 @@ jobs:
   # Informational twin of the job above: dispatched and linked in the run summary but never awaited, and deliberately
   # not in the gate's needs, so a slow or hung run can neither delay nor fail the gate.
   downstream-spyre-inference:
-    name: Integration (spyre-inference)
+    name: Integration (spyre-inference) - dispatched, not awaited
     needs: [changes, decide-spyre-test]
     if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
       needs.changes.outputs.code_changed == 'true'

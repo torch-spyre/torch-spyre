@@ -57,7 +57,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   downstream-integration:
-    name: Integration (${{ matrix.repo }})
+    name: Integration (${{ matrix.repo }})${{ matrix.wait == 'true' && '' || ' - dispatched, not awaited' }}
     needs: resolve
     if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -77,7 +77,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
-      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}
+      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.wait == 'true' && '' || ' (not awaited)' }}
     steps:
       - name: Report pending
         if: matrix.wait == 'true'
@@ -110,6 +110,15 @@ jobs:
           torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}
           pr_number: ${{ needs.resolve.outputs.number }}
+      # Green here only means the run was started; the status text and name say so, and link the run.
+      - name: Report dispatched
+        if: matrix.wait != 'true'
+        continue-on-error: true
+        env:
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state=success -f context="$STATUS_CONTEXT" \
+            -f description="Dispatched, not awaited: the result is on the linked run" -f target_url="$RUN_URL"
       - name: Report result
         if: always() && matrix.wait == 'true'
         continue-on-error: true
