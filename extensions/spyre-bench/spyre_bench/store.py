@@ -409,15 +409,19 @@ class ClickHouseStore(Store):
             sql = (
                 "SELECT toString(a.artifact_id) AS artifact_id, a.component AS component, a.arch AS arch, a.ts AS ts, "
                 "'build' AS source, '' AS ref_key, '' AS ref_state FROM {db}.v_artifacts AS a "
-                "WHERE a.artifact_id IN (SELECT artifact_id FROM {db}.v_artifact_results_published WHERE props['orch_run_key'] = {v:String}) "
+                "WHERE a.component = {c:String} "
+                "AND a.artifact_id IN (SELECT artifact_id FROM {db}.v_artifact_results_published WHERE props['orch_run_key'] = {v:String}) "
                 "ORDER BY a.ts DESC LIMIT {n:UInt32}"
             )
-            params = {"v": value, **n}
+            params = {"v": value, "c": product, **n}
         elif kind == "ref":
             sql = (
-                "SELECT toString(artifact_id) AS artifact_id, 'reference' AS component, arch, registered_at AS ts, "
-                "'reference' AS source, ref_key, state AS ref_state FROM {db}.v_bench_references WHERE ref_key = {v:String} "
-                "ORDER BY registered_at DESC LIMIT {n:UInt32}"
+                "SELECT toString(v.artifact_id) AS artifact_id, 'reference' AS component, v.arch AS arch, "
+                "v.registered_at AS ts, 'reference' AS source, v.ref_key AS ref_key, v.state AS ref_state, x.product AS product "
+                "FROM {db}.v_bench_references AS v LEFT JOIN "
+                "(SELECT artifact_id, any(component) AS product FROM {db}.v_bench_reference_values GROUP BY artifact_id) AS x "
+                "ON x.artifact_id = v.artifact_id WHERE v.ref_key = {v:String} "
+                "ORDER BY v.registered_at DESC LIMIT {n:UInt32}"
             )
             params = {"v": value, **n}
         else:
@@ -426,6 +430,7 @@ class ClickHouseStore(Store):
                 "max(e.run_ts) AS ts, 'main' AS source, '' AS ref_key, '' AS ref_state "
                 "FROM {db}.v_benchmark_results_enriched AS e INNER JOIN {db}.v_artifacts AS a ON a.artifact_id = e.artifact_id "
                 "WHERE a.component = {c:String} AND e.run_props['run.purpose'] IN {p:Array(String)} "
+                "AND e.run_props['run.validity'] = 'valid' AND e.run_props['run.trust'] != 'external' "
                 "GROUP BY e.artifact_id ORDER BY ts DESC LIMIT {n:UInt32}"
             )
             params = {"c": product, "p": list(purposes) or ["nightly"], **n}
