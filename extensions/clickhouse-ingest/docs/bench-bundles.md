@@ -90,6 +90,20 @@ A bundle that carries a channel-owned key (`run.trust`, `run.actor`, `run.channe
 `run.bundle_sha256`, `run.content_sha256`, `run.row_sha256`, `run.on_behalf_of`, `run.lib_ref`, `upload_id`, `round`,
 or anything under `claim.`) is rejected, never silently overwritten.
 
+## Connected runs (CI)
+
+A CI job records a results directory without an inbox, as the channel it runs in:
+
+```bash
+python -m spyre_clickhouse_ingest results --bench-dir RESULTS_DIR --arch s390x --trigger-type perf \
+  --workflow jenkins-<component>-bench-s390x --channel-trust ci --run-url "$RUN_URL"
+```
+
+The GitHub composite action `ingest-xml-to-clickhouse` takes the same as `bench-dir` and `channel-trust`; a
+Jenkins job uses the `v2Results(benchDir: ...)` step. `--workflow` names the regression verdict series
+(the first segment of each row's `source_file`) and is honoured only for `ci`; a lower channel files its
+rows without one. Without `--channel-trust` the run is recorded as `external`.
+
 ## Qualification and invalidation
 
 - **Qualification.** The record names the node, `env_id`, the evidence run (already ingested as a `bench` run), a limit and, unless the run holds one metric, the canary `metric`. The
