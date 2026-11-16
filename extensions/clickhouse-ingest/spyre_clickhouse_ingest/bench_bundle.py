@@ -230,18 +230,24 @@ def known_ci_envs(client, db: str, ids: list) -> set:
     return {str(r[0]) for r in rows}
 
 
-SERIES = re.compile(r"[A-Za-z0-9._-]+")
+SERIES = re.compile(r"[^/\x00-\x1f\x7f]{1,128}")
 
 
 def series_prefix(meta: dict, trust: str) -> str:
     """`<workflow>/` for a CI bundle, which files its rows in that verdict series (source_job is the
-    first segment of source_file); a lower channel cannot name one."""
-    wf = (meta.get("workflow") or "").strip()
-    if not wf or trust != "ci":
+    first segment of source_file, the legacy ingests' raw `--workflow`); a lower channel cannot name
+    one, and an empty workflow is the unprefixed series."""
+    if trust != "ci":
+        return ""
+    wf = meta.get("workflow") or ""
+    if not isinstance(wf, str):
+        raise BundleError("workflow must be a string")
+    wf = wf.strip()
+    if not wf:
         return ""
     if not SERIES.fullmatch(wf):
         raise BundleError(
-            f"workflow {wf!r} is not a series name (letters, digits, . _ -)"
+            f"workflow {wf!r} is not a series name (1-128 characters, no / or control characters)"
         )
     return wf + "/"
 
