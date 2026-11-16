@@ -192,10 +192,11 @@ class TestDynamicDeclarationValidation(TestCase):
             )
 
     def test_device_layout_reserved_dim_on_stick_rejected(self) -> None:
-        # dim_order puts host dim 0 in the stick: the reserved rows would be
-        # interleaved across sticks and could not be resized in place.
+        # dim_order [1, 0] makes host dim 0 the stick dimension, so the rows land
+        # on the stick-elements device dim (stride_map 1024 at the last position)
+        # and would be interleaved across sticks: not resizable in place.
         stl = SpyreTensorLayout((630, 1024), (1024, 1), torch.float16, [1, 0])
-        with self.assertRaisesRegex(ValueError, "exactly one device dimension"):
+        with self.assertRaisesRegex(ValueError, "stick-elements"):
             self.x.to(
                 DEVICE,
                 device_layout=stl,

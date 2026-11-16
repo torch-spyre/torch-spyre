@@ -45,7 +45,7 @@ from utils_inductor import expects_raise
 
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.config as spyre_config
-from torch_spyre._C import get_spyre_tensor_layout, SpyreTensorLayout
+from torch_spyre._C import get_device_dtype, get_spyre_tensor_layout, SpyreTensorLayout
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.execution.kernel_cache import get_cache_root_dir
 
@@ -150,6 +150,77 @@ def test_a_loop_over_the_declared_dim_is_right_at_every_size():
 
     assert counters["stats"]["unique_graphs"] == 1
     assert _kernel_cache_entries() == 1
+
+
+# A paged-attention chunk index: logical [C, E, 1] int32 as device [C, 1, E, 32],
+# one page id per 128-byte stick, the reserved chunk count C whole at device dim 0.
+# The consumer walks it one chunk per trip and gathers pages with the [E, 1] tile.
+C_MAX, C_MIN, E = 16, 8, 32
+PAGES, BLOCK, HEAD = 64, 64, 64
+CHUNK_SPEC = {"min": C_MIN, "max": C_MAX, "granularity": 1}
+CHUNK_SIZES = [C_MAX, C_MIN, 11, 13, C_MAX]
+
+
+def _chunk_major_layout(num_chunks):
+    return SpyreTensorLayout(
+        [num_chunks, 1, E, 32],
+        [E, 0, 1, 0],
+        get_device_dtype(torch.int32),
+        {(0,): num_chunks, (2,): E, (1, 3): 1},
+    )
+
+
+def gather_pages_and_sum(chunk_page_ids, pages):
+    """One chunk of page ids per trip, the pages gathered and summed into the carry."""
+    n = chunk_page_ids.shape[0]
+    torch._check(n >= C_MIN)
+    torch._check(n <= C_MAX)
+
+    def body(carry, tiles):
+        page_ids, pool = tiles
+        page_ids = page_ids[0]  # [E, 1], the gather splits on it
+        gathered = pool[page_ids].reshape(E, 1, BLOCK, HEAD)
+        return carry + gathered.sum(dim=0, keepdim=True), None
+
+    init = torch.zeros((1, 1, BLOCK, HEAD), dtype=pages.dtype, device=pages.device)
+    carry, _ = for_each_tile(
+        body, (chunk_page_ids, pages), dims=(0, None), tile_size=1, init=init
+    )
+    return carry
+
+
+def test_a_declared_chunk_index_in_an_explicit_layout_gathers_right_at_every_size():
+    """The consumer's shape of #6027: a chunk-major page index declared on its chunk axis.
+
+    The layout is given at the maximum and carries the reserved dim at device dim 0.
+    One compiled gather loop serves every chunk count, values against a CPU gather.
+    fp16 accumulation of up to 16 * 32 pages of values in [0, 1) against an fp32
+    reference: the sums reach the hundreds, so a relative check at 5e-2.
+    """
+    gen = torch.Generator().manual_seed(0)
+    ids = torch.randint(0, PAGES, (C_MAX, E, 1), generator=gen, dtype=torch.int32)
+    pages = torch.rand(PAGES, 1, BLOCK, HEAD, dtype=torch.float16)
+    pages_dev = pages.to(DEVICE)
+    ids_dev = ids.to(
+        DEVICE, device_layout=_chunk_major_layout(C_MAX), dynamic={0: CHUNK_SPEC}
+    )
+    layout = str(get_spyre_tensor_layout(ids_dev))
+    compiled = torch.compile(gather_pages_and_sum, fullgraph=True)
+
+    for n in CHUNK_SIZES:
+        if ids_dev.size(0) != n:
+            ids_dev.resize_((n, E, 1))
+        out = compiled(ids_dev, pages_dev).cpu().float()
+        expected = torch.zeros((1, 1, BLOCK, HEAD), dtype=torch.float32)
+        for c in range(n):
+            picked = pages[ids[c, :, 0].long()].float().reshape(E, 1, BLOCK, HEAD)
+            expected += picked.sum(dim=0, keepdim=True)
+        assert str(get_spyre_tensor_layout(ids_dev)) == layout, f"layout changed at {n}"
+        torch.testing.assert_close(
+            out, expected, rtol=5e-2, atol=5e-1, msg=f"at {n} chunks"
+        )
+
+    assert counters["stats"]["unique_graphs"] == 1
 
 
 def test_the_reserved_tail_is_never_read():
