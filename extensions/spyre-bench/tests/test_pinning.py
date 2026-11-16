@@ -305,7 +305,8 @@ class Resolve(unittest.TestCase):
 
     def test_stage_prefixes_cover_the_rank_tools_exactly(self):
         p = pp.resolve({"policy": "per_device", "cpus_by_device": ["0-1", "4-5"], "layout": "ranks"})
-        self.assertEqual(p.stage_prefixes("/t"), ("/t\0-c\00-1,4-5\0", "/t\0-c\00-1\0", "/t\0-c\04-5\0"))
+        want = tuple("\0".join(["/t", "-c", c]) + "\0" for c in ("0-1,4-5", "0-1", "4-5"))
+        self.assertEqual(p.stage_prefixes("/t"), want)
         for bad in (
             {"policy": "explicit"},
             {"policy": "explicit", "cpus": "x"},
