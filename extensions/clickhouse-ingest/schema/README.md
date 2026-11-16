@@ -61,6 +61,10 @@ without renumbering it:
 | `88` | anchor (baseline) views |
 | `89` | invalidation preview |
 
+Migration numbers: `025` is the reader exclusion; `026` (reference formats) and `027` (uploads) sit on their own
+branches; `028` (`ci_requests` accepts the `comment` channel, rerunnable) is independent of both and applies in
+any order. The ledger is per file, so a gap in the numbers is harmless.
+
 Behaviour notes for consumers of the stack:
 
 - A run with no eligible samples (all invalidated, or only excluded record types) has no row in
