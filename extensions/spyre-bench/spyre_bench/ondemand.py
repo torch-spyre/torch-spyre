@@ -33,6 +33,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import regex
@@ -114,40 +115,20 @@ class Policy:
     approval_ttl: timedelta = timedelta(hours=72)
 
 
-POLICIES = {
-    "github.com": Policy(
-        host="github.com",
-        tiers=("sanity",),
-        reuse_modes=("if_valid", "prefer", "only"),
-        force_all=False,
-        profiles=("off",),
-        custom_env=False,
-        budget_device_hours={"sanity": 4.0},
-        pr_window_device_hours=8.0,
-        per_user_per_hour=6,
-        max_wait_default_s=1800,
-        max_wait_cap_s=3600,
-        clean_per_user=1,
-        clean_per_user_per_day=3,
-        clean_cluster=2,
-    ),
-    "ghe": Policy(
-        host="ghe",
-        tiers=("sanity", "core"),
-        reuse_modes=REUSE_MODES,
-        force_all=True,
-        profiles=("off", "light"),
-        custom_env=True,
-        budget_device_hours={"sanity": 12.0, "core": 48.0},
-        pr_window_device_hours=96.0,
-        per_user_per_hour=6,
-        max_wait_default_s=1800,
-        max_wait_cap_s=3600,
-        clean_per_user=1,
-        clean_per_user_per_day=3,
-        clean_cluster=2,
-    ),
-}
+def _load_policies():
+    """The limits from ondemand_policy.json, the single place they are set."""
+    with open(Path(__file__).with_name("ondemand_policy.json"), encoding="utf-8") as f:
+        raw = json.load(f)
+    out = {}
+    for host in HOSTS:
+        d = raw[host]
+        for key in ("tiers", "reuse_modes", "profiles"):
+            d[key] = tuple(d[key])
+        out[host] = Policy(host=host, **d)
+    return out
+
+
+POLICIES = _load_policies()
 
 
 @dataclass(frozen=True)
@@ -587,7 +568,7 @@ class Decision:
 
 LIVE_STATES = ("active", "previewed", "launched", "admit", "needs_confirm")
 DEAD_STATES = ("cancelled", "denied", "rejected", "deny")
-FINISHED_STATES = ("done", "completed", "finished")
+FINISHED_STATES = ("done", "completed", "finished", "failed")
 
 
 def _hours(value):
@@ -826,6 +807,94 @@ def bench_env(req, product, subject_id="", environment=""):
     if subject_id:
         env["BENCH_SUBJECT_ID"] = subject_id
     return env
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Request log: the ci_requests row for a request, and admission history read back from v_ci_requests.
+
+CI_STATES = ("previewed", "launched", "denied", "rejected", "failed", "cancelled")
+CI_CHANNEL = "comment"
+HISTORY_SQL = (
+    "SELECT toString(request_id) AS id, requested_by AS user, state, subjects, estimate, requested_at AS ts "
+    "FROM v_ci_requests WHERE channel = 'comment' AND target_kind = 'pr' AND requested_at >= now() - INTERVAL 2 DAY"
+)
+
+
+def _uuid7(now=None):
+    import os
+    import uuid
+
+    ms = int((_parse(now) if now else datetime.now(timezone.utc)).timestamp() * 1000)
+    b = bytearray(ms.to_bytes(6, "big") + os.urandom(10))
+    b[6] = (b[6] & 0x0F) | 0x70
+    b[8] = (b[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(b)))
+
+
+def ci_request_row(
+    req, state, actor, *, host, pr, repo, head_sha, plan=None, request_id="", comment_url="", error="", now=None
+):
+    """One ci_requests row (append-only; one per event). `plan` is a plan.json, `actor` the login that caused the event."""
+    if state not in CI_STATES:
+        raise RequestError(f"state {state!r}: one of {', '.join(CI_STATES)}")
+    cases = (plan or {}).get("cases") or []
+    est = (plan or {}).get("estimate") or {}
+    pv = build_preview(plan, req, POLICIES[host]) if plan else None
+    brief = lambda c: {"name": str(c.get("name")), "action": c.get("action"), "reason": str(c.get("reason") or "")}  # noqa: E731
+    return {
+        "request_id": request_id or _uuid7(now),
+        "plan_id": (pv or {}).get("digest", ""),
+        "state": state,
+        "actor": str(actor)[:200],
+        "channel": CI_CHANNEL,
+        "target_kind": "pr",
+        "subjects": json.dumps(
+            {"repo": repo, "pr": int(pr), "head_sha": head_sha, "comment_url": comment_url}, sort_keys=True
+        ),
+        "preset": "bench-pr",
+        "arches": [str(a) for a in ((plan or {}).get("leg") or {}).get("arch", "").split()] or [],
+        "modes": ["perf"],
+        "cells_requested": json.dumps([brief(c) for c in cases if c.get("action") == "run"]),
+        "cells_skipped": json.dumps([brief(c) for c in cases if c.get("action") == "reuse"]),
+        "cells_blocked": json.dumps([brief(c) for c in cases if c.get("action") not in ("run", "reuse")]),
+        "estimate": json.dumps(
+            {
+                "device_hours": est.get("device_hours"),
+                "wall_min": est.get("wall_min"),
+                "clean": req.clean,
+                "limit": budget_limit(req, POLICIES[host]),
+            },
+            sort_keys=True,
+        ),
+        "canonical": json.dumps(req.to_dict(), sort_keys=True),
+        "error": neutral(error, 500),
+        "props": {"bench.host": host, "bench.purpose": req.purpose, "bench.digest": (pv or {}).get("digest", "")},
+    }
+
+
+_HISTORY_STATE = {"previewed": "previewed", "launched": "launched", "denied": "denied", "rejected": "rejected",
+                  "cancelled": "cancelled", "failed": "done"}  # fmt: skip
+
+
+def history_from_ci_requests(rows):
+    """v_ci_requests rows (HISTORY_SQL) -> the history rows `admission` reads. A row it cannot read raises, so a damaged
+    log blocks admission rather than waving a request through."""
+    out = []
+    for r in rows:
+        try:
+            subj = json.loads(r.get("subjects") or "{}")
+            est = json.loads(r.get("estimate") or "{}")
+            out.append(
+                {"id": str(r["id"]), "pr": subj["pr"], "user": str(r["user"]), "ts": r["ts"],
+                 "state": _HISTORY_STATE.get(str(r["state"]).lower(), "unknown"),
+                 "est": est.get("device_hours") if est.get("device_hours") is not None else 0,
+                 "clean": bool(est.get("clean"))}
+            )  # fmt: skip
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise RequestError(
+                "the request log has a row that cannot be read: not admitting anything until it is fixed"
+            ) from None
+    return out
 
 
 STATE_OPEN, STATE_CLOSE, STATE_MAX = "<!-- spyre-bench-state:", "-->", 8192
@@ -1076,6 +1145,31 @@ def _cmd_env(a):
     return cliutil.EXIT_OK
 
 
+def _cmd_record(a):
+    req = OnDemandRequest.from_dict(_load(a.request))
+    plan = _load(a.plan) if a.plan else None
+    row = ci_request_row(
+        req,
+        a.state,
+        a.actor,
+        host=a.host,
+        pr=a.pr,
+        repo=a.repo,
+        head_sha=a.head_sha,
+        plan=plan,
+        request_id=a.request_id or "",
+        comment_url=a.comment_url or "",
+        error=a.error or "",
+    )
+    print(json.dumps(row, sort_keys=True))
+    return cliutil.EXIT_OK
+
+
+def _cmd_history(a):
+    print(json.dumps(history_from_ci_requests(_load(a.rows)), sort_keys=True))
+    return cliutil.EXIT_OK
+
+
 def _cmd_sanitize(a):
     print(safe(sys.stdin.read(a.limit * 4), a.limit))
     return cliutil.EXIT_OK
@@ -1111,6 +1205,22 @@ def parser():
     p.add_argument("--subject-id")
     p.add_argument("--environment")
     p.set_defaults(fn=_cmd_env)
+    p = sub.add_parser("record", help="request (+plan) -> the ci_requests row for one event, as JSON")
+    p.add_argument("--request", required=True)
+    p.add_argument("--plan")
+    p.add_argument("--state", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--host", choices=HOSTS, required=True)
+    p.add_argument("--pr", type=int, required=True)
+    p.add_argument("--repo", required=True)
+    p.add_argument("--head-sha", required=True)
+    p.add_argument("--request-id")
+    p.add_argument("--comment-url")
+    p.add_argument("--error")
+    p.set_defaults(fn=_cmd_record)
+    p = sub.add_parser("history", help="v_ci_requests rows (JSON file) -> admission history rows")
+    p.add_argument("--rows", required=True)
+    p.set_defaults(fn=_cmd_history)
     p = sub.add_parser("sanitize", help="stdin -> the same text made inert for a PR comment")
     p.add_argument("--limit", type=int, default=600)
     p.set_defaults(fn=_cmd_sanitize)

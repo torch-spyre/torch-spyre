@@ -42,6 +42,7 @@ spyre_bench = [
     "packs/index.yaml",
     "packs/*/pack.yaml",
     "packs/*/schemas/*.json",
+    "ondemand_policy.json",
 ]
 
 [tool.ruff]

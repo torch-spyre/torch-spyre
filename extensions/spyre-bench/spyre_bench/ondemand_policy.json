@@ -1,0 +1,57 @@
+{
+ "_note": "The one place the on-demand limits live (device-hours, counts, seconds). Proposals accepted as starting values; change them here. The internal poller keeps a copy checked against this file by a test.",
+ "github.com": {
+  "tiers": [
+   "sanity"
+  ],
+  "reuse_modes": [
+   "if_valid",
+   "prefer",
+   "only"
+  ],
+  "force_all": false,
+  "profiles": [
+   "off"
+  ],
+  "custom_env": false,
+  "budget_device_hours": {
+   "sanity": 4.0
+  },
+  "pr_window_device_hours": 8.0,
+  "per_user_per_hour": 6,
+  "max_wait_default_s": 1800,
+  "max_wait_cap_s": 3600,
+  "clean_per_user": 1,
+  "clean_per_user_per_day": 3,
+  "clean_cluster": 2
+ },
+ "ghe": {
+  "tiers": [
+   "sanity",
+   "core"
+  ],
+  "reuse_modes": [
+   "if_valid",
+   "never",
+   "prefer",
+   "only"
+  ],
+  "force_all": true,
+  "profiles": [
+   "off",
+   "light"
+  ],
+  "custom_env": true,
+  "budget_device_hours": {
+   "sanity": 12.0,
+   "core": 48.0
+  },
+  "pr_window_device_hours": 96.0,
+  "per_user_per_hour": 6,
+  "max_wait_default_s": 1800,
+  "max_wait_cap_s": 3600,
+  "clean_per_user": 1,
+  "clean_per_user_per_day": 3,
+  "clean_cluster": 2
+ }
+}

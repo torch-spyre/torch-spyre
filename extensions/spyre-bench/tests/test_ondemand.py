@@ -944,5 +944,102 @@ class Hardening(unittest.TestCase):
         self.assertEqual((env["BENCH_CLEAN"], env["BENCH_MAX_WAIT"], env["BENCH_BUDGET"]), ("1", "2700s", "0.1234567"))
 
 
+class RequestLog(unittest.TestCase):
+    def plan(self):
+        return plan_doc("--purpose", "pr", "--subject-id", SUBJECT, "--tier", "sanity")
+
+    def row(self, state="previewed", **kw):
+        return od.ci_request_row(
+            req(), state, "dev1", host="ghe", pr=7, repo="o/r", head_sha=SHA, plan=self.plan(), **kw
+        )
+
+    def test_row_columns_exist_in_the_ci_requests_ddl(self):
+        from pathlib import Path
+
+        ddl = (Path(__file__).resolve().parents[2] / "clickhouse-ingest/schema/42-ci-requests.sql").read_text()
+        cols = {
+            line.split()[0]
+            for line in ddl.splitlines()
+            if line.startswith("    ") and not line.strip().startswith("CONSTRAINT")
+        }
+        row = self.row()
+        self.assertLessEqual(set(row), cols)
+        self.assertEqual((row["channel"], row["target_kind"], row["state"]), ("comment", "pr", "previewed"))
+
+    def test_row_content(self):
+        row = self.row(request_id="018f0000-0000-7000-8000-000000000001")
+        self.assertEqual(json.loads(row["subjects"]), {"comment_url": "", "head_sha": SHA, "pr": 7, "repo": "o/r"})
+        self.assertEqual([c["name"] for c in json.loads(row["cells_requested"])], ["op_add_fp16"])
+        self.assertEqual(json.loads(row["estimate"])["limit"], 12.0)
+        self.assertEqual(row["modes"], ["perf"])
+        self.assertEqual(json.loads(row["canonical"])["purpose"], "pr")
+        self.assertTrue(row["plan_id"])
+
+    def test_uuid7_and_state_check(self):
+        import uuid
+
+        u = uuid.UUID(self.row()["request_id"])
+        self.assertEqual(u.version, 7)
+        with self.assertRaises(od.RequestError):
+            self.row(state="dry_run")
+
+    def test_error_text_is_neutral_and_bounded(self):
+        row = self.row("failed", error="see [x](http://e.co) @team " + "z" * 900)
+        self.assertNotIn("](", row["error"])
+        self.assertLessEqual(len(row["error"]), 500)
+
+    def test_history_maps_states_and_feeds_admission(self):
+        rows = [
+            {
+                "id": "a",
+                "user": "dev1",
+                "state": "launched",
+                "subjects": json.dumps({"pr": 7}),
+                "estimate": json.dumps({"device_hours": 3}),
+                "ts": "2026-11-16T09:00:00Z",
+            },
+            {
+                "id": "b",
+                "user": "dev1",
+                "state": "failed",
+                "subjects": json.dumps({"pr": 7}),
+                "estimate": json.dumps({"device_hours": 7}),
+                "ts": "2026-11-16T08:00:00Z",
+            },
+            {
+                "id": "c",
+                "user": "dev1",
+                "state": "denied",
+                "subjects": json.dumps({"pr": 7}),
+                "estimate": json.dumps({"device_hours": 90}),
+                "ts": "2026-11-16T08:00:00Z",
+            },
+        ]
+        hist = od.history_from_ci_requests(rows)
+        self.assertEqual([h["state"] for h in hist], ["launched", "done", "denied"])
+        d = od.authorize(planned(history=hist, estimate_device_hours=1))
+        self.assertEqual(d.cancel, ["a"])
+        self.assertEqual(d.state, "admit")
+
+    def test_unreadable_rows_raise_instead_of_passing(self):
+        for row in (
+            {"id": "x", "user": "u", "state": "launched", "subjects": "{", "estimate": "", "ts": "t"},
+            {"id": "x"},
+        ):
+            with self.assertRaises(od.RequestError):
+                od.history_from_ci_requests([row])
+
+    def test_limits_come_from_one_json_file(self):
+        import json as j
+        from pathlib import Path
+
+        raw = j.loads((Path(od.__file__).with_name("ondemand_policy.json")).read_text())
+        for host, pol in od.POLICIES.items():
+            self.assertEqual(dict(pol.budget_device_hours), raw[host]["budget_device_hours"])
+            self.assertEqual(pol.pr_window_device_hours, raw[host]["pr_window_device_hours"])
+        self.assertEqual(od.POLICIES["github.com"].budget_device_hours, {"sanity": 4.0})
+        self.assertEqual(od.POLICIES["ghe"].budget_device_hours, {"sanity": 12.0, "core": 48.0})
+
+
 if __name__ == "__main__":
     unittest.main()

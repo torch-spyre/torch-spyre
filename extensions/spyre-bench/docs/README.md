@@ -680,7 +680,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | budget per request (device-hours) | 4 | 12 (`sanity`), 48 (`core`) |
 | budget per PR per 24 h | 8 | 96 |
 
-Numbers are proposals until catalogs carry real `est` values. An estimate above half the limit needs `/bench confirm`;
+The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a copy that a test compares with it). An estimate above half the limit needs `/bench confirm`;
 above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
 access may cancel anyone's, others are refused while another user's request runs). History rows are normalised
 (pull request numbers compared as text, states case-insensitively). A state that is not dead or finished is live
@@ -702,6 +702,16 @@ at once overall.
   An approval by someone without write access, for another sha or for a changed request is rejected.
 - The measuring job gets `sandbox_profile`: no secrets, no registry or store credentials, checkout of the pinned sha,
   results leave through a trusted post step, provenance `fork`, never baseline-eligible.
+
+### Request log
+
+`ondemand record` builds the `ci_requests` row for one event of a request (`channel` is `comment`, `target_kind` `pr`;
+states `previewed`, `launched`, `denied`, `rejected`, `failed`, `cancelled`; migration 028 widens the channel check).
+`ondemand history` turns `v_ci_requests` rows (`spyre_bench.ondemand.HISTORY_SQL`) into the history `authorize` reads, so the
+per-PR window, the supersede rule and the clean quotas count from the log where it exists. A row that cannot be read
+raises: admission stops until the log is fixed. The GitHub route has no store credentials and so records nothing;
+it counts the user's runs from its own run list instead. A same-repository head needs no `sha=`; a confirm refuses a
+moved head, and a fork head needs `sha=`.
 
 ### Preview
 
