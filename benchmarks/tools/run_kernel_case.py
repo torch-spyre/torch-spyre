@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run command of an `ops` case: this case's rows of the ops perf report, in the layout the ingest reads.
+"""Run command of a perf case: this case's rows of the perf report, in the layout the ingest reads.
 
 The report comes from the repo's own perf entry point (`make tests TEST_TYPE=perf`, or BENCH_SUITE_CMD). It covers
-every op, so it runs once per --suite-dir and each case keeps only the testcases of its op and shape: the ingest
-then writes exactly one row per case and the cases cannot double-count.
+every op and model, so it runs once per --suite-dir and each case keeps only its own testcases: the ingest then
+writes exactly one row per case and the cases cannot double-count. BENCH_SUITE_FROM names a directory that already
+holds the report (and any per-kernel breakdown XMLs) of a finished perf run; it is copied instead of running the suite.
 
     run_kernel_case.py --op OP --shape SHAPES --suite-dir DIR --raw-dir DIR
+    run_kernel_case.py --model MODEL --config CONFIG --mode MODE --suite-dir DIR --raw-dir DIR
 """
 
 import argparse
 import os
+import regex as re
 import shlex
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -41,6 +45,11 @@ METRICS = (
     "compile",
     "mem_size",
 )
+# The ingest's own name pattern: perf_<op>_<metric>_<ms|MB>[_<shapes>].
+NAME = re.compile(
+    rf"^perf_(?P<op>.+?)_(?P<metric>{'|'.join(METRICS)})_(?:ms|MB)(?:_(?P<shapes>.+))?$"
+)
+KERNEL_CLASS = "kernel_benchmark"
 
 
 def suite_report(suite_dir):
@@ -48,55 +57,162 @@ def suite_report(suite_dir):
     if report.is_file():
         return report
     suite_dir.mkdir(parents=True, exist_ok=True)
-    cmd = shlex.split(os.environ.get("BENCH_SUITE_CMD", "")) or [
-        "make", "-C", str(ROOT), "tests", "TEST_TYPE=perf", f"RESULTS_DIR={suite_dir}",
-    ]  # fmt: skip
-    subprocess.run(cmd, check=True)
+    finished = os.environ.get("BENCH_SUITE_FROM")
+    if finished:
+        for xml in sorted(Path(finished).glob("*.xml")):
+            shutil.copyfile(xml, suite_dir / xml.name)
+    else:
+        cmd = shlex.split(os.environ.get("BENCH_SUITE_CMD", "")) or [
+            "make", "-C", str(ROOT), "tests", "TEST_TYPE=perf", f"RESULTS_DIR={suite_dir}",
+        ]  # fmt: skip
+        subprocess.run(cmd, check=True)
     if not report.is_file():
         raise SystemExit(f"the perf suite wrote no {report.name} in {suite_dir}")
     return report
 
 
-def case_rows(name, op, shape):
-    """Whether a testcase name is `perf_<op>_<metric>_<ms|MB>_<shape>` for this op and shape."""
-    head = f"perf_{op}_"
-    if not name.startswith(head) or not name.endswith(f"_{shape}"):
-        return False
-    rest = name[len(head) : -len(shape) - 1]
-    return any(rest in (f"{m}_ms", f"{m}_MB") for m in METRICS)
+def tags_of(tc):
+    """The testcase's `tag` properties, `key__value` split on the first `__` (the ingest's reading)."""
+    out = {}
+    for p in tc.iter("property"):
+        value = p.get("value", "").strip()
+        if p.get("name") == "tag" and "__" in value:
+            key, _, val = value.partition("__")
+            out[key] = val
+    return out
 
 
-def filtered(report, op, shape):
+def is_model(tags, op):
+    """The ingest's model test: the explicit model tag, or the granite_ op prefix of older reports."""
+    return bool(tags.get("model")) or op.startswith("granite_")
+
+
+def model_name(tags, op):
+    return "granite" if op.startswith("granite_") else tags.get("model", "")
+
+
+class Case:
+    """Which rows belong to one case: an op at a shape, or a model at a config and mode."""
+
+    def __init__(self, op=None, shape=None, model=None, config=None, mode=None):
+        self.op, self.shape = op, shape
+        self.model, self.config, self.mode = model, config, mode
+
+    def describe(self):
+        if self.model:
+            return f"model {self.model} config {self.config} mode {self.mode}"
+        return f"op {self.op} with shape {self.shape}"
+
+    def owns_tags(self, tags):
+        """Whether a testcase's tags put it in this case (kernel breakdowns and model rows)."""
+        op = tags.get("op", "")
+        if self.model:
+            return (
+                is_model(tags, op)
+                and model_name(tags, op) == self.model
+                and tags.get("config") == self.config
+                and tags.get("mode") == self.mode
+            )
+        return (
+            not is_model(tags, op)
+            and op == self.op
+            and tags.get("input_shape") == self.shape
+        )
+
+
+def report_groups(suite, case):
+    """The (op, shapes) groups of the report that are this case's."""
+    groups = set()
+    for tc in suite.findall("testcase"):
+        m = NAME.match(tc.get("name", ""))
+        if not m:
+            continue
+        key = (m["op"], m["shapes"] or "")
+        if case.model:
+            if case.owns_tags(tags_of(tc)):
+                groups.add(key)
+        elif key == (case.op, case.shape):
+            groups.add(key)
+    return groups
+
+
+def filtered(report, case):
+    """(tree, kept): the report with only the case's testcases."""
     tree = ET.parse(report)
     kept = 0
     for suite in tree.getroot().iter("testsuite"):
+        groups = report_groups(suite, case)
         for tc in list(suite.findall("testcase")):
-            if case_rows(tc.get("name", ""), op, shape):
+            m = NAME.match(tc.get("name", ""))
+            if m and (m["op"], m["shapes"] or "") in groups:
                 kept += 1
             else:
                 suite.remove(tc)
     return tree, kept
 
 
+def is_kernel_xml(root):
+    cases = root.findall(".//testcase")
+    return bool(cases) and all(KERNEL_CLASS in tc.get("classname", "") for tc in cases)
+
+
+def kernel_breakdowns(suite_dir, report, case):
+    """[(name, tree, kept)] for each per-kernel breakdown XML of the suite that holds rows of this case."""
+    out = []
+    for xml in sorted(suite_dir.glob("*.xml")):
+        if xml == report:
+            continue
+        tree = ET.parse(xml)
+        if not is_kernel_xml(tree.getroot()):
+            continue
+        kept = 0
+        for suite in tree.getroot().iter("testsuite"):
+            for tc in list(suite.findall("testcase")):
+                if case.owns_tags(tags_of(tc)):
+                    kept += 1
+                else:
+                    suite.remove(tc)
+        if kept:
+            out.append((xml.name, tree, kept))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--op", required=True)
+    ap.add_argument("--op")
     ap.add_argument(
-        "--shape", required=True, help="the shape string as the report names it"
+        "--shape", help="the shape string as the report names it (with --op)"
     )
+    ap.add_argument("--model")
+    ap.add_argument("--config", help="the model's config_name (with --model)")
+    ap.add_argument("--mode", help="the model's run_mode (with --model)")
     ap.add_argument("--suite-dir", required=True, type=Path)
     ap.add_argument("--raw-dir", required=True, type=Path)
     args = ap.parse_args(argv)
-    tree, kept = filtered(suite_report(args.suite_dir), args.op, args.shape)
+    if bool(args.op) == bool(args.model):
+        ap.error("give --op with --shape, or --model with --config and --mode")
+    if (
+        args.op
+        and args.shape is None
+        or args.model
+        and None in (args.config, args.mode)
+    ):
+        ap.error("--op needs --shape; --model needs --config and --mode")
+    case = Case(args.op, args.shape, args.model, args.config, args.mode)
+    report = suite_report(args.suite_dir)
+    tree, kept = filtered(report, case)
     if not kept:
-        print(
-            f"no testcase for op {args.op} with shape {args.shape} in the perf report",
-            file=sys.stderr,
-        )
+        print(f"no testcase for {case.describe()} in the perf report", file=sys.stderr)
         return 3
     args.raw_dir.mkdir(parents=True, exist_ok=True)
     tree.write(args.raw_dir / "report.xml", encoding="utf-8", xml_declaration=True)
-    print(f"{args.op}: kept {kept} testcases")
+    kernels = kernel_breakdowns(args.suite_dir, report, case)
+    for name, ktree, _ in kernels:
+        ktree.write(args.raw_dir / name, encoding="utf-8", xml_declaration=True)
+    print(
+        f"{args.op or args.model}: kept {kept} testcases and "
+        f"{sum(k for _, _, k in kernels)} kernel testcases"
+    )
     return 0
 
 

@@ -18,7 +18,7 @@ on:
         description: Selection of benchmarks/ to run
         required: false
         type: string
-        default: ops-core
+        default: perf-core
       clickhouse_env:
         description: >-
           Which ClickHouse instance receives the rows: "dev" (default) or "prod". Prod only when
@@ -68,7 +68,7 @@ defaults:
 env:
   PREBAKED_VENV_PATH: /home/senuser/.venv
   RUNNER_SETUP_SCRIPT: /etc/profile.d/ibm-aiu-setup.sh
-  BENCH_SELECTION: ${{ inputs.selection || 'ops-core' }}
+  BENCH_SELECTION: ${{ inputs.selection || 'perf-core' }}
   BENCH_PURPOSE: on-demand
   BENCH_ENVIRONMENT: one-device
   BENCH_REUSE: never

@@ -22,7 +22,7 @@ golden table, so an edit that would start a new series fails here.
     python benchmarks/tools/check_identity_ids.py [--update]
 
 Needs pyyaml, regex, lxml, clickhouse-connect and the spyre-bench package; exits 0 with a notice when a module
-is missing unless BENCH_REQUIRED is set. Shapes and kernel names are synthetic fixtures.
+is missing unless BENCH_REQUIRED is set. Kernel names are synthetic fixtures; shapes, models and configs are the perf suite's own.
 """
 
 import argparse
@@ -36,12 +36,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "benchmarks"
 GOLDEN = CATALOG / "ingest-ids.golden.tsv"
-HEADER = "component\tname\trow\tinput_shapes\tkernel_name\tbenchmark_id"
+HEADER = "component\tname\trow\tconfig_name\tinput_shapes\trun_mode\tkernel_name\tbenchmark_id"
 KERNELS = (
     ("spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa#2", 0.003),
     ("spyre_kernel_v1_fused_add_bbbbbbbbbbbbbbbb#2", 0.27),
 )
 METRIC = "wall_clock"
+CLASSNAME = (
+    "perf.benchmark"  # the ingest detects a perf report by "benchmark" in the classname
+)
 
 
 def engine(*args, catalog=CATALOG):
@@ -81,15 +84,50 @@ def declared(catalog=CATALOG):
     return [(case, inputs[case], stored[case]) for case in stored]
 
 
+def row_key(name, disc):
+    """What tells two rows of one name apart: the discriminators a case varies."""
+    return (
+        name,
+        disc.get("record_type") or "",
+        disc.get("config_name") or "",
+        disc.get("input_shapes") or "",
+        disc.get("run_mode") or "",
+    )
+
+
+def model_testcases(inp):
+    """The testcases of a model record: no shape in the name, the model identity in the tags."""
+    disc, name = inp["disc"], inp["name"]
+    mode = disc["run_mode"]
+    batch, prompt = (1, 512) if mode == "prefill_only" else (4, 128)
+    op = f"{name}_bs{batch}_pl{prompt}_{mode}_{disc['config_name']}"
+    tags = "".join(
+        f'<property name="tag" value="{t}"/>'
+        for t in (
+            f"op__{op}",
+            f"model__{name}",
+            f"config__{disc['config_name']}",
+            f"mode__{mode}",
+            f"batch_size__{batch}",
+            f"prompt_length__{prompt}",
+        )
+    )
+    return f'<testcase classname="{CLASSNAME}" name="perf_{op}_{METRIC}_ms" time="1.0"><properties>{tags}</properties></testcase>'
+
+
 def report_xml(cases):
-    """The report.xml the perf suite writes for these cases: one wall-clock testcase per op and shape."""
+    """The report.xml the perf suite writes for these cases: one wall-clock testcase per row."""
     seen, tcs = set(), []
     for _, inp, _ in cases:
-        key = (inp["name"], inp["disc"]["input_shapes"])
-        if key not in seen:
-            seen.add(key)
+        key = row_key(inp["name"], inp["disc"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if inp["disc"]["record_type"] == "model":
+            tcs.append(model_testcases(inp))
+        else:
             tcs.append(
-                f'<testcase name="perf_{key[0]}_{METRIC}_ms_{key[1]}" time="1.0"/>'
+                f'<testcase classname="{CLASSNAME}" name="perf_{key[0]}_{METRIC}_ms_{key[3]}" time="1.0"/>'
             )
     return (
         '<?xml version="1.0"?><testsuites><testsuite name="spyre-perf-suite" '
@@ -98,13 +136,13 @@ def report_xml(cases):
 
 
 def ingest_report_ids(results, BenchmarkId, cases):
-    """{(name, input_shapes): id} the ingest writes for the synthetic report."""
+    """{row_key: id} the ingest writes for the synthetic report."""
     with tempfile.TemporaryDirectory() as d:
         xml = Path(d) / "report.xml"
         xml.write_text(report_xml(cases))
         _, records = results.parse_benchmark_xml(xml, "bench-conformance", "", "x86_64")
     return {
-        (e["name"], e["disc"]["input_shapes"]): BenchmarkId.derive(
+        row_key(e["name"], e["disc"]): BenchmarkId.derive(
             results.COMPONENT_DEFAULT, e["name"], e["tags"], e["disc"], e["disc_keys"]
         )
         for e in results._bench_entries(records)
@@ -148,17 +186,17 @@ def table(results, BenchmarkId, cases, report_ids):
     rows, bad = [], []
     for case, inp, stored in cases:
         name, disc = inp["name"], inp["disc"]
-        shapes = disc["input_shapes"]
+        key = (disc["config_name"], disc["input_shapes"], disc["run_mode"])
         if inp["component"] != comp or list(inp["disc_keys"]) != list(keys):
             bad.append(
                 f"{case}: component/keys {inp['component']}/{inp['disc_keys']} differ from the ingest's"
             )
-        written = report_ids.get((name, shapes))
+        written = report_ids.get(row_key(name, disc))
         if written != stored:
             bad.append(
                 f"{case}: definition derives {stored}, the ingest writes {written}"
             )
-        rows.append((comp, name, "report", shapes, "", written or ""))
+        rows.append((comp, name, "report", *key, "", written or ""))
         entries = [
             {
                 "name": name,
@@ -172,14 +210,14 @@ def table(results, BenchmarkId, cases, report_ids):
         ]
         for e in BenchmarkId.rank_kernels(comp, entries):
             kid = BenchmarkId.derive(comp, name, e["tags"], e["disc"], keys)
-            rows.append((comp, name, "kernel", shapes, e["disc"]["kernel_name"], kid))
+            rows.append((comp, name, "kernel", *key, e["disc"]["kernel_name"], kid))
         total = {**disc, "kernel_name": "Total", "is_total": 1}
         rows.append(
             (
                 comp,
                 name,
                 "total",
-                shapes,
+                *key,
                 "Total",
                 BenchmarkId.derive(comp, name, [], total, keys),
             )
@@ -210,13 +248,13 @@ def check(catalog=CATALOG, golden=GOLDEN, update=False):
     old = {}
     if Path(golden).exists():
         old = {
-            tuple(ln.split("\t")[:5]): ln.split("\t")[5]
+            tuple(ln.split("\t")[:7]): ln.split("\t")[7]
             for ln in Path(golden).read_text().splitlines()[1:]
         }
     for r in rows:
-        if old.get(r[:5]) != r[5]:
+        if old.get(r[:7]) != r[7]:
             msgs.append(
-                f"{r[1]} {r[2]} {r[4]}: derived {r[5]}, golden {old.get(r[:5])}"
+                f"{r[1]} {r[2]} {r[6]}: derived {r[7]}, golden {old.get(r[:7])}"
             )
     if len(old) != len(rows):
         msgs.append(f"golden has {len(old)} rows, the catalog derives {len(rows)}")
