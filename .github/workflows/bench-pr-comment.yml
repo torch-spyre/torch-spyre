@@ -219,7 +219,7 @@ jobs:
               '[.[] | select((.databaseId | tostring) != $self and (.displayTitle | endswith(" by=" + $actor)))
                 | {id: ("req" + (.databaseId | tostring)), pr: 0, user: $actor, ts: .createdAt, state: "done", est: 0, clean: false}]' \
             > "$W/rate.json"
-          # Window and supersede: every measuring run of the last 24 hours (both workflows), charged the whole per-request
+          # Window and supersede: every measuring run (a cancelled one still counts: it may have run for hours) of the last 24 hours (both workflows), charged the whole per-request
           # limit because the run's own estimate is not known here. Rows never count toward the hourly rate.
           limit=$("$BENCH" ondemand limit --host github.com | jq .request_device_hours)
           day=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
@@ -227,7 +227,7 @@ jobs:
             gh run list --workflow "$wf" --created ">=${day}" --limit 200 --json databaseId,createdAt,displayTitle,status,conclusion
           done | jq -s --argjson limit "${limit}" '[.[][] | (.displayTitle | capture("pr=(?<pr>[0-9]+) by=(?<by>.*)$")?) as $t | select($t != null)
                 | {id: ("run" + (.databaseId | tostring)), pr: $t.pr, user: $t.by, ts: .createdAt, est: $limit, clean: false, rate: false,
-                   state: (if .status != "completed" then "active" elif .conclusion == "cancelled" then "cancelled" else "done" end)}]' > "$W/window.json"
+                   state: (if .status != "completed" then "active" else "done" end)}]' > "$W/window.json"
           jq -s 'add' "$W/rate.json" "$W/window.json" > "$W/runs.json"
 
       - name: Authorize (policy, permission, fork sha)
@@ -378,8 +378,9 @@ jobs:
           set -euo pipefail
           # A cancel or another confirm that landed while this run was planning wins: the preview is spent.
           started=$(cat "$W/started")
-          if gh api --paginate "repos/${REPO}/issues/${PR}/comments" | jq -es --arg t "${started}" \
-            '[.[][] | select(.user.login == "github-actions[bot]" and .created_at > $t and (.body | test("\\A(Benchmark run started|Benchmark run for this pull request cancelled)")))] | length > 0' > /dev/null; then
+          newer=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" | jq -es --arg t "${started}" \
+            '[.[][] | select(.user.login == "github-actions[bot]" and .created_at > $t and (.body | test("\\A(Benchmark run started|Benchmark run for this pull request cancelled)")))] | length') || { echo "::error::could not read the comments; not dispatching"; exit 1; }
+          if [ "${newer}" != 0 ]; then
             echo "::warning::a newer start or cancel exists; not dispatching"
             exit 0
           fi
