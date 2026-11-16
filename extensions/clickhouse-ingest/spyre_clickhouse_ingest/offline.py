@@ -91,6 +91,7 @@ ADMIN_KINDS = (
 )
 # Keys the receiving channel sets itself; a bundle that carries one is refused, never overwritten.
 RESERVED_RUN_KEYS = (
+    "run.ref_only", "run.record_type",
     "run.trust", "run.actor", "run.channel", "run.upload_id", "run.writer", "run.bundle_sha256",
     "run.content_sha256", "run.row_sha256", "run.on_behalf_of", "run.lib_ref", "upload_id", "round",
 )  # fmt: skip
@@ -450,7 +451,12 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
 
 
 def _finite(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    try:
+        return (
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+        )
+    except OverflowError:  # an integer too large for a float
+        return False
 
 
 def benchmark_entries(path: Path) -> list:
@@ -675,15 +681,16 @@ def bench_result(path: Path) -> dict:
         _strmap(r.get("clean"), f"{at} clean")
         if r.get("started_at") is not None:
             try:
-                _ts(str(r["started_at"]))
+                if not 1970 <= _ts(str(r["started_at"])).year <= 2299:
+                    raise ValueError("out of range")
             except ValueError:
                 raise BundleError(f"{at}: started_at is not an ISO-8601 time") from None
         n_it = r.get("iterations", 0)
-        if not isinstance(n_it, int) or isinstance(n_it, bool) or n_it < 0:
+        if not isinstance(n_it, int) or isinstance(n_it, bool) or not 0 <= n_it < 2**32:
             raise BundleError(f"{at}: iterations is a count")
-        if not isinstance(r.get("placement", {}).get("links", []), list) or not all(
-            isinstance(x, str) for x in r.get("placement", {}).get("links", [])
-        ):
+        pl_ = r.get("placement") or {}
+        links = pl_.get("links", []) if isinstance(pl_, dict) else None
+        if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
             raise BundleError(f"{at}: placement.links is a list of strings")
         samples = r.get("samples") or {}
         if not isinstance(samples, dict):
@@ -1163,7 +1170,10 @@ def bench_inputs(src: Path, stage: Path) -> tuple:
             if isinstance(r, dict):
                 _unreserved(r.get("props") or {}, dropped)
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-        name = str((data.get("metadata") or {}).get("name") or p.parent.name)
+        meta_block = (
+            data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        )
+        name = str(meta_block.get("name") or p.parent.name)
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:80]
         out = stage / f"{slug}-{hashlib.sha256(text.encode()).hexdigest()[:8]}.json"
         out.write_text(text)

@@ -80,8 +80,8 @@ downgraded value:
 
 | Claim | Stored for `lab` / `external` |
 |---|---|
-| `run.purpose` outside the channel's allowed set (`lab`: `on-demand`, `investigate`; `external`: `external`) | the allowed value; the claim in `claim.run.purpose` |
-| `run.validity` other than `unknown` | `unknown`; the claim in `claim.run.validity` |
+| `run.purpose` outside the channel's allowed set, or absent (`lab`: `on-demand`, `investigate`; `external`: `external`) | the allowed value; the claim in `claim.run.purpose` |
+| `run.validity` | always `unknown`; a claim is kept in `claim.run.validity` |
 | `clean.exclusive` `enforced` or `observed` | `unknown`; the claim in the placement's `clean['claim.exclusive']` |
 | environment labels | replaced by `env.label.origin=<trust>` on the fingerprint row (first sight only) |
 | placement source | `self_reported` (`probe` for `ci`) |
@@ -123,8 +123,8 @@ whole ingest package on the sealing host (`offline.py` reads `bundle.schema.json
   so a trust-filtered series, and the qualification check (which needs a CI-trusted evidence run measured in that
   environment), do not accept them. A fingerprint row first written by a lower channel is described again when CI sends
   the same `env_id`.
-- **A run keeps the lowest trust of what was added to it.** Adding repeats to a CI run through a lower channel supersedes
-  the verdict with the lower trust; keep manual run keys distinct from CI's.
+- **A lower channel cannot add repeats to a run recorded with higher trust** (rejected; send it under its own engine run
+  id). Below CI the fingerprint version is stored as 1, so a claimed high version cannot outrank CI's description.
 - **Failed repeats** (`status` other than `ok`, no samples) have no `benchmark_runs` row, so they are not compared on a
   re-send; the run's verdict records that a case had no ok repeat.
 - **Placements are one row per repeat number.** Cases of one run that share a repeat number are merged

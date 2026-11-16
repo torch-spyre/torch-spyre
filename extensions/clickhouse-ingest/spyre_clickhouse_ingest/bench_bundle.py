@@ -39,8 +39,8 @@ from .bench_tables import (
 )
 from .identity import BenchmarkId, DerivedId
 from .offline import (
+    CHANNEL_TRUST,
     BundleError,
-    effective_trust,
     bench_result,
     content_digest,
     _ts,
@@ -88,10 +88,13 @@ def downgrade(trust: str, run_props: dict, clean: dict) -> tuple:
     purpose = run_props.get("run.purpose")
     if purpose and purpose not in allowed:
         run_props["claim.run.purpose"] = purpose
+    if (
+        purpose not in allowed
+    ):  # an absent purpose is stored too: absent reads as baseline-eligible
         run_props["run.purpose"] = DOWNGRADED_PURPOSE[trust]
     if run_props.get("run.validity") not in (None, "", "unknown"):
         run_props["claim.run.validity"] = run_props["run.validity"]
-        run_props["run.validity"] = "unknown"
+    run_props["run.validity"] = "unknown"
     if clean.get("exclusive") in CLEAN_CLAIMS:
         clean["claim.exclusive"] = clean["exclusive"]
         clean["exclusive"] = "unknown"
@@ -135,7 +138,7 @@ def build(root: Path, trust: str) -> dict:
         env_id = env["env_id"]
         labels = _s(env.get("labels")) if trust == "ci" else {"env.label.origin": trust}
         envs.setdefault(env_id, {
-            "env_id": env_id, "fingerprint_version": int(env.get("fingerprint_version", 1)), "labels": labels,
+            "env_id": env_id, "fingerprint_version": int(env.get("fingerprint_version", 1)) if trust == "ci" else 1, "labels": labels,
             "fingerprint": _s(env.get("fingerprint")), "members": [], "devices": "",
             "props": {"run.trust": trust},
         })  # fmt: skip
@@ -232,8 +235,6 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
 
     trust = report.get("trust") or "external"
     earlier = prior_trust(client, db, aid, rid, meta["test_type"])
-    if earlier:  # a run only keeps the lowest trust of anything added to it
-        trust = effective_trust(trust, earlier)
     report["trust"] = trust
     plan = build(root, trust)
     held, placed = recorded(client, db, rid)
@@ -251,6 +252,11 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
     fresh = [
         r for r in fresh if r["samples"]
     ]  # a repeat with no samples has no row to compare
+    if earlier and fresh and CHANNEL_TRUST.index(trust) < CHANNEL_TRUST.index(earlier):
+        raise BundleError(
+            f"run {rid} is already recorded with trust {earlier}; a {trust} channel cannot add repeats to it "
+            "(send it under its own engine run id)"
+        )
     have_envs = known(
         client, db, "environment_fingerprints", "env_id", list(plan["envs"])
     )
@@ -320,7 +326,7 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
         state, _ = ArtifactWriter.over_prior(
             client, db, aid, rid, meta["test_type"], state, 0.0
         )
-    if not (fresh or new_places) and prior:
+    if not (fresh or new_places or new_cases or new_envs) and prior:
         return {**report, "status": "duplicate"}
     insert_artifact_result(
         client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"], state=state, arch=meta["arch"],
