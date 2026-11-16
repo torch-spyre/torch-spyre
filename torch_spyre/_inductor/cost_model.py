@@ -211,7 +211,7 @@ from .work_division import (
     ge,
     piecewise,
     _and,
-    _floor,
+    _ceil,
     _is_sym,
 )
 from . import config
@@ -2136,7 +2136,7 @@ def _matmul_split_preference_us(o, axes) -> float | sympy.Expr:
     call_batch = B * passes / trip
     # A whole number of at least one call: a Python bool when known, otherwise a
     # SymPy condition the branches below (and the preferences) carry.
-    whole = _and(ge(call_batch, 1), eq(_floor(call_batch), call_batch))
+    whole = _and(ge(call_batch, 1), eq(_ceil(call_batch), call_batch))
     B = piecewise((call_batch, whole), (B, True))
     shared_weight = (
         True

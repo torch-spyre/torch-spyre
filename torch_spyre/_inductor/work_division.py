@@ -2238,12 +2238,12 @@ def log2(arg):
     return math.log2(arg)
 
 
-def _floor(arg):
-    """``math.floor``, symbolic-aware: ``sympy.floor`` for a SymPy expression,
-    so an undecided floor stays symbolic instead of raising."""
+def _ceil(arg):
+    """``math.ceil``, symbolic-aware: ``sympy.ceiling`` for a SymPy expression,
+    so an undecided ceiling stays symbolic instead of raising."""
     if isinstance(arg, sympy.Basic):
-        return sympy.floor(arg)
-    return math.floor(arg)
+        return sympy.ceiling(arg)
+    return math.ceil(arg)
 
 
 def _is_sym(*vals) -> bool:

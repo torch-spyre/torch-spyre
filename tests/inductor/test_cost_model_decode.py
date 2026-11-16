@@ -1130,6 +1130,78 @@ def test_split_preferences_branch_on_an_undecided_whole_call_batch(monkeypatch):
         assert float(preference.subs(s, value)) == pytest.approx(priced(B, shared))
 
 
+def test_cpsat_lowers_a_symbolic_call_batch(monkeypatch):
+    """A Piecewise call batch puts ``ITE`` conditions in the preferences (SymPy
+    rewrites a condition over a Piecewise, such as ``Eq(B, 1)``, to ``ITE``).
+    The CP-SAT printer lowers them to the value SymPy gives at each batch."""
+    import sympy
+
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+        _SympyExprToCpSat,
+    )
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    s = sympy.Symbol("s0", integer=True, positive=True)
+    T, N, K, m, n, trips = 16, 128, 2048, 4, 8, 2
+    feature = OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[ArgTraffic("arg1", "input", False, K * N)],
+        is_matmul=True,
+        out_elems=s * T * N,
+        cores=m * n,
+        loop_trip=trips,
+        matmul_macs=s * T * N * K,
+        matmul_rows_per_core=T // m,
+        matmul_cols_per_core=N // n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        matmul_a_bytes=T * K * 2,
+        matmul_b_bytes=K * N * 2,
+    )
+    preference = cm._matmul_split_preference_us(
+        feature, ((s, 1), (T, m), (N, n), (K, 1), False)
+    )
+    assert preference.has(sympy.ITE)
+    for value in range(1, 7):
+        model = cp_model.CpModel()
+        variable = model.new_int_var(value, value, s.name)
+        model.minimize(
+            _SympyExprToCpSat(model, {s.name: variable}, {}).convert(preference)
+        )
+        solver = cp_model.CpSolver()
+        assert solver.solve(model) == cp_model.OPTIMAL
+        assert solver.objective_value == pytest.approx(
+            float(preference.subs(s, value)), rel=1e-3
+        )
+
+
+def test_cpsat_keeps_the_whole_call_batch_test():
+    """The CP-SAT rewrite drops floors but keeps ceilings, so the whole-call
+    test ``ceiling(b) == b`` still tells an even ``s0 / 2`` from an odd one."""
+    import sympy
+
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+        _SympyExprToCpSat,
+    )
+
+    s = sympy.Symbol("s0", integer=True, positive=True)
+    batch = s / 2
+    expr = sympy.Piecewise((1, sympy.Eq(sympy.ceiling(batch), batch)), (0, True))
+    for value in range(1, 7):
+        model = cp_model.CpModel()
+        variable = model.new_int_var(value, value, s.name)
+        model.maximize(_SympyExprToCpSat(model, {s.name: variable}, {}).convert(expr))
+        solver = cp_model.CpSolver()
+        assert solver.solve(model) == cp_model.OPTIMAL
+        assert solver.objective_value == (value % 2 == 0)
+
+
 def test_split_preferences_branch_on_a_symbolic_shared_weight():
     """A symbolic sharing condition gives a ``Piecewise`` over both branches."""
     import sympy
