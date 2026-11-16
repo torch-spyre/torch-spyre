@@ -24,6 +24,7 @@ different repeat under a known key is refused.
 
 import hashlib
 import json
+import re
 import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -229,11 +230,28 @@ def known_ci_envs(client, db: str, ids: list) -> set:
     return {str(r[0]) for r in rows}
 
 
+SERIES = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def series_prefix(meta: dict, trust: str) -> str:
+    """`<workflow>/` for a CI bundle, which files its rows in that verdict series (source_job is the
+    first segment of source_file); a lower channel cannot name one."""
+    wf = (meta.get("workflow") or "").strip()
+    if not wf or trust != "ci":
+        return ""
+    if not SERIES.fullmatch(wf):
+        raise BundleError(
+            f"workflow {wf!r} is not a series name (letters, digits, . _ -)"
+        )
+    return wf + "/"
+
+
 def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
     """Record a bench bundle; `report` carries the run, artifact and trust the caller derived."""
     from .bundle import prior_trust
 
     trust = report.get("trust") or "external"
+    series = series_prefix(meta, trust)
     earlier = prior_trust(client, db, aid, rid, meta["test_type"])
     report["trust"] = trust
     plan = build(root, trust)
@@ -310,7 +328,7 @@ def ingest(client, db, root, meta, aid, rid, props, report, dry_run) -> dict:
     runs = [
         {"run_id": rid, "benchmark_id": r["bid"], "component": r["component"], "backend": r["backend"],
          "measurements": r["samples"], "iterations": r["iterations"],
-         "props": {**r["props"], **base, "report_kind": "bench", "source_file": r["file"], "run.repeat": str(r["repeat"]),
+         "props": {**r["props"], **base, "report_kind": "bench", "source_file": series + r["file"], "run.repeat": str(r["repeat"]),
                    "run.repeat_status": r["status"], "env.id": r["env_id"], "run.row_sha256": r["sha"]}}
         for r in fresh
     ]  # fmt: skip

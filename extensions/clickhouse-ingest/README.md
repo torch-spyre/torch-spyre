@@ -264,6 +264,7 @@ A **connected** run records every kind directly with the same flags, no `--offli
 | vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
 | sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
 | benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+| bench | `results --bench-dir <dir> --trigger-type perf\|quality --channel-trust ci --workflow <series> <the usual flags>` ([bench bundles](docs/bench-bundles.md)) |
 
 vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
 temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
