@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -650,28 +649,49 @@ def apply_neg_shift(
     % physical_cores``. The resulting set balances the two 16-core halves
     of the card (low ids of the first half, high ids of the second) at
     every active count, mirroring the validated [0, 31] two-core placement.
-    Owners are rewritten so each physical id maps back to its logical slice
-    via ``(core_id + num_cores // 2) % physical_cores``. Returns the
-    rewritten map, the fold size (``max(physical_cores, num_cores)``), and
-    the dispatched physical ids. A no-op for ``num_cores <= 1``, when the
-    slice count does not divide the physical core count, or when the shift
-    would be zero.
+    Returns the rewritten map, the fold size (``max(physical_cores,
+    num_cores)``), and the dispatched physical ids. A no-op for
+    ``num_cores <= 1``, when the slice count does not divide the physical
+    core count, or when the shift would be zero.
+
+    Owner rewrite: each owner expression is rebuilt by substituting
+    ``core_id`` with the operation-logical slice of the physical core,
+    gated to zero outside the window: with ``t = Mod(core_id + shift,
+    physical_cores)``, the substitution is ``t * Max(1 - floor(t /
+    num_cores), 0)``. Dispatched members have ``t < num_cores`` and map to
+    their exact slices (including across the fold wrap); non-dispatched
+    fold positions evaluate to slice 0, which is required by the backend:
+    every non-dispatched position must carry the shared HBM base symbol
+    (the slice-0 address that address planning anchors on the fold
+    position owning work slice 0), not a derived per-core address.
     """
-    min_shift = int(os.environ.get("SPYRE_NEG_SHIFT_MIN", "2"))
-    if (
-        num_cores < min_shift
-        or num_cores >= physical_cores
-        or physical_cores % num_cores != 0
-    ):
+    if num_cores <= 1 or num_cores >= physical_cores or physical_cores % num_cores != 0:
         return dict(core_map), num_cores, tuple(range(num_cores))
     shift = num_cores // 2
     ids = tuple((i - shift) % physical_cores for i in range(num_cores))
-    span = max(physical_cores, num_cores)
+    # Owner expression: the wrapping term t = Mod(core_id + shift,
+    # physical_cores) is the logical slice at dispatched members (t < n, so
+    # the gate below stays open and members map to their exact slices,
+    # including across the fold wrap — the clamshell window, n=8 -> ids
+    # [28..31, 0..3]). At non-dispatched fold positions t >= n and the gate
+    # floor(t / n) zeroes the expression, so non-members evaluate to
+    # slice 0. That is load-bearing, not cosmetic: address planning anchors
+    # the shared HBM base symbol on the fold position that owns work slice
+    # 0, and the backend requires every non-dispatched position to carry
+    # that same base symbol in startAddressCoreCorelet_ — non-members on a
+    # derived (slice n-1) address fault the card with a PCIe BusFence
+    # during attention-graph recording even though every address is
+    # in-bounds. Zeroing non-members reproduces exactly the symbol-sharing
+    # structure of the validated non-wrap legs.
     core_id = Symbol("core_id")
-    logical = (core_id + shift) % physical_cores
+    from sympy import Max, floor as sympy_floor
+
+    t = Mod(core_id + Integer(shift), Integer(physical_cores))
+    op_logical = t * Max(Integer(1) - sympy_floor(t / Integer(num_cores)), Integer(0))
     rewritten = {
-        dim: owner.xreplace({core_id: logical}) for dim, owner in core_map.items()
+        dim: owner.xreplace({core_id: op_logical}) for dim, owner in core_map.items()
     }
+    span = max(physical_cores, num_cores)
     return rewritten, span, ids
 
 

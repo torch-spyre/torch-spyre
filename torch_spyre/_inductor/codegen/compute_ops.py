@@ -857,19 +857,20 @@ def generate_sdsc(
 
     def _derived_kind(
         arg_index: int,
-        core0_addr: int,
+        anchor_addr: int,
         addr: int,
         sliced_base_sym_idx: int,
     ) -> SymbolKind:
-        """Return the SymbolKind for a per-core (c>0) HBM address.
+        """Return the SymbolKind for a per-core (non-anchor) HBM address.
 
-        Core 0 is handled by the caller (either ``kernel`` or ``kernel_slice``).
-        ``sliced_base_sym_idx`` is the 0-based index in ``symbols`` of the
-        sliced-base symbol (``kernel`` or ``kernel_slice``) for this tensor.
+        The anchor core is handled by the caller (either ``kernel`` or
+        ``kernel_slice``).  ``sliced_base_sym_idx`` is the 0-based index in
+        ``symbols`` of the sliced-base symbol (``kernel`` or ``kernel_slice``)
+        for this tensor.
         """
         return SymbolKind.kernel_derived(
             base_sym_idx=sliced_base_sym_idx,
-            offset=addr - core0_addr,
+            offset=addr - anchor_addr,
             arg_index=arg_index,
         )
 
@@ -905,11 +906,11 @@ def generate_sdsc(
         tensor,
         c: int,
         addr: int,
-        core0_addr: int,
+        anchor_addr: int,
         sliced_base_sym_idx: int,
         symbolic_split: tuple[str, int, str] | None,
     ) -> None:
-        """Register the c>0 derived address for a kernel tensor.
+        """Register the non-anchor derived address for a kernel tensor.
 
         Routes to ``kernel_derived_symbolic`` when the tensor is split on a
         symbolic dim (the byte offset depends on the runtime dim size and is
@@ -937,7 +938,7 @@ def generate_sdsc(
         else:
             offset_as_symbol(
                 addr,
-                _derived_kind(tensor.arg_index, core0_addr, addr, sliced_base_sym_idx),
+                _derived_kind(tensor.arg_index, anchor_addr, addr, sliced_base_sym_idx),
             )
 
     # Compute per-tensor, per-level affine strides and register base addresses.
@@ -1000,12 +1001,28 @@ def generate_sdsc(
             continue
         nb = num_bytes(tensor.data_format)
         slice_offset_bytes = sum(tensor.offsets.values()) * nb
-        # core0_addr: compile-time address for core 0 including the tensor's
-        # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
-        core0_addr = (
+        # anchor_addr: compile-time address of the fold position that owns
+        # work slice 0 on every split dim — the position whose runtime address
+        # the raw ``kernel``/``kernel_slice`` base symbol represents (it is
+        # built from the tensor origin plus compile-time slice offsets only).
+        # Core 0 is that position under dense/stride placements, but a sparse
+        # placement can dispatch slice 0 elsewhere; anchoring on core 0 then
+        # hands every dispatched core a derived symbol for a base the backend
+        # expects shared, and the slice-0 owner an address offset that may
+        # point before the buffer. Pick the lowest fold position whose
+        # evaluated slice is all zeros, deterministically.
+        anchor_core = min(
+            (
+                c
+                for c in range(sdsc_spec.num_cores)
+                if not any(core_id_to_wk_slice[str(c)].values())
+            ),
+            default=0,
+        )
+        anchor_addr = (
             tensor.start_address
             + core_idx_to_slice_offset(
-                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                tensor, core_id_to_wk_slice[str(anchor_core)], sdsc_spec.work_slices
             )
             * nb
         )
@@ -1108,7 +1125,7 @@ def generate_sdsc(
             # base; otherwise a kernel_slice sym is registered for the combined offset.
             if total_slice_offset > 0:
                 offset_as_symbol(
-                    core0_addr,
+                    anchor_addr,
                     SymbolKind.kernel_slice(
                         arg_index=tensor.arg_index, offset=total_slice_offset
                     ),
@@ -1158,24 +1175,26 @@ def generate_sdsc(
                     )
                     * nb
                 )
-                if c == 0:
+                if c == anchor_core:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    # kernel / kernel_slice already registered above; skip c==0
+                    # kernel / kernel_slice already registered above; the
+                    # anchor core IS the base address owner, skip it
                 else:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    elif addr != core0_addr:
+                    elif addr != anchor_addr:
                         # Only register a derived symbol when the core has a
-                        # distinct address from core 0.  When addr == core0_addr
-                        # (e.g. a non-split tensor where all cores share one
-                        # address) the sliced-base symbol already covers it and
-                        # we must not create a duplicate registration.
+                        # distinct address from the anchor.  When
+                        # addr == anchor_addr (e.g. a non-split tensor where
+                        # all cores share one address) the sliced-base symbol
+                        # already covers it and we must not create a duplicate
+                        # registration.
                         _register_per_core_derived(
                             tensor,
                             c,
                             addr,
-                            core0_addr,
+                            anchor_addr,
                             sliced_base_sym_idx,
                             symbolic_split,
                         )
@@ -1191,14 +1210,15 @@ def generate_sdsc(
                     )
                     * nb
                 )
-                if c == 0:
+                if c == anchor_core:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    # kernel / kernel_slice already registered above; skip c==0
+                    # kernel / kernel_slice already registered above; the
+                    # anchor core IS the base address owner, skip it
                 else:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    elif addr != core0_addr:
+                    elif addr != anchor_addr:
                         # Symbolic split on a non-tiled dim combined with
                         # tiling on another dim still routes through the
                         # helper; the split==tiled case is rejected above.
@@ -1206,7 +1226,7 @@ def generate_sdsc(
                             tensor,
                             c,
                             addr,
-                            core0_addr,
+                            anchor_addr,
                             sliced_base_sym_idx,
                             symbolic_split,
                         )
@@ -1237,20 +1257,30 @@ def generate_sdsc(
             tensor, sdsc_spec.work_slices, symbolic_dims
         )
         # Hoist kernel-tensor compile-time offsets so they are not
-        # duplicated across the c==0 and c>0 branches.
+        # duplicated across the anchor and non-anchor branches.
         if not is_pool_tensor:
             slice_offset_bytes = sum(tensor.offsets.values()) * nb
             tile_offset_bytes = tensor.start_address - tensor.arg_index
             total_slice_offset = tile_offset_bytes + slice_offset_bytes
-            c0_slice_key: tuple | int = (
+            anchor_slice_key: tuple | int = (
                 ("kernel_slice", tensor.arg_index, total_slice_offset)
                 if total_slice_offset > 0
                 else ("kernel", tensor.arg_index)
             )
-            core0_addr_lookup = (
+            # Same anchor selection as the per-tensor registration loop: the
+            # lowest fold position owning work slice 0 on every split dim.
+            anchor_core = min(
+                (
+                    c
+                    for c in range(sdsc_spec.num_cores)
+                    if not any(core_id_to_wk_slice[str(c)].values())
+                ),
+                default=0,
+            )
+            anchor_addr_lookup = (
                 tensor.start_address
                 + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                    tensor, core_id_to_wk_slice[str(anchor_core)], sdsc_spec.work_slices
                 )
                 * nb
             )
@@ -1265,18 +1295,18 @@ def generate_sdsc(
             )
             if is_pool_tensor:
                 key: tuple | int = ("pool", addr)
-            elif c == 0:
-                key = c0_slice_key
-            elif addr == core0_addr_lookup:
-                # Non-split tensor: all cores share core 0's address, so no
-                # derived symbol was registered, reuse the sliced-base key.
-                key = c0_slice_key
+            elif c == anchor_core:
+                key = anchor_slice_key
+            elif addr == anchor_addr_lookup:
+                # Non-split tensor: all cores share the anchor's address, so
+                # no derived symbol was registered, reuse the sliced-base key.
+                key = anchor_slice_key
             elif symbolic_split is not None:
-                # Symbolic-dim split: c>0 registered a kernel_derived_symbolic
+                # Symbolic-dim split: non-anchor cores registered a
                 # symbol keyed by (tensor, core).
                 key = ("kernel_derived_symbolic", tensor.arg_index, c)
             else:
-                # c>0 concrete per-core derived address (bare int key).
+                # Non-anchor concrete per-core derived address (bare int key).
                 key = addr
             result[f"[{c}, 0, 0]"] = str(local_symbols[key])
         return result
