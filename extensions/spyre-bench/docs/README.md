@@ -596,3 +596,10 @@ spyre-bench analyze pinning-effect --catalog examples/pinning-demo --results res
 `examples/pinning-demo` is the end-to-end pattern: one latency Benchmark at two output lengths, node-a and node-b
 Environments with and without `device_local` pinning, and the `pinning-effect` Analysis. The Results come from the
 launcher; the tests build synthetic ones.
+
+`relax:` on an Analysis lets `compare` combine cells that differ in the attributes it names (`subject.id`, `env.id`,
+`env.node`, `env.label.<k>`, a trailing `*` allowed, a bare `*` relaxes nothing), for a comparison whose point is that
+difference, such as card count. Everything not named stays strict, but relaxing `env.id` also stops comparing the rest of
+the environment fingerprint (kernel, driver). `derive` pairs stay strict. `examples/trace-demo` scales a decode Benchmark
+over 1, 2 and 4 cards (`decode-scaling`) and keeps a per-card controlled-set query (`rank-spread`, evaluated on stored rows
+where `run.rank` is a property of each per-rank row; validate with `--pack examples/packs/trace-example`).
