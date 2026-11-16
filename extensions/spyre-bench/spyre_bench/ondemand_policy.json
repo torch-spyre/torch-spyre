@@ -28,7 +28,11 @@
   "clean_cluster": 2,
   "types": [
    "perf"
-  ]
+  ],
+  "vs_kinds": [
+   "main"
+  ],
+  "vs_relax": false
  },
  "ghe": {
   "tiers": [
@@ -61,6 +65,14 @@
   "types": [
    "perf",
    "quality"
-  ]
+  ],
+  "vs_kinds": [
+   "main",
+   "tag",
+   "build",
+   "artifact",
+   "ref"
+  ],
+  "vs_relax": true
  }
 }

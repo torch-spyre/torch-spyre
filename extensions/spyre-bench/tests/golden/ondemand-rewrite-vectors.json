@@ -119,6 +119,18 @@
  },
  {
   "in": {
+   "text": "/spyre-bench sanity vs=ref:ref-a"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity bench-vs=ref:ref-a TEST_TYPE=perf"
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity vs=artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10"
+  },
+  "out": "/spyre-test preset=perf-only bench=sanity bench-vs=artifact:0b7f1c52-3d1e-4a39-9c21-5f6a8e2d4b10 TEST_TYPE=perf"
+ },
+ {
+  "in": {
    "text": "/spyre-bench sanity max-wait=45m clean=true budget=3 sha=abcdef1 env=e1 profile=light vs=main purpose=pr"
   },
   "out": "/spyre-test preset=perf-only bench=sanity bench-max-wait=45m bench-clean=true bench-budget=3 bench-sha=abcdef1 bench-env=e1 bench-profile=light bench-vs=main bench-purpose=pr TEST_TYPE=perf"

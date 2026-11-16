@@ -683,7 +683,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 | `reuse` | `if_valid`, `never`, `prefer`, `only` | `if_valid` |
 | `force` | case names, or `all` | none (needs a reuse mode other than `never`) |
 | `profile` | `off`, `light`, `full` | `off` |
-| `vs` | `main`, `nightly`, `build:<job>#<n>` (kept in the request for the report; the planner does not read it) | `nightly` |
+| `vs` | `main` (alias `nightly`), `tag:<t>`, `build:<job>#<n>`, `artifact:<uuid>`, `ref:<key>`; see "Comparing with `vs=`" | `main` (spelled `nightly`) |
 | `clean` | `true`, `false` | `false` (needs write access) |
 | `max-wait` | `45m`, `1h`, ... (with `clean=true`) | the placer's default; capped at 60m |
 | `env` | an Environment name | the preset's |
@@ -697,6 +697,7 @@ start a line; lines inside code fences, quotes or indented are ignored.
 |---|---|---|
 | tiers | `sanity` | `sanity`, `core` |
 | `reuse=never`, `force=all`, `profile=light`, `env=` | refused | allowed |
+| `vs=` kinds | `main` | `main`, `tag`, `build`, `artifact`, `ref` |
 | `extended`, `profile=full` | refused (ops request only) | refused |
 | who may ask | write permission, checked by API | write permission or org membership |
 | `clean=true` | write permission | write permission |
@@ -713,6 +714,62 @@ except the hourly rate and the daily clean quota, so a submit-and-cancel loop st
 what the caller records in the history, so the caller must record refused requests too. A row with a non-finite or
 negative estimate fails closed. There is no per-user device-hour cap across pull requests. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
 at once overall.
+
+### Comparing with `vs=`
+
+`vs=` says what the run is compared with. Resolution is read-only against the store and follows the verdict trust
+rules: only a valid, non-external, non-invalidated stored result counts as the other side. The subject is still a PR
+run, so its verdict is capped at `suspected` and `purpose_not_baseline` holds whatever `vs=` says.
+
+| Form | Resolves to | The other side, when it has no usable result |
+|---|---|---|
+| `vs=main` (also `nightly`) | the newest artifact of the same product and arch with a stored result of a main purpose (`nightly`, `weekly`) | cannot compare; never measured here |
+| `vs=tag:<t>` | the artifact the tag points at now (same product and arch) | measured here, for the missing cases only |
+| `vs=build:<job>#<n>` | the artifact that Jenkins build produced | measured here, for the missing cases only |
+| `vs=artifact:<uuid>` | that artifact | measured here, for the missing cases only |
+| `vs=ref:<key>` | the current approved version of that reference | cannot compare; a reference is never measured |
+
+Rules, in the order they are applied:
+
+1. The host decides which kinds it offers (`vs_kinds` in the policy file): github.com only `main`; the internal host
+   all five. An artifact, build or tag names internal material, so it is never offered on the public host.
+2. A reference is reachable only through `ref:`. `main`, `tag:`, `build:` and `artifact:` refuse a target that is a
+   reference (`reference_only_via_ref`), and `ref:` takes only the version that is `current` (retired, superseded or
+   not yet approved ones are refused). A reference is a comparison target and never a baseline
+   (`target.baseline_eligible` is `false`).
+3. The target must be of the same product and arch as the subject, and must not be the subject.
+4. Per case, the newest stored result of that benchmark is the candidate. It must be `valid`, not `external` trust, and
+   not invalidated (`run` or `run_benchmark` scope, unless restored). `vs=main` additionally needs a main purpose.
+5. Environment is strict by default: the stored `env_id` must equal the plan's, with the same pinning policy. A
+   result from another environment is never used. `main` and `ref:` then say `cannot compare: different_environment`;
+   a named artifact is measured here instead, because a result in this environment is what is missing. A plan with
+   no environment id compares nothing (`environment_unknown`). A reference carries no environment id of its own: only
+   its arch is matched, and its comparability caveats apply. `spyre-bench ondemand compare --relax-labels` matches
+   labels instead of the id, and only where the host allows it (`vs_relax`; the internal host). It cannot be asked
+   for in a comment.
+6. The other side is measured only when the reason is that nothing usable is stored (`no_stored_result`) or the
+   environment differs, and only for `tag:`, `build:` and `artifact:`. A stored result that is invalid, suspect,
+   external or invalidated is refused, not silently re-measured.
+
+```bash
+spyre-bench ondemand compare --plan plan.json --request request.json --product spyre-inference --host ghe --store clickhouse
+spyre-bench ondemand preview --plan plan.json --request request.json --compare compare.json
+```
+
+`compare` prints a `bench.compare/1` document: the resolved target, the cap, and per case one of `ready` (both sides
+stored), `will_run_other` (the other side will be measured; `other_requests` holds the engine request for those
+cases) or `cannot_compare` with the reason; counts; the device-hours of both sides; and a `digest`. The preview adds
+the other side's device-hours to the estimate the budget is judged on and shows a compare section (ids only on the
+internal host). Pass `--expect-digest` (and `--expect-artifact`) at run time to refuse a comparison that moved since
+the preview: `vs=main` follows the newest nightly, so the target is pinned by the artifact id the preview showed.
+
+The request record (`ci_requests`) carries `bench.vs`, `bench.vs.kind`, `bench.vs.status`, `bench.vs.artifact`,
+`bench.vs.role`, `bench.vs.subject_artifact` and `bench.vs.digest`, so a reader can open the Perf Lab compare layer
+with both sides: `/perf-lab/drill/compare/<run a>/<run b>/<benchmark id>`, one per case with both runs known (the
+subject's run id is the plan's `reused_from`, or the run once it ran).
+
+Examples (synthetic names): `/spyre-bench sanity vs=main`; `/spyre-bench ladder@sanity vs=tag:release-1`;
+`/spyre-bench a_1,b_2 vs=ref:ref-a`.
 
 ### Fork pull requests and the pinned sha
 

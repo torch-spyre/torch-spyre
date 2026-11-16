@@ -20,6 +20,7 @@ callers (a PR-comment workflow, the internal comment bot) fetch the facts, call 
   spyre-bench ondemand parse     --comment-file F --host H            comment -> request.json
   spyre-bench ondemand authorize --facts F                            request + actor + PR facts -> decision.json
   spyre-bench ondemand preview   --plan P --request R [--format md]   plan.json -> preview comment / JSON
+  spyre-bench ondemand compare   --plan P --request R --product X    what vs= resolves to, per case (read-only store)
   spyre-bench ondemand engine-request | env | state | sanitize         request -> plan request / BENCH_* / hidden state / inert text
 
 Grammar, policy table and the threat model: docs/README.md ("On-demand benchmarks for a PR").
@@ -38,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 
 import regex
 
-from spyre_bench import cliutil
+from spyre_bench import cliutil, compare
 from spyre_bench.cliutil import UsageError
 
 PRODUCTS = ("torch-spyre", "hf-adapters", "spyre-inference", "spyre-comms")
@@ -46,7 +47,6 @@ DEFAULT_PRODUCT = "spyre-inference"
 TIERS = ("sanity", "core", "extended")
 REUSE_MODES = ("if_valid", "never", "prefer", "only")
 PROFILES = ("off", "light", "full")
-VS_FIXED = ("main", "nightly")
 HOSTS = ("github.com", "ghe")
 PURPOSE = "pr"
 PREVIEW_SCHEMA = "bench.preview/1"
@@ -102,6 +102,8 @@ class Policy:
     tiers: tuple
     reuse_modes: tuple
     types: tuple
+    vs_kinds: tuple
+    vs_relax: bool
     force_all: bool
     profiles: tuple
     custom_env: bool
@@ -125,7 +127,7 @@ def _load_policies():
     out = {}
     for host in HOSTS:
         d = raw[host]
-        for key in ("tiers", "reuse_modes", "profiles", "types"):
+        for key in ("tiers", "reuse_modes", "profiles", "types", "vs_kinds"):
             d[key] = tuple(d[key])
         out[host] = Policy(host=host, **d)
     return out
@@ -192,10 +194,10 @@ class OnDemandRequest:
             raise RequestError("the stored request has an unknown type")
         if self.reuse not in REUSE_MODES or self.profile not in PROFILES:
             raise RequestError("the stored request has an unknown reuse mode or profile")
-        if self.vs not in VS_FIXED and (
-            ".." in self.vs or not regex.fullmatch(r"build:[A-Za-z0-9][A-Za-z0-9._/-]{0,79}#[0-9]{1,9}", self.vs)
-        ):
-            raise RequestError("the stored request has a bad vs")
+        try:
+            compare.parse_vs(self.vs)
+        except ValueError:
+            raise RequestError("the stored request has a bad vs") from None
         if self.sha and not SHA_PREFIX.fullmatch(self.sha):
             raise RequestError("the stored request has a bad sha")
         if self.env:
@@ -353,10 +355,10 @@ def parse_flags(flags, default_product=DEFAULT_PRODUCT):
     if profile not in PROFILES:
         raise RequestError(f"profile={profile!r}: one of {', '.join(PROFILES)}")
     vs = got.get("vs", "nightly")
-    if vs not in VS_FIXED and (
-        ".." in vs or not regex.fullmatch(r"build:[A-Za-z0-9][A-Za-z0-9._/-]{0,79}#[0-9]{1,9}", vs)
-    ):
-        raise RequestError(f"vs={vs!r}: main, nightly or build:<job>#<n>")
+    try:
+        compare.parse_vs(vs)
+    except ValueError as e:
+        raise RequestError(str(e)) from None
     env = got.get("env", "")
     if env:
         _name(env, "env")
@@ -495,6 +497,8 @@ def check_policy(req, policy, actor=None):
         bad.append("force=all is not available here: name the cases")
     if req.profile not in policy.profiles:
         bad.append(f"profile={req.profile} is not available here")
+    if compare.parse_vs(req.vs).kind not in policy.vs_kinds:
+        bad.append(f"vs={compare.parse_vs(req.vs).kind} is not available here")
     if req.env and not policy.custom_env:
         bad.append("env= is not available here: the environment is fixed by the workflow")
     if req.max_wait_s > policy.max_wait_cap_s:
@@ -994,6 +998,7 @@ def ci_request_row(
     error="",
     now=None,
     would_refuse=(),
+    cmp=None,
 ):
     """One ci_requests row (append-only; one per event). `plan` is a plan.json, `actor` the login that caused the event."""
     if state not in CI_STATES:
@@ -1039,6 +1044,7 @@ def ci_request_row(
             "bench.enforced": str(SETTINGS["enforce_budgets"]).lower(),
             # What the budgets would have refused, recorded whether or not they are enforced: this is the usage record.
             "bench.would_refuse": neutral("; ".join(map(str, would_refuse)), 500),
+            **({k: neutral(v, 200) for k, v in compare.request_props(cmp).items()} if cmp else {}),
         },
     }
 
@@ -1167,10 +1173,43 @@ def _asked_vs_planned(req, plan):
     return rows
 
 
-def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()):
-    """The preview as data (the dashboard consumes this; `render_markdown` is the same data as text)."""
+def compare_view(cmp):
+    """The compare document as the preview carries it: states, reasons and short ids, never a measured value."""
+    t = cmp.get("target") or {}
+    return {
+        "schema": cmp["schema"],
+        "vs": cmp["vs"]["text"],
+        "status": cmp["status"],
+        "refusal": cmp.get("refusal"),
+        "target": {k: t.get(k) for k in ("artifact_id", "source", "ref_key", "role", "baseline_eligible")}
+        if t
+        else None,
+        "cap": cmp["cap"],
+        "counts": cmp["counts"],
+        "estimate": cmp["estimate"],
+        "cases": [
+            {
+                "name": c["name"],
+                "state": c["state"],
+                "why": c["why"],
+                "subject": c["subject"]["action"],
+                "other_run": c["other"]["run_id"],
+                "other_validity": c["other"]["validity"],
+            }
+            for c in cmp["cases"]
+        ],
+        "digest": cmp["digest"],
+    }
+
+
+def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=(), cmp=None):
+    """The preview as data (the dashboard consumes this; `render_markdown` is the same data as text).
+
+    `cmp` is a compare document: the other side's device-hours join the estimate the budget is judged on."""
     s, est = plan["summary"], plan.get("estimate") or {}
     known = _finite_hours(est.get("device_hours"))
+    if known is not None and cmp:
+        known += float((cmp.get("estimate") or {}).get("other_device_hours") or 0.0)
     hours = known if known is not None else 0.0
     limit = budget_limit(req, policy) if policy else None
     needs_confirm = False
@@ -1216,10 +1255,36 @@ def build_preview(plan, req, policy=None, queue=None, dashboard_url="", notes=()
         "dashboard_url": dashboard_url,
         "notes": [safe(n, 200) for n in notes],
     }
-    body["digest"] = hashlib.sha256(
-        json.dumps({k: body[k] for k in ("counts", "estimate", "diff", "cases")}, sort_keys=True).encode()
-    ).hexdigest()[:16]
+    keyed = {k: body[k] for k in ("counts", "estimate", "diff", "cases")}
+    if cmp:
+        body["compare"] = compare_view(cmp)
+        keyed["compare"] = cmp["digest"]
+    body["digest"] = hashlib.sha256(json.dumps(keyed, sort_keys=True).encode()).hexdigest()[:16]
     return body
+
+
+_CMP_WORD = {"ready": "both sides stored", "will_run_other": "other side runs", "cannot_compare": "cannot compare"}
+
+
+def _render_compare(cv, public):
+    """Compare section of the PR comment. A public host names no artifact, run or reference, only states."""
+    c = cv["counts"]
+    t = cv.get("target") or {}
+    where = "" if public or not t else f" ({safe(t.get('source'), 20)} {safe(str(t.get('artifact_id'))[:8], 8)})"
+    out = [
+        f"**Compared with {safe(cv['vs'], 80)}**{where}: ready {c['ready']} · other side runs {c['will_run_other']} · cannot compare {c['cannot_compare']}"
+    ]
+    out.append("A PR run is advisory (`suspected` at most) and never becomes a baseline.")
+    if cv["status"] != "ok":
+        out.append(f"**Nothing to compare:** {safe((cv.get('refusal') or {}).get('message'), 160)}")
+    bad = [k for k in cv["cases"] if k["state"] != "ready"][:10]
+    if bad:
+        out += ["", "| case | state | why |", "|---|---|---|"]
+        out += [
+            f"| {safe(k['name'], 90)} | {_CMP_WORD.get(k['state'], safe(k['state'], 20))} | {safe(k['why'], 100)} |"
+            for k in bad
+        ]
+    return out
 
 
 def render_markdown(preview, public=True, command="/spyre-bench", state=None):
@@ -1252,6 +1317,9 @@ def render_markdown(preview, public=True, command="/spyre-bench", state=None):
         out.append("**Nothing will run** until the selection fits this host.")
     elif b.get("needs_confirm"):
         out.append(f"**Confirm to run:** reply `{command} confirm` (write access needed). Nothing runs until then.")
+    cv = preview.get("compare")
+    if cv:
+        out += ["", *_render_compare(cv, public)]
     if preview["diff"]:
         out += ["", "**You asked for / will run**", "", "| item | asked | planned | why |", "|---|---|---|---|"]
         out += [
@@ -1314,13 +1382,58 @@ def _cmd_authorize(a):
 def _cmd_preview(a):
     req = OnDemandRequest.from_dict(_load(a.request))
     queue = json.loads(a.queue) if a.queue else None
-    pv = build_preview(_load(a.plan), req, POLICIES[a.host], queue, a.dashboard_url or "", a.note)
+    pv = build_preview(
+        _load(a.plan),
+        req,
+        POLICIES[a.host],
+        queue,
+        a.dashboard_url or "",
+        a.note,
+        _load(a.compare) if a.compare else None,
+    )
     state = json.loads(a.state) if a.state else None
     print(
         render_markdown(pv, public=a.host == "github.com", command=a.command or "/spyre-bench", state=state)
         if a.format == "md"
         else json.dumps(pv, sort_keys=True)
     )
+    return cliutil.EXIT_OK
+
+
+def _cmd_compare(a):
+    from spyre_bench import store as store_mod
+
+    req = OnDemandRequest.from_dict(_load(a.request))
+    plan = _load(a.plan)
+    policy = POLICIES[a.host]
+    relax = tuple(cliutil.csv(a.relax_labels or ""))
+    if relax and not policy.vs_relax:
+        raise RequestError("relaxed environment matching is not available here")
+    if a.store_file:
+        spec = _load(a.store_file)
+        for r in spec.get("results", []):
+            r["ts"] = _parse(r["ts"])
+        for t in spec.get("targets", []):
+            t["ts"] = _parse(t["ts"])
+        st = store_mod.MemoryStore(
+            results=spec.get("results", []), targets=spec.get("targets", []), events=spec.get("events", [])
+        )
+    else:
+        st = store_mod.open_store(a.store)
+    doc = compare.plan_compare(
+        plan,
+        compare.parse_vs(req.vs),
+        st,
+        product=a.product,
+        host_kinds=policy.vs_kinds,
+        relax=relax,
+        purposes=tuple(cliutil.csv(a.purposes)) if a.purposes else compare.MAIN_PURPOSES,
+        expect_artifact=a.expect_artifact or "",
+    )
+    print(json.dumps(doc, sort_keys=True))
+    if a.expect_digest and doc["digest"] != a.expect_digest:
+        print("error: the comparison changed since the preview", file=sys.stderr)
+        return cliutil.EXIT_INVALID
     return cliutil.EXIT_OK
 
 
@@ -1352,6 +1465,7 @@ def _cmd_record(a):
         request_id=a.request_id or "",
         comment_url=a.comment_url or "",
         error=a.error or "",
+        cmp=_load(a.compare) if a.compare else None,
     )
     print(json.dumps(row, sort_keys=True))
     return cliutil.EXIT_OK
@@ -1398,6 +1512,20 @@ def parser():
     p = sub.add_parser("authorize", help="facts.json -> decision (exit 0 allowed, 2 denied)")
     p.add_argument("--facts", required=True)
     p.set_defaults(fn=_cmd_authorize)
+    p = sub.add_parser("compare", help="plan.json + request.json (+ the store) -> what vs= resolves to, per case")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--request", required=True)
+    p.add_argument("--product", required=True)
+    p.add_argument("--host", choices=HOSTS, default="github.com")
+    p.add_argument("--store", default="none", help="none | clickhouse (read-only)")
+    p.add_argument("--store-file", help="a JSON file standing in for the store (tests and demos)")
+    p.add_argument(
+        "--relax-labels", help="env label patterns to match instead of the environment id (where the host allows)"
+    )
+    p.add_argument("--purposes", help="purposes whose results vs=main may use")
+    p.add_argument("--expect-artifact", help="refuse when the target is not this artifact (the one the preview showed)")
+    p.add_argument("--expect-digest", help="exit 2 when the comparison differs from the one the preview showed")
+    p.set_defaults(fn=_cmd_compare)
     p = sub.add_parser("engine-request", help="request.json -> the Run request for `spyre-bench plan --request`")
     p.add_argument("--request", required=True)
     p.add_argument("--product", required=True)
@@ -1423,6 +1551,7 @@ def parser():
     p.add_argument("--comment-url")
     p.add_argument("--error")
     p.add_argument("--would-refuse", action="append", help="a budget finding to record (repeatable)")
+    p.add_argument("--compare", help="compare.json: records the comparison target in the row")
     p.set_defaults(fn=_cmd_record)
     p = sub.add_parser("history", help="v_ci_requests rows (JSON file) -> admission history rows")
     p.add_argument("--rows", required=True)
@@ -1443,6 +1572,7 @@ def parser():
     p.add_argument("--format", choices=("md", "json"), default="md")
     p.add_argument("--queue", help="JSON object of queue facts to show")
     p.add_argument("--dashboard-url")
+    p.add_argument("--compare", help="compare.json from `ondemand compare`: adds its section and cost")
     p.add_argument("--command", default=None)
     p.add_argument("--note", action="append", default=[], help="a line shown under the table (repeatable)")
     p.add_argument("--state", help="JSON object stored in the comment for a later /bench confirm")
