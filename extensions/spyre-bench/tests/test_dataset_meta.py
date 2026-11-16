@@ -79,8 +79,12 @@ class Metadata(unittest.TestCase):
                     dm.parse(text, "slot-91")
                 self.assertNotIn(SECRET, str(cm.exception))
 
+    def test_hostile_json_is_a_clean_error(self):
+        with self.assertRaises(dm.DatasetMetaError):
+            dm.parse("[" * 100000, "slot-90")
+
     def test_bad_slug_is_refused(self):
-        for slug in ("", "../x", "A", "a/b", None):
+        for slug in ("", "../x", "A", "a/b", None, "slot-1\n"):
             with self.subTest(slug=slug), self.assertRaises(dm.DatasetMetaError):
                 dm.DirSource(TMP).fetch(slug)
 
@@ -94,9 +98,11 @@ class Metadata(unittest.TestCase):
         ok = {"integrity": {"files": [{"path": "a", "sha256": DIGEST}]}}
         dm.check_assets(meta, [ok])
         dm.check_assets(meta, [{"integrity": {"manifest": {"path": "m", "sha256": DIGEST}}}])
-        dm.check_assets(meta, [{"integrity": {"revision_pinned": True}}])
+        with self.assertRaises(dm.DatasetMetaError):
+            dm.check_assets(meta, [{"integrity": {"revision_pinned": True}}])
         with self.assertRaises(dm.DatasetMetaError):
             dm.check_assets(meta, [{"integrity": {"files": [{"path": "a", "sha256": "1" * 64}]}}])
+        dm.check_assets(dm.parse(json.dumps({"display_name": "n", "public": True}), "slot-90"), [{}])
 
     def test_http_source(self):
         seen = []
@@ -137,6 +143,23 @@ class Metadata(unittest.TestCase):
             dm.source_for_store(store, {}, urlopen)
         with self.assertRaises(dm.DatasetMetaError):
             dm.source_for_store({"type": "core/hf"}, env)
+        with self.assertRaises(dm.DatasetMetaError):
+            dm.source_for_store(store, {**env, "S_URL": "http://store.invalid"}, urlopen)
+
+    def test_http_failures_beyond_oserror_are_store_errors(self):
+        import http.client
+
+        def bad(req, timeout):
+            raise http.client.BadStatusLine("x")
+
+        with self.assertRaises(dm.DatasetMetaError):
+            dm.Labels(dm.HttpSource("https://store.invalid", "", "", bad)).label("slot-90")
+
+    def test_redirects_are_not_followed(self):
+        import urllib.request
+
+        req = urllib.request.Request("https://a.invalid/x")
+        self.assertIsNone(dm._NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://b.invalid/x"))
 
 
 class ToolsRespectPublic(unittest.TestCase):
