@@ -107,8 +107,8 @@ value is the legacy `--workflow` string as it is (no `/`, no control characters,
 `--channel-trust` the run is recorded as `external`.
 
 The series and trust of a run are those of its first send: re-sending the same results with another workflow or
-a higher trust is a `duplicate` and changes nothing. The action refuses `channel-trust: ci` on `pull_request`,
-`pull_request_target` and `workflow_run` events, and `bench-dir` combined with another results input.
+a higher trust is a `duplicate` and changes nothing. The action accepts `channel-trust: ci` only on `push`, `schedule` and
+`workflow_dispatch` events, and `bench-dir` combined with another results input.
 
 ## Qualification and invalidation
 

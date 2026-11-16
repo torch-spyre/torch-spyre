@@ -416,7 +416,7 @@ def test_a_legacy_workflow_name_with_spaces_is_a_series_and_none_is_the_unprefix
     ) == [("",)]
 
 
-@pytest.mark.parametrize("bad", [5, ["a"], "a/b", "a\nb", "x" * 129])
+@pytest.mark.parametrize("bad", [5, ["a"], "a/b", "a\nb", "x" * 129, "a\ud800"])
 def test_a_malformed_workflow_is_a_rejection_for_ci_and_ignored_below(bad):
     with pytest.raises(offline.BundleError, match="workflow"):
         bench_bundle.series_prefix({"workflow": bad}, "ci")

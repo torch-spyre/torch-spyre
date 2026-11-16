@@ -24,7 +24,7 @@ different repeat under a known key is refused.
 
 import hashlib
 import json
-import re
+import regex as re
 import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -230,7 +230,7 @@ def known_ci_envs(client, db: str, ids: list) -> set:
     return {str(r[0]) for r in rows}
 
 
-SERIES = re.compile(r"[^/\x00-\x1f\x7f]{1,128}")
+SERIES = re.compile(r"[^/\x00-\x1f\x7f\ud800-\udfff]{1,128}")
 
 
 def series_prefix(meta: dict, trust: str) -> str:
@@ -242,8 +242,7 @@ def series_prefix(meta: dict, trust: str) -> str:
     wf = meta.get("workflow") or ""
     if not isinstance(wf, str):
         raise BundleError("workflow must be a string")
-    wf = wf.strip()
-    if not wf:
+    if not wf.strip():
         return ""
     if not SERIES.fullmatch(wf):
         raise BundleError(
