@@ -1600,6 +1600,9 @@
     "path": {
      "type": "string"
     },
+    "slug": {
+     "$ref": "#/$defs/name"
+    },
     "uri": {
      "type": "string"
     },
@@ -1633,7 +1636,7 @@
      ]
     }
    },
-   "description": "exactly one of store+path, uri, generator"
+   "description": "exactly one of store+path, store+slug, uri, generator; a slug is the store-relative path `<slug>`"
   }
  }
 }

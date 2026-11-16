@@ -11,7 +11,7 @@ spec: {type: llm/lm-eval-model, backend: hf-demo, token: demoa-fp8, model: demo-
 ---
 apiVersion: bench/v1alpha1
 kind: Benchmark
-metadata: {name: eval-gsm8k}
+metadata: {name: eval-slot-91}
 spec:
   type: quality
   level: model
@@ -19,11 +19,11 @@ spec:
   system: demo-llm-a-hfa-fp16
   workload:
     type: llm/lm-eval
-    inputs: [{name: tasks, dataset: gsm8k, subset: test-first-50, expect: {records: 50}}]
-    eval: {task: gsm8k, num_fewshot: 5, seed: 1234, filter: strict-match}
+    inputs: [{name: tasks, dataset: slot-91, subset: test-first-50, expect: {records: 50}}]
+    eval: {task: slot-91, num_fewshot: 5, seed: 1234, filter: strict-match}
   run: {cache: warm, timeout: 120m, est: 30m}
   matrix:
-    name_template: eval_gsm8k_{system.token}_{system.precision}_l50
+    name_template: eval_slot-91_{system.token}_{system.precision}_l50
     axes:
       model:
         - {token: fp16, patch: {tier: sanity}}

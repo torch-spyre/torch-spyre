@@ -191,6 +191,25 @@ PYTHONPATH=extensions/clickhouse-ingest python tests/refresh_conformance.py [--c
 which rewrites the table. A changed id is a changed series: review the diff. When the ingest changes a producer's keys,
 update `ID_PROFILES`, the example blocks and the table together.
 
+## Dataset slugs
+
+A public definition names a dataset by an opaque slug (`slot-95`), never by its real name. The artifact store holds
+`<slug>/dataset.json` beside the data:
+
+```json
+{"display_name": "Demo Questions", "public": true, "license": "MIT", "sha256": "<digest>", "notes": ""}
+```
+
+- `Dataset.spec.slug` (default: the name) locates it; `spec.store` (default: the store of its first Asset) says where.
+  An Asset may use `source: {store, slug}` in place of `store+path`; the path is then `<slug>`.
+- A tool labels a dataset with `display_name` only when `public` is exactly `true`; otherwise it shows the slug.
+  `explain --dataset-meta-dir DIR` or `--dataset-store STORE` reads the files; with neither, nothing is read and the
+  slug is shown. `validate` never reads a store: a slug is only a string there.
+- A missing, unreadable or malformed file, a `slug` field that disagrees with the directory, or a `sha256` that none of
+  the Dataset's Assets declares is an error, never a silent fallback. Error text carries the slug, not the file.
+- The file is a trusted input: whoever can write the store path decides what is public. Keep that path write-restricted.
+- `dataset.json` is not part of any identity. The store namespace is configured per deployment, never in a public file.
+
 ## Cost hints, not scheduling
 
 The core Benchmark kind carries no cadence. `est_hours` (optional, all cases) and `run.est`/`run.timeout` (per case)

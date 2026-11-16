@@ -1,10 +1,10 @@
 catalog	case	benchmark_id	series_key	env_spec_digest
-llm-demo	serve_demoa_tp4_c1_all	f31285a4-7af2-5627-9853-29239ad63c7a	dfc182b5-67de-5d59-a2f2-c371b657652d	f320c221-ceb5-51d8-98cb-b956616b66f3
+llm-demo	serve_demoa_tp4_c1_all	6247b288-12ac-55f6-b4af-5e98ea2e0aa7	1648b96a-91c5-583a-816a-6fdb37e71825	f320c221-ceb5-51d8-98cb-b956616b66f3
 llm-demo	serve_demoa_tp4_c1_trace-y	9111f8ff-c8ea-5c40-8e1f-b5c0e6c133b5	4eb42b1d-2a5b-5b78-9743-f89a1d590662	f320c221-ceb5-51d8-98cb-b956616b66f3
-llm-demo	serve_demoa_tp4_c5_all	757d46e9-2fca-520c-917d-44e840c15de5	333950b9-4e33-54da-945c-9f4ee0a43c8e	f320c221-ceb5-51d8-98cb-b956616b66f3
+llm-demo	serve_demoa_tp4_c5_all	6b1bb760-f024-5085-9b38-3f5334560f0d	704b6e56-fbe8-5f57-866c-61a0d44ad4e8	f320c221-ceb5-51d8-98cb-b956616b66f3
 llm-demo	serve_demoa_tp4_c5_trace-x	2a310850-0ff8-50ca-971d-be57f3ddd923	5dc1a038-e58c-5f30-a505-6aa322d9e6de	f320c221-ceb5-51d8-98cb-b956616b66f3
 llm-demo	serve_demoa_tp4_c5_trace-y	4db80732-f870-5897-9e8f-7f2bbb4fbc6d	59274b15-ad00-5a5f-9a87-379b5e93a727	f320c221-ceb5-51d8-98cb-b956616b66f3
-llm-demo	serve_demoa_tp4_c16_all	f9eb710d-d91f-55e9-a63a-8a0e4529d9ca	331014e8-b2bf-5cee-a7ce-bf604c0e6bfc	f320c221-ceb5-51d8-98cb-b956616b66f3
+llm-demo	serve_demoa_tp4_c16_all	4796fba6-c54d-5fe2-90b0-d8878c4dc44e	176207e0-c422-57fd-9f87-4d6e2af622db	f320c221-ceb5-51d8-98cb-b956616b66f3
 llm-demo	serve_demoa_tp4_c16_trace-y	13b3b8f3-cb65-5af5-b058-dfbc5eb35fb0	5863cae0-e55e-5358-bfb7-96b48c31a574	f320c221-ceb5-51d8-98cb-b956616b66f3
 llm-demo	serve_demo-embed-a_tp1_c64_n200_in512	fc58d120-9b1f-5bd3-9e92-79bd850e4d98	529f969b-2975-500d-beee-6b9f470a91e5	429b09d4-b2a9-5027-bb0f-f23e40b97f10
 llm-demo	serve_demo-embed-a_tp1_c16_n10000_in512	a7e137c9-3b27-5056-bcba-a1b741836339	23e43bc4-0489-5515-bd4d-427c87a21dd6	429b09d4-b2a9-5027-bb0f-f23e40b97f10
@@ -17,8 +17,8 @@ llm-demo	reference_outputs_demoa	3d3b41b6-03c3-5829-aa95-a4f27cce9eed	7f3cbb03-a
 llm-demo	startup_demoa_tp4_len1000_seqs10	b69735ce-48fe-5877-83fe-bee5c7f02a1b	90eee6e4-5cab-58d7-bc01-0f904e853594	f320c221-ceb5-51d8-98cb-b956616b66f3
 hf-demo	latency-demo-llm-a/batch=b1	9b058158-ad71-51c3-a40b-e8220b793545	c72220e8-0a17-5994-965f-66061a5cbf18	429b09d4-b2a9-5027-bb0f-f23e40b97f10
 hf-demo	latency-demo-llm-a/batch=b4	502ca0da-e9ff-5161-be69-cab04febfd83	19e67c61-cfb6-53b2-8f25-21702b1c5c09	429b09d4-b2a9-5027-bb0f-f23e40b97f10
-hf-demo	eval_gsm8k_demoa_fp16_l50	9419df90-1fb3-518c-95ed-c452e7030b4c	afd43628-8637-582b-9324-50a5dc1a0d45	429b09d4-b2a9-5027-bb0f-f23e40b97f10
-hf-demo	eval_gsm8k_demoa-fp8_fp8_l50	01fa7635-98db-54c3-ba2e-f5d61a0d760b	017e5d2c-2d19-51ea-b096-f768c50f660d	429b09d4-b2a9-5027-bb0f-f23e40b97f10
+hf-demo	eval_slot-91_demoa_fp16_l50	c41b0373-d996-5740-a372-8421630bec07	217dd6ea-f6c1-5674-b549-b43247bd56f8	429b09d4-b2a9-5027-bb0f-f23e40b97f10
+hf-demo	eval_slot-91_demoa-fp8_fp8_l50	cd030b27-abc0-522e-9fe6-66894ab1b896	ecc99394-fb61-5bd2-bd00-f2402b7bdac4	429b09d4-b2a9-5027-bb0f-f23e40b97f10
 kernel-demo	op_all_fp16_shapeset-ops-extended	351cdf27-ef87-5831-8322-e108e4c2b206	d016b6b4-9bdc-5a12-b4c9-dd2c5580eadb	429b09d4-b2a9-5027-bb0f-f23e40b97f10
 kernel-demo	op_matmul_fp16_m4096-n4096-k4096	30bb1911-7600-5655-99e3-8e7dace1d268	c3111b86-c796-56b6-8c4b-cd0e1db51cda	429b09d4-b2a9-5027-bb0f-f23e40b97f10
 kernel-demo	op_matmul_fp16_m1-n4096-k4096	1a92f57a-ee84-5f92-ad04-1fb972eb6bd9	13a05a6c-409a-5843-96ae-2549590f1799	429b09d4-b2a9-5027-bb0f-f23e40b97f10
