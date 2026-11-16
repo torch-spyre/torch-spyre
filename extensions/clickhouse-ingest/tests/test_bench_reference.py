@@ -64,7 +64,7 @@ def quality_doc(**over):
         **{
             "class": "quality",
             "dataset": {"id": "ds1", "subset": "full"},
-            "key": "quality.synth.gsm8k.refsys.acc",
+            "key": "quality.synth.slot-12.refsys.acc",
         }
     )
     d["comparability"] = {"harness": "synth@1", "harness_match": "yes", "precision": "fp32", "dataset_subset": "full",
