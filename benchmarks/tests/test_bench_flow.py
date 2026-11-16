@@ -160,7 +160,7 @@ def test_the_workflow_is_advisory_and_serialised():
     wf = workflow()
     assert (
         wf["concurrency"]["group"]
-        and wf["concurrency"]["cancel-in-progress"] == "false"
+        and wf["concurrency"]["cancel-in-progress"] == "${{ inputs.pr_number != '' }}"
     )
     assert wf["jobs"]["bench"]["continue-on-error"] == "true"
     assert wf["permissions"] == {"contents": "read"}
