@@ -92,14 +92,16 @@ def test_the_nightly_smoke_runs_the_whole_flow_without_cards(tmp_path):
     out = make("bench-nightly-smoke", f"BENCH_RESULTS_DIR={results}")
     assert out.returncode == 0, out.stderr
     assert (
-        "plan: run 6" in out.stdout
-        and "run: 6 ok" in out.stdout
+        "plan: run 25" in out.stdout
+        and "run: 25 ok" in out.stdout
         and "verdict rows" in out.stdout
     )
     plan = json.loads((results / "plan" / "plan.json").read_text())
-    assert plan["stub"] and plan["purpose"] == "nightly" and plan["summary"]["run"] == 6
+    assert (
+        plan["stub"] and plan["purpose"] == "nightly" and plan["summary"]["run"] == 25
+    )
     run = json.loads((results / "run.json").read_text())
-    assert run["counts"]["ok"] == 6 and run["run_id"]
+    assert run["counts"]["ok"] == 25 and run["run_id"]
     assert not list(results.rglob("*.xml"))
 
 
@@ -110,7 +112,7 @@ def test_the_smoke_selection_plans_one_case(tmp_path):
     )
     assert out.returncode == 0, out.stderr
     plan = json.loads((results / "plan" / "plan.json").read_text())
-    assert [c["name"] for c in plan["cases"]] == ["matmul_s1"]
+    assert [c["name"] for c in plan["cases"]] == ["matmul_prefill-n4096"]
 
 
 def test_bench_run_plans_first_unless_given_a_plan():

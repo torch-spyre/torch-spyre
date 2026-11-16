@@ -5,12 +5,14 @@ benchmarks, not where or when they run. The catalog is advisory; nothing here ga
 
 | File | Contents |
 |---|---|
-| `project.yaml` | Project, the `ops` Suite, the `one-device` Environment request and the named Selections |
+| `project.yaml` | Project, the `ops` and `models` Suites, the `one-device` Environment request and the named Selections (`perf-core` is what one perf-suite report holds) |
 | `systems.yaml` | the operator library under test |
 | `ops/<operation>.yaml` | one Benchmark per operation name, expanded over input shapes into cases (`<operation>_<shape token>`) |
-| `ingest-ids.golden.tsv` | ids the ingest writes for each case's report, kernel and total rows (synthetic fixtures) |
+| `models/<model>.yaml` | one Benchmark per model name, expanded over config (`full_model`, `one_block`) and mode into cases |
+| `ingest-ids.golden.tsv` | ids the ingest writes for each case's report, kernel and total rows (kernel names are synthetic) |
 | `tools/check_identity_ids.py` | conformance check: recomputes the table with `spyre_clickhouse_ingest` and compares |
-| `tools/run_kernel_case.py` | the command of an `ops` case: runs the repo's perf entry point once per run and keeps the case's own rows of `report.xml` |
+| `tools/check_report_coverage.py` | which rows of a perf report the catalog declares (`--strict` fails on an undeclared row) |
+| `tools/run_kernel_case.py` | the command of a case: runs the repo's perf entry point once per run and keeps the case's own rows of `report.xml` and of the per-kernel breakdown XMLs |
 | `tools/collect_ingest_xml.py` | gathers the `report.xml` of every case that ran ok, flat, for the XML ingest |
 | `tools/bench_stub.py` | card-free stand-in for the `plan`, `run`, `verdict` and `report` verbs (smoke runs) |
 | `tests/` | pytest suite for the conformance check, the make targets and the on-demand workflow |
@@ -19,7 +21,7 @@ benchmarks, not where or when they run. The catalog is advisory; nothing here ga
 
 ```bash
 make bench-validate                      # schema, packs, cross-resource rules
-make bench-explain CASE=matmul_s1        # one case with its ids
+make bench-explain CASE=matmul_prefill-n4096        # one case with its ids
 make bench-check-ids                     # identity blocks against the ingest derivation
 make bench-list bench-plan bench-run bench-verdict bench-smoke bench-report
 make bench-nightly-smoke                 # plan -> run -> verdict -> report with the stub, no cards
@@ -45,17 +47,23 @@ prefixes the engine with `SENPERFORMANCE=2` unless the caller set it, as `make t
 
 Every Benchmark carries an `identity` block (`mode: ingest`, `profile: perf-kernel`), so the engine's stored
 `benchmark_id` is the id the ingest writes for the same row. The block lists the six discriminators the perf-suite
-parser hashes, in its order: `record_type: op`, an empty `config_name`, `input_shapes`, `run_mode: op_benchmark`, and
-the empty `kernel_name` and `is_total` of an operation-level row. `input_shapes` comes from the case's
-`workload.flags.input_shapes`, the shape string exactly as the perf suite names it in `report.xml`. Compiled-kernel
-and total rows are not cases: the ingest parser keeps writing them, and their ids are pinned in the golden table.
+parser hashes, in its order. An operation case: `record_type: op`, an empty `config_name`, `input_shapes` from the case's
+`workload.flags.input_shapes` (the shape string exactly as the perf suite names it in `report.xml`), `run_mode:
+op_benchmark`, and the empty `kernel_name` and `is_total` of an operation-level row. A model case: `record_type: model`,
+`config_name` and `run_mode` from the case's flags, an empty `input_shapes`; `batch_size` and `prompt_length` are row
+properties, not part of the id. Compiled-kernel and total rows are not cases: the ingest parser keeps writing them, and
+their ids are pinned in the golden table.
 
 `make bench-check-ids` (and the `bench-conformance` workflow) derive the ids twice, once from the definitions through
-the engine and once by running the ingest's own `report.xml` parser over a synthetic report, and fail when they
-differ, when an id in the golden table moves, or when a definition declares a `schedule` or lacks `est_hours`.
+the engine and once by running the ingest's own `report.xml` parser over a report built from the definitions, and fail
+when they differ, when an id in the golden table moves, or when a definition declares a `schedule` or lacks `est_hours`.
 Changing an id on purpose means `python benchmarks/tools/check_identity_ids.py --update` and a reviewed golden diff.
-The golden rows are synthetic: one fixed shape per case and made-up kernel names; model rows and real shapes are not
-covered.
+The report rows of the 25 cases equal the ids the ingest has stored for these series (`SERIES_IDS` in
+`tests/test_conformance.py`); kernel rows use made-up kernel names, as real ones change with every compile.
+
+Series the ingest stores that the catalog does not declare, and why: the model rows of two further models (six each)
+have no producer in this repository; two older `granite` configurations
+(`bs1_pl512_*`) are retired and the suite no longer emits them. None is migrated and none gets a new id.
 
 ## Cost and cadence
 
@@ -73,7 +81,7 @@ never a required check) and serialised by a concurrency group.
 | Input | Default | Meaning |
 |---|---|---|
 | `ref` | the dispatch ref | branch, tag or SHA to check out |
-| `selection` | `ops-core` | Selection of this catalog to run |
+| `selection` | `perf-core` | Selection of this catalog to run |
 | `target` | `dev` | `dev` or `prod`; prod only from `main`, with `ref` and `engine_ref` empty, `main` or a full SHA that is an ancestor of `origin/main`, and never falling back to the dev secrets. Prod with purpose `nightly` or `weekly` (baseline-eligible rows) additionally needs the dispatching actor listed in the repository variable `BENCH_BASELINE_DISPATCHERS` (comma-separated logins; empty means nobody) |
 | `prebaked_image` | empty | runner-set label (`^(image_[a-z0-9_]{1,60})?$`) of the image to run in, e.g. the nightly build's; empty uses the default set and the checkout's definitions, a value runs `make` inside the image's own tree so the definitions are the image commit's. Nothing is installed or rebuilt either way |
 | `run_id` | empty | lower-case UUID; becomes the engine's run id and the ingest stores it verbatim, the verdict reads it (the step fails if the engine ran under another id); empty lets the engine mint one |
@@ -87,7 +95,8 @@ With `prebaked_image` the scripts that run (`run_kernel_case.py`, the collector,
 A first job checks every input against these patterns and stops the workflow before any card is requested.
 Completion signal: the dispatched run's conclusion; the job summary names the target, purpose, image and run id.
 
-Each case's `report.xml` is ingested by the existing XML parser, so stored ids are the ones the identity check pins.
+Each case's `report.xml` (and the per-kernel breakdown XMLs holding its kernel rows, matched by their `op`, `input_shape`,
+`config` and `mode` tags) is ingested by the existing XML parser, so stored ids are the ones the identity check pins.
 In the workflow, rows reach ClickHouse through the `ingest-xml-to-clickhouse` action and the `CLICKHOUSE_*` secrets
 (`*_DEV` for dev), inline on the runner; results are never uploaded as workflow artifacts and the log carries stage
 outcomes and counts, not measurements. The rows are written under the workflow name `bench-on-demand`, so their series
@@ -130,8 +139,20 @@ The targets assume no GitHub Actions state: paths are relative to the checkout (
 
 ## Runner
 
-Cases run through the runner the Project names, `kernel-bench`, a neutral runner name. An `ops` case's command is
-`python3 benchmarks/tools/run_kernel_case.py --op <op> --shape <input_shapes> --suite-dir <dir> --raw-dir <dir>`; set it
-as `spec.run.command` (argv array with the engine's `{case.*}`, `{out_dir}` and `{raw_dir}` tokens) with an engine whose
-Benchmark schema has that field. The shape strings in `ops/*.yaml` are fixtures: a case whose op and shape the perf
-report does not contain fails with exit 3 instead of ingesting a row, so replace them with the report's own strings.
+Cases run through the runner the Project names, `kernel-bench`, a neutral runner name. A case's command is
+`python3 benchmarks/tools/run_kernel_case.py --op <op> --shape <input_shapes> ...` (an `ops` case) or `--model <model>
+--config <config> --mode <mode> ...` (a `models` case), plus `--suite-dir <dir> --raw-dir <dir>`, set as
+`spec.run.command` (argv array with the engine's `{benchmark}`, `{case.*}`, `{out_dir}` and `{raw_dir}` tokens). A case
+whose rows the perf report does not contain fails with exit 3 instead of ingesting a row.
+
+`BENCH_SUITE_FROM=<dir>` points the runner at the output of a perf run that already finished (copied instead of running
+the suite again); pass the name through to the command with `BENCH_PASS_ENV=BENCH_SUITE_FROM`.
+
+## Running next to the existing perf leg (`bench_mode`)
+
+The reusable `_test_matrix.yaml` perf job takes `bench_mode` (forwarded by `integration-tests.yaml`): `off` (default)
+changes nothing; `side-by-side` additionally feeds the same `report.xml` through this catalog (no second suite run) and
+ingests it under the workflow name `bench-<workflow>` with the engine's own run id, next to the unchanged legacy ingest;
+`replace` skips the legacy ingest and stores the catalog's rows under the legacy workflow name and run id, and fails
+the job when the report holds a row no case declares (`check_report_coverage.py --strict`). Both modes are advisory
+(`continue-on-error`) except `replace`, where the mirror step is the ingest.

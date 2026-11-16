@@ -50,51 +50,49 @@ def catalog(tmp_path):
     return dst
 
 
-# The first-shape ids of the ops before the identity blocks existed (report, kernels, total): a series that exists
-# today must keep its id.
-PRE_IDENTITY_IDS = {
-    ("matmul", "report", ""): "ca0a80b2-3610-59d3-9af2-1ec73250ac0d",
-    (
-        "matmul",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@2",
-    ): "e756b63d-6012-5617-b487-9d3c52cbee47",
-    (
-        "matmul",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@1",
-    ): "a1ffc1ca-20c0-5d91-a36d-8089f1fbcb9f",
-    ("matmul", "total", "Total"): "be8a6293-d023-525c-a8c5-6adc506940f6",
-    ("pointwise_add", "report", ""): "a3f641e5-1e92-55b6-b530-dc2245fedb9f",
-    (
-        "pointwise_add",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@2",
-    ): "78c588c1-cf56-54bd-9aec-9303029400ec",
-    (
-        "pointwise_add",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@1",
-    ): "587dd475-2a20-54c6-ad6f-bc1254b4473b",
-    ("pointwise_add", "total", "Total"): "9f8e8621-e431-5061-8ec8-9825e543d853",
-    ("softmax", "report", ""): "c754d519-198d-5492-92c5-783284305245",
-    (
-        "softmax",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@2",
-    ): "7256b70e-6c9a-5ba8-9003-f544fc58557d",
-    (
-        "softmax",
-        "kernel",
-        "spyre_kernel_v1_fused_add#2@1",
-    ): "ad0d8be5-ba49-52ac-a5f6-a12fabd90a9b",
-    ("softmax", "total", "Total"): "6d14e18d-2e0d-5660-a8f2-2b563daec032",
-}
+# The report ids of every series the catalog declares, as the ingest stored them before the catalog existed
+# (op rows keyed by shape, model rows by config and mode): a series that exists today must keep its id.
+SERIES_IDS = """
+attention||[[1, 32, 512, 128], [1, 32, 4096, 128], [1, 32, 4096, 128]]|op_benchmark 1deb8f5d-6628-5b2f-ac94-362ffd6569a8
+attention||[[4, 32, 1, 128], [4, 32, 4096, 128], [4, 32, 4096, 128]]|op_benchmark ecbc75e9-9744-5976-a36b-4e1a038fe950
+attention_gqa||[[1, 32, 512, 128], [1, 8, 4096, 128], [1, 8, 4096, 128]]|op_benchmark 877de30a-7d96-544e-a417-dd6b6e356361
+attention_gqa||[[4, 32, 1, 128], [4, 8, 4096, 128], [4, 8, 4096, 128]]|op_benchmark bf575f36-61cc-5327-b852-c53279714a52
+layernorm||[[1, 512, 4096]]|op_benchmark accc7627-50b1-54e0-8dce-447e379a936e
+matmul||[[1, 512, 4096], [4096, 1024]]|op_benchmark 6c2336a8-2c6b-584c-bfe9-804db3207341
+matmul||[[1, 512, 4096], [4096, 12800]]|op_benchmark 9cdac7d4-93b8-572f-8caa-5a76c9e40822
+matmul||[[1, 512, 4096], [4096, 4096]]|op_benchmark c0994a96-44c0-5069-ab2d-924354712344
+matmul||[[4, 1, 4096], [4096, 1024]]|op_benchmark bbb198c2-f835-538d-8e52-f8ede09b41df
+matmul||[[4, 1, 4096], [4096, 12800]]|op_benchmark 3c086bfe-db98-51f8-a661-908f073dc177
+matmul||[[4, 1, 4096], [4096, 4096]]|op_benchmark 522a7bbb-f406-5692-a260-c6ec42dfb698
+mlp||[[1, 512, 4096]]|op_benchmark 582802b0-fb9e-542e-998b-dad64b1b81a4
+mlp||[[4, 1, 4096]]|op_benchmark 2b762d5f-e8eb-5056-a6fd-da525f286b3b
+mlp-linear-kn-t||[[1, 512, 4096]]|op_benchmark ff8cff94-39b8-5e65-84eb-2a930cfe6467
+mlp-linear-kn-t||[[4, 1, 4096]]|op_benchmark 33a91ea9-df47-554a-a0e6-f52fffd14ba2
+pointwise_add||[[1, 512, 4096], [1, 512, 4096]]|op_benchmark 9b763db9-f0f2-55e5-8701-6e7ec800bd38
+pointwise_add||[[4, 1, 4096], [4, 1, 4096]]|op_benchmark d3f28b8a-33d8-50b8-be4c-0684594a3537
+softmax||[[1, 512, 4096]]|op_benchmark d7f2cdc7-5745-5dca-8944-3a038bc2589b
+softmax||[[4, 1, 4096]]|op_benchmark a6ce2409-dfd4-57d7-9178-666ccfced973
+granite|full_model||decode_only 57080893-ff44-5133-92a7-21f6585bdeb5
+granite|full_model||generate 230277c7-0a03-536a-92bb-a31241448dc9
+granite|full_model||prefill_only c214d6b3-cf67-5f71-81ff-e7db0db942df
+granite|one_block||decode_only 85cf3877-f161-568b-afb4-614228b16109
+granite|one_block||generate 8b365796-bf8a-507a-a97f-59dedff2926d
+granite|one_block||prefill_only 2103423c-ed79-5f3b-8041-dfa54ee6e313
+"""
+
+
+def series_ids():
+    out = {}
+    for line in SERIES_IDS.strip().splitlines():
+        key, _, want = line.rpartition(" ")
+        name, config, shapes, mode = key.split("|")
+        out[(name, config, shapes, mode)] = want
+    return out
 
 
 def golden_rows(path):
     rows = [ln.split("\t") for ln in Path(path).read_text().splitlines()[1:]]
-    return {(r[1], r[2], r[4], r[3]): r[5] for r in rows}
+    return {(r[1], r[2], r[3], r[4], r[5], r[6]): r[7] for r in rows}
 
 
 def test_repo_catalog_conforms_to_the_ingest(tool):
@@ -104,9 +102,23 @@ def test_repo_catalog_conforms_to_the_ingest(tool):
 
 def test_existing_series_keep_their_ids(tool):
     golden = golden_rows(tool.GOLDEN)
-    first_shape = "1_512_4096__4096_4096"
-    for (name, row, kernel), want in PRE_IDENTITY_IDS.items():
-        assert golden[(name, row, kernel, first_shape)] == want
+    pinned = series_ids()
+    assert len(pinned) == 25
+    for (name, config, shapes, mode), want in pinned.items():
+        assert golden[(name, "report", config, shapes, mode, "")] == want
+
+
+def test_the_catalog_declares_exactly_the_pinned_series(tool):
+    declared = {
+        (
+            inp["name"],
+            inp["disc"]["config_name"],
+            inp["disc"]["input_shapes"],
+            inp["disc"]["run_mode"],
+        )
+        for _, inp, _ in tool.declared()
+    }
+    assert declared == set(series_ids())
 
 
 def test_every_case_is_an_ingest_identity(tool):
@@ -125,6 +137,16 @@ def test_a_definition_that_changes_an_id_fails(tool, catalog, tmp_path):
     code, msgs = tool.check(catalog, golden)
     assert code == 1
     assert any("softmax" in m for m in msgs)
+
+
+def test_a_model_definition_that_changes_an_id_fails(tool, catalog, tmp_path):
+    golden = tmp_path / "golden.tsv"
+    assert tool.check(catalog, golden, update=True)[0] == 0
+    models = catalog / "models" / "granite.yaml"
+    models.write_text(models.read_text().replace("value: model}", "value: op}"))
+    code, msgs = tool.check(catalog, golden)
+    assert code == 1
+    assert any("granite" in m for m in msgs)
 
 
 def test_a_discriminator_the_parser_does_not_write_disagrees_with_the_ingest(
