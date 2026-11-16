@@ -211,9 +211,9 @@ jobs:
   # against this commit's torch-spyre and gates "Spyre Test (amd64)".
   downstream-hf-adapters:
     name: Integration (hf-adapters)
-    needs: changes
-    if: github.event_name == 'merge_group' && vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && vars.GHA_DOWNSTREAM_INTEGRATION == 'true' && needs.changes.outputs.code_changed
-      == 'true'
+    needs: [changes, decide-spyre-test]
+    if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
+      needs.changes.outputs.code_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 270
     steps:
@@ -244,9 +244,9 @@ jobs:
   # Advisory twin of the job above, deliberately not in the gate's needs so it can never delay or fail it.
   downstream-spyre-inference:
     name: Integration (spyre-inference)
-    needs: changes
-    if: github.event_name == 'merge_group' && vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && vars.GHA_DOWNSTREAM_INTEGRATION == 'true' && needs.changes.outputs.code_changed
-      == 'true'
+    needs: [changes, decide-spyre-test]
+    if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
+      needs.changes.outputs.code_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 270
     continue-on-error: true
@@ -275,25 +275,43 @@ jobs:
           hash_source: ${{ github.event.merge_group.head_ref }}
           merge_group_ref: ${{ github.event.merge_group.head_ref }}
 
+  # Reads the variables once, so the downstream jobs and the gate below cannot disagree about them if
+  # they are flipped while a run is in flight.
+  decide-spyre-test:
+    name: Decide whether GHA owns the check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
+    outputs:
+      owns: ${{ steps.v.outputs.owns }}
+      downstream: ${{ steps.v.outputs.downstream }}
+    steps:
+      - id: v
+        env:
+          OWNS: ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.pull_request.auto_merge
+            == null || vars.GHA_TESTS_ON_AUTO_MERGE == 'true'))) }}
+          DOWNSTREAM: ${{ vars.GHA_DOWNSTREAM_INTEGRATION == 'true' }}
+        run: |
+          {
+            echo "owns=${OWNS}"
+            echo "downstream=${DOWNSTREAM}"
+          } >> "$GITHUB_OUTPUT"
+
   # Posts the required "Spyre Test (amd64)" context on merge-queue entries and on PRs where GHA ran
   # the suite and owns the check; the name only matches then, so a skipped run can never satisfy it.
   merge-queue-spyre-test:
-    name: ${{ (vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.pull_request.auto_merge
-      == null || vars.GHA_TESTS_ON_AUTO_MERGE == 'true')))) && 'Spyre Test (amd64)' || 'gha-merge-queue-tests (inactive)' }}
+    name: ${{ needs.decide-spyre-test.outputs.owns == 'true' && 'Spyre Test (amd64)' || 'gha-merge-queue-tests (inactive)' }}
     runs-on: ubuntu-latest
-    needs: [changes, run-tests, downstream-hf-adapters]
+    needs: [decide-spyre-test, changes, run-tests, downstream-hf-adapters]
     if: always() && (github.event_name == 'merge_group' || github.event_name == 'pull_request')
     steps:
       - name: GHA does not own this check here
-        if: ${{ !(vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.pull_request.auto_merge
-          == null || vars.GHA_TESTS_ON_AUTO_MERGE == 'true')))) }}
+        if: ${{ needs.decide-spyre-test.outputs.owns != 'true' }}
         run: echo "Jenkins owns the Spyre Test (amd64) check here."
       - name: Check all suites passed
-        if: ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.pull_request.auto_merge
-          == null || vars.GHA_TESTS_ON_AUTO_MERGE == 'true'))) }}
+        if: ${{ needs.decide-spyre-test.outputs.owns == 'true' }}
         run: |-
           # run-tests may only be skipped for a docs-only change; a failed `changes` job also skips it.
-          if ${{ (needs.run-tests.result == 'success' || (needs.run-tests.result == 'skipped' && needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) && (github.event_name != 'merge_group' || vars.GHA_DOWNSTREAM_INTEGRATION != 'true' || needs.downstream-hf-adapters.result == 'success' || (needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) }}; then
+          if ${{ (needs.run-tests.result == 'success' || (needs.run-tests.result == 'skipped' && needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) && (github.event_name != 'merge_group' || needs.decide-spyre-test.outputs.downstream != 'true' || needs.downstream-hf-adapters.result == 'success' || (needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) }}; then
             echo "All test suites passed."
             exit 0
           fi
