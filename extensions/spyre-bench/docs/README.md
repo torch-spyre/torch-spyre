@@ -206,8 +206,12 @@ A public definition names a dataset by an opaque slug (`slot-95`), never by its 
   `explain --dataset-meta-dir DIR` or `--dataset-store STORE` reads the files; with neither, nothing is read and the
   slug is shown. `validate` never reads a store: a slug is only a string there.
 - A missing, unreadable or malformed file, a `slug` field that disagrees with the directory, or a `sha256` that none of
-  the Dataset's Assets declares is an error, never a silent fallback. Error text carries the slug, not the file.
-- The file is a trusted input: whoever can write the store path decides what is public. Keep that path write-restricted.
+  the Dataset's Assets declares is an error, never a silent fallback (an Asset that declares no digest cannot vouch for
+  one: omit `sha256`). Error text carries the slug, not the file.
+- Only the dataset label goes through the metadata. Every tool prints Dataset and Asset *names* as written, so name them
+  by slug as well. The HTTP source accepts https only and follows no redirects, so the token reaches only the configured host.
+- The file is a trusted input: whoever can write the store path decides what is public (a duplicate key is not an error: the
+  last one wins). Keep that path write-restricted.
 - `dataset.json` is not part of any identity. The store namespace is configured per deployment, never in a public file.
 
 ## Cost hints, not scheduling
