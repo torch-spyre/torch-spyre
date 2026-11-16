@@ -363,6 +363,14 @@ runs:
         BENCH_RESULTS_IN: ${{ inputs.bench-dir }}
         CHANNEL_TRUST_IN: ${{ inputs.channel-trust }}
         PERF_IN: ${{ inputs.perf }}
+        WORKFLOW_IN: ${{ inputs.workflow }}
+        BRANCH_IN: ${{ inputs.branch }}
+        SHA_IN: ${{ inputs.sha }}
+        RUN_ID_IN: ${{ inputs.run-id }}
+        GHA_RUN_ID_IN: ${{ inputs.gha-run-id }}
+        TRIGGERED_AT_IN: ${{ inputs.triggered-at }}
+        PR_NUMBER_IN: ${{ inputs.pr-number }}
+        TRIGGER_TYPE_IN: ${{ inputs.trigger-type }}
       run: |
         source "${VENV}/bin/activate"
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
@@ -404,12 +412,12 @@ runs:
           [ -n "${kv}" ] && ARGS+=(--perf "${kv}")
         done <<< "${PERF_IN}"
         python -m spyre_clickhouse_ingest results \
-          --workflow "${{ inputs.workflow }}" \
+          --workflow "${WORKFLOW_IN}" \
           --branch "${BRANCH_IN}" \
-          --sha "${{ inputs.sha }}" \
-          --run-id "${{ inputs.run-id }}" \
-          --gha-run-id "${{ inputs.gha-run-id }}" \
-          --triggered-at "${{ inputs.triggered-at }}" \
-          --pr-number "${{ inputs.pr-number }}" \
-          --trigger-type "${{ inputs.trigger-type }}" \
+          --sha "${SHA_IN}" \
+          --run-id "${RUN_ID_IN}" \
+          --gha-run-id "${GHA_RUN_ID_IN}" \
+          --triggered-at "${TRIGGERED_AT_IN}" \
+          --pr-number "${PR_NUMBER_IN}" \
+          --trigger-type "${TRIGGER_TYPE_IN}" \
           "${ARGS[@]}"
