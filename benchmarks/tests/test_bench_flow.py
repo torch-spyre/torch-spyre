@@ -509,7 +509,7 @@ def test_the_legacy_perf_ingest_is_skipped_only_in_replace_mode():
 def test_the_mirror_is_advisory_except_when_it_replaces_the_legacy_ingest(step):
     s = perf_steps()[step]
     assert s["continue-on-error"] == "${{ inputs.bench_mode != 'replace' }}"
-    assert "inputs.bench_mode != 'off'" in perf_steps()["bench-mirror"]["if"]
+    assert "side-by-side" in perf_steps()["bench-mirror"]["if"]
 
 
 def test_the_mirror_ingests_under_its_own_series_next_to_the_legacy_one():
@@ -519,7 +519,11 @@ def test_the_mirror_ingests_under_its_own_series_next_to_the_legacy_one():
         == "${{ inputs.bench_mode == 'replace' && github.workflow || format('bench-{0}', github.workflow) }}"
     )
     assert with_["run-id"] == "${{ steps.bench-mirror.outputs.ingest_run_id }}"
-    assert with_["schema"] == "v2" and "purpose" not in with_
+    assert (
+        "replace" in with_["schema"]
+        and "v2" in with_["schema"]
+        and "purpose" not in with_
+    )
     mirror = perf_steps()["bench-mirror"]
     assert mirror["env"]["BENCH_INGEST"] == "0"
     assert mirror["env"]["BENCH_SUITE_FROM"] == "${{ env.RESULTS_DIR }}"

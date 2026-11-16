@@ -352,3 +352,23 @@ def test_coverage_is_clean_for_a_report_of_exactly_the_catalog(tmp_path, capsys)
         "not declared 0; declared but absent from the report 0"
         in capsys.readouterr().out
     )
+
+
+def test_a_kernel_tag_spelled_differently_from_the_report_name_still_matches(tmp_path):
+    case = runner.Case(op="matmul", shape=MM)
+    assert case.owns_tags({"op": "matmul", "input_shape": "1x512x4096x4096x1024"})
+    assert not case.owns_tags({"op": "matmul", "input_shape": "4x1x4096x4096x1024"})
+    assert runner.Case(model="Granite", config="c", mode="m").owns_tags(
+        {"op": "granite_x", "config": "c", "mode": "m"}
+    )
+
+
+def test_strict_coverage_fails_on_a_kernel_testcase_no_case_claims(suite, tmp_path):
+    pytest.importorskip("lxml")
+    pytest.importorskip("clickhouse_connect")
+    pytest.importorskip("spyre_bench")
+    coverage = load("check_report_coverage")
+    ids = load("check_identity_ids")
+    (tmp_path / "report.xml").write_text(ids.report_xml(ids.declared()))
+    (tmp_path / "kernels.xml").write_text(KERNELS.replace("matmul", "nosuchop"))
+    assert coverage.main([str(tmp_path), "--strict"]) == 1

@@ -91,6 +91,11 @@ def model_name(tags, op):
     return "granite" if op.startswith("granite_") else tags.get("model", "")
 
 
+def ints(text):
+    """The integers of a shape string: a name spells `[[1, 512], [512, 8]]` where a kernel tag may spell `1x512`."""
+    return tuple(re.findall(r"\d+", text or ""))
+
+
 class Case:
     """Which rows belong to one case: an op at a shape, or a model at a config and mode."""
 
@@ -109,14 +114,14 @@ class Case:
         if self.model:
             return (
                 is_model(tags, op)
-                and model_name(tags, op) == self.model
+                and model_name(tags, op).lower() == self.model.lower()
                 and tags.get("config") == self.config
                 and tags.get("mode") == self.mode
             )
         return (
             not is_model(tags, op)
-            and op == self.op
-            and tags.get("input_shape") == self.shape
+            and op.lower() == self.op.lower()
+            and ints(tags.get("input_shape")) == ints(self.shape)
         )
 
 
@@ -131,7 +136,9 @@ def report_groups(suite, case):
         if case.model:
             if case.owns_tags(tags_of(tc)):
                 groups.add(key)
-        elif key == (case.op, case.shape):
+        elif key == (case.op, case.shape) or (
+            key[0].lower() == case.op.lower() and key[1] == case.shape
+        ):
             groups.add(key)
     return groups
 

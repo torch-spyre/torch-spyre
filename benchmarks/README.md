@@ -153,6 +153,6 @@ the suite again); pass the name through to the command with `BENCH_PASS_ENV=BENC
 The reusable `_test_matrix.yaml` perf job takes `bench_mode` (forwarded by `integration-tests.yaml`): `off` (default)
 changes nothing; `side-by-side` additionally feeds the same `report.xml` through this catalog (no second suite run) and
 ingests it under the workflow name `bench-<workflow>` with the engine's own run id, next to the unchanged legacy ingest;
-`replace` skips the legacy ingest and stores the catalog's rows under the legacy workflow name and run id, and fails
+`replace` skips the legacy ingest (both schemas, as the legacy step) and stores the catalog's rows under the legacy workflow name and run id, and fails
 the job when the report holds a row no case declares (`check_report_coverage.py --strict`). Both modes are advisory
 (`continue-on-error`) except `replace`, where the mirror step is the ingest.
