@@ -68,7 +68,6 @@ jobs:
     permissions:
       contents: read
       issues: write
-      pull-requests: write
       actions: write
     env:
       GH_REPO: ${{ github.repository }}
@@ -112,6 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' "${COMMENT_BODY}" > "$W/comment.txt"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$W/started"
           perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission 2>/dev/null || echo none)
           gh api "repos/${REPO}/pulls/${PR}" > "$W/pr.json"
           jq -n --arg login "${ACTOR}" --arg perm "${perm}" --arg assoc "${ASSOCIATION}" \
@@ -213,11 +213,22 @@ jobs:
           user="${ACTOR}"
           if [ "${KIND}" = confirm ]; then user=$(jq -r '.requester.login // ""' "$W/state.json"); fi
           since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+          # Rate: this user's /bench requests in the last hour. They count toward the hourly limit only (rate rows).
           gh run list --workflow bench-pr-comment.yml --user "${user}" --created ">=${since}" --limit 200 --json databaseId,createdAt,displayTitle \
             | jq --arg actor "${user}" --arg self "${RUN_ID}" \
               '[.[] | select((.databaseId | tostring) != $self and (.displayTitle | endswith(" by=" + $actor)))
-                | {id: (.databaseId | tostring), pr: 0, user: $actor, ts: .createdAt, state: "done", est: 0, clean: false}]' \
-            > "$W/runs.json"
+                | {id: ("req" + (.databaseId | tostring)), pr: 0, user: $actor, ts: .createdAt, state: "done", est: 0, clean: false}]' \
+            > "$W/rate.json"
+          # Window and supersede: every measuring run of the last 24 hours (both workflows), charged the whole per-request
+          # limit because the run's own estimate is not known here. Rows never count toward the hourly rate.
+          limit=$("$BENCH" ondemand limit --host github.com | jq .request_device_hours)
+          day=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          for wf in bench-on-demand.yml bench-on-demand-fork.yml; do
+            gh run list --workflow "$wf" --created ">=${day}" --limit 200 --json databaseId,createdAt,displayTitle,status,conclusion
+          done | jq -s --argjson limit "${limit}" '[.[][] | (.displayTitle | capture("pr=(?<pr>[0-9]+) by=(?<by>.*)$")?) as $t | select($t != null)
+                | {id: ("run" + (.databaseId | tostring)), pr: $t.pr, user: $t.by, ts: .createdAt, est: $limit, clean: false, rate: false,
+                   state: (if .status != "completed" then "active" elif .conclusion == "cancelled" then "cancelled" else "done" end)}]' > "$W/window.json"
+          jq -s 'add' "$W/rate.json" "$W/window.json" > "$W/runs.json"
 
       - name: Authorize (policy, permission, fork sha)
         id: auth1
@@ -362,11 +373,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REPO: ${{ steps.facts.outputs.head_repo }}
           HEAD_SHA: ${{ steps.facts.outputs.head_sha }}
+          FORK_RUNNER_LABEL: ${{ vars.BENCH_FORK_RUNNER_LABEL }}
         run: |
           set -euo pipefail
+          # A cancel or another confirm that landed while this run was planning wins: the preview is spent.
+          started=$(cat "$W/started")
+          if gh api --paginate "repos/${REPO}/issues/${PR}/comments" | jq -es --arg t "${started}" \
+            '[.[][] | select(.user.login == "github-actions[bot]" and .created_at > $t and (.body | test("\\A(Benchmark run started|Benchmark run for this pull request cancelled)")))] | length > 0' > /dev/null; then
+            echo "::warning::a newer start or cancel exists; not dispatching"
+            exit 0
+          fi
           # The decision is bound to this sha; refuse if the head moved while we were planning.
           [ "$(gh api "repos/${REPO}/pulls/${PR}" --jq .head.sha)" = "${HEAD_SHA}" ] || { echo "::warning::head moved; not dispatching"; exit 0; }
           "$BENCH" ondemand env --request "$W/request.json" --product torch-spyre > "$W/bench-env.json"
+          if [ "${HEAD_REPO,,}" != "${REPO,,}" ] && [ -z "${FORK_RUNNER_LABEL}" ]; then
+            gh api "repos/${REPO}/issues/${PR}/comments" -f body="Runs of fork heads are not enabled on this repository (no runner label is set aside for them), so nothing was started." > /dev/null
+            exit 0
+          fi
           if [ "${HEAD_REPO,,}" = "${REPO,,}" ]; then
             gh workflow run bench-on-demand.yml --ref "${DEFAULT_BRANCH}" \
               -f ref="${HEAD_SHA}" -f pr_number="${PR}" -f requested_by="${ACTOR}" \

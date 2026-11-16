@@ -17,6 +17,7 @@ spec:
       iterations: 100
       warmup_iterations: 3
   run:
+    est: 6m
     command:
       - python3
       - benchmarks/tools/run_kernel_case.py

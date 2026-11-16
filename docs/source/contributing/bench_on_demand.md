@@ -78,6 +78,16 @@ it a second time, and confirming keeps the original request time and requester.
 
 The limits (tiers, device-hour budgets, rates) are set in one file, `extensions/spyre-bench/spyre_bench/ondemand_policy.json`; the workflows read them through the engine and hold no numbers. This route has no store credentials, so it does not write `ci_requests`; it counts a user's recent runs from its own run list.
 
+Cost bounds on this route: a run that declares no `run.est` for a case is refused (its cost is unknown), the per-PR
+24-hour window is counted from the measuring runs themselves (each charged the whole per-request limit, because their
+own estimate is not known to the request job), and the runner job's 240-minute timeout on one device is the hard
+bound that equals the public per-request limit. Each measuring run first asks the API whether the pull request is
+still open, still at the requested head, and was requested less than a day ago.
+
+Fork heads run only when the repository variable `BENCH_FORK_RUNNER_LABEL` names a runner set reserved for them; with
+none configured nothing runs and the PR is told so. Deciding that set is an owner action: a fork's Makefile and `mk/`
+run there, so it must not share a runner image, venv or credentials with the credentialed `bench-on-demand` job.
+
 Limits of this route today: clean (exclusive node) runs are not available here; reuse is looked up when the run
 starts, so the preview assumes nothing is reusable; the per-pull-request daily device-hour window needs a store and is
 enforced by the internal route only; two requests that race each other are resolved by which dispatch lands last; the

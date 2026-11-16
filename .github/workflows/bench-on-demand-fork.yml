@@ -52,9 +52,12 @@ env:
 jobs:
   bench:
     name: On-demand benchmarks, fork head (advisory)
+    # Fork code runs only on a runner set reserved for it (repository variable BENCH_FORK_RUNNER_LABEL); with no label
+    # configured the job does not run. Keeping fork code off the credentialed runners is a decision for the owner.
+    if: ${{ vars.BENCH_FORK_RUNNER_LABEL != '' }}
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - ${{ vars.BENCH_FORK_RUNNER_LABEL }}
       - linux
       - image_spyre_backend
     timeout-minutes: 240
@@ -75,6 +78,20 @@ jobs:
           set -euo pipefail
           [[ "${INPUT_REF}" =~ ^[0-9a-f]{40}$ ]]
           [[ "${INPUT_REPOSITORY}" =~ ^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$ ]]
+
+      - name: Check the request is still current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          api() { curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          pr=$(api "pulls/${PR}")
+          [ "$(jq -r .state <<< "${pr}")" = open ] || { echo "::error::the pull request is no longer open"; exit 1; }
+          [ "$(jq -r .head.sha <<< "${pr}")" = "${INPUT_REF}" ] || { echo "::error::the pull request head moved since this run was requested"; exit 1; }
+          created=$(api "actions/runs/${GITHUB_RUN_ID}" | jq -r .created_at)
+          [ "$(date -u -d "${created}" +%s)" -gt "$(date -u -d '24 hours ago' +%s)" ] || { echo "::error::this run waited more than a day"; exit 1; }
 
       - name: Checkout the engine (default branch)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

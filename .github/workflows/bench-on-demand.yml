@@ -152,6 +152,22 @@ jobs:
 
       # The request is data from a trusted dispatch; keys and values are checked again here because anyone with
       # write access can also dispatch this workflow by hand.
+      - name: Check the request is still current
+        if: ${{ inputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          api() { curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          pr=$(api "pulls/${PR}")
+          [ "$(jq -r .state <<< "${pr}")" = open ] || { echo "::error::the pull request is no longer open"; exit 1; }
+          [ "$(jq -r .head.sha <<< "${pr}")" = "${INPUT_REF}" ] || { echo "::error::the pull request head moved since this run was requested"; exit 1; }
+          created=$(api "actions/runs/${GITHUB_RUN_ID}" | jq -r .created_at)
+          [ "$(date -u -d "${created}" +%s)" -gt "$(date -u -d '24 hours ago' +%s)" ] || { echo "::error::this run waited more than a day"; exit 1; }
+
       - name: Apply the request
         if: ${{ inputs.bench_env != '' }}
         env:
