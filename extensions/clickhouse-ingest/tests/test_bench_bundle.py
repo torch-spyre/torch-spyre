@@ -715,20 +715,74 @@ def test_ci_describes_an_environment_a_lower_channel_registered_first(tmp_path, 
     ]
 
 
-def test_a_lower_channel_cannot_lift_a_runs_trust_by_adding_to_it(tmp_path, db):
-    ev = ingest(
+def test_a_lower_channel_cannot_add_repeats_to_a_higher_trust_run(tmp_path, db):
+    ingest(
         seal(tmp_path, run_dir(tmp_path, result()), "b.tgz", "--seal-trust", "none"),
         trust="ci",
     )
     more = result(samples=((10.0, 11.0), (12.0,), (10.5,), (10.7,)))
-    rep = ingest(
-        seal(
-            tmp_path, run_dir(tmp_path, more, name="m"), "m.tgz", "--seal-trust", "none"
-        ),
+    out = seal(
+        tmp_path, run_dir(tmp_path, more, name="m"), "m.tgz", "--seal-trust", "none"
+    )
+    with pytest.raises(offline.BundleError, match="cannot add repeats"):
+        ingest(out, trust="external")
+    assert ingest(out, trust="ci")["new_repeats"] == 1
+
+
+def test_a_lower_channel_with_no_purpose_is_not_baseline_eligible(tmp_path, db):
+    r = result()
+    r["status"]["run_props"] = {}
+    ingest(seal(tmp_path, run_dir(tmp_path, r)), trust="external")
+    row = (
+        "SELECT props['run.purpose'], props['run.validity'] FROM benchmark_runs LIMIT 1"
+    )
+    assert db.rows(row) == [("external", "unknown")]
+
+
+def test_a_lower_channel_cannot_outrank_ci_with_a_high_fingerprint_version(
+    tmp_path, db
+):
+    low = result()
+    low["status"]["environment"]["fingerprint_version"] = 65535
+    low["status"]["environment"]["fingerprint"] = {"env.fp.kernel": "EVIL"}
+    ingest(
+        seal(tmp_path, run_dir(tmp_path, low), "l.tgz", "--seal-trust", "none"),
         trust="external",
     )
-    assert (rep["trust"], rep["new_repeats"]) == ("external", 1)
-    assert ev["run_id"] == rep["run_id"]
+    ci = result()
+    ci["metadata"]["name"] = f"{RUN[:-1]}0.decode"
+    ingest(
+        seal(
+            tmp_path, run_dir(tmp_path, ci, name="ci"), "c.tgz", "--seal-trust", "none"
+        ),
+        trust="ci",
+    )
+    assert db.rows(
+        "SELECT fingerprint['env.fp.kernel'] FROM v_environment_fingerprints"
+    ) == [("6.1",)]
+
+
+def test_an_admin_bundle_is_refused_when_it_arrives_through_an_inbox(tmp_path, db):
+    out = admin_bundle(tmp_path, "bench-definitions", DEFS)
+    with pytest.raises(offline.BundleError, match="is not its artifact_id"):
+        ingest(out, trust="ci", expect_key="whatever")
+
+
+def test_a_new_case_with_no_ok_repeat_updates_the_verdict(tmp_path, db):
+    ingest(seal(tmp_path, run_dir(tmp_path, result())))
+    both = result("prefill")
+    both["status"]["repeats"] = [
+        {
+            "run.repeat": 1,
+            "status": "failed",
+            "samples": {},
+            "placement": {"nodes": [NODE]},
+        }
+    ]
+    out = seal(tmp_path, run_dir(tmp_path, result(), both, name="two"), "t.tgz")
+    assert ingest(out)["status"] == "ingested"
+    newest = "SELECT state FROM artifact_results ORDER BY ts DESC, audit_timestamp DESC LIMIT 1"
+    assert db.rows(newest) == [("failed",)]
 
 
 def test_a_failed_repeat_does_not_make_every_resend_new(tmp_path, db):

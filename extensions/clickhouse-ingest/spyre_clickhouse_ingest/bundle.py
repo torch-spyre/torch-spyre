@@ -426,6 +426,11 @@ def _ingest_bench(
 def _ingest_admin(client, db, root, meta, args, extra) -> dict:
     from . import bench_bundle
 
+    if args.expect_key:
+        raise BundleError(
+            f"a {meta['kind']} bundle is not an inbox bundle: only a CI job ingests it directly"
+        )
+
     sha = digest(root)
     uploader = (
         args.uploader or current_user()

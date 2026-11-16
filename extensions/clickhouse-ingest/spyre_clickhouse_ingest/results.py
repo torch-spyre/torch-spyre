@@ -1939,6 +1939,7 @@ def main(argv=None, assigned_trust=""):
         or args.sendnn_report
         or args.benchmarks_dir
         or args.tables_dir
+        or getattr(args, "bench_dir", "")
     ):
         return _ingest_kind(argv, args)
     if args.channel_trust:
