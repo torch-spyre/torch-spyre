@@ -1,6 +1,5 @@
--- bench: a results bundle of bench Results (kinds that name no run are not uploads). `reference` is the references
--- bundle's format, listed so this and migration 026 of that branch converge on one constraint in either order.
--- result_uploads' last three constraints are re-added in their DDL order.
+-- bench and reference: the upload formats of a Bench result and of a comparison target (bench-reference
+-- bundle). result_uploads' last three constraints are re-added in their DDL order.
 ALTER TABLE result_uploads DROP CONSTRAINT IF EXISTS chk_test_type;
 
 ALTER TABLE result_uploads DROP CONSTRAINT IF EXISTS chk_result_kind;

@@ -312,3 +312,13 @@ def test_a_retracted_round_no_longer_counts_toward_the_runs_trust():
     assert prior_trust(Client(), "default", AID, RUN, "unit") == "external"
     event(ids[1], "retracted", 5)
     assert prior_trust(Client(), "default", AID, RUN, "unit") == "lab"
+
+
+def test_migration_026_adds_the_ddl_format_list():
+    sql = (
+        SCHEMA_DIR / "migrations" / "026_result_uploads_bench_reference_formats.sql"
+    ).read_text()
+    m = re.search(r"ADD CONSTRAINT chk_format CHECK format IN \(([^)]*)\)", sql)
+    assert re.findall(r"'([^']+)'", m.group(1)) == _check(
+        "49-result-uploads.sql", "chk_format"
+    )
