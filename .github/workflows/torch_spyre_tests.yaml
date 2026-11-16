@@ -241,14 +241,15 @@ jobs:
           hash_source: ${{ github.event.merge_group.head_ref }}
           merge_group_ref: ${{ github.event.merge_group.head_ref }}
 
-  # Advisory twin of the job above, deliberately not in the gate's needs so it can never delay or fail it.
+  # Informational twin of the job above: dispatched and linked in the run summary but never awaited, and deliberately
+  # not in the gate's needs, so a slow or hung run can neither delay nor fail the gate.
   downstream-spyre-inference:
     name: Integration (spyre-inference)
     needs: [changes, decide-spyre-test]
     if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
       needs.changes.outputs.code_changed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 270
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       # Default branch: the dispatch action is not taken from the queued change.
@@ -270,6 +271,7 @@ jobs:
         with:
           repository: torch-spyre/spyre-inference
           extra_inputs: '{"image_rpms":"true"}'
+          wait: 'false'
           token: ${{ steps.app-token.outputs.token }}
           torch_spyre_ref: ${{ github.sha }}
           hash_source: ${{ github.event.merge_group.head_ref }}
