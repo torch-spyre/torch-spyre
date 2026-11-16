@@ -39,6 +39,13 @@ jobs:
       sha: ${{ steps.pr.outputs.sha }}
       url: ${{ steps.pr.outputs.url }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/ensure-gh-cli
       - id: pr
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,17 +85,19 @@ jobs:
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
       STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.advisory && ' (advisory)' || '' }}
     steps:
+      # Default branch: on /spyre-test the dispatch action is never taken from the PR.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/ensure-gh-cli
       - name: Report pending
         continue-on-error: true
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state=pending -f context="$STATUS_CONTEXT" \
             -f description="Running" -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-      # Default branch: on /spyre-test the dispatch action is never taken from the PR.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:

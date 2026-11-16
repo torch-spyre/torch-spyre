@@ -15,11 +15,19 @@ declare -A done_tokens=()
 
 fail() { echo "::error::$*" >&2; exit 1; }
 
+# An unparsable line is fatal only when it names this leg's repo; otherwise it is another repo's
+# (or an internal component's) and is ignored, so it cannot block an unrelated dispatch.
+mentions_companion() { [[ "$1" =~ (^|[^A-Za-z0-9_.-])${COMPANION}(\.git)?($|[^A-Za-z0-9_.-]) ]]; }
+
 while IFS= read -r line; do
   line="${line%$'\r'}"
   [[ "$line" =~ ^[[:space:]]*[Tt][Ee][Ss][Tt]-[Ww][Ii][Tt][Hh][[:space:]]*:[[:space:]]*(.*)$ ]] || continue
   rest="${BASH_REMATCH[1]}"
-  [[ "$rest" =~ ^([^[:space:]]+)([[:space:]]+#.*)?[[:space:]]*$ ]] || fail "malformed Test-With line: '${rest}'"
+  if [[ ! "$rest" =~ ^([^[:space:]]+)([[:space:]]+#.*)?[[:space:]]*$ ]]; then
+    mentions_companion "$rest" && fail "malformed Test-With line: '${rest}'"
+    echo "ignoring unparsable Test-With line: '${rest}'" >&2
+    continue
+  fi
   tok="${BASH_REMATCH[1]}"
   [ -z "${done_tokens[$tok]:-}" ] || continue
   done_tokens[$tok]=1
@@ -57,7 +65,9 @@ while IFS= read -r line; do
       fail "Test-With '${tok}': PR is not open or has no head repository"
     fi
   else
-    fail "malformed Test-With line: '${tok}'"
+    mentions_companion "$tok" && fail "malformed Test-With line: '${tok}'"
+    echo "ignoring unparsable Test-With line: '${tok}'" >&2
+    continue
   fi
 
   found=$((found + 1))

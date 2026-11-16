@@ -1,0 +1,11 @@
+name: Ensure the GitHub CLI
+description: Installs gh through setup-gh-cli only when it is not already on PATH. Needs .github/actions checked out.
+
+runs:
+  using: composite
+  steps:
+    - id: gh
+      shell: bash
+      run: echo "present=$(command -v gh >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+    - if: steps.gh.outputs.present != 'true'
+      uses: ./.github/actions/setup-gh-cli
