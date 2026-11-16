@@ -41,6 +41,11 @@ x is left physically untouched.  The hardware masks within-stick elements of x
 beyond the true K to zero, so extending the SDSC iteration to K_padded does not
 introduce numerical error from x.
 
+For BATCH_MATMUL_FP8_OP, y's padding rows are allocated but not filled (steps 2
+and 3 are omitted): the backend cannot splat an FP8 constant, and the rows only
+need to exist so the matmul does not read past y.  Their values do not matter
+because x's within-stick padding past K is zero.
+
 Deduplication of identical constants across multiple pad calls happens later
 at the IR level via dedup_and_promote_constants.
 
@@ -486,6 +491,12 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         patch_env(V.graph)
         y_fx_node = find_fx_node(y_name, V.graph)
 
+        # An FP8 weight's extra K rows are left unwritten: they only need to
+        # exist so the matmul does not read past the buffer. Their values never
+        # matter, because x's within-stick padding past K is zero, and the
+        # backend cannot splat an FP8 constant to fill them.
+        fill_value = None if reduction.reduction_type == BATCH_MATMUL_FP8_OP else 0.0
+
         # No orig_stl: this pass runs before stickification, so the new ops keep
         # host FixedLayouts and propagate_spyre_tensor_layouts lays them out.
         y_padded_buf, y_new_ops = lower_pad_sequence(
@@ -495,6 +506,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             dtype=dtype,
             dim=y_k_dim,
             insert_before=matmul_fx_node,
+            fill_value=fill_value,
             arg_buf=y_buf if y_fx_node is None else None,
         )
 

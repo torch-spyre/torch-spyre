@@ -2094,8 +2094,14 @@ def lower_cat(inputs, dim=0):
     torch.ops.aten.constant_pad_nd.default, type_promotion_kind=None
 )
 def lower_constant_pad_nd(
-    input, pad, value=0, align_to_stick=False, output_stride=None
+    input, pad, value=0, align_to_stick=False, output_stride=None, fill_padding=True
 ):
+    # fill_padding=False allocates the padded output and copies the input in,
+    # but leaves the padding region unwritten. insert_bmm_padding uses it for an
+    # FP8 matmul weight, whose extra K rows only need to exist (so the matmul
+    # does not read out of bounds): the activation's within-stick padding is
+    # zero, so those rows contribute nothing whatever they hold, and the
+    # backend cannot splat an FP8 constant anyway.
     # output_stride, when given, is the host stride the *output* buffer must
     # be allocated with (e.g. to match a non-row-major source buffer's
     # physical layout -- see pass_utils.py's lower_pad_sequence).  It must be
@@ -2151,12 +2157,16 @@ def lower_constant_pad_nd(
         )
     else:
         output = lowering.empty(output_size, dtype=dtype, device=device)
-    pad_constant = lower_constant(value, dtype, device)
 
     # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
     # Extra padding from alignment will be overwritten by input.
     stick_size = get_elem_in_stick(dtype)
-    for (left, right), dim in zip(bounds, range(n, len(output_size))):
+    fill_bounds = list(zip(bounds, range(n, len(output_size))))
+    if fill_padding:
+        pad_constant = lower_constant(value, dtype, device)
+    else:
+        fill_bounds = []
+    for (left, right), dim in fill_bounds:
         pad_left = max(0, left)
         pad_right = max(0, right)
         if pad_left + pad_right == 0:

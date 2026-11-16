@@ -2827,6 +2827,8 @@ def _fresh_allocation_layout(
         # is left out, so its arrangement is lost.
         for arg in _get_prop_args(reads, strict=False):
             source_eas.update(s.element_arrangement for s in arg.layouts)
+    if ElementArrangement.QFP8WT in source_eas:
+        return _qfp8wt_allocation_layout(op, writers, source_eas)
     staggered_eas = source_eas & STAGGERED_EAS
     if not staggered_eas:
         return stl
@@ -2841,6 +2843,44 @@ def _fresh_allocation_layout(
     for writer in writers:
         _check_whole_stagger_units(writer, op.get_layout(), stl)
     return stl
+
+
+def _qfp8wt_allocation_layout(
+    op: Operation,
+    writers: list[ComputedBuffer],
+    source_eas: set[ElementArrangement],
+) -> SpyreTensorLayout:
+    """QFP8WT layout for an allocation whose writers store a QFP8WT weight.
+
+    ``insert_bmm_padding`` pads an FP8 matmul weight's K to a stick boundary
+    with ``constant_pad_nd``. The padded buffer must stay QFP8WT, or the
+    matmul reads a STANDARD weight it cannot consume. QFP8WT pairs K rows with
+    N in a 2D stick, so the allocation takes the default QFP8WT dim order (K
+    directly outside the stick); ``nonstick_dim_order`` reorders it later if
+    the matmul's K is a different host dim.
+    """
+    name = op.get_name()
+    if len(source_eas) > 1:
+        raise Unsupported(
+            f"writers of {name} store mixed element arrangements "
+            f"{sorted(ea.name for ea in source_eas)}"
+        )
+    layout = op.get_layout()
+    c_size = [concretize_expr(s) for s in layout.size]
+    c_stride = [concretize_expr(s) for s in layout.stride]
+    if c_stride[-1] != 1:
+        # TODO: support a QFP8WT allocation whose N is not host-contiguous.
+        raise Unsupported(
+            f"QFP8WT allocation {name}: last host dim is not contiguous "
+            f"(stride {c_stride})"
+        )
+    return SpyreTensorLayout(
+        c_size,
+        c_stride,
+        layout.dtype,
+        qfp8wt_dim_order(len(c_size)),
+        ElementArrangement.QFP8WT,
+    )
 
 
 def _carries_element_arrangement(read, dtype: torch.dtype) -> bool:
