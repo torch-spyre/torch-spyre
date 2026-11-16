@@ -980,6 +980,33 @@ class TestUnsupportedGates(unittest.TestCase):
                 with self.assertRaisesRegex(Unsupported, "without a source dtype"):
                     SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
 
+    def test_compiled_conversion_of_multi_output_op_does_not_crash(self):
+        """A dtype conversion of a multi-output op's result compiles cleanly (#5831).
+
+        argsort lowers through aten.sort, whose FX node carries a (values,
+        indices) tuple as meta["val"]. split_multi_ops called .to() on it and
+        crashed with "'tuple' object has no attribute 'to'", which hid the real
+        cause. aten.sort is not supported on Spyre yet, so the compile may still
+        be rejected, but with that op's own error; once it is supported, the
+        result must match the CPU.
+
+        Caches are off: the graph compiles with the fix (the sort error comes at
+        run time), so a cached graph would skip split_multi_ops and hide the bug.
+        """
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float16)
+
+        def fn(a):
+            return torch.argsort(a, dim=1).to(torch.float16)
+
+        try:
+            with torch._inductor.config.patch(force_disable_caches=True):
+                out = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+        except Exception as e:
+            self.assertNotIn("'tuple' object has no attribute", str(e))
+        else:
+            torch.testing.assert_close(out, fn(x))
+
 
 class TestModelIntegration(unittest.TestCase):
     """Compiled model integration tests: dtype behavior through realistic compute patterns."""

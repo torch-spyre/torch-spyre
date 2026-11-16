@@ -602,9 +602,12 @@ def _make_intermediate_bufs(
             new_node = gl.graph.create_node("call_function", target, args, clean_kw)
         _set_split_child_provenance(orig_node, new_node, target)
 
-        # Propagate metadata for shape inference
-        if input_nodes and "val" in input_nodes[0].meta:
-            new_node.meta["val"] = input_nodes[0].meta["val"].to(out_dtype)
+        # Propagate metadata for shape inference. The input's val is a tuple
+        # when the input is a multi-output op (aten.sort for argsort, topk,
+        # min/max with indices); fall back to the original node's val then.
+        input_val = input_nodes[0].meta.get("val") if input_nodes else None
+        if isinstance(input_val, torch.Tensor):
+            new_node.meta["val"] = input_val.to(out_dtype)
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
