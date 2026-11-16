@@ -610,3 +610,26 @@ def test_an_ineligible_run_over_the_floor_does_not_make_the_next_eligible_one_re
         "single_run",
         1,
     )
+
+
+def test_an_ineligible_over_floor_run_sharing_a_position_does_not_make_a_later_one_regressed(
+    fx,
+):
+    f = fx
+    f.register_benchmarks()
+    for n in range(45):
+        f.run()
+    accept(f, 40, 1)
+    slow = {n: 0.12 for n, *_ in BENCHMARKS}
+    f.run()  # eligible and fine
+    f.run(
+        slow=slow, props={"run.purpose": "pr-check"}
+    )  # over the floor, but ineligible
+    f.run()  # eligible and fine: shares its position with the ineligible run
+    nxt = f.run(slow=slow)
+    a = anchored(f, nxt)
+    assert (a["status"], a["reason"], a["n_exceeding_runs"]) == (
+        "suspected",
+        "single_run",
+        1,
+    )
