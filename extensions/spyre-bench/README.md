@@ -69,6 +69,7 @@ plan = engine.plan(cat, {"purpose": "pr", "selection": {"tier": "sanity"}}, leg)
 |---|---|
 | `spyre_bench/engine.py` | registry, catalog validation, case expansion, identity, plan, reuse, invalidation, qualification, validity |
 | `spyre_bench/validate.py`, `explain.py`, `analysis.py`, `gen_schemas.py`, `cli.py` | the CLI verbs (`analysis.py` also evaluates `derive` and `compare`) |
+| `spyre_bench/reference.py`, `reference_client.py` | the `reference` verb (create, validate, seal, submit, compare) and its dashboard client |
 | `spyre_bench/plan.py`, `run.py`, `verdict.py`, `store.py`, `planfile.py`, `cliutil.py` | the `plan`, `run` and `verdict` verbs, the stores behind them (none, ClickHouse, in-memory), the `plan.json` constants and token templates, shared CLI plumbing |
 | `spyre_bench/ingest_adapter.py`, `ids.py` | the only import of the ingest derivation; the `ids` verb |
 | `spyre_bench/placement.py` | observed CPU placement (`run.exec.*`) from `/proc` and `/sys` |
