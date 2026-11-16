@@ -364,7 +364,6 @@ runs:
         CHANNEL_TRUST_IN: ${{ inputs.channel-trust }}
         PERF_IN: ${{ inputs.perf }}
         WORKFLOW_IN: ${{ inputs.workflow }}
-        BRANCH_IN: ${{ inputs.branch }}
         SHA_IN: ${{ inputs.sha }}
         RUN_ID_IN: ${{ inputs.run-id }}
         GHA_RUN_ID_IN: ${{ inputs.gha-run-id }}
