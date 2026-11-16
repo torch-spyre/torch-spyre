@@ -52,7 +52,7 @@ Applying them in filename order works from an empty database.
 
 Numbers 81-86 land together in the `feat/bench-schema` stack, in this order: environments,
 placements and invalidations (81-84), reader exclusion (edits to 50/52/55/60/62/70 plus migration
-025), verdict views (85), references view (86). Later benchmark work extends the stack
+025, 028), verdict views (85), references view (86). Later benchmark work extends the stack
 without renumbering it:
 
 | reserved | for |
