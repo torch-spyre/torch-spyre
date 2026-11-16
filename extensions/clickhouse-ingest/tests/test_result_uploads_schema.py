@@ -36,7 +36,10 @@ def test_result_kind_and_test_type_match_artifact_results():
 
 def test_format_matches_the_bundle_kinds():
     kinds = offline.schema()["properties"]["kind"]["enum"]
-    assert _check("49-result-uploads.sql", "chk_format") == kinds
+    formats = [offline.UPLOAD_FORMAT.get(k, k) for k in kinds] + list(
+        offline.RESERVED_UPLOAD_FORMATS
+    )
+    assert _check("49-result-uploads.sql", "chk_format") == formats
 
 
 NIL = "00000000-0000-0000-0000-000000000000"
@@ -263,4 +266,14 @@ def test_rbac_keeps_the_newest_version_and_logs_every_one():
     )
     assert (
         s.query("SELECT count() FROM rbac_role_versions", "CSV").data().strip() == "2"
+    )
+
+
+def test_migration_026_adds_the_ddl_format_list():
+    sql = (
+        SCHEMA_DIR / "migrations" / "026_result_uploads_bench_reference_formats.sql"
+    ).read_text()
+    m = re.search(r"ADD CONSTRAINT chk_format CHECK format IN \(([^)]*)\)", sql)
+    assert re.findall(r"'([^']+)'", m.group(1)) == _check(
+        "49-result-uploads.sql", "chk_format"
     )

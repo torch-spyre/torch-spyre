@@ -24,6 +24,7 @@ session = pytest.importorskip("chdb.session")
 FILES = (
     "10-functional-tests",
     "20-artifacts",
+    "30-benchmarks",
     "49-result-uploads",
     "50-artifact-views",
     "86-bench-references",
