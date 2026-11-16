@@ -4167,36 +4167,38 @@ def spyre_index_fill(
     self: torch.Tensor,
     dim: int,
     index: torch.Tensor,
-    value: Union[int, float, bool, torch.Tensor],
+    value: torch.Tensor,
 ) -> torch.Tensor:
-    """`index_fill` as an overwrite-scatter of a materialized fill block.
+    """`index_fill.int_Tensor` as an overwrite-scatter of a materialized block.
 
-    The upstream reference broadcasts a rank-0 `scalar_tensor(value)` with
-    `expand` and scatters it via `index_copy`. That reaches the Spyre store as
-    a bare `Constant`, which codegen rejects ("store value of unexpected type").
-    Building the block with `torch.full` gives the scatter a real source
-    buffer, the same shape `index_copy` already handles.
+    The upstream reference broadcasts the 0-d `value` with `expand` and
+    scatters it via `index_copy`, so the store reads a stride-0 view that has
+    no dimension advancing with the indexed rows. Adding `value` to a real
+    block gives the scatter a source buffer, the shape `index_copy` already
+    handles.
+
+    The scalar overload (`int_Scalar`) is not registered here: upstream builds
+    it from `scalar_tensor(value).expand(...)`, which the
+    `materialize_scalar_fill` post-grad pass rewrites to a `full`. That pass
+    does not match a tensor `value`, which is why this overload still needs
+    its own decomposition.
     """
     torch._check(
         index.dim() <= 1,
         lambda: f"Index should have dimension 1 or 0 (got {index.dim()})",
     )
-    if isinstance(value, torch.Tensor):
-        torch._check(
-            value.dim() == 0,
-            lambda: "Only supports 0-dimensional value tensor. "
-            f"Got a tensor with {value.dim()} dimensions.",
-        )
+    torch._check(
+        value.dim() == 0,
+        lambda: "Only supports 0-dimensional value tensor. "
+        f"Got a tensor with {value.dim()} dimensions.",
+    )
     # Treat a 0-d self as shape [1], as the upstream reference does.
     y = self.unsqueeze(0) if self.dim() == 0 else self
     dim = dim % y.dim()
     index = index.reshape(-1)
     shape = list(y.shape)
     shape[dim] = index.numel()
-    if isinstance(value, torch.Tensor):
-        block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
-    else:
-        block = torch.full(shape, value, dtype=y.dtype, device=y.device)
+    block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
     out = torch.index_copy(y, dim, index, block)
     return out.squeeze(0) if self.dim() == 0 else out
 
