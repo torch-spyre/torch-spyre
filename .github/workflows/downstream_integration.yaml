@@ -2,7 +2,7 @@ name: downstream_integration
 
 # Pre-queue stand-in for Jenkins' downstream fan-out: once auto-merge is enabled on a PR, or a
 # maintainer comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
-# (advisory) integration suites on their main against this PR's torch-spyre head. Inert unless
+# (informational) integration suites on their main against this PR's torch-spyre head. Inert unless
 # GHA_DOWNSTREAM_INTEGRATION is "true".
 run-name: downstream-integration
 
@@ -62,23 +62,25 @@ jobs:
     if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 270
-    continue-on-error: ${{ matrix.advisory }}
+    continue-on-error: ${{ matrix.wait != 'true' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - repo: hf-adapters
-            advisory: false
+            wait: 'true'
             extra_inputs: '{}'
+          # Informational: dispatched and linked in the run summary, never awaited, so a slow or hung run cannot hold this workflow open or leave a pending status.
           - repo: spyre-inference
-            advisory: true
+            wait: 'false'
             extra_inputs: '{"image_rpms":"true"}'
     env:
       GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
-      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.advisory && ' (advisory)' || '' }}
+      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}
     steps:
       - name: Report pending
+        if: matrix.wait == 'true'
         continue-on-error: true
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state=pending -f context="$STATUS_CONTEXT" \
@@ -103,12 +105,13 @@ jobs:
         with:
           repository: torch-spyre/${{ matrix.repo }}
           extra_inputs: ${{ matrix.extra_inputs }}
+          wait: ${{ matrix.wait }}
           token: ${{ steps.app-token.outputs.token }}
           torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}
           pr_number: ${{ needs.resolve.outputs.number }}
       - name: Report result
-        if: always()
+        if: always() && matrix.wait == 'true'
         continue-on-error: true
         env:
           JOB_STATUS: ${{ job.status }}
