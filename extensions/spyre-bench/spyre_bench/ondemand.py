@@ -1210,6 +1210,19 @@ def _cmd_history(a):
     return cliutil.EXIT_OK
 
 
+def _cmd_limit(a):
+    pol = POLICIES[a.host]
+    print(
+        json.dumps(
+            {
+                "request_device_hours": max(pol.budget_device_hours.values()),
+                "pr_window_device_hours": pol.pr_window_device_hours,
+            }
+        )
+    )
+    return cliutil.EXIT_OK
+
+
 def _cmd_sanitize(a):
     print(safe(sys.stdin.read(a.limit * 4), a.limit))
     return cliutil.EXIT_OK
@@ -1262,6 +1275,9 @@ def parser():
     p.add_argument("--rows", required=True)
     p.add_argument("--host", choices=HOSTS, required=True)
     p.set_defaults(fn=_cmd_history)
+    p = sub.add_parser("limit", help="the per-request and per-PR window device-hour limits of a host, as JSON")
+    p.add_argument("--host", choices=HOSTS, required=True)
+    p.set_defaults(fn=_cmd_limit)
     p = sub.add_parser("sanitize", help="stdin -> the same text made inert for a PR comment")
     p.add_argument("--limit", type=int, default=600)
     p.set_defaults(fn=_cmd_sanitize)

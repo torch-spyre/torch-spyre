@@ -827,6 +827,10 @@ class EngineRequestCli(unittest.TestCase):
         self.assertEqual((env["BENCH_SUITES"], env["BENCH_TIER"], env["BENCH_REUSE"]), ("decoder", "sanity", "only"))
         self.assertNotIn("BENCH_SELECTION", env)
 
+    def test_limit_prints_the_hosts_numbers_from_the_policy_file(self):
+        code, out, _ = capture(cli_main, ["ondemand", "limit", "--host", "github.com"])
+        self.assertEqual((code, json.loads(out)), (0, {"request_device_hours": 4.0, "pr_window_device_hours": 8.0}))
+
     def test_sanitize_reads_stdin(self):
         import io
         from unittest import mock
