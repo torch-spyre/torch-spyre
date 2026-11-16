@@ -74,6 +74,10 @@ _requires_emulation = pytest.mark.skipif(
 # always admits. "EMUL1p5-small-dma" also lowers the DMA slice size, which
 # Flex reads once at runtime start, so each shard's copy becomes several
 # DMA slices (256 MiB by default: a test shard would take one).
+#
+# The small-dma mode reruns the whole file on purpose, not only the
+# multi-slice test: every other test whose shards are larger than one slice
+# is then also checked with its copies split into several DMA slices.
 _SMALL_DMA_SLICE_BYTES = 4096
 _DEVICE_MODES = {
     "EMUL1p5": {"FLEX_DEVICE": "EMUL1p5"},
@@ -81,6 +85,12 @@ _DEVICE_MODES = {
         "FLEX_DEVICE": "EMUL1p5",
         "FLEX_DATA_TRANSFER_BUFFER_SIZE": str(_SMALL_DMA_SLICE_BYTES),
     },
+}
+# Extra child pytest arguments per mode. With the default slice size the
+# multi-slice test would only skip, and the wrapper allows no skips in a child
+# besides its own tests, so it is deselected there instead.
+_MODE_PYTEST_ARGS = {
+    "EMUL1p5": ("-k", "not test_shards_larger_than_one_dma_slice_round_trip"),
 }
 
 
@@ -124,6 +134,7 @@ def test_device_suite_in_emulation_shape(mode, shards, tmp_path):
             "-p",
             "no:cacheprovider",
             f"--junit-xml={junit}",
+            *_MODE_PYTEST_ARGS.get(mode, ()),
             __file__,
         ],
         env=env,
@@ -696,12 +707,20 @@ def test_padded_shards_round_trip(shape_per_shard, dim, dtype):
     shape[dim] *= n
     cpu = _exact_source(shape, dtype)
 
+    x = _sharded(cpu, dim, n)
+
+    # Padded on the device, or the test proves nothing about padding: 50
+    # elements per row take 64 slots (e.g. 200 B of fp32 in 256 B).
+    logical_bytes = torch.Size(shape_per_shard).numel() * cpu.element_size()
+    assert torch.spyre.sharding_info(x).shard_device_bytes > logical_bytes
     # Control: if the unsharded round trip fails too, the fault is not in the
     # sharded path.
     assert torch.equal(cpu.to("spyre").cpu(), cpu)
-    assert torch.equal(_sharded(cpu, dim, n).cpu(), cpu)
+    assert torch.equal(x.cpu(), cpu)
 
 
+# The DMA slice size Flex uses: FLEX_DATA_TRANSFER_BUFFER_SIZE, else Flex's
+# default of 256 MiB (RuntimeConfig::DataTransferBufferSize), mirrored here.
 _DMA_SLICE_BYTES = int(
     os.environ.get("FLEX_DATA_TRANSFER_BUFFER_SIZE", 256 * 1024 * 1024)
 )
