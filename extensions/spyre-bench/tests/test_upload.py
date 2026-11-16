@@ -115,6 +115,9 @@ def test_apply_puts_the_bundle_in_the_inbox_and_prints_the_receipt(run_dir, real
 
 
 def test_a_rejected_outcome_exits_2_and_a_network_failure_exits_5(run_dir, real_ingest, monkeypatch, capsys):
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", "https://art.example.com/artifactory")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_REPO", "results")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "{arch}/v2-results")
     sent(monkeypatch, {"status": "rejected", "reason": "x"})
     assert upload.main([str(run_dir), "--apply"]) == 2
     monkeypatch.setattr(
@@ -153,3 +156,41 @@ def test_an_ingest_that_predates_bench_bundles_asks_for_an_upgrade(run_dir, monk
     monkeypatch.setattr(ingest_adapter.importlib, "import_module", lambda name: stale)
     assert upload.main([str(run_dir)]) == 2
     assert "upgrade the ingest first" in capsys.readouterr().err
+
+
+def test_a_single_result_file_is_sealed_not_mistaken_for_a_bundle(run_dir, real_ingest, capsys):
+    one = next(run_dir.rglob("result.json"))
+    assert upload.main([str(one), "--json", "--arch", "x86_64"]) == 0
+    assert json.loads(capsys.readouterr().out)["kind"] == "bench"
+
+
+def test_the_arch_is_never_guessed_from_the_host(tmp_path, real_ingest, capsys):
+    d = tmp_path / "res" / "cases" / "decode-1"
+    d.mkdir(parents=True)
+    (d / "result.json").write_text(json.dumps(result()))
+    assert upload.main([str(tmp_path / "res")]) == 2
+    assert "--arch" in capsys.readouterr().err
+
+
+def test_seal_flags_with_a_sealed_bundle_and_wait_without_apply_are_refused(run_dir, real_ingest, capsys):
+    assert upload.main([str(run_dir), "--json"]) == 0
+    bundle = json.loads(capsys.readouterr().out)["bundle"]
+    assert upload.main([bundle, "--redact-host"]) == 2
+    assert "--redact-host" in capsys.readouterr().err
+    assert upload.main([str(run_dir), "--wait"]) == 2
+
+
+def test_missing_transfer_settings_are_a_usage_error_before_anything_is_sealed(
+    run_dir, real_ingest, monkeypatch, capsys
+):
+    for var in ("ARTIFACTORY_BASE_URL", "ARTIFACTORY_V2_RESULTS_REPO", "ARTIFACTORY_V2_RESULTS_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    assert upload.main([str(run_dir), "--apply"]) == 2
+    assert "--base-url" in capsys.readouterr().err
+    assert not (run_dir / "upload").exists()
+
+
+def test_a_relay_that_does_not_answer_is_not_a_success(run_dir, real_ingest, monkeypatch, capsys):
+    sent(monkeypatch, {"status": "waiting", "reason": "not relayed within 5 min"})
+    args = ["--apply", "--wait", "5", "--base-url", "https://art.example.com", "--repo", "r", "--root", "{arch}/x"]
+    assert upload.main([str(run_dir), *args]) == 5

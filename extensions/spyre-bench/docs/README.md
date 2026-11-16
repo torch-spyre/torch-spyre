@@ -436,7 +436,7 @@ spyre-bench upload bundle.tgz --apply                  # send a bundle sealed el
 `upload` is for results measured outside CI: a lab host, a developer machine, a partner's machine. The engine writes
 no rows. The command seals the run directory (every `result.json` under it) into a `bench` bundle through the
 ingest's offline module, checks it, and prints the run key, case and repeat counts, both digests and a receipt id
-(`RCPT-...`). Without `--apply` nothing leaves the machine. With it, the bundle is put in the Artifactory inbox
+(`RCPT-...`). Without `--apply` nothing leaves the machine (the sealed bundle is written to `RESULTS_DIR/upload/bundle.tgz`, or `--out`). With it, the bundle is put in the Artifactory inbox
 (`--base-url`, `--repo`, `--root` or `ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
 `ARTIFACTORY_V2_RESULTS_ROOT`; `ARTIFACTORY_TOKEN` or `~/.netrc`) and the relay records it; `--wait [MIN]` polls for
 its outcome. The dashboard's upload page takes the same bundle if you have a login. `--via api` is refused: the
@@ -446,7 +446,7 @@ dashboard accepts a browser login only.
 |---|---|
 | `--seal-trust lab\|external` | where the results came from (default `external`); the receiving channel records the trust and a label can only lower it |
 | `--redact-host`, `--redact-user` | leave the sealing host and user out of the bundle |
-| `--ended-at`, `--arch`, `--test-type perf\|quality` | end time (ISO-8601 with a zone), where it ran (default `run.json`, else the host), the tier |
+| `--ended-at`, `--arch`, `--test-type perf\|quality` | end time (ISO-8601 with a zone), where it ran (default `run.json`; required when it records none: it is never guessed from the host), the tier |
 | `--out` | where to write the sealed bundle (default `RESULTS_DIR/upload/bundle.tgz`) |
 
 Rules that follow from the receiving side:
@@ -458,11 +458,15 @@ Rules that follow from the receiving side:
 - **The whole ingest package must be installed** (`spyre-bench[ingest]`, or its wheel in an air-gapped kit). The
   vendored identity module that derives benchmark ids (see the adapter contract) is not enough, because sealing reads
   `bundle.schema.json` beside the offline module.
-- **Re-sending is safe.** The run key is the engine run id, so sealing the same results again is the same run; the
+- **Re-sending is safe.** The run key is the engine run id and the results digest (`content_sha256`) ignores the
+  sealing host and time, so sealing the same results again is the same run even though the bundle digest differs; the
   receiving side skips repeats it has and rejects a repeat whose content changed.
+- **Seal flags apply to a results directory.** Given an already sealed bundle, `--redact-*`, `--seal-trust`, `--arch`,
+  `--test-type`, `--ended-at` and `--out` are refused instead of ignored; `--wait` needs `--apply`.
 - **Keys the receiving channel owns** (`run.trust` and others) are dropped from the sealed copy, with a warning.
 
-Exit codes: 0 sent or dry run, 2 invalid input or a rejected bundle, 5 the transfer failed.
+Exit codes: 0 sent or dry run, 2 invalid input, missing configuration or a rejected bundle, 5 the transfer failed or
+the relay did not answer within `--wait` (status `waiting`: the bundle is in the inbox but not yet confirmed).
 Bundle format and trust rules: `extensions/clickhouse-ingest/docs/bench-bundles.md`.
 
 ## Running the tests
