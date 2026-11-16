@@ -19,7 +19,9 @@
 
 Reads the run's samples from the store, refuses anything that is not baseline-eligible (suspect, invalidated,
 off-purpose), and hands one reference-from-run request per series scope to a ReferenceSink. The request is the input
-of the reference machinery (bench-reference bundle, approval, tag move); the engine writes no rows and moves no
+of the reference machinery (`reference create --from-request`, approval, tag move); each value carries the `case` block
+(component, name, tags, disc, disc_keys[, id_profile]) that rebuilds its benchmark_id, and `anchor` is
+{role, run_id, as_of} (`from_run_id` repeats run_id for older readers); the engine writes no rows and moves no
 tag itself, so the anchor changes only when the reference is approved.
 """
 
@@ -33,12 +35,20 @@ import sys
 from datetime import timezone
 from pathlib import Path
 
-from spyre_bench import cliutil, store as stores, verdict
+from spyre_bench import cliutil, engine, store as stores, verdict
 from spyre_bench.cliutil import UsageError
 
 REQUEST_SCHEMA = "bench.reference-request/1"
 MIN_SAMPLES = 3
 MAX_WINDOW = 50
+
+
+class CaseDataError(Exception):
+    """A series whose case block cannot be rebuilt into its benchmark_id."""
+
+    def __init__(self, problems):
+        super().__init__("; ".join(problems))
+        self.problems = problems
 
 
 class ReferenceSink:
@@ -126,13 +136,70 @@ def refusals(rows):
     return out
 
 
-def build_request(scope, rows, carried, run_id, reason, actor, anchored):
+CASE_KEYS = ("component", "name", "tags", "disc", "disc_keys", "id_profile")
+
+
+def rebuilds(block):
+    """The benchmark_id a case block derives, by the rule `reference create --from-request` applies; '' if it cannot."""
+    try:
+        disc = {k: str(v) for k, v in (block.get("disc") or {}).items()}
+        keys = block.get("disc_keys")
+        return engine.benchmark_id(
+            block["component"], block["name"].strip(), list(block.get("tags") or []), disc,
+            sorted(disc) if keys is None else list(keys),
+        )  # fmt: skip
+    except (KeyError, AttributeError, TypeError):
+        return ""
+
+
+def result_cases(run_dir):
+    """benchmark_id -> case block from the Result files of a results directory (exact disc_keys and id profile)."""
+    manifest = verdict.manifest_of(run_dir) or {}
+    base = Path(run_dir).resolve()
+    out = {}
+    for c in manifest.get("cases", []):
+        name = c.get("result") if isinstance(c, dict) else None
+        path = (base / name) if name else None
+        try:
+            case = json.loads(path.read_text())["status"]["case"]
+        except (AttributeError, OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(case, dict) and case.get("benchmark_id") and path.resolve().is_relative_to(base):
+            out[case["benchmark_id"]] = {k: case[k] for k in CASE_KEYS if k in case}
+    return out
+
+
+def case_blocks(st, ids, run_dir=None):
+    """(benchmark_id -> case block, problems): from the run's Results first, else the registered case; every block must
+    rebuild its id, because the reference refuses one that does not."""
+    found = result_cases(run_dir) if run_dir else {}
+    missing = [i for i in ids if i not in found]
+    for r in st.case_rows(missing) if missing else []:
+        props = {k: str(v) for k, v in (r.get("props") or {}).items()}
+        found.setdefault(
+            r["benchmark_key"],
+            {"component": r["component"], "name": r["name"], "tags": list(r.get("tags") or []), "disc": props,
+             "disc_keys": sorted(props)},
+        )  # fmt: skip
+    blocks, problems = {}, []
+    for i in sorted(ids):
+        block = found.get(i)
+        if block is None:
+            problems.append(f"{i}: no case data (not registered, and not in the --run-dir results)")
+        elif rebuilds(block) != i:
+            problems.append(f"{i}: its case data derives {rebuilds(block) or 'no id'}; pass the run's --run-dir")
+        else:
+            blocks[i] = block
+    return blocks, problems
+
+
+def build_request(scope, rows, carried, run_id, reason, actor, anchored, cases):
     """One reference-from-run request for a scope; `carried` are the scope's anchored series this run does not replace."""
     component, arch, backend, source_job = scope
     as_of = max(iso(r["run_ts"]) for r in rows)
     values = [
         {
-            "benchmark_id": r["benchmark_key"], "name": r["name"], "metric": r["metric"],
+            "benchmark_id": r["benchmark_key"], "name": r["name"], "case": cases[r["benchmark_key"]], "metric": r["metric"],
             "samples": [float(x) for x in r["samples"]], "as_of": iso(r["run_ts"]), "carried": False,
             "window_run_ids": r.get("window_run_ids") or [run_id],
             "replaces": anchored.get((r["benchmark_key"], r["metric"], backend, arch, source_job)),
@@ -141,7 +208,7 @@ def build_request(scope, rows, carried, run_id, reason, actor, anchored):
     ]  # fmt: skip
     values += [
         {
-            "benchmark_id": c["benchmark_key"], "name": None, "metric": c["metric"],
+            "benchmark_id": c["benchmark_key"], "name": None, "case": cases[c["benchmark_key"]], "metric": c["metric"],
             "samples": [float(x) for x in c["samples"]], "as_of": iso(c["anchor_from"]), "carried": True,
             "replaces": None,
         }
@@ -158,7 +225,7 @@ def build_request(scope, rows, carried, run_id, reason, actor, anchored):
         "reason": reason,
         "accepted_by": actor,
         "scope": {"component": component, "arch": arch, "backend": backend, "source_job": source_job},
-        "anchor": {"from_run_id": run_id, "as_of": as_of},
+        "anchor": {"role": "anchor", "run_id": run_id, "from_run_id": run_id, "as_of": as_of},
         "comparability": {
             "harness": "spyre-bench",
             "harness_match": "yes",
@@ -197,7 +264,7 @@ def too_thin(rows):
     ]
 
 
-def plan_requests(st, run_id, rows, reason, actor):
+def plan_requests(st, run_id, rows, reason, actor, run_dir=None):
     scopes = {}
     for r in rows:
         scopes.setdefault((r["component"], r["arch"], r["backend"], r["source_job"]), []).append(r)
@@ -211,7 +278,11 @@ def plan_requests(st, run_id, rows, reason, actor):
         taken = {(r["benchmark_key"], r["metric"]) for r in srows}
         carried = [c for c in st.anchor_rows(*scope) if (c["benchmark_key"], c["metric"]) not in taken]
         sound = [c for c in carried if c["samples"] and all(math.isfinite(float(x)) for x in c["samples"])]
-        request = build_request(scope, srows, sound, run_id, reason, actor, anchored)
+        ids = {r["benchmark_key"] for r in [*srows, *sound]}
+        cases, problems = case_blocks(st, ids, run_dir)
+        if problems:
+            raise CaseDataError(problems)
+        request = build_request(scope, srows, sound, run_id, reason, actor, anchored, cases)
         if len(sound) < len(carried):
             request["warnings"].append(
                 f"{len(carried) - len(sound)} carried series dropped: empty or non-finite samples"
@@ -262,7 +333,12 @@ def execute(a, st=None, sink=None):
         if bad:
             print("error: not baseline-eligible, nothing proposed:\n  " + "\n  ".join(bad), file=sys.stderr)
             return cliutil.EXIT_FAILED
-        requests = plan_requests(st, run_ids[0], rows, reason, actor)
+        requests = plan_requests(st, run_ids[0], rows, reason, actor, a.run_dir)
+    except CaseDataError as e:
+        print(
+            "error: cannot rebuild the benchmark id, nothing proposed:\n  " + "\n  ".join(e.problems), file=sys.stderr
+        )
+        return cliutil.EXIT_FAILED
     except stores.StoreError as e:
         print(f"error: store: {e}", file=sys.stderr)
         return cliutil.EXIT_STORE
@@ -281,7 +357,10 @@ def execute(a, st=None, sink=None):
 
 def parser():
     ap = argparse.ArgumentParser(prog="spyre-bench accept", description=__doc__.split("\n")[0])
-    ap.add_argument("--run-dir", help="a results directory: its run.json names the stored run id (BENCH_RUN_DIR)")
+    ap.add_argument(
+        "--run-dir",
+        help="a results directory: its run.json names the stored run id and its Results give each case (BENCH_RUN_DIR)",
+    )
     ap.add_argument("--run-id", help="the stored run UUID to accept (BENCH_RUN_ID, RUN_ID)")
     ap.add_argument("--reason", help="why this run is the new normal (required; recorded with the anchor)")
     ap.add_argument("--benchmark", action="append", default=[], help="accept only these benchmark ids")

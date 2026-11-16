@@ -24,11 +24,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from spyre_bench import accept as accept_cmd
+from spyre_bench import engine
 from spyre_bench import store as stores
 from spyre_bench import verdict as verdict_cmd
-from test_run import RUN, SUBJECT, FakeClient, capture, clean_env, verdict_row
+from test_run import RUN, FakeClient, capture, clean_env
+from test_run import verdict_row as base_verdict_row
 
-B1, B2 = SUBJECT, "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10"
+PROPS = {"dtype": "float16", "batch": "4"}
+
+
+def case_row(name, component="demo", props=PROPS):
+    bid = engine.benchmark_id(component, name, [], props, sorted(props))
+    return {"benchmark_key": bid, "component": component, "name": name, "tags": [], "props": dict(props)}
+
+
+B1, B2 = case_row("op_add")["benchmark_key"], case_row("op_b")["benchmark_key"]
+CASES = [case_row("op_add"), case_row("op_b")]
+
+
+def verdict_row(**kw):
+    return base_verdict_row(**{"benchmark_id": B1, **kw})
+
+
+def mem(**kw):
+    return stores.MemoryStore(**{"cases": list(CASES), **kw})
+
+
 WHEN = datetime(2026, 11, 10, 2, 0, tzinfo=timezone.utc)
 TMP = Path(tempfile.mkdtemp(prefix="spyre-bench-accept-"))
 
@@ -72,7 +93,7 @@ class AcceptTests(unittest.TestCase):
         self.sink = accept_cmd.MemorySink()
 
     def call(self, *argv, series_rows=None, anchors=(), anchored_rows=None):
-        st = stores.MemoryStore(
+        st = mem(
             series={RUN: [series()] if series_rows is None else series_rows},
             anchors=list(anchors),
             anchored={RUN: anchored_rows or []},
@@ -90,7 +111,9 @@ class AcceptTests(unittest.TestCase):
         self.assertEqual(
             req["scope"], {"component": "demo", "arch": "x86_64", "backend": "spyre", "source_job": "nightly"}
         )
-        self.assertEqual(req["anchor"], {"from_run_id": RUN, "as_of": "2026-11-10T02:00:00Z"})
+        self.assertEqual(
+            req["anchor"], {"role": "anchor", "run_id": RUN, "from_run_id": RUN, "as_of": "2026-11-10T02:00:00Z"}
+        )
         self.assertRegex(req["key"], r"^anchor-demo-x86-64-spyre-nightly-[0-9a-f]{8}$")
         (v,) = req["values"]
         self.assertEqual(
@@ -148,7 +171,7 @@ class AcceptTests(unittest.TestCase):
 
     def test_a_dry_run_writes_nothing_and_the_default_sink_writes_a_file(self):
         out = TMP / "files"
-        st = stores.MemoryStore(series={RUN: [series()]}, anchored={RUN: []})
+        st = mem(series={RUN: [series()]}, anchored={RUN: []})
         code, text, err = capture(
             accept_cmd.main, ["--run-id", RUN, "--reason", "r", "--dry-run", "--out", str(out)], st=st
         )
@@ -167,7 +190,7 @@ class AcceptTests(unittest.TestCase):
         self.assertEqual(json.loads(Path(path).read_text()), saved)
 
     def test_a_store_failure_is_exit_5(self):
-        st = stores.MemoryStore(fail="boom")
+        st = mem(fail="boom")
         code, out, err = capture(accept_cmd.main, ["--run-id", RUN, "--reason", "r"], st=st, sink=self.sink)
         self.assertEqual(code, 5)
         self.assertIn("boom", err)
@@ -181,9 +204,7 @@ class AcceptEdgeTests(unittest.TestCase):
         self.sink = accept_cmd.MemorySink()
 
     def call(self, *argv, series_rows=None, anchors=(), anchored_rows=None):
-        st = stores.MemoryStore(
-            series={RUN: series_rows or [series()]}, anchors=list(anchors), anchored={RUN: anchored_rows or []}
-        )
+        st = mem(series={RUN: series_rows or [series()]}, anchors=list(anchors), anchored={RUN: anchored_rows or []})
         return capture(accept_cmd.main, ["--run-id", RUN, "--accepted-by", "amy", *argv], st=st, sink=self.sink)
 
     def test_scopes_that_only_differ_in_punctuation_get_different_keys(self):
@@ -201,7 +222,7 @@ class AcceptEdgeTests(unittest.TestCase):
     def test_two_scopes_write_two_files(self):
         out = TMP / "two"
         rows = [series(component="a_b"), series(component="a-b", bid=B2)]
-        st = stores.MemoryStore(series={RUN: rows}, anchored={RUN: []})
+        st = mem(series={RUN: rows}, anchored={RUN: []})
         code, text, err = capture(accept_cmd.main, ["--run-id", RUN, "--reason", "r", "--out", str(out)], st=st)
         self.assertEqual(code, 0, err)
         self.assertEqual(len(list(out.glob("reference-request-*.json"))), 2)
@@ -247,7 +268,7 @@ class AcceptEdgeTests(unittest.TestCase):
         out = TMP / "preflight"
         shutil.rmtree(out, ignore_errors=True)
         rows = [series(source_job="nightly"), series(source_job="weekly")]
-        st = stores.MemoryStore(series={RUN: rows}, anchored={RUN: []})
+        st = mem(series={RUN: rows}, anchored={RUN: []})
         accept_cmd.main(["--run-id", RUN, "--reason", "r", "--out", str(out), "--json"], st=st)
         first = sorted(out.glob("reference-request-*.json"))
         for f in first[1:]:
@@ -286,9 +307,7 @@ class AcceptWindowTests(unittest.TestCase):
 
     def call(self, *argv, hist=None):
         row = series(samples=(104.0,), run_key="r4", run_ts=datetime(2026, 11, 5, tzinfo=timezone.utc))
-        st = stores.MemoryStore(
-            series={RUN: [row]}, anchored={RUN: []}, windows=self.history(5) if hist is None else hist
-        )
+        st = mem(series={RUN: [row]}, anchored={RUN: []}, windows=self.history(5) if hist is None else hist)
         return capture(
             accept_cmd.main, ["--run-id", RUN, "--accepted-by", "amy", "--reason", "r", *argv], st=st, sink=self.sink
         )
@@ -323,7 +342,7 @@ class AnchoredVerdictTests(unittest.TestCase):
         self.addCleanup(self._env.stop)
 
     def call(self, *argv, rows=None, anchored_rows=None):
-        st = stores.MemoryStore(verdicts={RUN: rows or [verdict_row()]}, anchored=anchored_rows)
+        st = mem(verdicts={RUN: rows or [verdict_row()]}, anchored=anchored_rows)
         return capture(verdict_cmd.main, ["--run-id", RUN, *argv], st=st)
 
     def test_the_anchored_verdict_sits_beside_the_rolling_one(self):
@@ -368,7 +387,7 @@ class AnchoredVerdictTests(unittest.TestCase):
 
     def test_several_runs_never_share_an_anchored_row(self):
         other = "8e1f7a52-1b8d-4a3e-9d7e-0a1b2c3d4e5f"
-        st = stores.MemoryStore(
+        st = mem(
             verdicts={RUN: [verdict_row(run_id=RUN)], other: [verdict_row(run_id=other)]},
             anchored={RUN: [anchored()], other: [anchored(run_key=other, status="improved", reason="anchor_improved")]},
         )
@@ -489,3 +508,122 @@ class ClickHouseAnchorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaseBlockTests(unittest.TestCase):
+    def setUp(self):
+        self._env = clean_env()
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.sink = accept_cmd.MemorySink()
+
+    def call(self, *argv, st):
+        return capture(accept_cmd.main, ["--run-id", RUN, "--reason", "r", *argv], st=st, sink=self.sink)
+
+    def store(self, cases=None, **kw):
+        return mem(series={RUN: [series()]}, anchored={RUN: []}, **({} if cases is None else {"cases": cases}), **kw)
+
+    def test_every_value_carries_a_case_block_that_rebuilds_its_id(self):
+        code, out, err = self.call(st=self.store(anchors=[anchor_row()]))
+        self.assertEqual(code, 0, err)
+        by_id = {v["benchmark_id"]: v for v in self.sink.requests[0]["values"]}
+        self.assertEqual(set(by_id), {B1, B2})
+        self.assertEqual(
+            by_id[B1]["case"],
+            {"component": "demo", "name": "op_add", "tags": [], "disc": PROPS, "disc_keys": ["batch", "dtype"]},
+        )
+        for bid, v in by_id.items():
+            self.assertEqual(accept_cmd.rebuilds(v["case"]), bid)
+
+    def test_a_case_that_is_not_registered_is_refused_and_nothing_is_proposed(self):
+        code, out, err = self.call(st=self.store(cases=[case_row("op_b")]))
+        self.assertEqual(code, 1)
+        self.assertIn(B1, err)
+        self.assertIn("no case data", err)
+        self.assertEqual(self.sink.requests, [])
+
+    def test_a_case_whose_data_derives_another_id_is_refused(self):
+        wrong = {**case_row("op_add"), "props": {"dtype": "float32", "batch": "4"}}
+        code, out, err = self.call(st=self.store(cases=[wrong]))
+        self.assertEqual(code, 1)
+        self.assertIn("derives", err)
+        self.assertEqual(self.sink.requests, [])
+
+    def test_a_carried_series_without_case_data_is_refused_too(self):
+        code, out, err = self.call(st=self.store(cases=[case_row("op_add")], anchors=[anchor_row()]))
+        self.assertEqual(code, 1)
+        self.assertIn(B2, err)
+
+    def test_the_run_dir_results_give_the_exact_disc_keys_and_profile(self):
+        keys = ["dtype"]
+        bid = engine.benchmark_id("demo", "op_add", [], PROPS, keys)
+        d = TMP / "rd"
+        (d / "c1").mkdir(parents=True, exist_ok=True)
+        case = {"benchmark_id": bid, "component": "demo", "name": "op_add", "tags": [], "disc": PROPS,
+                "disc_keys": keys, "id_profile": "generic", "props": {}}  # fmt: skip
+        (d / "c1" / "result.json").write_text(json.dumps({"kind": "Result", "status": {"case": case}}))
+        (d / "run.json").write_text(json.dumps({"stored_run_ids": [RUN], "cases": [{"result": "c1/result.json"}]}))
+        st = mem(series={RUN: [series(bid=bid)]}, anchored={RUN: []}, cases=[])
+        code, out, err = capture(accept_cmd.main, ["--run-dir", str(d), "--reason", "r"], st=st, sink=self.sink)
+        self.assertEqual(code, 0, err)
+        (v,) = self.sink.requests[0]["values"]
+        self.assertEqual(v["case"]["disc_keys"], keys)
+        self.assertEqual(v["case"]["id_profile"], "generic")
+        self.assertNotIn("props", v["case"])
+
+
+try:
+    from spyre_bench import reference
+except ImportError:  # the reference engine is a sibling branch
+    reference = None
+
+
+@unittest.skipIf(reference is None, "the reference engine is not on this branch")
+class RoundTripTests(unittest.TestCase):
+    """accept -> `reference create --from-request` -> validate."""
+
+    def setUp(self):
+        self._env = clean_env()
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.dir = Path(tempfile.mkdtemp(dir=TMP))
+
+    def propose(self):
+        st = mem(series={RUN: [series()]}, anchored={RUN: []}, anchors=[anchor_row()])
+        code, out, err = capture(
+            accept_cmd.main, ["--run-id", RUN, "--reason", "r", "--out", str(self.dir / "req")], st=st
+        )
+        self.assertEqual(code, 0, err)
+        (path,) = (self.dir / "req").glob("reference-request-*.json")
+        return path
+
+    def create(self, path, out):
+        meta = self.dir / "meta.json"
+        meta.write_text(json.dumps({
+            "model": {"name": "demo"}, "dataset": {"name": "demo"}, "producer": "demo", "terms": "internal-generated",
+            "comparability": {"caveats": "demo"}, "system": {"backend": "spyre"},
+        }))  # fmt: skip
+        st = stores.NullStore()
+        st.registered = set  # every case counts as registered
+        argv = ["create", "--from-request", str(path), "--out", str(out), "--meta", str(meta)]
+        return capture(reference.main, argv, st=st)
+
+    def test_the_request_becomes_a_valid_reference(self):
+        out = self.dir / "ref"
+        code, text, err = self.create(self.propose(), out)
+        self.assertEqual(code, 0, err)
+        doc = json.loads((out / "reference.json").read_text())
+        self.assertEqual({v["case"]["benchmark_id"] for v in doc["values"]}, {B1, B2})
+        self.assertEqual(doc["source_run"]["run_id"], RUN)
+        code, text, err = capture(reference.main, ["validate", str(out)])
+        self.assertEqual(code, 0, text + err)
+
+    def test_a_tampered_case_block_is_refused(self):
+        path = self.propose()
+        req = json.loads(path.read_text())
+        req["values"][0]["case"]["name"] = "something_else"
+        path.write_text(json.dumps(req))
+        code, text, err = self.create(path, self.dir / "ref2")
+        self.assertNotEqual(code, 0)
+        self.assertIn("derives", err)
+        self.assertFalse((self.dir / "ref2").exists())
