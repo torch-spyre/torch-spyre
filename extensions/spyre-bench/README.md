@@ -35,6 +35,8 @@ spyre-bench validate examples/llm-demo --central examples/central
 spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-example
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
 spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
+spyre-bench dataset add ./data.jsonl --display-name "Name" --license internal   # dry run; --apply writes
+spyre-bench dataset list --benchmarks-dir examples/llm-demo --central examples/central
 spyre-bench gen-schemas --check
 spyre-bench analyze --help
 spyre-bench plan --catalog examples/run-demo --central examples/central --purpose nightly --arch x86_64 \

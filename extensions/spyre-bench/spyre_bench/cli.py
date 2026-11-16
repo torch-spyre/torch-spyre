@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""spyre-bench command line: validate, explain, ids, plan, run, verdict, analyze, gen-schemas."""
+"""spyre-bench command line: validate, explain, ids, plan, run, verdict, analyze, dataset, gen-schemas."""
 
 import sys
 
@@ -24,6 +24,10 @@ VERBS = {
     "explain": ("spyre_bench.explain", "show a case with every reference resolved, its identity and its plan record"),
     "ids": ("spyre_bench.ids", "print the stored benchmark_id of each case, or its derivation inputs (--inputs)"),
     "analyze": ("spyre_bench.analysis", "evaluate an Analysis (derive, compare) over stored Results"),
+    "dataset": (
+        "spyre_bench.dataset_add",
+        "add, list and check datasets: store staging plus Dataset/Asset definitions",
+    ),
     "gen-schemas": ("spyre_bench.gen_schemas", "regenerate (or --check) the core JSON Schemas"),
 }
 
