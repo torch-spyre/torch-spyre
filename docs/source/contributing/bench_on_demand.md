@@ -53,7 +53,7 @@ artifact identity, does not ingest, and comments counts only.
 | Threat | Control |
 |---|---|
 | A stranger comments `/bench` on a public pull request | A gate job reads the commenter's permission from the collaborator API (not the event's `author_association`); without write access nothing else runs and nothing is posted. |
-| A fork head runs code on shared runners | A write-access user must name the head commit (`sha=`); the request is bound to that sha, a moved head is refused, and a new comment is a new request and a new check. |
+| A fork head runs code on the shared runner pools | A write-access user must name the head commit (`sha=`); the request is bound to that sha, a moved head is refused, and a new comment is a new request and a new check. |
 | The fork changes the engine, the workflow or the Makefile to get secrets | The workflows and the engine come from the default branch. The fork workflow references no secrets, ingests nothing, and its checkouts do not keep credentials. Its outcomes are read by a separate reporting job that checks out nothing. |
 | Comment text becomes a command, a mention or a link | The comment is passed through an environment variable and parsed by a strict grammar (names are letters, digits, `.`, `_`, `-`); every error and every string derived from a comment or a plan is stripped of control and bidirectional characters, backticks, tags, pipes, link and image syntax and issue references, `@` is neutralised, and URL schemes are broken, before it is posted. |
 | The fork head is parsed with a token in reach | The plan step has no token in its environment, symlinks in the fetched tree are removed first, and plan errors are sanitized before they are posted. |
@@ -84,9 +84,15 @@ own estimate is not known to the request job), and the runner job's 240-minute t
 bound that equals the public per-request limit. Each measuring run first asks the API whether the pull request is
 still open, still at the requested head, and was requested less than a day ago.
 
-Fork heads run only when the repository variable `BENCH_FORK_RUNNER_LABEL` names a runner set reserved for them; with
-none configured nothing runs and the PR is told so. Deciding that set is an owner action: a fork's Makefile and `mk/`
-run there, so it must not share a runner image, venv or credentials with the credentialed `bench-on-demand` job.
+Fork heads run on the default runner labels of the measuring workflow, the same pools `/spyre-test` uses for fork
+heads. The repository variable `BENCH_FORK_RUNNER_LABEL` is optional: when set it replaces the card-size label, so the
+owner can move fork runs to a separate runner set later without changing the workflows.
+
+Residual risk, stated plainly: a fork's Makefile and `mk/` run on the same pools as same-repository jobs, so isolation
+of the runner pod (service account, network, shared caches, the prebaked venv) is a property of those pools and is not
+established by these workflows. What bounds it: only a user with write access can trigger a run, and only after naming
+the exact head commit (`sha=`); the request is bound to that sha and re-checked when the job starts; the fork workflow
+references no secrets and stores nothing; and the pods are ephemeral where the runner set is per-identity.
 
 Limits of this route today: clean (exclusive node) runs are not available here; reuse is looked up when the run
 starts, so the preview assumes nothing is reusable; the per-pull-request daily device-hour window needs a store and is

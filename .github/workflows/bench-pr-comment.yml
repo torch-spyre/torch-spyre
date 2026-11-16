@@ -373,7 +373,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REPO: ${{ steps.facts.outputs.head_repo }}
           HEAD_SHA: ${{ steps.facts.outputs.head_sha }}
-          FORK_RUNNER_LABEL: ${{ vars.BENCH_FORK_RUNNER_LABEL }}
         run: |
           set -euo pipefail
           # A cancel or another confirm that landed while this run was planning wins: the preview is spent.
@@ -387,10 +386,6 @@ jobs:
           # The decision is bound to this sha; refuse if the head moved while we were planning.
           [ "$(gh api "repos/${REPO}/pulls/${PR}" --jq .head.sha)" = "${HEAD_SHA}" ] || { echo "::warning::head moved; not dispatching"; exit 0; }
           "$BENCH" ondemand env --request "$W/request.json" --product torch-spyre > "$W/bench-env.json"
-          if [ "${HEAD_REPO,,}" != "${REPO,,}" ] && [ -z "${FORK_RUNNER_LABEL}" ]; then
-            gh api "repos/${REPO}/issues/${PR}/comments" -f body="Runs of fork heads are not enabled on this repository (no runner label is set aside for them), so nothing was started." > /dev/null
-            exit 0
-          fi
           if [ "${HEAD_REPO,,}" = "${REPO,,}" ]; then
             gh workflow run bench-on-demand.yml --ref "${DEFAULT_BRANCH}" \
               -f ref="${HEAD_SHA}" -f pr_number="${PR}" -f requested_by="${ACTOR}" \

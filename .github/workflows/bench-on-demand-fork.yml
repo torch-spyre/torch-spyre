@@ -52,14 +52,10 @@ env:
 jobs:
   bench:
     name: On-demand benchmarks, fork head (advisory)
-    # Fork code runs only on a runner set reserved for it (repository variable BENCH_FORK_RUNNER_LABEL); with no label
-    # configured the job does not run. Keeping fork code off the credentialed runners is a decision for the owner.
-    if: ${{ vars.BENCH_FORK_RUNNER_LABEL != '' }}
-    runs-on:
-      - x86_64
-      - ${{ vars.BENCH_FORK_RUNNER_LABEL }}
-      - linux
-      - image_spyre_backend
+    # The default runner labels of bench-on-demand, as /spyre-test uses for fork heads. The repository variable
+    # BENCH_FORK_RUNNER_LABEL, when set, replaces the card-size label (spyre_pf_x1) with a runner set of the owner's choice.
+    runs-on: ${{ fromJSON(vars.BENCH_FORK_RUNNER_LABEL != '' && format('["x86_64","{0}","linux","image_spyre_backend"]', vars.BENCH_FORK_RUNNER_LABEL) ||
+      '["x86_64","spyre_pf_x1","linux","image_spyre_backend"]') }}
     timeout-minutes: 240
     continue-on-error: true
     permissions:
