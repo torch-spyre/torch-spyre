@@ -61,9 +61,9 @@ without renumbering it:
 | `88` | anchor (baseline) views |
 | `89` | invalidation preview |
 
-Migration numbers: `025` is the reader exclusion; `026` (reference formats) and `027` (uploads) sit on their own
-branches; `028` (`ci_requests` accepts the `comment` channel, rerunnable) is independent of both and applies in
-any order. The ledger is per file, so a gap in the numbers is harmless.
+Migration numbers: `025` is the reader exclusion; `028` (`ci_requests` accepts the `comment` channel) and `029`
+(the HUD projection skips bench rows) are rerunnable. `026` (the `reference` and `bench` upload formats) belongs
+to the bundle kinds and `027` is not used. The ledger is per file, so a gap in the numbers is harmless.
 
 Behaviour notes for consumers of the stack:
 
