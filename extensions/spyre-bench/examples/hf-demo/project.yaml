@@ -27,22 +27,27 @@ spec:
   selector: {suites: [lm-eval], groupings: {tier: {at_most: sanity}}}
 ---
 apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: demo-store}
+spec: {type: core/filesystem, path: /datasets, auth: {mode: none}, visibility: internal}
+---
+apiVersion: bench/v1alpha1
 kind: Asset
-metadata: {name: gsm8k-test-table}
+metadata: {name: slot-91-files}
 spec:
-  type: table
-  format: parquet
+  type: fileset
+  format: jsonl
   version: "1"
   license: MIT
-  visibility: public
-  source: {uri: "hf://datasets/openai/gsm8k", revision: 740312add88f781978c0658806c59bfa2a2e4a1e, config: main, split: test}
-  integrity: {revision_pinned: true}
+  visibility: internal
+  source: {store: demo-store, slug: slot-91}
+  integrity: {files: [{path: questions.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000d}]}
 ---
 apiVersion: bench/v1alpha1
 kind: Dataset
-metadata: {name: gsm8k}
+metadata: {name: slot-91}
 spec:
-  asset: gsm8k-test-table
+  asset: slot-91-files
   role: eval
   schema: {record: {question: text, answer: text}}
   subsets: {test-first-50: {limit: 50, order: sequential}}

@@ -409,6 +409,7 @@ DEFS = {
         {
             "store": any_of(ref("name"), ref("store_inline")),
             "path": s(),
+            "slug": ref("name"),
             "uri": s(),
             "revision": s(),
             "config": s(),
@@ -417,7 +418,7 @@ DEFS = {
                 {"tool": s(minLength=1), "seed": integer(), "params": {"type": "object"}}, required=("tool", "seed")
             ),
         },
-        desc="exactly one of store+path, uri, generator",
+        desc="exactly one of store+path, store+slug, uri, generator; a slug is the store-relative path `<slug>`",
     ),
 }
 
@@ -613,6 +614,8 @@ SPECS = {
     ),
     "Dataset": obj(
         {
+            "slug": ref("name"),
+            "store": ref("name"),
             "asset": ref("name"),
             "assets": arr(obj({"name": ref("name"), "asset": ref("name")}, required=("name", "asset")), minItems=1),
             "role": {"enum": ["trace", "eval", "calibration", "shapes", "fixture", "schema"]},
@@ -621,7 +624,8 @@ SPECS = {
             "subsets": {"type": "object", "additionalProperties": ref("select")},
         },
         required=("role",),
-        desc="semantics over assets (role, schema, named subsets); `asset` is shorthand for one",
+        desc="semantics over assets (role, schema, named subsets); `asset` is shorthand for one. `slug` (default: the name) "
+        "locates `<store>/<slug>/dataset.json`, which holds the real name and whether it may be shown",
     ),
     "Model": obj(
         {

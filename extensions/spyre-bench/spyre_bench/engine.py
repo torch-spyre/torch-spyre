@@ -1075,9 +1075,15 @@ class Catalog:
     def _check_asset(self, d):
         sp, w = d.spec, d.where
         src = sp["source"]
-        forms = [bool(src.get("store") and src.get("path")), bool(src.get("uri")), bool(src.get("generator"))]
+        if src.get("path") and src.get("slug"):
+            self.errors.append(f"{w}: source takes path or slug, not both")
+        forms = [
+            bool(src.get("store") and (src.get("path") or src.get("slug"))),
+            bool(src.get("uri")),
+            bool(src.get("generator")),
+        ]
         if sum(forms) != 1:
-            self.errors.append(f"{w}: source needs exactly one of store+path, uri, generator")
+            self.errors.append(f"{w}: source needs exactly one of store+path, store+slug, uri, generator")
         st = src.get("store")
         if isinstance(st, str):
             store = self.get("Store", st, w, "source.store")
@@ -1106,6 +1112,8 @@ class Catalog:
         self._check_refs(
             d, [a["asset"] for a in d.spec.get("assets", [])] + ([d.spec["asset"]] if "asset" in d.spec else [])
         )
+        if d.spec.get("store"):
+            self.get("Store", d.spec["store"], d.where, "store")
         names = self._dataset_assets(d)
         if "assets" in d.spec and len(names) != len(d.spec["assets"]):
             self.errors.append(f"{d.where}: duplicate asset names")
@@ -2054,6 +2062,36 @@ class Catalog:
             else [("weights", d.spec["asset"])]
         )
         return hid("model", sorted((r, self.ref_id("Asset", a)) for r, a in pairs))
+
+    def dataset_slug(self, name):
+        """The opaque slug a Dataset is stored under; its name when it declares none."""
+        d = self.by.get(("Dataset", name))
+        return d.spec.get("slug", name) if d is not None else name
+
+    def dataset_asset_specs(self, name):
+        d = self.by.get(("Dataset", name))
+        if d is None:
+            return []
+        names = [a["asset"] for a in d.spec.get("assets", [])] + ([d.spec["asset"]] if "asset" in d.spec else [])
+        return [self.by[("Asset", a)].spec for a in names if ("Asset", a) in self.by]
+
+    def dataset_store(self, name):
+        """The Store spec that holds a Dataset's `<slug>/dataset.json`: its `store`, else its first Asset's store."""
+        d = self.by.get(("Dataset", name))
+        if d is None:
+            return None
+        ref = d.spec.get("store")
+        if ref is None:
+            assets = [a["asset"] for a in d.spec.get("assets", [])] + ([d.spec["asset"]] if "asset" in d.spec else [])
+            for a in assets:
+                st = ((self.by.get(("Asset", a)) or d).spec.get("source") or {}).get("store")
+                if st:
+                    ref = st
+                    break
+        if isinstance(ref, str):
+            ref = self.by.get(("Store", ref))
+            return ref.spec if ref is not None else None
+        return ref
 
     def input_identity(self, inp):
         """(asset ids, effective select, unhashed props) of one Workload input."""
