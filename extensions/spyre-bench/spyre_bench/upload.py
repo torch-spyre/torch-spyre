@@ -61,7 +61,7 @@ def seal(off, a, source):
     if not arch:
         raise UsageError("say where the results were measured: --arch x86_64|s390x|ppc64le (run.json records none)")
     argv = ["--offline", "--bench-dir", str(source), "--arch", arch, "--out", str(out),
-            "--trigger-type", a.test_type, "--seal-trust", a.seal_trust]  # fmt: skip
+            "--trigger-type", a.test_type or "perf", "--seal-trust", a.seal_trust or "external"]  # fmt: skip
     for flag, on in (("--redact-host", a.redact_host), ("--redact-user", a.redact_user)):
         if on:
             argv.append(flag)
@@ -89,13 +89,15 @@ def describe(off, path):
             "receipt": off.receipt_id(sha)}  # fmt: skip
 
 
-SEAL_ONLY = (("arch", None), ("test_type", "perf"), ("seal_trust", "external"), ("redact_host", False),
+SEAL_ONLY = (("arch", None), ("test_type", None), ("seal_trust", None), ("redact_host", False),
              ("redact_user", False), ("ended_at", None), ("out", None))  # fmt: skip
 
 
 def execute(a):
     if a.wait is not None and not a.apply:
         raise UsageError("--wait needs --apply")
+    if a.out and not a.out.endswith((".tgz", ".tar.gz")):
+        raise UsageError("--out is a .tgz file to write (a folder cannot be written twice)")
     if is_bundle(a.source):
         ignored = [f"--{k.replace('_', '-')}" for k, default in SEAL_ONLY if getattr(a, k) not in (default, "", None)]
         if ignored:
@@ -132,11 +134,12 @@ def execute(a):
             doc["next"] = "re-run with --apply to send it to the inbox"
             emit(doc, a)
             return cliutil.EXIT_OK
+    except off.BundleError as e:
+        return fail(off, a, e)
+    try:  # only the transfer: a local sealing error is an I/O failure, not an inbox failure
         sent = json.loads(off.upload(path, transfer_args(a)))
     except off.BundleError as e:
-        doc = {"upload_schema": UPLOAD_SCHEMA, "status": off.STATUS[e.code], "reason": str(e)}
-        emit(doc, a)
-        return cliutil.EXIT_INVALID if e.code in (off.REJECTED, off.INCOMPLETE) else cliutil.EXIT_STORE
+        return fail(off, a, e)
     except (urllib.error.URLError, OSError) as e:
         emit({"upload_schema": UPLOAD_SCHEMA, "status": "failed", "reason": f"inbox: {e}"}, a)
         return cliutil.EXIT_STORE
@@ -145,6 +148,12 @@ def execute(a):
     if sent.get("status") == "rejected":
         return cliutil.EXIT_INVALID
     return cliutil.EXIT_STORE if sent.get("status") == "waiting" else cliutil.EXIT_OK
+
+
+def fail(off, a, e):
+    emit({"upload_schema": UPLOAD_SCHEMA, "status": off.STATUS[e.code], "reason": str(e)}, a)
+    config = "no Artifactory token" in str(e)  # a missing credential is configuration, not a transfer failure
+    return cliutil.EXIT_INVALID if config or e.code in (off.REJECTED, off.INCOMPLETE) else cliutil.EXIT_STORE
 
 
 def emit(doc, a):
@@ -164,13 +173,16 @@ def parser():
                     help="after --apply, wait (default 40 min) for the relay's outcome")  # fmt: skip
     ap.add_argument("--via", default="inbox", help="inbox (the default); api is not available yet")
     ap.add_argument("--arch", help="where it ran (default: run.json; required when it records none)")
-    ap.add_argument("--test-type", choices=TEST_TYPES, default="perf")
-    ap.add_argument("--seal-trust", choices=SEAL_TRUST, default="external",
+    ap.add_argument("--test-type", choices=TEST_TYPES, help="the tier (default perf)")
+    ap.add_argument("--seal-trust", choices=SEAL_TRUST,
                     help="where the results came from; the receiving channel decides the trust it records")  # fmt: skip
     ap.add_argument("--redact-host", action="store_true", help="leave the sealing host out of the bundle")
     ap.add_argument("--redact-user", action="store_true", help="leave the sealing user out of the bundle")
     ap.add_argument("--ended-at", help="ISO-8601 end time with a zone (UTC)")
-    ap.add_argument("--out", help="the sealed bundle to write (default RESULTS_DIR/upload/bundle.tgz)")
+    ap.add_argument(
+        "--out",
+        help="the sealed bundle to write, a .tgz (default RESULTS_DIR/upload/bundle.tgz, beside a single Result file)",
+    )
     ap.add_argument("--inbox", default="inbox", help="under the results root")
     ap.add_argument("--base-url", help="ARTIFACTORY_BASE_URL")
     ap.add_argument("--repo", help="ARTIFACTORY_V2_RESULTS_REPO")
