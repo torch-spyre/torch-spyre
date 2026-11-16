@@ -216,7 +216,11 @@ class OnDemandRequest:
             seen.add(product)
             if sel.get("tier") is not None and sel["tier"] not in TIERS:
                 raise RequestError("the stored request has a bad tier")
+            if set(sel) - {"tier", "suites", "cases"}:
+                raise RequestError("the stored request has an unknown selection key")
             for key in ("suites", "cases"):
+                if sel.get(key) is not None and not isinstance(sel[key], list):
+                    raise RequestError("the stored request has a bad selection list")
                 for name in sel.get(key) or ():
                     _name(name, key)
 
@@ -641,7 +645,7 @@ def plan_violations(plan, policy):
     where a tier limit is enforced for them; a case without a tier cannot be judged and is refused."""
     bad = []
     for c in plan.get("cases") or []:
-        if c.get("action") != "run":
+        if str(c.get("action", "")).lower() in ("reuse", "skip"):
             continue
         tier = (c.get("run_props") or {}).get("run.tier")
         if tier not in policy.tiers:
@@ -702,6 +706,10 @@ def authorize(facts):
     violations = check_policy(req, policy, who)
     if violations:
         return deny(*violations)
+    if req.sha and not head.startswith(req.sha):
+        return deny(
+            "sha= does not match the current head of the pull request: comment again with the commit you reviewed"
+        )
     approval = None
     if is_fork:
         # A fork runs only the exact commit a write-access commenter named; the comment is the approval.
@@ -719,8 +727,18 @@ def authorize(facts):
         if not ok:
             return deny(f"fork pull request: {why}")
     limit = budget_limit(req, policy)
-    planned = facts.get("stage") == "planned"
+    stage = facts.get("stage", "request")
+    if stage not in ("request", "planned"):
+        return deny(f"unknown stage {neutral(stage, 20)!r}")
+    planned = stage == "planned"
     est = _finite_hours(facts["estimate_device_hours"]) if facts.get("estimate_device_hours") is not None else None
+    if facts.get("estimate_device_hours") is not None and est is None:
+        return deny("the estimate is not a finite number of device-hours")
+    if planned and isinstance(facts.get("plan"), dict):
+        plan_est = _finite_hours((facts["plan"].get("estimate") or {}).get("device_hours"))
+        if plan_est is None:
+            return deny("the plan has no usable estimate in device-hours")
+        est = plan_est if est is None else max(est, plan_est)
     if planned and est is None:
         return deny("the plan has no usable estimate in device-hours")
     if facts.get("estimate_device_hours") is not None and est is None:
