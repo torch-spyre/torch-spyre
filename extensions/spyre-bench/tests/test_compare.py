@@ -381,6 +381,8 @@ class Preview(unittest.TestCase):
         self.assertNotEqual(plain["digest"], pv["digest"])
         self.assertEqual(plain["digest"], od.build_preview(plan(), self.req, GHE)["digest"])
         self.assertNotIn("value", json.dumps(pv["compare"]).replace("other_validity", ""))
+        a = next(c for c in pv["compare"]["cases"] if c["name"] == "a")
+        self.assertEqual((a["benchmark_id"], a["other_run"], a["subject_run"]), (B["a"], "run-o", ""))
 
     def test_markdown_names_ids_internally_and_not_publicly(self):
         pv = od.build_preview(plan(), self.req, GHE, cmp=self.doc())

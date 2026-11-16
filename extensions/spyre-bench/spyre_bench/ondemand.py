@@ -1190,9 +1190,11 @@ def compare_view(cmp):
         "cases": [
             {
                 "name": c["name"],
+                "benchmark_id": c.get("benchmark_id") or "",
                 "state": c["state"],
                 "why": c["why"],
                 "subject": c["subject"]["action"],
+                "subject_run": c["subject"].get("reused_from") or "",
                 "other_run": c["other"]["run_id"],
                 "other_validity": c["other"]["validity"],
             }
