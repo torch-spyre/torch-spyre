@@ -1154,7 +1154,7 @@ class RequestLog(unittest.TestCase):
 
         digest = hashlib.sha256(Path(od.__file__).with_name("ondemand_policy.json").read_bytes()).hexdigest()
         # The internal poller pins the same digest for its copy (pipelines/lib/bench_policy.json): change both together.
-        self.assertEqual(digest, "940828fc7c653b01090df19b75120ccdc0d2684d39d2fcc8fe8770131b82b82d")
+        self.assertEqual(digest, "095f61bf007f094c51a28810a70ed59b5be361e4cd4f5399df6e51f9950b87c7")
 
     def test_limits_come_from_one_json_file(self):
         import json as j
