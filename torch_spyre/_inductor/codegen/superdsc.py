@@ -1755,13 +1755,16 @@ def _create_sdsc_tensors(
                 # dims that actually carry a window entry are suppressed; a pool's
                 # other dims (mb/out) keep the normal backGap.
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
-                # A QFP8WT block axis (neither K nor the stick) that the op
-                # visits one block of: the block's start address is already in
+                # A QFP8WT block axis (neither K nor the stick) that an identity
+                # op visits one block of: the block's start address is already in
                 # offsets[dim].  In a 2D-stick layout the stick dim's 64-column
                 # groups are the outermost axis, so a gap here would stretch
-                # the stride between those groups.
+                # the stride between those groups.  Limited to identity ops, the
+                # ones that newly take the 2D stick; matmul kernels keep their
+                # existing gaps.
                 _qfp8wt_single_block = (
-                    qfp8wt_k_sym is not None
+                    op_spec.op == IDENTITY_OP
+                    and qfp8wt_k_sym is not None
                     and dim != qfp8wt_k_sym
                     and dim != stick_dim
                     and it_dim_size == 1
