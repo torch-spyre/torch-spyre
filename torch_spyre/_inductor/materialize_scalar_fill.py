@@ -148,7 +148,12 @@ def materialize_scalar_fill(graph: torch.fx.Graph) -> None:
                 (size, value),
                 {"dtype": example.dtype, "device": example.device},
             )
-        full.meta["val"] = example
+        # Not ``example`` itself: that is the expand's stride-0 view, the very
+        # property this rewrite exists to remove, and handing it to later
+        # layout decisions would keep the lie we just deleted.  ``new_empty``
+        # keeps shape, dtype and device but gives contiguous strides, which is
+        # what the ``full`` actually produces.
+        full.meta["val"] = example.new_empty(example.shape)
         node.replace_all_uses_with(full)
         graph.erase_node(node)
         logger.debug(
