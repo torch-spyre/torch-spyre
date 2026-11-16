@@ -151,8 +151,14 @@ the suite again); pass the name through to the command with `BENCH_PASS_ENV=BENC
 ## Running next to the existing perf leg (`bench_mode`)
 
 The reusable `_test_matrix.yaml` perf job takes `bench_mode` (forwarded by `integration-tests.yaml`): `off` (default)
-changes nothing; `side-by-side` additionally feeds the same `report.xml` through this catalog (no second suite run) and
-ingests it under the workflow name `bench-<workflow>` with the engine's own run id, next to the unchanged legacy ingest;
-`replace` skips the legacy ingest (both schemas, as the legacy step) and stores the catalog's rows under the legacy workflow name and run id, and fails
-the job when the report holds a row no case declares (`check_report_coverage.py --strict`). Both modes are advisory
-(`continue-on-error`) except `replace`, where the mirror step is the ingest.
+changes nothing. `side-by-side` additionally feeds the same `report.xml` through this catalog (no second suite run) and
+files the engine's own results as a connected CI run (`bench-dir`, `channel-trust: ci`) in the series `bench-<workflow>`,
+next to the unchanged legacy ingest. That run has its own run id, carries the per-case rows only (kernel rows stay with
+the legacy ingest), and the action refuses `ci` on `pull_request` and `workflow_run` events (the perf job never runs on
+those). `replace` skips the legacy ingest and stores the per-case XMLs (kernel rows included) under the legacy workflow
+name and run id with both schemas, because a `bench-dir` run derives its run id from the engine run and cannot carry the
+orchestrator's. Replace fails the job when the report or its kernel breakdowns hold a row no case declares
+(`check_report_coverage.py --strict`).
+
+Both modes are advisory (`continue-on-error`) except `replace`, where the mirror steps are the ingest. Side-by-side
+puts a second point on the HUD series until the HUD reads one series per benchmark.

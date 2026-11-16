@@ -24,6 +24,7 @@ holds the report (and any per-kernel breakdown XMLs) of a finished perf run; it 
 """
 
 import argparse
+import json
 import os
 import regex as re
 import shlex
@@ -50,6 +51,20 @@ NAME = re.compile(
     rf"^perf_(?P<op>.+?)_(?P<metric>{'|'.join(METRICS)})_(?:ms|MB)(?:_(?P<shapes>.+))?$"
 )
 KERNEL_CLASS = "kernel_benchmark"
+# Report metric -> the measurement key the ingest stores it under.
+SAMPLE_KEYS = {
+    "wall_clock": "total_duration_ms",
+    "cpu": "cpu_ms",
+    "spyre": "spyre_ms",
+    "kernel": "kernel_mean_ms",
+    "memory_transfer": "memory_transfer_mean_ms",
+    "runtime": "runtime_ms",
+    "compiler": "compile_ms",
+    "compile": "compile_ms",
+    "mem_size": "mem_size_mb",
+}
+# The suite writes 0.0 for these when it captured nothing; the ingest drops them.
+ZERO_WHEN_UNCAPTURED = ("pt_util_percent", "compile_ms", "runtime_ms")
 
 
 def suite_report(suite_dir):
@@ -158,6 +173,26 @@ def filtered(report, case):
     return tree, kept
 
 
+def samples_of(tree):
+    """{measurement key: [value]} of the kept testcases, as the ingest would store them."""
+    out = {}
+    for tc in tree.getroot().iter("testcase"):
+        m = NAME.match(tc.get("name", ""))
+        if not m:
+            continue
+        try:
+            out.setdefault(SAMPLE_KEYS[m["metric"]], [float(tc.get("time", ""))])
+        except ValueError:
+            continue
+        try:
+            out.setdefault("pt_util_percent", [float(tags_of(tc)["pt_util"])])
+        except (KeyError, ValueError):
+            pass
+    return {
+        k: v for k, v in out.items() if not (k in ZERO_WHEN_UNCAPTURED and v == [0.0])
+    }
+
+
 def is_kernel_xml(root):
     cases = root.findall(".//testcase")
     return bool(cases) and all(KERNEL_CLASS in tc.get("classname", "") for tc in cases)
@@ -195,6 +230,11 @@ def main(argv=None):
     ap.add_argument("--mode", help="the model's run_mode (with --model)")
     ap.add_argument("--suite-dir", required=True, type=Path)
     ap.add_argument("--raw-dir", required=True, type=Path)
+    ap.add_argument(
+        "--repeat-dir",
+        type=Path,
+        help="write metrics.json here for the engine's own results (the bench-dir ingest)",
+    )
     args = ap.parse_args(argv)
     if bool(args.op) == bool(args.model):
         ap.error("give --op with --shape, or --model with --config and --mode")
@@ -213,6 +253,11 @@ def main(argv=None):
         return 3
     args.raw_dir.mkdir(parents=True, exist_ok=True)
     tree.write(args.raw_dir / "report.xml", encoding="utf-8", xml_declaration=True)
+    if args.repeat_dir:
+        args.repeat_dir.mkdir(parents=True, exist_ok=True)
+        (args.repeat_dir / "metrics.json").write_text(
+            json.dumps({"samples": samples_of(tree)})
+        )
     kernels = kernel_breakdowns(args.suite_dir, report, case)
     for name, ktree, _ in kernels:
         ktree.write(args.raw_dir / name, encoding="utf-8", xml_declaration=True)
