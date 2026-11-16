@@ -135,6 +135,9 @@ ingest keeps depends on the case's identity profile (guide 2), and this is where
 | `vllm`, `vllm-sweep` | the scalar fields of the serving benchmark's JSON (latency, throughput, `mean_`/`median_`/`p99_` of ttft, tpot, itl, e2el) | a change to the ingest's extractor: other fields are skipped |
 | `perf-kernel` | testcases of the kernel report whose names match the ingest's metric patterns | a change to the ingest's parser and, for a new column, to the schema |
 
+[Guide 12](12-worked-example-nightly-weekly.md) maps each scalar field of `vllm bench` and each column of
+`spyre-perf-suite` to its registry name, and shows which have none.
+
 So the recipe is: if your harness can emit `generic` rows, a new metric is a pack edit plus a line in your command. If
 the rows come from a producer with a fixed field list, the metric also needs an ingest change in the same pull
 request or a follow-up, reviewed by the ingest's owners ([guide 10](10-contribute.md)). Stored metric names follow the

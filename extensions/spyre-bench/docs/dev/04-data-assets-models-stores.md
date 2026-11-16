@@ -198,6 +198,52 @@ spec:
   `split`, `ids`. Never write a subset that depends on the clock or an unseeded random choice.
 - `validate: {mode: off | sample | full, records: N}` states how much of the data a fetch step checks.
 
+[Guide 12](12-worked-example-nightly-weekly.md) declares the datasets of `vllm bench` (a generated `random` set, a
+curated chat set under a slug, and the shape of a deployment-private recorded trace).
+
+### Naming a dataset: slugs and `dataset.json`
+
+A public definition never carries the real name of a dataset. It names the dataset by an **opaque slug** (`slot-31` below)
+that locates the data in the artifact store, and the store says what the slug means:
+
+```yaml validated base=docs-data as=slug-example.yaml
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: slot-31-files}
+spec:
+  type: fileset
+  format: jsonl
+  visibility: internal
+  source: {store: datasets, slug: slot-31}
+  integrity: {files: [{path: data.jsonl, sha256: "0000000000000000000000000000000000000000000000000000000000000031"}]}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-31}
+spec: {asset: slot-31-files, role: eval, subsets: {head-50: {limit: 50, order: sequential}}}
+```
+
+Beside the data the store holds `<store root>/slot-31/dataset.json` (the store namespace is configured per deployment
+and never written into a public file):
+
+```text
+{"display_name": "Example Questions", "public": false, "license": "internal", "sha256": "<digest of the data>", "notes": ""}
+```
+
+- `source: {store, slug}` is `store+path` with the path `<slug>`. A Dataset may also declare `slug:` (default: its name)
+  and `store:` (default: the store of its first Asset) when the metadata lives elsewhere than the data.
+- **Only `public: true` shows the real name.** `explain --dataset-meta-dir DIR` (or `--dataset-store STORE`) reads the
+  files and labels a dataset `display_name` when the flag is exactly `true`, otherwise with the slug. The label is what
+  `explain` prints; every tool prints Dataset and Asset *names* as written, so give them slug names too. Without those
+  flags nothing is read and the slug is shown.
+- `validate` never touches a store: a slug is only a string there, so a catalog validates offline.
+- A missing, unreadable or malformed `dataset.json`, a `slug` field that disagrees with its directory, or a `sha256` that
+  none of the Dataset's Assets declares is an **error**, never a silent fallback to the slug. Asset digests are still
+  verified by the fetch step as before.
+- `dataset.json` is a **trusted input**: whoever can write the store path decides what is public. Keep it write-restricted
+  and review changes to a `public` flag like a change to the definitions.
+- The file is not identity. Benchmarks that already carry a dataset name in their id keep it; a slug never renames one.
+
 ## Models
 
 ```yaml validated in=docs-data/models.yaml
@@ -276,3 +322,4 @@ The definitions are the same on a connected laptop and in a sealed room; only th
 3. Subsets are pure functions with seeds; `expect.records` is set for any subset used in a gating benchmark.
 4. A new asset version is a new Asset (or a new `version` and digest), never an in-place edit of a published one.
 5. `explain` shows the `input.*` and `model_id` values you expect, and `validate` passes with `--central` and `--pack`.
+6. A dataset is named by a slug in public definitions; its real name lives only in `<slug>/dataset.json`.

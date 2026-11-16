@@ -5,7 +5,8 @@ for, the data they consume, the metrics they report, the analyses and expectatio
 teach the engine a new kind of system. They are end to end: each one starts from nothing and ends with a catalog that
 passes `spyre-bench validate` and is planned by `spyre-bench plan`.
 
-Every example in these guides is synthetic. Every YAML, JSON, Python and `spyre-bench` snippet is a block marked
+Guides 1 to 11 use synthetic examples; [guide 12](12-worked-example-nightly-weekly.md) declares the two real benchmarks
+(`vllm bench` and `spyre-perf-suite`) with nightly and weekly invocations. Every YAML, JSON, Python and `spyre-bench` snippet is a block marked
 `validated`, and `tests/test_docs_snippets.py` checks it against the real example files and the real engine on every
 run, so the guides cannot drift from the code without a test failing. The catalogs behind them are
 `examples/docs-*`; `tests/test_docs_examples.py` plans and runs each one with a stub command.
@@ -28,6 +29,7 @@ These guides link to it instead of repeating it.
 | try it on a laptop, read what came out, find out why a case did not run | [9. Test and debug locally](09-test-and-debug-locally.md) |
 | open the pull request | [10. Contribute](10-contribute.md) |
 | fix an error message | [11. Troubleshooting and FAQ](11-troubleshooting-and-faq.md) |
+| see the real `vllm bench` and `spyre-perf-suite` declared, with a nightly and a weekly run | [12. Worked example: nightly and weekly](12-worked-example-nightly-weekly.md) |
 
 ## The shortest path
 
@@ -51,6 +53,7 @@ on which pool, with what budget, or who is told about a regression: those belong
 workflow, a scheduler, a developer's shell). A Benchmark carries only a cost hint, `est_hours`. Guide 1 explains the
 split; guide 10 lists what a pull request to a catalog may and may not contain.
 
-The example catalogs name the engine's own packs (`kernel`, `llm-serving`, `spyre`) and use made-up model, node-class
-and pool names. Keep it that way in anything you contribute here: no real host names, measured numbers, credentials or
-names of internal systems.
+The guide catalogs `examples/docs-*` name the engine's own packs (`kernel`, `llm-serving`, `spyre`) and use made-up
+model, node-class and pool names. The `examples/real-*` catalogs of guide 12 may use the real benchmark, metric and model
+names; datasets are always named by slug. In either kind, never put a real host name, measured number, score, threshold, credential or
+name of an internal system in a definition or a guide.
