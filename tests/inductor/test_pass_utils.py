@@ -774,9 +774,7 @@ def _fp16_stl():
 def test_stick_compatible_pointwise_identical_sticks():
     stl = _fp16_stl()
     dc = [_ZERO, _m, _n]
-    assert pass_utils.stick_compatible(
-        [dc, dc], [stl, stl], op_kind=pass_utils.StickRule.POINTWISE
-    )
+    assert pass_utils.stick_compatible([dc, dc], [stl, stl], rule="pointwise")
 
 
 def test_stick_compatible_pointwise_different_stick_vars():
@@ -784,7 +782,7 @@ def test_stick_compatible_pointwise_different_stick_vars():
     assert not pass_utils.stick_compatible(
         [[_ZERO, _m, _n], [_ZERO, _n, _m]],
         [stl, stl],
-        op_kind=pass_utils.StickRule.POINTWISE,
+        rule="pointwise",
     )
 
 
@@ -792,12 +790,11 @@ def test_stick_compatible_pointwise_stick_var_in_residue_of_constant_stick():
     # A tensor with a constant stick cannot take the stick variable on an outer
     # dim: the other tensor's stick var n would index its rows.
     stl = _fp16_stl()
-    pointwise = pass_utils.StickRule.POINTWISE
     assert not pass_utils.stick_compatible(
-        [[_ZERO, _m, _n], [_ZERO, _n, _ZERO]], [stl, stl], op_kind=pointwise
+        [[_ZERO, _m, _n], [_ZERO, _n, _ZERO]], [stl, stl], rule="pointwise"
     )
     assert pass_utils.stick_compatible(
-        [[_ZERO, _m, _n], [_ZERO, _m, _ZERO]], [stl, stl], op_kind=pointwise
+        [[_ZERO, _m, _n], [_ZERO, _m, _ZERO]], [stl, stl], rule="pointwise"
     )
 
 
@@ -810,31 +807,29 @@ def test_stick_compatible_no_rule_only_counts_stick_vars():
     assert pass_utils.stick_compatible([[_ZERO, _m, _n], [_ZERO, _k, _n]], [stl, stl])
 
 
-def test_stick_compatible_bmm_qfp8wt_weight_nests_output_stick():
-    # out[m, n] = x[m, k] @ w[k, n]: the fp8 weight's [N, K] stick contains the
-    # fp16 output's N stick.
-    out_stl = _fp16_stl()
-    w_stl = _qfp8wt_layout(256, 128)
-    bmm = pass_utils.StickRule.BMM
+def test_stick_compatible_bmm_nests_fp16_sticks():
+    # out[m, n] = x[m, k] @ w[k, n] with fp16 operands: the weight's N stick
+    # contains the output's N stick. arg_1's stick var k may not index arg_0's rows.
+    stl = _fp16_stl()
     assert pass_utils.stick_compatible(
-        [[_ZERO, _m, _n], [_ZERO, _ZERO, _n, _k]], [out_stl, w_stl], op_kind=bmm
+        [[_ZERO, _m, _n], [_ZERO, _ZERO, _n]], [stl, stl], rule="bmm"
     )
-    # arg_1's K stick var must not index the output's rows.
     assert not pass_utils.stick_compatible(
-        [[_ZERO, _k, _n], [_ZERO, _ZERO, _n, _k]], [out_stl, w_stl], op_kind=bmm
+        [[_ZERO, _k, _n], [_ZERO, _ZERO, _k]], [stl, stl], rule="bmm"
     )
 
 
-def test_stick_compatible_pointwise_rejects_qfp8wt_against_single_stick():
-    # The pointwise rule needs identical stick terms; a QFP8WT [N, K] stick is
-    # not one variable. compute_restickify_needed passes no rule for it.
-    out_stl = _fp16_stl()
+def test_stick_rule_is_count_check_for_qfp8wt():
+    # A QFP8WT stick has two variables, which the bmm and pointwise rules do not
+    # model, so _stick_rule gives no rule for it: only the count check runs.
+    fp16 = _fp16_stl()
     w_stl = _qfp8wt_layout(256, 128)
-    dcs = [[_ZERO, _m, _n], [_ZERO, _ZERO, _n, _k]]
-    assert not pass_utils.stick_compatible(
-        dcs, [out_stl, w_stl], op_kind=pass_utils.StickRule.POINTWISE
-    )
-    assert pass_utils.stick_compatible(dcs, [out_stl, w_stl])
+    dcs = [[_ZERO, _k, _n], [_ZERO, _ZERO, _n, _k]]
+    assert pass_utils.stick_compatible(dcs, [fp16, w_stl], rule=None)
+    assert pass_utils._stick_rule(None, fp16, fp16) is None
+    # Any non-matmul op (not a ComputedBuffer reduction) takes the pointwise rule.
+    assert pass_utils._stick_rule(object(), fp16, fp16) == "pointwise"
+    assert pass_utils._stick_rule(object(), fp16, w_stl) is None
 
 
 # ---------------------------------------------------------------------------

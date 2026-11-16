@@ -1047,6 +1047,10 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     assert isinstance(op, ComputedBuffer)
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
+    if in_layout.device_layout.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT input's 2D stick is whole already; growing its N-tile dim
+        # (size N/64) by the stick size would multiply it by 64.
+        return
 
     # --- Gates: decide whether (and how) to pad BEFORE mutating the graph. ---
     out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))

@@ -42,6 +42,7 @@ from typing import NoReturn
 import sympy
 
 from . import config, constants
+from torch_spyre._C import ElementArrangement
 from .views import stick_dims_from_size
 from .core_mapping import owner_slots, transfer_edges
 from .dtype_ops import DtypeOpTable
@@ -670,6 +671,9 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
 
     op = op_spec.op
 
+    if op not in MATMUL_OPS:
+        _check_qfp8wt_inputs_are_matmul_only(op_spec, stage)
+
     if op in MATMUL_OPS:
         _check_stick_matmul(op_spec, stage)
     elif op in NORM_OPS:
@@ -690,6 +694,24 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         # — _check_stick_all_same only catches the case where different args
         # have different sticks.
         _check_stick_all_same(op_spec, stage)
+
+
+def _check_qfp8wt_inputs_are_matmul_only(op_spec: OpSpec, stage: str) -> None:
+    """Reject a QFP8WT input to a non-matmul op.
+
+    A QFP8WT tensor's 2D [64, 2] stick is read only by the matmul (its weight
+    operand). Element-wise ops such as the fp8 to fp16 dequantize have no
+    conversion for it, and the backend fails to compile them.
+    """
+    for arg in op_spec.args:
+        if arg.is_input and arg.element_arrangement == ElementArrangement.QFP8WT:
+            raise OpSpecValidationError(
+                op_spec,
+                "QFP8WT input to a non-matmul op",
+                f"{op_spec.op} reads a QFP8WT tensor, whose 2D [64, 2] stick only "
+                "a matmul can read; dequantize the weight with a matmul consumer",
+                stage,
+            )
 
 
 def _check_stick_all_same(op_spec: OpSpec, stage: str) -> None:
@@ -891,6 +913,24 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     if not reduction_syms:
         return
     reduction_sym = min(reduction_syms, key=str)
+
+    # A QFP8WT Input1 keeps its K on the 2-wide stick dim (the last one). A
+    # reduction variable on its 64-wide dim means the activation was quantized
+    # in the weight's layout (swapped quantize ops), which the matmul cannot read.
+    if x_arg.element_arrangement == ElementArrangement.QFP8WT:
+        stick_dims = stick_dims_from_size(
+            x_arg.device_size, x_arg.device_dtype.elems_per_stick()
+        )
+        k_dim = stick_dims[-1]
+        if reduction_sym not in x_arg.device_coordinates[k_dim].free_symbols:
+            raise OpSpecValidationError(
+                op_spec,
+                "QFP8WT Input1 must reduce over its 2-wide stick dim",
+                f"reduction_sym={reduction_sym!r} is not on the 2-wide stick dim "
+                f"{k_dim}; Input1 device coordinates "
+                f"{[str(c) for c in x_arg.device_coordinates]}",
+                stage,
+            )
 
     out_stick: set[sympy.Symbol] = set()
     for arg in outputs:

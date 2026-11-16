@@ -883,7 +883,12 @@ def _single_arg_op_layout(
                 # Staggered-EA candidate whose physical stick depth differs from
                 # elems_per_stick — not a valid input for this conversion path.
                 return []
-            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
+            # A QFP8WT input's last coordinate is its 2-wide K dim, which is not a
+            # full-stick expression. Keep the candidate so the conversion reaches
+            # OpSpec validation, which rejects a QFP8WT input to a non-matmul op.
+            if stl.element_arrangement != ElementArrangement.QFP8WT and not (
+                is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick())
+            ):
                 return []
 
             input_ea = stl.element_arrangement

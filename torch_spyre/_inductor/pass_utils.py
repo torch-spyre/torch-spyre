@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
 import io
 import itertools
 import math
@@ -24,6 +23,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Literal,
     Mapping,
     NamedTuple,
     Optional,
@@ -3100,13 +3100,6 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
-class StickRule(enum.Enum):
-    """Op-specific rule set applied by ``stick_compatible``."""
-
-    POINTWISE = "pointwise"
-    BMM = "bmm"
-
-
 def _stick_terms_and_residue(
     dc: "list[sympy.Expr]", stl: SpyreTensorLayout
 ) -> "tuple[set[sympy.Symbol], set[sympy.Symbol]]":
@@ -3131,32 +3124,26 @@ def _stick_terms_and_residue(
 def stick_compatible(
     coords: "list[list[sympy.Expr]]",
     stls: "list[SpyreTensorLayout]",
-    *,
-    op_kind: StickRule | None = None,
+    rule: "Literal['pointwise', 'bmm'] | None" = None,
 ) -> bool:
-    """Return True if all tensors are stick-compatible.
+    """Return True if all tensors are stick-compatible under ``rule``.
 
     coords: list of device_coordinates() results, one per tensor.
     stls: the layout of each tensor, in the same order, used to find its stick
-        dims. A stick can span several device dims (QFP8WT's [N/64, K/2, 64, 2]
-        stick is the N and K dims), so each tensor may contribute several stick
-        variables.
-    op_kind: the rule set to apply on top of the stick-variable count check.
-        ``StickRule.POINTWISE`` for pointwise ops, ``StickRule.BMM`` for
-        batched matmul (``out = arg_0 @ arg_1``), or None for the count check
-        alone.
+        dims. A stick can span several device dims, so each tensor may
+        contribute several stick variables.
+    rule: the op's stick rule, or None for the count check alone. The caller
+        picks the rule (see ``_stick_rule``).
 
-    The count check: the tensors' stick variables, taken together, form the
-    stick of one layout, with at most one stick variable per stick dim.
+    Count check (always): the stick variables of all tensors, taken together,
+    number at most the largest stick-dim count of any tensor (at least one).
 
-    ``StickRule.POINTWISE``: the non-empty stick terms are identical across
-    tensors, and a stick variable does not occur in the residue of a tensor
-    with no stick term. A tensor whose stick is constant (0) therefore cannot
-    take a stick variable that indexes its outer dims.
+    ``"pointwise"``: the non-empty stick terms are identical across tensors, and
+    a stick variable does not occur in the residue of a tensor with no stick
+    term.
 
-    ``StickRule.BMM``: non-empty stick terms are nested (one contains the
-    other, so an fp8 weight's [K, N] stick matches an fp16 output's N stick).
-    Each tensor's stick variables do not occur in another tensor's residue.
+    ``"bmm"``: non-empty stick terms are nested (one contains the other), and
+    each tensor's stick variables do not occur in another tensor's residue.
     This forbids the arg_0 stick in out and the arg_1 stick in arg_0.
     """
     terms: list[set[sympy.Symbol]] = []
@@ -3169,16 +3156,16 @@ def stick_compatible(
     max_stick_dims = max(len(stick_dims(stl)) for stl in stls)
     if len(stick_vars) > max(max_stick_dims, 1):
         return False
-    if op_kind is None:
+    if rule is None:
         return True
-    if op_kind == StickRule.POINTWISE:
+    if rule == "pointwise":
         nonempty = {frozenset(t) for t in terms if t}
         if len(nonempty) > 1:
             return False
         return all(
             not (stick_vars & residue) for t, residue in zip(terms, residues) if not t
         )
-    # StickRule.BMM
+    # rule == "bmm"
     for i, j in itertools.permutations(range(len(terms)), 2):
         both_sticked = bool(terms[i]) and bool(terms[j])
         if both_sticked and not (terms[i] <= terms[j] or terms[j] <= terms[i]):
@@ -3256,26 +3243,24 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
-def _stick_rule_for_op(
-    op: "str | None", out_stl: SpyreTensorLayout
-) -> "tuple[StickRule | None, bool]":
-    """Return the ``stick_compatible`` rule for ``op`` and a QFP8WT-producer flag.
+def _stick_rule(
+    op: "Operation | None",
+    in_stl: SpyreTensorLayout,
+    out_stl: SpyreTensorLayout,
+) -> "Literal['pointwise', 'bmm'] | None":
+    """Return the ``stick_compatible`` rule for an op, or None for the count check.
 
-    The flag is True for a non-matmul op writing a QFP8WT output.
+    The op's doc rules (pointwise, bmm) assume each tensor has one stick
+    variable. A QFP8WT tensor's stick is [N, K] with two variables, which those
+    rules do not model (see the multi-dimension stick TODO in the device tensor
+    docs), so any QFP8WT input or output gets the count check alone.
     """
-    qfp8wt_producer = (
-        op is not None
-        and not _is_matmul_op(op)
-        and out_stl.element_arrangement == ElementArrangement.QFP8WT
-    )
-    if op is None or qfp8wt_producer:
-        # A QFP8WT output has two stick variables (N and K), so the pointwise
-        # rule "stick terms are identical across tensors" cannot hold against a
-        # one-variable input stick; the N check below decides instead.
-        return None, qfp8wt_producer
-    if _is_matmul_op(op):
-        return StickRule.BMM, False
-    return StickRule.POINTWISE, False
+    if op is None:
+        return None
+    quantized = ElementArrangement.QFP8WT
+    if quantized in (in_stl.element_arrangement, out_stl.element_arrangement):
+        return None
+    return "bmm" if _is_matmul_op(op) else "pointwise"
 
 
 def _qfp8wt_producer_input_is_n(
@@ -3370,8 +3355,13 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    op_kind, qfp8wt_producer = _stick_rule_for_op(op, out_stl)
-    compatible = stick_compatible([idc, out_idc], [in_stl, out_stl], op_kind=op_kind)
+    qfp8wt_producer = (
+        op is not None
+        and not _is_matmul_op(op)
+        and out_stl.element_arrangement == ElementArrangement.QFP8WT
+    )
+    rule = _stick_rule(op, in_stl, out_stl)
+    compatible = stick_compatible([idc, out_idc], [in_stl, out_stl], rule)
     if compatible and qfp8wt_producer:
         n_compatible = _qfp8wt_producer_input_is_n(idc, out_idc, in_stl, out_stl)
         if n_compatible is None:

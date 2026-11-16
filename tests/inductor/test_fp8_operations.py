@@ -348,12 +348,7 @@ class TestFP8Operations:
 
         Pre-quantizing the weight in one torch.compile call and running _scaled_mm
         in a second torch.compile call crosses the compile boundary. The QFP8WT
-        kernel tensor must keep its 2D [2, 64] stick across that boundary, or the
-        batchmatmulfp8 SDSC codegen fails with:
-
-            loc("bmm.ddl":22:24): error: Fixed layout with too many dimensions
-            DtException: Impossible to match for sdsc0_batchmatmulfp8
-
+        kernel tensor must keep its 2D [2, 64] stick across that boundary.
         The layout carries its 2D stick, so no restore is needed at codegen.
         """
         M, K, N = 128, 128, 128
@@ -377,8 +372,8 @@ class TestFP8Operations:
         q_a = quantize_a(mat_a_d, scale_a_d)
         q_b = quantize_b(mat_b_d, scale_b_d)
 
-        # Run _scaled_mm in a third separate compiled call — this is the case
-        # that triggered the "Fixed layout with too many dimensions" crash.
+        # Run _scaled_mm in a third separate compiled call, the case that crosses
+        # the compile boundary.
         scaled_mm = torch.compile(
             lambda a, b: torch.ops.aten._scaled_mm(
                 a,

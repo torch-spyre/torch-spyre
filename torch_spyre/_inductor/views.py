@@ -915,8 +915,15 @@ def normalize_coordinates(
 
     # fuse contiguous dimensions when possible
     # never fuse last dimension = stick dimension!
+    # The stick dims' terms are never fused into the terms before them: a
+    # multi-dim stick (QFP8WT's [64, 2]) would otherwise merge its 64-wide dim
+    # into the N tile beside it.
+    n_stick = max(1, len(stick_set))
+    body, stick_tail = terms[:-n_stick], terms[-n_stick:]
+    if not body:
+        return list(stick_tail)
     fused_terms = []
-    fused_term = terms[0]
+    fused_term = body[0]
     # Whether a transparent placeholder term was skipped since ``fused_term``
     # was last (re)set.  A placeholder is a size-1 device dim with a constant
     # zero coordinate, e.g. the squeezed ``seq`` dim that
@@ -931,7 +938,7 @@ def normalize_coordinates(
     # second reduction dim, which the backend cannot schedule (a bmm contracts
     # exactly one dim; deeptools aborts with ``out_reuse_dim.size() == 1``).
     skipped_placeholder = False
-    for term in terms[1:-1]:
+    for term in body[1:]:
         if term.var is None and term.dim_size == 1 and term.offset == 0:
             skipped_placeholder = True
             continue
@@ -967,8 +974,8 @@ def normalize_coordinates(
         skipped_placeholder = False
     if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
-    # add term for stick dimension
-    fused_terms.append(terms[-1])
+    # the stick dims' terms, unfused
+    fused_terms.extend(stick_tail)
 
     return fused_terms
 

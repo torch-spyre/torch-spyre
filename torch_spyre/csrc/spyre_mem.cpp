@@ -98,8 +98,16 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     const int64_t tile_stride =
         device_sizes[device_rank - 1] * stride_map[device_rank - 1];
     for (int j = device_rank - 2; j >= 0; j--) {
+      // A size-1 dim is never the stick count.
+      if (device_sizes[j] == 1) continue;
       if (stride_map[j] == tile_stride) {
-        if (dim_map[j] != -1) dim_map[j] = dim_map[device_rank - 1];
+        // A dim the loop above mapped to a host dim of the same stride is a
+        // real row dim (e.g. the row dim of a [1, N, 64] layout) and keeps it.
+        // A folded or padded host dim (stride below the device stride) gives
+        // way to the stick's host dim.
+        if (dim_map[j] != -1 && strides[dim_map[j]] != stride_map[j]) {
+          dim_map[j] = dim_map[device_rank - 1];
+        }
         break;
       }
     }

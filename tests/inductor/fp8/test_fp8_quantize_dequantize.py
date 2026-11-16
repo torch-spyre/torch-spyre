@@ -481,16 +481,15 @@ class TestFP8Dequantize:
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0)
 
 
-class TestWeightRoundtrip:
-    """quantize_weight_fp8_with_scale → dequantize roundtrip: stick-aligned K, K=8, scale arithmetic."""
+# TODO: a QFP8WT tensor's 2D [64, 2] stick is readable only by a matmul, so a
+# dequantize of the weight is rejected at OpSpec validation. When element-wise
+# reads of QFP8WT are supported, these become positive roundtrip tests against
+# the CPU reference.
+QFP8WT_NON_MATMUL_REJECTION = "QFP8WT input to a non-matmul op"
 
-    pytestmark = pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3022: no longer "
-        "crashes the backend compiler, but dequantize misreads the QFP8WT weight layout "
-        "and returns wrong values",
-    )
+
+class TestWeightRoundtrip:
+    """quantize_weight_fp8_with_scale → dequantize: the QFP8WT weight is rejected."""
 
     @pytest.mark.parametrize(
         "shape,scale_val",
@@ -502,84 +501,45 @@ class TestWeightRoundtrip:
         ids=["2x128", "16x128", "2x4096"],
     )
     def test_2d_uniform_stick_aligned(self, shape, scale_val):
-        """Stick-aligned K (>=128), non-uniform input: weight roundtrip must match CPU ref."""
+        """Stick-aligned K (>=128): dequantizing the QFP8WT weight is rejected."""
         x = _make_arange_fp16(shape)
         scale = torch.tensor(scale_val, dtype=FP16, device=DEVICE)
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        out = _compile(_weight_quant_dequant_fn)(x, scale)
-        torch.testing.assert_close(
-            out.cpu(),
-            ref,
-            atol=0.0,
-            rtol=0.0,
-            msg=f"weight roundtrip shape={shape}: differs from CPU ref",
-        )
+        with pytest.raises(InductorError, match=QFP8WT_NON_MATMUL_REJECTION):
+            _compile(_weight_quant_dequant_fn)(x, scale)
 
     def test_2d_uniform_scale_arithmetic(self):
-        """(2,128) non-uniform input, scale=2.0: scale arithmetic applied per element."""
+        """(2,128) input at scale=2.0: dequantizing the QFP8WT weight is rejected."""
         x = _make_arange_fp16((2, 128))
         scale = torch.tensor(2.0, dtype=FP16, device=DEVICE)
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        out = _compile(_weight_quant_dequant_fn)(x, scale)
-        torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0)
+        with pytest.raises(InductorError, match=QFP8WT_NON_MATMUL_REJECTION):
+            _compile(_weight_quant_dequant_fn)(x, scale)
 
     @pytest.mark.parametrize("M", [16, 32, 64], ids=["M16", "M32", "M64"])
     def test_2d_k8_large_m_uniform(self, M):
-        """K=8, M >= rows_per_stick(16), non-uniform input."""
+        """K=8, M >= rows_per_stick(16): dequantizing the QFP8WT weight is rejected."""
         x = _make_arange_fp16((M, 8))
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        out = _compile(_weight_quant_dequant_fn)(x, scale)
-        torch.testing.assert_close(
-            out.cpu(),
-            ref,
-            atol=0.0,
-            rtol=0.0,
-            msg=f"weight K=8 M={M} non-uniform: differs from CPU ref",
-        )
+        with pytest.raises(InductorError, match=QFP8WT_NON_MATMUL_REJECTION):
+            _compile(_weight_quant_dequant_fn)(x, scale)
 
     @pytest.mark.parametrize(
-        "shape",
-        [
-            (2, 8),
-            pytest.param(
-                (4, 8),
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=RuntimeError,
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() "
-                    "of the FP16 output raises 'Invalid device sizes and stride map': "
-                    "the conversion from FP8 pads this stick-unaligned K to two FP16 "
-                    "sticks. Wrong values from issue 3022 are behind it",
-                ),
-            ),
-            (8, 8),
-        ],
-        ids=["2x8", "4x8", "8x8"],
+        "shape", [(2, 8), (4, 8), (8, 8)], ids=["2x8", "4x8", "8x8"]
     )
     def test_2d_k8_small_m(self, shape):
-        """K=8, M < rows_per_stick(16), non-uniform input."""
+        """K=8, M < rows_per_stick(16): dequantizing the QFP8WT weight is rejected."""
         x = _make_arange_fp16(shape)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        out = _compile(_weight_quant_dequant_fn)(x, scale)
-        torch.testing.assert_close(
-            out.cpu(),
-            ref,
-            atol=0.0,
-            rtol=0.0,
-            msg=f"weight K=8 shape={shape}: differs from CPU ref",
-        )
+        with pytest.raises(InductorError, match=QFP8WT_NON_MATMUL_REJECTION):
+            _compile(_weight_quant_dequant_fn)(x, scale)
 
     def test_2d_nonuniform_data(self):
-        """Non-uniform (2,128) rows: weight roundtrip must preserve per-element values."""
+        """Non-uniform (2,128) rows: dequantizing the QFP8WT weight is rejected."""
         vals0 = [float(i % 16 + 1) for i in range(128)]
         vals1 = [float(16 - i % 16) for i in range(128)]
         x = torch.tensor([vals0, vals1], dtype=FP16, device=DEVICE)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        out = _compile(_weight_quant_dequant_fn)(x, scale)
-        torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0)
+        with pytest.raises(InductorError, match=QFP8WT_NON_MATMUL_REJECTION):
+            _compile(_weight_quant_dequant_fn)(x, scale)
 
 
 class TestRoundtripBaseline:
