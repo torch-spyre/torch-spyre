@@ -29,7 +29,8 @@ Copy this into the description and tick what applies.
 - [ ] Metrics are registered with unit, direction, category; the ingest path stores them or a follow-up is linked.
 - [ ] Cost hints (`est_hours`, `run.est`, `run.timeout`) are set.
 - [ ] No `schedule`-like field: cadence belongs to the invoker.
-- [ ] Synthetic names only in anything public: no real hosts, measured numbers, credentials or internal system names.
+- [ ] Nothing public carries a real host, measured number, score, threshold, credential or internal system name.
+      Real benchmark, metric and model names are fine; datasets are named by slug.
 - [ ] Pre-commit passes on every changed file.
 - [ ] A reviewer who did not write the change read the identity diff.
 

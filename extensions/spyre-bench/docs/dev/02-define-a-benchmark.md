@@ -330,6 +330,9 @@ The rules that matter when writing the block (the [reference](../README.md#inges
 - After any change, run the repository's conformance check (it recomputes ids with the real ingest) and read the diff
   of the golden table. A changed id is a changed series. See [guide 10](10-contribute.md).
 
+Guide 12 has the real `vllm` and `vllm-sweep` blocks (serving benchmark) and the `perf-kernel` block (kernel report),
+with `explain` and `ids` output.
+
 ## Tiers, suites and reuse
 
 `tier` and `suite` are groupings declared in the Project. They select sets (`--tier`, `--suite`, a Selection's

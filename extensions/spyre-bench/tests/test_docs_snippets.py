@@ -36,6 +36,7 @@ Other languages (sh, text, make, console) are not run; an `sh` block may not con
 """
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -49,7 +50,8 @@ X = EXT / "examples"
 DOCS = EXT / "docs"
 DEV = DOCS / "dev"
 MUST_VALIDATE = {"yaml", "yml", "json", "python", "bash"}
-ENV = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(EXT)}
+INGEST = EXT.parent / "clickhouse-ingest"
+ENV = {"PATH": "/usr/bin:/bin", "PYTHONPATH": os.pathsep.join([str(EXT), *([str(INGEST)] if INGEST.is_dir() else [])])}
 
 
 class Block:
