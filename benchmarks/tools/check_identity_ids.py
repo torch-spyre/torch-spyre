@@ -26,6 +26,7 @@ is missing unless BENCH_REQUIRED is set. Kernel names are synthetic fixtures; sh
 """
 
 import argparse
+import re
 import json
 import os
 import subprocess
@@ -179,6 +180,20 @@ def lint(catalog=CATALOG):
     return problems
 
 
+def shape_collisions(cases):
+    """Cases of one op whose shapes share their digits: kernel breakdown tags are matched on the digits."""
+    seen, out = {}, []
+    for case, inp, _ in cases:
+        disc = inp["disc"]
+        if disc["record_type"] == "model":
+            continue
+        key = (inp["name"], tuple(re.findall(r"\d+", disc["input_shapes"])))
+        if key in seen:
+            out.append(f"{case} and {seen[key]} share the digits of their shapes")
+        seen[key] = case
+    return out
+
+
 def table(results, BenchmarkId, cases, report_ids):
     """(rows, mismatches): golden rows and every case whose definition disagrees with the ingest parser."""
     keys = results._V2_BENCH_ID_KEYS
@@ -236,7 +251,7 @@ def check(catalog=CATALOG, golden=GOLDEN, update=False):
         cases = declared(catalog)
     except RuntimeError as e:
         return 1, [str(e)]
-    msgs = lint(catalog)
+    msgs = lint(catalog) + shape_collisions(cases)
     rows, bad = table(
         results, BenchmarkId, cases, ingest_report_ids(results, BenchmarkId, cases)
     )

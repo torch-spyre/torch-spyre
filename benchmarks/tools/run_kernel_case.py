@@ -129,13 +129,13 @@ class Case:
         if self.model:
             return (
                 is_model(tags, op)
-                and model_name(tags, op).lower() == self.model.lower()
+                and model_name(tags, op) == self.model
                 and tags.get("config") == self.config
                 and tags.get("mode") == self.mode
             )
         return (
             not is_model(tags, op)
-            and op.lower() == self.op.lower()
+            and op == self.op
             and ints(tags.get("input_shape")) == ints(self.shape)
         )
 
@@ -173,7 +173,28 @@ def filtered(report, case):
     return tree, kept
 
 
-def samples_of(tree):
+def uncaptured(tree):
+    """Measurement keys the whole report zero-fills (the ingest drops them for every record of the file)."""
+    seen = {}
+    for tc in tree.getroot().iter("testcase"):
+        m = NAME.match(tc.get("name", ""))
+        key = SAMPLE_KEYS.get(m["metric"]) if m else None
+        if key in ZERO_WHEN_UNCAPTURED:
+            seen.setdefault(key, []).append(tc.get("time"))
+        util = tags_of(tc).get("pt_util")
+        if util is not None:
+            seen.setdefault("pt_util_percent", []).append(util)
+    zero = set()
+    for key, vals in seen.items():
+        try:
+            if key in ZERO_WHEN_UNCAPTURED and all(float(v) == 0 for v in vals):
+                zero.add(key)
+        except ValueError:
+            pass
+    return zero
+
+
+def samples_of(tree, drop=()):
     """{measurement key: [value]} of the kept testcases, as the ingest would store them."""
     out = {}
     for tc in tree.getroot().iter("testcase"):
@@ -188,9 +209,9 @@ def samples_of(tree):
             out.setdefault("pt_util_percent", [float(tags_of(tc)["pt_util"])])
         except (KeyError, ValueError):
             pass
-    return {
-        k: v for k, v in out.items() if not (k in ZERO_WHEN_UNCAPTURED and v == [0.0])
-    }
+    if "total_duration_ms" not in out and "cpu_ms" in out:
+        out["total_duration_ms"] = out["cpu_ms"]
+    return {k: v for k, v in out.items() if k not in drop}
 
 
 def is_kernel_xml(root):
@@ -248,6 +269,7 @@ def main(argv=None):
     case = Case(args.op, args.shape, args.model, args.config, args.mode)
     report = suite_report(args.suite_dir)
     tree, kept = filtered(report, case)
+    drop = uncaptured(ET.parse(report))
     if not kept:
         print(f"no testcase for {case.describe()} in the perf report", file=sys.stderr)
         return 3
@@ -256,7 +278,7 @@ def main(argv=None):
     if args.repeat_dir:
         args.repeat_dir.mkdir(parents=True, exist_ok=True)
         (args.repeat_dir / "metrics.json").write_text(
-            json.dumps({"samples": samples_of(tree)})
+            json.dumps({"samples": samples_of(tree, drop)})
         )
     kernels = kernel_breakdowns(args.suite_dir, report, case)
     for name, ktree, _ in kernels:

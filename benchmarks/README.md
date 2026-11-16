@@ -81,7 +81,7 @@ never a required check) and serialised by a concurrency group.
 | Input | Default | Meaning |
 |---|---|---|
 | `ref` | the dispatch ref | branch, tag or SHA to check out |
-| `selection` | `perf-core` | Selection of this catalog to run |
+| `selection` | `ops-core` | Selection of this catalog to run |
 | `target` | `dev` | `dev` or `prod`; prod only from `main`, with `ref` and `engine_ref` empty, `main` or a full SHA that is an ancestor of `origin/main`, and never falling back to the dev secrets. Prod with purpose `nightly` or `weekly` (baseline-eligible rows) additionally needs the dispatching actor listed in the repository variable `BENCH_BASELINE_DISPATCHERS` (comma-separated logins; empty means nobody) |
 | `prebaked_image` | empty | runner-set label (`^(image_[a-z0-9_]{1,60})?$`) of the image to run in, e.g. the nightly build's; empty uses the default set and the checkout's definitions, a value runs `make` inside the image's own tree so the definitions are the image commit's. Nothing is installed or rebuilt either way |
 | `run_id` | empty | lower-case UUID; becomes the engine's run id and the ingest stores it verbatim, the verdict reads it (the step fails if the engine ran under another id); empty lets the engine mint one |
