@@ -65,6 +65,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.cos` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
+| `torch.clamp_min` / `torch.clamp_max` | Y | Y | Spyre | Lowering to the clamp op; eager (incl. `out=`) registered on the compiled path |
 | `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
