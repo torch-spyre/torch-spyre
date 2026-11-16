@@ -1263,12 +1263,18 @@ def spyre__copy_from(self, dst, non_blocking=False):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:
+            src = self
+            if src.dim() and src.stride(-1) == 0 and src.size(-1) > 1:
+                # Pass a broadcast last dim once; lower_spyre_from_d2d expands it.
+                for d in range(src.dim()):
+                    if src.stride(d) == 0 and src.size(d) > 1:
+                        src = src.narrow(d, 0, 1)
             # Pass storage_offsets explicitly: a graph input's storage_offset
             # is dropped by Inductor, so the lowering must re-introduce it
             # in-graph (see copy_from_d2d in customops.py and
             # lower_spyre_from_d2d).
             torch.ops.spyre.copy_from_d2d(
-                self, dst, self.storage_offset(), dst.storage_offset()
+                src, dst, src.storage_offset(), dst.storage_offset()
             )
         return dst
     else:

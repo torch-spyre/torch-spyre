@@ -1811,6 +1811,8 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     # silently returns the first call's data. See _reoffset above.
     src = _reoffset(src, src_off)
     dst = _reoffset(dst, dst_off)
+    if list(src.get_size()) != list(dst.get_size()):
+        src = lowering.expand(src, dst.get_size())  # see spyre__copy_from
     lowering.mutate_to(dst, src)
 
 

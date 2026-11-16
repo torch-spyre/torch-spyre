@@ -2529,6 +2529,23 @@ def test_repeat_interleave_1d(dtype):
     _strict(lambda x: x.repeat_interleave(8), x)
 
 
+# Eager goes through spyre::copy_from_d2d instead of a clone.
+@pytest.mark.parametrize(
+    "dtype", [torch.int32, torch.float16], ids=lambda d: str(d).split(".")[-1]
+)
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x.repeat_interleave(8),
+        lambda x: x.unsqueeze(1).expand(64, 8).contiguous(),
+    ],
+    ids=["repeat_interleave", "expand_contiguous"],
+)
+def test_broadcast_new_stick_copy_eager(dtype, fn):
+    x = _arange(64, dtype=dtype)
+    compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=True, run_compile=False)
+
+
 def test_broadcast_new_stick_plan():
     """The broadcast clone takes the size-1 split, not a zero-cost restickify.
 
