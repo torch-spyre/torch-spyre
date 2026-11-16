@@ -193,13 +193,22 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
   int64_t prev_size = 1;
   for (int i = device_rank - 1; i > -1; i--) {
-    if (stl.stride_map[i] == 0) {
-      dcsi_sizes[i] = stl.device_size[i];
-    }
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
-    // Size 1 dimensions are ignored.
-    if (stl.stride_map[i] == -1) continue;
+    if (stl.stride_map[i] == 0) {
+      // Broadcast: extent matches an expanded host dim, so keep it with stride
+      // 0.
+      if (i + 1 < device_rank && stl.device_size[i] > 1) {
+        for (int h = 0; h < host_rank; h++) {
+          if (strides[h] == 0 && sizes[h] == stl.device_size[i]) {
+            dcsi_sizes[i] = stl.device_size[i];
+            host_strides[i] = 0;
+            break;
+          }
+        }
+      }
+      continue;
+    }
     host_strides[i] = stl.stride_map[i];
   }
 
@@ -614,7 +623,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     for (int i = 0; i < device_rank; i++) {
       const int64_t device_size = stl.device_size[i];
       if (device_size == 1) {
-        dst_stride_map[i] = -1;
+        dst_stride_map[i] = 0;
         continue;
       }
       const int64_t device_stride = stl.stride_map[i];
@@ -666,7 +675,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     for (int i = 0; i < dma_rank; i++) {
       for (const int& j : tile_map[i]) {
         if (cpu_sizes[i] == 1) {
-          dst_stride_map[j] = -1;
+          dst_stride_map[j] = 0;
         } else if (dst_stride_map[j] > cpu_sizes[i] * cpu_strides[i]) {
           dst_stride_map[j] = cpu_sizes[i] * cpu_strides[i];
         }
@@ -1469,10 +1478,9 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "sharded Spyre tensors only support whole-tensor copies");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
-  // Dtype-converting DMA is rejected: the D2H conversion path bounds its
-  // host output only through the post-factory host_capacity_bytes write in
-  // spyre_stream.cpp (a flex-side TODO), and converting shard copies are
-  // untested against it.
+  // Dtype-converting DMA is rejected: converting shard copies are untested
+  // against the D2H conversion path, which bounds its host output by the
+  // host_capacity the DMA factories set.
   TORCH_CHECK(host.dtype() == sharded.dtype(),
               "sharded Spyre tensors can only be copied without a dtype "
               "change (got ",

@@ -21,7 +21,6 @@ import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 
 MOVED_NAMES = [
-    "_LoopVarRebaseHandler",
     "_NameSwapHandler",
     "_divide_ranges",
     "_loop_var_hinted_ranges",

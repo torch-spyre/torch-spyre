@@ -191,9 +191,9 @@ the maximal number of element per stick for the tensor data type.
 The stride_map vector maps each device dimension to a host stride: the number
 of PyTorch elements to advance in host memory when stepping one position along
 that device dimension. The elements of this vector are integers where a value
-of `-1` indicates a synthetic or padded dimension with no corresponding host
-stride (e.g. the stick dimension when the tensor size is a multiple of the
-stick size, or a fully-padded expansion dimension).
+of `0` indicates a synthetic, padded, or broadcast dimension with no
+corresponding host stride (e.g. the stick dimension when the tensor size is
+a multiple of the stick size, or a broadcast/gap expansion dimension).
 
 For example, for a 3d PyTorch tensor of size `[128, 256, 512]` with
 stride `[131072, 512, 1]` and a device_size `[256, 8, 128, 64]`:
@@ -222,9 +222,9 @@ in device-coordinate order and still land on the right host element.
 
 ### Why the layout uses stride_map
 
-The layout records one host stride per device dimension, with `-1`
-reserved for synthetic or fully-padded dims that have no host
-counterpart. A stride is an integer count of how many host elements to
+The layout records one host stride per device dimension, with `0`
+reserved for synthetic, fully-padded, or broadcast dims that have no
+effective host counterpart. A stride is an integer count of how many host elements to
 step by, and that count stays meaningful through padding, split
 dimensions, fused dimensions, synthetic dims, and views. That is why
 the layout carries strides directly rather than a per-dimension index
@@ -243,7 +243,7 @@ work division, scratchpad planning, and codegen read it without special
 handling.
 
 Sparse Spyre layouts add a synthetic inner dimension that has no
-corresponding PyTorch dim; its stride is `-1`. Views without copies are
+corresponding PyTorch dim; its stride is `0`. Views without copies are
 handled the same way. When the compiler implements `transpose`,
 `flatten`, or `permute` as a different read pattern over the same
 storage, the device strides describe that read pattern directly, with
@@ -349,7 +349,7 @@ An instance of this class is embedded as a field in the `SpyreTensorImpl` class.
 It can be accessed in Python via an added Tensor method `device_tensor_layout()`.
 The key elements of metadata are:
 - `device_size`: analogous to PyTorch's `size` but with padded values and extra dimensions for tiling.
-- `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (-1 for synthetic or padded dimensions).
+- `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (0 for synthetic, padded, or broadcast dimensions).
 - `device_dtype`: the datatype of the Tensor.
 - `element_arrangement`: how elements are packed within a stick. Defaults to `STANDARD` and appears in the `repr` only when it is non-standard.
 - `valid_elements`: a map from each group of device dimensions to its valid (non-padded) element count, so padded dimensions carry their true logical extent. It is always shown in the `repr`.
@@ -433,8 +433,9 @@ change and recompile.
 The `dynamic=` argument of `to()` avoids this by reserving the device buffer at
 the **maximum** size of its first dimension, up front. This is the allocation
 half of dynamic-shape support: it keeps the buffer and the device layout fixed
-across sizes. Compiled kernels do not yet follow the current size (see
-Restrictions below).
+across sizes. The compile half is a `for_each_tile` loop over the declared
+dimension, which is built once for the whole range and runs for the current size
+(see "Compiled graphs over a declared dimension" below).
 
 ```
 import torch
@@ -496,15 +497,68 @@ stay the same, otherwise `resize_` raises.
   (default 32). Both live in `torch_spyre/_inductor/config.py`.
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
-- **Compiled graphs do not yet follow the current size.** The reservation keeps
-  the layout fixed, so `resize_` does not trigger a recompile. However, the
-  compiled kernel's loop extents currently come from the size the graph was first
-  compiled at, not from the current size. Running the same compiled function at
-  a different size can therefore return wrong values without raising an error,
-  for example `sum(dim=0)` over the reserved dimension, or an op's results for
-  rows beyond the size at first compile. Until the compiler supports dynamic
-  extents, do not rely on compiled results from a reserved tensor after it has
-  been resized.
+- A declared dimension reaches a compiled graph only as a `for_each_tile` loop
+  over it. An op whose own iteration space depends on the declared dimension
+  outside any loop is refused at compile time, see the next section.
+
+#### Compiled graphs over a declared dimension
+
+A compiled function sees one declared tensor at every size in its range as one
+graph and one kernel, provided the declared dimension is consumed by a
+`for_each_tile` loop over it. The loop's geometry is built once at the declared
+maximum and the number of iterations is bound at every launch from the tensor's
+current size, so the same binary is right at every legal size and never reads
+the reserved rows above it.
+
+The recipe, for a tensor declared on dimension 0 with granularity `G`:
+
+```
+def tiled_gelu(x):
+    rows = x.shape[0]
+    torch._check(rows >= MIN)      # the declared range, restated in the trace
+    torch._check(rows <= MAX)
+    torch._check(rows % G == 0)
+
+    def body(_carry, tiles):
+        (tile,) = tiles
+        return None, torch.nn.functional.gelu(tile)
+
+    _carry, out = for_each_tile(body, (x,), dims=(0,), tile_size=G, out_dim=0)
+    return out
+
+compiled = torch.compile(tiled_gelu, fullgraph=True)
+y = x.to("spyre", dynamic={0: {"min": MIN, "max": MAX, "granularity": G}})
+compiled(y)                       # compiles once
+y.resize_((MIN, x.shape[1]))
+compiled(y)                       # same graph, same kernel, right values
+```
+
+The three `torch._check` lines restate the declared range inside the traced
+function. They are what give the compiler a finite range in the trace today and
+have to be written by hand.
+
+What is refused, with an error naming `for_each_tile`:
+
+- A plain op over the declared dimension outside a loop, such as
+  `torch.nn.functional.gelu(y)` or `y.sum(dim=0)` on the reserved tensor
+  itself. Such a kernel can only be built for one size, so instead of running
+  and returning wrong values at every other size it does not compile. Tile it
+  with `for_each_tile` as above.
+- A `for_each_tile` loop over a dimension that only `torch._dynamo.mark_dynamic`
+  made dynamic, with no `dynamic=` declaration. Without the reservation each
+  size is a new allocation and a new layout, so there is no one binary to build,
+  and the loop is refused with the declaration named as the fix.
+- A declared minimum equal to the granularity: declare `min` as at least
+  `2 * granularity` for now (issue #6018). The one-tile call recompiles on a
+  PyTorch contiguity guard, which #6060 removes.
+
+What changed: before the compile half landed (PR #6066), a compiled graph over a
+reserved tensor was built for the size it was first compiled at and could return
+wrong values after a `resize_`, which the documentation warned about. Now a
+`for_each_tile` loop is right at every size, and the plain-op case that used to
+compile and be silently wrong raises `Unsupported` at compile time. Code that
+compiled a plain op over a reserved tensor has to tile it, or move the op out of
+the compiled region.
 
 #### Data Semantics
 

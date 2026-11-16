@@ -122,11 +122,13 @@ jobs:
   run-tests:
     needs: changes
     # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
+    # Repo variable GHA_FULL_MERGE_QUEUE_TESTS=true lifts the label and merge-queue skips so GHA runs the full suite;
+    # GHA_TESTS_ON_AUTO_MERGE=true lifts the auto-merge skip on PRs.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      needs.changes.outputs.integration_labeled != 'true' &&
-      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
-      github.event_name != 'merge_group'
+      (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true') &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null && vars.GHA_TESTS_ON_AUTO_MERGE != 'true') &&
+      (github.event_name != 'merge_group' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true')
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -185,7 +187,7 @@ jobs:
           RESULT="${{ needs.run-tests.result }}"
           echo "run-tests result: ${RESULT}"
 
-          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]]; then
+          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
             echo "integration-test label set -- the Jenkins integration run owns this"
             echo "commit's testing and reports its own check. Passing this required"
             echo "gate so the merge queue is not blocked by a missing check."
@@ -203,4 +205,115 @@ jobs:
           fi
 
           echo "One or more test suites failed or were cancelled."
+          exit 1
+
+  # Replaces Jenkins' downstream fan-out in the merge queue: hf-adapters' integration suite runs on its main
+  # against this commit's torch-spyre and gates "Spyre Test (amd64)".
+  downstream-hf-adapters:
+    name: Integration (hf-adapters)
+    needs: [changes, decide-spyre-test]
+    if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
+      needs.changes.outputs.code_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    steps:
+      # Default branch: the dispatch action is not taken from the queued change.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          owner: torch-spyre
+          repositories: hf-adapters
+          permission-actions: write
+      - uses: ./.github/actions/dispatch-downstream-integration
+        with:
+          repository: torch-spyre/hf-adapters
+          extra_inputs: '{}'
+          token: ${{ steps.app-token.outputs.token }}
+          torch_spyre_ref: ${{ github.sha }}
+          hash_source: ${{ github.event.merge_group.head_ref }}
+          merge_group_ref: ${{ github.event.merge_group.head_ref }}
+
+  # Advisory twin of the job above, deliberately not in the gate's needs so it can never delay or fail it.
+  downstream-spyre-inference:
+    name: Integration (spyre-inference)
+    needs: [changes, decide-spyre-test]
+    if: github.event_name == 'merge_group' && needs.decide-spyre-test.outputs.owns == 'true' && needs.decide-spyre-test.outputs.downstream == 'true' &&
+      needs.changes.outputs.code_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    continue-on-error: true
+    steps:
+      # Default branch: the dispatch action is not taken from the queued change.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          owner: torch-spyre
+          repositories: spyre-inference
+          permission-actions: write
+      - uses: ./.github/actions/dispatch-downstream-integration
+        with:
+          repository: torch-spyre/spyre-inference
+          extra_inputs: '{"image_rpms":"true"}'
+          token: ${{ steps.app-token.outputs.token }}
+          torch_spyre_ref: ${{ github.sha }}
+          hash_source: ${{ github.event.merge_group.head_ref }}
+          merge_group_ref: ${{ github.event.merge_group.head_ref }}
+
+  # Reads the variables once, so the downstream jobs and the gate below cannot disagree about them if
+  # they are flipped while a run is in flight.
+  decide-spyre-test:
+    name: Decide whether GHA owns the check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
+    outputs:
+      owns: ${{ steps.v.outputs.owns }}
+      downstream: ${{ steps.v.outputs.downstream }}
+    steps:
+      - id: v
+        env:
+          OWNS: ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.pull_request.auto_merge
+            == null || vars.GHA_TESTS_ON_AUTO_MERGE == 'true'))) }}
+          DOWNSTREAM: ${{ vars.GHA_DOWNSTREAM_INTEGRATION == 'true' }}
+        run: |
+          {
+            echo "owns=${OWNS}"
+            echo "downstream=${DOWNSTREAM}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Posts the required "Spyre Test (amd64)" context on merge-queue entries and on PRs where GHA ran
+  # the suite and owns the check; the name only matches then, so a skipped run can never satisfy it.
+  merge-queue-spyre-test:
+    name: ${{ needs.decide-spyre-test.outputs.owns == 'true' && 'Spyre Test (amd64)' || 'gha-merge-queue-tests (inactive)' }}
+    runs-on: ubuntu-latest
+    needs: [decide-spyre-test, changes, run-tests, downstream-hf-adapters]
+    if: always() && (github.event_name == 'merge_group' || github.event_name == 'pull_request')
+    steps:
+      - name: GHA does not own this check here
+        if: ${{ needs.decide-spyre-test.outputs.owns != 'true' }}
+        run: echo "Jenkins owns the Spyre Test (amd64) check here."
+      - name: Check all suites passed
+        if: ${{ needs.decide-spyre-test.outputs.owns == 'true' }}
+        run: |-
+          # run-tests may only be skipped for a docs-only change; a failed `changes` job also skips it.
+          if ${{ (needs.run-tests.result == 'success' || (needs.run-tests.result == 'skipped' && needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) && (github.event_name != 'merge_group' || needs.decide-spyre-test.outputs.downstream != 'true' || needs.downstream-hf-adapters.result == 'success' || (needs.changes.result == 'success' && needs.changes.outputs.code_changed == 'false')) }}; then
+            echo "All test suites passed."
+            exit 0
+          fi
+          echo "Test suites failed, were cancelled, or did not run."
           exit 1

@@ -28,7 +28,9 @@ capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 import os
 import sys
 
+import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -50,6 +52,15 @@ from torch_spyre._C import (  # noqa: E402
 # The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
 # the BackendCompilerFailed message.
 _INDEX_STICK_DIM_ERROR = "Expect index stick dim to be innermost in chunk loop order"
+
+_STICK_DIM_SCATTER = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason=(
+        "index_add along the stick (last) dim fails to compile with "
+        "'cannot re-tile: no size-1 stick target' (#4399)"
+    ),
+)
 
 
 class _ScatterScenarios:
@@ -1241,12 +1252,144 @@ class _ScatterScenarios:
             sdsc=False,
         )
 
-    def test_index_add_dim1_unsupported(self):
-        """index_add along dim=1 (column scatter-add) is unsupported. The gather
-        (index_select) leg puts the index-dependent coordinate on a non-outermost
-        device dim, and propagate_layouts finds no supported output layout
-        (indirect access requires the indexed dim outermost). The compile aborts,
-        surfaced here as CRASHED."""
+    # --- index_add along a dim other than 0 -------------------------------
+    # Every scenario above uses dim 0, the one dim whose index list needs no
+    # leading entry for the dims it skips.
+
+    def _index_add_3d_operands(self, dim, *, M=8, A=4, B=64, P=3, dtype=torch.float16):
+        """Operands for a 3-D index_add along `dim`: out[M,A,B], src with P on `dim`.
+
+        Sizes are distinct so each named dim keeps one size across the pair.
+        """
+        names, shape = ["M", "A", "B"], [M, A, B]
+        src_names, src_shape = list(names), list(shape)
+        src_names[dim % 3], src_shape[dim % 3] = "P", P
+        out = torch.rand(*shape, dtype=dtype).to("spyre")
+        src = torch.rand(*src_shape, dtype=dtype).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(out, dict(zip(names, shape)))
+        self.name_dims(src, dict(zip(src_names, src_shape)))
+        self.name_dims(idx, {"P": P})
+        return out, src, idx
+
+    def test_index_add_3d_middle_dim(self):
+        """3-D destination, scatter-add along the middle dim."""
+        out, src, idx = self._index_add_3d_operands(1)
+
+        def kernel(out, src, idx):
+            return out.index_add_(1, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_3d_negative_middle_dim(self):
+        """The same scatter, named with a negative dim."""
+        out, src, idx = self._index_add_3d_operands(-2)
+
+        def kernel(out, src, idx):
+            return out.index_add_(-2, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_negative_dim_matches_positive(self):
+        """dim=-2 and dim=1 name the same dim, so the results must be identical."""
+        out, src, idx = self._index_add_3d_operands(1)
+
+        def positive(out, src, idx):
+            return torch.index_add(out, 1, idx, src)
+
+        def negative(out, src, idx):
+            return torch.index_add(out, -2, idx, src)
+
+        got_pos = torch.compile(positive, dynamic=False)(out, src, idx)
+        got_neg = torch.compile(negative, dynamic=False)(out, src, idx)
+        torch.testing.assert_close(got_pos.cpu(), got_neg.cpu(), atol=0, rtol=0)
+
+    def test_index_add_fp32_middle_dim(self):
+        """fp32 along the middle dim, where the comparison is exact."""
+        out, src, idx = self._index_add_3d_operands(1, dtype=torch.float32)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 1, idx, src)
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_add_alpha_middle_dim(self):
+        """A negative alpha along the middle dim."""
+        out, src, idx = self._index_add_3d_operands(1, dtype=torch.float32)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 1, idx, src, alpha=-1.0)
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_reduce_mean_middle_dim(self):
+        """index_reduce_(mean) along the middle dim.
+
+        Upstream expands index_reduce into index_add, so it shares this
+        decomposition and its dim handling.
+        """
+        out, src, idx = self._index_add_3d_operands(1, dtype=torch.float32)
+
+        def kernel(out, src, idx):
+            out = out.clone()
+            out.index_reduce_(1, idx, src, reduce="mean", include_self=True)
+            return out
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_add_bf16_middle_dim(self):
+        """bfloat16 along the middle dim."""
+        out, src, idx = self._index_add_3d_operands(1, dtype=torch.bfloat16)
+
+        def kernel(out, src, idx):
+            return out.index_add_(1, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_4d_middle_dims(self):
+        """A 4-D destination, scattered along each middle dim in turn."""
+        for dim in (1, 2):
+            with self.subTest(dim=dim):
+                src_shape = [8, 4, 6, 64]
+                src_shape[dim] = 3
+                out = torch.rand(8, 4, 6, 64, dtype=torch.float32).to("spyre")
+                src = torch.rand(*src_shape, dtype=torch.float32).to("spyre")
+                idx = torch.arange(3, dtype=torch.int32).to("spyre")
+
+                def kernel(out, src, idx, _dim=dim):
+                    return torch.index_add(out, _dim, idx, src)
+
+                self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_reduce_mean_negative_dim(self):
+        """index_reduce_(mean) named with a negative dim."""
+        out, src, idx = self._index_add_3d_operands(-2, dtype=torch.float32)
+
+        def kernel(out, src, idx):
+            out = out.clone()
+            out.index_reduce_(-2, idx, src, reduce="mean", include_self=True)
+            return out
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    @_STICK_DIM_SCATTER
+    def test_index_add_bf16_last_dim(self):
+        """bfloat16 with a negative alpha along the last dim.
+
+        The shape and dtype first reported against this decomposition.
+        """
+        out = torch.randn(2, 8, 8, dtype=torch.bfloat16).to("spyre")
+        src = torch.randn(2, 8, 4, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(4, dtype=torch.int32).to("spyre")
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, -1, idx, src, alpha=-1.0)
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    @_STICK_DIM_SCATTER
+    def test_index_add_2d_last_dim(self):
+        """2-D destination, scatter-add along the last dim."""
         M, N, P = 4, 8, 3
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(M, P, dtype=torch.float16).to("spyre")
@@ -1258,7 +1401,27 @@ class _ScatterScenarios:
         def kernel(out, src, idx):
             return out.index_add_(1, idx, src)
 
-        self.check(kernel, out, src, idx, expect=CRASHED)
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    @_STICK_DIM_SCATTER
+    def test_index_add_3d_last_dim(self):
+        """3-D destination, scatter-add along the last dim."""
+        out, src, idx = self._index_add_3d_operands(2)
+
+        def kernel(out, src, idx):
+            return out.index_add_(2, idx, src)
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    @_STICK_DIM_SCATTER
+    def test_index_add_3d_negative_last_dim(self):
+        """The same scatter, named with a negative dim."""
+        out, src, idx = self._index_add_3d_operands(-1)
+
+        def kernel(out, src, idx):
+            return out.index_add_(-1, idx, src)
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
