@@ -30,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -200,6 +201,35 @@ void ea_shuffle_fp32tofp16(int64_t elems_per_stick, int64_t sticks,
 }
 
 /**
+ * Describes the boundary adjustment needed when the host's valid width
+ * doesn't fill a whole number of stick *pairs* (DL16_TO_FP32 only). The
+ * shuffle must run at `padded_width`; `boundary_dcsi` moves data between
+ * that padded extent and the host's real `valid_width`.
+ *   - D2H (restore): boundary_dcsi slices padded -> valid  (post_slice_dcsi_)
+ *   - H2D (apply):    boundary_dcsi expands valid -> padded (pre_expand_dcsi_,
+ *                     zero-filling the pad region)
+ */
+struct EaPairBoundary {
+  bool needed = false;
+  int64_t valid_width = 0;
+  int64_t padded_width = 0;
+  int stick_host_dim = -1;  // index into the (PyTorch ordered) host sizes
+  DataConversionStrideInfo boundary_dcsi;
+};
+
+auto make_width_boundary_dcsi(int64_t outer_count, int64_t padded_width,
+                              int64_t valid_width, bool padded_is_src)
+    -> DataConversionStrideInfo {
+  DataConversionStrideInfo dcsi;
+  dcsi.size_ = {valid_width, outer_count};  // innermost first
+  dcsi.offset_src_ = 0;
+  dcsi.offset_dst_ = 0;
+  dcsi.stride_src_ = {1, padded_is_src ? padded_width : valid_width};
+  dcsi.stride_dst_ = {1, padded_is_src ? valid_width : padded_width};
+  return dcsi;
+}
+
+/**
  * Inverts a shuffle given as (sub_elems, sub_stride). The strides must be the
  * place values of some ordering of the pieces (true for both staggers).
  * Sorting the pieces by stride gives the radix order of the staggered
@@ -238,21 +268,34 @@ void ea_invert_shuffle(std::vector<int64_t>& sub_elems,
  *   - H2D (apply): the entry goes to output_dimwise_ea_ and the engine
  *     computes out[layout(p(c))] = in[layout(c)].
  *
- * The entry itself does not depend on the direction. The DCSIs are not
+ * The entry itself does not depend on the copy direction. The DCSIs are not
  * touched.
  *
  * The permutation covers the allocated (padded) extent of the stick dim, so a
- * partial last stick or pair needs no special case.
+ * partial last stick needs no special case. If `stl` is DL16_TO_FP32 and
+ * `host_valid_width` needs an odd number of sticks, the last pair straddles
+ * real data and padding: the shuffle is built at the padded (even-pair)
+ * extent, and `boundary` is filled with the slice/expand needed to reconcile
+ * that with the host's real width. The caller must splice
+ * `boundary.boundary_dcsi` into post_slice_dcsi_ (D2H) or pre_expand_dcsi_
+ * (H2D), and use `boundary.padded_width` (not host_valid_width) when sizing
+ * the main dcsi_'s walk over this dim.
  *
  * @param stl SpyreTensorLayout describing the element arrangement.
  * @param device_elem_stride Device stride of one element inside a stick.
  * @param device_stick_stride Device stride between two sticks.
  * @param allocated_sticks Number of sticks allocated along the stick dim.
+ * @param host_valid_width Real (unpadded) element width of the stick host dim.
+ * @param outer_count Product of the host sizes outside the stick host dim.
  * @param dim Entry of the stick dim, filled by this function.
+ * @param invert True for H2D (apply), false for D2H (restore).
+ * @param boundary Pair-straddle adjustment, filled by this function.
  */
 void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
                 int64_t device_stick_stride, int64_t allocated_sticks,
-                perdim_element_arrangement& dim, bool invert) {
+                int64_t host_valid_width, int64_t outer_count,
+                perdim_element_arrangement& dim, bool invert,
+                EaPairBoundary& boundary) {
   constexpr int64_t kElemsPerGroup = 4;
   constexpr int64_t kSticksPerPair = 2;
   constexpr int64_t kHalvesPerStick = 2;
@@ -271,15 +314,40 @@ void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
   TORCH_CHECK(allocated_sticks > 0, "No sticks allocated for ",
               elementArrangementToString(ea), " element arrangement");
 
-  dim.dimShape_ = allocated_sticks * elems_per_stick;
-  dim.cumElemsBefore_ = {1, elems_per_stick};
-  dim.cumOffset_ = {device_elem_stride, device_stick_stride};
-
+  boundary = EaPairBoundary{};
   if (ea == ElementArrangement::DL16_TO_FP32) {
     TORCH_CHECK(allocated_sticks % kSticksPerPair == 0,
                 "DL16_TO_FP32 element arrangement requires whole stick pairs "
                 "along the stick dimension, but ",
                 allocated_sticks, " sticks are allocated");
+    const int64_t valid_sticks =
+        (host_valid_width + elems_per_stick - 1) / elems_per_stick;
+    // Only an odd valid-stick count makes a pair straddle real data and pure
+    // padding. A partial last stick with an even valid-stick count (e.g. 44,
+    // 63, 100) stays inside whole pairs and needs no boundary.
+    if (valid_sticks % kSticksPerPair != 0) {
+      TORCH_CHECK(allocated_sticks == valid_sticks + 1,
+                  "Unexpected padding for DL16_TO_FP32: valid_sticks=",
+                  valid_sticks, " allocated_sticks=", allocated_sticks);
+      const int64_t padded_width = allocated_sticks * elems_per_stick;
+      boundary.needed = true;
+      boundary.valid_width = host_valid_width;
+      boundary.padded_width = padded_width;
+      // D2H restore (!invert): the shuffle output is padded, the host wants the
+      //   valid width, so slice with the padded side as the source.
+      // H2D apply (invert): the host input is valid, the shuffle wants padded,
+      //   so expand with the padded side as the destination.
+      boundary.boundary_dcsi =
+          make_width_boundary_dcsi(outer_count, padded_width, host_valid_width,
+                                   /*padded_is_src=*/!invert);
+    }
+  }
+
+  dim.dimShape_ = allocated_sticks * elems_per_stick;
+  dim.cumElemsBefore_ = {1, elems_per_stick};
+  dim.cumOffset_ = {device_elem_stride, device_stick_stride};
+
+  if (ea == ElementArrangement::DL16_TO_FP32) {
     ea_shuffle_fp16tofp32(elems_per_stick, allocated_sticks, kElemsPerGroup,
                           kSticksPerPair, dim.subElems_, dim.subStride_);
   } else {
@@ -329,13 +397,18 @@ auto identity_dim_ea(const std::vector<int>& tiles,
  *                    on the input side for D2H (restore) and on the output
  *                    side for H2D (apply). Left empty unless the layout is
  *                    staggered.
+ * @param ea_boundary: receives the slice/expand of an odd number of stick
+ *                     pairs (see ea_shuffle). When needed, the walk below
+ *                     covers the pair-aligned (padded) width of the stick host
+ *                     dim and the caller splices ea_boundary.boundary_dcsi
+ *                     around it.
  * @return description of data conversion
  */
 auto get_device_stride_infos(
     c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t cpu_offset,
     int64_t device_offset, SpyreTensorLayout stl, bool host2device,
-    std::vector<perdim_element_arrangement>& dimwise_ea)
-    -> std::vector<DataConversionStrideInfo> {
+    std::vector<perdim_element_arrangement>& dimwise_ea,
+    EaPairBoundary& ea_boundary) -> std::vector<DataConversionStrideInfo> {
   const std::vector<std::vector<int>> tile_map =
       get_tile_map(sizes, strides, stl.device_size, stl.stride_map);
 
@@ -401,6 +474,81 @@ auto get_device_stride_infos(
     host_strides[i] = stl.stride_map[i];
   }
 
+  // EA shuffle: describe the permutation between STANDARD and the staggered
+  // arrangement, and widen the walked host sizes to the padded (whole-pair)
+  // extent when the host's valid width straddles a pair boundary. This runs
+  // before the per-host-dim loop below, which sizes the stick-count device dim
+  // from the host size: it has to see the padded size or it silently picks the
+  // smaller one. The DCSIs the loop builds stay as built for STANDARD
+  // arrangement.
+  dimwise_ea.clear();
+  std::vector<int64_t> walk_sizes(sizes.begin(), sizes.end());
+  std::vector<int64_t> walk_strides(strides.begin(), strides.end());
+  ea_boundary = EaPairBoundary{};
+  if (shuffle_ea) {
+    // Guard EA shuffle against unsupported dtypes.
+    TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32 ||
+                    stl.device_dtype == DataFormats::IEEE_FP16 ||
+                    stl.device_dtype == DataFormats::IEEE_INT64 ||
+                    stl.device_dtype == DataFormats::IEEE_INT32 ||
+                    stl.device_dtype == DataFormats::SEN169_FP16,
+                "EA shuffle unsupported dtype, got: ", stl.device_dtype,
+                " (element arrangement: ",
+                elementArrangementToString(stl.element_arrangement), ")");
+
+    TORCH_CHECK(stick_host_dim >= 0 && !stick_ambiguous,
+                "Unable to determine the stick dimension for ",
+                elementArrangementToString(stl.element_arrangement));
+
+    for (int i = 0; i < host_rank; i++) {
+      dimwise_ea.push_back(
+          identity_dim_ea(tile_map[i], stl.device_size, device_strides));
+    }
+
+    const bool has_stick_count = stick_count_dev_dim >= 0;
+    // Stride unused when a single stick is allocated (has_stick_count is
+    // false).
+    const int64_t allocated_sticks =
+        has_stick_count ? stl.device_size[stick_count_dev_dim] : 1;
+    const int64_t outer_count =
+        std::accumulate(sizes.begin(), sizes.end(), int64_t{1},
+                        std::multiplies<>()) /
+        std::max<int64_t>(sizes[stick_host_dim], 1);
+
+    ea_shuffle(stl, device_strides[stick_elem_dim],
+               has_stick_count ? device_strides[stick_count_dev_dim] : 0,
+               allocated_sticks, sizes[stick_host_dim], outer_count,
+               dimwise_ea[stick_host_dim], host2device, ea_boundary);
+
+    if (ea_boundary.needed) {
+      ea_boundary.stick_host_dim = stick_host_dim;
+      walk_sizes[stick_host_dim] = ea_boundary.padded_width;
+
+      // The padded staging buffer (pre-expand output for H2D, intermediate for
+      // D2H) has the padded row length, so every stride that steps over a whole
+      // stick dim must use the padded length too. Otherwise row r lands at
+      // r*valid but is read back at r*padded.
+      TORCH_CHECK(cpu_offset == 0,
+                  "Staggered EA with odd stick pairs does not support a "
+                  "non-zero host storage offset");
+      const int64_t valid = ea_boundary.valid_width;
+      const int64_t padded = ea_boundary.padded_width;
+      const int64_t threshold = valid * strides[stick_host_dim];
+      auto rescale = [&](int64_t s) -> int64_t {
+        if (s < threshold) return s;
+        TORCH_CHECK(s % valid == 0, "Cannot rescale host stride ", s,
+                    " to the padded stick width ", padded);
+        return s / valid * padded;
+      };
+      for (int i = 0; i < host_rank; i++) {
+        if (i != stick_host_dim) walk_strides[i] = rescale(strides[i]);
+      }
+      for (int k = 0; k < device_rank; k++) {
+        if (stl.stride_map[k] > 0) host_strides[k] = rescale(host_strides[k]);
+      }
+    }
+  }
+
   // The sizes for the subsequent DataConversionStrideInfo (remainders) match
   // the first DataConversionStrideInfo sizes except for dimensions with a
   // remainder.
@@ -415,15 +563,15 @@ auto get_device_stride_infos(
     // Dimensions that do not appear in the tile map are ignored.
     if (tile_map[i].size() == 0) continue;
 
-    const int64_t host_stride = strides[i];
-    int64_t host_size = sizes[i];
+    const int64_t host_stride = walk_strides[i];
+    int64_t host_size = walk_sizes[i];
 
     // Fold leading host dimensions that do not appear in the tile map.
     for (int j = i - 1; j > -1 && tile_map[j].size() == 0; j--) {
       // Expanded dimensions are ignored.
       if (strides[j] == 0) continue;
 
-      host_size *= sizes[j];
+      host_size *= walk_sizes[j];
     }
 
     int64_t elements_before = 1;
@@ -572,38 +720,6 @@ auto get_device_stride_infos(
       info.offset_dst_ += offset_dst;
       stride_infos.push_back(info);
     }
-  }
-
-  // EA shuffle: describe the permutation between STANDARD and the staggered
-  // arrangement. The DCSIs above stay as built for STANDARD arrangement.
-  dimwise_ea.clear();
-  if (shuffle_ea) {
-    // Guard EA shuffle against unsupported dtypes.
-    TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32 ||
-                    stl.device_dtype == DataFormats::IEEE_FP16 ||
-                    stl.device_dtype == DataFormats::IEEE_INT64 ||
-                    stl.device_dtype == DataFormats::IEEE_INT32 ||
-                    stl.device_dtype == DataFormats::SEN169_FP16,
-                "EA shuffle unsupported dtype, got: ", stl.device_dtype,
-                " (element arrangement: ",
-                elementArrangementToString(stl.element_arrangement), ")");
-
-    TORCH_CHECK(stick_host_dim >= 0 && !stick_ambiguous,
-                "Unable to determine the stick dimension for ",
-                elementArrangementToString(stl.element_arrangement));
-
-    for (int i = 0; i < host_rank; i++) {
-      dimwise_ea.push_back(
-          identity_dim_ea(tile_map[i], stl.device_size, device_strides));
-    }
-
-    const bool has_stick_count = stick_count_dev_dim >= 0;
-    // Stride unused when a single stick is allocated (has_stick_count is
-    // false).
-    ea_shuffle(stl, device_strides[stick_elem_dim],
-               has_stick_count ? device_strides[stick_count_dev_dim] : 0,
-               has_stick_count ? stl.device_size[stick_count_dev_dim] : 1,
-               dimwise_ea[stick_host_dim], host2device);
   }
 
   return stride_infos;
@@ -1061,9 +1177,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   } else {
     // EA shuffle: dimwise_ea is filled only for copies of staggered layouts.
     std::vector<perdim_element_arrangement> dimwise_ea;
-    dci.dcsi_ =
-        get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                device_offset, stl, host2device, dimwise_ea);
+    EaPairBoundary ea_boundary;
+    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                        device_offset, stl, host2device,
+                                        dimwise_ea, ea_boundary);
     if (!dimwise_ea.empty()) {
       // The shapes of the DCI are innermost first, so the per-dim EA is too.
       std::reverse(dimwise_ea.begin(), dimwise_ea.end());
@@ -1076,11 +1193,41 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       }
     }
 
+    // Host shape with the stick dim widened to the pair-aligned extent. The
+    // main dcsi_ walks this extent, so the buffer on the host side of the
+    // shuffle (the pre-expand output for H2D, the intermediate buffer for D2H)
+    // must be allocated at this size, not the real one.
+    std::vector<int64_t> padded_cpu_sizes = cpu_sizes;
+    if (ea_boundary.needed) {
+      padded_cpu_sizes[ea_boundary.stick_host_dim] = ea_boundary.padded_width;
+    }
+
     // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(padded_cpu_sizes.begin(), padded_cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
-    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+
+    if (ea_boundary.needed) {
+      if (host2device) {
+        // Zero-pad the real-width host tensor before the shuffle runs.
+        dci.pre_expand_dcsi_ = {ea_boundary.boundary_dcsi};
+        dci.pre_input_shape_ = cpu_sizes;  // real, unpadded
+        dci.usePadVal_ = true;
+        dci.inputPadVal_ = 0.0;
+        dci.input_shape_ = padded_cpu_sizes;
+        dci.output_shape_ = device_sizes;
+      } else {
+        // Slice the padded, now-unstaggered intermediate down to the host's
+        // real width.
+        dci.post_slice_dcsi_ = {ea_boundary.boundary_dcsi};
+        dci.post_output_shape_ = cpu_sizes;  // real, unpadded
+        dci.input_shape_ = device_sizes;
+        dci.output_shape_ = padded_cpu_sizes;
+      }
+    } else {
+      dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+      dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+    }
   }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {

@@ -383,10 +383,5 @@ identity entry.
   `DL16_TO_FP32` result) computes its device offset in standard order, so the
   shuffle treats sticks 1 and 2 as a pair instead of sticks (0, 1) and (2, 3)
   and produces wrong data without an error. See issue [#5556][issue-5556].
-* **Padded stick dims and work division:** for stick dims that are not
-  stick-aligned, work division does not take the padding into account yet, so
-  with some divisions the conversion itself leaves the device values wrong.
-  This is independent of the shuffle. A `work_div` hint that gives every
-  core a single row avoids it.
 
 [issue-5556]: https://github.com/torch-spyre/torch-spyre/issues/5556

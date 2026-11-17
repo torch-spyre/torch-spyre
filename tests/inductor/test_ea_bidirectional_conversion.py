@@ -1123,7 +1123,7 @@ def test_downcast_of_one_row_of_an_upcast(row, cols):
 # ---------------------------------------------------------------------------
 # D2H EA restore, H2D write back
 # ---------------------------------------------------------------------------
-def _build_ea_dci_tests(is_h2d: bool = False):
+def _build_ea_dci_tests():
     # Shapes common to both conversions: the stick dim is a whole number of
     # 64-element sticks.
     STICK_ALIGNED_SHAPES = [
@@ -1198,18 +1198,6 @@ def _build_ea_dci_tests(is_h2d: bool = False):
         (2, 3, 4, 44),
     ]
 
-    _XFAIL_SHAPES = {
-        (8, 16, 68),
-        (2, 96),
-        (4, 96),
-        (8, 16, 96),
-        (4, 160),
-        (8, 16, 160),
-    }
-
-    _D2H_XFAIL_SHAPES = _XFAIL_SHAPES
-    _H2D_XFAIL_SHAPES = _XFAIL_SHAPES | {(68,), (4, 68)}
-
     EA = ElementArrangement
     FP32 = torch.float32
     params = {}
@@ -1227,43 +1215,7 @@ def _build_ea_dci_tests(is_h2d: bool = False):
                     else base_expected_ea
                 )
                 key = f"{conv_name}_{shapes2key((shape,))}"
-                if (
-                    not is_h2d
-                    and src_dtype in DtypeOpTable.fp16_types()
-                    and dst_dtype == FP32
-                    and shape in _D2H_XFAIL_SHAPES
-                ):
-                    params[key] = pytest.param(
-                        src_dtype,
-                        dst_dtype,
-                        expected_ea,
-                        shape,
-                        marks=pytest.mark.xfail(
-                            strict=True,
-                            raises=AssertionError,
-                            reason=f"D2H {expected_ea.name} odd-stick-pairs are unsupported #5361, #6065",
-                        ),
-                    )
-                elif (
-                    is_h2d
-                    and src_dtype in DtypeOpTable.fp16_types()
-                    and dst_dtype == FP32
-                    and shape in _H2D_XFAIL_SHAPES
-                ):
-                    params[key] = pytest.param(
-                        src_dtype,
-                        dst_dtype,
-                        expected_ea,
-                        shape,
-                        marks=pytest.mark.xfail(
-                            strict=True,
-                            raises=RuntimeError,
-                            match=r"ConvertData: output_dimwise_ea_ extent .* exceeds output buffer capacity",
-                            reason="H2D buffer capacity exceeded #5361, #6065",
-                        ),
-                    )
-                else:
-                    params[key] = (src_dtype, dst_dtype, expected_ea, shape)
+                params[key] = (src_dtype, dst_dtype, expected_ea, shape)
     return params
 
 
@@ -1328,7 +1280,7 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     assert torch.equal(got, ref)
 
 
-EA_H2D_TEST_PARAMS = _build_ea_dci_tests(is_h2d=True)
+EA_H2D_TEST_PARAMS = EA_D2H_TEST_PARAMS
 
 
 def _shape_of(param):
