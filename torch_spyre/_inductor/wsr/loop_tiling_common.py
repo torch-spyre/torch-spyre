@@ -29,7 +29,7 @@ from sympy import Expr
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
-from torch._inductor.utils import sympy_index_symbol, sympy_subs
+from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -1023,9 +1023,13 @@ class _NameSwapHandler(WrapperHandler):
         self,
         inner,
         name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+        loop_terms: dict[str, Expr] | None = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
+        # swapped name -> a loop term added to the rescaled index of a load that
+        # was swapped. A load of the new name that was NOT swapped is left alone.
+        self._loop_terms = loop_terms or {}
 
     def load(self, name, index):
         if name in self._name_map:
@@ -1033,29 +1037,40 @@ class _NameSwapHandler(WrapperHandler):
             new_index = _rescale_index(
                 index, full_strides, tile_strides, strip_constant=True
             )
+            if name in self._loop_terms:
+                new_index = new_index + self._loop_terms[name]
             return super().load(new_name, new_index)
         return super().load(name, index)
 
 
-class _LoopVarRebaseHandler(WrapperHandler):
-    """Pin one advancing source load to its iteration-zero base address.
+class _AddLoopTermHandler(WrapperHandler):
+    """Add a loop term to the index of every load of one buffer.
 
-    A spliced ``for_each_tile`` body carries its induction variable directly
-    in graph-input load indexes.  A staged copy removes that term and
-    represents it through ``device_tile_advance_expr`` instead.  A direct
-    read restored after planning must use the same single representation;
-    otherwise the offset is applied twice and the raw unbacked symbol leaks
-    into the OpSpec coordinates.
+    The direct read that replaces a staged copy reads the copy's source buffer.
+    The copy's own read of that source carries the loop's advance as a term in
+    its index (``step * u``); the swapped-in read must carry the same term, or
+    the index and the stored per-trip step disagree. The term is taken from the
+    copy's index (``loop_term``), not from the record.
+
+    The consumer lists the loop variable in its ``dim_hints``, so
+    ``pass_utils.per_trip_index`` pins it in the base coordinates and it does not
+    reach ``device_coordinates``.
+
+    This adds the term to EVERY load of ``source_name``, so it is for a body that
+    loads it exactly once: the staged copy, which is a pure identity
+    (``identity_load`` requires one load). A consumer body that may load the same
+    buffer on its own uses ``_NameSwapHandler(loop_terms=...)`` instead, which adds
+    the term only to the loads that were swapped.
     """
 
-    def __init__(self, inner, source_name: str, loop_var_zeros: dict[Expr, Expr]):
+    def __init__(self, inner, source_name: str, loop_term: Expr):
         super().__init__(inner)
         self._source_name = source_name
-        self._loop_var_zeros = loop_var_zeros
+        self._loop_term = loop_term
 
     def load(self, name, index):
         if name == self._source_name:
-            index = sympy_subs(index, self._loop_var_zeros)
+            index = index + self._loop_term
         return super().load(name, index)
 
 
