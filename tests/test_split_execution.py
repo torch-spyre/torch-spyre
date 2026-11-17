@@ -100,6 +100,7 @@ def _child_s_prep_routing(tracker_on: bool) -> dict:
             f.write(b"\x00" * 1024)
 
         job_plan = _C.prepare_kernel(spyrecode_dir)
+        torch.accelerator.synchronize(torch.device("spyre"))
 
     num_steps = job_plan.num_steps()
     step_types = [job_plan.get_step_type(i) for i in range(num_steps)]
@@ -256,7 +257,7 @@ def _run_in_child(
 
     parent_conn.close()
 
-    if p.exitcode != 0 and success is None:
+    if p.exitcode != 0:
         raise RuntimeError(f"Child process exited with code {p.exitcode}")
 
     if success is False:
@@ -448,7 +449,7 @@ class TestBackToBackParity:
                 torch.testing.assert_close(
                     out_on,
                     out_off,
-                    atol=1e-5,
+                    atol=0.0,
                     rtol=0.0,
                     msg=(
                         f"pair {pair_idx}: tracker-on and tracker-off outputs differ — "

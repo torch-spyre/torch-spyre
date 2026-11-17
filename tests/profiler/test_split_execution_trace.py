@@ -276,7 +276,7 @@ def _run_in_child(
 
     parent_conn.close()
 
-    if p.exitcode != 0 and success is None:
+    if p.exitcode != 0:
         raise RuntimeError(f"Child process exited with code {p.exitcode}")
 
     if success is False:
