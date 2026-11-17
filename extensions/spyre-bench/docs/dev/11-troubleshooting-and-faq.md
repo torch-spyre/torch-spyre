@@ -122,11 +122,11 @@ The pack that registers the type is not loaded. Pass `--pack DIR` and list the p
 
 ### `error: selection is empty`
 
-Most often `--arch` is missing: a case whose Environment names an architecture is not selected without one. Next
+Most often `--arch` is missing or names another architecture: a case whose Environment names an architecture is only selected when `--arch` (default: the host's) matches it. Next
 suspects: a `--select`, `--tier` or `--suite` that matches nothing.
 
 ```bash validated
-spyre-bench plan --catalog examples/docs-benchmark --purpose pr --select smoke \
+spyre-bench plan --catalog examples/docs-benchmark --purpose pr --select smoke --arch s390x \
     --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan-none.json # exit=2
 spyre-bench plan --catalog examples/docs-benchmark --purpose pr --select nothing --arch x86_64 \
     --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan-none.json # exit=2
