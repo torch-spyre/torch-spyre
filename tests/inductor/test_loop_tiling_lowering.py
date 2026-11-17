@@ -54,6 +54,12 @@ from test_span_overflow_gate import (
 
 _SHAPE = (8, 8, 64, 512)
 
+# Device against CPU, both fp16 (the reference is not an fp32 one), with the tolerance
+# of ``test_solver_auto_coarse_tiling._assert_close``. A wrong tile or row is orders of
+# magnitude outside it (the bugs these tests pin return about 95% wrong elements), so
+# it is not widened to make anything pass.
+_TOLERANCE = {"atol": 0.1, "rtol": 0.05}
+
 
 def test_the_plan_types_are_frozen_and_hold_only_positions():
     """Nothing derivable from the live graph (kind, consumers, ranges, per-read
@@ -201,7 +207,6 @@ def test_a_reduction_with_reduction_tiling_disabled_is_refused():
 def test_a_partial_reduction_read_in_the_group_is_refused():
     """A pointwise op that reads a K-tiled reduction in the same loop would see a
     partial sum. The grouping never forms this group, so hand the builder one."""
-    seen = []
 
     def sum_then_its_consumer(operations, groups):
         (ops, levels), *_ = groups
@@ -221,10 +226,7 @@ def test_a_partial_reduction_read_in_the_group_is_refused():
     x = _shaped((64, 8192), 1)
     calls = []
     with _built_beside_the_legacy_planner(calls, regroup=sum_then_its_consumer):
-        try:
-            compile_span_overflow(fn, [x], 256 * 1024)
-        except Unsupported as error:  # the real grouping refuses first, or not
-            seen.append(error)
+        compile_span_overflow(fn, [x], 256 * 1024)
     assert calls, "the planner was never reached"
     (_, built, _), *_ = calls
     assert isinstance(built, Unsupported), built
@@ -466,7 +468,7 @@ def _allocator_post_call_state(lowering):
         mock.patch.object(passes, "CustomPreSchedulingPasses", Record),
     ):
         out = torch.compile(fn, fullgraph=True)(x.to(DEVICE_NAME), y.to(DEVICE_NAME))
-    torch.testing.assert_close(out.cpu(), fn(x, y), atol=0.1, rtol=0.05)
+    torch.testing.assert_close(out.cpu(), fn(x, y), **_TOLERANCE)
     return seen
 
 
@@ -695,7 +697,7 @@ def test_a_unit_row_consumer_in_the_next_nest_reads_every_row_of_a_copied_out_pr
         (x, y),
         lambda op: [halves] if _reads_graph_inputs_only(op) else [unit_rows],
     )
-    torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+    torch.testing.assert_close(device, cpu, **_TOLERANCE)
     _one_row_consumer_reads_the_whole_producer(infos, advances)
 
 
@@ -717,6 +719,93 @@ def test_a_unit_row_consumer_in_the_next_nest_reads_every_row_of_a_tiled_reducti
         (x,),
         lambda op: [reduced_halves] if _reads_graph_inputs_only(op) else [unit_rows],
     )
-    torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+    torch.testing.assert_close(device, cpu, **_TOLERANCE)
     assert any(any(info.loop_tiled_reduction_dims) for info in infos.values()), infos
     _one_row_consumer_reads_the_whole_producer(infos, advances)
+
+
+@expects_raise
+def test_an_unknown_lowering_setting_raises_instead_of_running_legacy():
+    """``config.patch`` can set a value the import-time check never saw; a typo must
+    not quietly select the legacy transform."""
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with (
+        config.patch({"loop_tiling_lowering": "plna"}),
+        pytest.raises(Exception, match="plna"),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+def _with_plan(rewrite):
+    """Patch ``build_loop_tiling_plan`` as the dispatch calls it, so ``rewrite(plan,
+    operations)`` can hand the lowering a plan the builder would not have made."""
+    from torch_spyre._inductor.wsr import loop_tiling_lowering as lowering
+
+    original = lowering.build_loop_tiling_plan
+
+    def build(operations, groups, group_idx_offset=0):
+        return rewrite(original(operations, groups, group_idx_offset), operations)
+
+    return mock.patch.object(lowering, "build_loop_tiling_plan", build)
+
+
+@expects_raise
+def test_a_trip_count_that_does_not_divide_the_tiled_range_is_refused():
+    """4096 and 1024 are not multiples of 3: the lowering says so before it divides
+    anything, instead of leaving a tile that is not a whole number of rows."""
+    import dataclasses
+
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import LoopTilingPlan
+
+    def trip_of_three(plan, operations):
+        return LoopTilingPlan(
+            tuple(dataclasses.replace(g, trip_count=3) for g in plan.groups)
+        )
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with (
+        _with_plan(trip_of_three),
+        config.patch({"loop_tiling_lowering": "plan"}),
+        pytest.raises(
+            Exception, match="lower_loop_tiling: .*not divisible by loop_count"
+        ),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+@expects_raise
+def test_a_loop_member_may_not_read_a_reductions_partial_result():
+    """The accumulator is complete only after the loop. A member of the loop that reads
+    the reduction's own buffer would see a partial sum on every trip but the last."""
+    import dataclasses
+
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import (
+        LoopTilingPlan,
+        OpTiling,
+    )
+
+    def add_the_reader(plan, operations):
+        (group,) = plan.groups
+        reduction = group.ops[0].op_name
+        names = {
+            o.get_name() for o in operations if o.get_operation_name() == reduction
+        }
+        reader = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer)
+            and o.get_operation_name() != reduction
+            and names & set(o.get_read_names())
+        )
+        ops = (*group.ops, OpTiling(reader.get_operation_name(), None))
+        return LoopTilingPlan((dataclasses.replace(group, ops=ops),))
+
+    x = _shaped((64, 8192), 1)
+    with (
+        _with_plan(add_the_reader),
+        config.patch({"loop_tiling_lowering": "plan"}),
+        pytest.raises(Exception, match="partial result"),
+    ):
+        compile_span_overflow(lambda x: x.sum(dim=1) * 2, [x], 256 * 1024)

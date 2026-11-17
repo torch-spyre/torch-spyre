@@ -2132,7 +2132,10 @@ def coarse_tile_post_stickify(
     """
     operations = graph.operations
 
-    if config.loop_tiling_lowering == "plan":
+    # Validated again here: the value is checked when the config module loads, but
+    # ``config.patch`` can set another one, which must not quietly run the legacy path.
+    lowering = config._choose_loop_tiling_lowering(config.loop_tiling_lowering)
+    if lowering == "plan":
         # Deferred: loop_tiling_lowering imports this module.
         from .loop_tiling_lowering import build_loop_tiling_plan, lower_loop_tiling
 

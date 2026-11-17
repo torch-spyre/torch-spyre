@@ -92,6 +92,11 @@ from .span_overflow_loop_terms import (
 
 logger = logging.getLogger(__name__)
 
+# The ops this lowering adds keep the names ``coarse_tile_copy_<buf>``,
+# ``coarse_tile_fill_<buf>`` and ``coarse_tile_combine_<buf>``. No source file keys on
+# those prefixes (comments mention them); 19 test files match them, so the names stay
+# until the legacy transform is deleted and the tests are rewritten together.
+
 
 @dataclass(frozen=True)
 class TiledDim:
@@ -256,6 +261,10 @@ def _tile_step(
     # The delta of the whole index over one trip, which must be a number: the
     # coefficient at one point is not the step of an index that is only partly affine
     # in the symbol (``d0 + 7*floor(d0/8)``), and a symbolic one (``d0*d1``) has none.
+    # The kernel reads the same advance back from the final index
+    # (``loop_facts._loop_coefficient``, which evaluates it at u = 0, 1, 2); for the
+    # ``step * u`` term added here the two agree by construction, and the parity tests
+    # check that they agree on real graphs.
     delta = sympy.simplify(dep.index.subs(symbol, symbol + extent) - dep.index)
     if delta.free_symbols:
         raise Unsupported(
@@ -487,7 +496,8 @@ def _insert_fill(
     fill_buf.operation_name = fill_name
     # Its write is read only by the next trip's combine: a dependency across
     # iterations that the pre-unroll IR does not show, so dead-code elimination
-    # would drop it.
+    # would drop it. The attribute keeps its legacy name because ``patches.py`` reads
+    # it (the scheduler's dead-node check); it is live code, not a leftover.
     fill_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
     V.graph.name_to_buffer[fill_name] = fill_buf
     at = operations.index(accum)

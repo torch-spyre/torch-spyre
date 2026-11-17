@@ -218,6 +218,10 @@ def _per_level_advance(
 def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
     """The coefficient of the loop variable ``variable`` in ``index``.
 
+    (The lowering computes the step it writes into the index separately, as the delta
+    of the undivided index over one trip: ``wsr.loop_tiling_lowering._tile_step``. This
+    reads that term back from the final index.)
+
     ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
     returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
     variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
