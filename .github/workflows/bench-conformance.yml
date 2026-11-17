@@ -45,7 +45,7 @@ jobs:
       - name: Install the engine and the ingest
         run: |
           uv venv
-          uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml pytest
+          uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml pytest jsonschema
       - name: Validate, check ids, run the tests
         run: |
           export PATH="${GITHUB_WORKSPACE}/.venv/bin:${PATH}"
