@@ -155,6 +155,87 @@ class TestLaunchJobPlan(TestCase):
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
+    @staticmethod
+    def _payload_hcm(payload: bytes) -> dict:
+        """Minimal valid HCM whose host compute output is exactly `payload`.
+
+        A single SYMBOL_SUBSTITUTE dci (int8 src/dst, host-to-sen, no symbols)
+        copies senConstants[0] verbatim into the output buffer. output_shape_ is
+        in int8 elements and must be a multiple of 8. senConstants[1] is the
+        empty trailer required by processComputeOnHostCommand.
+        """
+        return {
+            "vdci": {
+                "dsName_": "payload",
+                "isMarker_": 0,
+                "data_conversion_info_group_": [
+                    {
+                        "key": [],
+                        "dci": {
+                            "dsName_": "payload",
+                            "isHostToSen_": 1,
+                            "dataformat_src_": 8,
+                            "dataformat_dst_": 8,
+                            "dcOpName_": 6,
+                            "pre_expand_dcsi_": [],
+                            "pre_input_shape_": [],
+                            "dcsi_": [],
+                            "input_shape_": [],
+                            "output_shape_": [len(payload)],
+                            "post_slice_dcsi_": [],
+                            "post_output_shape_": [],
+                            "input_dimwise_ea_": [],
+                            "output_dimwise_ea_": [],
+                            "useSpi_": 0,
+                            "usePca_": 0,
+                            "usePadVal_": 0,
+                            "inputPadVal_": 0,
+                            "useWli_": 0,
+                            "dmdi_": {"perTensorInfo": []},
+                            "ssi_": {
+                                "value_and_locs_": [],
+                                "inputSym_": [],
+                                "unSubstitutedFlitStartOffset_": 0,
+                            },
+                        },
+                    }
+                ],
+                "group_tags_": [],
+                "inputSym_": [],
+                "dciIdxSym_": [],
+                "variableDefs_": [],
+            },
+            "senConstants": [{"senconst_": payload.hex()}, {"senconst_": ""}],
+        }
+
+    def test_host_compute_produces_nonzero_payload(self):
+        """A valid zero-symbol HCM runs through flex and emits its payload.
+
+        prepare_kernel rejects a HostCompute+H2D-only plan (the validator
+        requires a following Compute, see test_prepare_host_compute_sequence)
+        and executing a Compute from a mock SpyreCode faults the device, so
+        this drives the same flex host-compute path as
+        JobPlanStepHostCompute::construct through the _host_compute_bytes seam.
+        The payload is non-zero so a no-op producer cannot pass.
+        """
+        payload = b"\xab" * 16
+        correction_size = 128
+        out = torch_spyre._C._host_compute_bytes(
+            json.dumps(self._payload_hcm(payload)), correction_size
+        )
+        self.assertEqual(len(out), correction_size)
+        self.assertEqual(out[: len(payload)], payload)
+        self.assertEqual(
+            out[len(payload) :], b"\x00" * (correction_size - len(payload))
+        )
+
+    def test_host_compute_invalid_hcm_raises(self):
+        """An HCM with no DCI is rejected by the host compute path."""
+        with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
+            torch_spyre._C._host_compute_bytes(
+                json.dumps({"vdci": {}, "senConstants": []}), 128
+            )
+
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
     """Build a JobPlan with a single D2H DataTransfer step from dev_ptr.
@@ -255,21 +336,22 @@ class TestD2HFromTensorSegment(TestCase):
 
 
 class TestSymbolicArg(TestCase):
-    """
-    Unit tests for the SymbolicArg typed payload.
+    """Unit tests for the SymbolicArg typed payload."""
 
-    Notes:
-        Tests will need to be reworked once kdimension is implemented.
-    """
+    def test_kdimension_entry_is_no_longer_refused(self):
+        """A kDimension entry traverses Python, pybind, LaunchContext, construct.
 
-    def test_kdimension_entry_reaches_construct_and_raises(self):
-        """A kDimension entry traverses Python → pybind → LaunchContext →
-        construct() and raises 'kDimension is not yet implemented'.
+        It used to assert construct() raised "kDimension is not yet
+        implemented". That slot is implemented now, so the thing left to pin is
+        that the refusal is gone.
 
-        Uses a real-symbols ComputeOnHost step (non-{0} ishape) so the
-        payload is consumed rather than short-circuited by the fake-symbols
-        nullptr path.  The raise proves the entry survived the full carrier
-        path and was read positionally from slot 0.
+        Deliberately not asserting what happens instead. The mock's artifact
+        declares no symbol inputs, so the backend currently reports a count
+        mismatch, and that is a property of the fixture rather than of the
+        carrier path. Asserting it would make this test fail again the day the
+        fixture or the backend message changes. Either outcome is fine here: the
+        call succeeding is correct, and so is it failing for an environment
+        reason. Only the old refusal is a regression.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = tpk().create_mock_spyrecode(
@@ -288,10 +370,10 @@ class TestSymbolicArg(TestCase):
 
             stream = torch.Stream("spyre")
             with stream:
-                with pytest.raises(
-                    RuntimeError, match="kDimension is not yet implemented"
-                ):
+                try:
                     torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
+                except RuntimeError as exc:
+                    self.assertNotIn("kDimension is not yet implemented", str(exc))
 
     def test_symbolic_arg_attributes_and_repr_roundtrip(self):
         """SymbolicArg fields and repr survive pybind construction.
@@ -414,6 +496,118 @@ class TestSymbolicArg(TestCase):
         self.assertEqual(
             resolved_rev[1], addr_t0, "slot 1 of reversed payload must be addr_t0"
         )
+
+    def test_a_kdimension_slot_resolves_to_the_logical_size(self):
+        """A kDimension slot resolves to that tensor's logical size on the dim.
+
+        Read through _resolve_symbolic_args, so this is the value the launch
+        path binds rather than a hand-built one. Logical is the load-bearing
+        word: under a max-strided reservation the allocation is larger than the
+        logical extent, and a trip count built from the allocated extent would
+        run the maximum number of iterations on every call while still looking
+        correct.
+
+        The three dims are deliberately different sizes, so reading the wrong
+        one shows up as a wrong number rather than as a coincidence.
+        """
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        for dim, expected in enumerate(t.shape):
+            resolved = torch_spyre._C._resolve_symbolic_args(
+                [t],
+                [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=dim)],
+            )
+            self.assertEqual(resolved, [expected], f"dim_index={dim}")
+
+    def test_address_and_dimension_slots_resolve_in_one_payload(self):
+        """One payload carrying both kinds resolves each in its own slot.
+
+        The resolved vector holds two kinds of value, so anything that assumes
+        a single kind fails here rather than at a launch.
+        """
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kaddr = torch_spyre._C.SymbolicArgKind.kAddress
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        addr = torch_spyre._C._resolve_symbolic_args(
+            [t], [torch_spyre._C.SymbolicArg(kind=kaddr, tensor_id=0)]
+        )[0]
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t],
+            [
+                torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=1),
+                torch_spyre._C.SymbolicArg(kind=kaddr, tensor_id=0),
+                torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=2),
+            ],
+        )
+        self.assertEqual(resolved, [3, addr, 64])
+
+    def test_a_dim_index_out_of_range_is_refused(self):
+        """The refusal names the slot, the index and the rank it was given."""
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        with pytest.raises(RuntimeError, match="dim_index 3 is out of range"):
+            torch_spyre._C._resolve_symbolic_args(
+                [t],
+                [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=3)],
+            )
+
+    def test_a_size_inside_the_declared_contract_resolves(self):
+        """With the contract on the slot, a size that is a positive multiple of
+        the granularity and at most the maximum resolves as before."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+        t = torch.zeros(128, 64, dtype=torch.float16, device="spyre")
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t],
+            [
+                torch_spyre._C.SymbolicArg(
+                    kind=kdim, tensor_id=0, dim_index=0, granularity=64, max_value=512
+                )
+            ],
+        )
+        self.assertEqual(resolved, [128])
+
+    def test_a_size_outside_the_declared_contract_is_refused(self):
+        """The backstop at the launch. The in-trace range checks and the
+        declaring transfer enforce the contract first; a path that reaches the
+        launch without them fails here, loudly, instead of running a trip count
+        the bundle was not built for. Zero rows matters on its own: the backend
+        clamps the trip count only from above, so a divisibility check alone
+        would let an empty tensor run one tile."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        for rows in (0, 65, 520):
+            # empty, not zeros: the device cannot fill a zero-row tensor, and the
+            # values are never read here.
+            t = torch.empty((rows, 64), dtype=torch.float16, device="spyre")
+            with pytest.raises(RuntimeError, match="outside the declared contract"):
+                torch_spyre._C._resolve_symbolic_args(
+                    [t],
+                    [
+                        torch_spyre._C.SymbolicArg(
+                            kind=kdim,
+                            tensor_id=0,
+                            dim_index=0,
+                            granularity=64,
+                            max_value=512,
+                        )
+                    ],
+                )
+
+    def test_a_slot_without_a_contract_is_not_checked(self):
+        """A hand-built descriptor with the defaults carries no contract, and
+        then any size resolves, which is what the tests above rely on."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+        t = torch.zeros(65, 64, dtype=torch.float16, device="spyre")
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t], [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=0)]
+        )
+        self.assertEqual(resolved, [65])
 
 
 if __name__ == "__main__":

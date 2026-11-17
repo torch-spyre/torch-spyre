@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One dispatch, upserted on every state change; written only by the dispatcher.",
+  "properties": {
+    "artifact_id": {
+      "minLength": 1
+    },
+    "attempts": {},
+    "build_url": {},
+    "dispatch_id": {
+      "minLength": 1
+    },
+    "dispatcher_url": {},
+    "error": {},
+    "event_key": {},
+    "event_ts": {},
+    "event_type": {},
+    "next_attempt_at": {},
+    "params": {},
+    "payload": {},
+    "props": {},
+    "request_id": {},
+    "requested_at": {},
+    "requested_by": {
+      "enum": [
+        "auto",
+        "pipeline",
+        "user"
+      ]
+    },
+    "requester": {},
+    "state": {
+      "enum": [
+        "failed",
+        "queued",
+        "skipped",
+        "triggered"
+      ]
+    },
+    "subscription_id": {
+      "minLength": 1
+    },
+    "tag": {},
+    "target": {},
+    "target_type": {
+      "enum": [
+        "",
+        "gha_dispatch",
+        "jenkins",
+        "webhook"
+      ]
+    },
+    "target_url": {},
+    "updated_at": {}
+  },
+  "required": [
+    "dispatch_id",
+    "updated_at",
+    "subscription_id",
+    "artifact_id",
+    "event_type",
+    "event_key",
+    "tag",
+    "event_ts",
+    "requested_by",
+    "requester",
+    "request_id",
+    "requested_at",
+    "state",
+    "target_type",
+    "target",
+    "params",
+    "payload",
+    "target_url",
+    "build_url",
+    "error",
+    "attempts",
+    "next_attempt_at",
+    "dispatcher_url",
+    "props"
+  ],
+  "title": "artifact_dispatches: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

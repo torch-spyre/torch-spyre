@@ -51,8 +51,8 @@ demanded by that layer's type system:
 
 | Layer | Loop identity | Form |
 |---|---|---|
-| 1, pre-scheduling IR pass | `loop_info: CoarseTileInfo` on `ir.Operation` | Per-op tag |
-| 2, scheduler | `CountedLoopSchedulerNode` | Perimeter wrapper |
+| 1, pre-scheduling IR pass | `loop_info: CoarseTileInfo` on `ir.Operation`, with the loop's ops wrapped in a `LoopNode` | Per-op tag plus a structural node |
+| 2, scheduler | `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) | Perimeter wrapper |
 | 3, codegen output | `LoopSpec` | Serializable tree node |
 
 :::{figure} ../_static/images/coarse-tiling-layers.svg
@@ -62,11 +62,13 @@ demanded by that layer's type system:
 
 The three layers, from the pre-scheduling IR pass through the pre-fusion
 scheduler pass to codegen. Layer 1 stamps `loop_info` (`CoarseTileInfo`) on
-each `ir.Operation` and divides the tiled dimension by `K`. Layer 2 wraps
-each run of ops that shares a `loop_group_id` in a
-`CountedLoopSchedulerNode`, which is opaque to Inductor fusion. Layer 3
-drives `SpyreKernel` for the inner ops and wraps their `OpSpec`s in a
-`LoopSpec` that serializes to an `scf.for` with late-bound addresses.
+each `ir.Operation`, divides the tiled dimension by `K`, and wraps the loop's
+ops in a `LoopNode` so the loop is a structural unit from the first pass after
+the splice. Layer 2 hands each `LoopNode` to Inductor's scheduler as one
+`LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass), which is opaque to
+Inductor fusion. Layer 3 drives `SpyreKernel` for the inner ops and wraps their
+`OpSpec`s in a `LoopSpec` that serializes to an `scf.for` with late-bound
+addresses.
 :::
 
 ## Small Example
@@ -163,6 +165,27 @@ empty `tiled_dims_per_read` entry, `tiled_dims_per_read=[[[]],
 construction; there is no full-size buffer to divide down; the read is
 loop-invariant with respect to the tiling dimension the same way an
 already-tile-local read is in the span-overflow path.
+
+### `LoopNode`: the loop as a structural unit
+
+The final step of `splice_while_loops` is `collapse` (`loop_node.py`), which
+wraps each loop's ops in a `LoopNode` (nested for a nested loop). A `LoopNode`
+is one `ir.Operation` held in `graph.operations`; its `body` holds the ordinary
+ops and any nested `LoopNode`s, and it carries the per-loop facts (induction
+variable, trip count, carries). `loop_info` stays on the leaf ops; the node
+adds the loop structure and those facts without changing the leaf ops. So from
+the first pass after the splice, the loop is a structural unit in the IR.
+
+Pre-scheduling passes that know nothing about loop nodes run against an
+`OpsView`, which iterates the leaf ops in program order and forwards every
+mutation to the list that owns the op. The nested nodes therefore survive the
+whole pass pipeline. The one exception is `dedup_and_promote_constants`, which
+runs against an expanded (flattened) list. At the hand-off to the scheduler,
+`peel_non_members` moves any op a pass left at a body edge without the loop's
+`loop_info` back out of the node, and each `LoopNode` becomes one
+`LoopSchedulerNode` (gated by `loop_scheduler_supported()`; `SCHEDULE_LOOP_NODES`
+defaults to true). Building the nodes is gated by `BUILD_LOOP_NODES`, which
+defaults to true and is set false only by a no-behaviour-change test.
 
 ### The single-level `graph.operations` dump
 
@@ -753,6 +776,8 @@ self.passes = [
     #
     # Tensor Layout (Stickification)
     split_multi_ops,
+    apply_loop_carries,            # makes each declared for_each_tile carry's
+                                   # update an in-place write of its storage
     propagate_spyre_tensor_layouts,
     validate_ops,
     optimize_restickify_locations,
@@ -803,6 +828,15 @@ span arithmetic, so it runs before everything else. `_maybe_coarse_tile_span_ove
 post-stickification slot below, because span arithmetic needs
 `FixedTiledLayout.device_layout` (device size, stride map), which does not
 exist yet pre-stickification.
+
+**Span-overflow and the allocator's tiling take one loop level per group.**
+A group whose `levels` has more than one entry raises `Unsupported`
+("nested loop tiling is not supported in this release", #6088) from
+`reject_nested_loops`, called by `_maybe_coarse_tile_span_overflow` and
+`apply_tilings` before `coarse_tile_post_stickify`. The transform itself still
+accepts several levels and is driven that way by its unit tests; the refusal
+is there for the lowering that replaces it, which is not built yet. A
+`for_each_tile` nest never reaches it.
 
 **Must run after stickify and padding.**  `insert_bmm_padding` (which runs
 before stickification so the padded buffer is laid out like any other),
@@ -1041,7 +1075,15 @@ that `TensorArg` (the base address is fixed across iterations);
 `loop_count`, and `loop_tiled_dims`) as the original op, so the scheduler
 wraps both in the same `CountedLoopSchedulerNode`.  The `tiled_symbols` / `affine.apply`
 machinery computes the per-iteration slice offset automatically.  All
-outside consumers are patched to read the full buffer.
+outside consumers are patched to read the full buffer, and each one's load
+index is derived from the full buffer's layout while its `inner_fn` is
+traced (`_ReadThroughLayout` in `loop_tiling_common.py`): the producer's
+layout object, which `_divide_ranges` shrank to the tile and which the
+consumer's loader is bound to, presents the full buffer's host shape for the
+duration of the trace.  A downstream nest therefore shares nothing with this
+one but the full buffer in HBM.  In particular a dim the tile consumed whole,
+which has size 1 in the tile and so gets no term in an index traced against
+it, keeps its term.
 
 Beyond closing the post-stickify safety gap described above, splitting the
 crossing into two ops buys two more things for free, because the copy op is
@@ -1397,6 +1439,16 @@ output (the `carry` slot, see `working_set_reduction.md`) is exactly this
 case, and it is supported, not rejected.
 
 ## Layer 2: `CountedLoopSchedulerNode`
+
+A `for_each_tile` loop enters the scheduler as a `LoopSchedulerNode`
+(`loop_scheduler.py`), the subclass of `CountedLoopSchedulerNode` that carries
+the loop's `LoopNode` through the scheduler's dependency analysis and
+topological sorts via per-compile patches on Inductor's `Scheduler`. Because a
+`LoopSchedulerNode` is a `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`
+passes it through unchanged, and fusion, kernel preparation, HBM-pool planning,
+and codegen all operate on the counted loop described below. The rest of this
+section describes `CountedLoopSchedulerNode`, which the span-overflow path
+builds directly from the flat ops' `loop_info`.
 
 ### Class definition
 
@@ -1822,6 +1874,8 @@ landed.
 | File | Role |
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
+| `torch_spyre/_inductor/loop_node.py` | Layer 1: `LoopNode` structural node; `collapse` wraps each loop's ops, `OpsView` presents the body flat to passes, `expand`/`peel_non_members` for the scheduler hand-off |
+| `torch_spyre/_inductor/loop_scheduler.py` | Layer 2: `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) and the per-compile `Scheduler` patches; `SCHEDULE_LOOP_NODES`, `loop_scheduler_supported` |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile_post_stickify()` stamps `loop_info` and rewrites ranges; `_plan_tiling_propagation` plus the `_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
 | `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `prepare_kernel`, `_codegen_loop_body`, `_regroup_by_outer_loop_key` |
@@ -1832,7 +1886,7 @@ landed.
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager (`work_div` and the named-dim keys; the removed tiling keys raise `ValueError`); `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/wsr/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
 | `torch_spyre/_inductor/wsr/for_each_tile.py` | `for_each_tile()` frontend: thin wrapper over `torch._higher_order_ops.scan.scan`; `Gather`/`Kind`/`TileSpec` types |
-| `torch_spyre/_inductor/wsr/for_each_tile_lowering.py` | Layer 1 (for_each_tile path): `try_prove_for_each_tile`/`_extract_trip_count` prove the static trip count; `splice_while_loops` splices the traced `ir.WhileLoop` body into `graph.operations` and calls `_stamp_direct_loop_info` |
+| `torch_spyre/_inductor/wsr/for_each_tile_lowering.py` | Layer 1 (for_each_tile path): `try_prove_for_each_tile`/`_extract_trip_count` prove the static trip count; `splice_while_loops` splices the traced `ir.WhileLoop` body into `graph.operations`, calls `_stamp_direct_loop_info`, and ends by calling `collapse` to wrap the loop's ops in a `LoopNode` |
 | `torch_spyre/_inductor/wsr/while_loop_bridge.py` | Carry-rewiring for `for_each_tile`'s accumulator (`carry`) outputs, the true-recurrence mechanism |
 | `tests/inductor/test_coarse_tiling.py` | Unit tests: IR pass, propagation, scheduler node, bundle MLIR output |
 | `docs/tools/capture_for_each_tile_ir.py` | Regenerates this doc's for_each_tile Small Example snippets from real compiler output |
@@ -1953,6 +2007,10 @@ Call sites, all following this exact shape:
 - `_patch_consumers` (in `coarse_tile.py`, `NameSwapHandler` imported
   from `insert_restickify.py`), patches an outside consumer's `inner_fn` to
   read the newly-promoted full buffer instead of the original tile-sized one.
+  For a copy-out it also traces the consumer with the producer's layout
+  presenting the full buffer's shape (`_ReadThroughLayout`), so the index is
+  the full buffer's by construction; for a reduction accumulator it rescales
+  the tile-traced index instead (`_NameAndIndexSwapHandler`).
 - `_patch_retiled_load_indexes` / `_RetileLoadIndexHandler`
   (both in `coarse_tile.py`), a distinct
   mechanism from name-swapping, detailed in the next subsection.

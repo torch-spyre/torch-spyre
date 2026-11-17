@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "one benchmark's measurements on one backend. Identity fields ride in the row; ids are derived.",
+  "properties": {
+    "rows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "backend": {
+            "description": "spyre, cpu, ...: the axis two runs of one benchmark compare across. Not identity.",
+            "type": "string"
+          },
+          "identity": {
+            "description": "Which props are identity. Omitted: all of them. [] : the name alone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "iterations": {
+            "description": "The n behind a pre-averaged number.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "measurements": {
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ]
+            },
+            "description": "metric -> a number or a list of samples.",
+            "minProperties": 1,
+            "type": "object"
+          },
+          "name": {
+            "description": "The benchmark's name; part of its identity.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "props": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "description": "Describe the benchmark. Every prop is identity unless `identity` lists a subset.",
+            "type": "object"
+          },
+          "run_props": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "description": "Describe this run of the benchmark (never identity).",
+            "type": "object"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "measurements"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "rows"
+  ],
+  "title": "benchmark_runs upload file: results/benchmark_runs.json",
+  "type": "object"
+}

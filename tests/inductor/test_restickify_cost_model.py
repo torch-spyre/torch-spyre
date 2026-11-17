@@ -24,7 +24,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
-from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor import cost_features as dcm
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
@@ -64,6 +64,72 @@ def restickify(sb=8, sx=1, *, b=8, x=128, n=1024, trips=1):
 )
 def test_source_run_matches_measured_dma_burst(sb, sx, expected):
     assert run_bytes(sb, sx) == expected
+
+
+@pytest.mark.parametrize("stick_planes", [False, True])
+def test_a_feature_memo_changes_no_device_run(stick_planes):
+    """Inside :func:`dcm.feature_memo` the division-independent axes are reused;
+    every run must still be what an unscoped call returns."""
+    access = (
+        [N, B, sympy.floor(X / 64), sympy.Mod(X, 64)],
+        [33280, 8, 2, 64],
+        {B: 8, X: 128, N: 1024},
+    )
+    divisions = [{B: sb, X: sx, N: 1} for sb in (1, 2, 4, 8) for sx in (1, 2)]
+    plain = [
+        dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+        for d in divisions
+    ]
+    with dcm.feature_memo():
+        scoped = [
+            dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+            for d in divisions
+        ]
+    assert scoped == plain
+
+
+def test_a_feature_memo_derives_an_access_once_and_only_inside(monkeypatch):
+    """The axes of one access are derived once per scope however many
+    divisions ask, a nested scope shares the outer one, and outside any scope
+    nothing is kept."""
+    calls = []
+    real = dcm._device_run_axes
+
+    def counted(*args):
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(dcm, "_device_run_axes", counted)
+    with dcm.feature_memo():
+        run_bytes(8, 1)
+        run_bytes(4, 2)
+        with dcm.feature_memo():
+            run_bytes(2, 1)
+    assert len(calls) == 1
+    run_bytes(8, 1)
+    run_bytes(8, 1)
+    assert len(calls) == 3
+
+
+def test_reads_are_memoized_only_inside_a_feature_memo():
+    """The post-pass report extracts after every pass, and not every pass that
+    rewrites an op's loads drops the planner's memo of them; outside a scope
+    the reads are re-derived, so a stale memo never reaches the report."""
+
+    class Op:
+        def __init__(self):
+            self.reads = "first"
+
+        def get_read_writes(self):
+            return self.reads
+
+    op = Op()
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"
+    op.reads = "rewritten"  # in place, without invalidate_op_read_writes
+    assert dcm._read_writes(op) == "rewritten"
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"  # the planner's memo, by design
 
 
 def test_geometry_keeps_symbolic_splits_and_physical_gaps():
@@ -320,7 +386,7 @@ def test_serialization_defaults_and_roundtrip():
 @pytest.mark.parametrize("n,trips", [(1024, 1), (1024, 128), (16384, 1)])
 def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     sb, sx = sympy.symbols("split_b split_x", integer=True, positive=True)
     expr = sympy.sympify(cm.predict_ops([restickify(sb, sx, n=n, trips=trips)]))
@@ -351,15 +417,19 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):
+    _src_ds = [33280, 8, 2, 64]
     src = SpyreTensorLayout(
-        device_size=[33280, 8, 2, 64],
+        device_size=_src_ds,
         stride_map=[1024, 128, 64, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 33280, (1,): 8, (2, 3): 128},
     )
+    _dst_ds = [8, 16, 128, 64]
     dst = SpyreTensorLayout(
-        device_size=[8, 16, 128, 64],
+        device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 8, (1, 3): 1024, (2,): 128},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -394,7 +464,7 @@ def staged_transport_graph():
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
-    def layout(shape, strides, device_size, stride_map):
+    def layout(shape, strides, device_size, stride_map, valid_elements):
         return FixedTiledLayout(
             device,
             torch.float16,
@@ -404,6 +474,7 @@ def staged_transport_graph():
                 device_size=device_size,
                 stride_map=stride_map,
                 device_dtype=DataFormats.SEN169_FP16,
+                valid_elements=valid_elements,
             ),
         )
 
@@ -411,13 +482,21 @@ def staged_transport_graph():
         source = InputBuffer(
             name="input",
             layout=layout(
-                [32768, 8, 128], [1024, 128, 1], [32768, 8, 2, 64], [1024, 128, 64, 1]
+                [32768, 8, 128],
+                [1024, 128, 1],
+                [32768, 8, 2, 64],
+                [1024, 128, 64, 1],
+                {(0,): 32768, (1,): 8, (2, 3): 128},
             ),
         )
         stage = ComputedBuffer(
             name="stage",
             layout=layout(
-                [1024, 8, 128], [1024, 128, 1], [8, 2, 1024, 64], [128, 64, 1024, 1]
+                [1024, 8, 128],
+                [1024, 128, 1],
+                [8, 2, 1024, 64],
+                [128, 64, 1024, 1],
+                {(0,): 8, (1, 3): 128, (2,): 1024},
             ),
             data=Pointwise(
                 device=device,
@@ -433,6 +512,7 @@ def staged_transport_graph():
                 [131072, 1024, 1],
                 [8, 16, 128, 64],
                 [131072, 64, 1024, 1],
+                {(0,): 8, (1, 3): 1024, (2,): 128},
             ),
             data=Pointwise(
                 device=device,

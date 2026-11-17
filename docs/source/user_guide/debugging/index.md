@@ -94,11 +94,10 @@ The following environment variables control the level of diagnostic output:
 | `TORCH_SPYRE_DEBUG=1` | Logs all CPU↔Spyre data transfers, including tensor shapes, layouts, and raw values |
 | `TORCH_COMPILE_DEBUG=1` | Writes intermediate compiler artifacts to a local directory for offline inspection |
 | `TORCH_SPYRE_FFDC=1` | Captures an [FFDC](../profiling/ffdc.md) JSON report on frontend-compile / backend-compile / runtime / unimplemented failures. Separate from `USE_SPYRE_PROFILER` (profiler build flag); not set by default on pods. |
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated.* Use `TORCH_LOGS="torch_spyre.inductor"` instead (INFO level) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="+torch_spyre.inductor"` instead (DEBUG level) |
-| `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
+| `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
+| `SPYRE_VALIDATE_EVERY_PASS=1` | Check that `graph.operations` is topologically ordered after every pre-scheduling pass, and name the pass that broke the order. The check after the last pass always runs; when it fails, its error asks for this. Off by default because it re-extracts every operation's read set after every pass |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 To find an operation that silently ran on the host, promote its warning to an
@@ -173,8 +172,8 @@ if report is not None:
     print(report["_report_path"])
 ```
 
-See the [FFDC guide](../profiling/ffdc.md) for report locations,
-artifact interpretation, and pod/CI workflow.
+See the [FFDC guide](../profiling/ffdc.md) for the retrieve workflow,
+report schema, per-category triage, and pod/CI usage.
 
 ---
 

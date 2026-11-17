@@ -116,6 +116,51 @@ class TestInvokeSubgraphSplit(unittest.TestCase):
             f"{[n.name for n in seen_hops[0]]}",
         )
 
+    def test_region_transposed_intermediate_layout(self):
+        """A transposed intermediate passed into a reused region must keep its
+        device layout, not one rebuilt from its host strides.
+
+        x.t() * 1.0 produces a buffer with strides [1, 128] -- the stick
+        dimension is dim 0, not the default dim 1.  Before the fix,
+        propagate_spyre_tensor_layouts fell through to the host-stride fallback
+        for invoke_subgraph inputs (hasattr(op, "operands") was always True but
+        op.operands was None), and the rebuilt layout placed the stick on the
+        wrong dimension, giving ~81% wrong values with no error raised.
+        """
+
+        @nested_compile_region
+        def r(h):
+            return h + 1.0
+
+        def outer(x):
+            # Two calls: a single call is inlined and no invoke_subgraph remains.
+            return r(r(x.t() * 1.0))
+
+        seen_hops = []
+
+        def backend(gm, example_inputs):
+            seen_hops.append(
+                [
+                    n
+                    for n in gm.graph.nodes
+                    if "invoke_subgraph" in str(getattr(n, "target", ""))
+                ]
+            )
+            from torch._inductor.compile_fx import compile_fx
+
+            return compile_fx(gm, example_inputs)
+
+        x = torch.randn(64, 128, dtype=torch.float16, device=DEVICE_NAME)
+        compiled = torch.compile(outer, backend=backend, dynamic=False, fullgraph=True)
+        out = compiled(x)
+
+        self.assertGreaterEqual(
+            len(seen_hops[0]),
+            2,
+            f"expected two invoke_subgraph calls, got {[n.name for n in seen_hops[0]]}",
+        )
+        torch.testing.assert_close(out.cpu(), outer(x.cpu()), atol=0.1, rtol=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

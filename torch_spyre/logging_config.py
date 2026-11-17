@@ -16,10 +16,9 @@
 
 This module provides a centralized logging configuration system that:
 1. Parses TORCH_LOGS environment variable for spyre.* namespaces
-2. Maintains backward compatibility with legacy environment variables
-3. Exposes configuration to C++ via pybind11
-4. Provides programmatic API for runtime configuration
-5. Configures hierarchical Python logging handlers for the spyre namespace
+2. Exposes configuration to C++ via pybind11
+3. Provides programmatic API for runtime configuration
+4. Configures hierarchical Python logging handlers for the spyre namespace
 """
 
 import logging
@@ -91,8 +90,7 @@ def _normalize_component(component: str) -> str:
         "torch_spyre"                 -> "spyre"
         "torch_spyre.inductor.passes" -> "spyre.inductor.passes"
 
-    The legacy bare ``spyre.*`` spelling is returned unchanged for
-    backward compatibility.
+    The bare ``spyre.*`` spelling is returned unchanged.
     """
     if component == "torch_spyre" or component.startswith("torch_spyre."):
         return "spyre" + component[len("torch_spyre") :]
@@ -145,12 +143,10 @@ def _parse_torch_logs() -> Dict[str, LogLevel]:
     return config
 
 
-def _parse_legacy_vars() -> Dict[str, LogLevel]:
-    """Parse legacy environment variables with deprecation warnings.
+def _parse_env_vars() -> Dict[str, LogLevel]:
+    """Parse environment variables with deprecation warnings.
 
-    Legacy variables:
-    - SPYRE_INDUCTOR_LOG=1
-    - SPYRE_INDUCTOR_LOG_LEVEL=DEBUG
+    Deprecated variables:
     - TORCH_SPYRE_DEBUG=1
     - SPYRE_LOG_FILE=/path/to/file.log
 
@@ -161,21 +157,6 @@ def _parse_legacy_vars() -> Dict[str, LogLevel]:
 
     config: Dict[str, LogLevel] = {}
 
-    if os.environ.get("SPYRE_INDUCTOR_LOG") == "1":
-        warnings.warn(
-            "SPYRE_INDUCTOR_LOG is deprecated. Use TORCH_LOGS='spyre.inductor:INFO' instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        level_str = os.environ.get("SPYRE_INDUCTOR_LOG_LEVEL", "INFO")
-        try:
-            level = getattr(LogLevel, level_str.upper())
-            config["spyre.inductor"] = level
-            _config_source["spyre.inductor"] = "legacy:SPYRE_INDUCTOR_LOG"
-        except AttributeError:
-            config["spyre.inductor"] = LogLevel.INFO
-            _config_source["spyre.inductor"] = "legacy:SPYRE_INDUCTOR_LOG"
-
     if os.environ.get("TORCH_SPYRE_DEBUG") == "1":
         warnings.warn(
             "TORCH_SPYRE_DEBUG is deprecated. Use TORCH_LOGS='spyre:DEBUG' instead.",
@@ -185,18 +166,18 @@ def _parse_legacy_vars() -> Dict[str, LogLevel]:
         for component in DEFAULT_LOG_LEVELS:
             if component not in config:
                 config[component] = LogLevel.DEBUG
-                _config_source[component] = "legacy:TORCH_SPYRE_DEBUG"
+                _config_source[component] = "env:TORCH_SPYRE_DEBUG"
 
-    legacy_log_file = os.environ.get("SPYRE_LOG_FILE")
-    if legacy_log_file:
+    log_file = os.environ.get("SPYRE_LOG_FILE")
+    if log_file:
         warnings.warn(
             "SPYRE_LOG_FILE is deprecated. It is mapped to the top-level "
-            "'spyre' logger file handler for backward compatibility.",
+            "'spyre' logger file handler.",
             DeprecationWarning,
             stacklevel=3,
         )
-        _log_file_path = legacy_log_file
-        _log_file_source = "legacy:SPYRE_LOG_FILE"
+        _log_file_path = log_file
+        _log_file_source = "env:SPYRE_LOG_FILE"
 
     return config
 
@@ -206,7 +187,7 @@ def _resolve_config() -> Dict[str, LogLevel]:
 
     Priority order:
     1. TORCH_LOGS
-    2. Legacy environment variables
+    2. Environment variables
     3. Programmatic API (applied later)
     4. Defaults
 
@@ -215,8 +196,8 @@ def _resolve_config() -> Dict[str, LogLevel]:
     """
     config = DEFAULT_LOG_LEVELS.copy()
 
-    legacy_config = _parse_legacy_vars()
-    config.update(legacy_config)
+    env_config = _parse_env_vars()
+    config.update(env_config)
 
     torch_logs_config = _parse_torch_logs()
     config.update(torch_logs_config)
@@ -228,8 +209,7 @@ def _resolve_config() -> Dict[str, LogLevel]:
     # 'spyre.inductor.codegen.superdsc' resolve to the user-specified level.
     explicit_sources = {
         "TORCH_LOGS",
-        "legacy:SPYRE_INDUCTOR_LOG",
-        "legacy:TORCH_SPYRE_DEBUG",
+        "env:TORCH_SPYRE_DEBUG",
     }
     for component in list(config):
         if _config_source.get(component, "default") not in explicit_sources:
@@ -528,7 +508,8 @@ def get_config_source(component: str) -> str:
         component: Component name
 
     Returns:
-        Source name: "TORCH_LOGS", "legacy", "programmatic", or "default"
+        Source name: "TORCH_LOGS", "env:TORCH_SPYRE_DEBUG",
+            "programmatic", or "default"
     """
     if not _initialized:
         initialize()

@@ -23,7 +23,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
-#include <flex/telemetry/trace_context.hpp>
+#include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
 #include <set>

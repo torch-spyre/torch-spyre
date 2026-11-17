@@ -62,8 +62,8 @@ if report is not None:
     print(report["_report_path"])
 ```
 
-See the [FFDC user guide](ffdc.md) for failure categories, report
-locations, pod/CI workflow, and JSON triage. The
+See the [FFDC user guide](ffdc.md) for the enable → fail → retrieve →
+triage workflow, failure categories, report schema, and JSON triage. The
 [API reference](../../api/torch_spyre.rst) documents the function
 contract.
 
@@ -125,7 +125,7 @@ design and may change.
 :::
 
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [issue-1335]: https://github.com/torch-spyre/torch-spyre/issues/1335
 [pr-770]: https://github.com/torch-spyre/torch-spyre/pull/770
 [pr-1856]: https://github.com/torch-spyre/torch-spyre/pull/1856

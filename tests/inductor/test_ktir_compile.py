@@ -73,12 +73,16 @@ class _PrereqCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.output_dir = tmp.name
         self.ktir_path = os.path.join(self.output_dir, "k.ktir")
+        self.sdsc_bundle_dir_prefix = None
         with open(self.ktir_path, "w") as fh:
             fh.write("module {}\n")
 
     def compile(self):
         return _compiler()._compile_ktir_with_dbo(
-            "ktir_fused_add_0", self.ktir_path, self.output_dir
+            "ktir_fused_add_0",
+            self.ktir_path,
+            self.output_dir,
+            self.sdsc_bundle_dir_prefix,
         )
 
     def _write_spyrecode(self):
@@ -166,12 +170,17 @@ class TestKtirDboFailures(_PrereqCase):
         self.assertIn("warning: nothing to do", message)
 
     def test_timeout_is_reported_as_a_timeout(self):
-        exc = subprocess.TimeoutExpired(cmd=["dbo-opt"], timeout=ac._COMPILE_TIMEOUT_S)
-        with mock.patch(f"{_MODULE}.subprocess.run", side_effect=exc):
+        exc = subprocess.TimeoutExpired(cmd=["dbo-opt"], timeout=7.0)
+        with (
+            mock.patch(f"{_CONFIG}.backend_compile_timeout_seconds", 7.0),
+            mock.patch(f"{_MODULE}.subprocess.run", side_effect=exc),
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 self.compile()
         message = str(ctx.exception)
-        self.assertIn(f"timed out after {ac._COMPILE_TIMEOUT_S}s", message)
+        self.assertIn("timed out after 7.0s", message)
+        # Names the knob that relaxes it.
+        self.assertIn("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", message)
         self.assertIn("dbo-opt --from-ktir --device=", message)
 
 
@@ -232,6 +241,31 @@ class TestKtirDboSuccess(_PrereqCase):
         ):
             self.compile()
         self.assertIsNone(run.call_args[1].get("env"))
+
+    def test_timeout_comes_from_config(self):
+        for configured, expected in ((90.0, 90.0), (0.0, None)):
+            with (
+                self.subTest(configured=configured),
+                mock.patch(f"{_CONFIG}.backend_compile_timeout_seconds", configured),
+                mock.patch(f"{_MODULE}.SpyreSDSCKernelRunner"),
+                mock.patch(
+                    f"{_MODULE}.subprocess.run",
+                    side_effect=lambda *a, **k: self._run_ok(),
+                ) as run,
+            ):
+                self.compile()
+                self.assertEqual(run.call_args[1]["timeout"], expected)
+
+
+class TestSdscBundleDirPrefix(_PrereqCase):
+    def test_prefix_is_forwarded_to_runner(self):
+        self.sdsc_bundle_dir_prefix = "ab12cd34"
+        self._write_spyrecode()
+
+        with mock.patch(f"{_MODULE}.subprocess.run"):
+            runner = self.compile()
+
+        self.assertEqual(runner.sdsc_bundle_dir_prefix, "ab12cd34")
 
 
 if __name__ == "__main__":
