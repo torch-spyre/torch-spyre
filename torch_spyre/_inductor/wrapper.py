@@ -141,6 +141,40 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
             f"{python_kernel_name}{comma}{', '.join(args)})"
         )
 
+    # Recorded padding of graph inputs this graph writes.
+    #
+    # A Spyre tensor's layout records the value its padding holds, and the
+    # padding analysis of later graphs trusts it (track_padding_value). This
+    # graph's kernels write mutated inputs without touching that record, so the
+    # wrapper sets it to what track_padding_value proved the padding holds, or
+    # clears it. The update runs once per input, after the input's last use:
+    # just before the input is freed, or at the return if it never is.
+
+    def _input_padding_update(self, name: str) -> str | None:
+        """The update line for input name, once, or None if not needed."""
+        done = V.graph.__dict__.setdefault("_spyre_padding_updated", set())
+        if name in done or name not in V.graph.mutated_inputs:
+            return None
+        buf = V.graph.graph_inputs.get(name)
+        if buf is None or not isinstance(buf.get_layout(), FixedTiledLayout):
+            return None
+        done.add(name)
+        value = getattr(V.graph, "_spyre_input_padding", {}).get(name)
+        return f"set_tensor_padding_value({name}, {value!r})"
+
+    def codegen_free(self, buffer) -> None:
+        if isinstance(buffer, ir.InputBuffer):
+            if line := self._input_padding_update(buffer.get_name()):
+                self.writeline(line)
+        super().codegen_free(buffer)
+
+    def generate_return(self, output_refs: list[str]) -> None:
+        # Runs after _generate has moved the lines into wrapper_call.
+        for name in V.graph.mutated_inputs:
+            if line := self._input_padding_update(name):
+                self.wrapper_call.writeline(line)
+        super().generate_return(output_refs)
+
     def _is_hbm_pool_buffer(self, buffer: BufferLike) -> bool:
         layout = buffer.get_layout()
         return isinstance(layout, FixedTiledLayout) and "hbm_pool" in layout.allocation
@@ -211,7 +245,7 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
                 from sympy import sympify
                 from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, _spyre_empty_sharded
+                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, set_tensor_padding_value, _spyre_empty_sharded
                 import subprocess
                 from torch_spyre.ops.eager import _run_compiled_fallback
             """,

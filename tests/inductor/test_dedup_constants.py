@@ -115,7 +115,11 @@ class _StopBeforeDedupPasses(CustomPreSchedulingPasses):
     @override
     def __call__(self, graph: GraphLowering) -> None:
         # Import here so we don't shadow module-level names.
-        from torch_spyre._inductor.passes import _operations_have_spyre_device
+        from torch_spyre._inductor.passes import (
+            _flat_operations,
+            _get_pass_name,
+            _operations_have_spyre_device,
+        )
 
         if not _operations_have_spyre_device(graph.operations):
             return
@@ -134,9 +138,12 @@ class _StopBeforeDedupPasses(CustomPreSchedulingPasses):
         except StopIteration:
             raise AssertionError("dedup_and_promote_constants missing from pipeline")
 
-        # Run everything before dedup -- verbatim, no extra observers.
+        # Run everything before dedup -- verbatim, no extra observers. Each
+        # pass sees the flat view of any LoopNodes, as in _run_pass_loop:
+        # no pass before dedup is node-aware.
         for pass_fn in pass_list[:dedup_idx]:
-            pass_fn(graph)
+            with _flat_operations(graph, _get_pass_name(pass_fn)):
+                pass_fn(graph)
 
         # Hand off to the test. Access via type() so Python does not
         # bind self as the first positional arg to a function stored

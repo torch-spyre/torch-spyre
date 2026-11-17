@@ -93,7 +93,7 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
     layout = SimpleNamespace(
         allocation={"hbm": 0}, lx_view=None, device_layout=device_layout
     )
-    tensor = TensorAccess("input", 64 * loop_var + inner_var, layout)
+    tensor = TensorAccess("input", 64 * loop_var + inner_var, layout, 0)
     seen = {}
 
     def capture_coordinates(_layout, index, iteration_space, indirect_sizes, **_):

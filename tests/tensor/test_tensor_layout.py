@@ -232,6 +232,23 @@ class TestSpyreTensorLayout(TestCase):
             "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={(0, 2): 256, (1,): 512})",
         )
 
+    def test_stl_repr_round_trips_padding(self):
+        # Generated wrapper code embeds repr(stl), so it must eval back to an
+        # equal layout, including the padding value.
+        from torch_spyre._C import DataFormats  # noqa: F401
+
+        for value in [0.0, 1.0019378662109375, -3.4028234663852886e38, float("inf")]:
+            stl = SpyreTensorLayout(
+                [1, 64, 64],
+                [-1, 1, -1],
+                DataFormats.IEEE_FP32,
+                valid_elements={(0, 2): 1, (1,): 64},
+            )
+            stl.padding_value = value
+            rebuilt = eval(repr(stl))
+            self.assertEqual(rebuilt, stl)
+            self.assertEqual(rebuilt.padding_value, value)
+
     def test_device_alloc(self):
         x = torch.rand([512, 256], dtype=torch.float16).to("spyre")
         stl = x.device_tensor_layout()
@@ -1296,12 +1313,30 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(restored.stride_map), [32, 0, 1])
 
-    def test_stl_pickle_writes_v5(self):
+    def test_stl_pickle_writes_v6(self):
         fp16_df = get_device_dtype(torch.float16)
         stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
         state = stl.__getstate__()
-        self.assertEqual(state[0], 5)
-        self.assertEqual(len(state), 6)
+        self.assertEqual(state[0], 6)
+        self.assertEqual(len(state), 8)
+
+    def test_stl_v5_pickle_loads_without_padding(self):
+        """A v5 pickle (no padding fields) loads with UNINITIALIZED padding."""
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (
+                5,
+                [2, 1, 32],
+                [32, 0, 1],
+                fp16_df,
+                stl.element_arrangement,
+                dict(stl.valid_elements),
+            )
+        )
+        self.assertEqual(restored, stl)
+        self.assertIsNone(restored.padding_value)
 
 
 @instantiate_parametrized_tests

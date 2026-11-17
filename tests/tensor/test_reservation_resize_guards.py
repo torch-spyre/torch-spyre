@@ -24,6 +24,7 @@ dimension -- refuses loudly rather than silently reallocating or running
 with a stale tail.
 """
 
+from copy import copy
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
@@ -144,7 +145,9 @@ class TestReservationResizeGuard(TestCase):
         # keeps the recompile guard from firing when the real size
         # changes. data_ptr/nbytes staying stable is necessary but isn't
         # by itself proof of this.
-        before = str(get_spyre_tensor_layout(self.x_dev))
+        stl = copy(get_spyre_tensor_layout(self.x_dev))
+        stl.padding_value = None
+        before = str(stl)
         self.x_dev.resize_((140, 1024))
         self.assertEqual(str(get_spyre_tensor_layout(self.x_dev)), before)
         self.x_dev.resize_((DIM_MAX, 1024))
@@ -222,7 +225,9 @@ class TestReservationBoundaries(TestCase):
         x = torch.rand(560, 4, 1024, dtype=torch.float16)
         x_dev = x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
         ptr = x_dev.untyped_storage().data_ptr()
-        layout = str(get_spyre_tensor_layout(x_dev))
+        stl = copy(get_spyre_tensor_layout(x_dev))
+        stl.padding_value = None
+        layout = str(stl)
 
         x_dev.resize_((140, 4, 1024))
         self.assertEqual(x_dev.stride(), (4 * 1024, 1024, 1))

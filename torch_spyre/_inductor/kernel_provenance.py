@@ -87,6 +87,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "kernel_local": "bool",
     "replicated_scalar": "bool",
     "non_unified_shard_bytes": "int",
+    "mask_value": "float | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",

@@ -373,6 +373,7 @@ _SPYRE_METADATA_ATTRS = (
     # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
     # since that module imports this one (through pass_utils).
     "_work_division_chosen_with_tiling",
+    "input_mask_values",
 )
 
 

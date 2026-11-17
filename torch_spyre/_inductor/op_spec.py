@@ -283,6 +283,7 @@ class TensorArg:
             sharded storage (core c reads or writes only chunk c, through its
             own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
             0 for ordinary storage. Checked against the real tensor at launch.
+        mask_value: value to be used to for coordinate masking, if not None
     """
 
     is_input: bool
@@ -300,6 +301,7 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    mask_value: float | None = None
 
     @property
     def non_unified(self) -> bool:

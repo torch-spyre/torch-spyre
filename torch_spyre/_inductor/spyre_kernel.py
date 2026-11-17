@@ -123,6 +123,7 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+    mask_value: float | None
 
 
 @dataclass
@@ -1096,6 +1097,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
             non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
+            mask_value=tensor.mask_value,
         )
         if (
             _spyre_config.lx_planner_relayout
@@ -1469,13 +1471,27 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "lx" not in layout.allocation and "hbm_pool" not in layout.allocation:
             _ = self.args.input(name)
 
+        # For now assume that the mask value will be the same for all
+        # arguments of an op. This works around two issues:
+        # - mapping the buffer names to argument positions (it's not 1 to 1, ex: x * x)
+        # - inputs that have been renamed
+        mask_value = None
+        ir_node = self.current_node.node
+        if input_pad_values := getattr(ir_node, "input_mask_values", None):
+            mask_values = set(input_pad_values.values())
+            # SDSC takes one mask value per op. No domain rule constrains two
+            # inputs of one op differently yet (truediv constrains only the
+            # divisor). TODO: when one does, fall back to overwriting instead.
+            assert len(mask_values) <= 1
+            mask_value = next(iter(mask_values), None)
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"kernel_load: {name}, shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        return TensorAccess(name, index, layout)
+        return TensorAccess(name, index, layout, mask_value)
 
     def store(
         self,
@@ -1510,7 +1526,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
+        dst = TensorAccess(name, index, layout, None)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
@@ -1628,7 +1644,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "hbm_pool" not in layout.allocation:
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
+        dst = TensorAccess(name, index, layout, None)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
@@ -2153,6 +2169,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     "non_unified_shard_bytes="
                                     f"{arg.non_unified_shard_bytes},"
+                                )
+                            if arg.mask_value is not None:
+                                buf.writeline(
+                                    f"mask_value=float({str(arg.mask_value)!r}),"
                                 )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(

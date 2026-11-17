@@ -86,7 +86,8 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   // size is the same)
   check_sharded_view(self, sizes, strides, self.storage_offset());
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  SpyreTensorLayout stl = orig_impl->spyre_layout;
+  // An alias does not inherit recorded padding: see without_padding().
+  SpyreTensorLayout stl = orig_impl->spyre_layout.without_padding();
   at::Tensor self_;
   self_ = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
@@ -113,7 +114,8 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   // size is the same)
   check_sharded_view(self, sizes, strides, self.sym_storage_offset());
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  SpyreTensorLayout stl = orig_impl->spyre_layout;
+  // An alias does not inherit recorded padding: see without_padding().
+  SpyreTensorLayout stl = orig_impl->spyre_layout.without_padding();
   at::Tensor self_;
   self_ = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
@@ -186,8 +188,8 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
       self.dtype());
   at::native::setStrided(result, size, stride, storage_offset);
   auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
-  spyre_impl->spyre_layout = device_layout;
-  if (device_layout == orig_impl->spyre_layout) {
+  spyre_impl->spyre_layout = device_layout.without_padding();
+  if (device_layout.same_layout_ignoring_padding(orig_impl->spyre_layout)) {
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
   } else {
@@ -238,8 +240,8 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   spyre_tensor_impl_->set_storage_offset(self.storage_offset() +
                                          offset_increment);
   spyre_tensor_impl_->set_sizes_and_strides(size, stride);
-  spyre_tensor_impl_->spyre_layout = stl;
-  if (stl == orig_stl) {
+  spyre_tensor_impl_->spyre_layout = stl.without_padding();
+  if (stl.same_layout_ignoring_padding(orig_stl)) {
     spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   } else {
@@ -290,7 +292,7 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
 
   auto* result_impl =
       static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
-  result_impl->spyre_layout = orig_impl->spyre_layout;
+  result_impl->spyre_layout = orig_impl->spyre_layout.without_padding();
   result_impl->dma_sizes = orig_impl->dma_sizes;
   result_impl->dma_strides = orig_impl->dma_strides;
 
