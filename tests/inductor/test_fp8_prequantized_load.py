@@ -29,6 +29,7 @@ Covers:
 import pytest
 import torch
 from torch import nn
+from torch._inductor.exc import InductorError
 from utils_inductor import DEVICE, compare_with_pytorch
 
 import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
@@ -400,6 +401,26 @@ class TestScaledMmPrequantizedClosedOver:
 # End-to-end: quantscalepertokenfp8 + pre-quantized KERNEL weight
 # ---------------------------------------------------------------------------
 
+# K = 2112 is not a multiple of the 128-element FP8 stick, so the weight's K
+# is padded on the device and the graph fails to compile. Remove the mark when
+# the fix lands (#5926).
+_FP8_UNALIGNED_K_COMPILE_FAILS = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="#5524: K=2112 fails to compile: StopIteration in "
+    "_cost_model_matmul_planner (no QFP8WT input) for m > 1, and dbo-opt "
+    "'No system in place for splatting of data formats with <16b' for m = 1",
+)
+
+# A few output elements exceed atol=4.0: the error grows with sqrt(K) while
+# the tolerance is fixed. Do not widen atol to make these pass.
+_FP8_LARGE_K_EXCEEDS_ATOL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#5952: a few elements exceed atol=4.0, rtol=0.1 (greatest abs "
+    "diff 5.4-7.25); the error grows with sqrt(K) at a fixed tolerance",
+)
+
 
 class TestQuantScalePerTokenFp8WithPrequantizedWeight:
     """End-to-end test for the full FP8 inference pipeline:
@@ -419,6 +440,50 @@ class TestQuantScalePerTokenFp8WithPrequantizedWeight:
             (1, 512, 512),
             (4, 4096, 512),
             (4, 4096, 1024),
+            # derived from granite-3.3-8b-instruct-FP8 with spyre-inference
+            (4, 4096, 4096),
+            # (4, 4096, 1024),  # avoid duplication
+            pytest.param(4, 12800, 4096, marks=_FP8_LARGE_K_EXCEEDS_ATOL),
+            (1, 4096, 4096),
+            (1, 4096, 1024),
+            (1, 12800, 4096),
+            # derived from gemma-4-26b-a4b-it FP16 with spyre-inference
+            (512, 2816, 8192),
+            pytest.param(512, 4096, 2816, marks=_FP8_LARGE_K_EXCEEDS_ATOL),
+            (512, 2816, 4224),
+            pytest.param(512, 2112, 2816, marks=_FP8_UNALIGNED_K_COMPILE_FAILS),
+            (512, 2816, 10240),
+            pytest.param(512, 8192, 2816, marks=_FP8_LARGE_K_EXCEEDS_ATOL),
+            (8, 2816, 8192),
+            (8, 4096, 2816),
+            (8, 2816, 4224),
+            pytest.param(8, 2112, 2816, marks=_FP8_UNALIGNED_K_COMPILE_FAILS),
+            (8, 2816, 10240),
+            (8, 8192, 2816),
+            (4, 2816, 8192),
+            (4, 4096, 2816),
+            pytest.param(4, 2112, 2816, marks=_FP8_UNALIGNED_K_COMPILE_FAILS),
+            (4, 2816, 10240),
+            (4, 8192, 2816),
+            (2, 2816, 8192),
+            (2, 4096, 2816),
+            pytest.param(2, 2112, 2816, marks=_FP8_UNALIGNED_K_COMPILE_FAILS),
+            (2, 2816, 10240),
+            (2, 8192, 2816),
+            (1, 2816, 8192),
+            (1, 4096, 2816),
+            pytest.param(1, 2112, 2816, marks=_FP8_UNALIGNED_K_COMPILE_FAILS),
+            (1, 2816, 10240),
+            (1, 8192, 2816),
+            (8, 2816, 262144),
+            (4, 2816, 262144),
+            (2, 2816, 262144),
+            (1, 2816, 262144),
+            # this test does not 3D tensors so far
+            # ((1, 128), 512, 2816, 704),
+            # ((128, 128), 512, 704, 2816),
+            # ((1, 128), 8, 2816, 704),
+            # ((128, 128), 8, 704, 2816),
         ],
     )
     def test_full_fp8_pipeline(self, m, k, n):
