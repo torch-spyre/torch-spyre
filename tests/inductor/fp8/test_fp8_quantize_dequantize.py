@@ -1033,7 +1033,7 @@ class TestRoundtripScale:
         assert (out == 0.0).all()
 
     def test_zero_scale_raw_quantize(self):
-        """scale=0 raw quantize: produces finite (non-NaN/inf) FP8 tensor."""
+        """scale=0 raw quantize: safe reciprocal substitutes 1.0, giving FP8(clamp(x))."""
         x_cpu = torch.tensor(
             [
                 [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
@@ -1045,7 +1045,12 @@ class TestRoundtripScale:
         scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
         q = _compile(_quantize_fn)(x, scale).cpu()
         assert not q.isnan().any()
-        assert not q.float().isinf().any()
+        torch.testing.assert_close(
+            q.float(),
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
 
     def test_zero_scale_weight(self):
         """scale=0 weight roundtrip: output must be all zero."""
@@ -1063,7 +1068,7 @@ class TestRoundtripScale:
         assert (w_out == 0.0).all()
 
     def test_zero_scale_raw_quantize_weight(self):
-        """scale=0 raw weight quantize: stick-aligned K=128 produces finite FP8."""
+        """scale=0 raw weight quantize: stick-aligned K=128 gives FP8(clamp(x))."""
         x_cpu = torch.zeros((2, 128), dtype=FP16)
         x_cpu[0, 0] = 1.0
         x_cpu[0, 1] = -1.0
@@ -1077,7 +1082,12 @@ class TestRoundtripScale:
         ).cpu()
         q_f = q.float()
         assert not q_f.isnan().any()
-        assert not q_f.isinf().any()
+        torch.testing.assert_close(
+            q_f,
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
 
     def test_zero_scale_mixed_per_row(self):
         """Per-row scale with one zero row: row0 (scale=0) gives 0, row1 scales normally."""
