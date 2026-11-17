@@ -55,8 +55,8 @@ test_suite_config:
         # tagged STANDARD, so the D2H copy does not restore it and the readback is
         # permuted. The values on the device are right; only the tag is wrong.
         # Strict xfail (not skip) so that these XPASS and fail CI once the tag is
-        # propagated. No issue filed yet for this; #4014 is a reduction *over* the
-        # stick dim and #4142 only plans EA rules for reductions. #5553
+        # propagated. See issue #5553; #4014 is a reduction *over* the stick dim
+        # and #4142 only plans EA rules for reductions.
         - names:
             - LxPlanning.*::test_to_dtype_float32_to_float16_2x4x8x64_lx_planning_reduction
             - LxPlanning.*::test_to_dtype_float32_to_float16_4x16_lx_planning_reduction

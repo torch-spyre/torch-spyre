@@ -67,10 +67,26 @@ def assert_ea(tensor, expected_ea):
     assert actual_ea == expected_ea, f"Expected: {expected_ea}, Got: {actual_ea}"
 
 
-def assert_val(fn, x, result):
+def assert_val(fn, x, result, intermediate=None):
+    """Compare a device result with the CPU result of ``fn``.
+
+    The tolerance follows the lowest-precision dtype involved. Pass
+    ``intermediate`` when ``fn`` rounds through a dtype that is neither the
+    input nor the output (for example fp32 -> fp16 -> fp32).
+    """
     x_cpu = x.cpu()
     result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-2, atol=1e-2)
+    dtypes = {x.dtype, result.dtype}
+    if intermediate is not None:
+        dtypes.add(intermediate)
+    if torch.bfloat16 in dtypes:
+        rtol, atol = 1.6e-2, 1.6e-2
+    elif torch.float16 in dtypes:
+        # For randn-scale values (<5), fp16 half-ulp is <= ~2e-3.
+        rtol, atol = 2e-3, 2e-3
+    else:
+        rtol, atol = 1e-5, 1e-5
+    torch.testing.assert_close(result.cpu(), result_cpu, rtol=rtol, atol=atol)
 
 
 def ea_of(dev):
@@ -200,8 +216,8 @@ def test_fp16_to_fp32_restoration(device, fp16):
     # Verify output EA is STANDARD (restored)
     assert_ea(result, ElementArrangement.STANDARD)
 
-    # Verify correctness
-    assert_val(fn, x, result)
+    # Verify correctness (value is rounded through fp16/bf16 in between)
+    assert_val(fn, x, result, intermediate=fp16)
 
     print("✓ FP16→FP32 restoration (FP32_TO_DL16 → STANDARD) works")
 
@@ -303,8 +319,8 @@ def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
     # Verify final EA is STANDARD
     assert_ea(result, ElementArrangement.STANDARD)
 
-    # Verify correctness
-    assert_val(fn, x, result)
+    # Verify correctness (value is rounded through fp16/bf16 in between)
+    assert_val(fn, x, result, intermediate=fp16)
 
     print("✓ FP32→FP16→FP32 roundtrip works")
 
@@ -1273,6 +1289,9 @@ def _rescale_rejected(src_dtype, dst_dtype, shape):
 def _whole_stick_pairs_rejected(expected_ea, shape):
     # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim narrower than
     # 64 only gets a single fp32 stick, so half of each pair has nowhere to go.
+    # Note: shape[-1] is safe for 0-dim shapes () because expected_ea is forced
+    # to STANDARD in those cases, so the expected_ea == DL16_TO_FP32 check
+    # short-circuits and will not reach shape[-1].
     return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] < 64
 
 

@@ -592,6 +592,8 @@ auto get_device_stride_infos(
     }
 
     const bool has_stick_count = stick_count_dev_dim >= 0;
+    // Stride unused when a single stick is allocated (has_stick_count is
+    // false).
     ea_shuffle(stl, device_strides[stick_elem_dim],
                has_stick_count ? device_strides[stick_count_dev_dim] : 0,
                has_stick_count ? stl.device_size[stick_count_dev_dim] : 1,
