@@ -50,6 +50,9 @@ spyre-bench plan --catalog examples/run-demo --central examples/central --purpos
 spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
 spyre-bench verdict --run-id <uuid> --store clickhouse --json
 spyre-bench upload results/bench                 # seal and check a lab run; --apply sends it to the inbox
+spyre-bench accept --run-dir results/bench --reason "new driver"   # propose a stored run as the new anchor
+spyre-bench reference create --from-request <file>              # also: validate, seal, submit, compare
+spyre-bench invalidate --run <uuid> --reason-code C --reason T  # preview; --apply records it
 ```
 
 The `runners` declared by the kernel and comms packs name entry points supplied by the producer packages, not shipped here; `run` executes each Benchmark's own `run.command`.
