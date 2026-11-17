@@ -309,6 +309,27 @@ class TestCoarseTileLoopTripCount(TestCase):
         op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
+    def test_symbolic_trip_count_resolves_through_concretize_expr(self):
+        """A symbolic count that concretize_expr resolves (the declared maximum
+        or the hint) is priced at that value, not as one trip."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8, 2]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 64)
+
+    def test_cost_features_loop_trip_resolves_a_symbolic_count(self):
+        """cost_features prices a symbolic loop with the same resolved count."""
+        from torch_spyre._inductor.cost_features import _loop_features
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_loop_features(op)[0], 32)
+
 
 class TestDrainLifetimeBoundary(TestCase):
     """The post-loop drain storage must stay live to the graph exit.

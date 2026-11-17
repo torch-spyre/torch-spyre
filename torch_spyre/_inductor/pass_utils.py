@@ -398,6 +398,29 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
+def trip_count_estimate(count) -> int:
+    """A loop's trip count as an ``int``, for the cost model and the allocator.
+
+    A concrete count is returned as it is. A symbolic count (a loop over a
+    declared or dynamic dimension, e.g. ``s38 // 8``) resolves with
+    :func:`concretize_expr`: the declared maximum, or the hint. The solvers use
+    this count to price re-reads across trips, so a symbolic loop must not be
+    priced as one trip: with 1 trip the re-read terms are 0 and LX residency of
+    the loop-invariant reads is worth nothing to the solver.
+
+    Returns 1 when the count cannot be resolved (e.g. an unbacked, data-dependent
+    count), and never less than 1.
+    """
+    try:
+        return max(1, int(count))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(1, int(concretize_expr(count)))
+    except Exception:  # noqa: BLE001 - an estimate: fall back to one trip
+        return 1
+
+
 # The dimensions declared with ``tensor.to("spyre", dynamic=...)`` for the compile
 # in progress, by symbol name: {name: (min, max, granularity)}. Set for the span
 # of one Spyre ``compile_fx`` by ``patches.enable_spyre_context`` from the graph
