@@ -299,7 +299,7 @@ class TestReservationWithExplicitLayout(TestCase):
             self.assertTrue(torch.equal(d.cpu(), self.ids[:rows]), f"at {rows} rows")
 
     def test_layout_for_a_smaller_max_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "extent max=16, got 12"):
+        with self.assertRaisesRegex(RuntimeError, "extent max=16, got 12"):
             self.ids.to(
                 DEVICE, device_layout=_chunk_major_layout(12), dynamic=self.spec
             )
