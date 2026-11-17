@@ -1571,6 +1571,11 @@ def _create_sdsc_tensors(
                 stick_dim = topk_stick_fallback_sym
             else:
                 stick_dim = next((d for d in dims if d not in op_dim_order), None)
+                if stick_dim is None:
+                    raise ValueError(
+                        f"{op_spec.op}: no free dimension available as the stick "
+                        f"dimension of argument {i}"
+                    )
                 # The chosen dim is absent from the *op*'s dim_order, but an
                 # individual arg may already carry it: a conv2d kernel tensor
                 # gets ki/kj added explicitly by _get_device_dim_order (they are
@@ -1579,7 +1584,7 @@ def _create_sdsc_tensors(
                 # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
                 # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
                 # rejects with "external allocations with repeated dimensions".
-            if stick_dim is not None and stick_dim not in dim_order:
+            if stick_dim not in dim_order:
                 dim_order = dim_order + [stick_dim]
 
         # layernormscale is unary on one value per stick, so the stick dim is
@@ -2721,15 +2726,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if len(out_arg.device_coordinates) > 0
             else None
         )
-        # Inject N=1 when the output's stick coordinate is constant (0):
-        # N collapsed to size 1 so there is no N loop variable in the output's
-        # device_coordinates.  For STANDARD weights the original condition also
-        # required y_stick_coord == 0; for QFP8WT weights a restickify may have
-        # made y's stick non-zero even when N was never an iteration dimension,
-        # so we rely on the output signal alone when y carries QFP8WT EA.
-        y_is_qfp8wt = y_arg.element_arrangement == ElementArrangement.QFP8WT
-        n_is_one = out_stick_coord == 0 and (y_stick_coord == 0 or y_is_qfp8wt)
-        if n_is_one:
+        if y_stick_coord == 0 and out_stick_coord == 0:
             idx = len(sdsc_iteration_space)
             if idx < len(INPUT_DIM_LABELS):
                 n_dim_label = INPUT_DIM_LABELS[idx]

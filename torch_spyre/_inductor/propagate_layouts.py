@@ -1601,21 +1601,21 @@ def _matmul_layouts(
         x_req_stl = generate_stl_with_required_stick(
             x, stick_var, data.reduction_type, "x"
         )
-        # If y already carries a non-STANDARD EA (e.g. QFP8WT from a KV-cache
-        # gather), pass it through directly.  The hardware's batchmatmulfp8
-        # op understands the 2D-stick weight layout regardless of N size;
-        # building a STANDARD sparse-stick STL here would produce a dense→sparse
-        # scatter incompatibility in the beam search.
-        _y_non_std = next(
+        # If y already carries a QFP8WT EA (e.g. from a KV-cache gather), pass
+        # it through directly.  The hardware's batchmatmulfp8 op understands the
+        # 2D-stick weight layout regardless of N size; building a STANDARD
+        # sparse-stick STL here would produce a dense→sparse scatter
+        # incompatibility in the beam search.
+        _y_qfp8wt = next(
             (
                 stl
                 for stl in y.layouts
-                if stl.element_arrangement != ElementArrangement.STANDARD
+                if stl.element_arrangement == ElementArrangement.QFP8WT
             ),
             None,
         )
-        if _y_non_std is not None:
-            y_req_stl = _y_non_std
+        if _y_qfp8wt is not None:
+            y_req_stl = _y_qfp8wt
         else:
             y_dim_order = list(range(len(y.layout.size))) + [-1]
             y_req_stl = SpyreTensorLayout(

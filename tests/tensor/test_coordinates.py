@@ -1318,6 +1318,20 @@ class TestNormalizeCoordinatesFusion(TestCase):
         for val in range(4):
             self.assertEqual(int(addr.subs({k: val})), val * 64 + 5)
 
+    def test_constant_offset_on_non_stick_size_one_dim_is_rejected(self):
+        """Only the stick dim may carry a constant offset.
+
+        A size-1 non-stick dim without variables is dropped when terms are
+        fused, so a nonzero offset on it would silently be lost.
+        """
+        k = sympy.Symbol("c1")
+        with self.assertRaises(AssertionError):
+            self._normalize(
+                {k: 4},
+                [4, 1, 64],
+                [k, sympy.Integer(3), sympy.Mod(k, 64)],
+            )
+
 
 class TestFlatDenseProjectionLayout(TestCase):
     """Unit tests for _flat_dense_projection_x_layout in nonstick_dim_order."""

@@ -1175,8 +1175,8 @@ def _insert_mutation_relayout_copy(
 
     # If the target already has exactly the required layout, no copy-in/copy-back
     # is needed — the scatter can write directly into the target buffer.
-    # (Non-STANDARD EA targets such as QFP8WT never get here: they are rewritten
-    # in place by reorder_nonstick_dims_mutation.)
+    # (QFP8WT targets never get here: they are rewritten in place by
+    # reorder_nonstick_dims_mutation.)
     if target_layout.device_layout == required_stl:
         logger.info(
             "nonstick_dim_order: scatter target %s already has required layout "
@@ -1286,11 +1286,11 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
             _rewrite_producer_layout(buf, entry.required_stl)
         elif entry.kind == "copy":
             if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE) and (
-                entry.required_stl.element_arrangement != ElementArrangement.STANDARD
+                entry.required_stl.element_arrangement == ElementArrangement.QFP8WT
             ):
-                # Non-STANDARD EA (e.g. QFP8WT): the scatter source and destination
-                # share a physical element layout (2D-stick) that cannot be
-                # transcoded by a plain byte-copy restickify.  Instead, rewrite the
+                # QFP8WT EA: the scatter source and destination share a physical
+                # element layout (2D-stick) that cannot be transcoded by a plain
+                # byte-copy restickify.  Instead, rewrite the
                 # mutation target's layout in-place to the required (rotated) STL so
                 # the scatter writes directly into the target buffer with the correct
                 # 2D-stick addressing — no copy-in / copy-back needed.

@@ -388,7 +388,7 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         # KERNEL (one or more batch dims collapsed into the leading positions by
         # _flatten_device_size) dim_order is e.g. ["out","in","mb"] or
         # ["x","in","mb"]; taking [-2:] strips the batch prefix and leaves only
-        # the 2D-stick pair, which is what the DDL conversion expects.
+        # the 2D-stick pair that a 2D-stick tensor requires.
         dim_order = layout_info["dim_order"]
         if len(dim_order) < 2:
             raise ValueError(

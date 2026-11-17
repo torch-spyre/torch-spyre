@@ -73,6 +73,8 @@ Test classes
   13. ``TestFp8ScaledBmmQKT``             — FP8 Q·Kᵀ matmul with calibrated scale schemes
   14. ``TestFp8KvCacheWriteQFP8WT``       — QFP8WT cache write + gather + score
   15. ``TestFp8KvCacheQFP8WTDecodeEndToEnd`` — full fill-and-decode pipeline (direct-FP8-matmul)
+  16. ``TestFp8Qfp8wtSliceCopy``            — plain copies into whole, row-sliced and column-block QFP8WT buffers
+  17. ``TestFp8Qfp8wtBatchTransfer``        — host/device transfer of batched, contiguous and non-contiguous QFP8WT tensors
 
 Stick-alignment rules
 ---------------------
@@ -118,7 +120,14 @@ import pytest
 import torch
 from utils_inductor import DEVICE, cached_randn, compare_with_pytorch
 
-from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+from torch_spyre._C import (
+    ElementArrangement,
+    SpyreTensorLayout,
+    copy_tensor,
+    get_device_dtype,
+    get_elem_in_stick,
+    spyre_empty_with_layout,
+)
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1978,7 +1987,8 @@ class TestFp8KvCacheWriteQFP8WT:
     enhancement in ``spyre_mem.cpp``.
     """
 
-    def test_fp8_kv_cache_write_qfp8wt_roundtrip(self):
+    @pytest.mark.parametrize("block", [0, 1, NUM_BLOCKS - 1])
+    def test_fp8_kv_cache_write_qfp8wt_roundtrip(self, block):
         """Write K as QFP8WT at fill time with per-token scales, gather, score.
 
         Scale correctness is verified end-to-end: the CPU reference dequantizes
@@ -2019,7 +2029,7 @@ class TestFp8KvCacheWriteQFP8WT:
             [_cpu_per_token_scale(k_perm_cpu).amax().item()], dtype=torch.float16
         )  # scalar: worst-case per-token scale → conservative per-tensor bound
 
-        block_idx = torch.tensor([0], dtype=torch.int32)
+        block_idx = torch.tensor([block], dtype=torch.int32)
 
         # 4D paged cache [NUM_BLOCKS, KV, D, BLOCK_SIZE]:
         #   last two dims are the [K=D, N=BLOCK_SIZE] QFP8WT weight per KV head.
@@ -2348,3 +2358,68 @@ class TestFp8Qfp8wtSliceCopy:
 
         result = torch.compile(fn)(qa, qb, buf).cpu().float()
         torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
+
+    def test_qfp8wt_odd_k_offset_slice_rejected(self):
+        """A 2-row stick cannot start mid-pair: an odd K offset fails loudly."""
+        qa, qb, buf, _ = self._operands(128, 128)
+
+        def fn(qa, qb, buf):
+            buf[1:65].copy_(qb[1:65])
+            return torch.ops.aten._scaled_mm(qa, buf, **self._SCALED_MM)
+
+        with pytest.raises(Exception, match="odd K offset"):
+            torch.compile(fn)(qa, qb, buf)
+
+
+class TestFp8Qfp8wtBatchTransfer:
+    """Host/device round trip of QFP8WT tensors with outer batch dimensions.
+
+    A paged KV cache is ``[NUM_BLOCKS, ..., K, N]``: every outer index selects
+    an independent ``[K, N]`` matrix.  Each batch element carries different
+    values, so a transfer that reused the first element's offsets would fail.
+    """
+
+    @pytest.mark.parametrize("shape", [(2, 128, 128), (3, 2, 128, 64)])
+    def test_batched_round_trip(self, shape):
+        n = 1
+        for s in shape:
+            n *= s
+        host = ((torch.arange(n) % 251).to(torch.float16).reshape(shape)).to(
+            torch.float8_e4m3fn
+        )
+        stl = SpyreTensorLayout(
+            list(host.shape),
+            list(host.stride()),
+            torch.float8_e4m3fn,
+            list(range(host.dim())),
+            ElementArrangement.QFP8WT,
+        )
+        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
+        copy_tensor(host, dev, non_blocking=False)
+        assert torch.equal(dev.cpu().view(torch.uint8), host.view(torch.uint8))
+
+    @pytest.mark.parametrize("shape", [(128, 128), (2, 128, 128), (3, 2, 128, 64)])
+    def test_non_contiguous_host_is_read_in_logical_order(self, shape):
+        """A transposed host view lands on the device as its logical contents."""
+        n = 1
+        for s in shape:
+            n *= s
+        raw = (torch.arange(n) % 251).to(torch.float16).reshape(shape)
+        raw = raw.to(torch.float8_e4m3fn)
+        # Swap the last two dims in memory, then swap them back as a view, so
+        # the logical shape stays ``shape`` but the strides are not row-major.
+        view = raw.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert not view.is_contiguous()
+        expected = view.contiguous()
+        stl = SpyreTensorLayout(
+            list(expected.shape),
+            list(expected.stride()),
+            torch.float8_e4m3fn,
+            list(range(expected.dim())),
+            ElementArrangement.QFP8WT,
+        )
+        dev = spyre_empty_with_layout(
+            expected.size(), expected.stride(), expected.dtype, stl
+        )
+        copy_tensor(view, dev, non_blocking=False)
+        assert torch.equal(dev.cpu().view(torch.uint8), expected.view(torch.uint8))

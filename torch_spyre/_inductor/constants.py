@@ -228,9 +228,9 @@ SPYRE_FP8_OPS = {
 # Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
 # Used in compute_ops._layout_info_for_tensor to restore 2D-stick metadata
 # that was erased by device-size flattening when an op is compiled individually.
-# Note: index_copy_ scatter ops are lowered as IDENTITY_OP ("identity"), so they
-# are NOT gated here; their 2D-stick layout is handled directly in superdsc via
-# the is_qfp8wt_indirect flag.
+# Other ops (e.g. identity copies and index_copy_ scatters) are not gated here:
+# superdsc selects the 2D stick from the tensor's element arrangement alone, so
+# their metadata is never flattened away.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
