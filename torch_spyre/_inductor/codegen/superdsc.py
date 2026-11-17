@@ -1529,7 +1529,11 @@ def _create_sdsc_tensors(
                     if stick_dim not in dim_order:
                         dim_order = dim_order + [stick_dim]
 
-        if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
+        # layernormscale is unary on one value per stick. For fp32 the stick dim
+        # is reduced on the input and on the output; otherwise only on the input.
+        if op_spec.op == "layernormscale" and (
+            arg.device_dtype == DataFormats.IEEE_FP32 or len(sdsc_args) == 0
+        ):
             reduced_dims = [stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims

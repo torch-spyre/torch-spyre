@@ -675,9 +675,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         and has no iteration dim, so this drives
         coarse_tile._point_splice_advance_for_dep (record the per-trip
         advance), leave the read direct (never staged into scratch),
-        _rebase_point_splice_reads (pin the index to iteration 0 so the
-        advance is not applied twice), and insert_restickify's per-dep advance
-        handover. Numerics, not just compilation: every one of those can be
+        keep the loop term in the index (per_trip_index pins it in the base
+        coordinates, so the advance is not applied twice), and
+        insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
         got wrong in a way that compiles and re-reads the same page.
 
         Two matmuls per trip and a distinct page per trip, so an advance
@@ -1449,6 +1449,61 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
             compiled(pool, ids, init)
 
 
+# --- Slice(dim, extent) as the for_each_tile#5763 remedy --------------------
+
+SCALE_TRIPS, SCALE_WIDTH = 4, 256
+
+
+def slice_scale_row_fn(x, scale, init):
+    from torch_spyre._inductor.wsr import Slice, for_each_tile
+
+    def fn(x, scale, init):
+        def body(carry, tiles):
+            x_tile, scale_row = tiles
+            return (carry[0] + x_tile * scale_row,), None
+
+        (acc,), _ = for_each_tile(
+            body, (x, scale), dims=(0, Slice(0, extent=1)), tile_size=1, init=(init,)
+        )
+        return acc
+
+    return fn(x, scale, init)
+
+
+class TestForEachTileSliceScaleTableE2E(_DynamoResetTestCase):
+    """Slice(dim, extent) compiled on device at the exact shape issue #5763 reports.
+
+    #5763 ("for_each_tile with a short Gather index fails") gathers one row at a
+    time from a [4, 256] fp16 scale table with a 4-long index -- the same
+    sub-stick, one-element-per-trip advance ``TestForEachTileSubStickAdvanceE2E``
+    above still refuses; Gather itself is unchanged by this PR. ``Slice(0,
+    extent=1)`` is the issue's other accepted fix: a per-trip row that is really
+    just "the next row" needs no index table at all.
+    ``test_slice_extent_differs_from_tile_size`` in test_for_each_tile.py already
+    covers this through ``_assert_lowers`` -- the post-grad graph's shape only,
+    no device involved. This test compiles the issue's own [4, 256] shape through
+    the real Spyre backend, so the fix is exercised where #5763 originally
+    failed -- codegen -- and "downstream needs no change" is checked in CI, not
+    just asserted in the PR description.
+    """
+
+    def test_slice_scale_table_compiles_at_issue_shape(self):
+        x = cached_randn((SCALE_TRIPS, SCALE_WIDTH))
+        scale = cached_randn((SCALE_TRIPS, SCALE_WIDTH), differentiation=1)
+        init = torch.zeros(1, SCALE_WIDTH, dtype=torch.float16)
+
+        ref = torch.zeros(1, SCALE_WIDTH)
+        for i in range(SCALE_TRIPS):
+            ref = ref + dl16_round(x[i : i + 1].float()) * dl16_round(
+                scale[i : i + 1].float()
+            )
+
+        compiled = torch.compile(slice_scale_row_fn, backend="inductor", fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME), scale.to(DEVICE_NAME), init.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+
+
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     """for_each_tile bodies that exercise passes beyond plain tiling.
 
@@ -2151,26 +2206,41 @@ def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestASymbolicTripCountIsRefusedByName(_DynamoResetTestCase):
-    """A varying trip count reaches codegen and stops there with a clear reason.
+class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
+    """One compiled graph serves a declared range, at a second tile size.
 
-    TODO: becomes a positive test, one compile correct at several sizes, once
-    the geometry is built at the declared maximum and the launch reads the size
-    (the next pull request of the #5186 split).
+    A second body op (a plain scale) and a second granularity (32 rows) beside
+    ``tests/inductor/test_symbolic_loop_e2e.py``'s gelu at 64. The tensor is
+    declared with ``.to(DEVICE_NAME, dynamic=...)`` (#5179), so its buffer is
+    reserved at the maximum and the kernel's geometry is built there, and the
+    launch binds the logical size into the loop's dimension slot. 96 rows is
+    three trips of 32 and not a multiple of 64, so the granularity in use is
+    the declared one and not the other test's.
     """
 
-    @expects_raise
-    def test_a_varying_trip_count_says_what_is_missing(self):
-        from torch._inductor.exc import InductorError
+    SPEC = {"min": 64, "max": 512, "granularity": 32}
 
-        x = torch.randn(128, 64, dtype=torch.float16).to(DEVICE_NAME)
-        torch._dynamo.mark_dynamic(x, 0)
+    def test_one_graph_right_at_every_size(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
         compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
 
-        with self.assertRaisesRegex(
-            InductorError, "geometry at the declared maximum is not implemented"
-        ):
-            compiled(x)
+        for rows in (128, 64, 512, 96, 256):
+            y.resize_((rows, 64))
+            out = compiled(y).cpu().float()
+            # Not exact: the device rounds fp16 arithmetic its own way, and a
+            # plain eager ``y * 2`` on a Spyre tensor is already one fp16 ulp off
+            # the host on about half the elements (measured 6 Nov 2026). One
+            # ulp of a value below 4 is under 4e-3, so 1e-2 is a real check of
+            # the rows and not of the rounding.
+            torch.testing.assert_close(
+                out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
 if __name__ == "__main__":

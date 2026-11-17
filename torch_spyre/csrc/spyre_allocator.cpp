@@ -250,7 +250,7 @@ std::vector<flex::CompositeAddress> allocateShardTable(
     const std::shared_ptr<flex::FlexAllocator>& flex_alloc,
     uint64_t shard_device_bytes, uint32_t logical_chunks) {
   const uint32_t num_domains =
-      static_cast<uint32_t>(flex_alloc->topology().num_domains());
+      static_cast<uint32_t>(flex_alloc->topology().numDomains());
   std::vector<flex::CompositeAddress> shards;
   shards.reserve(logical_chunks);
   for (uint32_t i = 0; i < logical_chunks; ++i) {

@@ -28,6 +28,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_facts import counted_loop_path, enclosing_loops
 from .loop_info import ReadCopyElisionRecord
+from .loop_node import insert_after
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -1020,6 +1021,21 @@ def _retarget_internal_buf_mutation(
     )
 
 
+def _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback) -> None:
+    """Put ``buf_tmp`` right before ``mutation_op`` and ``buf_copyback`` right after.
+
+    ``_create_restickify_node`` appends both nodes at the end of ``operations``, so
+    they are taken out first. Each goes next to the mutation op in the list that
+    holds it: the copy-back is placed with ``insert_after``, not at a flat index
+    ``index(mutation_op) + 2``, which puts it before whatever follows the mutation,
+    and that is outside the loop when the mutation is the last op of a loop body.
+    """
+    operations.remove(buf_tmp)
+    operations.insert(operations.index(mutation_op), buf_tmp)
+    operations.remove(buf_copyback)
+    insert_after(operations, mutation_op, buf_copyback)
+
+
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """
     Move a slice mutation onto an alternate layout when the original layout
@@ -1142,15 +1158,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         mutation_op._emit_set_layout = (target_name, alt_stl)
 
         # Insert buf_tmp before mutation, copy-back after mutation.
-        # _create_restickify_node -> realize() appends buf_tmp/buf_copyback at
-        # the end of operations, so they sit after mutation_op; removing them
-        # first keeps the index arithmetic below correct.
-        mutation_op_index = operations.index(mutation_op)
-        operations.remove(buf_tmp)
-        operations.insert(mutation_op_index, buf_tmp)
-        # mutation_op is now at mutation_op_index + 1; insert copy-back after it.
-        operations.remove(buf_copyback)
-        operations.insert(mutation_op_index + 2, buf_copyback)
+        _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback)
 
         logger.info(
             "insert_post_mutation_restickify: %s (orig->alt) before %s; copy-back %s->%s after %s",

@@ -223,29 +223,12 @@ def enable_spyre_lowerings():
             saved = {}
 
             # Capture stock Inductor lowerings before overwriting them, so the
-            # adapters below can fall back to them for host-side (CPU) tensors.
-            # (Same pattern as _register_cmp_lowerings captures stock_tensor /
-            # stock_scalar before enable_spyre_lowerings() installs its overlay.)
+            # last exit can restore them.
             all_clamp_ovs = [
                 ov for ov in [clamp_min_ov, clamp_max_ov] if ov is not None
             ]
             for ov in all_clamp_ovs:
                 saved[ov] = lowering.lowerings.get(ov)
-
-            def _make_clamp_adapter(stock_key, spyre_fn):
-                """Route to stock Inductor for CPU tensors, Spyre lowering otherwise."""
-
-                def _adapter(*args, **kwargs):
-                    # ATen uses "self" as the first positional argument name.
-                    x = args[0] if args else kwargs.get("self")
-                    if x is not None and hasattr(x, "get_device"):
-                        if x.get_device().type != DEVICE_NAME:
-                            stock = saved.get(stock_key)
-                            if stock is not None:
-                                return stock(*args, **kwargs)
-                    return spyre_fn(*args, **kwargs)
-
-                return _adapter
 
             def _spyre_clamp_min(x, min):
                 return lower_clamp(x, min=min, max=None)
@@ -254,13 +237,9 @@ def enable_spyre_lowerings():
                 return lower_clamp(x, min=None, max=max)
 
             if clamp_min_ov is not None:
-                lowering.lowerings[clamp_min_ov] = _make_clamp_adapter(
-                    clamp_min_ov, _spyre_clamp_min
-                )
+                lowering.lowerings[clamp_min_ov] = _spyre_clamp_min
             if clamp_max_ov is not None:
-                lowering.lowerings[clamp_max_ov] = _make_clamp_adapter(
-                    clamp_max_ov, _spyre_clamp_max
-                )
+                lowering.lowerings[clamp_max_ov] = _spyre_clamp_max
 
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
@@ -2454,6 +2433,24 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if (
+        not skip_cast
+        and condition.get_dtype() != val_dtype
+        and result_dtype != torch.bool
+    ):
+        # The cast is realized under this where, so its only origin is
+        # aten.where.self. Layout propagation finds a dtype conversion, and the
+        # element arrangement it creates (e.g. dl16tofp32 -> DL16_TO_FP32), by the
+        # convert_element_type origin; without one the cast is recorded as
+        # STANDARD and a staggered mask is read as standard by where3.
+        origin = (
+            condition.get_origin_node() if isinstance(condition, ir.IRNode) else None
+        )
+        _ensure_synthetic_origin(
+            converted_condition,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
     if not skip_cast:
         # Spliced loop bodies no longer have FX bindings for splitting this cast.
         converted_condition.realize()
@@ -2905,12 +2902,14 @@ def _lower_cmp_impl(x, y, pointwise_fn):
 def _is_host_cmp(x, y):
     """True when no tensor operand of a comparison lives on the Spyre device.
 
-    enable_spyre_lowerings() overlays these lowerings on every node of the
-    graph, including host-side compares such as ``torch.arange(n) < k`` that a
-    model computes on CPU before moving the mask to the device. The int ->
-    float promotion exists only because Spyre has no integer compare; applied
-    to a CPU tensor it routes the cast through ``spyre::to_dtype_cpu``, which
-    has no CPU kernel.
+    enable_spyre_lowerings() overlays these lowerings on every node of a Spyre
+    graph, including the host-side compare in the condition of each while loop
+    that ``scan`` and ``for_each_tile`` lower to: Inductor's
+    ``decompose_scan_to_while_loop`` keeps that loop's counter as a host int64
+    scalar and tests ``counter < N``. The int -> float promotion exists only
+    because Spyre has no integer compare. Applied to that host compare it would
+    add a conversion the trip-count prover (``_extract_trip_count``) does not
+    accept, so the stock lowering keeps it a single ``lt``.
     """
     devices = [v.get_device() for v in (x, y) if hasattr(v, "get_device")]
     return not any(d is not None and d.type == DEVICE_NAME for d in devices)

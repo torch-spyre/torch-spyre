@@ -100,7 +100,11 @@ from torch._inductor.virtualized import V
 from .. import timing_recorder
 from ..deadcode_elimination import deadcode_elimination
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import identity_load, format_operations
+from ..pass_utils import (
+    format_operations,
+    identity_load,
+    invalidate_op_read_writes,
+)
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -2471,7 +2475,6 @@ def _contract_cross_scope_input_materializations(
     )
     from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
     from torch_spyre._inductor.wsr.loop_tiling_common import (
-        _LoopVarRebaseHandler,
         _rescale_index,
     )
 
@@ -2805,27 +2808,11 @@ def _contract_cross_scope_input_materializations(
                 # and the post-layout proof requires a nonzero loop advance.
                 continue
 
-            loop_var_zeros = {
-                loop_var: sympy.S.Zero for loop_var, _trip_count in loop_specs
-            }
-
-            def fallback_inner(
-                *args,
-                _inner=composed_inner,
-                _target=root_name,
-                _zeros=loop_var_zeros,
-            ):
-                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
-                    return _inner(*args)
-
-            def direct_inner(
-                *args,
-                _inner=direct_composed_inner,
-                _target=source_name,
-                _zeros=loop_var_zeros,
-            ):
-                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
-                    return _inner(*args)
+            # The loop term stays in these reads' indexes (stage 7.2b): the consumer
+            # lists the loop variable in its dim_hints, so per_trip_index pins it in
+            # the base coordinates and the step comes from the index.
+            fallback_inner = composed_inner
+            direct_inner = direct_composed_inner
 
             fallback_tiled, fallback_squeezed = fallback_metadata
             tiled_per_read = copy.deepcopy(final_info.tiled_dims_per_read)
@@ -2880,6 +2867,35 @@ def _contract_cross_scope_input_materializations(
             return
 
 
+def _split_loop_term(
+    source_index: sympy.Expr,
+    loop_vars: "set[sympy.Symbol]",
+) -> "tuple[sympy.Expr, sympy.Expr] | None":
+    """Split a staged copy's source index into (loop term, index without it).
+
+    The loop term is the part that depends on the loop variables ``loop_vars`` (and
+    only those): the direct read that replaces the copy adds it back to its own
+    source load. Returns ``None`` when the index is not of that shape, so the caller
+    keeps the staged copy:
+
+    * a symbol other than the copy's own iteration variables and the loop
+      variables (an indirect or unbacked symbol) stays in the index, so the
+      caller's pure-identity check fails on it as it did before the term was
+      carried in the index;
+    * the loop term must not contain the copy's own iteration variables (a cross
+      term such as ``c*i*u``): they do not exist in the consumer's frame, so adding
+      such a term there would be wrong code.
+    """
+    present = {s for s in source_index.free_symbols if s in loop_vars}
+    rest = sympy.simplify(source_index.subs({s: sympy.S.Zero for s in present}))
+    loop_term = sympy.simplify(source_index - rest)
+    # Anything in the loop term that is not a loop variable is refused: the copy's
+    # own iteration variables (a cross term c*i*u) and any other symbol alike.
+    if loop_term.free_symbols - loop_vars:
+        return None
+    return loop_term, rest
+
+
 def _contract_exact_stride_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2907,12 +2923,11 @@ def _contract_exact_stride_input_materializations(
 
     from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
     from torch_spyre._inductor.wsr.loop_tiling_common import (
-        _LoopVarRebaseHandler,
+        _AddLoopTermHandler,
         _NameSwapHandler,
         _divide_ranges,
         _loop_var_hinted_ranges,
         _patch_retiled_load_indexes,
-        _splice_loop_vars,
     )
 
     _contract_cross_scope_input_materializations(graph, pending_levels)
@@ -3176,6 +3191,22 @@ def _contract_exact_stride_input_materializations(
                     producer_info,
                     squeezed_advance_per_read=squeezed,
                 )
+                # The source read carries the step in its index too: ``source_step`` times
+                # the loop variable. Bound as defaults, because the wrapped inner_fn runs
+                # later, after this loop has moved on to the next producer.
+                _orig_inner = producer.data.inner_fn
+
+                def _inner_with_loop_term(
+                    *args,
+                    _o=_orig_inner,
+                    _src=identities[name][0],
+                    _term=source_step * loop_var,
+                ):
+                    with V.set_ops_handler(_AddLoopTermHandler(V.ops, _src, _term)):
+                        return _o(*args)
+
+                object.__setattr__(producer.data, "inner_fn", _inner_with_loop_term)
+                invalidate_op_read_writes(producer)
 
         if not contracted_level_names:
             continue
@@ -3236,6 +3267,14 @@ def _contract_exact_stride_input_materializations(
         if not isinstance(copy_op, ir.ComputedBuffer) or identity is None:
             continue
         source_name, source_index, identity_indices = identity
+        # The staged copy's source read carries the loop term in its index (stage
+        # 7.2b). The shape check below is about the copy's own iteration variables,
+        # so set the loop term apart: it is what the direct read adds back to its
+        # source load, read from the copy's index and not from the record.
+        split = _split_loop_term(source_index, {lv for lv, *_ in pending_levels})
+        if split is None:
+            continue
+        loop_term, source_index = split
         source_base = sympy.simplify(
             source_index.subs({index: sympy.S.Zero for index in identity_indices})
         )
@@ -3301,23 +3340,20 @@ def _contract_exact_stride_input_materializations(
             continue
         full_strides = list(copy_op.layout.stride)
         name_map = {copy_name: (source_name, full_strides, source_strides)}
-        loop_var_zeros = {
-            symbol: sympy.S.Zero for symbol in _splice_loop_vars(consumer)
-        }
         consumer_inner = consumer.data.inner_fn
 
         def direct_inner_fn(
             *args,
             _inner=consumer_inner,
             _map=name_map,
-            _source_name=source_name,
-            _loop_var_zeros=loop_var_zeros,
+            _loop_terms={copy_name: loop_term},
         ):
-            with V.set_ops_handler(
-                _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
-            ):
-                with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
-                    return _inner(*args)
+            # The swapped-in read keeps the staged copy's loop term in its index
+            # (stage 7.2b): the consumer's dim_hints list the loop variable, so
+            # per_trip_index pins it in the base coordinates, and the step comes
+            # from the index. Only the loads that were swapped get the term.
+            with V.set_ops_handler(_NameSwapHandler(V.ops, _map, _loop_terms)):
+                return _inner(*args)
 
         direct_tiled = copy_info.tiled_dims_per_read[0]
         direct_squeezed = (
@@ -3412,7 +3448,6 @@ def splice_while_loops(graph) -> None:
     from torch._inductor import ir
 
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.wsr.loop_tiling_common import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
@@ -3537,20 +3572,7 @@ def splice_while_loops(graph) -> None:
     # the complete K/V cache on each trip.
     _contract_exact_stride_input_materializations(graph, pending_levels)
 
-    # Read-side counterpart of the stamping above: _stamp_direct_loop_info
-    # records a point-shaped splice read's per-trip step in
-    # squeezed_advance_per_read (mirroring coarse_tile.py's own
-    # _point_splice_advance_for_dep -- see that function's docstring), but
-    # leaves the read's index itself unrebased (e.g. paged attention's
-    # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
-    # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
-    # splice groups never go through it -- see this function's own docstring.
-    # Without this call the raw indirect symbol survives into
-    # propagate_spyre_tensor_layouts, which rejects it (not an
-    # iteration_space key). Run once, after every level's stamping has been
-    # merged in above, so squeezed_advance_per_read reflects each op's final,
-    # fully-merged state rather than a partially-stamped intermediate.
-    _rebase_point_splice_reads(graph.operations)
+    # A point read keeps its loop term in the index (not rebased to iteration 0).
 
     if pending_levels:
         # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
