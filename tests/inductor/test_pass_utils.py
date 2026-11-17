@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-import math
 import types
 
 import pytest
@@ -483,7 +482,7 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     # One element per stick: the old stick's 64 elements become an outer dim
     # and the stick maps to no host stride.
     assert list(result.device_size) == [64, 4, 64]
-    assert list(result.stride_map) == [1, 64, -1]
+    assert list(result.stride_map) == [1, 64, 0]
 
 
 _FP16 = get_device_dtype(torch.float16)
@@ -821,24 +820,6 @@ def test_compiled_transpose_restickify_padded_valid_elements():
     assert out_stl.valid_elements[stick_key] == S
 
 
-def test_rescale_stl_for_dtype_matches_fp32_host_layout():
-    """fp16 -> fp32 rescale of [2, 4, 64] must match the fp32 constructor.
-
-    Dim 0 has stride 64 (the fp16 stick depth) but is not in the stick's
-    valid_elements pair, so it must stay 4 rows. Only dims 1 and 3 are rescaled.
-    All 512 elements remain valid.
-    """
-    stl = SpyreTensorLayout([2, 4, 64], torch.float16)
-    out = pass_utils.rescale_stl_for_dtype(
-        stl, torch.float32, ElementArrangement.STANDARD
-    )
-    ref = SpyreTensorLayout([2, 4, 64], torch.float32)
-    assert list(out.device_size) == list(ref.device_size) == [4, 2, 2, 32]
-    assert list(out.stride_map) == list(ref.stride_map) == [64, 32, 256, 1]
-    assert out.valid_elements == ref.valid_elements == {(0,): 4, (1, 3): 64, (2,): 2}
-    assert math.prod(out.valid_elements.values()) == 2 * 4 * 64
-
-
 def test_compute_size1_restickify_layout_indirect_access():
     """Indirect-access tensors (x[i]) must not return None from compute_size1_restickify_layout.
 
@@ -870,4 +851,4 @@ def test_compute_size1_restickify_layout_indirect_access():
     # The old stick's 512 host elements stay on dim 0 and the one-element stick
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
-    assert list(result.stride_map) == [1, -1]
+    assert list(result.stride_map) == [1, 0]

@@ -243,6 +243,23 @@ def test_only_transient_errors_are_retriable(err, expected):
     assert retriable(err) is expected
 
 
+@pytest.mark.parametrize("code", [242, 285, 286, 319, 999])
+def test_replication_errors_are_retriable_when_the_driver_reports_the_code(code):
+    # Newer drivers carry the server code on the exception and omit "HTTP status" from the text.
+    e = DatabaseError(
+        f"Received ClickHouse exception, code: {code}, server response: x", code=code
+    )
+    assert retriable(e) is True
+
+
+@pytest.mark.parametrize("code", [60, 47, 497, 516, 469])
+def test_deterministic_errors_stay_fatal_when_the_driver_reports_the_code(code):
+    e = DatabaseError(
+        f"Received ClickHouse exception, code: {code}, server response: x", code=code
+    )
+    assert retriable(e) is False
+
+
 def test_a_deterministic_error_fails_at_once_without_backoff():
     c = Client(
         fail_at=range(1, 99),
@@ -329,7 +346,7 @@ def test_table_insert_passes_the_scope_and_idempotence_through():
 
 
 def test_every_replacing_merge_tree_model_is_marked_idempotent():
-    import re
+    import regex as re
     from pathlib import Path
 
     from spyre_clickhouse_ingest import schema

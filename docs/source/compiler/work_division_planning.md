@@ -433,8 +433,10 @@ the splits to legacy coefficient-keyed `op_it_space_splits` transport so
 Scheduler/codegen can survive iteration-symbol renaming.
 
 For the worked example below, the pre-scheduler ownership is
-`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
-coefficient-keyed encoding.
+`{M: 16, N: 1, K: 2}`. The M/N splits use write-index coefficients and the K
+split uses a read-index coefficient. Splits with an axis absent from its index
+or collisions between nontrivial axes are rejected; finalization checks again
+before encoding.
 :::
 
 Two op-kind constraints apply on top of the algorithm above. For
