@@ -346,8 +346,20 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=_ATOL_F16,
         )
 
+    @pytest.mark.skip(
+        reason="Compiled topk indices used to gather table rows give an unstable result: \
+        the second row is wrong (both output rows are table[0], see issue #4713), the same \
+        run can return the correct rows, and some runs raise ComputeHardwareError 0x9b01, \
+        after which StreamInErrorState poisons the session. A strict xfail cannot hold. \
+        See issue #4713."
+    )
     def test_topk_index_inside_graph(self):
-        """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC."""
+        """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC.
+
+        The gather alone is correct (ids computed on the host match CPU at 1 and 32
+        cores); with topk in the same graph the outcome varies run to run.
+        """
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
         expert_w = cached_randn(
             (8, 64, 32), differentiation="ing02", dtype=torch.float16
         )

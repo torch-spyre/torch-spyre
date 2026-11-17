@@ -215,6 +215,39 @@ def xfail_existing(
 _xfail_existing = xfail_existing
 
 
+_DL16_MAX = 65472.0  # 1023/1024 * 2**16, largest finite dl16 value
+
+
+def dl16_snap(x):
+    """Round fp16 values to what a Spyre ``.to(device).cpu()`` round trip returns.
+
+    fp16 is stored on device as dl16 (SEN169_FP16), which keeps one mantissa bit
+    fewer than IEEE fp16 (9 stored vs 10), so a transfer rounds each value to 10
+    significant bits.  Ties round away from zero (measured on device over every
+    finite fp16 value; ties-to-even matches only 75.8%).  This is the "transfer
+    floor" in docs/source/user_guide/debugging/op_spec_lab.md, not a bug.
+
+    Rounding saturates at 65472, the largest dl16 value: the device returns
+    +-65472 for +-65504 (measured), where plain rounding would give 65536.
+
+    The function is idempotent, leaves 0, inf and nan unchanged, and commutes
+    with data movement: snap(x)[i] == snap(x[i]).
+
+    Tensors of any other dtype (bf16, fp32, int, bool) round-trip losslessly
+    and are returned unchanged.  Tuples and lists are handled element-wise.
+    """
+    if isinstance(x, (tuple, list)):
+        return type(x)(dl16_snap(e) for e in x)
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.float16:
+        return x
+    mant, exp = torch.frexp(x.float())
+    scaled = mant * 1024
+    rounded = torch.sign(scaled) * torch.floor(scaled.abs() + 0.5)
+    snapped = torch.ldexp(rounded / 1024, exp)
+    snapped = snapped.clamp(-_DL16_MAX, _DL16_MAX)
+    return torch.where(torch.isfinite(x), snapped, x.float()).to(torch.float16)
+
+
 def compare_mode(execution_mode, fn, *args, atol, rtol):
     """Run fn in exactly one execution mode and compare result with CPU.
 
@@ -222,9 +255,18 @@ def compare_mode(execution_mode, fn, *args, atol, rtol):
     index_select, embedding lookup, scatter without arithmetic), and the dtype
     tolerance only for compute that follows the gather.
 
+    With ``atol == rtol == 0`` the comparison stays bit-exact.  fp16 inputs are
+    first snapped to the dl16 transfer floor (see ``dl16_snap``), because an
+    fp16 value cannot survive the host/device round trip unchanged; with
+    snapped inputs a correct gather returns bit-identical values on CPU and
+    device, while a wrong row, a dropped or a duplicated element still differs
+    by far more than the floor and fails.
+
     Executes the full graph on Spyre hardware without manual try/except.
     Torch-Spyre's strict_xfail manages the expected failure validation.
     """
+    if atol == 0 and rtol == 0:
+        args = dl16_snap(args)
     compare_with_cpu(
         fn,
         *args,

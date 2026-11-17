@@ -444,10 +444,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
     def test_api_torch_take(self, execution_mode):
         """torch.take(x, flat_idx); flat index into flattened tensor."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4307
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
-        _xfail_existing(
-            execution_mode, eager=_TAKE_EAGER, compiled=_HOST_SIZE_DIM_ORDER
-        )
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
+        _xfail_existing(execution_mode, eager=_TAKE_EAGER, compiled=_RESTICKIFY_3ARGS)
         x = cached_randn((64, 128), differentiation="api05", dtype=torch.float16)
         flat_idx = torch.randint(0, 64 * 128, (32,), dtype=torch.int64)
         compare_mode(

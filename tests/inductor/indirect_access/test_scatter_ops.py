@@ -35,7 +35,7 @@ _ATOL_F32 = 1e-5
 
 
 _MASKED_FILL_FP32 = (
-    5495,
+    4714,
     "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA that is refused as Multi-arg pointwise with mixed EA.",
     r"Multi-arg pointwise with mixed EA",
 )
@@ -296,7 +296,7 @@ class TestMaskedFillStandaloneEagerCompile:
 
     def test_masked_fill_float32(self, execution_mode):
         """masked_fill on (8,16) float32; validates 4-byte word path for mask-based fill."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5495
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4714
         _xfail_existing(
             execution_mode, eager=_MASKED_FILL_FP32, compiled=_MASKED_FILL_FP32
         )

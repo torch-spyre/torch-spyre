@@ -64,7 +64,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from conftest import _xfail_existing, compare_mode, dl16_snap  # noqa: E402
 
 try:
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
@@ -152,8 +152,13 @@ def _compare_explicit_stl(
     tensors) and passed as ``cpu_eager_result`` so ``compare_with_cpu`` does not
     re-run ``fn(x_dev, idx_dev)`` as a "CPU reference", which would silently
     execute in Spyre-eager mode instead of on CPU.
+
+    With ``atol == rtol == 0`` the reference is snapped to the dl16 transfer floor
+    (see ``conftest.dl16_snap``), the value a correct gather returns on device.
     """
     cpu_ref = fn(x_cpu, idx_cpu)
+    if atol == 0 and rtol == 0:
+        cpu_ref = dl16_snap(cpu_ref)
     compare_with_cpu(
         fn,
         x_dev,
@@ -334,7 +339,7 @@ class TestGatherImplicitLayout:
         for p in (8, 16, 24):
             idx = torch.randint(0, 40, (p,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=0, rtol=0)
+            torch.testing.assert_close(result, dl16_snap(x[idx]), atol=0, rtol=0)
 
     def test_api_equivalence(self, execution_mode):
         """index_select(x,0,idx) on Spyre matches CPU reference (float16, implicit layout)."""
