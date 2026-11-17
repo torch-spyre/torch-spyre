@@ -52,14 +52,13 @@ Applying them in filename order works from an empty database.
 | `89-bench-invalidation-preview.sql` | `v_bench_repeat_scope`, `v_bench_invalidation_impact`, `v_bench_invalidation_summary`, `v_bench_scope_hits` (parameterized) | 60, 82, 83 |
 | `90-bench-span-values.sql` | OPTIONAL: `bench_span_values`, `mv_bench_span_values`, `v_bench_spans_fast` (an insert-triggered copy of the unnested spans) | 30, 83, 87 |
 
-### Benchmark schema stack (81-89)
+### Benchmark schema stack (81-90)
 
-Numbers 81-86 land together in the `feat/bench-schema` stack, in this order: environments,
-placements and invalidations (81-84), reader exclusion (edits to 50/52/55/60/62/70 plus migration
-025, 029), verdict views (85), references view (86). Later benchmark work extends the stack
-without renumbering it:
+Numbers 81-86 come first, in this order: environments, placements and invalidations (81-84), reader
+exclusion (edits to 50/52/55/60/62/70 plus migrations 025 and 029), verdict views (85), references view
+(86). The views that follow extend the stack without renumbering it:
 
-| reserved | for |
+| number | for |
 |---|---|
 | `87` | trace views |
 | `88` | anchor (baseline) views |
