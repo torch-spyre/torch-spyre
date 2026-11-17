@@ -34,7 +34,6 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
-    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -1387,9 +1386,10 @@ _QFP8WT_ROWS_PER_STICK = 2
 
 def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
     """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
-    return (
-        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
-    )
+    # The arrangement alone marks the 2D stick; the op-name gate was removed
+    # with FP8_2D_STICK_OPS, since a QFP8WT tensor only reaches batchmatmulfp8
+    # and qfp8wt (other ops reject it in OpSpec validation).
+    return arg.element_arrangement == ElementArrangement.QFP8WT
 
 
 def _check_qfp8wt_offset(arg: TensorArg) -> None:
