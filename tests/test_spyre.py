@@ -189,7 +189,7 @@ class TestSpyre(TestCase):
             d = expected.to("spyre")
             for view in (lambda t: t[8:16], lambda t: t[8:16].detach().view(-1)):
                 with self.assertRaisesRegex(
-                    RuntimeError, "view of a Spyre tensor is not supported yet"
+                    RuntimeError, "partial view of a Spyre tensor"
                 ):
                     view(d).fill_(3.0)
             self.assertTrue(torch.equal(d.cpu(), expected))
@@ -206,12 +206,18 @@ class TestSpyre(TestCase):
             subtest(lambda t: t.view(-1), name="flat"),
             subtest(lambda t: t.t(), name="transposed"),
             subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+            # A detached whole tensor is not a view, but its views are: the
+            # root check must accept them.
+            subtest(lambda t: t.detach().view(-1), name="detached_flat"),
+            subtest(lambda t: t.detach().t(), name="detached_transposed"),
         ],
     )
     def test_fill_whole_tensor_view(self, view):
         d = torch.zeros(64, 64).to("spyre")
         view(d).fill_(3.0)
         self.assertTrue(d.cpu().eq(3.0).all())
+        view(d).zero_()
+        self.assertTrue(d.cpu().eq(0.0).all())
 
     @parametrize(
         "shape, dtype",
@@ -251,9 +257,7 @@ class TestSpyre(TestCase):
         reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
         expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
         d = expected.to("spyre", dynamic=reserve)
-        with self.assertRaisesRegex(
-            RuntimeError, "view of a Spyre tensor is not supported yet"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "partial view of a Spyre tensor"):
             d[10:20].fill_(3.0)
         self.assertTrue(torch.equal(d.cpu(), expected))
 

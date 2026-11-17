@@ -1939,8 +1939,10 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               self.sizes(), " at storage offset ", self.storage_offset(),
               "; the whole tensor has ",
               whole_elements >= 0 ? whole_elements : root.numel(),
-              " elements at storage offset 0). Fill the whole tensor, or fill "
-              "a CPU copy and copy it back.");
+              " elements at storage offset ",
+              whole_elements >= 0 ? 0 : root.storage_offset(),
+              "). Fill the whole tensor, or fill a CPU copy and copy it "
+              "back.");
 
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // flex::createFillAsyncParams performs internally.
