@@ -591,9 +591,8 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
 
     .. deprecated::
         Does not handle factorized layouts where a variable spans multiple host
-        dims. New code should use ``_host_size_stride_for_expr`` in
-        ``pass_utils.py`` instead, which resolves factorized expressions via
-        ``_factorized_chain``.
+        dims. New code should scan ``ic`` directly for dims carrying the
+        variable and read ``host_size``/``host_stride`` from the host layout.
     """
     if len(expr.free_symbols) != 1:
         return None

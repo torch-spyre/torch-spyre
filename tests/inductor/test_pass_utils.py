@@ -33,7 +33,6 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
-from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 
@@ -41,7 +40,6 @@ from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 @pytest.mark.parametrize("folded_axis", ["new", "old", None])
 def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
     from torch_spyre._C import DataFormats, SpyreTensorLayout
-    from torch_spyre._inductor.propagate_layouts import PropArg
 
     page, token, head, feature = sympy.symbols(
         "page token head feature", integer=True, nonnegative=True
@@ -62,22 +60,10 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
             2 * page + sympy.floor(feature / 64),
             sympy.Mod(feature, 64),
         ]
-        dep = MemoryDep(
-            "x",
-            5120 * token + 2560 * head + 128 * page + feature,
-            (token, head, page, feature),
-            (64, 2, 20, 128),
-        )
     else:
         size = [20, 64, 2, 64]
         stride = [8192, 128, 64, 1]
         host_coords = [page, token, head, feature]
-        dep = MemoryDep(
-            "x",
-            8192 * page + 128 * token + 64 * head + feature,
-            (page, token, head, feature),
-            (20, 64, 2, 64),
-        )
         if folded_axis == "new":
             stl = SpyreTensorLayout(
                 [1280, 2, 1, 64],
@@ -95,14 +81,12 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
             )
             device_coords = [page, token, head, sympy.S.Zero, feature]
     host = FixedLayout(torch.device("cpu"), torch.float16, size, stride)
-    arg = PropArg(dep, host, [stl])
     target = pass_utils.compute_restickify_target_layout(
         stl,
         host,
         sympy.Mod(token, 64),
         host_coords,
         device_coords,
-        arg=arg,
     )
     if folded_axis is not None:
         assert target is None
@@ -439,11 +423,8 @@ def test_compute_restickify_target_layout_moves_to_existing_size1_dim():
     # outer dim's coordinate is the same constant as the host's size-1 dim.
     stl = SpyreTensorLayout([1, 64], [64, 1], torch.float16, [0, 1])
     idc = [sympy.S.Zero, d1]
-    dep = MemoryDep("x", d1, (d1,), (64,))
-    arg = PropArg(dep, host_layout, [stl])
-
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
+        stl, host_layout, sympy.S.Zero, ic, idc
     )
 
     assert result is not None
@@ -463,10 +444,8 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     ic = pass_utils.host_coordinates(host_layout, dep, None)
     idc = pass_utils.device_coordinates(stl, dep, None)
 
-    arg = PropArg(dep, host_layout, [stl])
-
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
+        stl, host_layout, sympy.S.Zero, ic, idc
     )
 
     assert result is not None
@@ -488,18 +467,12 @@ def test_compute_size1_restickify_layout_indirect_access():
 
     # 1-D host tensor with 512 fp16 elements (8 sticks of 64).
     host_layout = FixedLayout(torch.device("spyre"), torch.float16, [512], [1])
-    # dep.ranges is empty: tmp0 is an indirect symbol, not a loop variable.
-    dep = MemoryDep("x", tmp0, (), ())
     stl = SpyreTensorLayout([8, 64], [64, 1], torch.float16, [0, 1])
     # Host coordinate for the single dim is the indirect symbol itself.
     ic = [tmp0]
     # Device coords: outer = which stick, inner = position within stick.
     idc = [FloorDiv(tmp0, stick_size), ModularIndexing(tmp0, 1, stick_size)]
-    arg = PropArg(dep, host_layout, [stl])
-
-    result = pass_utils.compute_size1_restickify_layout(
-        stl, host_layout, ic, idc, arg=arg
-    )
+    result = pass_utils.compute_size1_restickify_layout(stl, host_layout, ic, idc)
 
     # Must not return None: the indirect symbol is a valid dimension, not broadcast.
     assert result is not None
