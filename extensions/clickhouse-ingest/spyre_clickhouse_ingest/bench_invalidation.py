@@ -21,7 +21,6 @@ Bundle: bundle.json {"kind": "bench-invalidation"} and results/invalidation.json
 Exit codes as the other kinds: 0 ingested or already ingested, 1 failed (retry), 2 rejected.
 """
 
-import getpass
 import hashlib
 import json
 import os
@@ -30,7 +29,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .offline import BUNDLE_FILE, FAILED, BundleError, bundle_files, digest, sha256
+from .offline import (
+    BUNDLE_FILE,
+    FAILED,
+    BundleError,
+    bundle_files,
+    current_user,
+    digest,
+    sha256,
+)
 
 KIND = "bench-invalidation"
 EVENTS_FILE = "results/invalidation.json"
@@ -765,7 +772,7 @@ def ingest(root, args, client=None):
 
     events = load(root)
     extra = dict(getattr(args, "bundle_prop", None) or [])
-    actor = getattr(args, "uploader", "") or getpass.getuser()
+    actor = getattr(args, "uploader", "") or current_user()
     sha = digest(Path(root))
     if client is None:
         db = ClickHouseEnv.target_database()

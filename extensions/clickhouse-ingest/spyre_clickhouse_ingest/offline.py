@@ -83,7 +83,7 @@ UPLOAD_FORMAT = {"bench-reference": "reference"}
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
 # Kinds that record no result of a tested artifact: they name no artifact, tier or arch, and only a
-# CI-trusted channel may ingest them (bundle.py).
+# CI-trusted channel (a lab one too, for bench-invalidation) may ingest them (bundle.py).
 ADMIN_KINDS = (
     "bench-definitions",
     "bench-qualification",
@@ -882,10 +882,14 @@ def check_admin(root: Path, meta: dict, results: list) -> None:
             ):
                 raise BundleError(f"{at}: scope.repeat is a count")
             for key in ("window_from", "window_to"):
-                if scope.get(key) and not _date_time(str(scope[key])):
-                    raise BundleError(
-                        f"{at}: scope.{key} is an ISO-8601 time with a zone"
-                    )
+                if e.get(key) and not _date_time(str(e[key])):
+                    raise BundleError(f"{at}: {key} is an ISO-8601 time with a zone")
+            from .bench_invalidation import InvalidationError, normalize
+
+            try:
+                normalize(e)
+            except InvalidationError as err:
+                raise BundleError(f"{at}: {err}") from None
 
 
 def check_reference(root: Path, meta: dict, results: list) -> None:
@@ -1395,7 +1399,12 @@ def write(args, validate_times: bool = True) -> Path:
         raise BundleError(f"{root} is not empty")
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
-        shutil.copy2(p, root / "results" / p.name)
+        shutil.copy2(
+            p,
+            root
+            / "results"
+            / ("invalidation.json" if kind == "bench-invalidation" else p.name),
+        )
     if staged:
         shutil.rmtree(staged, ignore_errors=True)
     if getattr(args, "redact_host", False):
@@ -1707,8 +1716,6 @@ def add_offline_options(parser) -> None:
     )
     g.add_argument("--bundle-prop", action="append", type=_pair, default=[],
                    help="--from-bundle: k=v added to the verdict's props (the source keys win)")  # fmt: skip
-    g.add_argument("--confirm-runs", type=int, default=None, metavar="N",
-                   help="--from-bundle: confirm an invalidation covering more than 50 runs (N = the previewed count)")  # fmt: skip
     g.add_argument("--append-to-run", action="store_true",
                    help="--from-bundle: add this bundle's files to the manual run it names, "
                    "which already has results (needs --bundle-prop upload_id=<id>)")  # fmt: skip

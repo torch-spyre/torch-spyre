@@ -14,7 +14,7 @@
 
 """Writers of the bench bundle kinds (offline.py checks them): `bench` Results into benchmarks,
 benchmark_runs, environment_fingerprints, run_placements and the run's verdict; and the CI-only
-`bench-definitions`, `bench-qualification` and `bench-invalidation` records.
+`bench-definitions`, `bench-qualification` and `bench-placement` records (`bench-invalidation` is bench_invalidation.py).
 
 Trust is the channel's, never the bundle's. A claim a lower-trust channel cannot back (purpose,
 validity, clean.exclusive, environment labels) is stored as a `claim.*` prop beside the
@@ -26,7 +26,7 @@ import hashlib
 import json
 import regex as re
 import statistics
-from datetime import datetime, timedelta, timezone
+from datetime import timezone
 from pathlib import Path
 
 from . import schema
@@ -35,7 +35,6 @@ from .bench_tables import (
     EnvironmentQualifications,
     Environments,
     NodeClasses,
-    ResultInvalidations,
     RunPlacements,
 )
 from .identity import BenchmarkId, DerivedId
@@ -48,7 +47,6 @@ from .offline import (
 )
 from .writer import ArtifactWriter, insert_artifact_result, upload_row_props
 
-LARGE_INVALIDATION = 50
 MIN_EVIDENCE_REPEATS = 3
 LOW_TRUST_PURPOSES = {"lab": ("on-demand", "investigate"), "external": ("external",)}
 DOWNGRADED_PURPOSE = {"lab": "on-demand", "external": "external"}
@@ -385,19 +383,7 @@ def ingest_admin(client, db, root, meta, args, trust, uploader, sha, dry_run) ->
     if kind == "bench-placement":
         require_channel(kind, trust, ("ci",))
         return {**out, **placement_updates(client, db, root, sha, dry_run)}
-    require_channel(kind, trust, ("ci", "lab"))
-    return {
-        **out,
-        **invalidations(
-            client,
-            db,
-            root,
-            uploader,
-            sha,
-            dry_run,
-            getattr(args, "confirm_runs", None),
-        ),
-    }
+    raise BundleError(f"{kind}: not written by bench_bundle")
 
 
 def definitions(client, db, root, dry_run) -> dict:
@@ -525,78 +511,6 @@ def qualifications(client, db, root, uploader, sha, dry_run) -> dict:
         "status": ("would-ingest" if dry_run else "ingested") if rows else "duplicate",
         "new_records": len(rows),
     }
-
-
-def matched_runs(client, db: str, scope_kind: str, scope: dict) -> int:
-    """Runs a scope covers now (the preview count stored with the event)."""
-    if scope_kind in ("run", "run_benchmark"):
-        extra = " AND benchmark_id = {b:UUID}" if scope_kind == "run_benchmark" else ""
-        n = client.query(
-            f"SELECT count() FROM {db}.benchmark_runs WHERE run_id = {{r:UUID}}{extra}",
-            parameters={
-                "r": scope["run_id"],
-                "b": scope.get("benchmark_id") or scope["run_id"],
-            },
-        ).result_rows[0][0]
-        if not n:
-            raise BundleError(f"no recorded rows for run {scope['run_id']}")
-        return 1
-    test = {"node": "has(nodes, {v:String})", "device": "arrayExists(d -> d.serial = {v:String}, devices)",
-            "placement": "lower(toString(placement_id)) = lower({v:String})"}[scope_kind]  # fmt: skip
-    value = scope.get(
-        {"node": "node", "device": "device_serial", "placement": "placement_id"}[
-            scope_kind
-        ]
-    )
-    window = ""
-    params = {"v": value}
-    if scope.get("window_from"):
-        window += " AND (started_at IS NULL OR started_at >= parseDateTime64BestEffort({wf:String}, 3, 'UTC'))"
-        params["wf"] = scope["window_from"]
-    if scope.get("window_to"):
-        window += " AND (started_at IS NULL OR started_at <= parseDateTime64BestEffort({wt:String}, 3, 'UTC'))"
-        params["wt"] = scope["window_to"]
-    return int(client.query(
-        f"SELECT uniqExact(run_id) FROM {db}.run_placements WHERE {test}{window}", parameters=params
-    ).result_rows[0][0])  # fmt: skip
-
-
-def invalidations(client, db, root, uploader, sha, dry_run, confirm) -> dict:
-    events, rows, counts, needs = records(root, "events"), [], [], []
-    base = datetime.now(timezone.utc)
-    for i, e in enumerate(events):
-        scope = e.get("scope") or {}
-        count = matched_runs(client, db, e["scope_kind"], scope)
-        counts.append(count)
-        latest = client.query(
-            f"SELECT argMax(state, (ts, audit_timestamp, audit_uuid)) FROM {db}.result_invalidations "
-            "WHERE invalidation_id = {i:UUID}",
-            parameters={"i": e["invalidation_id"]},
-        ).result_rows
-        if latest and latest[0][0] == e["state"]:
-            continue
-        if e["state"] != "restored" and count > LARGE_INVALIDATION and confirm != count:
-            if dry_run:
-                needs.append(count)
-                continue
-            raise BundleError(
-                f"event {i} covers {count} runs (more than {LARGE_INVALIDATION}): preview with --dry-run, "
-                f"then confirm with --confirm-runs {count}"
-            )
-        rows.append({
-            "ts": base + timedelta(milliseconds=i), "invalidation_id": e["invalidation_id"],
-            "scope_kind": e["scope_kind"], "run_id": scope.get("run_id"), "benchmark_id": scope.get("benchmark_id"),
-            "repeat": scope.get("repeat"), "node": scope.get("node", ""), "device_serial": scope.get("device_serial", ""),
-            "placement_id": scope.get("placement_id", ""), "window_from": _utc(scope.get("window_from")),
-            "window_to": _utc(scope.get("window_to")), "match": {}, "match_expr": "", "matched_runs": count,
-            "state": e["state"], "reason_code": e["reason_code"], "reason": e.get("reason", ""),
-            "actor": uploader, "evidence_url": e.get("evidence_url", ""), "props": {"bundle_sha256": sha},
-        })  # fmt: skip
-    if not dry_run:
-        ResultInvalidations.insert(client, rows, db=db)
-    return {"status": ("would-ingest" if dry_run else "ingested") if rows else "duplicate",
-            "new_records": len(rows), "matched_runs": counts,
-            **({"needs_confirm": needs} if needs else {})}  # fmt: skip
 
 
 def placement_updates(client, db, root, sha, dry_run) -> dict:

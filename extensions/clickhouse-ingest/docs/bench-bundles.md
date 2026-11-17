@@ -43,7 +43,7 @@ Records for the other kinds are sealed with `--kind bench-definitions|bench-qual
 ```text
 bench-definitions     {"source": {"repo","ref","git_sha"}, "records": [{"kind": "Environment|NodeClass", "name", "spec_digest", "spec": {...}}]}
 bench-qualification   {"records": [{"node","env_id","probe","outcome": "pass|fail","limit_pct","evidence_run_id","qualified_at","expires_at","checks": {...},"metric"?,"cv_pct"? (a claim)}]}
-bench-invalidation    {"events": [{"invalidation_id","scope_kind","scope": {...},"state","reason_code","reason"?,"evidence_url"?}]}
+bench-invalidation    {"events": [{"invalidation_id","scope_kind","scope": {...},"window_from"?,"window_to"?,"state","reason_code","reason","evidence_url"?}]}
 bench-placement       {"updates": [{"run_id","repeats"? (absent: every repeat),"clean"?: {...},"nodes"?,"devices"?: [{node,serial,pci,firmware,link}],"links"?}]}
 ```
 
@@ -121,10 +121,12 @@ a higher trust is a `duplicate` and changes nothing. The action accepts `channel
   the `clean` keys and marking the source `ci_update`. Sending the same update again writes nothing; a run with no
   placement rows, or a repeat it lacks, is refused.
 - **Invalidation.** An event is a scope (`run`, `run_benchmark`, `node`, `device`, `placement`, with an optional time
-  window), a state and a reason code. The actor is `--uploader` (the verified login), never the bundle. The preview
-  (`--dry-run`) prints `matched_runs`; an event that covers more than 50 runs is refused until the same count is
-  passed back with `--confirm-runs N`. Re-sending the state an id already has is a no-op. A run that matches no stored
-  row is rejected.
+  window: `window_from` / `window_to` are event fields, not scope fields), a state (`suspect`, `invalidated`, `restored`), a reason code and a reason. It is ingested by
+  `bench_invalidation.py` (the same writer the dashboard uses): the sealed file is `results/invalidation.json`; the
+  actor is `--uploader` (the verified login), never the bundle; a channel of trust `external` and an inbox upload are
+  refused. The state machine, `matched_runs` and the confirmation of an event that covers more runs than the
+  threshold (`confirmed: true`, and the preview's `confirm_token` when it names one) are that module's. Re-sending the
+  state an id already has is a no-op.
 - **Retraction** of a `bench` upload is a `result_uploads` event (`format = bench`); the view `v_invalidated_runs`
   projects it, so a retracted run leaves the readers the same way an invalidated one does. It is not also written as
   an invalidation.

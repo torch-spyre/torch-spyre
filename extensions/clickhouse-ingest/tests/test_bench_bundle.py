@@ -179,7 +179,7 @@ def seal(tmp_path, src, out="b.tgz", *extra):
 def ingest(path, trust="", dry_run=False, **over):
     args = types.SimpleNamespace(from_bundle=str(path), trusted_job_prefix=[], expect_key="", bundle_prop=[],
                                  dry_run=dry_run, uploader="alice", bundle_url="", channel_trust=trust,
-                                 append_to_run=False, strict=False, confirm_runs=None)  # fmt: skip
+                                 append_to_run=False, strict=False)  # fmt: skip
     args.__dict__.update(over)
     with offline.opened(path) as root:
         return bundle._ingest(root, args)
@@ -565,61 +565,7 @@ def test_a_qualification_from_a_non_ci_run_is_refused(tmp_path, db):
 
 def event(state="invalidated", iid="018f0000-0000-7000-8000-000000000001", **scope):
     return {"events": [{"invalidation_id": iid, "scope_kind": "node", "scope": scope or {"node": NODE}, "state": state,
-                        "reason_code": "bad_card", "reason": "r"}]}  # fmt: skip
-
-
-def test_an_invalidation_previews_the_runs_it_covers_and_restores(tmp_path, db):
-    ev = ingest(
-        seal(tmp_path, run_dir(tmp_path, result()), "b.tgz", "--seal-trust", "none"),
-        trust="ci",
-    )
-    out = admin_bundle(tmp_path, "bench-invalidation", event())
-    with pytest.raises(offline.BundleError, match="trust ci or lab"):
-        ingest(out, trust="external")
-    prev = ingest(out, trust="lab", dry_run=True, uploader="amy@example.com")
-    assert (prev["matched_runs"], prev["new_records"]) == ([1], 1)
-    assert db.rows("SELECT count() FROM result_invalidations") == [(0,)]
-    assert ingest(out, trust="lab", uploader="amy@example.com")["status"] == "ingested"
-    assert ingest(out, trust="lab")["status"] == "duplicate"
-    assert (
-        db.rows("SELECT run_id, state FROM v_invalidated_runs")
-        == [(ev["run_id"], "invalidated")] * 3
-    )
-    back = admin_bundle(tmp_path, "bench-invalidation", event("restored"), "r.tgz")
-    assert ingest(back, trust="lab")["status"] == "ingested"
-    assert db.rows("SELECT count() FROM v_invalidated_runs") == [(0,)]
-    assert db.rows("SELECT actor FROM result_invalidations ORDER BY ts LIMIT 1") == [
-        ("amy@example.com",)
-    ]
-
-
-def test_an_invalidation_of_an_unknown_run_or_of_more_than_fifty_runs_needs_care(
-    tmp_path, db
-):
-    with pytest.raises(offline.BundleError, match="no recorded rows"):
-        ingest(
-            admin_bundle(
-                tmp_path,
-                "bench-invalidation",
-                {
-                    "events": [
-                        {
-                            **event()["events"][0],
-                            "scope_kind": "run",
-                            "scope": {"run_id": str(uuid.uuid4())},
-                        }
-                    ]
-                },
-            ),
-            trust="lab",
-        )
-    for i in range(51):
-        db.insert("run_placements", [(str(uuid.uuid4()), 0, None, ENV, str(uuid.uuid4()), ["big"], [], [], {}, {})],
-                  ["run_id", "repeat", "started_at", "env_id", "placement_id", "nodes", "devices", "links", "clean", "props"])  # fmt: skip
-    wide = admin_bundle(tmp_path, "bench-invalidation", event(node="big"), "w.tgz")
-    with pytest.raises(offline.BundleError, match="--confirm-runs 51"):
-        ingest(wide, trust="lab")
-    assert ingest(wide, trust="lab", confirm_runs=51)["status"] == "ingested"
+                        "reason_code": "faulty_hardware", "reason": "r"}]}  # fmt: skip
 
 
 def test_admin_bundles_cannot_be_uploaded(tmp_path):
@@ -908,14 +854,6 @@ def test_a_pass_needs_enough_repeats_in_the_same_environment(tmp_path, db):
         ingest(
             admin_bundle(tmp_path, "bench-qualification", other, "o.tgz"), trust="ci"
         )
-
-
-def test_a_large_invalidation_previews_instead_of_raising(tmp_path, db):
-    for _ in range(51):
-        db.insert("run_placements", [(str(uuid.uuid4()), 0, None, ENV, str(uuid.uuid4()), ["big"], [], [], {}, {})],
-                  ["run_id", "repeat", "started_at", "env_id", "placement_id", "nodes", "devices", "links", "clean", "props"])  # fmt: skip
-    out = admin_bundle(tmp_path, "bench-invalidation", event(node="big"))
-    assert ingest(out, trust="lab", dry_run=True)["needs_confirm"] == [51]
 
 
 @pytest.mark.parametrize("edit,problem", [

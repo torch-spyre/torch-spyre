@@ -360,9 +360,30 @@ def _ingest_reference(root: Path, meta: dict, args) -> dict:
     }
 
 
+def _ingest_invalidation(root: Path, args) -> dict:
+    """The invalidation writer owns the kind; the channel rules of the other admin kinds still apply."""
+    if args.expect_key:
+        raise BundleError(
+            "a bench-invalidation bundle is not an inbox bundle: only a CI job or an operator ingests it directly"
+        )
+    meta = check(root)
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    if trust not in ("ci", "lab"):
+        raise BundleError(
+            f"a bench-invalidation bundle needs a channel of trust ci or lab, not {trust or 'none'}"
+        )
+    report = bench_invalidation.ingest(root, args)
+    upload_id = dict(getattr(args, "bundle_prop", None) or []).get("upload_id", "")
+    return {
+        **report,
+        "trust": trust,
+        "receipt": receipt_id(report["bundle_sha256"], upload_id),
+    }
+
+
 def _ingest(root: Path, args) -> dict:
     if bench_invalidation.is_bundle(root):
-        return bench_invalidation.ingest(root, args)
+        return _ingest_invalidation(root, args)
     meta = check(root)
     if meta.get("kind") == "bench-reference":
         if getattr(args, "append_to_run", False):

@@ -425,7 +425,8 @@ def test_results_from_bundle_dispatches_the_kind(world, tmp_path, monkeypatch):
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
     monkeypatch.setattr(ClickHouse, "connect", classmethod(lambda cls, **kw: c))
     report = bundle._ingest(
-        root, args(trusted_job_prefix=[], expect_key="", bundle_url="")
+        root,
+        args(trusted_job_prefix=[], expect_key="", bundle_url="", channel_trust="lab"),
     )
     assert report["status"] == "ingested" and len(stored(c)) == 1
 
