@@ -94,7 +94,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -379,6 +379,40 @@ def _loop_info_without_advance(info, new_op):
     )
 
 
+def _input_k_already_padded(
+    graph: GraphLowering, y_buf: Buffer, y_dep, reduction_var, k_padded: int
+) -> bool:
+    """Whether the FP8 matmul weight ``y_buf`` is a graph input with K_padded rows.
+
+    lower_qfp8wt pads a weight's K and returns a slice of the padded buffer, so
+    a weight quantized in one graph and consumed in another arrives as an input
+    whose host K is unpadded but whose QFP8WT device layout holds K_padded rows.
+    Padding it again would copy it as plain sticks, which moves only K rows of
+    an image laid out for K_padded (the 64-column strips of the [2, 64] stick
+    are K_padded / 2 sticks apart). The real input's layout is what tells: a
+    weight loaded from the host with an unpadded layout is padded as usual.
+    """
+    if isinstance(y_buf, ComputedBuffer) or getattr(graph, "parent", None) is not None:
+        return False
+    name = y_buf.get_name()
+    if name not in graph.graph_input_names:
+        return False
+    real_inputs = V.get_real_inputs()
+    if real_inputs is None or len(real_inputs) != len(graph.graph_input_names):
+        return False
+    real = real_inputs[graph.graph_input_names.index(name)]
+    if not hasattr(real, "device_tensor_layout"):
+        return False
+    stl = real.device_tensor_layout()
+    if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+        return False
+    try:
+        k_dim = _device_dim_carrying_sym(stl, y_dep, reduction_var)
+    except Unsupported:
+        return False
+    return k_dim is not None and stl.device_size[k_dim] >= k_padded
+
+
 def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
@@ -463,6 +497,19 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         pad = compute_padding(k_val, dtype)
 
         k_padded = k_val + pad
+
+        # A graph input that lower_qfp8wt padded in an earlier graph: the
+        # attribute above is gone, but its device layout still holds K_padded rows.
+        if reduction.reduction_type == BATCH_MATMUL_FP8_OP and _input_k_already_padded(
+            graph, y_buf, y_dep, reduction_var, k_padded
+        ):
+            logger.debug(
+                "insert_bmm_padding: %s input y=%s already holds K_padded=%d rows",
+                op.get_name(),
+                y_name,
+                k_padded,
+            )
+            continue
 
         logger.debug(
             "insert_bmm_padding: padding %s K=%d -> K=%d (pad=%d)",

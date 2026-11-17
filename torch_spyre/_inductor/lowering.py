@@ -444,15 +444,21 @@ def lower_bmm_fp8(
     # [B, M, K] × [K, N] → [B, M, N] shares one mat2 across the batch.
     shared_mat2 = mat1_ndim == 3 and mat2_ndim == 2
     mat1_batch = [] if shared_mat2 else list(mat1_size[:-2])
-    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))) or any(
-        sympy.simplify(d1 - d2) != 0
-        for d1, d2 in zip(
-            [*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
-        )
-    ):
+    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))):
         raise Unsupported(
             f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
         )
+    # The batch and contraction dims must match. A provable mismatch is
+    # rejected. A symbolic size against a concrete one (a weight's K
+    # specialized by lower_qfp8wt's padding, an activation's K left dynamic) is
+    # not provably equal, so guard on it, as Inductor's own mm lowerings do.
+    sizevars = V.graph.sizevars
+    for d1, d2 in zip([*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]):
+        if sizevars.statically_known_true(sympy.Ne(d1, d2)):
+            raise Unsupported(
+                f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+            )
+        sizevars.check_equals(d1, d2)
 
     output_dtype = out_dtype if out_dtype is not None else torch.float16
     reduction_numel = mat1_size[-1]  # K
@@ -3003,32 +3009,37 @@ def lower_qfp8ch(x):
 
 
 def _pad_qfp8wt_k(x):
-    """Zero-pad the fp16 K of a [K, N] scaled_mm weight to the fp8 stick (#2831).
+    """Zero-pad the fp16 K (host dim -2) of a qfp8wt input to the fp8 stick (#2831).
 
     batchmatmulfp8 reads K in whole fp8 sticks, and insert_bmm_padding would pad
     the weight after this op, in fp8, which dbo-opt cannot fill. Returns the
     input and the valid K, or ``(x, None)`` when it is left unpadded.
+
+    Symbolic sizes are guarded, not concretized. Whether to pad depends only on
+    K % 128 and on the N check, so those predicates are guarded and the sizes
+    stay symbolic. When the op pads, the pad amount and the slice back to K are
+    sizes of the graph that are only right for this K, so K is then specialized
+    with guard_int and a different K recompiles. N is never specialized.
     """
     node = V.graph.current_node
     if node is None:
         return x, None
     size = x.get_size()
-    if len(size) != 2 or not all(isinstance(s, (int, sympy.Integer)) for s in size):
+    if len(size) < 2:
         return x, None
-    k, n = int(size[0]), int(size[1])
+    sizevars = V.graph.sizevars
     eps = get_elem_in_stick(torch.float8_e4m3fn)
-    k_pad = -(-k // eps) * eps
-    # Pad only for scaled_mm's mat2: a returned padded weight reads back wrong,
-    # since the DMA takes K from the host size. N > 128 with N % 128 != 0
-    # computes wrong values (#5924), so leave it failing loudly.
-    if k_pad == k or (n > eps and n % eps) or not node.users:
+    k_sym, n = size[-2], size[-1]
+    if sizevars.evaluate_expr(sympy.Eq(sympy.Mod(k_sym, eps), 0)):
         return x, None
-    if not all(
-        u.target is torch.ops.spyre.scaled_mm.default
-        and (u.args[1] if len(u.args) > 1 else u.kwargs.get("mat2")) is node
-        for u in node.users
+    # N > 128 with N % 128 != 0 computes wrong values (#5924), so leave it
+    # failing loudly.
+    if sizevars.evaluate_expr(sympy.Gt(n, eps)) and sizevars.evaluate_expr(
+        sympy.Ne(sympy.Mod(n, eps), 0)
     ):
         return x, None
+    k = sizevars.guard_int(k_sym)
+    k_pad = -(-k // eps) * eps
     return lower_constant_pad_nd(x, [0, 0, 0, k_pad - k], 0.0), k
 
 
@@ -3061,14 +3072,18 @@ def lower_qfp8wt(x):
     # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
     # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
     # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    # The shape_env lets get_stride_order order symbolic strides.
     pw.freeze_layout_with_stride_order(
-        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+        ir.get_stride_order(
+            ir.FlexibleLayout.contiguous_strides(pw.get_size()),
+            V.graph.sizevars.shape_env,
+        )
     )
     if valid_k is not None:
         # Rows valid_k.. are zero; insert_bmm_padding keys on this.
         buf = V.graph.get_buffer(pw.get_name())
         buf.spyre_qfp8wt_valid_k = valid_k
-        return lowering.slice_(pw, 0, 0, valid_k)
+        return lowering.slice_(pw, len(pw.get_size()) - 2, 0, valid_k)
     return pw
 
 
