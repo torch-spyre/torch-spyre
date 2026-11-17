@@ -1642,3 +1642,70 @@ class TestFP8ScaledMMRegressions:
             return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
+
+
+class TestFP8OutDtypeNone:
+    """Regression for #6053: out_dtype=None must be accepted and resolve to FP16.
+
+    spyre.scaled_mm, spyre.bmm_fp8 and spyre.scaled_bmm once declared
+    ``out_dtype: torch.dtype = None``, giving the non-optional schema
+    ``ScalarType out_dtype=None``, so an explicit None (which the decompositions
+    pass) was rejected during fake-tensor tracing.
+    """
+
+    _OPS = ("scaled_mm", "bmm_fp8", "scaled_bmm")
+
+    def setup_method(self):
+        torch._dynamo.reset()
+
+    @pytest.mark.parametrize("op_name", _OPS)
+    def test_out_dtype_schema_is_optional(self, op_name):
+        """out_dtype is declared ScalarType? so the dispatcher accepts None."""
+        schema = str(getattr(torch.ops.spyre, op_name).default._schema)
+        assert "ScalarType? out_dtype=None" in schema, schema
+
+    @pytest.mark.parametrize("op_name", _OPS)
+    def test_out_dtype_none_fake_tensor(self, op_name):
+        """Each op accepts out_dtype=None under FakeTensorMode and returns FP16."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            if op_name == "scaled_mm":
+                a = torch.empty(16, 128, dtype=E4M3, device=DEVICE)
+                b = torch.empty(128, 128, dtype=E4M3, device=DEVICE)
+                out = torch.ops.spyre.scaled_mm(a, b, out_dtype=None)
+                expected_shape = (16, 128)
+            else:
+                a = torch.empty(2, 16, 128, dtype=E4M3, device=DEVICE)
+                b = torch.empty(2, 128, 128, dtype=E4M3, device=DEVICE)
+                if op_name == "bmm_fp8":
+                    out = torch.ops.spyre.bmm_fp8(a, b, out_dtype=None)
+                else:
+                    s = torch.empty((), dtype=FP16, device=DEVICE)
+                    out = torch.ops.spyre.scaled_bmm(a, b, s, s, out_dtype=None)
+                expected_shape = (2, 16, 128)
+
+        assert out.dtype == FP16
+        assert tuple(out.shape) == expected_shape
+
+    def test_scaled_mm_without_out_dtype_compiles(self):
+        """torch._scaled_mm with out_dtype omitted compiles and returns FP16."""
+        M, K, N = 16, 128, 128
+        sa_val, sw_val = 1.0, 1.0
+        sa = _st16(sa_val, DEVICE)
+        sw = _st16(sw_val, DEVICE)
+        a, w = _make_rand_inputs(M, K, N, seed=6053, device=DEVICE)
+        ref = _pipeline_ref(a, w, sa_val, sw_val, FP16)
+
+        def _fn_no_out_dtype(a, w, sa, sw):
+            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a, sa)
+            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
+            return torch._scaled_mm(a_fp8, w_fp8, scale_a=sa, scale_b=sw)
+
+        out = _compile(_fn_no_out_dtype)(a, w, sa, sw).cpu()
+
+        assert out.shape == (M, N)
+        assert out.dtype == FP16
+        assert not out.isnan().any()
+        assert not out.isinf().any()
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)

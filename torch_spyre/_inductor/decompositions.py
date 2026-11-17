@@ -3833,7 +3833,7 @@ def scaled_mm_decomp(
     scale_b: torch.Tensor = None,
     bias: torch.Tensor = None,
     scale_result: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
@@ -3871,7 +3871,7 @@ def scaled_bmm_decomp(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
