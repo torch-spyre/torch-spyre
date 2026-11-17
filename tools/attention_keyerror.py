@@ -13,27 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal repro: compiling two or more attention layers in one graph fails.
-
-    python3 tools/repro_attention_keyerror.py --layers 1   # compiles and runs
-    python3 tools/repro_attention_keyerror.py --layers 2   # KeyError: 'bufN'
-
-Observed on the dev box (fp16, batch 1, seq 400): 1 layer works, 2 layers raise
-KeyError in Scheduler.compute_ancestors. Seq 128 with 6 layers fails the same
-way. Stream environment variables are not involved.
+"""
+python3 script.py --layers 1   # compiles and runs
+python3 script.py --layers 2   # KeyError: 'bufN'
 """
 
 import argparse
 
 import torch
 import torch.nn.functional as F
-import torch_spyre  # noqa: F401
 from torch import nn
 
 D_MODEL = 256
 N_HEADS = 8
-D_HEAD = D_MODEL // N_HEADS  # 32
-D_HEAD_PAD = 64  # padded to a full fp16 stick
+D_HEAD = D_MODEL // N_HEADS
+D_HEAD_PAD = 64
 FFN = 2048
 
 
