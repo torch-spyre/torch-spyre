@@ -38,7 +38,7 @@
 
     <rect x="120" y="420" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
     <text x="135" y="437" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">stride_map</text>
-    <text x="245" y="437" fill="#475569">one host stride per device dim; -1 marks a synthetic or fully-padded dim</text>
+    <text x="245" y="437" fill="#475569">one host stride per device dim; 0 marks a synthetic, padded, or broadcast dim</text>
 
     <rect x="120" y="446" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
     <text x="135" y="463" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">device_dtype</text>
