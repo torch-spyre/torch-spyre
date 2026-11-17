@@ -1350,10 +1350,16 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
 
 EA_H2D_TEST_PARAMS = _build_ea_dci_tests(is_h2d=True)
 
+
+def _shape_of(param):
+    values = param.values if hasattr(param, "values") else param
+    return values[3]
+
+
 EA_H2D_BASIC_TEST_PARAMS = {
     key: params
     for key, params in EA_H2D_TEST_PARAMS.items()
-    if (params.values[3] if hasattr(params, "values") else params[3]) in _SHAPES
+    if _shape_of(params) in _SHAPES
 }
 
 
@@ -1466,6 +1472,3 @@ def test_ea_h2d_d2h_h2d_chain(src_dtype, dst_dtype, expected_ea, shape):
     y.copy_(new1)
     assert_ea(y, expected_ea)
     assert torch.equal(y.cpu(), new1), f"{shape}: chain read3 mismatch"
-
-
-# Made with Bob

@@ -344,6 +344,12 @@ auto get_device_stride_infos(
 
   // EA shuffle: copies of staggered layouts (D2H restore, H2D apply) need the
   // element arrangement shuffled.
+  //
+  // Known limitation:
+  //
+  // Slices of a staggered tensor: a copy of a slice that starts
+  // mid-stick-pair (e.g. y[:, 32:96]) misaligns the sticks and gives wrong
+  // data without an error. See issue #5556.
   const bool shuffle_ea = is_ea_staggered(stl.element_arrangement);
 
   // EA shuffle: stick tiling facts. The innermost device dim holds the elements
