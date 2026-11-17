@@ -307,6 +307,21 @@ class TestCoarseTileLoopTripCount(TestCase):
         with self._UNRESOLVED:
             self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
+    def test_unresolved_trip_count_warns_once(self):
+        """Falling back to one trip logs a warning, once per exception type."""
+        from torch_spyre._inductor import logging_utils, pass_utils
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        with (
+            self._UNRESOLVED,
+            mock.patch.object(logging_utils, "_warned_once", set()),
+            mock.patch.object(pass_utils.logger, "warning") as warning,
+        ):
+            self.assertEqual(pass_utils.trip_count_estimate(n), 1)
+            self.assertEqual(pass_utils.trip_count_estimate(n // 8), 1)
+        warning.assert_called_once()
+        self.assertIn("priced as 1 trip", warning.call_args.args[0])
+
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
@@ -344,6 +359,25 @@ class TestCoarseTileLoopTripCount(TestCase):
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
         ):
             self.assertEqual(_loop_features(op)[0], 32)
+
+
+class TestTripCountEstimate(TestCase):
+    """A concrete trip count converts with ``int()`` and is at least 1."""
+
+    def test_concrete_counts(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count, expected in [(5, 5), (5.0, 5), (sympy.Integer(5), 5)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), expected)
+                self.assertIs(type(trip_count_estimate(count)), int)
+
+    def test_zero_and_negative_counts_are_one_trip(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count in [0, -3, 0.0, sympy.Integer(0), sympy.Integer(-3)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), 1)
 
 
 class TestDrainLifetimeBoundary(TestCase):

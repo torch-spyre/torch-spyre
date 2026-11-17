@@ -85,7 +85,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .logging_utils import get_inductor_logger
+from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
@@ -413,7 +413,13 @@ def trip_count_estimate(count) -> int:
             return 1
         return max(1, int(concretize_expr(count)))
     except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
-        logger.debug("trip count %s not resolved, priced as 1 trip: %s", count, e)
+        warn_once(
+            logger,
+            f"trip_count_estimate:{type(e).__name__}",
+            "trip count %s not resolved, priced as 1 trip: %r",
+            count,
+            e,
+        )
         return 1
 
 
