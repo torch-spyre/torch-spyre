@@ -321,6 +321,13 @@ class ReferencePermutationBasedLayoutSolver:
         self._check_index(idx, "is_fully_allocated")
         return self._is_allocated(idx)
 
+    def position(self, idx: int) -> int:
+        """The permutation position buffer ``idx`` holds: the inverse of
+        ``permutation[pos]``. Found by a scan, where the native packer keeps the
+        inverse incrementally."""
+        self._check_index(idx, "position")
+        return self.permutation.index(idx)
+
     def _is_allocated(self, idx: int) -> bool:
         """:meth:`is_fully_allocated` without the bounds check, for the internal
         callers that hold an index they just derived. Mirrors the native packer's
