@@ -27,7 +27,6 @@ from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
-_ATOL_F32 = 1e-5
 
 
 _GATHER_EAGER = (
@@ -46,34 +45,34 @@ _SLICE_OFFSET_ALIGNMENT = (
     r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
 )
 _POINTWISE_NO_LAYOUT = (
-    4306,
-    "compile Multi-arg pointwise: no supported output layout found.",
+    6388,
+    "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
     r"Multi-arg pointwise .*no supported output layout found",
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
-    r"spyre <-> cpu\S* mismatch",
+    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
+    r"cannot re-tile \S+: no size-1 stick target",
 )
 _MATMUL_MISMATCH = (
     4722,
     "compile gather followed by matmul / linear numerical mismatch.",
-    r"spyre <-> cpu\S* mismatch",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _LN_MIXED_EA = (
     4714,
     "compile LayerNorm after gather: multi-arg pointwise with mixed EA.",
     r"Multi-arg pointwise with mixed EA",
 )
-_LN_EAGER_SUBPROC = (
-    "Pending issue: eager LayerNorm after gather raises SubprocException",
-    "Eager LayerNorm after gather raises SubprocException in the compile subprocess.",
-    r"SubprocException",
+_LN_EAGER_MISMATCH = (
+    5856,
+    "Eager LayerNorm after gather (fp16 to fp32 cast) mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _SCATTER_STICK = (
-    "Pending issue: compile gather then scatter_add numerical mismatch",
+    4395,
     "compile gather followed by scatter_add produces numerical mismatch vs CPU.",
-    r"compiled spyre <-> cpu\S* mismatch",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _CHUNK_REDUCE_MUTATION = (
     4754,
@@ -120,8 +119,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             table,
             idx1,
             idx2,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_then_matmul(self, execution_mode):
@@ -145,8 +144,9 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_then_layer_norm(self, execution_mode):
         """Gather output into layer_norm; end-to-end embedding + norm."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4714
-        _xfail_existing(execution_mode, eager=_LN_EAGER_SUBPROC, compiled=_LN_MIXED_EA)
+        _xfail_existing(execution_mode, eager=_LN_EAGER_MISMATCH, compiled=_LN_MIXED_EA)
         emb = cached_randn((256, 128), differentiation="ch04e", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
         compare_mode(
@@ -209,7 +209,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
         Standalone grouped_mm scatter_add is in test_scatter_ops.py.
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4396
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4395
         _xfail_existing(
             execution_mode, eager=_SCATTER_ADD_EAGER, compiled=_SCATTER_STICK
         )
@@ -296,7 +296,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_chunk_then_reduce(self, execution_mode):
         """Gather + chunk + per-chunk sum reduction; each quarter summed independently."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3916
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4754
         _xfail_existing(
             execution_mode,
             eager=_CHUNK_REDUCE_MUTATION,
@@ -444,8 +444,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda kv, p: kv[p],
             cache,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_kv_decode_extend(self, execution_mode):
@@ -457,8 +457,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda kv, p: kv[p],
             cache,
             all_pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_logit_slice(self, execution_mode):
@@ -470,8 +470,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             execution_mode,
             lambda x: x[:, -1, :],
             logits,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_continuous_batch(self, execution_mode):
@@ -485,8 +485,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda x, i: x[i],
             kv,
             all_slots,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_speculative_token(self, execution_mode):
@@ -533,7 +533,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     def test_rope_neox_qk_both(self, execution_mode):
         """NeoX rotate-half RoPE applied to both Q and K after position gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6388
         _xfail_existing(
             execution_mode,
             eager=_SLICE_OFFSET_ALIGNMENT,

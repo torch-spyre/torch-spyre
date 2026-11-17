@@ -76,8 +76,6 @@ except ImportError:
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 _ATOL_F16 = 1e-2
-_ATOL_BF16 = 2e-2
-_ATOL_F32 = 1e-5
 
 # ---------------------------------------------------------------------------
 # Module-level xfail issue markers
@@ -93,7 +91,7 @@ _INDEX_EAGER = (
 _FP16_TO_FP32_EAGER = (
     5856,
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 # torch.compile(dynamic=True): Cannot convert symbols to int during codegen.
@@ -223,25 +221,19 @@ class TestGatherImplicitLayout:
         """(128,64) gather at dim=0; narrow inner dim forces non-trivial stick packing."""
         x = cached_randn((128, 64), differentiation="gstl01", dtype=torch.float16)
         idx = torch.randint(0, 128, (48,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_2d_frs_example_a(self, execution_mode):
         """FRS canonical Example A — (12,1024) gather at dim=0, P=8."""
         x = cached_randn((12, 1024), differentiation="gstl02", dtype=torch.float16)
         idx = torch.randint(0, 12, (8,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_2d_16x512(self, execution_mode):
         """(16,512), 8 sticks in inner dim; stick grid."""
         x = cached_randn((16, 512), differentiation="gstl03", dtype=torch.float16)
         idx = torch.randint(0, 16, (8,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_2d_int32_idx(self, execution_mode):
         """int32 index arrives at hardware width directly; no double-downcast.
@@ -251,9 +243,7 @@ class TestGatherImplicitLayout:
         """
         x = cached_randn((48, 192), differentiation="gstl04i32", dtype=torch.float16)
         idx = torch.randint(0, 48, (24,), dtype=torch.int32)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_2d_with_tanh(self, execution_mode):
         """(24,128) gather + tanh downstream co-scheduled."""
@@ -303,25 +293,21 @@ class TestGatherImplicitLayout:
             lambda x, i: torch.index_select(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_3d_kv_shape(self, execution_mode):
         """3D (8,32,128) gather at dim=0, P=4."""
         x = cached_randn((8, 32, 128), differentiation="gstl09", dtype=torch.float16)
         idx = torch.randint(0, 8, (4,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_2d_bfloat16(self, execution_mode):
         """bfloat16 value tensor; SDSC wordLength and stride map for bf16."""
         x = cached_randn((16, 128), differentiation="gstl18", dtype=torch.bfloat16)
         idx = torch.randint(0, 16, (8,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
     # Compiler features
@@ -332,9 +318,7 @@ class TestGatherImplicitLayout:
         idx = torch.randint(0, 64, (8,), dtype=torch.int64)
         _pnd.name_tensor_dims(x, ["M", "N"])
         _pnd.name_tensor_dims(idx, ["P"])
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_dynamic_compile(self, execution_mode):
         """torch.compile(dynamic=True); three runtime index sizes.
@@ -350,7 +334,7 @@ class TestGatherImplicitLayout:
         for p in (8, 16, 24):
             idx = torch.randint(0, 40, (p,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=0, rtol=0)
 
     def test_api_equivalence(self, execution_mode):
         """index_select(x,0,idx) on Spyre matches CPU reference (float16, implicit layout)."""
@@ -361,8 +345,8 @@ class TestGatherImplicitLayout:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -372,25 +356,19 @@ class TestGatherImplicitLayout:
         """Embedding (1024,128); stick-aligned inner dim at production scale."""
         x = cached_randn((1024, 128), differentiation="gstl15", dtype=torch.float16)
         idx = torch.randint(0, 1024, (64,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_kv_cache_shape(self, execution_mode):
         """KV cache 3D (256,8,64); paged attention page lookup."""
         x = cached_randn((256, 8, 64), differentiation="gstl16", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_moe_shape(self, execution_mode):
         """MoE expert weight (8,512,64); large inner dims."""
         x = cached_randn((8, 512, 64), differentiation="gstl17", dtype=torch.float16)
         idx = torch.randint(0, 8, (4,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
     # Stride-exact real-model patterns
@@ -400,9 +378,7 @@ class TestGatherImplicitLayout:
         x = cached_randn((32, 64), differentiation="str_s2d", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         assert x.stride() == (64, 1)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_granite_kv_strides(self, execution_mode):
         """Granite-3.3-8b/Ministral exact strides (1,8,2048,128).
@@ -419,8 +395,8 @@ class TestGatherImplicitLayout:
             lambda c, i: torch.index_select(c.squeeze(0), 1, i),
             cache,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_stride_rope_cache(self, execution_mode):
@@ -435,8 +411,8 @@ class TestGatherImplicitLayout:
             lambda c, p: torch.index_select(c, 0, p),
             cos_sin,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_stride_non_contiguous_t(self, execution_mode):
@@ -444,19 +420,7 @@ class TestGatherImplicitLayout:
         base = cached_randn((64, 32), differentiation="str09", dtype=torch.float16)
         x = base.t().contiguous()
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
-
-    def test_stride_float32_kv(self, execution_mode):
-        """float32 KV (512,8,64) exact strides; wordLength=4."""
-        kv = cached_randn(
-            (512, 8, 64), differentiation="str_f32kv", dtype=torch.float32
-        )
-        idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, idx, atol=_ATOL_F32, rtol=_ATOL_F32
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -513,31 +477,31 @@ class TestGatherExplicitStl2Arg:
         """(32,256) float16 + int64 index; 2-arg STL round-trips through compile."""
         x = cached_randn((32, 256), differentiation="e2arg01", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_2arg_2d_float16_int32(self, execution_mode):
         """(32,256) float16 + int32 index; hardware-native width, no double-cast."""
         x = cached_randn((32, 256), differentiation="e2arg01i32", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int32)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_2arg_3d_kv(self, execution_mode):
         """2-arg STL on (512,8,64) KV cache shape."""
         x = cached_randn((512, 8, 64), differentiation="e2arg02", dtype=torch.float16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_2arg_bfloat16(self, execution_mode):
         """2-arg STL on bfloat16 (64,64)."""
         x = cached_randn((64, 64), differentiation="e2arg03", dtype=torch.bfloat16)
         idx = torch.randint(0, 64, (8,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_BF16, _ATOL_BF16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_2arg_embedding_shape(self, execution_mode):
         """2-arg STL on embedding (1024,128)."""
         x = cached_randn((1024, 128), differentiation="e2arg05", dtype=torch.float16)
         idx = torch.randint(0, 1024, (64,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -596,19 +560,19 @@ class TestGatherExplicitStl4Arg:
         """(36,256) float16 + int64 index; compiled path reads annotated layout."""
         x = cached_randn((36, 256), differentiation="e4arg01", dtype=torch.float16)
         idx = torch.randint(0, 36, (18,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_4arg_2d_float16_int32(self, execution_mode):
         """(48,128) float16 + int32 index; hardware-native width, no double-cast."""
         x = cached_randn((48, 128), differentiation="e4arg01i32", dtype=torch.float16)
         idx = torch.randint(0, 48, (16,), dtype=torch.int32)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_4arg_kv_exact_paged(self, execution_mode):
         """Canonical paged-attention STL: (512,32,128) cache, gather 12 rows."""
         x = cached_randn((512, 32, 128), differentiation="e4arg02", dtype=torch.float16)
         idx = torch.randint(0, 512, (12,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     # ------------------------------------------------------------------
     # GQA / MQA KV cache shapes
@@ -617,19 +581,19 @@ class TestGatherExplicitStl4Arg:
         """GQA KV cache (1024,8,128) with 4-arg STL."""
         x = cached_randn((1024, 8, 128), differentiation="e4arg04", dtype=torch.float16)
         idx = torch.randint(0, 1024, (4 * 64,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_4arg_mqa_h1(self, execution_mode):
         """MQA KV cache (1024,1,64) with 4-arg STL."""
         x = cached_randn((1024, 1, 64), differentiation="e4arg05", dtype=torch.float16)
         idx = torch.randint(0, 1024, (4 * 64,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_F16, _ATOL_F16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     def test_4arg_bfloat16(self, execution_mode):
         """4-arg STL for bfloat16 (128,4,64) KV cache."""
         x = cached_randn((128, 4, 64), differentiation="e4arg06", dtype=torch.bfloat16)
         idx = torch.randint(0, 128, (32,), dtype=torch.int64)
-        self._run(lambda x, i: x[i], x, idx, execution_mode, _ATOL_BF16, _ATOL_BF16)
+        self._run(lambda x, i: x[i], x, idx, execution_mode, 0, 0)
 
     # ------------------------------------------------------------------
     # Downstream ops after STL-annotated gather
@@ -670,8 +634,8 @@ class TestGatherExplicitStl4Arg:
             x_dev,
             idx_dev,
             execution_mode,
-            _ATOL_F16,
-            _ATOL_F16,
+            0,
+            0,
         )
 
     # ------------------------------------------------------------------

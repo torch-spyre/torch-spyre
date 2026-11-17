@@ -27,23 +27,22 @@ from utils_inductor import cached_randn  # noqa: E402
 from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _ATOL_F16 = 1e-2
-_ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
 _EAGER_MISMATCH = (
-    "Pending issue: eager embedding lookup + linear numerical mismatch",
-    "Eager embedding lookup followed by linear mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    6355,
+    "Eager FP16 matmul (F.linear) after an embedding lookup mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _EAGER_TIED_MISMATCH = (
-    "Pending issue: eager embedding lookup + tied LM-head numerical mismatch",
-    "Eager embedding lookup followed by a tied LM-head matmul mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    6355,
+    "Eager FP16 matmul (tied LM head) after an embedding lookup mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _EMBEDDING_BAG_UNSUPPORTED = (
     4319,
@@ -58,17 +57,12 @@ _EMBEDDING_RENORM = (
 _TIED_LM_HEAD_MISMATCH = (
     4723,
     "compile embedding lookup + tied LM-head matmul numerical mismatch.",
-    r"compiled spyre <-> cpu\S* mismatch",
-)
-_DXP_STANDALONE = (
-    4321,
-    "compile gather dxp_standalone returned non-zero exit status 1.",
-    r"SubprocException",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _MATMUL_MISMATCH = (
     4722,
     "compile gather followed by matmul / linear numerical mismatch.",
-    r"spyre <-> cpu\S* mismatch",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 
@@ -88,35 +82,27 @@ class TestGatherEmbeddingTableLookupAndPooling:
         """Small vocab (512,64) via advanced indexing; GATHER_OP_SPEC."""
         w = cached_randn((512, 64), differentiation="emb01", dtype=torch.float16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_medium_vocab(self, execution_mode):
         """Medium vocab (8192,128) via advanced indexing; stick-aligned."""
         w = cached_randn((512, 128), differentiation="emb02", dtype=torch.float16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_gpt2_vocab(self, execution_mode):
         """GPT-2 vocab shape (50257,768) approximated; 12-stick row."""
         w = cached_randn((256, 128), differentiation="emb03", dtype=torch.float16)
         idx = torch.randint(0, 256, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_batch_2d_ids(self, execution_mode):
         """2D token IDs (B=4, S=128); output shape (4,128,dim)."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         w = cached_randn((512, 64), differentiation="emb05", dtype=torch.float16)
         idx = torch.randint(0, 512, (4, 16), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_positional(self, execution_mode):
         """Positional encoding via index_select(0, pos_ids)."""
@@ -129,8 +115,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda p, i: torch.index_select(p, 0, i),
             pos_emb,
             pos_ids,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_embedding_rope_cos_sin(self, execution_mode):
@@ -144,25 +130,21 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda c, p: torch.index_select(c, 0, p),
             cos_sin,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_embedding_bfloat16(self, execution_mode):
         """bfloat16 embedding table; SDSC wordLength=2."""
         w = cached_randn((512, 64), differentiation="emb09", dtype=torch.bfloat16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_float32(self, execution_mode):
         """float32 embedding table; 4-byte elements."""
         w = cached_randn((512, 64), differentiation="emb10", dtype=torch.float32)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F32, rtol=_ATOL_F32
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_embedding_with_exp(self, execution_mode):
         """Embedding lookup + exp() downstream fused."""
@@ -186,26 +168,13 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda w, i: F.embedding(i, w),
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
-        )
-
-    def test_embedding_nn_module(self, execution_mode):
-        """nn.Embedding.forward → aten.embedding lookup."""
-        w = cached_randn((512, 64), differentiation="emb14_mod", dtype=torch.float16)
-        idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode,
-            lambda w, i: F.embedding(i, w),
-            w,
-            idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_embedding_tied_lm_head(self, execution_mode):
         """Weight-tied model: same matrix for embedding and LM head."""
-        # TODO: Pending issue: eager tied LM head numerical mismatch
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4723
         _xfail_existing(
             execution_mode, eager=_EAGER_TIED_MISMATCH, compiled=_TIED_LM_HEAD_MISMATCH
@@ -459,14 +428,10 @@ class TestGatherEmbeddingTableLookupAndPooling:
         """GEMB2-12: bfloat16 lookup table gather."""
         w = cached_randn((64, 64), differentiation="emb2_12", dtype=torch.bfloat16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_lookup_table_with_layer_norm(self, execution_mode):
         """GEMB2-13: Lookup table + layer_norm downstream."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
-        _xfail_existing(execution_mode, eager=_DXP_STANDALONE, compiled=_DXP_STANDALONE)
         w = cached_randn((64, 64), differentiation="emb2_13", dtype=torch.float32)
         weight = cached_randn(
             (64,), differentiation="emb2_13_ln_w", dtype=torch.float32
@@ -488,7 +453,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
 
     def test_lookup_table_with_linear(self, execution_mode):
         """GEMB2-14: Lookup table + linear projection downstream."""
-        # TODO: Pending issue: eager numerical mismatch on Spyre
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
         _xfail_existing(
             execution_mode, eager=_EAGER_MISMATCH, compiled=_MATMUL_MISMATCH

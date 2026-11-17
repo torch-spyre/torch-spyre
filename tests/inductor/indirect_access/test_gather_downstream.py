@@ -27,22 +27,21 @@ from conftest import _xfail_existing, compare_mode  # noqa: E402
 _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
-_ATOL_F32_DEVICE = 1e-3
 
 _NUMERICAL_MISMATCH = (
-    "Pending issue: eager gather + downstream op numerical mismatch",
-    "Eager gather followed by a downstream op mismatches CPU.",
-    r"spyre <-> cpu\S* mismatch",
+    6391,
+    "Eager fp32 exp (after a gather) mismatches CPU at atol=rtol=1e-5.",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _FP16_TO_FP32_EAGER = (
     5856,
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _CLIP_FP32 = (
-    "Pending issue: eager and compiled gather + exp float32 numerical mismatch",
-    "Eager and compiled gather followed by exp on float32 mismatch CPU.",
-    r"spyre <-> cpu\S* mismatch",
+    6391,
+    "Compiled fp32 exp (after a gather) mismatches CPU at atol=rtol=1e-5.",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 
@@ -97,8 +96,7 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_exp_float32(self, execution_mode):
         """float32 gather + exp downstream; test with device float32 tolerance."""
-        # TODO: Pending issue: numerical precision mismatch between Spyre device and CPU reference
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4720
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6391
         _xfail_existing(
             execution_mode,
             eager=_NUMERICAL_MISMATCH,
@@ -269,9 +267,7 @@ class TestGatherFusedDownstreamOperations:
         idx = torch.randint(0, 32000, (32,), dtype=torch.int64)
         self._name_dims(w, {"vocab": 32000, "dim": 128})
         self._name_dims(idx, {"seq": 32})
-        compare_mode(
-            execution_mode, lambda w, i: w[i], w, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda w, i: w[i], w, idx, atol=0, rtol=0)
 
     def test_named_with_downstream(self, execution_mode):
         """Named dims preserved through gather → exp → sum chain."""

@@ -215,8 +215,12 @@ def xfail_existing(
 _xfail_existing = xfail_existing
 
 
-def compare_mode(execution_mode, fn, *args, atol=0.1, rtol=0.1):
+def compare_mode(execution_mode, fn, *args, atol, rtol):
     """Run fn in exactly one execution mode and compare result with CPU.
+
+    ``atol``/``rtol`` are required: use 0 for pure data movement (gather, take,
+    index_select, embedding lookup, scatter without arithmetic), and the dtype
+    tolerance only for compute that follows the gather.
 
     Executes the full graph on Spyre hardware without manual try/except.
     Torch-Spyre's strict_xfail manages the expected failure validation.

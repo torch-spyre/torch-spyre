@@ -34,6 +34,11 @@ _ATOL_F16 = 1e-2
 _ATOL_F32 = 1e-5
 
 
+_MASKED_FILL_FP32 = (
+    5495,
+    "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA that is refused as Multi-arg pointwise with mixed EA.",
+    r"Multi-arg pointwise with mixed EA",
+)
 _IR_OUT = (
     4634,
     "aten::index_reduce.out is not registered on Spyre.",
@@ -215,8 +220,8 @@ class TestIndexFillEagerCompile:
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -243,8 +248,8 @@ class TestIndexFillEagerCompile:
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -291,13 +296,9 @@ class TestMaskedFillStandaloneEagerCompile:
 
     def test_masked_fill_float32(self, execution_mode):
         """masked_fill on (8,16) float32; validates 4-byte word path for mask-based fill."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5495
         _xfail_existing(
-            execution_mode,
-            compiled=(
-                "Pending issue: compile masked_fill fp32 mismatches CPU (old #4073 closed)",
-                "compile masked_fill fp32 mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch",
-            ),
+            execution_mode, eager=_MASKED_FILL_FP32, compiled=_MASKED_FILL_FP32
         )
         x = cached_randn((8, 16), differentiation="mfill_f32_01", dtype=torch.float32)
         mask = torch.arange(8 * 16).reshape(8, 16) % 2 == 0
@@ -486,7 +487,7 @@ class TestScatterAddGroupedMmOffs:
             compiled=(
                 4395,
                 "compile scatter_add int64 grouped_mm offs mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch",
+                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
             ),
         )
         G, T = 128, 192
@@ -527,6 +528,7 @@ class TestScatterRouterMaps:
         """torch.scatter dim=1 K=1 into -inf dest (192, 128) — Llama 4 router (#4403)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4404
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=(
@@ -535,8 +537,8 @@ class TestScatterRouterMaps:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -560,6 +562,7 @@ class TestScatterRouterMaps:
         """torch.scatter dim=1 K=8 into zeros dest (192, 128) — Qwen3 MoE router (#4403)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4404
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=(
@@ -568,8 +571,8 @@ class TestScatterRouterMaps:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -683,8 +686,8 @@ class TestScatter1DDestRestickify:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -711,8 +714,8 @@ class TestScatter1DDestRestickify:
                 r"Could not run 'aten::scatter.src_out'",
             ),
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -761,7 +764,7 @@ class TestScatterReduceLegacyGroupedMm:
             compiled=(
                 4407,
                 "compile scatter_(reduce=) grouped_mm mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch",
+                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
             ),
         )
         G, T = 128, 192
@@ -790,7 +793,7 @@ class TestScatterReduceLegacyGroupedMm:
             compiled=(
                 4407,
                 "compile scatter_(reduce=) grouped_mm mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch",
+                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
             ),
         )
         G, T = 128, 192
@@ -825,7 +828,7 @@ class TestScatterReduceTwoColliding:
             compiled=(
                 4351,
                 "compile scatter_reduce colliding dim=0 mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch",
+                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
             ),
         )
 
@@ -901,12 +904,13 @@ class TestScatterReduceTwoColliding:
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4361
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4637
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )
@@ -935,12 +939,13 @@ class TestScatterReduceTwoColliding:
         """scatter_reduce sum dim=1 fp32 — ReStickifyOpHBM leftover (#1796)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4361
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1796
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
             compiled=(
-                "Pending issue: compile: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout",
-                "compile scatter/take: cannot re-tile buf: no size-1 stick target for SpyreTensorLayout.",
+                4399,
+                "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
             ),
         )

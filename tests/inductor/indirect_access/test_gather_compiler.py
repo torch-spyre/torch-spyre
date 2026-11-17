@@ -26,7 +26,6 @@ from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
-_ATOL_F32 = 1e-5
 
 _SYMBOLIC_INT_CONV = (
     4304,
@@ -40,8 +39,8 @@ _DXP_STANDALONE_FAIL = (
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
-    r"spyre <-> cpu\S* mismatch",
+    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
+    r"cannot re-tile \S+: no size-1 stick target",
 )
 
 
@@ -67,9 +66,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((64, 128), differentiation="gcp04", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_two_gathers_two_op_specs(self):
         """Two independent gathers; two GATHER_OP_SPECs in same graph."""
@@ -128,17 +125,13 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         """Source rows are stick-aligned (D=64, fp16, 128 bytes)."""
         x = cached_randn((64, 64), differentiation="mem01", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_bfloat16_alignment(self):
         """bfloat16 alignment: 2 bytes/elem; stick boundaries differ from fp16."""
         x = cached_randn((64, 64), differentiation="mem10", dtype=torch.bfloat16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_stride_non_standard(self):
         """Non-standard strides from slice; still gathers correctly."""
@@ -150,8 +143,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: x[i],
             x_sliced,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -284,9 +277,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         """Gather correctness across sencores=1/4/32 (from class fixture) on (256,128)."""
         x = cached_randn((256, 128), differentiation="cfg05", dtype=torch.float16)
         idx = torch.randint(0, 256, (64,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -332,18 +323,14 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((4096, 64), differentiation="lxd09", dtype=torch.float16)
         idx = torch.randint(0, 4096, (128,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_lxd_bfloat16_co_opt(self):
         """bfloat16 + LX_PLANNING co-optimization; 2-byte elements."""
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((64, 128), differentiation="lxd10", dtype=torch.bfloat16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -359,9 +346,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=_ATOL_F16,
         )
 
-    @pytest.mark.skip(
-        reason="StreamInErrorState fatal card stream drop on topk gather inside graph. See issue #4713."
-    )
     def test_topk_index_inside_graph(self):
         """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC."""
         expert_w = cached_randn(
@@ -386,9 +370,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         nz_idx = scores.nonzero(as_tuple=True)[0].to(torch.int64)
         if nz_idx.numel() == 0:
             nz_idx = torch.tensor([0], dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, nz_idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, nz_idx, atol=0, rtol=0)
 
     def test_where_index_inside_graph(self):
         """torch.where condition → index inside compiled graph; gather valid slot rows."""
@@ -397,9 +379,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         idx = torch.where(scores > 0)[0].to(torch.int64)
         if idx.numel() == 0:
             idx = torch.tensor([0], dtype=torch.int64)
-        compare_mode(
-            "compiled", lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_argmax_index_inside_graph(self):
         """argmax inside compiled graph; gather the single top-scoring row."""
@@ -464,8 +444,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda s, i: torch.gather(s, 0, i),
             src,
             index,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_explicit_gather_dim1_lx(self):
@@ -480,8 +460,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda s, i: torch.gather(s, 1, i),
             src,
             index,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_explicit_gather_dim2_lx(self):
@@ -496,8 +476,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda s, i: torch.gather(s, 2, i),
             src,
             index,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_explicit_gather_dim0_bfloat16_lx(self):
@@ -512,8 +492,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda s, i: torch.gather(s, 0, i),
             src,
             index,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -531,12 +511,14 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: x[:, i, :],
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_dim2_fancy_indexing_lx(self):
         """x[:, :, idx] dim=2 gather with LX_PLANNING=1; innermost-dim indirect access through LX planner."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
+        _xfail_existing("compiled", compiled=_RESTICKIFY_3ARGS)
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((8, 16, 64), differentiation="dim02", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
@@ -545,8 +527,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: x[:, :, i],
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_dim1_explicit_gather_lx(self):
@@ -561,6 +543,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda s, i: torch.gather(s, 1, i),
             src,
             index,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )

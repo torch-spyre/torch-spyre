@@ -25,22 +25,20 @@ from utils_inductor import DEVICE, cached_randn  # noqa: E402
 from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _ATOL_F16 = 1e-2
-_ATOL_BF16 = 2e-2
-_ATOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
 _FP16_TO_FP32_EAGER = (
     5856,
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _POINTWISE_NO_LAYOUT = (
-    "Pending issue: compile topk routing: aten.clamp has no supported output layout",
-    "compile topk-2 routing: aten.clamp.default has no supported output layout for any candidate input layout.",
+    4713,
+    "compile topk-2 routing (4 rows): topk indices flatten -> int64 -> gather: aten.clamp.default has no supported output layout for any candidate input layout.",
     r"aten\.clamp\.default\): no supported output layout found",
 )
 _SYMBOLIC_INT_CONV = (
@@ -55,22 +53,22 @@ _GATHER_OUT_EAGER = (
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
-    r"spyre <-> cpu\S* mismatch",
+    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
+    r"cannot re-tile \S+: no size-1 stick target",
 )
 _STICK_INCOMPATIBLE = (
-    "Pending issue: eager topk routing: no mechanism to resolve stick incompatibility",
-    "Eager topk MoE routing: no mechanism to resolve stick incompatibility.",
+    6390,
+    "Eager fp16 gather followed by a broadcast multiply by a size-1-last-dim tensor: Pointwise no mechanism to resolve stick incompatibility.",
     r"no mechanism to resolve stick incompatibility",
 )
 _STICK_TOP1_MISMATCH = (
-    "Pending issue: eager topk-1 routing gather numerical mismatch",
-    "Eager topk-1 MoE routing gather mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    4713,
+    "Eager topk-1 MoE routing: topk indices used to gather expert rows give a wrong result vs CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _STICK_TOP2_EAGER = (
-    "Pending issue: eager topk-2 routing: Unexpected stick expression floor(d0/2)",
-    "Eager topk-2 MoE routing: Unexpected stick expression floor(d0/2).",
+    6384,
+    "Eager topk-2 routing: flatten() then dtype conversion of topk indices: Unexpected stick expression floor(d0/2).",
     r"Unexpected stick expression floor\(d0/2\)",
 )
 _CANNOT_RESCALE = (
@@ -78,10 +76,15 @@ _CANNOT_RESCALE = (
     "compile: cannot rescale device layout for conversion to torch.float16.",
     r"cannot rescale device layout",
 )
-_OUT_LAYOUTS_EMPTY = (
-    "Pending issue: eager topk + table gather numerical mismatch",
-    "Eager topk followed by a table gather mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+_TOPK_GATHER_EAGER = (
+    4713,
+    "Eager topk indices used to gather table rows give a wrong result vs CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
+_TOPK_GATHER_COMPILED = (
+    4713,
+    "Compile topk indices used to gather table rows silently use the wrong index (result mismatches CPU).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _TOPK_K_PER_CORE = (
     4716,
@@ -91,7 +94,7 @@ _TOPK_K_PER_CORE = (
 _GATHER_EXPANDED_MISMATCH = (
     4840,
     "compile gather along dim>=1 with expanded index produces numerical mismatch vs CPU.",
-    r"compiled spyre <-> cpu\S* mismatch",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _INDEX_PUT_IMPL_EAGER = (
     692,
@@ -118,22 +121,22 @@ class TestGatherInferencePatternsEagerCompile:
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
-        "shape,P,dtype,atol,diff_key",
+        "shape,P,dtype,diff_key",
         [
-            ((4, 64, 32), 8, torch.float16, _ATOL_F16, "moe01"),
-            ((64, 64, 64), 32, torch.float16, _ATOL_F16, "moe02"),
-            ((256, 64, 32), 16, torch.float16, _ATOL_F16, "moe03"),
-            ((8, 64, 32), 32, torch.float16, _ATOL_F16, "moe04"),
-            ((8, 64, 64), 32, torch.bfloat16, _ATOL_BF16, "moe05"),
-            ((8, 64, 64), 32, torch.float16, _ATOL_F16, "moe06"),
-            ((8, 64, 128), 32, torch.float16, _ATOL_F16, "moe07"),
+            ((4, 64, 32), 8, torch.float16, "moe01"),
+            ((64, 64, 64), 32, torch.float16, "moe02"),
+            ((256, 64, 32), 16, torch.float16, "moe03"),
+            ((8, 64, 32), 32, torch.float16, "moe04"),
+            ((8, 64, 64), 32, torch.bfloat16, "moe05"),
+            ((8, 64, 64), 32, torch.float16, "moe06"),
+            ((8, 64, 128), 32, torch.float16, "moe07"),
         ],
     )
-    def test_moe_expert_routing(self, execution_mode, shape, P, dtype, atol, diff_key):
+    def test_moe_expert_routing(self, execution_mode, shape, P, dtype, diff_key):
         """MoE expert weight gather: expert_w[ids] across shapes and dtypes."""
         w = cached_randn(shape, differentiation=diff_key, dtype=dtype)
         ids = torch.randint(0, shape[0], (P,), dtype=torch.int64)
-        compare_mode(execution_mode, lambda w, i: w[i], w, ids, atol=atol, rtol=atol)
+        compare_mode(execution_mode, lambda w, i: w[i], w, ids, atol=0, rtol=0)
 
     def test_moe_expert_aggregation(self, execution_mode):
         """Route via gather then weighted-sum aggregation."""
@@ -168,25 +171,23 @@ class TestGatherInferencePatternsEagerCompile:
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
-        "kv_shape,P,dtype,atol,diff_key",
+        "kv_shape,P,dtype,diff_key",
         [
-            ((256, 8, 64), 128, torch.float16, _ATOL_F16, "gpa01"),
-            ((1024, 8, 64), 128, torch.float16, _ATOL_F16, "gpa02"),
-            ((512, 16, 128), 256, torch.float16, _ATOL_F16, "gpa03"),
-            ((512, 8, 64), 128, torch.float16, _ATOL_F16, "gpa05"),
-            ((1024, 1, 64), 256, torch.float16, _ATOL_F16, "gpa08"),
-            ((512, 8, 256), 128, torch.float16, _ATOL_F16, "gpa10"),
-            ((512, 8, 64), 128, torch.bfloat16, _ATOL_BF16, "gpa11"),
-            ((128, 8, 16, 64), 64, torch.float16, _ATOL_F16, "gpa23"),
+            ((256, 8, 64), 128, torch.float16, "gpa01"),
+            ((1024, 8, 64), 128, torch.float16, "gpa02"),
+            ((512, 16, 128), 256, torch.float16, "gpa03"),
+            ((512, 8, 64), 128, torch.float16, "gpa05"),
+            ((1024, 1, 64), 256, torch.float16, "gpa08"),
+            ((512, 8, 256), 128, torch.float16, "gpa10"),
+            ((512, 8, 64), 128, torch.bfloat16, "gpa11"),
+            ((128, 8, 16, 64), 64, torch.float16, "gpa23"),
         ],
     )
-    def test_paged_kv_pool_shape(
-        self, execution_mode, kv_shape, P, dtype, atol, diff_key
-    ):
+    def test_paged_kv_pool_shape(self, execution_mode, kv_shape, P, dtype, diff_key):
         """Paged KV pool gather: kv[idx] across pool shapes, head configs, and dtypes."""
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=dtype)
         idx = torch.randint(0, kv_shape[0], (P,), dtype=torch.int64)
-        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=atol, rtol=atol)
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     def test_paged_kv_block_table(self, execution_mode):
         """Block table: slot = block_table[b, t] * page_size + offset."""
@@ -199,8 +200,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda x, i: x[i],
             kv,
             flat_slots,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_paged_kv_page_reuse(self, execution_mode):
@@ -208,9 +209,7 @@ class TestGatherInferencePatternsEagerCompile:
         kv = cached_randn((512, 8, 64), differentiation="gpa13", dtype=torch.float16)
         shared_page = 42
         idx = torch.full((32,), shared_page, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     def test_paged_kv_online_softmax(self, execution_mode):
         """K gather + attention scores + softmax."""
@@ -310,8 +309,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda x, i: x[i],
             kv,
             boundary_slots,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -355,9 +354,7 @@ class TestGatherInferencePatternsEagerCompile:
             (64, 16, 8, 64), differentiation="vllm07", dtype=torch.float16
         )
         idx = torch.randint(0, 64, (4 * 16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     def test_vllm_beam_search_reorder(self, execution_mode):
         """Beam search KV reordering via index_select at batch dim."""
@@ -370,8 +367,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda x, i: torch.index_select(x, 0, i),
             past_kv,
             beam_idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_vllm_llama31_8b(self, execution_mode):
@@ -397,9 +394,7 @@ class TestGatherInferencePatternsEagerCompile:
         """Mistral-Small-3.2-24B sliding-window KV gather."""
         kv = cached_randn((512, 16, 128), differentiation="vllm12", dtype=torch.float16)
         idx = torch.randint(0, 512, (4 * 64,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     def test_vllm_speculative_decode(self, execution_mode):
         """Speculative decode; gather target probs at draft positions."""
@@ -426,18 +421,18 @@ class TestGatherInferencePatternsEagerCompile:
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
-        "P,dtype,atol,diff_key",
+        "P,dtype,diff_key",
         [
-            (64, torch.float16, _ATOL_F16, "fms01"),
-            (1, torch.float16, _ATOL_F16, "fms05"),
-            (4 * 16, torch.bfloat16, _ATOL_BF16, "fms06"),
+            (64, torch.float16, "fms01"),
+            (1, torch.float16, "fms05"),
+            (4 * 16, torch.bfloat16, "fms06"),
         ],
     )
-    def test_fms_4d_layout(self, execution_mode, P, dtype, atol, diff_key):
+    def test_fms_4d_layout(self, execution_mode, P, dtype, diff_key):
         """FMS 4D KV (128,8,16,128) gather across dtypes and output sizes."""
         kv = cached_randn((128, 8, 16, 128), differentiation=diff_key, dtype=dtype)
         idx = torch.randint(0, 128, (P,), dtype=torch.int64)
-        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=atol, rtol=atol)
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -453,9 +448,7 @@ class TestGatherInferencePatternsEagerCompile:
         """Model-specific KV gather at production prefill/decode sizes."""
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=torch.float16)
         idx = torch.randint(0, kv_shape[0], (P,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
     def test_rope_index_select_float32(self, execution_mode):
         """SpyreRotaryEmbedding float32: cos_sin_cache.index_select(0, pos); 4-byte elements."""
@@ -468,13 +461,13 @@ class TestGatherInferencePatternsEagerCompile:
             lambda c, p: torch.index_select(c, 0, p),
             cos_sin,
             pos,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=0,
+            rtol=0,
         )
 
     def test_token_unpadding(self, execution_mode):
         """Packed token gather: each seq pos from flat packed buffer."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         packed = cached_randn((64, 128), differentiation="mdl12", dtype=torch.float16)
         pos_ids = torch.randint(0, 64, (4, 16), dtype=torch.int64)
@@ -483,8 +476,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda p, i: p[i],
             packed,
             pos_ids,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     @pytest.mark.parametrize(
@@ -498,7 +491,7 @@ class TestGatherInferencePatternsEagerCompile:
         self, execution_mode, kv_shape, idx_shape, diff_key
     ):
         """Paged KV: 2D (B,Lk) slot_idxs into 3D cache — FRS paged gather pattern."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=torch.float16)
         slot_idxs = torch.randint(0, kv_shape[0], idx_shape, dtype=torch.int64)
@@ -507,8 +500,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda x, i: x[i],
             kv,
             slot_idxs,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -516,6 +509,7 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top1(self, execution_mode):
         """MoE top-1 routing: softmax → topk(1) → index → gather expert weights."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
         _xfail_existing(execution_mode, eager=_STICK_TOP1_MISMATCH)
         n_experts = 8
         expert_w = cached_randn(
@@ -540,7 +534,8 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6384
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
         _xfail_existing(
             execution_mode,
             eager=_STICK_TOP2_EAGER,
@@ -566,7 +561,7 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_moe_weighted_routing(self, execution_mode):
         """MoE top-2 weighted: topk scores × gathered expert outputs → weighted sum."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6390
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4392
         _xfail_existing(
             execution_mode,
@@ -596,12 +591,12 @@ class TestGatherInferencePatternsEagerCompile:
         """Speculative decode: topk draft candidates → gather their token embeddings."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4716
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4718
         _xfail_existing(
             execution_mode,
             patch_sencores=patch_sencores,
-            eager=_OUT_LAYOUTS_EMPTY,
+            eager=_TOPK_GATHER_EAGER,
             compiled_1=_TOPK_K_PER_CORE,
+            compiled_32=_TOPK_GATHER_COMPILED,
         )
         embed = cached_randn((512, 128), differentiation="topk04", dtype=torch.float16)
         scores = cached_randn((512,), differentiation="topk04s", dtype=torch.float16)
@@ -614,6 +609,10 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_beam_search_kv_reorder(self, execution_mode):
         """Beam search: topk beam scores → gather KV rows for top beams."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
+        _xfail_existing(
+            execution_mode, eager=_TOPK_GATHER_EAGER, compiled=_TOPK_GATHER_COMPILED
+        )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)
         beam_scores = cached_randn((8,), differentiation="topk05s", dtype=torch.float16)
 
@@ -659,8 +658,8 @@ class TestGatherInferencePatternsEagerCompile:
                 lambda x, i: x[i],
                 kv,
                 slot_idxs,
-                atol=_ATOL_F16,
-                rtol=_ATOL_F16,
+                atol=0,
+                rtol=0,
             )
 
     def test_multi_layer_4d_kv_per_layer(self, execution_mode):
@@ -678,8 +677,8 @@ class TestGatherInferencePatternsEagerCompile:
                 lambda x, i: x[i],
                 kv,
                 idx,
-                atol=_ATOL_F16,
-                rtol=_ATOL_F16,
+                atol=0,
+                rtol=0,
             )
 
     def test_multi_layer_bfloat16_kv(self, execution_mode):
@@ -695,8 +694,8 @@ class TestGatherInferencePatternsEagerCompile:
                 lambda x, i: x[i],
                 kv,
                 slot_idxs,
-                atol=_ATOL_BF16,
-                rtol=_ATOL_BF16,
+                atol=0,
+                rtol=0,
             )
 
     def test_float32_kv_cache_access(self, execution_mode):
@@ -704,9 +703,7 @@ class TestGatherInferencePatternsEagerCompile:
         pool, H, D = 512, 8, 64
         kv = cached_randn((pool, H, D), differentiation="f32kv01", dtype=torch.float32)
         slots = torch.randint(0, pool, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], kv, slots, atol=_ATOL_F32, rtol=_ATOL_F32
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], kv, slots, atol=0, rtol=0)
 
     def test_index_put_view_n_32_32(self, execution_mode):
         """index_put_ on view [8, 32, 32] → [8, 1024]; compile Mod(d1, 32) (#4443)."""

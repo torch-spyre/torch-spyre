@@ -26,7 +26,7 @@ from utils_inductor import cached_randn  # noqa: E402
 from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _INT32_TO_INT64_CONV = (
-    "Pending issue: eager aten::index.Tensor does not support bool source tensors",
+    4332,
     "Eager Spyre aten::index.Tensor does not support bool source tensors.",
     r"does not support bool source tensors",
 )
@@ -59,13 +59,13 @@ class TestGatherValueAndIndexDtypeCoverage:
         """bfloat16 value + int32 index; SDSC wordLength=2."""
         x = cached_randn((32, 128), differentiation="gdt01", dtype=torch.bfloat16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int32)
-        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=2e-2, rtol=2e-2)
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_float32_value(self, execution_mode):
         """float32 value + int32 index; 4 bytes/element layout."""
         x = cached_randn((32, 128), differentiation="gdt02", dtype=torch.float32)
         idx = torch.randint(0, 32, (16,), dtype=torch.int32)
-        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=1e-5, rtol=1e-5)
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_int32_value(self, execution_mode):
         """Integer value tensor gather; exact integer output."""
@@ -81,7 +81,6 @@ class TestGatherValueAndIndexDtypeCoverage:
 
     def test_gather_bool_value(self, execution_mode):
         """Boolean value gather; 1-byte elements."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4334
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4332
         _xfail_existing(
             execution_mode,
@@ -95,36 +94,26 @@ class TestGatherValueAndIndexDtypeCoverage:
     # -- index dtype variants and downcast --------------------------------
 
     @pytest.mark.parametrize(
-        "val_dtype,diff_key,atol",
+        "val_dtype,diff_key",
         [
-            (torch.float16, "gdt06", 1e-2),
-            (torch.bfloat16, "gdt08", 2e-2),
-            (torch.float32, "gdt10", 1e-5),
+            (torch.float16, "gdt06"),
+            (torch.bfloat16, "gdt08"),
+            (torch.float32, "gdt10"),
         ],
     )
-    def test_gather_int64_index_downcast(
-        self, execution_mode, val_dtype, diff_key, atol
-    ):
+    def test_gather_int64_index_downcast(self, execution_mode, val_dtype, diff_key):
         """int64 index auto-downcast to int32; warning emitted for each value dtype."""
         x = cached_randn((32, 128), differentiation=diff_key, dtype=val_dtype)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
-            compare_mode(
-                execution_mode, lambda x, i: x[i], x, idx, atol=atol, rtol=atol
-            )
+            compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_int32_index_bfloat16(self, execution_mode):
         """bfloat16 value + int32 index at production scale (512,256) — standard combo."""
         x = cached_randn((512, 256), differentiation="gdt07", dtype=torch.bfloat16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int32)
-        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=2e-2, rtol=2e-2)
-
-    def test_gather_int32_index_float32(self, execution_mode):
-        """float32 value + int32 index; no downcast path."""
-        x = cached_randn((32, 128), differentiation="gdt09", dtype=torch.float32)
-        idx = torch.randint(0, 32, (16,), dtype=torch.int32)
-        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=1e-5, rtol=1e-5)
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_float64_not_gathered(self, execution_mode):
         """float64 must NOT produce GATHER_OP_SPEC; falls back to CPU."""
@@ -143,9 +132,7 @@ class TestGatherValueAndIndexDtypeCoverage:
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            compare_mode(
-                execution_mode, lambda x, i: x[i], x, idx, atol=1e-2, rtol=1e-2
-            )
+            compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
         spyre_warns = [
             str(m.message) for m in w if "downcast" in str(m.message).lower()
         ]
@@ -185,6 +172,4 @@ class TestGatherValueAndIndexDtypeCoverage:
         idx = torch.randint(0, 32, (16,), dtype=idx_dtype)
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
-            compare_mode(
-                execution_mode, lambda x, i: x[i], x, idx, atol=1e-2, rtol=1e-2
-            )
+            compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)

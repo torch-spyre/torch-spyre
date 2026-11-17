@@ -25,11 +25,9 @@ from utils_inductor import cached_randn  # noqa: E402
 from conftest import _xfail_existing, compare_mode  # noqa: E402
 
 _ATOL_F16 = 1e-2
-_ATOL_BF16 = 2e-2
-_ATOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
@@ -50,18 +48,18 @@ _DXP_STANDALONE_FAIL = (
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
-    r"spyre <-> cpu\S* mismatch",
+    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
+    r"cannot re-tile \S+: no size-1 stick target",
 )
 _INCOMPATIBLE_HOST_SIZE = (
-    "Pending issue: compile take: cannot re-tile / no mechanism to resolve stick incompatibility",
-    "compile take / flatten-take: cannot re-tile or no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility|cannot re-tile \S+: no size-1 stick target",
+    3732,
+    "compile flat take_along_dim: Pointwise no mechanism to resolve stick incompatibility.",
+    r"no mechanism to resolve stick incompatibility",
 )
-_WRAPPER_SYNTAX_ERROR = (
-    4333,
-    "compile take_along_dim: failed to import inductor wrapper, inner SyntaxError.",
-    r"SyntaxError",
+_REMAINDER_COMPILED = (
+    4416,
+    "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
+    r"unimplemented operation remainder",
 )
 _MULTIPLE_INDIRECT_SYMBOLS = (
     4471,
@@ -91,57 +89,43 @@ class TestGatherShapeRankAndIndexPatterns:
         """Basic 2D gather across diverse (M, N) shapes and output sizes."""
         x = cached_randn(shape, differentiation=diff_key, dtype=torch.float16)
         idx = torch.randint(0, shape[0], (P,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_large_m256(self, execution_mode, patch_sencores):
         """(256, 64) P=128 — M large enough to split across cores."""
         x = cached_randn((256, 64), differentiation="gfc04", dtype=torch.float16)
         idx = torch.randint(0, 256, (128,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_non_power_of_2_inner(self, execution_mode):
         """N=100 not a multiple of 64; stick padding must not leak."""
         x = cached_randn((16, 100), differentiation="gfc06", dtype=torch.float16)
         idx = torch.randint(0, 16, (8,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_full_range(self, execution_mode):
         """Index = full row permutation; every row accessed exactly once."""
         x = cached_randn((32, 64), differentiation="gfc07", dtype=torch.float16)
         idx = torch.randperm(32, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_all_same_row(self, execution_mode):
         """All idx values = 0; repeated reads of row 0."""
         x = cached_randn((32, 64), differentiation="gfc08", dtype=torch.float16)
         idx = torch.zeros(16, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_ascending_idx(self, execution_mode):
         """Sequential ascending idx [0..15]; cache-friendly access."""
         x = cached_randn((32, 128), differentiation="gfc09", dtype=torch.float16)
         idx = torch.arange(16, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_descending_idx(self, execution_mode):
         """Descending idx [31..16]; reverse access order."""
         x = cached_randn((32, 128), differentiation="gfc10", dtype=torch.float16)
         idx = torch.arange(31, 15, -1, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_2d_repeated_idx(self, execution_mode):
         """idx has repeated values; duplicate output rows must be identical."""
@@ -150,25 +134,19 @@ class TestGatherShapeRankAndIndexPatterns:
             [0, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5, 6, 7, 8, 9, 6, 7, 8, 9],
             dtype=torch.int64,
         )
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_3d_wide(self, execution_mode):
         """3D tensor (8,32,512), dim=0 gather, P=16."""
         x = cached_randn((8, 32, 512), differentiation="gfc12", dtype=torch.float16)
         idx = torch.randint(0, 8, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_3d_small(self, execution_mode):
         """Smallest valid 3D tensor (4,4,16), sub-stick inner dims."""
         x = cached_randn((4, 4, 16), differentiation="gfc13", dtype=torch.float16)
         idx = torch.randint(0, 4, (2,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_3d_interior_dim(self, execution_mode):
         """x[:, idx, :] — interior dim=1 gather, (8,16,64)."""
@@ -179,17 +157,15 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.index_select(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_4d_data(self, execution_mode):
         """4D tensor (2,8,4,64), gather at dim=0, P=4."""
         x = cached_randn((2, 8, 4, 64), differentiation="gfc15", dtype=torch.float16)
         idx = torch.randint(0, 2, (4,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_index_select_new_shape(self, execution_mode):
         """torch.index_select(x,0,idx) on (16,256) with P=12."""
@@ -200,18 +176,17 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_along_dim(self, execution_mode):
         """torch.take_along_dim(x, idx, dim=0), same-rank index (16,64)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4333
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_WRAPPER_SYNTAX_ERROR,
+            compiled=_REMAINDER_COMPILED,
         )
         x = cached_randn((32, 64), differentiation="gfc17", dtype=torch.float16)
         idx = torch.randint(0, 32, (16, 64), dtype=torch.int64)
@@ -220,8 +195,8 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.take_along_dim(x, i, dim=0),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_torch_gather_dim0(self, execution_mode):
@@ -240,8 +215,8 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.gather(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_torch_gather_dim0_fewer_index_cols(self, execution_mode):
@@ -263,8 +238,8 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.gather(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_result_exact(self, execution_mode):
@@ -281,9 +256,7 @@ class TestGatherShapeRankAndIndexPatterns:
             [v for pair in zip(range(16), range(16, 32)) for v in pair],
             dtype=torch.int64,
         )
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -292,51 +265,39 @@ class TestGatherShapeRankAndIndexPatterns:
         x = cached_randn((32, 128), differentiation="gidx02", dtype=torch.float16)
         hot = [5] * 19 + [torch.randint(0, 32, (1,)).item() for _ in range(5)]
         idx = torch.tensor(hot[:24], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_strided(self, execution_mode):
         """Strided access [0,4,8,...]; stride=4 row selection."""
         x = cached_randn((64, 64), differentiation="gidx04", dtype=torch.float16)
         idx = torch.arange(0, 64, 4, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_oversize(self, execution_mode):
         """P=32 > M=16; each input row read multiple times."""
         x = cached_randn((16, 64), differentiation="gidx06", dtype=torch.float16)
         idx = torch.randint(0, 16, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_two_elements(self, execution_mode):
         """Minimal index P=2; smallest valid gather output."""
         x = cached_randn((32, 128), differentiation="gidx07", dtype=torch.float16)
         idx = torch.randint(0, 32, (2,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_single_row(self, execution_mode):
         """P=1 — single-element index; validates compile succeeds."""
         x = cached_randn((32, 256), differentiation="gidx08", dtype=torch.float16)
         idx = torch.randint(0, 32, (1,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_2d_shape(self, execution_mode):
         """2D-shaped index (8,4) on (16,64) value tensor."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         x = cached_randn((16, 64), differentiation="gidx10", dtype=torch.float16)
         idx = torch.randint(0, 16, (8, 4), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_idx_boundary_values(self, execution_mode):
         """Both boundary rows (0 and M-1=31) plus mid values."""
@@ -345,9 +306,7 @@ class TestGatherShapeRankAndIndexPatterns:
             [0, 31, 5, 10, 15, 20, 25, 3, 8, 13, 18, 23, 28, 1, 16, 30],
             dtype=torch.int64,
         )
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -368,8 +327,8 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.gather(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_torch_gather_dim1_2d_fp16(self, execution_mode):
@@ -395,18 +354,17 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.gather(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_along_dim_dim1(self, execution_mode):
         """torch.take_along_dim at dim=1; selects sequence positions per batch head."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4333
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_WRAPPER_SYNTAX_ERROR,
+            compiled=_REMAINDER_COMPILED,
         )
         x = cached_randn((4, 32, 64), differentiation="gfc_tad1", dtype=torch.float16)
         idx = torch.randint(0, 32, (4, 16, 64), dtype=torch.int64)
@@ -415,8 +373,8 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.take_along_dim(x, i, dim=1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_along_dim_none_flat(self, execution_mode):
@@ -442,11 +400,10 @@ class TestGatherShapeRankAndIndexPatterns:
     def test_take_along_dim_float32(self, execution_mode):
         """take_along_dim at dim=1 on float32 source; selects 16 positions per head from (4,32,64)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4333
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_WRAPPER_SYNTAX_ERROR,
+            compiled=_REMAINDER_COMPILED,
         )
         x = cached_randn((4, 32, 64), differentiation="tad_f32_01", dtype=torch.float32)
         idx = torch.randint(0, 32, (4, 16, 64), dtype=torch.int64)
@@ -455,18 +412,17 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.take_along_dim(x, i, dim=1),
             x,
             idx,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_along_dim_bfloat16(self, execution_mode):
         """take_along_dim at dim=1 on bfloat16 source; same shape as float32 variant for dtype parity."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4333
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_WRAPPER_SYNTAX_ERROR,
+            compiled=_REMAINDER_COMPILED,
         )
         x = cached_randn(
             (4, 32, 64), differentiation="tad_bf16_01", dtype=torch.bfloat16
@@ -477,13 +433,13 @@ class TestGatherShapeRankAndIndexPatterns:
             lambda x, i: torch.take_along_dim(x, i, dim=1),
             x,
             idx,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=0,
+            rtol=0,
         )
 
     def test_advanced_index_2d_coordinate(self, execution_mode):
         """x[idx0, idx1] two-tensor coordinate indexing; each (idx0[i], idx1[i]) pair selects one element."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4471
         _xfail_existing(
             execution_mode,
@@ -547,8 +503,8 @@ class TestGatherNonLeadingDimEagerCompile:
             lambda x, i: torch.gather(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_dim1_sequence_position_select(self, execution_mode):
@@ -572,8 +528,8 @@ class TestGatherNonLeadingDimEagerCompile:
             lambda x, i: torch.gather(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # -- dim=2: feature / channel selection (no prior coverage in the suite) -
@@ -599,8 +555,8 @@ class TestGatherNonLeadingDimEagerCompile:
             lambda x, i: torch.gather(x, 2, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_along_dim_dim2(self, execution_mode):
@@ -620,8 +576,8 @@ class TestGatherNonLeadingDimEagerCompile:
             lambda x, i: torch.take_along_dim(x, i, dim=2),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_dim2_bfloat16(self, execution_mode):
@@ -641,6 +597,6 @@ class TestGatherNonLeadingDimEagerCompile:
             lambda x, i: torch.gather(x, 2, i),
             x,
             idx,
-            atol=2e-2,
-            rtol=2e-2,
+            atol=0,
+            rtol=0,
         )

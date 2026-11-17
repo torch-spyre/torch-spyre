@@ -30,29 +30,39 @@ _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
 _BOOL_SOURCE_EAGER = (
-    "Pending issue: eager aten::index.Tensor does not support bool source tensors",
+    4332,
     "Eager Spyre aten::index.Tensor does not support bool source tensors.",
     r"does not support bool source tensors",
 )
+_EAGER_MATMUL_MISMATCH = (
+    6355,
+    "Eager FP16 matmul after a gather mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
 _NUMERICAL_MISMATCH = (
-    "Pending issue: eager gather + downstream op numerical mismatch",
-    "Eager gather followed by a downstream op mismatches CPU.",
-    r"spyre <-> cpu\S* mismatch",
+    4723,
+    "Eager gather followed by a sum accumulate mismatches CPU.",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _FP16_TO_FP32_EAGER = (
     5856,
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
+_CLAMP_MIN_EAGER = (
+    6340,
+    "aten::clamp_min.out is not registered on Spyre.",
+    r"Could not run 'aten::clamp_min.out'",
 )
 _STICK_INCOMPATIBLE = (
-    "Pending issue: compile take: cannot re-tile / no mechanism to resolve stick incompatibility",
-    "compile take / flatten-take: cannot re-tile or no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility|cannot re-tile \S+: no size-1 stick target",
+    3732,
+    "compile single-row gather: Pointwise no mechanism to resolve stick incompatibility.",
+    r"no mechanism to resolve stick incompatibility",
 )
 _MASKED_SELECT = (
     4371,
@@ -60,7 +70,7 @@ _MASKED_SELECT = (
     r"Could not run 'aten::masked_select'",
 )
 _NONZERO = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
@@ -71,8 +81,8 @@ _BOOL_OPERANDS = (
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
-    r"spyre <-> cpu\S* mismatch",
+    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
+    r"cannot re-tile \S+: no size-1 stick target",
 )
 _TAKE_EAGER = (
     4307,
@@ -80,19 +90,19 @@ _TAKE_EAGER = (
     r"Could not run 'aten::take'",
 )
 _HOST_SIZE_DIM_ORDER = (
-    "Pending issue: compile take: cannot re-tile / no mechanism to resolve stick incompatibility",
-    "compile take / flatten-take: cannot re-tile or no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility|cannot re-tile \S+: no size-1 stick target",
+    3732,
+    "compile take / flatten-take: Pointwise no mechanism to resolve stick incompatibility.",
+    r"no mechanism to resolve stick incompatibility",
 )
 _REMAINDER = (
     4416,
     "aten::remainder.Tensor_out is not registered on Spyre.",
     r"Could not run 'aten::remainder.Tensor_out'",
 )
-_WRAPPER_SYNTAX_ERROR = (
-    4333,
-    "compile take_along_dim: failed to import inductor wrapper, inner SyntaxError.",
-    r"SyntaxError",
+_REMAINDER_COMPILED = (
+    4416,
+    "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
+    r"unimplemented operation remainder",
 )
 _GATHER_OUT = (
     4328,
@@ -104,20 +114,15 @@ _DXP_STANDALONE = (
     "compile gather dxp_standalone returned non-zero exit status 1.",
     r"SubprocException",
 )
-_GATHER_EXPANDED_MISMATCH = (
-    4840,
-    "compile gather along dim>=1 with expanded index produces numerical mismatch vs CPU.",
-    r"compiled spyre <-> cpu\S* mismatch",
-)
 _MATMUL_MISMATCH = (
     4722,
     "compile gather followed by matmul / linear numerical mismatch.",
-    r"spyre <-> cpu\S* mismatch",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _ACCUMULATE_MISMATCH = (
     4723,
     "compile gather accumulate numerical mismatch.",
-    r"spyre <-> cpu\S* mismatch",
+    r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 
@@ -131,38 +136,29 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_single_row_source(self, execution_mode):
         """Source has a single row (M=1); all indices must be 0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
         _xfail_existing(execution_mode, compiled=_STICK_INCOMPATIBLE)
         x = cached_randn((1, 64), differentiation="ec01", dtype=torch.float16)
         idx = torch.zeros(8, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_all_same_index(self, execution_mode):
         """All indices identical; output is repeated rows."""
         x = cached_randn((64, 128), differentiation="ec04", dtype=torch.float16)
         idx = torch.full((16,), 7, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_odd_inner_dim(self, execution_mode):
         """Odd D=65; cross-stick boundary element."""
         x = cached_randn((64, 65), differentiation="ec10", dtype=torch.float16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_gather_1d_source(self, execution_mode):
         """1D source tensor; gather is scalar indexing."""
         x = cached_randn((256,), differentiation="ec12", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_exact_integer_gather(self, execution_mode):
         """Integer value source; output is exact (atol=0)."""
@@ -225,9 +221,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         nz = torch.nonzero(scores, as_tuple=True)[0].int()
         if nz.numel() == 0:
             nz = torch.tensor([0], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, nz, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, nz, atol=0, rtol=0)
 
     def test_mask_then_index_gather(self, execution_mode):
         """Create index from mask; use as int gather index."""
@@ -237,9 +231,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         idx = torch.where(keep_mask)[0].int()
         if idx.numel() == 0:
             idx = torch.tensor([0], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], src, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], src, idx, atol=0, rtol=0)
 
     def test_causal_attention_mask(self, execution_mode):
         """Causal mask applied to scores then gather valid row subset."""
@@ -301,7 +293,6 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_gather_from_bool_tensor(self, execution_mode):
         """Gather from a bool tensor; exact output."""
-        # TODO: Pending issue: bool source tensor not supported on Spyre eager index
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4332
         _xfail_existing(
             execution_mode, eager=_BOOL_SOURCE_EAGER, compiled=_BOOL_OPERANDS
@@ -314,6 +305,10 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_index_select_dim1(self, execution_mode):
         """index_select at dim=1; column selection."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
+        _xfail_existing(
+            execution_mode, eager=_RESTICKIFY_3ARGS, compiled=_RESTICKIFY_3ARGS
+        )
         x = cached_randn((32, 128), differentiation="idxs02", dtype=torch.float16)
         idx = torch.randint(0, 128, (64,), dtype=torch.int64)
         compare_mode(
@@ -321,8 +316,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_3d_dim0(self, execution_mode):
@@ -334,8 +329,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_single_index(self, execution_mode):
@@ -347,8 +342,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_bfloat16(self, execution_mode):
@@ -360,8 +355,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_int32_result(self, execution_mode):
@@ -386,8 +381,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_with_downstream(self, execution_mode):
@@ -412,8 +407,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_fp32_dim1(self, execution_mode):
@@ -427,8 +422,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_large(self, execution_mode, patch_sencores):
@@ -440,8 +435,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 0, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -460,8 +455,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take(x, i),
             x,
             flat_idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_api_repeat_interleave(self, execution_mode):
@@ -485,8 +480,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
                 lambda x, i: x[i],
                 x,
                 idx,
-                atol=_ATOL_F16,
-                rtol=_ATOL_F16,
+                atol=0,
+                rtol=0,
             )
         else:
             fn = torch.compile(lambda x, i: x[i], fullgraph=True)
@@ -496,10 +491,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
     def test_api_take_along_dim_argmax(self, execution_mode):
         """take_along_dim(x, argmax, dim=0); pick argmax rows."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4333
-        _xfail_existing(
-            execution_mode, eager=_REMAINDER, compiled=_WRAPPER_SYNTAX_ERROR
-        )
+        _xfail_existing(execution_mode, eager=_REMAINDER, compiled=_REMAINDER_COMPILED)
         x = cached_randn((32, 64), differentiation="api18", dtype=torch.float16)
         idx = x.argmax(dim=0, keepdim=True)
         compare_mode(
@@ -507,8 +499,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take_along_dim(x, i, dim=0),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_api_slice_and_gather(self, execution_mode):
@@ -516,9 +508,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x = cached_randn((128, 64), differentiation="api19", dtype=torch.float16)
         half = x[:64]
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], half, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], half, idx, atol=0, rtol=0)
 
     def test_api_repeat_interleave_gather(self, execution_mode):
         """repeat_interleave to expand batch then gather."""
@@ -530,8 +520,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: x[i],
             expanded,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_api_gather_then_softmax(self, execution_mode):
@@ -556,36 +546,28 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x = cached_randn((128, 64), differentiation="ncs01", dtype=torch.float16)
         xt = x.t().contiguous()
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], xt, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], xt, idx, atol=0, rtol=0)
 
     def test_ncs_permuted_3d(self, execution_mode):
         """3D tensor permuted (1,0,2) then contiguous; gather at dim=0."""
         x = cached_randn((8, 64, 128), differentiation="ncs03", dtype=torch.float16)
         xp = x.permute(1, 0, 2).contiguous()
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], xp, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], xp, idx, atol=0, rtol=0)
 
     def test_ncs_expanded_dims(self, execution_mode):
         """Source with expanded singleton dim; gather after expand."""
         x = cached_randn((1, 64, 128), differentiation="ncs05", dtype=torch.float16)
         xe = x.expand(8, 64, 128).reshape(512, 128).contiguous()
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], xe, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], xe, idx, atol=0, rtol=0)
 
     def test_ncs_after_view(self, execution_mode):
         """Source viewed to new shape; gather on re-shaped tensor."""
         x = cached_randn((8, 64, 128), differentiation="ncs06", dtype=torch.float16)
         xv = x.reshape(512, 128)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], xv, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], xv, idx, atol=0, rtol=0)
 
     def test_ncs_chunk_then_gather(self, execution_mode):
         """Source split into 4 chunks; gather on third chunk."""
@@ -597,8 +579,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: x[i],
             chunk,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_ncs_cat_then_gather(self, execution_mode):
@@ -607,27 +589,23 @@ class TestGatherBoundaryNumericsAndAPIForms:
         b = cached_randn((32, 64), differentiation="ncs09b", dtype=torch.float16)
         ab = torch.cat([a, b], dim=0)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], ab, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], ab, idx, atol=0, rtol=0)
 
     def test_ncs_stack_then_gather(self, execution_mode):
         """Stack 32 row vectors; gather rows from stacked tensor."""
         base = cached_randn((32, 128), differentiation="ncs_stk01", dtype=torch.float16)
         x = torch.stack(list(base.unbind(0)), dim=0)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
     def test_gather_then_matmul_downstream_correct(self, execution_mode):
         """Gather rows then matmul in one compiled graph; downstream op matches CPU."""
-        # TODO: Pending issue: eager numerical mismatch on Spyre
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
         _xfail_existing(
-            execution_mode, eager=_NUMERICAL_MISMATCH, compiled=_MATMUL_MISMATCH
+            execution_mode, eager=_EAGER_MATMUL_MISMATCH, compiled=_MATMUL_MISMATCH
         )
         x = cached_randn((64, 128), differentiation="bug03x", dtype=torch.float16)
         w = cached_randn((128, 64), differentiation="bug03w", dtype=torch.float16)
@@ -647,12 +625,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x = cached_randn((64, 128), differentiation="bug06a", dtype=torch.float16)
         y = cached_randn((64, 128), differentiation="bug06b", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
-        compare_mode(
-            execution_mode, lambda y, i: y[i], y, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
+        compare_mode(execution_mode, lambda y, i: y[i], y, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -660,17 +634,13 @@ class TestGatherBoundaryNumericsAndAPIForms:
         """Inner dim D=1; minimal column width."""
         x = cached_randn((64, 1), differentiation="cor02", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_cor_bfloat16_large_index(self, execution_mode, patch_sencores):
         """bfloat16 source; large P=256 index."""
         x = cached_randn((512, 64), differentiation="cor03", dtype=torch.bfloat16)
         idx = torch.randint(0, 512, (256,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_cor_float32_exact(self, execution_mode):
         """float32 round-trip; values preserved exactly."""
@@ -697,14 +667,12 @@ class TestGatherBoundaryNumericsAndAPIForms:
         """D=512 (8 sticks at fp16); wide row gather."""
         x = cached_randn((64, 512), differentiation="cor08", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_cor_gather_then_norm(self, execution_mode):
         """Gather + F.normalize downstream."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6340
+        _xfail_existing(execution_mode, eager=_CLAMP_MIN_EAGER)
         x = cached_randn((64, 128), differentiation="cor09", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         compare_mode(
@@ -725,8 +693,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 1, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_cor_gather_with_scale(self, execution_mode):
@@ -744,7 +712,6 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_cor_gather_accumulate(self, execution_mode):
         """Gather + sum accumulate; output is scalar per batch."""
-        # TODO: Pending issue: eager numerical mismatch on Spyre
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4723
         _xfail_existing(
             execution_mode, eager=_NUMERICAL_MISMATCH, compiled=_ACCUMULATE_MISMATCH
@@ -768,9 +735,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x[5, :] = float("nan")
         x[20, :] = float("nan")
         idx = torch.tensor([5, 0, 20, 10], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_neg_inf_padding_rows_gathered(self, execution_mode):
         """-inf padding rows (attention masking pattern); gather must preserve -inf."""
@@ -778,18 +743,14 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x[0, :] = float("-inf")
         x[31, :] = float("-inf")
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_pos_inf_source_rows(self, execution_mode):
         """+inf values in source row; gather propagates +inf to all output copies."""
         x = cached_randn((32, 64), differentiation="nan03", dtype=torch.float16)
         x[7, :] = float("inf")
         idx = torch.tensor([7, 7, 0, 1, 7], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_mixed_nan_neg_inf_source(self, execution_mode):
         """Source with both NaN and -inf rows; gather reads each type correctly."""
@@ -797,9 +758,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         x[0, :] = float("nan")
         x[31, :] = float("-inf")
         idx = torch.tensor([0, 31, 5, 15], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_nan_in_unselected_rows_does_not_contaminate(self, execution_mode):
         """NaN in rows NOT indexed; selected output rows must be free of NaN."""
@@ -809,18 +768,14 @@ class TestGatherBoundaryNumericsAndAPIForms:
         idx = torch.arange(8, dtype=torch.int64)
         result_ref = x[idx]
         assert not result_ref.isnan().any()
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_causal_neg_inf_mask_gather_valid_rows(self, execution_mode):
         """Causal mask: future-position rows are -inf; gather reads only valid past rows."""
         x = cached_randn((64, 128), differentiation="nan06", dtype=torch.float16)
         x[32:, :] = float("-inf")
         idx = torch.arange(32, dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -830,21 +785,17 @@ class TestGatherBoundaryNumericsAndAPIForms:
         idx_full = torch.randint(0, 32, (32,), dtype=torch.int64)
         idx = idx_full[::2]
         assert not idx.is_contiguous()
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_noncontig_2d_idx_transposed(self, execution_mode):
         """Transposed 2D index tensor; shape (8,4) with non-unit strides."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         x = cached_randn((32, 64), differentiation="ncidx04", dtype=torch.float16)
         idx_2d = torch.randint(0, 32, (4, 8), dtype=torch.int64)
         idx = idx_2d.T
         assert not idx.is_contiguous()
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
 
@@ -861,15 +812,14 @@ class TestGatherBoundaryNumericsAndAPIForms:
         compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     @pytest.mark.skip(
-        "vf_streamer.cpp: 498] Detected 1 bad response blocks in message stream"
+        reason="Negative int64 indices reach the hardware gather un-normalized: \
+        bad response blocks / ComputeHardwareError, then StreamInErrorState poisons the session. See issue #4731."
     )
     def test_negative_index_int64(self, execution_mode):
         """Negative int64 index values; PyTorch defines x[tensor([-1])] as the last row."""
         x = cached_randn((16, 64), differentiation="neg_idx01", dtype=torch.float16)
         idx = torch.tensor([-1, -2, 0, 5, -1], dtype=torch.int64)
-        compare_mode(
-            execution_mode, lambda x, i: x[i], x, idx, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     def test_index_select_dim2_on_4d(self, execution_mode):
         """index_select at dim=2 on (2,4,32,64); head-level sequence position selection."""
@@ -882,8 +832,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.index_select(x, 2, i),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_negative_dim(self, execution_mode):
@@ -930,8 +880,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take(x, i),
             x,
             idx,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_bfloat16(self, execution_mode):
@@ -948,26 +898,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take(x, i),
             x,
             idx,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
-        )
-
-    def test_take_int32_index(self, execution_mode):
-        """torch.take with int32 flat index; validates int32 path for flat-index gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4307
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
-        _xfail_existing(
-            execution_mode, eager=_TAKE_EAGER, compiled=_HOST_SIZE_DIM_ORDER
-        )
-        x = cached_randn((3, 4), differentiation="take_i32_01", dtype=torch.float16)
-        idx = torch.tensor([0, 5, 11], dtype=torch.int64)
-        compare_mode(
-            execution_mode,
-            lambda x, i: torch.take(x, i),
-            x,
-            idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_duplicate_flat_index(self, execution_mode):
@@ -1017,8 +949,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take(x, i),
             inp,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_take_rank_lesser_2d_index(self, execution_mode):
@@ -1032,8 +964,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.take(x, i),
             inp,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_masked_select_float32(self, execution_mode):
@@ -1105,10 +1037,8 @@ class TestGatherOutParameterEagerCompile:
     def test_gather_out_dim2(self, execution_mode):
         """torch.gather(x, 2, idx, out=buf): out= with dim=2 feature selection."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4840
-        _xfail_existing(
-            execution_mode, eager=_GATHER_OUT, compiled=_GATHER_EXPANDED_MISMATCH
-        )
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
+        _xfail_existing(execution_mode, eager=_GATHER_OUT, compiled=_RESTICKIFY_3ARGS)
         B, H, F, K = 2, 8, 128, 32
         x = cached_randn((B, H, F), differentiation="out03", dtype=torch.float16)
         idx = torch.randint(0, F, (B, H, K), dtype=torch.int64)

@@ -25,13 +25,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils_inductor import cached_randn  # noqa: E402
 from conftest import _xfail_existing, compare_mode  # noqa: E402
 
-_ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_SDPA = 2e-2
 
 
 _INDEX_2D_EAGER = (
-    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
@@ -41,19 +40,19 @@ _COPY_D2D_UNALIGNED = (
     r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
 )
 _POINTWISE_NO_LAYOUT = (
-    4306,
-    "compile Multi-arg pointwise: no supported output layout found.",
+    6388,
+    "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
     r"Multi-arg pointwise .*no supported output layout found",
 )
 _SDPA_EAGER_LIN_MISMATCH = (
-    "Pending issue: eager SDPA followed by linear projection numerical mismatch",
-    "Eager SDPA followed by an output linear projection mismatches CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+    6355,
+    "Eager FP16 matmul mismatches CPU (seen in the output projection after SDPA).",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _SDPA_LIN_MISMATCH = (
     4728,
     "compile paged-KV SDPA followed by output linear projection numerical mismatch.",
-    r"compiled spyre <-> cpu\S* mismatch",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _RESTICKIFY_MOD = (
     4760,
@@ -61,20 +60,20 @@ _RESTICKIFY_MOD = (
     r"insert_restickify_padding: new-stick extent .* requires a re-base copy",
 )
 _CANON_FACTORIZED = (
-    "Pending issue: compile 4D KV cache gather: cannot canonicalize factorized y_var",
+    4760,
     "compile 4D KV cache layout/reshape-before-permute: cannot canonicalize factorized y_var "
     "(expected an affine contiguous host dimension chain).",
     r"cannot canonicalize factorized y_var",
 )
 _SUBPROC_EAGER = (
-    "Pending issue: eager 4D KV reshape-before-permute raises SubprocException",
-    "Eager 4D KV reshape-before-permute raises SubprocException in the compile subprocess.",
-    r"SubprocException",
+    4760,
+    "Eager 4D KV reshape-before-permute: dbo-opt fails in the compile subprocess with sbf-ddc DtException: Could not find any suitable dimension mapping.",
+    r"SubprocException.*sbf-ddc.*Could not find any suitable dimension mapping",
 )
-_SDPA_LOOP_SCHEDULER_MEMBERS = (
-    "Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members",
-    "SDPA eager decomposition: counted loop loopnode0 holds kernel ops that are not all members of it.",
-    r"counted loop loopnode0 holds kernel ops that are not all members",
+_SDPA_LOOP_STRUCTURE = (
+    6336,
+    "SDPA eager decomposition: LoopStructureError after insert_restickify_padding, a buffer is in the body of loopnode0 but is not a member of the loop.",
+    r"LoopStructureError.*is in the body of loopnode0",
 )
 
 
@@ -274,11 +273,11 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_batch_decode_b4(self, execution_mode):
         """Batched decode B=4; each request gathers 8 slots → SDPA per request."""
-        # TODO: Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6336
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
         _xfail_existing(
             execution_mode,
-            eager=_SDPA_LOOP_SCHEDULER_MEMBERS,
+            eager=_SDPA_LOOP_STRUCTURE,
             compiled=_RESTICKIFY_MOD,
         )
         pool, H, D, Lk = 512, 8, 64, 8
@@ -309,17 +308,11 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_2d_slot_index_batched_decode(self, execution_mode, patch_sencores):
         """2D slot_idxs (B=4, Lk=16): paged batch decode; each row is one request."""
-        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6335
         _xfail_existing(
             execution_mode,
             eager=_INDEX_2D_EAGER,
         )
-        if execution_mode == "compiled" and patch_sencores == 32:
-            pytest.skip(
-                "RuntimeError: Bad responses and/or bad response blocks detected "
-                "on 32-core SDPA with 2D slot indexing (poisons device stream). "
-                "Pending issue: sdpa_2d_slot_index_32core_bad_response (see #4083, closed)."
-            )
         pool, H, D, B, Lk = 512, 8, 64, 4, 16
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn12k", dtype=torch.float16
@@ -349,7 +342,7 @@ class TestGatherPagedAttentionAndSDPA:
     def test_sdpa_rope_gather_then_attention(self, execution_mode):
         """Gather RoPE position embeddings → apply rotate-half → SDPA."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6388
         _xfail_existing(
             execution_mode,
             eager=_COPY_D2D_UNALIGNED,
@@ -509,7 +502,7 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_output_then_linear_projection(self, execution_mode, patch_sencores):
         """Gather KV → SDPA → linear output projection; full attention block pattern."""
-        # TODO: Pending issue: eager SDPA followed by linear projection numerical mismatch
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4728
         _xfail_existing(
             execution_mode,
@@ -552,8 +545,8 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_beam_reorder_then_attend(self, execution_mode):
         """Beam search KV reorder via index_select → SDPA on reordered KV."""
-        # TODO: Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members
-        _xfail_existing(execution_mode, eager=_SDPA_LOOP_SCHEDULER_MEMBERS)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6336
+        _xfail_existing(execution_mode, eager=_SDPA_LOOP_STRUCTURE)
         pool, H, D, B_beam = 512, 8, 64, 4
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn18k", dtype=torch.float16
