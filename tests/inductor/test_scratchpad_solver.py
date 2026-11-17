@@ -293,21 +293,36 @@ class TestCoarseTileLoopTripCount(TestCase):
         op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
 
+    _UNRESOLVED = mock.patch(
+        "torch_spyre._inductor.pass_utils.concretize_expr",
+        side_effect=RuntimeError("unresolvable"),
+    )
+
     def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
-        """A dynamic-shape loop bound (for_each_tile_lowering.py's
-        _extract_trip_count) can stamp an unresolved sympy.Symbol into
-        loop_count instead of a concrete int. int() on that raises TypeError;
-        the multiplier must fall back to 1 for that level rather than
-        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
-        float, consumed by min()/round() elsewhere in the solver)."""
+        """A symbolic count that concretize_expr cannot resolve is priced as
+        one trip, not propagated as a symbol into RelayoutCandidate.cost_ns
+        (a float consumed by min()/round() in the solver)."""
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_unbacked_trip_count_is_one_trip(self):
+        """An unbacked count is one trip, not the unbacked-symint fallback hint
+        that concretize_expr would return."""
+        u = sympy.Symbol("u0", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([u // 8, 4]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=1024
+        ) as concretize:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        concretize.assert_not_called()
 
     def test_symbolic_trip_count_resolves_through_concretize_expr(self):
         """A symbolic count that concretize_expr resolves (the declared maximum

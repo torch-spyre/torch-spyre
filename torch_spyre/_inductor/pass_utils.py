@@ -399,25 +399,21 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 
 
 def trip_count_estimate(count) -> int:
-    """A loop's trip count as an ``int``, for the cost model and the allocator.
+    """A loop's trip count as an ``int`` (at least 1), for pricing re-reads.
 
-    A concrete count is returned as it is. A symbolic count (a loop over a
-    declared or dynamic dimension, e.g. ``s38 // 8``) resolves with
-    :func:`concretize_expr`: the declared maximum, or the hint. The solvers use
-    this count to price re-reads across trips, so a symbolic loop must not be
-    priced as one trip: with 1 trip the re-read terms are 0 and LX residency of
-    the loop-invariant reads is worth nothing to the solver.
-
-    Returns 1 when the count cannot be resolved (e.g. an unbacked, data-dependent
-    count), and never less than 1.
+    A symbolic count resolves with :func:`concretize_expr`. An unbacked count,
+    or one that does not resolve, is 1.
     """
     try:
         return max(1, int(count))
     except (TypeError, ValueError):
         pass
     try:
+        if free_unbacked_symbols(count):
+            return 1
         return max(1, int(concretize_expr(count)))
-    except Exception:  # noqa: BLE001 - an estimate: fall back to one trip
+    except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
+        logger.debug("trip count %s not resolved, priced as 1 trip: %s", count, e)
         return 1
 
 
