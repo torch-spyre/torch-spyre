@@ -114,6 +114,7 @@ from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
 from .wsr.loop_tiling_lowering import tile_groups
+from .precision_cast_barriers import drop_precision_cast_barriers
 from .dump_cost_model import dump_cost_model
 
 # The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
@@ -319,6 +320,9 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 strided_stick_slice_to_index_select,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
+                # Last, so it also clears marks that an earlier post-grad pass
+                # copied onto a node it created.
+                drop_precision_cast_barriers,
             ]
         )
 
