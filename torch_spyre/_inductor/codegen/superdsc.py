@@ -2011,21 +2011,17 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
 def _merged_reduction_dim_order(op_spec, symbol_mapping):
     """Union op_dim_order/op_stick_dim across every reduction operand.
 
-    A single operand's own dim_order usually has full visibility into the
-    op's dims and stick, which is why using just op_spec.args[-1] normally
-    suffices (see the non-reduction branch in parse_op_spec). But a
-    broadcast reduction input (e.g. expand() feeding sum())
-    collapses the dims it doesn't vary over to a constant, dropping them
-    from its own dim_order -- while the destination/accumulator's own stick
-    is routinely elided to a constant too (normal, and harmless on its own:
-    see the non-broadcast case, where the same elision on the destination
-    causes no issue because the input still carries every dim and the real
-    stick symbol). When the input is *also* a broadcast, neither operand
-    alone carries both the full dim set and a real stick symbol, so basing
-    op_dim_order on just one of them silently drops dims from every
-    operand's SDSC descriptor -- which the backend can't reconcile
-    ("Could not find any suitable dimension mapping", issue #5237). Merge
-    across all args instead of trusting one.
+    A broadcast operand (e.g. an expand()'d reduction input) collapses the
+    dims it does not vary over to a constant, dropping them from its own
+    dim_order; a reduction's destination/accumulator likewise elides its own
+    stick to a constant. Basing op_dim_order on a single operand can
+    therefore miss dims that only appear on another operand, so this merges
+    the per-operand dim orders instead, keeping the first non-None stick
+    symbol seen.
+
+    Operands are visited in op_spec.args order. A dim shared by two operands
+    is assumed to appear in the same relative order in both; if they
+    disagree, the order from the first operand to mention it wins.
     """
     merged_order: list[Symbol] = []
     merged_stick: Symbol | None = None
@@ -2460,7 +2456,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    if op_spec.is_reduction:
+    if (
+        op_spec.is_reduction
+        and not (is_matmul or is_pool or has_indirect_access)
+        and not _is_conv(op_spec.op)
+        and not _is_topk(op_spec.op)
+        and not _is_keep_by_index(op_spec.op)
+    ):
         op_dim_order, op_stick_dim = _merged_reduction_dim_order(
             op_spec, symbol_mapping
         )
