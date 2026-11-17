@@ -283,14 +283,16 @@ def generate_bundle(
     has_pool = any(sk.is_pool for sk in symbol_kinds)
 
     # Each loop's device-read count source, or None, in the same outer-first
-    # order as loop_bounds. A device-read count is addressed off %pool, and
-    # %pool is only defined (in either pool mode below) when has_pool is set.
+    # order as loop_bounds. Only a count in the pool is supported for now, so
+    # it is addressed off %pool, which is only defined (in either pool mode
+    # below) when has_pool is set.
     loop_sources: list[CountSource | None] = [
         loop.count_from_buffer for loop in walk_loop_specs(specs_list)
     ]
     if not has_pool and any(src is not None for src in loop_sources):
         raise Unsupported(
-            "a device-read loop count needs the bundle's device_mem_allocate pool"
+            "a device-read loop count is only supported from the bundle's pool "
+            "for now, and this bundle has none"
         )
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
@@ -911,7 +913,7 @@ def _loop_level(
 
     A device-read count (``source`` set) also counts tiles with step 1, but its
     bound is read from device memory with ``load_value_at_address``. The count
-    is written by an earlier op in the same bundle, so the read goes in
+    may be written by an earlier op in the same bundle, so the read goes in
     ``pre_loop``, right before the loop, while its address, which is fixed, goes
     in ``setup`` with the other constants. ``count`` is the static maximum.
 

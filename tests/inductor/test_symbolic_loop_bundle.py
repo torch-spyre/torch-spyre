@@ -520,7 +520,7 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
         with self.assertRaises(Unsupported) as caught:
             self._run([_op_spec(), loop], [self._entry(), self._entry()])
 
-        self.assertIn("device_mem_allocate pool", str(caught.exception))
+        self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
 
 if __name__ == "__main__":
