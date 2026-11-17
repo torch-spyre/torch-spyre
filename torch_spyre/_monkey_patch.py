@@ -198,8 +198,6 @@ def _parse_dynamic_to_args(self, args, kwargs):
 
 def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
-    import warnings
-
     import torch
 
     # This path calls spyre_empty_reserved directly via pybind11, bypassing
@@ -227,15 +225,6 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     )
     copy_tensor(src, dst, non_blocking=False)
 
-    warnings.warn(
-        'tensor.to("spyre", dynamic=...) reserves the buffer at max, but compiled '
-        "kernels are still built for the size at first compile, so running a "
-        "compiled function at another size returns wrong values without an "
-        "error. Tracked in #5937.",
-        UserWarning,
-        stacklevel=3,
-    )
-
     # mark_dynamic must run eagerly, before any compile, so Dynamo treats
     # `dim` as symbolic from the first trace.
     #
@@ -244,8 +233,10 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     # tile_size == 0), wsr/for_each_tile.py) then raises
     # ConstraintViolationError, because not every value in the range is a
     # multiple. The declared range reaches the compiler through
-    # get_reserved_dims instead, read once per compile by a later compiler
-    # change, which emits the range checks inside the trace.
+    # get_reserved_dims instead: the Spyre compile_fx wrapper reads it once per
+    # compile from the graph inputs and builds a for_each_tile loop's geometry
+    # at the declared maximum, with the size bound at launch. The range checks
+    # inside the trace are still written by the traced function.
     torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
 
@@ -751,6 +742,35 @@ def _patch_tensor_for_spyre():
         import warnings
 
         warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
+
+
+def _patch_fake_tensor_device_init():
+    """Force ``FakeTensorMode.avoid_device_init`` to True for the Spyre backend.
+
+    A workaround to let FakeTensors on Spyre really be Fake - ie not use the device.
+    Without this patch, we observe device memcpy's during compilation
+    where this is not expected/needed.
+
+    TODO: Once upstream Pytorch issue: #203190 is resolved, this can be removed.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    # using __dict__ to be resilient to changes in FakeTensorMode
+    # such as the open PR: https://github.com/pytorch/pytorch/pull/202561
+    current = FakeTensorMode.__dict__.get("avoid_device_init", None)
+
+    if current is None:
+        import warnings
+
+        warnings.warn(
+            "Failed to install patch to avoid device init under FakeTensor: real tensors used on Spyre for compilation!"
+        )
+        return
+
+    def _spyre_avoid_device_init(self):
+        return True
+
+    FakeTensorMode.avoid_device_init = property(_spyre_avoid_device_init)
 
 
 def _patch_invoke_subgraph_decompositions():

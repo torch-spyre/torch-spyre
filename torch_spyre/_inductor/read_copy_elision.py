@@ -587,6 +587,8 @@ def project_transport_read_copies(graph, division_splits, *, relayout_sources=()
             continue
         direct_op = None
         for splits in candidates:
+            # `candidates` comes from the solver menu, filtered by
+            # WorkDivisionContext.is_legal including transport representability.
             candidate = copy.copy(consumer)
             commit_iteration_space_ownership(candidate, splits)
             direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)
