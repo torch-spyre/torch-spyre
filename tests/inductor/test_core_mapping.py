@@ -1819,7 +1819,7 @@ class TestCorePlacementStrategies:
         assert ids == tuple(range(12))
         assert span == 12
 
-    def test_default_mode_is_neg_shift(self):
+    def test_default_mode_is_dense(self):
         import torch_spyre._inductor.config as config_module
 
-        assert config_module.core_placement_mode == "neg_shift"
+        assert config_module.core_placement_mode == "dense"
