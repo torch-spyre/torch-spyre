@@ -42,7 +42,11 @@ from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import (
+    insert_bmm_padding,
+    insert_qfp8wt_padding,
+    insert_restickify_padding,
+)
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -585,6 +589,10 @@ class CustomPreSchedulingPasses:
             # insert_restickify would have to pad a restickify output, whose
             # device layout and index expressions cannot be reconciled with a
             # grown host extent.
+            # insert_qfp8wt_padding zero-pads a qfp8wt's FP16 input to the
+            # K_padded rows its QFP8WT output stores; it runs first so that
+            # insert_bmm_padding sees a qfp8wt-produced weight as K-padded.
+            insert_qfp8wt_padding,
             insert_bmm_padding,
             #
             # Tensor Layout (Stickification)

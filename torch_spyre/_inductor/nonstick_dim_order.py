@@ -108,7 +108,7 @@ from .pass_utils import (
     indirect_info_from_op,
     try_device_coordinates,
 )
-from .propagate_layouts import PropArg
+from .propagate_layouts import PropArg, pad_qfp8wt_k
 from .work_division import MAX_SPAN_BYTES
 
 # Helpers shared with enforce_indirect_access_layout.
@@ -674,7 +674,8 @@ def _qfp8wt_k_rotation(
     if k_pos == n - 2:
         return None
     order = [i for i in range(n - 1) if i != k_pos] + [k_pos, n - 1]
-    return _permute_stl(stl, order)
+    # The K padding moves with K (see pad_qfp8wt_k).
+    return pad_qfp8wt_k(_permute_stl(stl, order))
 
 
 def _try_scatter_ia_constraint(

@@ -44,7 +44,16 @@ introduce numerical error from x.
 For BATCH_MATMUL_FP8_OP, y's padding rows are allocated but not filled (steps 2
 and 3 are omitted): the backend cannot splat an FP8 constant, and the rows only
 need to exist so the matmul does not read past y.  Their values do not matter
-because x's within-stick padding past K is zero.
+because x's within-stick padding past K is zero.  An FP8 y that already holds
+K_padded rows is not padded at all: the output of a ``qfp8wt`` in the same
+graph, or a graph input whose QFP8WT layout pads K (pad_qfp8wt_k in
+propagate_layouts).
+
+insert_qfp8wt_padding pads the FP16 input of every ``qfp8wt`` the same way,
+along the host dim that becomes the weight's K, with zeros.  The QFP8WT layout
+stores K_padded rows and ``qfp8wt`` writes all of them, so it must read K_padded
+input rows: without the pad it reads past its input and quantizes whatever is
+there into the weight's padding rows.
 
 Deduplication of identical constants across multiple pad calls happens later
 at the IR level via dedup_and_promote_constants.
@@ -94,7 +103,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -379,6 +388,202 @@ def _loop_info_without_advance(info, new_op):
     )
 
 
+def _is_qfp8wt(op: Operation) -> bool:
+    """Whether ``op`` is the lowered ``spyre.qfp8wt`` pointwise."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Pointwise)
+        and any(
+            getattr(o, "target", None) is torch.ops.spyre.qfp8wt.default
+            for o in op.origins
+        )
+    )
+
+
+def _qfp8wt_k_already_padded(
+    graph: GraphLowering, y_buf: Buffer, y_dep, reduction_var, k_padded: int
+) -> bool:
+    """Whether the FP8 matmul weight ``y_buf`` already holds K_padded rows.
+
+    A ``qfp8wt`` output does: its layout pads K (pad_qfp8wt_k), and
+    insert_qfp8wt_padding gives it K_padded input rows to write them from. A
+    graph input does when its real tensor's QFP8WT layout gives K a device
+    extent of at least K_padded. Anything else (a weight loaded from the host
+    with an unpadded layout, or an input of a subgraph) is padded as usual.
+    """
+    if isinstance(y_buf, ComputedBuffer):
+        return _is_qfp8wt(y_buf)
+    name = y_buf.get_name()
+    if getattr(graph, "parent", None) is not None:
+        return False
+    if name not in graph.graph_input_names:
+        return False
+    real_inputs = V.get_real_inputs()
+    if real_inputs is None or len(real_inputs) != len(graph.graph_input_names):
+        return False
+    real = real_inputs[graph.graph_input_names.index(name)]
+    if not hasattr(real, "device_tensor_layout"):
+        return False
+    stl = real.device_tensor_layout()
+    if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+        return False
+    try:
+        k_dim = _device_dim_carrying_sym(stl, y_dep, reduction_var)
+    except Unsupported:
+        return False
+    return k_dim is not None and stl.device_size[k_dim] >= k_padded
+
+
+def _redirect_pointwise_read(
+    op: ComputedBuffer,
+    orig_buf: Buffer,
+    padded_buf: Buffer,
+    operations: list[Operation],
+    pass_name: str,
+    reason: str,
+) -> ComputedBuffer:
+    """Rebuild a pointwise ``op`` so its loads of ``orig_buf`` read ``padded_buf``.
+
+    The pointwise counterpart of _rebuild_matmul: the live inner_fn is wrapped
+    with _PaddedLoadHandler, so any view of the input stays correct, and the
+    ranges are unchanged.
+    """
+    pw = op.data
+    assert isinstance(pw, Pointwise)
+    orig_inner_fn = pw.inner_fn
+    orig_layout = orig_buf.get_layout()
+    orig_name = orig_buf.get_name()
+    orig_size = [concretize_expr(s) for s in orig_layout.size]
+    orig_stride = [concretize_expr(s) for s in orig_layout.stride]
+    padded_name = padded_buf.get_name()
+    padded_indexer = padded_buf.get_layout().make_indexer()
+    padded_stride = [concretize_expr(s) for s in padded_buf.get_layout().stride]
+
+    def new_inner_fn(index, _orig_inner_fn=orig_inner_fn, _pw=pw):
+        var_ranges = {
+            sym: rng
+            for sym, rng in zip(index, _pw.ranges)
+            if isinstance(sym, sympy.Symbol)
+        }
+        handler = _PaddedLoadHandler(
+            V.ops,
+            orig_name,
+            orig_size,
+            orig_stride,
+            padded_name,
+            padded_indexer,
+            var_ranges,
+            padded_stride,
+        )
+        with V.set_ops_handler(handler):
+            return _orig_inner_fn(index)
+
+    object.__setattr__(pw, "inner_fn", new_inner_fn)
+    return replace_computed_buffer_body(
+        op, pw, operations, pass_name=pass_name, reason=reason
+    )
+
+
+def insert_qfp8wt_padding(graph: GraphLowering) -> None:
+    """Pad the FP16 input of each ``qfp8wt`` along the weight's K to K_padded.
+
+    A QFP8WT tensor stores K rounded up to an FP8 stick (128): its layout pads
+    K (pad_qfp8wt_k in propagate_layouts) and ``qfp8wt``'s SDSC iterates the
+    padded K. Its input must hold those rows too, or the op reads past it and
+    the weight's padding rows quantize whatever lies there. The input is
+    zero-padded, along the host dim that carries the output's K (host dim -2,
+    which the lowering keeps row-major), so the padding rows are FP8 zeros.
+
+    ``qfp8wt``'s ranges stay at K, as for insert_bmm_padding; SDSC codegen
+    widens the iteration (_extend_qfp8wt_k_to_padded in superdsc.py).
+    """
+    operations = graph.operations
+    fp8_stick = get_elem_in_stick(torch.float8_e4m3fn)
+    for op in list(operations):
+        if not _is_qfp8wt(op):
+            continue
+        out_layout = op.get_layout()
+        if not isinstance(out_layout, FixedLayout) or len(out_layout.size) < 2:
+            continue
+        k_val = concretize_expr(out_layout.size[-2])
+        pad = (fp8_stick - k_val % fp8_stick) % fp8_stick
+        if pad == 0:
+            continue
+
+        rw = op.get_read_writes()
+        reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
+        if len(reads) != 1:
+            continue
+        x_dep = reads[0]
+        write_dep = next(iter(rw.writes))
+        x_buf = graph.get_buffer(x_dep.name)
+        if x_buf is None or not isinstance(x_buf.get_layout(), FixedLayout):
+            continue
+
+        # K's index variable is the one in the output's host dim -2; the
+        # input's K dim is the host dim whose coordinate carries it.
+        out_k_syms = host_coordinates(out_layout, write_dep, None)[-2].free_symbols
+        if len(out_k_syms) != 1:
+            raise Unsupported(
+                f"insert_qfp8wt_padding: {op.get_name()} has no single K "
+                f"variable in output dim -2 ({out_k_syms})"
+            )
+        k_sym = next(iter(out_k_syms))
+        x_k_dim = _host_dim_carrying_sym(
+            host_coordinates(x_buf.get_layout(), x_dep, None), k_sym
+        )
+        if x_k_dim is None:
+            raise Unsupported(
+                f"insert_qfp8wt_padding: input {x_dep.name} of {op.get_name()} "
+                f"does not carry K ({k_sym}) in any host dim"
+            )
+        x_size = [concretize_expr(s) for s in x_buf.get_size()]
+        if x_size[x_k_dim] != k_val:
+            # A broadcast or sliced K: the pad would not line up with K.
+            raise Unsupported(
+                f"insert_qfp8wt_padding: input {x_dep.name} of {op.get_name()} "
+                f"has K extent {x_size[x_k_dim]}, expected {k_val}"
+            )
+        x_padded_size = list(x_size)
+        x_padded_size[x_k_dim] = k_val + pad
+
+        logger.debug(
+            "insert_qfp8wt_padding: padding input %s of %s K=%d -> %d",
+            x_dep.name,
+            op.get_name(),
+            k_val,
+            k_val + pad,
+        )
+        qfp8wt_fx_node = next(iter(op.origins))
+        patch_env(V.graph)
+        x_fx_node = find_fx_node(x_dep.name, V.graph)
+        x_padded_buf, new_ops = lower_pad_sequence(
+            x_fx_node,
+            padded_size=x_padded_size,
+            device=x_buf.get_device(),
+            dtype=x_buf.get_dtype(),
+            dim=x_k_dim,
+            insert_before=qfp8wt_fx_node,
+            arg_buf=x_buf if x_fx_node is None else None,
+        )
+        _move_ops_before(operations, new_ops, op)
+        if hasattr(op, "loop_info"):
+            for new_op in new_ops:
+                if isinstance(new_op, ComputedBuffer):
+                    new_op.loop_info = _loop_info_without_advance(  # type: ignore[attr-defined]
+                        op.loop_info, new_op
+                    )
+        new_op = _redirect_pointwise_read(
+            op,
+            x_buf,
+            x_padded_buf,
+            operations,
+            pass_name="insert_qfp8wt_padding",
+            reason="redirect qfp8wt to K-padded input",
+        )
+        _refresh_loop_advance_for_padded_read(new_op, x_buf, x_padded_buf)
+
+
 def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
@@ -460,6 +665,17 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         pad = compute_padding(k_val, dtype)
 
         k_padded = k_val + pad
+
+        if reduction.reduction_type == BATCH_MATMUL_FP8_OP and _qfp8wt_k_already_padded(
+            graph, y_buf, y_dep, reduction_var, k_padded
+        ):
+            logger.debug(
+                "insert_bmm_padding: %s y=%s already holds K_padded=%d rows",
+                op.get_name(),
+                y_name,
+                k_padded,
+            )
+            continue
 
         logger.debug(
             "insert_bmm_padding: padding %s K=%d -> K=%d (pad=%d)",

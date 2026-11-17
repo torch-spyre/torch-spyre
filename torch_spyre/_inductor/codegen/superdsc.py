@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
+    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -1983,6 +1984,43 @@ def _round_up_to_stick(
         sdsc_iteration_space[sym] = padded
 
 
+def _extend_qfp8wt_k_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Round the K dim of a 2D-stick QFP8WT arg up to a full FP8 stick.
+
+    The QFP8WT layout pads K to K_padded (pad_qfp8wt_k in propagate_layouts),
+    and the [2, 64] stick lays N out in strips of K_padded / 2 sticks. The
+    ops that read or write the 2D stick (FP8_2D_STICK_OPS) must iterate
+    K_padded before the SDSC tensors are built. With K there, the K dim's
+    device extent is larger than its iteration extent, so _create_sdsc_tensors
+    adds a backGap, and the later stick rounding (_get_padded_iteration_space)
+    widens the iteration on top of it, leaving each strip stride too large.
+    batchmatmulfp8 already gets this from _extend_matmul_k_to_padded.
+    """
+    if op_spec.op not in FP8_2D_STICK_OPS:
+        return
+    for arg in op_spec.args:
+        if arg.element_arrangement != ElementArrangement.QFP8WT:
+            continue
+        if len(arg.device_coordinates) < 2:
+            continue
+        k_syms = arg.device_coordinates[-2].subs(symbol_mapping).free_symbols
+        if len(k_syms) != 1:
+            continue
+        k_sym = next(iter(k_syms))
+        if k_sym not in sdsc_iteration_space:
+            continue
+        _round_up_to_stick(
+            sdsc_iteration_space,
+            k_sym,
+            arg.device_dtype.elems_per_stick(),
+            "_extend_qfp8wt_k_to_padded",
+        )
+
+
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -2510,6 +2548,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    _extend_qfp8wt_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # Grow a core-split index-entry iteration to the padded output device_size.
     # The output's entry-dim device_size was rounded up to the index stick

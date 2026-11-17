@@ -541,6 +541,44 @@ def qfp8wt_dim_order(rank: int) -> list[int]:
     return [rank - 2, *range(rank - 2), rank - 1]
 
 
+def pad_qfp8wt_k(stl: SpyreTensorLayout) -> SpyreTensorLayout:
+    """Round the device extent of a QFP8WT layout's K dim up to a full stick.
+
+    The device stores a QFP8WT tensor in 2D sticks of [2, 64] (two K rows
+    against 64 N columns), each 64-column strip of N holding K_padded / 2
+    sticks, where K_padded is K rounded up to the 128 elements of an FP8 stick.
+    ``qfp8wt`` writes that image (its SDSC iterates K_padded) and
+    ``batchmatmulfp8`` reads it, so the strip stride depends on K_padded, not
+    on K. A layout sized for K is too short, and every strip after the first
+    is found at the wrong offset.
+
+    K is device dim -2 (see ``qfp8wt_dim_order``). Its device extent becomes
+    K_padded; valid_elements keeps the logical K. Any other single non-stick
+    dim is reset to its valid extent, so the padding follows K when
+    ``nonstick_dim_order`` moves a different dim to -2.
+    """
+    n = len(stl.device_size)
+    if stl.element_arrangement != ElementArrangement.QFP8WT or n < 2:
+        return stl
+    eps = stl.elems_per_stick()
+    device_size = list(stl.device_size)
+    for i in range(n - 1):
+        valid = stl.valid_elements.get((i,))
+        if valid is None:
+            # Unknown, or grouped with the stick dim (an N tile): keep as is.
+            continue
+        device_size[i] = -(-valid // eps) * eps if i == n - 2 else valid
+    if device_size == list(stl.device_size):
+        return stl
+    return SpyreTensorLayout(
+        device_size,
+        list(stl.stride_map),
+        stl.device_dtype,
+        dict(stl.valid_elements),
+        stl.element_arrangement,
+    )
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -568,12 +606,14 @@ def _qfp8wt_stl(
     last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
     c_size = outer_sizes + [last_dim]
     c_stride = outer_strides + [1]
-    return SpyreTensorLayout(
-        c_size,
-        c_stride,
-        output.dtype,
-        qfp8wt_dim_order(len(c_size)),
-        ElementArrangement.QFP8WT,
+    return pad_qfp8wt_k(
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            output.dtype,
+            qfp8wt_dim_order(len(c_size)),
+            ElementArrangement.QFP8WT,
+        )
     )
 
 
@@ -2874,12 +2914,14 @@ def _qfp8wt_allocation_layout(
             f"QFP8WT allocation {name}: last host dim is not contiguous "
             f"(stride {c_stride})"
         )
-    return SpyreTensorLayout(
-        c_size,
-        c_stride,
-        layout.dtype,
-        qfp8wt_dim_order(len(c_size)),
-        ElementArrangement.QFP8WT,
+    return pad_qfp8wt_k(
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            layout.dtype,
+            qfp8wt_dim_order(len(c_size)),
+            ElementArrangement.QFP8WT,
+        )
     )
 
 
