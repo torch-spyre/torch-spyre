@@ -451,7 +451,12 @@ def test_the_step_in_the_index_is_the_tile_advance(case, read_step, write_step):
     assert any(regex.search(rf"\b{write_step}\*u\d+\b", i) for i in writes), writes
 
 
+# Compares the legacy lowering with ``add_loop_terms`` against the same lowering without it,
+# so it runs under ``legacy``: under ``plan`` neither compile calls ``add_loop_terms`` and
+# the comparison would be a compile against itself. (The plan against legacy is
+# ``test_loop_tiling_parity.py``.) It goes with ``add_loop_terms``.
 @pytest.mark.parametrize("case", ALL_CASES)
+@config.patch({"loop_tiling_lowering": "legacy"})
 def test_the_kernel_text_equals_the_legacy_lowerings_modulo_names(case):
     with_terms, _, _, _ = _compile_case(case)
     legacy, _, _, _ = _compile_case(case, terms=False)
@@ -491,16 +496,8 @@ def test_a_k_tiled_matmul_carries_the_loop_in_the_index():
         )
 
 
-@pytest.fixture
-def legacy_lowering():
-    """These tests exercise the legacy transform's own internals (``add_loop_terms``,
-    the group left whole): they run under the legacy lowering, and go with it."""
-    with config.patch({"loop_tiling_lowering": "legacy"}):
-        yield
-
-
 @expects_raise
-@pytest.mark.usefixtures("legacy_lowering")
+@config.patch({"loop_tiling_lowering": "legacy"})  # tests add_loop_terms: legacy only
 def test_a_later_pass_that_rebuilds_the_op_data_fails_loudly():
     """The term lives in wrappers on ``op.data``. A pass that rebuilt the data from
     ``inner_fn`` and ``ranges`` would lose the write's wrapper and compile a kernel
@@ -530,7 +527,7 @@ def test_a_later_pass_that_rebuilds_the_op_data_fails_loudly():
         compile_span_overflow(fn, args, limit)
 
 
-@pytest.mark.usefixtures("legacy_lowering")
+@config.patch({"loop_tiling_lowering": "legacy"})  # tests add_loop_terms: legacy only
 def test_the_memoized_read_writes_see_the_term():
     """Passes ask for reads and writes through ``pass_utils.op_read_writes``, which
     memoizes per op and is never refreshed by itself. The memo is already filled by
@@ -867,7 +864,7 @@ def _compile_forced_view(view, levels):
     return _recording(run)
 
 
-@pytest.mark.usefixtures("legacy_lowering")
+@config.patch({"loop_tiling_lowering": "legacy"})  # tests add_loop_terms: legacy only
 def test_a_read_through_a_permuted_view_keeps_the_legacy_lowering():
     """The op iterates (8, 64, 512) over an input stored (64, 8, 512): its dim 0 is
     the buffer's dim 1. Tiled 8 ways on dim 0 that dim is squeezed to extent one, so

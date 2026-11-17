@@ -46,7 +46,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import sympy
 from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
@@ -140,15 +139,6 @@ from utils_inductor import (
     ir_input_loader,
     patch_tiling_helper,
 )
-
-
-@pytest.fixture(autouse=True)
-def _legacy_transform():
-    """This file tests the legacy transform's internals (the CoarseTileInfo it stamps,
-    its planner and its phases), which ``coarse_tile_post_stickify`` runs only under
-    ``loop_tiling_lowering == "legacy"``. They go with the transform."""
-    with config.patch({"loop_tiling_lowering": "legacy"}):
-        yield
 
 
 _FP16 = DataFormats.SEN169_FP16
@@ -11278,3 +11268,27 @@ class TestHoistedInputClone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _pin_the_tests_to_the_legacy_lowering():
+    """Every test here exercises the legacy transform's own internals (the
+    ``CoarseTileInfo`` it stamps, its planner and its phases), which
+    ``coarse_tile_post_stickify`` runs only under ``loop_tiling_lowering == "legacy"``.
+    They go with the transform.
+
+    Each test method is wrapped, not each class: the OOT wrapper that CI runs this file
+    through re-creates the classes, and a class decorator (or a module fixture) does not
+    survive that."""
+    for obj in list(globals().values()):
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, unittest.TestCase)
+            and obj.__module__ == __name__
+        ):
+            for name, method in list(vars(obj).items()):
+                if name.startswith("test") and callable(method):
+                    patched = config.patch({"loop_tiling_lowering": "legacy"})(method)
+                    setattr(obj, name, patched)
+
+
+_pin_the_tests_to_the_legacy_lowering()
