@@ -24,6 +24,7 @@ run-name: integration-tests (${{ inputs.test_type || 'integration' }})
 #
 # Tests the PRE-BAKED torch-spyre-dev image (prebaked_image=true, default): no
 # checkout/build/RPM-install on the runner.
+# Additional line to test torch spyre
 # ---------------------------------------------------------------------------
 on:
   workflow_dispatch:
