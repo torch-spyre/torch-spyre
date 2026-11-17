@@ -98,6 +98,7 @@ _EXPECTED_LOOP_SPEC_SCHEMA = {
     "body": "list[Any]",
     "count_symbol_bounds": "dict[str, tuple[int, int]]",
     "count_symbol_sources": "dict[str, tuple[int, int]]",
+    "count_from_buffer": "CountSource | None",
 }
 
 
@@ -305,6 +306,11 @@ def _canonical_spec(spec: object) -> object:
             result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
         if spec.count_symbol_sources:
             result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
+        # Same rule: absent for a loop without one, so existing keys are kept.
+        if spec.count_from_buffer is not None:
+            result["count_from_buffer"] = _canonical_value(
+                dataclasses.asdict(spec.count_from_buffer)
+            )
         return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
