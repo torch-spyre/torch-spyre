@@ -24,7 +24,7 @@ inputs:
     description: Human-readable label (used in echo/log output)
     required: true
   config:
-    description: Path passed to run_test.sh (e.g. tests/configs/...)
+    description: Path passed to run_test.sh (e.g. tests/configs/...); several space-separated paths run as one job
     required: true
   extra_test_flags:
     description: Extra flags forwarded to run_test.sh (e.g. "-v")
@@ -180,8 +180,18 @@ runs:
               # (spurious exit 147). Stop watching as soon as a terminal summary
               # appears; the parent's `wait "$test_pid"` (plus the bounded
               # torchrun teardown in run_test.sh) collects the real exit code.
-              if grep -qE '^=+ (.*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed|deselected)|no tests ran)' "$log_file" 2>/dev/null; then
-                echo "[stall-watcher] pytest summary seen — teardown may be quiet, stopping stall watch"
+              # run_test.sh runs one pytest per test file, so a pytest summary marks the end of ONE
+              # file, not the suite: stopping there leaves every later file unwatched (a config listing
+              # several files, or several configs in one job). Single-card jobs stop on run_test.sh's
+              # own last line instead. Distributed (parallel=false, torchrun) jobs keep stopping at the
+              # first summary, the teardown case described above.
+              if [[ "${{ inputs.parallel }}" == "false" ]]; then
+                _done_re='^=+ (.*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed|deselected)|no tests ran)'
+              else
+                _done_re='^\[torch_oot_device_tests_run\] Done\. Overall exit code:'
+              fi
+              if grep -qE "$_done_re" "$log_file" 2>/dev/null; then
+                echo "[stall-watcher] test run finished — teardown may be quiet, stopping stall watch"
                 return
               fi
               current_lines=$(wc -l < "$log_file" 2>/dev/null || echo 0)
@@ -262,11 +272,11 @@ runs:
           # quotes or $(...). The unquoted vars split into words exactly as they
           # do in the invocation below, so the printed and run word lists match.
           printf '  command       :'
-          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" \
+          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh $CONFIG \
             ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag}
           printf '\n'
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh $CONFIG ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag} \
             >&"$FIFO_FD" 2>&1 &
           test_pid=$!
 
@@ -293,6 +303,15 @@ runs:
           # failure exit code.
           _DEVICE_OPEN_FAIL=0
           grep -q 'RAS::VFIO::DeviceOpenFail' "$log_file" 2>/dev/null && _DEVICE_OPEN_FAIL=1
+          # Several configs in one job: run_test.sh only fails when EVERY file is missing, and the
+          # empty-suite report counts per JUnit file, so one member that collected nothing would pass
+          # unnoticed. Fail the attempt if any file reports no tests when more than one config ran.
+          if [[ $(wc -w <<< "$CONFIG") -gt 1 && $TEST_EXIT -eq 0 ]] && \
+             grep -qE '^  NOTEST ' "$log_file" 2>/dev/null; then
+            echo "::error title=Empty bucket member::a config in this job collected no tests:"
+            grep -E '^  NOTEST ' "$log_file" | sed 's/^/    /'
+            TEST_EXIT=1
+          fi
           rm -f "$log_file" "$stall_flag" "${stall_flag}.done" "${stall_flag}.stalled"
         }
 

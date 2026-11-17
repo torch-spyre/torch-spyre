@@ -104,7 +104,9 @@ def run_utc(started_at: str) -> str:
     return ts.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def write(client, db: str, run_id: str, path: Path, run_props: dict) -> int:
+def write(
+    client, db: str, run_id: str, path: Path, run_props: dict, row_props=None
+) -> int:
     """benchmarks + benchmark_runs for one report; nothing when this run already has it."""
     from .results import _bench_entries
     from .writer import BenchmarkWriter
@@ -118,5 +120,5 @@ def write(client, db: str, run_id: str, path: Path, run_props: dict) -> int:
     for e in entries:
         e["run_props"] = run_props
     return BenchmarkWriter.insert(
-        client, db, COMPONENT, run_id, entries, REPORT_KIND, path.name
+        client, db, COMPONENT, run_id, entries, REPORT_KIND, path.name, row_props
     )

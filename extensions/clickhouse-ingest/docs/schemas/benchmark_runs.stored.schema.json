@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One benchmark's measurements in one run; `measurements` is a metric's SAMPLES.",
+  "properties": {
+    "backend": {},
+    "benchmark_id": {},
+    "component": {
+      "minLength": 1
+    },
+    "iterations": {},
+    "measurements": {},
+    "props": {},
+    "run_id": {}
+  },
+  "required": [
+    "run_id",
+    "benchmark_id",
+    "component",
+    "backend",
+    "measurements",
+    "iterations",
+    "props"
+  ],
+  "title": "benchmark_runs: the stored row",
+  "type": "object",
+  "x-uploadable": true
+}

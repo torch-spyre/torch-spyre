@@ -17,7 +17,7 @@
 Covers the three `FallbackKernel.create` output shapes (upstream
 torch/_inductor/ir.py):
 
-  shape 1 (single tensor)  -> MultiOutputLayout + 1 trailing MultiOutput
+  shape 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
   shape 2 (tuple of N)     -> MultiOutputLayout + N trailing MultiOutputs
   shape 3 (void/in-place)  -> NoneLayout       + 0 trailing MultiOutputs
 
@@ -180,9 +180,9 @@ if not _ns_has_op("test_fk_cat", "cat_two"):
 class TestFallbackKernelShape1Single(unittest.TestCase):
     """Shape 1: op(...) -> Tensor.
 
-    Lowered to MultiOutputLayout FallbackKernel + 1 trailing MultiOutput.
-    Was the only shape the original passes handled correctly; included
-    here so all three shapes are covered by one test file.
+    PyTorch 2.14 puts the output layout on the FallbackKernel itself, instead
+    of creating a trailing MultiOutput. The consumer must still receive a
+    Spyre layout.
     """
 
     def test_single_tensor_return_compiles(self):
@@ -413,6 +413,9 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
             return y_s * 2.0
 
         x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+        # `fn`'s code object is shared across tests; without a reset Dynamo
+        # reuses the first test's compile and the allocator under test never runs.
+        torch.compiler.reset()
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         test.assertEqual(out.device.type, DEVICE)
@@ -443,6 +446,14 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
+        self._run_and_check(self)
+
+    @config.patch(
+        {"co_optimizing_lx_planning": True, "layout_solver": "simulated_annealing"}
+    )
+    def test_cpu_pointwise_chain_compiles_co_optimizing_sa(self):
+        """Co-optimizing allocator over `SaCoOptimizingSolver`, which reaches
+        the footprint accounting by a different route than the greedy case."""
         self._run_and_check(self)
 
 

@@ -151,13 +151,15 @@ Nothing gives that residency back yet; a tile-local staging copy, placed by the 
 
 ## The apply round
 
-`CoOptimizingAllocator._apply_chosen_tilings` runs `CoarseTilingPass` on the chosen `TileSpec`s
-before the divisions are committed, so the ownership is built against the already-tiled op;
-`commit_divisions` re-keys each tiled op's splits to its live symbols (`_live_splits`) and refuses
-only a split above 1 on an axis the tiling squeezed away. The anneal's placement stands, and the
-companion buffers the apply mints stay in HBM. A refusal raises: it is a defect in
-`OpSplitSpace.admits`, not a graph to route around. `_check_priced_footprints` then checks that each
-tiled buffer's applied per-core footprint is the one it was placed at.
+`CoOptimizingAllocator._post_solve` runs `apply_chosen_tilings` on the chosen `TileSpec`s
+before the divisions are committed, so the ownership is built against the already-tiled op, the
+same apply the CP-SAT solve uses. `check_priced_footprints` then checks that each tiled buffer's
+applied per-core footprint is the one it was placed at, and `commit_divisions` restates each
+tiled op's splits on the symbols its tile iterates (`planned_splits`), refusing with `Unsupported`
+only a split above 1 on an axis the tiling squeezed away; a copy-out takes the division of the op
+it drains. The anneal's placement stands, and the companion buffers the apply mints stay in HBM.
+A refusal from the apply raises: it is a defect in `OpSplitSpace.admits`, not a graph to route
+around.
 
 ## The objective
 

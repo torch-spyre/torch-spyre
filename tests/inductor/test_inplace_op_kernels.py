@@ -92,6 +92,7 @@ ANCHOR_OPS = [
     "aten::div_.Scalar_mode",
     "aten::div_.Tensor",
     "aten::div_.Tensor_mode",
+    "aten::floor_divide_.Scalar",
     "aten::mul_.Scalar",
     "aten::mul_.Tensor",
     "aten::relu_",
@@ -99,7 +100,7 @@ ANCHOR_OPS = [
     "aten::sub_.Tensor",
 ]
 
-# The derivation finds 37 overloads today. A floor (rather than an equality)
+# The derivation finds 40 overloads today. A floor (rather than an equality)
 # lets ops be added or legitimately dropped without churn, while still catching
 # a broad collapse that leaves only the anchors standing.
 MIN_DERIVED_OPS = 30
@@ -151,7 +152,7 @@ def test_derivation_is_not_degenerate():
     return ``None``, ``COMPILED_OPS`` being renamed, the overload filter
     tightening) would collect zero cases and the suite would go green while
     silently testing nothing. Verified: stubbing ``_functional_sibling`` to
-    return ``None`` takes the derivation from 37 overloads to 0.
+    return ``None`` takes the derivation from 40 overloads to 0.
 
     This test is *not* parametrized, so it always runs and always asserts.
     """
@@ -168,6 +169,20 @@ def test_derivation_is_not_degenerate():
         f"derivation collapsed to {len(ops)} overloads (expected at least "
         f"{MIN_DERIVED_OPS}); the parametrized guard below is no longer "
         "covering the registration"
+    )
+
+
+def test_floor_divide_tensor_inplace_has_spyre_kernel():
+    """``floor_divide_.Tensor`` is registered explicitly, not derived.
+
+    Its functional (Tensor, Tensor) overload is ``floor_divide.default``, so
+    ``_functional_sibling`` (name-based) cannot pair it and the derived list in
+    :func:`_spyre_kernel_ops` never includes it. Without the explicit
+    registration ``x //= tensor`` fails with "Could not run
+    'aten::floor_divide_.Tensor' ... 'spyre' backend".
+    """
+    assert torch._C._dispatch_has_kernel_for_dispatch_key(
+        aten.floor_divide_.Tensor.name(), "PrivateUse1"
     )
 
 
@@ -288,24 +303,15 @@ def test_inplace_tensor_operand(packet):
     "rounding_mode",
     [
         None,
-        # 'floor'/'trunc' fail in the *functional* div kernel, independently of
-        # any in-place wrapper. 'floor' raises InductorError("Cannot resolve
-        # target for 'div_rn'"), and so does a tensor-operand 'trunc' ('truediv');
-        # a scalar-operand 'trunc' compiles but has no trunc kernel, so it raises
-        # a RuntimeError when the kernel runs. The in-place kernel inherits that
-        # gap; it does not introduce it.
-        #
+        "floor",
+        # 'trunc' fails in the *functional* div kernel, independently of any
+        # in-place wrapper. The in-place kernel inherits that gap; it does not
+        # introduce it.
         # ``raises`` names the expected failure, not bare ``Exception``: these
         # xfails must not double as a blanket licence for this path to break
         # some other way. A wrong *value* or a failure in the derivation or
         # ``copy_`` wrapper raises something else and still fails the suite,
         # while ``strict=True`` catches the day the kernel starts working.
-        pytest.param(
-            "floor",
-            marks=pytest.mark.xfail(
-                raises=torch._inductor.exc.InductorError, strict=True
-            ),
-        ),
         pytest.param(
             "trunc", marks=pytest.mark.xfail(raises=RuntimeError, strict=True)
         ),
@@ -320,10 +326,10 @@ def test_div_rounding_mode(rounding_mode, scalar_operand):
 
     These take a kwarg-only ``rounding_mode``; the kernel forwards ``**kwargs``
     to the functional op, and nothing else in this module exercises that path.
-    The ``rounding_mode=None`` case is the one the backend supports today; the
-    rounding modes are strict-xfail on their expected error so this starts
-    passing (and tells us) once the functional kernel gains support, while any
-    *other* failure on this path still fails the suite.
+    ``None`` and ``floor`` are supported by the backend today; ``trunc`` is
+    strict-xfail on the specific compile error so this starts passing (and tells
+    us) once the functional kernel gains support, while any *other* failure on
+    this path still fails the suite.
     """
     op = "div_"
     torch.manual_seed(4)

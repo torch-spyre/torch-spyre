@@ -86,6 +86,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
     "replicated_scalar": "bool",
+    "non_unified_shard_bytes": "int",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -95,6 +96,8 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    "count_symbol_bounds": "dict[str, tuple[int, int]]",
+    "count_symbol_sources": "dict[str, tuple[int, int]]",
 }
 
 
@@ -286,11 +289,23 @@ def _canonical_spec(spec: object) -> object:
             )
         return result
     if isinstance(spec, LoopSpec):
-        return {
+        result = {
             "kind": "loop",
             "count": _canonical_value(spec.count),
             "body": [_canonical_spec(child) for child in spec.body],
         }
+        # Present only when there is something to carry, the same way
+        # completed_producer_cores is handled above. A concrete loop has no
+        # bounds, so its bundle key is unchanged by this field existing, which
+        # matters because that key names every profiler event and a symbolic
+        # feature should not rename them for kernels that are not symbolic. Two
+        # loops that differ by having bounds still get different keys, so the
+        # discriminating power is the same.
+        if spec.count_symbol_bounds:
+            result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
+        if spec.count_symbol_sources:
+            result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
+        return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
 
@@ -340,6 +355,8 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
     # emitter reads out of the buffer -- one lane or the whole stick.
     if arg.replicated_scalar:
         result["replicated_scalar"] = True
+    if arg.non_unified_shard_bytes:
+        result["non_unified_shard_bytes"] = arg.non_unified_shard_bytes
     return result
 
 

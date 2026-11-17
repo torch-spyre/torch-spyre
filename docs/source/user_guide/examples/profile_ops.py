@@ -33,7 +33,9 @@ Knobs: BENCH_OP, BENCH_ROWS, BENCH_COLS, BENCH_WARMUP. BENCH_EMIT_RECORDS=1 adds
 machine-readable IO/MODEL/FEATS block the sweep folds into the cost-model database;
 it is off by default because it restates the cost-model dump. BENCH_OP is any of the
 bench_ops/bench_bandwidth ops: neg copy gelu relu sigmoid exp | mul add | add3 add4 |
-read sumrow sumall amax mean | bcast mulbcast | write.
+read sumrow sumall amax mean | bcast mulbcast | write. ``relayout`` (knobs RL_SRC,
+RL_DST, RL_MODE) measures one LX relayout between two hinted ops; see
+``_relayout_workload``.
 
 Examples:
     # one op (prints the table + a parseable SUMMARY line with kernel_us / memset_us)
@@ -80,6 +82,13 @@ BB = int(os.environ.get("BENCH_B", "8"))  # batch dim for bmm ops (a[B,M,K] @ b[
 STAGES = int(
     os.environ.get("BENCH_STAGES", "0")
 )  # extra LX-resident pointwise stages for `softmax_stages` (see that op)
+# `relayout`: the producer's and the consumer's work divisions over the named dims R
+# (ROWS) and H (COLS), as `spyre_hint(work_div=...)` specs ("R:32", "R:4,H:8"), and
+# whether the solver may relayout between them (`on`) or must spill the edge to HBM
+# (`off`). See _relayout_workload.
+RL_SRC = os.environ.get("RL_SRC", "R:32")
+RL_DST = os.environ.get("RL_DST", "R:4,H:8")
+RL_MODE = os.environ.get("RL_MODE", "on")
 # The IO/MODEL/FEATS blocks are the machine-readable record the sweep folds into the
 # database (tools/cost_model/parse_sweep_logs.py). They restate what the cost-model dump
 # already printed, so for a human running one op they are pure noise -- emitted only when
@@ -842,6 +851,144 @@ def _flash_attn_workload():
     return torch.compile(flash, fullgraph=True), dev_args
 
 
+def _parse_work_div(spec: str) -> dict:
+    """``"R:4,H:8"`` -> ``{"R": 4, "H": 8}``."""
+    out = {}
+    for part in spec.split(","):
+        name, sep, n = part.partition(":")
+        if not sep or not name.strip() or not n.strip().isdigit():
+            raise SystemExit(f"bad work_div spec {spec!r} (want e.g. 'R:4,H:8')")
+        out[name.strip()] = int(n)
+    return out
+
+
+def _relayout_workload():
+    """One LX relayout: ``neg`` hinted to RL_SRC feeds ``relu`` hinted to RL_DST.
+
+    The pair fuses into one kernel, so the shuffle never gets a profiler event of its
+    own. (A build used to emit one kernel per op under BUNDLE_SYMBOLIC_ARGS=0, the
+    baked-address bundle path; #3741 removed that path.) It is isolated instead by
+    the four-run swap estimator, each run its own configuration over the same
+    [ROWS, COLS] fp16 tensor, with A and B two divisions::
+
+        shuffle ~= (T[A->B] + T[B->A] - T[A->A] - T[B->B]) / 2
+
+    The two cross runs carry one relayout each plus the same producer and consumer work
+    as the two matched runs, so the compute cancels; the law is symmetric in the two
+    views, so the halving is exact for it. ``eval_model.py --relayout`` pairs the runs.
+
+    RL_MODE=off keeps A->B but turns off ``config.lx_solver_relayout``, so the solver
+    is offered no relayout and the edge spills to HBM: the off-minus-on difference is
+    the quantity the layout solver decides on.
+
+    Whether a relayout fired is checked after the compile (``_check_relayout``): a run
+    whose relayout count is not what its divisions ask for is reported FAILED rather
+    than stored under a label that says otherwise. That also catches an `off` run
+    whose solve failed: the greedy fallback plans relayouts under
+    SPYRE_LX_PLANNER_RELAYOUT, which this flag does not gate.
+    """
+    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    from torch._inductor.codecache import FxGraphCache
+    from torch_spyre._inductor import config, spyre_hint
+    from torch_spyre._inductor.scratchpad.allocator import (
+        CoOptimizingAllocator,
+        select_allocator,
+    )
+
+    global _PREPARE
+    if RL_MODE not in ("on", "off"):
+        raise SystemExit(f"RL_MODE={RL_MODE!r} (want on or off)")
+    if not config.lx_planning or not config.co_optimizing_lx_planning:
+        raise SystemExit(
+            "relayout needs LX_PLANNING=1 and CO_OPTIMIZING_LX_PLANNING=1: only a "
+            "co-optimizing allocator offers its solver relayouts"
+        )
+    # Ask the allocator the compile will use, so a solver that does not decide
+    # relayouts stops here with its name rather than as a FAILED run per config.
+    allocator = select_allocator()
+    if not (
+        isinstance(allocator, CoOptimizingAllocator)
+        and allocator.layout_planning.decides_lx_relayouts()
+    ):
+        raise SystemExit(
+            f"relayout needs a layout solver that decides LX relayouts; "
+            f"LAYOUT_SOLVER={config.layout_solver!r} does not (use cpsat)"
+        )
+    # Set from RL_MODE, not left to SPYRE_LX_SOLVER_RELAYOUT, so the mode the record
+    # carries is the mode that was measured.
+    config.lx_solver_relayout = RL_MODE == "on"
+    src_wd, dst_wd = _parse_work_div(RL_SRC), _parse_work_div(RL_DST)
+    rows, cols = ROWS, COLS
+
+    def _declare():
+        pnd.declare_tensor_dim("R", rows)
+        pnd.declare_tensor_dim("H", cols)
+
+    _declare()
+
+    def fn(t):
+        pnd.name_tensor_dims(t, ["R", "H"])
+        with spyre_hint(work_div=src_wd):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div=dst_wd):
+            return torch.relu(hidden)
+
+    _PREPARE = _declare
+    torch._dynamo.reset_code_caches()
+    FxGraphCache.clear()
+    x = torch.rand(rows, cols, dtype=torch.float16).to(DEVICE)
+    return torch.compile(fn, dynamic=False), (x,)
+
+
+def _relayout_copies(feats: list) -> list:
+    """The LX relayout copies in the compiled bundle's cost-model features: one per
+    relayout the allocator materialized."""
+    return [o for o in feats if getattr(o, "is_lx_relayout", False)]
+
+
+def _check_relayout(feats: list) -> str:
+    """Why the `relayout` run does not measure what its configuration says, or "".
+
+    A relayout fires only between two different divisions with RL_MODE=on, and then
+    exactly once (one edge). Anything else -- the solver declining, or a matched pair
+    planning a copy -- would file the measurement under the wrong label."""
+    want = int(RL_MODE == "on" and _parse_work_div(RL_SRC) != _parse_work_div(RL_DST))
+    got = len(_relayout_copies(feats))
+    if got == want:
+        return ""
+    return f"relayout_copies={got} (want {want})"
+
+
+def _relayout_config_fields() -> str:
+    """The `relayout` configuration as SUMMARY fields, "" for every other op. On every
+    SUMMARY, FAILED ones included, so ``run_cost_model_sweep.py --from-records`` can
+    rebuild the configuration of a run that failed."""
+    if OP != "relayout":
+        return ""
+    # `sencores`: the budget, which `cores` (the widest division's count) is not.
+    return (
+        f" rl_src={RL_SRC} rl_dst={RL_DST} rl_mode={RL_MODE} sencores={SENCORES or '-'}"
+    )
+
+
+def _relayout_summary(feats: list) -> str:
+    """The `relayout` SUMMARY fields: the configuration, and the governing features and
+    the cost-model price of each relayout the compile emitted (0 when none did)."""
+    if OP != "relayout":
+        return ""
+    copies = _relayout_copies(feats)
+    split = max((o.relayout_split for o in copies), default=0)
+    run = max((o.relayout_run_elems for o in copies), default=0)
+    cores = max((o.relayout_cores or o.cores for o in copies), default=0)
+    nbytes = sum(o.out_elems * o.dtype_bytes for o in copies)
+    rl_us = sum(cost_model.relayout_ns(o) for o in copies) / 1000
+    return (
+        f"{_relayout_config_fields()} rl_copies={len(copies)} "
+        f"rl_split={split} rl_run_elems={run} rl_cores={cores} rl_bytes={nbytes} "
+        f"rl_pred_us={rl_us:.3f}"
+    )
+
+
 def make_workload():
     if OP in _UNARY:
         return torch.compile(_UNARY[OP]), (_rand(ROWS, COLS),)
@@ -918,6 +1065,8 @@ def make_workload():
         return _bmm_workload("k")  # optional forced split (WD_B/M/N/K) -- see _to_dev
     if OP == "flash_attn":  # multi-op tiled flash attention (FA_* knobs)
         return _flash_attn_workload()
+    if OP == "relayout":  # one LX relayout between two hinted ops (RL_* knobs)
+        return _relayout_workload()
     if OP == "mm":  # matmul [M=ROWS, K=COLS] @ [K=COLS, N=BENCH_N]: a Reduction over K
         # -> work-division Pass 2 (cost_model_matmul_division) picks the (m,n,k) split.
         mm = lambda a, b: a @ b  # noqa: E731
@@ -952,6 +1101,7 @@ def make_workload():
             "bmm_wd_3d2d",
             "bmm_layout",
             "flash_attn",
+            "relayout",
             "mm",
             "mmwd",
             "transpose_outer",
@@ -1085,12 +1235,23 @@ def _run():
             return
     io = dict(dump_cost_model.LAST_IO)  # device-layout I/O the model computed
     feats = list(dump_cost_model.LAST_FEATS)  # raw OpFeatures for predict_ops()
+    if OP == "relayout" and (why := _check_relayout(feats)):
+        print(
+            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX}"
+            f"{_relayout_config_fields()} FAILED reason={why}"
+        )
+        return
     io_hbm_bytes = io.get("hbm_bytes", 0)
 
     def _profile_once():
         """One profiled trace -> (kernel_us, memset_us, other_us), classified by
         EXCLUSION (a Memset / Memcpy is NOT the fused compute kernel; the new image
-        leaves the kernel event name BLANK, so a name match silently reports 0)."""
+        leaves the kernel event name BLANK, so a name match silently reports 0).
+
+        Only DEVICE events count. The host-side ``launch::Compute`` / ``launch::D2H``
+        / ``launch::H2D`` markers (``RECORD_FUNCTION`` in spyre_stream.cpp) are CPU
+        events, yet the profiler credits each with its device twin's time as "Self
+        SPYRE"; counted, they doubled the kernel and added the output read-back."""
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
             record_shapes=True,
@@ -1104,7 +1265,7 @@ def _run():
             us = getattr(ev, "self_device_time_total", 0) or getattr(
                 ev, "self_cuda_time_total", 0
             )
-            if not us or us <= 0:
+            if not us or us <= 0 or ev.device_type == torch.autograd.DeviceType.CPU:
                 continue
             key = ev.key or ""
             if "Memset" in key:
@@ -1198,6 +1359,10 @@ def _run():
         f"kernel_us_min={k_min:.3f} kernel_us_median={k_med:.3f} "
         f"kernel_us_mean={k_mean:.3f} kernel_us_std={k_std:.3f} "
         f"kernel_us_cv={k_cv:.2f} reps={len(kernels)}"
+        # `timing=device`: kernel_us counts device events only (see _profile_once).
+        # Earlier harnesses also counted the launch::* host markers, so eval_model
+        # scores an unmarked row only if it predates them.
+        " timing=device" + _relayout_summary(feats)
     )
 
 
@@ -1212,7 +1377,8 @@ def main():
 
         traceback.print_exc()
         print(
-            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX} "
+            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX}"
+            f"{_relayout_config_fields()} "
             f"FAILED reason={type(exc).__name__}: {str(exc)[:140]}"
         )
 

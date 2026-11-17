@@ -18,7 +18,7 @@ import json
 import subprocess
 
 import pytest
-from spyre_clickhouse_ingest import gha_logs
+from spyre_clickhouse_ingest import gha_logs, paging
 
 
 class FakeCompleted:
@@ -140,3 +140,92 @@ def test_escape_sequence_flag_is_probed(monkeypatch):
         subprocess, "run", lambda *a, **k: FakeCompleted(0, stdout="no flag")
     )
     assert gha_logs.escape_sequence_flag() == []
+
+
+def _jobs_gh(monkeypatch, fail_over, total=203):
+    """subprocess.run that answers 502 for a listing larger than fail_over, as GitHub does for a many-job run."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        size = int(
+            next(a for a in args if str(a).startswith("per_page=")).split("=")[1]
+        )
+        calls.append(size)
+        if size > fail_over:
+            return FakeCompleted(1, stderr=b"gh: Server Error (HTTP 502)")
+        rows = [{"id": i, "name": f"job {i}"} for i in range(total)]
+        return FakeCompleted(
+            0, stdout="".join(json.dumps(r) + "\n" for r in rows).encode()
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def test_list_jobs_steps_the_page_size_down_on_502(monkeypatch, tmp_path):
+    calls = _jobs_gh(monkeypatch, fail_over=50)
+    n = gha_logs.list_jobs("o/r", "1", tmp_path / "jobs.jsonl")
+    assert n == 203
+    assert calls == [100, 100, 50]
+    assert len((tmp_path / "jobs.jsonl").read_text().splitlines()) == 203
+
+
+def test_list_jobs_is_one_call_when_the_first_size_works(monkeypatch, tmp_path):
+    calls = _jobs_gh(monkeypatch, fail_over=100, total=12)
+    assert gha_logs.list_jobs("o/r", "1", tmp_path / "jobs.jsonl") == 12
+    assert calls == [100]
+
+
+def test_list_jobs_last_size_keeps_the_long_backoff_then_aborts(monkeypatch, tmp_path):
+    calls = _jobs_gh(monkeypatch, fail_over=0)
+    with pytest.raises(SystemExit) as stopped:
+        gha_logs.list_jobs("o/r", "1", tmp_path / "jobs.jsonl")
+    assert stopped.value.code == 1
+    assert calls.count(10) == paging.LAST_SIZE_ATTEMPTS
+    for size in paging.JOB_PAGE_SIZES[:-1]:
+        assert calls.count(size) == paging.STEP_ATTEMPTS
+    assert not (tmp_path / "jobs.jsonl").exists()
+
+
+def test_list_jobs_does_not_retry_a_404_at_any_size(monkeypatch, tmp_path):
+    calls = _sequence(
+        monkeypatch, [FakeCompleted(1, stderr=b"gh: Not Found (HTTP 404)")]
+    )
+    with pytest.raises(SystemExit):
+        gha_logs.list_jobs("o/r", "1", tmp_path / "jobs.jsonl")
+    assert len(calls) == len(paging.JOB_PAGE_SIZES)
+
+
+def test_list_jobs_asks_for_the_latest_attempt_with_get(monkeypatch, tmp_path):
+    calls = _sequence(monkeypatch, [FakeCompleted(0, stdout=b"")])
+    gha_logs.list_jobs("o/r", "77", tmp_path / "jobs.jsonl")
+    (args,) = calls
+    assert args[args.index("--method") + 1] == "GET"
+    assert "filter=latest" in args and "--paginate" in args
+    assert "/repos/o/r/actions/runs/77/jobs" in args
+
+
+def test_list_jobs_keeps_only_a_prefix_and_strips_it(monkeypatch, tmp_path):
+    rows = [
+        {"id": 1, "name": "model-ops / llama"},
+        {"id": 2, "name": "build"},
+        {"id": 3, "name": "model-ops / gemma"},
+    ]
+    _sequence(
+        monkeypatch,
+        [FakeCompleted(0, stdout="".join(json.dumps(r) + "\n" for r in rows).encode())],
+    )
+    out = tmp_path / "jobs.jsonl"
+    assert gha_logs.list_jobs("o/r", "1", out, name_prefix="model-ops / ") == 2
+    assert [json.loads(line) for line in out.read_text().splitlines()] == [
+        {"id": 1, "name": "llama"},
+        {"id": 3, "name": "gemma"},
+    ]
+    assert gha_logs.load_jobs(out)[0]["name"] == "llama"
+
+
+def test_list_jobs_with_no_match_writes_an_empty_file(monkeypatch, tmp_path):
+    _sequence(monkeypatch, [FakeCompleted(0, stdout=b'{"id": 2, "name": "build"}\n')])
+    out = tmp_path / "jobs.jsonl"
+    assert gha_logs.list_jobs("o/r", "1", out, name_prefix="model-ops / ") == 0
+    assert out.read_text() == ""

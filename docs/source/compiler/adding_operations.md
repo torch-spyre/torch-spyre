@@ -39,6 +39,10 @@ that are performed before the graph is lowered to loop level IR.
 We define Spyre-specific lowerings from ATen operations to Inductor's
 loop level IR in [lowering.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/lowering.py) using the `@register_spyre_lowering` decorator.
 
+See the [custom op example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/custom_op.py) for a
+runnable script that defines a custom op and registers a Spyre lowering with
+`register_spyre_lowering`.
+
 ## Spyre-specific OpFuncs
 
 For Spyre OpFuncs that do not have corresponding ATen operations, we use

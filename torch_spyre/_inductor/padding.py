@@ -50,9 +50,12 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+import dataclasses
+
 import sympy
 import torch
 from sympy import Expr
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -78,7 +81,9 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
+    loop_induction_symbols,
     lower_pad_sequence,
+    op_read_writes,
     patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
@@ -117,6 +122,51 @@ def _move_ops_before(
         operations.insert(idx + i, o)
 
 
+def restride_loop_step(
+    step: Expr,
+    size: list[int],
+    stride: list[int],
+    padded_stride: list[int],
+    buffer_name: str,
+) -> Expr:
+    """The per-trip step of a loop that walks ``buffer_name``, in the padded buffer.
+
+    ``step`` is the loop variable's coefficient in a read of the unpadded buffer,
+    so it is a whole number of positions along one of that buffer's dims:
+    ``step = count * stride[d]``. Padding grows some dims, so the stride of every
+    dim outside the padded one can change (the per-expert stride of a tiled weight
+    goes from 67 * 128 to 128 * 128). The step in the padded buffer is
+    ``count * padded_stride[d]``.
+
+    ``count`` is 1 for one position and above 1 for a tile of several, and the
+    count must stay inside the dim. Dims of size one are never stepped, so they
+    cannot own the step. If two dims could own it the loop cannot be re-strided,
+    and this raises ``Unsupported`` rather than guess or leave a step that walks
+    the padded buffer by the unpadded stride (#5573). A step that no dim owns is
+    returned unchanged.
+    """
+    dims = [d for d in range(len(stride)) if size[d] > 1 and stride[d] > 0]
+    # Every dim that could own the step: a whole number (1 or more) of positions
+    # along it, staying inside it. In a contiguous layout this is at most one dim
+    # (stride[d] = stride[d + 1] * size[d + 1], so a multiple of an inner stride
+    # that fits inside the inner dim is smaller than the outer stride). A layout
+    # that is not contiguous (a transposed or column-major read-copy buffer) can
+    # give two readings of one step, and re-striding the wrong one would read the
+    # wrong place after the first trip, so it is rejected, not resolved by
+    # preferring an exact match.
+    owners = [d for d in dims if step % stride[d] == 0 and step // stride[d] < size[d]]
+    if len(owners) > 1:
+        raise Unsupported(
+            f"insert_bmm_padding: cannot tell which dim of {buffer_name} the loop "
+            f"steps by {step} (strides {stride}, sizes {size}); the padded "
+            f"buffer's per-trip step would be wrong"
+        )
+    if not owners:
+        return step
+    d = owners[0]
+    return sympy.Integer(step // stride[d] * padded_stride[d])
+
+
 class _PaddedLoadHandler(WrapperHandler):
     """Redirect every ``load`` of ``orig_name`` to ``padded_name``, re-striding
     the index.
@@ -143,6 +193,7 @@ class _PaddedLoadHandler(WrapperHandler):
         padded_name: str,
         padded_indexer,
         var_ranges: dict,
+        padded_stride: list[int],
     ):
         super().__init__(inner)
         self._orig_name = orig_name
@@ -151,15 +202,32 @@ class _PaddedLoadHandler(WrapperHandler):
         self._padded_name = padded_name
         self._padded_indexer = padded_indexer
         self._var_ranges = var_ranges
+        self._padded_stride = padded_stride
 
     def load(self, name, index):
         if name != self._orig_name:
             return super().load(name, index)
         index = concretize_index(sympy.sympify(index), set(self._var_ranges))
+        # A loop induction variable is not an iteration variable of this op, so
+        # ``compute_coordinates`` cannot place it and would drop the term; the
+        # padded read would then read tile 0 on every trip. Take the term out,
+        # decompose the rest, and add it back at the padded buffer's stride.
+        loop_term = sympy.S.Zero
+        for symbol in loop_induction_symbols(index, self._var_ranges):
+            step = index.coeff(symbol)
+            if step != 0:
+                loop_term += symbol * restride_loop_step(
+                    step,
+                    self._orig_size,
+                    self._orig_stride,
+                    self._padded_stride,
+                    self._orig_name,
+                )
+                index = index - step * symbol
         coords = compute_coordinates(
             self._orig_size, self._orig_stride, self._var_ranges, index
         )
-        return super().load(self._padded_name, self._padded_indexer(coords))
+        return super().load(self._padded_name, self._padded_indexer(coords) + loop_term)
 
 
 def _rebuild_matmul(
@@ -192,6 +260,7 @@ def _rebuild_matmul(
     y_stride = [concretize_expr(s) for s in y_layout.stride]
     padded_name = y_padded_buf.get_name()
     padded_indexer = y_padded_buf.get_layout().make_indexer()
+    y_padded_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
 
     def new_inner_fn(
         index,
@@ -218,6 +287,7 @@ def _rebuild_matmul(
             padded_name,
             padded_indexer,
             var_ranges,
+            y_padded_stride,
         )
         with V.set_ops_handler(handler):
             return _orig_inner_fn(index, reduction_index)
@@ -231,6 +301,76 @@ def _rebuild_matmul(
         operations,
         pass_name="insert_bmm_padding",
         reason="redirect matmul to padded input",
+    )
+
+
+def _refresh_loop_advance_for_padded_read(
+    op: ComputedBuffer, y_buf: Buffer, y_padded_buf: Buffer
+) -> None:
+    """Re-stride the per-trip step of the read that now targets the padded y.
+
+    ``splice_while_loops`` stamps ``squeezed_advance_per_read`` before padding,
+    as the loop variable's coefficient in the read of y, which is a stride of
+    y's own layout.  Padding retargets that read to a buffer whose K is larger,
+    so the stride of every dim outside K grows (for example the per-expert stride
+    of a tiled weight, 67 * 128 to 128 * 128).  The stamped step would walk the
+    padded buffer by the unpadded stride, and every trip after the first would
+    read the wrong place (#5573).
+
+    A step that is the stride of one dim of y becomes that dim's stride in the
+    padded buffer.  A step that is no dim's stride is left alone.  A step shared by
+    several dims of size above one cannot be mapped, and raises ``Unsupported``
+    rather than leave a step that would silently read the wrong place.
+    """
+    info = getattr(op, "loop_info", None)
+    if info is None or not info.squeezed_advance_per_read:
+        return
+    old_size = [concretize_expr(s) for s in y_buf.get_layout().size]
+    old_stride = [concretize_expr(s) for s in y_buf.get_layout().stride]
+    new_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
+    if len(old_stride) != len(new_stride):
+        return
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    squeezed = [
+        [list(level) for level in per_read]
+        for per_read in info.squeezed_advance_per_read
+    ]
+    changed = False
+    for idx, dep in enumerate(reads):
+        if dep.name != y_padded_buf.get_name() or idx >= len(squeezed):
+            continue
+        for level in squeezed[idx]:
+            for pos, (step, extent) in enumerate(level):
+                # The same rule the index uses (_PaddedLoadHandler), so the two
+                # sources of the advance cannot disagree until the record is gone.
+                new_step = restride_loop_step(
+                    step, old_size, old_stride, new_stride, y_buf.get_name()
+                )
+                if new_step != step:
+                    level[pos] = (new_step, extent)
+                    changed = True
+    if changed:
+        op.loop_info = dataclasses.replace(info, squeezed_advance_per_read=squeezed)
+
+
+def _loop_info_without_advance(info, new_op):
+    """Loop group membership of ``info`` with no per-trip advance on ``new_op``.
+
+    ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` are positional in the
+    op's own reads.  A padding op reads different buffers than the matmul it pads
+    for, so the matmul's records would land on the wrong reads (for example the
+    tiled ``x``'s advance on the loop-invariant ``y`` being padded).  The padding
+    op re-runs identical work every trip, so it advances nothing.
+    """
+    n_reads = len([d for d in new_op.get_read_writes().reads if hasattr(d, "name")])
+    levels = len(info.loop_count)
+    return dataclasses.replace(
+        info,
+        tiled_dims_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        output_tiled_dims=[[] for _ in range(levels)],
+        squeezed_advance_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        squeezed_advance_output=[[] for _ in range(levels)],
+        propagation=None,
     )
 
 
@@ -368,12 +508,15 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if hasattr(op, "loop_info"):
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
-                    new_op.loop_info = op.loop_info  # type: ignore[attr-defined]
+                    new_op.loop_info = _loop_info_without_advance(  # type: ignore[attr-defined]
+                        op.loop_info, new_op
+                    )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loads are redirected to the padded buffer.
-        _rebuild_matmul(op, y_buf, y_padded_buf, operations)
+        new_op = _rebuild_matmul(op, y_buf, y_padded_buf, operations)
+        _refresh_loop_advance_for_padded_read(new_op, y_buf, y_padded_buf)
 
 
 # --------------------------------------------------------------------------- #
@@ -383,7 +526,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 def _write_dep(op):
     """Return op's write dependency on the buffer it produces."""
-    writes = [d for d in op.get_read_writes().writes if hasattr(d, "name")]
+    writes = [d for d in op_read_writes(op).writes if hasattr(d, "name")]
     assert len(writes) == 1, (
         f"_write_dep: {op.get_name()} has {len(writes)} named writes, want exactly 1"
     )
@@ -397,7 +540,7 @@ def _restickify_input(op, graph: GraphLowering):
     """
     # Callers that already know op is a confirmed restickify can assume this
     # succeeds.
-    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    reads = [r for r in op_read_writes(op).reads if hasattr(r, "name")]
     if len(reads) != 1:
         return None, None, None
     in_dep = reads[0]
@@ -537,7 +680,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     The transposed dim is a non-stick dim here -- the new stick on the input side,
     the old stick on the output side -- that pairs with the stick on the other
     operand.  When it has host size 1, Inductor elides it, so the STL carries it as
-    a size-1 dim with ``stride_map == -1``, and its allocation holds one plane, but
+    a size-1 dim with ``stride_map == 0``, and its allocation holds one plane, but
     the paired stick needs 64.
 
     Prepending a size-64 gap dim makes the allocation cover all 64 planes.  This
@@ -551,7 +694,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     stick = stl.elems_per_stick()
     grown_stl = SpyreTensorLayout(
         [stick, *stl.device_size],
-        [-1, *stl.stride_map],
+        [0, *stl.stride_map],
         stl.device_dtype,
         stl.element_arrangement,
     )

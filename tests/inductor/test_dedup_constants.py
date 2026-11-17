@@ -43,9 +43,11 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
+from torch_spyre._inductor import pass_counters
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.dedup_constants import dedup_and_promote_constants
 from torch_spyre._inductor.ir import SpyreConstantFallback
+from torch_spyre._inductor.pass_counters import READ_WRITES_EXTRACTIONS
 from torch_spyre._inductor.pass_utils import NameSwapHandler
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
@@ -335,28 +337,10 @@ class TestDedupConstants(_DedupTestBase):
 # ===========================================================================
 
 
-class TestDedupConstantsPassLevel(_DedupTestBase):
-    """Deterministic pass-level tests.
+class _PassLevelBase(_DedupTestBase):
+    """Drives the real pipeline up to the dedup pass and hands the graph to a callback.
 
-    Each test runs the real pre-scheduling pipeline up to
-    insert_bmm_padding, then hands the GraphLowering to a callback
-    which:
-
-      1. Optionally mutates state into the exact condition the test
-         needs (drop consumers, install additional live reads, ...).
-      2. Invokes ``dedup_and_promote_constants(graph)`` directly.
-      3. Asserts on the resulting state.
-      4. Raises ``_TestStopSignal`` to stop the compile before
-         downstream passes see the deliberately mutated graph.
-
-    Fixture-shape assertions in these tests fail loudly with
-    ``PRECONDITION`` in the message when the pipeline no longer
-    produces the required incidental state (e.g. no duplicate group).
-    Those failures indicate the fixture no longer exercises the
-    intended dedup condition, NOT a dedup semantic failure. Do not
-    silence them with ``skipTest`` -- the loud failure is what keeps
-    the coverage honest.
-    """
+    Holds no tests, so a class that inherits it does not re-run another's."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -394,6 +378,30 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                     return
                 cur = cur.__cause__ or cur.__context__
             raise
+
+
+class TestDedupConstantsPassLevel(_PassLevelBase):
+    """Deterministic pass-level tests.
+
+    Each test runs the real pre-scheduling pipeline up to
+    insert_bmm_padding, then hands the GraphLowering to a callback
+    which:
+
+      1. Optionally mutates state into the exact condition the test
+         needs (drop consumers, install additional live reads, ...).
+      2. Invokes ``dedup_and_promote_constants(graph)`` directly.
+      3. Asserts on the resulting state.
+      4. Raises ``_TestStopSignal`` to stop the compile before
+         downstream passes see the deliberately mutated graph.
+
+    Fixture-shape assertions in these tests fail loudly with
+    ``PRECONDITION`` in the message when the pipeline no longer
+    produces the required incidental state (e.g. no duplicate group).
+    Those failures indicate the fixture no longer exercises the
+    intended dedup condition, NOT a dedup semantic failure. Do not
+    silence them with ``skipTest`` -- the loud failure is what keeps
+    the coverage honest.
+    """
 
     # ------------------------------------------------------------------
     # test_zero_consumer_duplicate
@@ -916,13 +924,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         x = torch.randn(2, 8, k_aligned, dtype=dtype, device="spyre")
         w1 = torch.randn(2, k_aligned, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -938,10 +939,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "fixture shape changed.",
             )
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             self.assertEqual(
                 calls,
@@ -982,13 +982,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w3 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1009,37 +1002,41 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "PRECONDITION: no dedup group with >=3 constants (D>=2). "
                 "Not a dedup failure.",
             )
-            n_ops_at_entry = len(graph.operations)
+            n_computed = sum(isinstance(op, ComputedBuffer) for op in graph.operations)
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             # In the single-sweep implementation, each ComputedBuffer in
             # graph.operations at pass entry is visited exactly once,
-            # so the call count is at most n_ops_at_entry.
+            # so the call count is at most n_computed.
             #
             # A regression that rebuilds the reverse index inside the
-            # per-duplicate loop would call get_read_writes on each op
-            # once per duplicate; with D >= 2 in the largest group the
-            # call count would be at least 2 * (number of ComputedBuffer
-            # candidates) > n_ops_at_entry.
+            # per-duplicate loop would call get_read_writes on each
+            # ComputedBuffer once per duplicate; with D >= 2 in the
+            # largest group the call count would be at least
+            # 2 * n_computed.
             #
             # The tight invariant this guard enforces:
             #
-            #     get_read_writes calls <= n_ops_at_entry.
+            #     get_read_writes calls <= n_computed.
             #
-            # Any per-duplicate rebuild would blow past this bound.
+            # Any per-duplicate rebuild would blow past this bound. It counts
+            # ComputedBuffers rather than all ops because constants and other
+            # extern kernels are never counted: against an op-count bound, a
+            # rebuild passes whenever ComputedBuffers are half the graph or
+            # less.
             self.assertLessEqual(
                 calls,
-                n_ops_at_entry,
+                n_computed,
                 f"regression guard: dedup called "
                 f"ComputedBuffer.get_read_writes {calls} times on a graph "
-                f"with {n_ops_at_entry} ops at pass entry. A single-sweep "
-                "reverse-index build should make at most one call per op. "
-                "A count materially larger than N suggests the index is "
-                "being rebuilt per duplicate (regression).",
+                f"with {n_computed} ComputedBuffers at pass entry. A "
+                "single-sweep reverse-index build should make at most one "
+                "call per ComputedBuffer. A count materially larger "
+                "suggests the index is being rebuilt per duplicate "
+                "(regression).",
             )
             # Also assert a lower bound so a broken impl that made zero
             # get_read_writes calls (and never built the index) does not
@@ -1106,13 +1103,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w1 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1155,10 +1145,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             object.__setattr__(graph, "get_output_names", patched_get_output_names)
 
             try:
-                with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                    counter["n"] = 0
+                with pass_counters.counted_region() as counts:
                     dedup_and_promote_constants(graph)
-                    calls = counter["n"]
+                calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
             finally:
                 # Restore -- best-effort; the test raises _TestStopSignal
                 # right after this so the graph will not be used.
@@ -1332,6 +1321,213 @@ class TestBuildReverseConsumerIndex(unittest.TestCase):
             _ = idx["absent"]
         _ = idx.get("absent")
         self.assertNotIn("absent", idx)
+
+
+# ===========================================================================
+# TestDedupConstantsWithLoopNodes -- the pass with the nodes visible.
+# ===========================================================================
+
+
+class TestDedupConstantsWithLoopNodes(_PassLevelBase):
+    """The pass on a graph that holds ``LoopNode``s, reached the way production
+    reaches it: ``_flat_operations`` puts an ``OpsView`` over the nested list.
+
+    The pass used to run on the expanded list because the view could not express
+    its whole-graph hoist (it would move a constant to the head of its own body).
+    It now hoists across node boundaries itself, so these check the nested tree
+    after the pass: a constant leaves its loop, a duplicate in a body is removed,
+    and the order matches what the expanded path produced.
+    """
+
+    @staticmethod
+    def _tree_constants(real: list[Operation]) -> list[tuple[str, int, int]]:
+        """``(name, nesting depth, index)`` of every constant in the nested list."""
+        from torch_spyre._inductor.loop_node import LoopNode
+
+        found: list[tuple[str, int, int]] = []
+
+        def walk(ops: list[Operation], depth: int) -> None:
+            for i, op in enumerate(ops):
+                if isinstance(op, LoopNode):
+                    walk(op.body, depth + 1)
+                elif isinstance(op, SpyreConstantFallback):
+                    found.append((op.get_operation_name(), depth, i))
+
+        walk(real, 0)
+        return found
+
+    def _run_pass_on_view(self, graph: GraphLowering):
+        """Run the pass under the same view ``_flat_operations`` installs."""
+        from torch_spyre._inductor.loop_node import OpsView
+
+        real = graph.operations
+        graph.operations = OpsView(real)
+        try:
+            dedup_and_promote_constants(graph)
+        finally:
+            graph.operations = real
+        return real
+
+    def _nested_fixture(self):
+        from for_each_tile_fixtures import LK, LQ, D, nested_online_softmax_fn
+
+        def args():
+            return (
+                torch.randn(LQ, D, dtype=torch.float16, device="spyre"),
+                torch.randn(LK, D, dtype=torch.float16, device="spyre"),
+                torch.randn(LK, D, dtype=torch.float16, device="spyre"),
+            )
+
+        return nested_online_softmax_fn, args()
+
+    def test_body_constants_leave_their_loop_and_duplicates_are_removed(self) -> None:
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def cb(graph: GraphLowering) -> None:
+            from torch_spyre._inductor.loop_node import LoopNode, all_ops
+
+            real = graph.operations
+            before = self._tree_constants(real)
+            # PRECONDITION: the fixture must put constants inside a loop body and
+            # contain a duplicate, or this exercises nothing.
+            assert any(depth > 0 for _, depth, _ in before), (
+                "PRECONDITION: no constant inside a loop body",
+                before,
+            )
+            assert any(isinstance(op, LoopNode) for op in real), "PRECONDITION: no node"
+            keys = [
+                (c.constant_args[0], c.layout.dtype)
+                for c in self._constants(list(all_ops(real)))
+            ]
+            assert len(keys) > len(set(keys)), ("PRECONDITION: no duplicate", keys)
+
+            after_real = self._run_pass_on_view(graph)
+            after = self._tree_constants(after_real)
+            seen.update(before=before, after=after, n_before=len(keys))
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        after = seen["after"]
+        self.assertEqual({depth for _, depth, _ in after}, {0}, after)
+        self.assertEqual([i for _, _, i in after], list(range(len(after))), after)
+        self.assertLess(len(after), seen["n_before"])
+
+    def test_constants_keep_their_relative_order(self) -> None:
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def cb(graph: GraphLowering) -> None:
+            from torch_spyre._inductor.loop_node import all_ops
+
+            order_before: list[str] = []
+            keys_seen: set[tuple] = set()
+            for op in all_ops(graph.operations):
+                if isinstance(op, SpyreConstantFallback):
+                    key = (op.constant_args[0], op.layout.dtype)
+                    if key not in keys_seen:
+                        keys_seen.add(key)
+                        order_before.append(op.get_operation_name())
+            after_real = self._run_pass_on_view(graph)
+            seen["order_before"] = order_before
+            seen["order_after"] = [
+                op.get_operation_name()
+                for op in after_real
+                if isinstance(op, SpyreConstantFallback)
+            ]
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        self.assertEqual(seen["order_after"], seen["order_before"])
+
+    def test_nothing_but_constants_moves(self) -> None:
+        """The loops keep their shape: the same nodes, with the non-constant ops in
+        the same order, and every constant now ahead of all of them."""
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def shape(ops: list[Operation]) -> list[Any]:
+            from torch_spyre._inductor.loop_node import LoopNode
+
+            return [
+                ["NODE", shape(op.body)]
+                if isinstance(op, LoopNode)
+                else op.get_operation_name()
+                for op in ops
+                if isinstance(op, LoopNode) or not isinstance(op, SpyreConstantFallback)
+            ]
+
+        def cb(graph: GraphLowering) -> None:
+            before = shape(graph.operations)
+            after_real = self._run_pass_on_view(graph)
+            seen["before"], seen["after"] = before, shape(after_real)
+            seen["first_non_constant"] = next(
+                i
+                for i, op in enumerate(after_real)
+                if not isinstance(op, SpyreConstantFallback)
+            )
+            seen["constants_after_first_non_constant"] = [
+                op
+                for op in after_real[seen["first_non_constant"] :]
+                if isinstance(op, SpyreConstantFallback)
+            ]
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        self.assertEqual(seen["after"], seen["before"])
+        self.assertEqual(seen["constants_after_first_non_constant"], [])
+
+    def test_the_view_agrees_with_the_nested_list_after_the_pass(self) -> None:
+        """The pass edits the nested list, so the view must not keep serving the
+        order it cached before: the observer and the INFO log read it afterwards."""
+        from torch_spyre._inductor.loop_node import OpsView, all_ops
+
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def cb(graph: GraphLowering) -> None:
+            real = graph.operations
+            view = OpsView(real)
+            graph.operations = view
+            try:
+                before = list(view)  # fills the view's cache
+                dedup_and_promote_constants(graph)
+                seen["before"] = before
+                seen["view"] = [op.get_operation_name() for op in view]
+                seen["real"] = [op.get_operation_name() for op in all_ops(real)]
+            finally:
+                graph.operations = real
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        self.assertEqual(seen["view"], seen["real"])
+        self.assertNotEqual(
+            [op.get_operation_name() for op in seen["before"]],
+            seen["real"],
+            "PRECONDITION: the pass changed nothing, so this tests nothing",
+        )
+
+    def test_a_graph_without_nodes_is_unchanged(self) -> None:
+        """No ``LoopNode``: ``graph.operations`` is a plain list and the pass is the
+        one it always was."""
+        dtype = torch.float16
+
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return (x + 1.0) * 2.0 + 1.0
+
+        seen: dict[str, Any] = {}
+
+        def cb(graph: GraphLowering) -> None:
+            seen["is_view"] = type(graph.operations).__name__ == "OpsView"
+            dedup_and_promote_constants(graph)
+            ops = list(graph.operations)
+            consts = self._constants(ops)
+            seen["head"] = ops[: len(consts)] == consts
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, (torch.randn(64, 64, dtype=dtype, device="spyre"),))
+        self.assertFalse(seen["is_view"])
+        self.assertTrue(seen["head"])
 
 
 if __name__ == "__main__":

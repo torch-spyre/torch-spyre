@@ -279,6 +279,10 @@ class TensorArg:
             one MEMORY_FILL (``spyre_constant_tensor`` -> ``spyre_fill_tensor``),
             and False everywhere else. The KTIR emitter reads it to widen a
             scalar operand's read to its whole stick; see ``_reads_every_lane``.
+        non_unified_shard_bytes: Device bytes of one shard when the tensor is
+            sharded storage (core c reads or writes only chunk c, through its
+            own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
+            0 for ordinary storage. Checked against the real tensor at launch.
     """
 
     is_input: bool
@@ -295,6 +299,11 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
     replicated_scalar: bool = False
+    non_unified_shard_bytes: int = 0
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
 
 def is_lx_relayout_identity(
@@ -427,6 +436,16 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        count_symbol_bounds: For a symbolic ``count``, the ``(max_value,
+            tile_size)`` of each symbol in it, keyed by name. Resolved by the
+            scheduler while the ShapeEnv exists and carried from there, because
+            codegen also runs in a reload phase where it is gone. Empty for a
+            concrete count.
+        count_symbol_sources: For a symbolic ``count``, the ``(arg_index,
+            dim_index)`` each symbol's value is read from at launch, keyed by
+            name. Resolved during kernel codegen, where the launch argument
+            ordering is still live. A symbol that cannot be placed is left out,
+            and bundle generation then refuses to declare a parameter for it.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -439,6 +458,25 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+def walk_loop_specs(specs):
+    """Every LoopSpec in a spec tree, outer before inner.
+
+    Lives here rather than in either consumer because kernel codegen and bundle
+    generation both walk the same tree for the same reason, and a second copy is
+    a second thing to keep in step.
+    """
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            yield spec
+            yield from walk_loop_specs(spec.body)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

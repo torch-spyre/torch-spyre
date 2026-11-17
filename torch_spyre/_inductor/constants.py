@@ -14,11 +14,24 @@
 
 import torch
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+
+# Relative restickify cost per device byte, by device dtype. The restickify cost
+# is (device size in bytes) x this weight. 32-bit formats take 2 passes per stick,
+# so they are 2x slower than fp16 for the same number of bytes (and therefore 4x
+# per element, since they also have 2x the bytes). Single source of truth for the
+# supported dtypes below.
+RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT = {
+    DataFormats.SEN169_FP16: 1,
+    DataFormats.IEEE_FP32: 2,
+    DataFormats.IEEE_INT32: 2,
+    DataFormats.SENUINT32: 2,
+}
+RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT)
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
@@ -170,6 +183,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "log",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
@@ -225,12 +239,22 @@ LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
+# Most extreme *finite* fp16 values, used as max/min reduction identities.
+#
+# Used by codegen for reduction padding masks (_get_mask_value) and by the
+# max_pool2d lowering to fill the explicitly-materialized pad halo.
+# See codegen/superdsc.py for more details
+FP16_MAX = 65504.0
+FP16_MIN = -65504.0
+
 AVGPOOL2D_OP = "avgpoolfwd"
+MAXPOOL2D_OP = "maxpoolfwd"
+# Pool opfunc names, mirroring TOPK_OPS. Add minpool here as it lands so
 # max(|x|) reduction; torch.any/all lower to it (see lowering.lower_any_*).
 ABSMAX_OP = "absmax"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
-POOL_OPS = {AVGPOOL2D_OP}
+POOL_OPS = {AVGPOOL2D_OP, MAXPOOL2D_OP}
 
 # Conv opfunc names. conv2d is a two-input reduction (activation + weight) with
 # windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
@@ -268,7 +292,7 @@ SINGLE_INPUT_REDUCTION_OPS = frozenset(
         "prod",
         "exx2",
         *TOPK_OPS,
-        AVGPOOL2D_OP,
+        *POOL_OPS,
         ABSMAX_OP,
         QUANTSCALEPERTOKENFP8_OP,
     }

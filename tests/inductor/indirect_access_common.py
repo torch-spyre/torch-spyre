@@ -89,10 +89,15 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
     stick_count = (last + eps - 1) // eps
     device_size = [*lead, stick_count, eps]
     stride_map = [math.prod(shape[k + 1 :]) for k in range(len(lead))] + [eps, 1]
+    n = len(device_size)
     return SpyreTensorLayout(
         device_size=device_size,
         stride_map=stride_map,
         device_dtype=get_device_dtype(dtype),
+        valid_elements={
+            **{(i,): lead[i] for i in range(len(lead))},
+            (n - 2, n - 1): last,
+        },
     )
 
 
@@ -612,10 +617,10 @@ class IndirectAccessTestCase(InductorTestCase):
     def assert_entry_dim_unsplit(self, code, index_size, data_size=None):
         """Assert the index/entry dim is NOT core-split at the current SENCORES.
 
-        A partial last stick is padded by restickify. That padded dimension must
-        stay on one core: older code enforced this only inside SuperDSC, after
-        wrapper emission, so the wrapper could advertise a split the device did
-        not execute. Planning now blocks that split before wrapper emission.
+        An entry count that is a partial last index stick must stay on one core:
+        a split would have the last core read the padding lanes of the index's
+        last stick as rows. Planning blocks that split before wrapper emission,
+        so the wrapper and the device agree on it.
         """
         from torch_spyre._inductor import config
 

@@ -102,7 +102,9 @@ uv sync --group test
 
 Load a causal-LM with `AutoSpyreModelForCausalLM`. It reads the checkpoint's
 config, selects the matching adapter, prepares the model for Spyre, and moves
-it to the device. The tokenizer is the stock HF one.
+it to the device. The tokenizer is the stock HF one. See the
+[HuggingFace model example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/hf_model.py) for a runnable version of
+the script below.
 
 ```python
 from hf_adapters import AutoSpyreModelForCausalLM

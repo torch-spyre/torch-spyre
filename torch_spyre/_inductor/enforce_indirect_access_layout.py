@@ -29,6 +29,7 @@ graph output) or inserts a spyre.restickify copy in the required layout.
 
 import sympy
 import torch
+from torch._inductor.virtualized import V
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -38,9 +39,9 @@ from torch._inductor.ir import (
     ReinterpretView,
     Scatter,
 )
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout
 
-from .constants import ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR, RESTICKIFY_SUPPORTED_DEVICE_DTYPES
 from .errors import Unsupported
 from .insert_restickify import (
     _fixed_tiled,
@@ -134,19 +135,26 @@ def _scatter_access_subs_and_sizes(
 
     # Compute device coordinates to find the actual device dimension for each
     # scatter symbol, then look up its size from coord_layout.device_size.
+    # Symbol sizes come from the layout the write index was built against: for
+    # a mutation through a view, that is the view's layout, not the allocation.
+    op_layout = getattr(scatter_op, "layout", None)
+    size_layout = coord_layout
+    if isinstance(op_layout, MutationLayoutSHOULDREMOVE):
+        size_layout = op_layout.target.get_layout()
+
     sizes: dict[sympy.Symbol, int] = {}
-    if coord_layout.size and coord_layout.stride:
+    if size_layout.size and size_layout.stride:
         # For each scatter symbol, find which host dimension it multiplies
-        # (by matching the stride of that dimension in coord_layout.stride).
+        # (by matching the stride of that dimension in size_layout.stride).
         for sym in access_subs:
             # Extract the coefficient of this symbol in write_dep.index
             coeff = write_dep.index.coeff(sym)
             if coeff is not None:
                 # Find which host dimension has this stride
-                for dim_idx, stride in enumerate(coord_layout.stride):
+                for dim_idx, stride in enumerate(size_layout.stride):
                     if stride == coeff:
-                        if 0 <= dim_idx < len(coord_layout.size):
-                            sizes[sym] = coord_layout.size[dim_idx]
+                        if 0 <= dim_idx < len(size_layout.size):
+                            sizes[sym] = size_layout.size[dim_idx]
                         break
 
     return access_subs, sizes
@@ -210,7 +218,7 @@ def _dense_scatter_source_stl(value_layout: FixedTiledLayout) -> SpyreTensorLayo
     arrangement while returning its host dimensions to their canonical order.
     """
     source_stl = value_layout.device_layout
-    if source_stl.device_dtype != DataFormats.SEN169_FP16:
+    if source_stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
         raise Unsupported(
             "scatter source alignment requires materialization, but "
             f"ReStickifyOpHBM does not support {source_stl.device_dtype}"
@@ -338,7 +346,10 @@ def _materialize_unaligned_scatter_source(
         # ReStickify cannot materialize a non-DL16 source.  It may be an
         # unrelated direct operand, so keep looking for a feasible candidate;
         # if none resolves the split, preserve the original alignment error.
-        if source_layout.device_layout.device_dtype != DataFormats.SEN169_FP16:
+        if (
+            source_layout.device_layout.device_dtype
+            not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        ):
             logger.debug(
                 "enforce_indirect_access_layout: scatter source candidate %s "
                 "uses unsupported ReStickify format %s",
@@ -420,7 +431,12 @@ def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
     target = op.layout.target
     while isinstance(target, ReinterpretView):
         target = target.data
-    return target.get_name(), target
+    name = target.get_name()
+    # The reference held by the mutation layout dates from lowering, so its
+    # layout may still be uncommitted. Resolve the name against the graph to
+    # get the live buffer, which is also the one a copy-back mutates.
+    live = V.graph.try_get_buffer(name)
+    return name, target if live is None else live
 
 
 def _get_indirect_access_dim_order_requirements(
