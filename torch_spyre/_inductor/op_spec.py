@@ -473,9 +473,10 @@ class UnimplementedOp:
 class CountSource:
     """Where a loop reads its trip count from device memory at run time.
 
-    The count is written by an earlier op in the same bundle, so the host never
-    sees it. It is an FP32 value holding a whole number of trips, stored as the
-    first value of a stick inside the bundle's pool.
+    The count stays in device memory, so the host never needs to see it. It is
+    an FP32 value holding a whole number of trips. Only a count stored in the
+    bundle's pool is supported for now, as the first value of a stick, typically
+    written by an earlier op in the same bundle.
 
     Plain integers only, so the record survives the generated-code round trip.
 
@@ -509,10 +510,10 @@ class LoopSpec:
             name. Resolved during kernel codegen, where the launch argument
             ordering is still live. A symbol that cannot be placed is left out,
             and bundle generation then refuses to declare a parameter for it.
-        count_from_buffer: When set, the loop runs as many trips as an earlier
-            op in the same bundle wrote to device memory, read right before the
-            loop starts. ``count`` then stays the static maximum, so every pass
-            that reads it is unchanged. None for every other loop.
+        count_from_buffer: When set, the loop runs as many trips as a count
+            read from device memory right before the loop starts. ``count``
+            then stays the static maximum, so every pass that reads it is
+            unchanged. None for every other loop.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
