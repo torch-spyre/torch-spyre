@@ -435,9 +435,11 @@ def test_relayout_off_spills_the_hinted_edge(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
-def _run_grouped_carry_sum(monkeypatch, *, group=4, caller_init=False, **options):
+def _run_grouped_carry_sum(
+    monkeypatch, coopt, *, group=4, caller_init=False, **options
+):
     """Compile ``grouped_carry_group_sum_fn`` for 32 cores under the
-    co-optimizing solve and run it.
+    co-optimizing solve of ``coopt`` (CP-SAT or the annealer) and run it.
 
     Returns the relayout observations, the device result, the expected result
     and the op summaries of the generated kernels. The slabs are small
@@ -474,7 +476,7 @@ def _run_grouped_carry_sum(monkeypatch, *, group=4, caller_init=False, **options
     def fn(values, init=None):
         return grouped_carry_group_sum_fn(values, group, cores, init)
 
-    with config.patch({**_COOPT, "sencores": cores, **options}):
+    with config.patch({**coopt, "sencores": cores, **options}):
         out, code = run_and_get_code(
             torch.compile(fn, dynamic=False, fullgraph=True), *args
         )
@@ -489,13 +491,13 @@ def _accumulate_allocations(ops):
     return [op["allocations"] for op in ops if op["op"] == "add"]
 
 
-def test_post_loop_sum_reads_a_relayout_of_a_grouped_carry(monkeypatch):
+def test_post_loop_sum_reads_a_relayout_of_a_grouped_carry(monkeypatch, coopt):
     """A loop adds four slabs per trip into a carry split {G: 4, T: 8}; the sum
     over G after the loop is split {T: 32}. Each core of the sum needs its
     rows from all four parts of the carry, which are on four cores, so the
     two divisions do not match. The solver takes one copy after the loop, and
     the carry stays in LX through its in-loop updates."""
-    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch)
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt)
 
     observed.assert_emitted_in_lx(expected_plans=1)
     (plan,) = observed.plans
@@ -521,9 +523,11 @@ def test_post_loop_sum_reads_a_relayout_of_a_grouped_carry(monkeypatch):
     ],
     ids=["relayout_off", "fan_in_16", "caller_owned_init"],
 )
-def test_grouped_carry_without_a_copy_spills_and_keeps_its_values(monkeypatch, case):
+def test_grouped_carry_without_a_copy_spills_and_keeps_its_values(
+    monkeypatch, case, coopt
+):
     """Where the sum after the loop gets no copy, the carry spills as before."""
-    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, **case)
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt, **case)
 
     observed.assert_nothing_emitted()
     adds = _accumulate_allocations(ops)
@@ -531,7 +535,7 @@ def test_grouped_carry_without_a_copy_spills_and_keeps_its_values(monkeypatch, c
     assert torch.equal(out, expected)
 
 
-def test_grouped_carry_keeps_its_values_when_its_copy_is_demoted(monkeypatch):
+def test_grouped_carry_keeps_its_values_when_its_copy_is_demoted(monkeypatch, coopt):
     """Kernel preparation can still reject the copy. The carry then leaves LX
     with its relayout group, each kernel is prepared again, and the in-loop
     update follows its storage to HBM."""
@@ -555,7 +559,7 @@ def test_grouped_carry_keeps_its_values_when_its_copy_is_demoted(monkeypatch):
         return real_prepare(backend, bundle, kernel)
 
     monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
-    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch)
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt)
 
     assert rejected, "the fixture did not reach the copy's kernel"
     (plan,) = observed.plans

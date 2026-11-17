@@ -4395,7 +4395,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
-        self._add_carry_writer_edges(
+        carry_writers = self._add_carry_writer_edges(
             graph, op_by_name, prep_cache, residency_by_buf, carry_update_edges
         )
 
@@ -4586,6 +4586,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 prep_cache,
                 residency_by_buf,
                 cd_parent_matches,
+                carry_writers=carry_writers,
             )
             for storage_name in carry_storage_names:
                 if storage_name not in parent_proj:
@@ -4720,12 +4721,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
         carry_update_edges: dict[str, ResidencyEdge],
-    ) -> None:
+    ) -> dict[str, list[str]]:
         """Give each other writer of a carry, e.g. the copy-back of an
         all_reduce_ into the loop result, the storage's ownership edge.
 
         A writer without one leaves the storage in HBM and drops every edge
-        on it. Records the writers of each storage in ``_carry_writers``.
+        on it. Records the writers of each storage in ``_carry_writers`` and
+        returns them.
         """
         self._carry_writers: dict[str, list[str]] = {}
         for writer in graph.operations:
@@ -4757,6 +4759,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if edge.buf_name == storage_name
             ]:
                 del carry_update_edges[name]
+        return self._carry_writers
 
     @staticmethod
     def _carry_writer_edge(
@@ -5281,6 +5284,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
         cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]] = None,
+        *,
+        carry_writers: Mapping[str, Sequence[str]],
     ) -> dict[str, list[RelayoutCandidate]]:
         """Priced relayout candidates for each divided producer this op reads.
 
@@ -5293,10 +5298,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``collect_lx_relayout_plans``, with one addition that only this path
         has: the sum after a counted loop may read a copy of the loop's carry
         (``solver_relayout_edge_context``). A carry that another op writes
-        after the loop is no source. The per-pair gates (permutation
-        compatibility, projectable ownership on both frames, the law's fitted
-        split range) live in ``solver_relayout_pair_cost``. Gated on the
-        solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
+        after the loop is no source. ``carry_writers`` is what
+        ``_add_carry_writer_edges`` returns; it is a required argument, so the
+        writers are recorded before any candidate is built. The per-pair gates
+        (permutation compatibility, projectable ownership on both frames, the
+        law's fitted split range) live in ``solver_relayout_pair_cost``. Gated
+        on the solver's ``decides_lx_relayouts`` and on
+        ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
         gives a coarse-tiled parent's cap-and-rank step the other parents'
@@ -5321,7 +5329,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # One copy serves every reader of its view. A carry that another op
             # writes after the loop (the copy-back of an in-place collective)
             # has readers before and after that write, so it is no source.
-            if parent in getattr(self, "_carry_writers", {}):
+            if parent in carry_writers:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "relayout source %s declined for %s: written after its "
+                        "loop by %s",
+                        parent,
+                        consumer_op.get_name(),
+                        ", ".join(carry_writers[parent]),
+                    )
                 continue
             parent_op = op_by_name[parent]
             padded_axis = prefix_lx_contraction_axis(parent_op, consumer_op)

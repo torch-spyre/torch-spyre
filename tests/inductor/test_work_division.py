@@ -3183,7 +3183,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             stack.enter_context(
                 patch.object(
-                    allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
+                    allocator, "_cd_parent_relayouts", side_effect=lambda *a, **k: {}
                 )
             )
             stack.enter_context(patch.object(allocator, "_set_one_allocation"))
@@ -3643,9 +3643,10 @@ class TestCarryWriterEdges(unittest.TestCase):
             op_by_name["upd"], op_by_name, {}, graph=self.graph
         )
         edges = {"upd": update_edge}
-        self.allocator._add_carry_writer_edges(
+        writers = self.allocator._add_carry_writer_edges(
             self.graph, op_by_name, {}, self.residency, edges
         )
+        self.assertIs(writers, self.allocator._carry_writers)
         return edges
 
     def _divisions(self):
@@ -3722,6 +3723,7 @@ class TestCarryWriterEdges(unittest.TestCase):
         for a reader of the carry after the loop."""
         reader = self._op("reader", ["storage"])
         self._carry_edges()
+        carry_writers = self.allocator._carry_writers
         asked = []
         with (
             patch.object(self.allocator, "_decides_lx_relayouts", True),
@@ -3741,6 +3743,7 @@ class TestCarryWriterEdges(unittest.TestCase):
                 {op.get_name(): op for op in self.graph.operations},
                 {},
                 self.residency,
+                carry_writers=carry_writers,
             )
         self.assertEqual(relayouts, {})
         self.assertIsNone(self.residency["storage"])

@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 from functools import cache
+import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
@@ -870,13 +871,17 @@ def _relayout_consumer_kind_supported(producer: Operation, consumer: Operation) 
     """Whether the solver may offer ``consumer`` a relayout copy of ``producer``.
 
     A pointwise or matmul consumer qualifies. A reduction qualifies in one
-    case: a ``sum`` outside every loop that reads the storage of a counted-loop
-    carry. The loop's core map splits the carry (for example one accumulator
-    per core group), and the sum after the loop reads every part of it. A
-    division of the sum that keeps whole rows on a core then matches no
-    division of the carry, and the carry, with each in-loop update of it,
+    case: a ``sum`` outside every counted loop that reads the storage of a
+    counted-loop carry. The loop's core map splits the carry (for example one
+    accumulator per core group), and the sum after the loop reads every part
+    of it. A division of the sum that keeps whole rows on a core then matches
+    no division of the carry, and the carry, with each in-loop update of it,
     would live in HBM. The copy gives the sum the per-core view that its own
     division reads, as it does for a pointwise consumer.
+
+    Loop membership comes from ``counted_loop_path``, the loop-facts read API,
+    not from ``loop_info``, so the rule follows that API when the loop
+    representation changes (#5863).
 
     The carry clause is a limit of scope, not of legality: it is the reduction
     that has a test. The copy is still subject to every later gate (movement
@@ -888,7 +893,7 @@ def _relayout_consumer_kind_supported(producer: Operation, consumer: Operation) 
     return (
         isinstance(data, Reduction)
         and data.reduction_type == "sum"
-        and getattr(consumer, "loop_info", None) is None
+        and not counted_loop_path(consumer)
         and is_loop_carry_storage(producer)
     )
 
@@ -969,6 +974,13 @@ def solver_relayout_edge_context(
         getattr(consumer, "origin_node", None) is None
         and origin_in_graph(getattr(consumer, "origins", ()), fx_graph) is None
     ):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "relayout edge %s -> %s declined: an end has no FX origin in the "
+                "lowering graph",
+                producer.get_name(),
+                consumer.get_name(),
+            )
         return None
     if not _supported_consumer_layout(graph, producer, consumer, source_name):
         return None
