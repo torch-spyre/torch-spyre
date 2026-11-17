@@ -135,6 +135,99 @@ class TestSpyre(TestCase):
         self.assertTrue(a_cpu.eq(3.5).all())
 
     @parametrize(
+        "view",
+        [
+            subtest(lambda t: t[8:16], name="rows_middle"),
+            subtest(lambda t: t[:8], name="rows_leading"),
+            subtest(lambda t: t[56:], name="rows_trailing"),
+            subtest(lambda t: t[3], name="one_row"),
+            subtest(lambda t: t[:, 32:], name="cols_trailing"),
+            subtest(lambda t: t[:, :32], name="cols_leading"),
+            subtest(lambda t: t[::2], name="strided"),
+            # Not a tracked view: no base to compare with, so the layout's
+            # element count is what catches it.
+            subtest(lambda t: t[8:16].detach(), name="detached_rows_middle"),
+            subtest(lambda t: t[:8].detach(), name="detached_rows_leading"),
+            # Broadcast: the base's offset and element count, but only row 0.
+            subtest(lambda t: t[:1].expand(64, 64), name="broadcast_row"),
+        ],
+    )
+    @parametrize("op", [subtest("fill", name="fill"), subtest("zero", name="zero")])
+    def test_fill_partial_view_rejected(self, view, op):
+        # The device fill writes whole sticks of the storage, so a fill of a
+        # partial or broadcast view would overwrite elements outside it. It
+        # must raise and leave the tensor untouched.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        d = expected.to("spyre")
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            if op == "fill":
+                view(d).fill_(3.0)
+            else:
+                view(d).zero_()
+        self.assertTrue(torch.equal(d.cpu(), expected))
+
+    @parametrize(
+        "view",
+        [
+            subtest(lambda t: t, name="base"),
+            subtest(lambda t: t[0:64], name="full_slice"),
+            subtest(lambda t: t.view(-1), name="flat"),
+            subtest(lambda t: t.t(), name="transposed"),
+            subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+        ],
+    )
+    def test_fill_whole_tensor_view(self, view):
+        d = torch.zeros(64, 64).to("spyre")
+        view(d).fill_(3.0)
+        self.assertTrue(d.cpu().eq(3.0).all())
+
+    @parametrize(
+        "shape, dtype",
+        [
+            subtest(((64, 50), torch.float32), name="padded_fp32"),
+            subtest(((3, 7), torch.float16), name="padded_fp16"),
+            subtest(((), torch.float32), name="scalar"),
+        ],
+    )
+    def test_fill_whole_tensor_padded_layouts(self, shape, dtype):
+        d = torch.zeros(shape, dtype=dtype).to("spyre")
+        d.fill_(3.0)
+        self.assertTrue(d.cpu().eq(3.0).all())
+
+    @parametrize(
+        "view",
+        [
+            subtest(lambda t: t, name="base"),
+            subtest(lambda t: t[0:70], name="full_slice"),
+            subtest(lambda t: t.t(), name="transposed"),
+        ],
+    )
+    @parametrize("op", [subtest("fill", name="fill"), subtest("zero", name="zero")])
+    def test_fill_whole_reserved_tensor(self, view, op):
+        # A max-reserved tensor's storage is sized for 630 rows; filling its
+        # current 70 rows is a whole-tensor fill and must work.
+        reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
+        d = torch.ones(70, 64).to("spyre", dynamic=reserve)
+        if op == "fill":
+            view(d).fill_(3.0)
+            self.assertTrue(d.cpu().eq(3.0).all())
+        else:
+            view(d).zero_()
+            self.assertTrue(d.cpu().eq(0.0).all())
+
+    def test_fill_partial_view_of_reserved_tensor_rejected(self):
+        reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
+        expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
+        d = expected.to("spyre", dynamic=reserve)
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            d[10:20].fill_(3.0)
+        self.assertTrue(torch.equal(d.cpu(), expected))
+
+    @parametrize(
         "factory",
         [
             subtest(
