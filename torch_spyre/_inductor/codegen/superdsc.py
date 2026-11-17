@@ -2456,16 +2456,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    if (
-        op_spec.is_reduction
-        and not (is_matmul or is_pool or has_indirect_access)
-        and not _is_conv(op_spec.op)
-        and not _is_topk(op_spec.op)
-        and not _is_keep_by_index(op_spec.op)
-    ):
-        op_dim_order, op_stick_dim = _merged_reduction_dim_order(
-            op_spec, symbol_mapping
-        )
+    if op_spec.is_reduction:
+        if (
+            not (is_matmul or is_pool or has_indirect_access)
+            and not _is_conv(op_spec.op)
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
+            op_dim_order, op_stick_dim = _merged_reduction_dim_order(
+                op_spec, symbol_mapping
+            )
+        else:
+            op_dim_order, op_stick_dim = _get_device_dim_order(
+                op_spec.args[0], symbol_mapping
+            )
     else:
         op_dim_order, op_stick_dim = _get_device_dim_order(
             op_spec.args[-1], symbol_mapping
