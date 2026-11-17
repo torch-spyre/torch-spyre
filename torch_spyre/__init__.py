@@ -203,6 +203,11 @@ def make_spyre_module() -> types.ModuleType:
     # Public profiler API (eagerly imported above); avoid private _ffdc import.
     mod.get_diagnostic_report = profiler.get_diagnostic_report
 
+    # WARNING: does not make sense until upstream issue #203190
+    # Once that issue is resolved, ensure the names match
+    # and revert the rest of the monkey patch logic in PR: 5887
+    mod._fake_avoid_device_init = lambda: True
+
     import torch  # noqa: E402
 
     mod.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16]
@@ -314,9 +319,21 @@ def _autoload_impl():
     # cache guards. It must be available before any .to("spyre") /
     # .to(device_layout=...) call -- including when that call is the very first
     # mention of the device (e.g. moving model weights onto Spyre).
-    from ._monkey_patch import _patch_tensor_for_spyre
+    from ._monkey_patch import _patch_fake_tensor_device_init, _patch_tensor_for_spyre
 
     _patch_tensor_for_spyre()
+
+    # FakeTensorMode device-init opt-out for the Spyre backend: keeps
+    # torch.tensor(..., device="spyre") under FakeTensorMode from
+    # materializing real device storage (78 one-stick DMAs + memsets per
+    # cold compile from Inductor's SDPA pattern init). See
+    # _monkey_patch._patch_fake_tensor_device_init.
+    try:
+        _patch_fake_tensor_device_init()
+    except Exception as e:  # pragma: no cover - defensive during torch import
+        import warnings
+
+        warnings.warn(f"Failed to install FakeTensorMode device-init patch: {e}")
 
     # Inductor backend registration (scheduler / codegen / op-overrides).
     from torch_spyre._inductor import _autoload as ts_inductor_autoload

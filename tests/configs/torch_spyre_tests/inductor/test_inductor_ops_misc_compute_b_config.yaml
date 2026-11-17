@@ -41,12 +41,14 @@ test_suite_config:
             - TestOps::test_dropout_functional.*
             - TestOps::test_fallback.*
             - TestOps::test_fill_scalar.*
+            - TestOps::test_masked_fill_scalar.*
             - TestOps::test_implicit_loading.*
             - TestOps::test_is_nonzero.*
             - TestOps::test_item.*
             - TestOps::test_div_rounding_mode.*
             - TestOps::test_div_mixed_dtype.*
             - TestOps::test_div_scalar_dtypes.*
+            - TestOps::test_floor_divide_eager.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log
             # test_mean has 3 params: 3d_dim0, 3d_dim1, 3d_dim0_keepdim.

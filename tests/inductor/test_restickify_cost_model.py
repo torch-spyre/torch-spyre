@@ -66,6 +66,72 @@ def test_source_run_matches_measured_dma_burst(sb, sx, expected):
     assert run_bytes(sb, sx) == expected
 
 
+@pytest.mark.parametrize("stick_planes", [False, True])
+def test_a_feature_memo_changes_no_device_run(stick_planes):
+    """Inside :func:`dcm.feature_memo` the division-independent axes are reused;
+    every run must still be what an unscoped call returns."""
+    access = (
+        [N, B, sympy.floor(X / 64), sympy.Mod(X, 64)],
+        [33280, 8, 2, 64],
+        {B: 8, X: 128, N: 1024},
+    )
+    divisions = [{B: sb, X: sx, N: 1} for sb in (1, 2, 4, 8) for sx in (1, 2)]
+    plain = [
+        dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+        for d in divisions
+    ]
+    with dcm.feature_memo():
+        scoped = [
+            dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+            for d in divisions
+        ]
+    assert scoped == plain
+
+
+def test_a_feature_memo_derives_an_access_once_and_only_inside(monkeypatch):
+    """The axes of one access are derived once per scope however many
+    divisions ask, a nested scope shares the outer one, and outside any scope
+    nothing is kept."""
+    calls = []
+    real = dcm._device_run_axes
+
+    def counted(*args):
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(dcm, "_device_run_axes", counted)
+    with dcm.feature_memo():
+        run_bytes(8, 1)
+        run_bytes(4, 2)
+        with dcm.feature_memo():
+            run_bytes(2, 1)
+    assert len(calls) == 1
+    run_bytes(8, 1)
+    run_bytes(8, 1)
+    assert len(calls) == 3
+
+
+def test_reads_are_memoized_only_inside_a_feature_memo():
+    """The post-pass report extracts after every pass, and not every pass that
+    rewrites an op's loads drops the planner's memo of them; outside a scope
+    the reads are re-derived, so a stale memo never reaches the report."""
+
+    class Op:
+        def __init__(self):
+            self.reads = "first"
+
+        def get_read_writes(self):
+            return self.reads
+
+    op = Op()
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"
+    op.reads = "rewritten"  # in place, without invalidate_op_read_writes
+    assert dcm._read_writes(op) == "rewritten"
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"  # the planner's memo, by design
+
+
 def test_geometry_keeps_symbolic_splits_and_physical_gaps():
     sb, sx = sympy.symbols("sb sx", integer=True, positive=True)
     expr = run_bytes(sb, sx)
