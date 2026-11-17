@@ -214,6 +214,7 @@ def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
     ea: ElementArrangement,
+    device_coords: "list[sympy.Expr] | None" = None,
 ) -> SpyreTensorLayout:
     """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
 
@@ -240,6 +241,10 @@ def rescale_stl_for_dtype(
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
+        device_coords: Optional device coordinates of the access (from
+            ``device_coordinates(stl, dep)``). When given, a dim whose stride
+            equals the stick depth is rescaled only if it indexes the same
+            iteration variable as the stick, or is constant (size 1).
 
     Raises:
         Unsupported: If the stick-indexing dim does not rescale to a whole
@@ -256,8 +261,30 @@ def rescale_stl_for_dtype(
     # sentinel 0 entries rather than a linear num-sticks stride) has no such
     # dim; there only the stick depth changes, so a no-match is expected and
     # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
+    #
+    # A dim with stride == in_eps counts sticks only when the stick itself runs
+    # along the contiguous host dim (stick stride 1). Under a restickified
+    # layout the stick runs along another dim, and a stride equal to in_eps is
+    # a coincidence (e.g. a size-1 dim whose stride is the tensor's numel, or
+    # an outer dim whose host stride happens to be 32); rescaling it would
+    # merge unrelated slices or reject a valid layout (#2619). The stick dim
+    # itself is never a candidate.
+    #
+    # Even with a contiguous stick, a stick shorter than in_eps (8 of 32
+    # elements, say) leaves no next stick along its host dim, and an outer dim
+    # can have host stride in_eps by coincidence ((3, 4, 8, 1): the dim of 3
+    # has stride 4 * 8 = 32). The device coordinates tell the two apart: a
+    # real num-sticks dim indexes the stick's own iteration variable.
+    contiguous_stick = stl.stride_map[-1] == 1
+    coord_syms = [c.free_symbols for c in device_coords] if device_coords else None
+
+    def _counts_sticks(i: int) -> bool:
+        if coord_syms is None:
+            return True
+        return not coord_syms[i] or bool(coord_syms[i] & coord_syms[-1])
+
+    for i, s in enumerate(stl.stride_map[:-1]):
+        if contiguous_stick and s == in_eps and _counts_sticks(i):
             total_elems = stl.device_size[i] * in_eps
             if total_elems % out_eps != 0:
                 raise Unsupported(

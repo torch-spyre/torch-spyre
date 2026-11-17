@@ -998,6 +998,32 @@ TO_DTYPE_REDUCTION_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES_ALIGNED
 }
 
+# fp16 -> fp32 -> sum over the stick dim (keepdim) -> fp16 (#2619). After the
+# sum each row is one value in its own fp32 stick, and the cast back has to
+# rescale that layout. The 3D and 4D shapes used to be rejected with "cannot
+# rescale device layout", or (2x4x8x64) to return wrong values, because a
+# stride of 32 was taken for a stick count by coincidence. 3x4x8x64 covers an
+# odd number (3) of coincidental stride-32 slices under a contiguous stick.
+TO_DTYPE_REDUCTION_ROUND_TRIP_SHAPES = [
+    (64,),
+    (5120,),
+    (4, 64),
+    (1, 8, 128),
+    (2, 8, 128),
+    (4, 8, 64),
+    (4, 8, 128),
+    (4, 8, 256),
+    (2, 4, 8, 64),
+    (3, 4, 8, 64),
+]
+TO_DTYPE_REDUCTION_ROUND_TRIP_PARAMS_SETS = {
+    f"float16_via_float32_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=torch.float16),
+        torch.float32,
+    )
+    for shape in TO_DTYPE_REDUCTION_ROUND_TRIP_SHAPES
+}
+
 # Mixed element arrangements across a graph boundary: one operand is a native
 # fp32 (STANDARD) input, the other is fp16 upcast to fp32 in-graph (staggered
 # DL16_TO_FP32). The op then sees two different EAs on operands whose stick
@@ -8264,6 +8290,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
         },
         (
+            "test_reduction_with_to_dtype_round_trip",
+            "test_reduction_with_to_dtype_round_trip_cpu",
+        ): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": TO_DTYPE_REDUCTION_ROUND_TRIP_PARAMS_SETS,
+        },
+        (
             "test_round_trip_to_dtype_implicit_invalid",
             "test_round_trip_to_dtype_implicit_invalid_cpu",
         ): {
@@ -13101,6 +13134,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             op,
             x,
             dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_reduction_with_to_dtype_round_trip_cpu(self, op, x, mid_dtype):
+        def fn(op, x, mid_dtype):
+            return op(x.to(mid_dtype), dim=-1, keepdim=True).to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
+            mid_dtype,
             cpu_compile=False,
             run_eager=False,
         )
