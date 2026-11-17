@@ -9390,8 +9390,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((32, 8, 64), differentiation="sgo_x"),
                     cached_randn((32, 8, 32), differentiation="sgo_a"),
                 ),
+                # The odd gather is the one written at the offset.
                 "cat_even_odd": (
-                    lambda x, a, i: torch.cat(
+                    lambda x, i: torch.cat(
                         (
                             torch.index_select(x, -1, i),
                             torch.index_select(x, -1, i + 1),
@@ -9399,7 +9400,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         -1,
                     ),
                     cached_randn((32, 8, 64), differentiation="sgo_x"),
-                    cached_randn((32, 8, 32), differentiation="sgo_a"),
                 ),
                 "cat_after_2d": (
                     lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
@@ -9407,26 +9407,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((8, 32), differentiation="sgo_a2"),
                 ),
                 "pad_left": (
-                    lambda x, a, i: torch.nn.functional.pad(
+                    lambda x, i: torch.nn.functional.pad(
                         torch.index_select(x, -1, i), (32, 0)
                     ),
                     cached_randn((32, 8, 64), differentiation="sgo_x"),
-                    cached_randn((32, 8, 32), differentiation="sgo_a"),
                 ),
                 # The fill value must survive next to the gathered lanes.
                 "pad_right_fill": (
-                    lambda x, a, i: torch.nn.functional.pad(
+                    lambda x, i: torch.nn.functional.pad(
                         torch.index_select(x, -1, i), (0, 32), value=7.0
                     ),
                     cached_randn((32, 8, 64), differentiation="sgo_x"),
-                    cached_randn((32, 8, 32), differentiation="sgo_a"),
                 ),
                 "pad_both_fill": (
-                    lambda x, a, i: torch.nn.functional.pad(
+                    lambda x, i: torch.nn.functional.pad(
                         torch.index_select(x, -1, i), (16, 16), value=7.0
                     ),
                     cached_randn((32, 8, 64), differentiation="sgo_x"),
-                    cached_randn((32, 8, 32), differentiation="sgo_a"),
                 ),
             },
         },
@@ -12398,10 +12395,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
 
-    def test_stick_gather_at_offset_cpu(self, build, x, a):
-        """Gather the even stick positions of ``x`` and write them beside ``a``."""
+    def test_stick_gather_at_offset_cpu(self, build, x, *partners):
+        """Write a gather of ``x``'s stick dim at an offset inside a wider stick.
+
+        ``index`` holds the even positions; ``partners`` are the tensors ``build``
+        writes beside the gather, if any.
+        """
         index = torch.arange(0, x.shape[-1], 2)
-        self.compare_with_cpu(build, x, a, index, run_eager=False)
+        self.compare_with_cpu(build, x, *partners, index, run_eager=False)
 
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""

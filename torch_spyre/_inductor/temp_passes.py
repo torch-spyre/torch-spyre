@@ -396,6 +396,11 @@ def strided_stick_slice_to_index_select(graph: torch.fx.Graph) -> None:
     and transposed back. A gather along the stick itself would need one stick per
     element, which the 256 MB per-core span limit caps at about 32k rows. Size-1
     dims are dropped first, so that one never becomes the transposed stick dim.
+
+    Temporary: a kernel could read the slice in place, but this pays two copies of
+    ``x`` and a gather instead. Drop it once the backend reads a scaled stick
+    expression such as ``2*Mod(d1, 32)``, which ``_check_stick_expr_supported``
+    rejects today; native support is tracked in #3454.
     """
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target is not aten.slice.Tensor:
