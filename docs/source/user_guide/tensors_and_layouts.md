@@ -575,11 +575,19 @@ the compiled region.
 #### Views and In-place Reshapes
 
 The reservation describes a specific dimension of a specific tensor, so it does
-not follow a reshaped view. `detach()` of the full tensor keeps it. Other views
-(`t()`, `view()`, slices) are ordinary Spyre tensors with no reservation. If a
-reserved tensor is reshaped in place (`t_()`, `squeeze_()`, `unsqueeze_()`,
+not follow a reshaped view. A tensor keeps it while its storage offset, sizes
+and strides still match the allocation. `detach()` of the full tensor does, and
+so does a `view()`, `alias()` or `as_strided()` that reproduces the tensor's own
+size and strides. A view that changes any of them (`t()`, a `view()` to another
+shape, a slice such as `x[1:]`) is an ordinary Spyre tensor with no reservation.
+If a reserved tensor is reshaped in place (`t_()`, `squeeze_()`, `unsqueeze_()`,
 `as_strided_()`), its reservation is no longer valid: `resize_` raises an error
 instead of resizing the wrong axis.
+
+A view or `detach()` result is a new tensor object, so it does not carry the
+`torch._dynamo.mark_dynamic` that `to(dynamic=...)` placed on the original.
+Passed to a compiled function it keeps its reservation but is static to Dynamo
+unless you mark its dimension dynamic yourself.
 
 To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
 when there is no valid reservation):

@@ -19,15 +19,33 @@ tensor.to("spyre", dynamic={dim: {min, max, granularity}})). Unlike most
 accessors in this codebase, it must never raise: it is meant to be called
 on arbitrary graph inputs, including tensors that were never reserved and
 tensors that aren't even on this device.
+
+Also covers which eager ops keep the reservation (detach, and views that leave
+offset, sizes and strides alone) and which drop it, and that a view that keeps
+it behaves correctly.
 """
+
+from unittest import mock
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
+import torch_spyre._inductor as spyre_inductor
 from torch_spyre._C import get_reserved_dims
+from torch_spyre._inductor.wsr import for_each_tile
 
 DEVICE = torch.device("spyre")
+
+DECLARATION = {0: {"min": 70, "max": 630, "granularity": 70}}
+# A for_each_tile tile that divides every size the declaration allows.
+TILE = 70
+
+
+def declared_tensor():
+    """A 560-row tensor with dim 0 declared, and its host copy."""
+    x = torch.rand(560, 1024, dtype=torch.float16)
+    return x, x.to(DEVICE, dynamic=DECLARATION)
 
 
 class TestGetReservedDims(TestCase):
@@ -86,6 +104,149 @@ class TestGetReservedDims(TestCase):
         d.unsqueeze_(0)
         self.assertIsNone(get_reserved_dims(d))
 
+    def test_same_geometry_views_inherit_the_map(self) -> None:
+        # A view keeps the map while offset, sizes and strides still match the
+        # allocation, as detach() does (has_intact_reservation()).
+        _, x_dev = declared_tensor()
+        same = {
+            "view": x_dev.view(x_dev.shape),
+            "alias": torch.ops.aten.alias(x_dev),
+            "as_strided": x_dev.as_strided(x_dev.shape, x_dev.stride()),
+            "view, then detach": x_dev.view(x_dev.shape).detach(),
+        }
+        for name, v in same.items():
+            with self.subTest(view=name):
+                self.assertEqual(get_reserved_dims(v), DECLARATION)
+
+    def test_changed_geometry_views_are_not_reserved(self) -> None:
+        _, x_dev = declared_tensor()
+        changed = {
+            "flatten": x_dev.view(-1),
+            "reshape": x_dev.view(280, 2048),
+            "slice": x_dev[1:],
+            "as_strided": x_dev.as_strided((280, 1024), (1024, 1)),
+        }
+        for name, v in changed.items():
+            with self.subTest(view=name):
+                self.assertIsNone(get_reserved_dims(v))
+
+    def test_same_geometry_views_share_the_base_data(self) -> None:
+        x, x_dev = declared_tensor()
+        for v in (
+            x_dev.view(x_dev.shape),
+            torch.ops.aten.alias(x_dev),
+            x_dev.as_strided(x_dev.shape, x_dev.stride()),
+        ):
+            self.assertTrue(torch.allclose(v.cpu(), x, atol=1e-3))
+        x_dev.view(x_dev.shape).zero_()
+        self.assertTrue(x_dev.cpu().eq(0).all())
+
+    def test_resize_on_view_matches_cpu(self) -> None:
+        # With the map, a view takes the reserved resize_ path. Without it, the
+        # unreserved path recomputes the layout from the concrete size and the
+        # view reads back wrong data.
+        x, x_dev = declared_tensor()
+        v = x_dev.view(x_dev.shape)
+        v.resize_((140, 1024))
+        self.assertEqual(tuple(v.shape), (140, 1024))
+        self.assertTrue(torch.allclose(v.cpu(), x[:140], atol=1e-3))
+        # The base is untouched.
+        self.assertEqual(tuple(x_dev.shape), (560, 1024))
+        self.assertTrue(torch.allclose(x_dev.cpu(), x, atol=1e-3))
+
+
+# One compiled function reused over these sizes: the kernel sees the whole range.
+SIZES = (70, 140, 560, 630)
+
+# Eager ops on a declared tensor. `view(t.shape)` and `aten.alias` work on both
+# a concrete and a symbolic tensor.
+OPS = {
+    "identity": lambda t: t,
+    "view": lambda t: t.view(t.shape),
+    "detach": lambda t: t.detach(),
+    "alias": lambda t: torch.ops.aten.alias(t),
+}
+
+
+def _double_per_tile(t):
+    """t + t as a for_each_tile loop over dim 0.
+
+    A pointwise op over a declared dim is refused outside a for_each_tile: not
+    every size in the range is a multiple of the compiler's tile.
+    """
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile + tile
+
+    _, out = for_each_tile(body, (t,), dims=(0,), tile_size=TILE, out_dim=0)
+    return out
+
+
+def _compile_fresh(fn, **kwargs):
+    # The functions compiled here share code objects (_double_per_tile and the
+    # lambdas in OPS). Reset Dynamo so they stay under its recompile limit,
+    # which fullgraph=True turns into an error.
+    torch._dynamo.reset()
+    return torch.compile(fn, **kwargs)
+
+
+class TestViewResultIntoCompiledKernel(TestCase):
+    """x.to(dynamic=...) -> eager op -> compiled kernel, against the CPU
+    equivalent (a mark_dynamic'd tensor -> the same op -> a symbolic compile).
+
+    An eager result is a new tensor and does not inherit the mark_dynamic that
+    .to(dynamic=...) set, so the test marks dim 0 dynamic itself. The compile
+    then reads get_reserved_dims(result) to decide whether that dim is declared.
+    With no map it is an ordinary dynamic dim, sized from a hint; with one, the
+    kernel is built for the declared maximum. Both give right values at the
+    sizes tried, so the test also checks what the compile concluded.
+    """
+
+    def test_compile_sees_the_declared_range_and_matches_cpu(self) -> None:
+        real_declared_dims_of = spyre_inductor._declared_dims_of
+        for name, op in OPS.items():
+            with self.subTest(op=name):
+                dev_fn = _compile_fresh(_double_per_tile, fullgraph=True)
+                cpu_fn = _compile_fresh(lambda t: t + t, backend="aot_eager")
+                seen = []  # what the compile wrapper concluded, per device compile
+
+                def recording(*args, _seen=seen, **kwargs):
+                    result = real_declared_dims_of(*args, **kwargs)
+                    _seen.append({k: tuple(v) for k, v in result.items()})
+                    return result
+
+                for n in SIZES:
+                    x = torch.rand(n, 1024, dtype=torch.float16)
+                    v = op(x.to(DEVICE, dynamic=DECLARATION))
+                    torch._dynamo.mark_dynamic(v, 0)
+                    with mock.patch.object(
+                        spyre_inductor, "_declared_dims_of", recording
+                    ):
+                        out_dev = dev_fn(v)
+
+                    x_cpu = x.clone()
+                    torch._dynamo.mark_dynamic(x_cpu, 0)
+                    out_cpu = cpu_fn(op(x_cpu))
+
+                    # Eager x + x anchors the CPU reference, so a wrong
+                    # reference cannot hide a wrong device result.
+                    self.assertTrue(torch.allclose(out_cpu, x + x), f"{name}@{n}")
+                    self.assertTrue(
+                        torch.allclose(out_dev.cpu(), out_cpu, atol=1e-3),
+                        f"{name}@{n}: device differs from CPU",
+                    )
+
+                self.assertTrue(seen, "the device kernel never compiled")
+                for declared in seen:
+                    self.assertEqual(
+                        sorted(declared.values()),
+                        [(70, 630, 70)],
+                        f"{name}: compile did not see the declared range",
+                    )
+
 
 if __name__ == "__main__":
     run_tests()
+
+

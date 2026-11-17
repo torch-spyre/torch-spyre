@@ -98,6 +98,9 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  // Same as shallow_copy_and_detach_core: has_intact_reservation() is the gate
+  // for whether this view's shape still matches the recorded allocation.
+  // spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
 
@@ -125,6 +128,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
 
@@ -190,6 +194,10 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   if (device_layout == orig_impl->spyre_layout) {
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
+    // Only here: dma_sizes/dma_strides still describe the original allocation,
+    // so has_intact_reservation() stays meaningful. In the else branch they
+    // are reset to this view's own shape and the check would pass trivially.
+    spyre_impl->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_impl->dma_sizes = size.vec();
     spyre_impl->dma_strides = stride.vec();
