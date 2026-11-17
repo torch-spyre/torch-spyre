@@ -35,12 +35,14 @@ from unittest import mock
 import pytest
 import regex as re
 import torch
+from torch._dynamo.utils import counters
 from torch._inductor import config as inductor_config
 from torch._inductor.exc import InductorError
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 import torch_spyre._inductor.wrapper as wrapper
+from torch_spyre._inductor import _allow_scan_graph_caching
 from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_size_in_bytes,
@@ -206,14 +208,123 @@ class TestCrossKernelContract(unittest.TestCase):
         # Reservations cover one dim today, so a second symbolic dim has no
         # home. Combining two declared dims outside for_each_tile is refused
         # before output_reserved_dims's own "more than one symbolic dim" check
-        # is ever reached; that
-        # check is exercised directly by
+        # is ever reached; that check is exercised directly by
         # test_reserved_dims_propagation.py::test_more_than_one_symbolic_dim_is_refused.
         a, _ = declared_input(MIN_ROWS)
         b, _ = declared_input(MIN_ROWS)
 
         with pytest.raises(InductorError, match="outside any for_each_tile loop"):
             compiled(lambda a, b: a.unsqueeze(1) + b.unsqueeze(0))(a, b)
+
+
+def _fx_counts():
+    c = counters["inductor"]
+    return c["fxgraph_cache_hit"], c["fxgraph_cache_miss"], c["fxgraph_cache_bypass"]
+
+
+class TestContractCacheKey(unittest.TestCase):
+    """A stamp is baked into the cached wrapper, so the cache key must follow it.
+
+    The tests above run with the caches off. Here the FX graph cache is on: two
+    compiles of the same function over inputs that differ only in the declared
+    (min, max, granularity) must not share an entry, or the second would run with
+    the first one's stamp and the kernels built from it.
+    """
+
+    # (min, max, granularity) on the input -> the stamp expected on tiled_sum's
+    # output, which is s // TILE rows. The declarations differ in one field each.
+    BASE = ((128, 512, 128), (2, 8, 2))
+    OTHER_GRANULARITY = ((128, 512, 64), (2, 8, 1))
+    OTHER_MAX = ((128, 640, 128), (2, 10, 2))
+    OTHER_MIN = ((256, 512, 128), (4, 8, 2))
+
+    @staticmethod
+    def _stamp(values):
+        return {0: dict(zip(("min", "max", "granularity"), values))}
+
+    @staticmethod
+    def _declared_input(declared):
+        dim_min, dim_max, granularity = declared
+        x_cpu = torch.rand(dim_min, COLS, dtype=torch.float16)
+        return x_cpu.to(
+            DEVICE_NAME,
+            dynamic={0: {"min": dim_min, "max": dim_max, "granularity": granularity}},
+        )
+
+    def _compile_and_run(self, declared):
+        """Compile tiled_sum from scratch (Dynamo cold) and return its output's stamp."""
+        torch._dynamo.reset()
+        out = compiled(tiled_sum)(self._declared_input(declared))
+        return get_reserved_dims(out)
+
+    def test_key_follows_the_declared_contract(self):
+        with (
+            mock.patch.dict("os.environ", {"TORCH_SPYRE_CACHE_SCAN": "1"}),
+            inductor_config.patch(
+                unsafe_marked_cacheable_functions={},
+                fx_graph_cache=True,
+                fx_graph_remote_cache=False,
+            ),
+            fresh_cache(),
+        ):
+            _allow_scan_graph_caching()
+            counters.clear()
+
+            base_declared, base_stamp = self.BASE
+            self.assertEqual(
+                self._compile_and_run(base_declared), self._stamp(base_stamp)
+            )
+            hit0, miss0, bypass0 = _fx_counts()
+            self.assertEqual((hit0, bypass0), (0, 0))
+            self.assertGreater(miss0, 0)
+
+            # Control: the same declaration is a hit. Without it, a cache that
+            # never engages for this graph would make the checks below pass for
+            # the wrong reason.
+            self._compile_and_run(base_declared)
+            hit1, miss1, _ = _fx_counts()
+            self.assertEqual(miss1, miss0)
+            self.assertGreater(hit1, hit0)
+
+            # Each of these declares the same graph with one field changed: a new
+            # entry, and the stamp that goes with its own declaration.
+            for name, (declared, stamp) in (
+                ("granularity", self.OTHER_GRANULARITY),
+                ("max", self.OTHER_MAX),
+                ("min", self.OTHER_MIN),
+            ):
+                with self.subTest(differs_in=name):
+                    _, misses_before, _ = _fx_counts()
+                    got = self._compile_and_run(declared)
+                    _, misses_after, _ = _fx_counts()
+                    self.assertGreater(misses_after, misses_before)
+                    self.assertEqual(got, self._stamp(stamp))
+            self.assertEqual(_fx_counts()[2], 0)
+
+    def test_dynamo_guard_follows_the_declared_contract(self):
+        # The same compiled callable, no Dynamo reset: only Dynamo's own guards
+        # decide whether the first compile is reused. The layout they compare
+        # reflects max, so a different min or granularity passes every guard
+        # that existed before reserved_dims was compared, and the second input
+        # would run the first one's code and carry the first one's stamp.
+        #
+        # Reset once, before the first call: other tests compile tiled_sum too,
+        # and an entry left by one of them could be what the first call hits.
+        torch._dynamo.reset()
+        kernel = compiled(tiled_sum)
+        with inductor_config.patch(force_disable_caches=True):
+            base_declared, base_stamp = self.BASE
+            self.assertEqual(
+                get_reserved_dims(kernel(self._declared_input(base_declared))),
+                self._stamp(base_stamp),
+            )
+            for name, (declared, stamp) in (
+                ("granularity", self.OTHER_GRANULARITY),
+                ("min", self.OTHER_MIN),
+            ):
+                with self.subTest(differs_in=name):
+                    out = kernel(self._declared_input(declared))
+                    self.assertEqual(get_reserved_dims(out), self._stamp(stamp))
 
 
 if __name__ == "__main__":

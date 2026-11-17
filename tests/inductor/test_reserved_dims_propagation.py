@@ -141,6 +141,39 @@ class TestApplyReservedDimsContract(unittest.TestCase):
         bounds = graph.sizevars.shape_env.bound_sympy(s0)
         self.assertEqual((bounds.lower, bounds.upper), (200, 512))
 
+    def test_a_range_that_does_not_overlap_the_existing_one_is_refused(self):
+        # The model already requires s0 >= 600 and the declaration caps it at
+        # 512: no size satisfies both. Each case is on the other side of the
+        # declared range, so both comparisons are exercised.
+        cases = {
+            "existing range above the declaration": (600, 1000),
+            "existing range below the declaration": (2, 100),
+        }
+        for name, existing in cases.items():
+            with self.subTest(case=name):
+                graph = make_graph(ranges={s0: existing})
+                add_input(graph, "arg0", [s0, COLS])
+
+                with self.assertRaisesRegex(Unsupported, "does not overlap"):
+                    run_pass(graph, declared(128, 512, 64))
+
+                # Nothing was stored for the refused symbol.
+                self.assertEqual(contract.get_dim_contracts(graph), {})
+                self.assertEqual(
+                    graph.sizevars.shape_env.var_to_range[s0],
+                    ValueRanges(*existing),
+                )
+
+    def test_ranges_that_only_touch_are_accepted(self):
+        # [200, 512] and [512, 1000] share exactly one size: not empty.
+        graph = make_graph(ranges={s0: (512, 1000)})
+        add_input(graph, "arg0", [s0, COLS])
+
+        run_pass(graph, declared(128, 512, 64))
+
+        bounds = graph.sizevars.shape_env.bound_sympy(s0)
+        self.assertEqual((bounds.lower, bounds.upper), (512, 512))
+
     def test_input_without_a_contract_is_left_alone(self):
         # Every ordinary compile takes this path.
         graph = make_graph(ranges={s0: (2, None)})

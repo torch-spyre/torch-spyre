@@ -202,6 +202,24 @@ def apply_reserved_dims_contract(graph: GraphLowering) -> None:
                 continue
             dim_min, dim_max, granularity = declared
             current = shape_env.var_to_range.get(sym)
+            # The intersection below is empty when the two ranges do not
+            # overlap, which means the model already requires a size the
+            # declaration rules out (for example torch._check(rows >= 600)
+            # against max=512). Stored as is, that gives the compile a symbol
+            # with no possible value and no message naming the cause, so refuse
+            # it here. Compare the bounds directly rather than building the
+            # empty range, so this does not depend on how ValueRanges treats one.
+            if current is not None and (
+                bool(current.upper < dim_min) or bool(current.lower > dim_max)
+            ):
+                raise Unsupported(
+                    f"graph input {name}: the declared range [{dim_min}, "
+                    f"{dim_max}] of {sym} does not overlap the range "
+                    f"[{current.lower}, {current.upper}] the compile already "
+                    f"has for it (for example from a torch._check in the "
+                    f"model), so no size satisfies both. Change the "
+                    f"declaration or the check."
+                )
             new_range = ValueRanges(dim_min, dim_max)
             shape_env.var_to_range[sym] = (
                 new_range if current is None else current & new_range
