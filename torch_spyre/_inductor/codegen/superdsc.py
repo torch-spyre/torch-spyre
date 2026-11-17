@@ -2186,6 +2186,43 @@ def _inject_implicit_conv_kernel_dims(
         work_slices[kj_sym] = 1
 
 
+def _select_placement(mode: str):
+    """Placement function for ``mode``; dense is the identity placement."""
+    if mode == "neg_shift":
+        return apply_neg_shift
+    if mode == "dense":
+        return _apply_dense_placement
+    return apply_core_stride
+
+
+def _apply_dense_placement(
+    core_map, num_cores: int, physical_cores: int
+) -> tuple[dict, int, tuple[int, ...]]:
+    """Identity placement: keep the logical map, fold, and dispatched ids.
+
+    Runs through the same call path as the sparse placements so every
+    consumer sees the same frames (per-tensor spans, active ids, producer
+    remap) — only the placement itself is a no-op.
+    """
+    return dict(core_map), num_cores, tuple(range(num_cores))
+
+
+def _remap_producer_cores(
+    mode: str,
+    completed_producer_cores: tuple[int, ...],
+    logical_cores: int,
+    sencores: int,
+) -> tuple[int, ...]:
+    """Convert producer cores into the current placement's frame."""
+    if mode == "neg_shift":
+        shift = logical_cores // 2
+        return tuple((core - shift) % sencores for core in completed_producer_cores)
+    if mode == "dense":
+        return completed_producer_cores
+    stride = resolve_core_stride(logical_cores, sencores)
+    return tuple(core * stride for core in completed_producer_cores)
+
+
 def _finalize_tensor_work_divisions(
     args: list[SDSCArgs],
     mapping_dims: tuple[Symbol, ...],
@@ -2902,60 +2939,41 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             completed_producer_cores,
         )
         operation_cores = math.prod(dim_splits.values())
-        if core_placement_mode == "dense":
-            # Original dense mapping: no remapping at all — the fold stays at
-            # the logical slice count and logical slice i runs on core i.
-            active_core_ids = tuple(range(operation_cores))
-            num_cores = max(num_cores, operation_cores)
-        else:
-            _place = (
-                apply_neg_shift
-                if core_placement_mode == "neg_shift"
-                else apply_core_stride
+        _place = _select_placement(core_placement_mode)
+        core_id_to_work_slice, operation_span, destination_ids = _place(
+            core_id_to_work_slice, operation_cores, _spyre_config.sencores
+        )
+        active = set(destination_ids)
+        num_cores = max(num_cores, operation_span)
+        for index, arg in enumerate(args):
+            division = arg.work_division
+            assert division is not None
+            logical_cores = division.num_cores or num_cores
+            owner_map, physical_span, tensor_ids = _place(
+                division.core_id_to_work_slice,
+                logical_cores,
+                _spyre_config.sencores,
             )
-            core_id_to_work_slice, operation_span, destination_ids = _place(
-                core_id_to_work_slice, operation_cores, _spyre_config.sencores
-            )
-            active = set(destination_ids)
-            num_cores = max(num_cores, operation_span)
-            for index, arg in enumerate(args):
-                division = arg.work_division
-                assert division is not None
-                logical_cores = division.num_cores or num_cores
-                owner_map, physical_span, tensor_ids = _place(
-                    division.core_id_to_work_slice,
+            num_cores = max(num_cores, physical_span)
+            if index == 0 and completed_producer_cores:
+                tensor_ids = _remap_producer_cores(
+                    core_placement_mode,
+                    completed_producer_cores,
                     logical_cores,
                     _spyre_config.sencores,
                 )
-                num_cores = max(num_cores, physical_span)
-                if index == 0 and completed_producer_cores:
-                    if core_placement_mode == "neg_shift":
-                        shift = logical_cores // 2
-                        tensor_ids = tuple(
-                            (core - shift) % _spyre_config.sencores
-                            for core in completed_producer_cores
-                        )
-                    else:
-                        stride = resolve_core_stride(
-                            logical_cores, _spyre_config.sencores
-                        )
-                        tensor_ids = tuple(
-                            core * stride for core in completed_producer_cores
-                        )
-                    completed_producer_cores = tensor_ids
-                arg.active_core_ids = tensor_ids
-                active.update(tensor_ids)
-                arg.work_division = TensorWorkDivision(
-                    division.work_slices, owner_map, num_cores=physical_span
-                )
-            active_core_ids = tuple(sorted(active))
+                completed_producer_cores = tensor_ids
+            arg.active_core_ids = tensor_ids
+            active.update(tensor_ids)
+            arg.work_division = TensorWorkDivision(
+                division.work_slices, owner_map, num_cores=physical_span
+            )
+        active_core_ids = tuple(sorted(active))
     elif core_placement_mode != "dense" and (
         resolve_core_stride(num_cores, _spyre_config.sencores) > 1
-        or core_placement_mode == "neg_shift"
+        or core_placement_mode in ("neg_shift", "dense")
     ):
-        _place = (
-            apply_neg_shift if core_placement_mode == "neg_shift" else apply_core_stride
-        )
+        _place = _select_placement(core_placement_mode)
         core_id_to_work_slice, num_cores, completed_producer_cores = _place(
             core_id_to_work_slice, num_cores, _spyre_config.sencores
         )
