@@ -56,35 +56,25 @@ _RESTICKIFY_3ARGS = (
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
-_STICK_INCOMPATIBLE = (
-    6390,
-    "Eager fp16 gather followed by a broadcast multiply by a size-1-last-dim tensor: Pointwise no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility",
+_CAST_STAGGERED_READ = (
+    5856,
+    "Eager topk of an fp16 tensor cast to fp32 on device: the fp16 to fp32 copy_from_d2d of a small tensor raises 'staggered read with no unique num-sticks dim'.",
+    r"staggered read with no unique num-sticks dim",
 )
-_STICK_TOP1_MISMATCH = (
-    4713,
-    "Eager topk-1 MoE routing: topk indices used to gather expert rows give a wrong result vs CPU.",
+_TOPK_CAST_EAGER = (
+    5856,
+    "Eager topk of an fp16 tensor cast to fp32 on device: the cast gives wrong values, so topk picks different ids than on CPU and the gathered rows mismatch CPU.",
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_STICK_TOP2_EAGER = (
-    6384,
-    "Eager topk-2 routing: flatten() then dtype conversion of topk indices: Unexpected stick expression floor(d0/2).",
-    r"Unexpected stick expression floor\(d0/2\)",
-)
-_CANNOT_RESCALE = (
-    4392,
-    "compile: cannot rescale device layout for conversion to torch.float16.",
-    r"cannot rescale device layout",
-)
-_TOPK_GATHER_EAGER = (
-    4713,
-    "Eager topk indices used to gather table rows give a wrong result vs CPU.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
-_TOPK_GATHER_COMPILED = (
-    4713,
-    "Compile topk indices used to gather table rows silently use the wrong index (result mismatches CPU).",
+_TOPK_CAST_COMPILED = (
+    5856,
+    "Compiled topk of an fp16 tensor cast to fp32 on device: the cast gives wrong values, so topk picks different ids than on CPU and the gathered rows mismatch CPU.",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
+_WEIGHTED_NO_LAYOUT = (
+    6390,
+    "compile gather followed by a broadcast multiply by a size-1-last-dim tensor: Multi-arg pointwise has no supported output layout.",
+    r"Multi-arg pointwise \(buf\d+\): no supported output layout found",
 )
 _TOPK_K_PER_CORE = (
     4716,
@@ -508,9 +498,8 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_moe_routing_top1(self, execution_mode):
         """MoE top-1 routing: softmax → topk(1) → index → gather expert weights."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
-        _xfail_existing(execution_mode, eager=_STICK_TOP1_MISMATCH)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_CAST_STAGGERED_READ)
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 64, 32), differentiation="topk01", dtype=torch.float16
@@ -533,12 +522,11 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6384
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
         _xfail_existing(
             execution_mode,
-            eager=_STICK_TOP2_EAGER,
+            eager=_CAST_STAGGERED_READ,
             compiled=_POINTWISE_NO_LAYOUT,
         )
         n_experts = 8
@@ -561,12 +549,12 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_moe_weighted_routing(self, execution_mode):
         """MoE top-2 weighted: topk scores × gathered expert outputs → weighted sum."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6390
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4392
         _xfail_existing(
             execution_mode,
-            eager=_STICK_INCOMPATIBLE,
-            compiled=_CANNOT_RESCALE,
+            eager=_CAST_STAGGERED_READ,
+            compiled=_WEIGHTED_NO_LAYOUT,
         )
         n_experts = 8
         expert_w = cached_randn(
@@ -589,14 +577,14 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_speculative_candidate_embed(self, execution_mode, patch_sencores):
         """Speculative decode: topk draft candidates → gather their token embeddings."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4716
         _xfail_existing(
             execution_mode,
             patch_sencores=patch_sencores,
-            eager=_TOPK_GATHER_EAGER,
+            eager=_TOPK_CAST_EAGER,
             compiled_1=_TOPK_K_PER_CORE,
-            compiled_32=_TOPK_GATHER_COMPILED,
+            compiled_32=_TOPK_CAST_COMPILED,
         )
         embed = cached_randn((512, 128), differentiation="topk04", dtype=torch.float16)
         scores = cached_randn((512,), differentiation="topk04s", dtype=torch.float16)
@@ -609,9 +597,9 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_beam_search_kv_reorder(self, execution_mode):
         """Beam search: topk beam scores → gather KV rows for top beams."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
         _xfail_existing(
-            execution_mode, eager=_TOPK_GATHER_EAGER, compiled=_TOPK_GATHER_COMPILED
+            execution_mode, eager=_CAST_STAGGERED_READ, compiled=_TOPK_CAST_COMPILED
         )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)
         beam_scores = cached_randn((8,), differentiation="topk05s", dtype=torch.float16)
