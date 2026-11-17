@@ -2469,6 +2469,38 @@ def lower_where(condition, self, other):
     return result
 
 
+def _broadcast_keeping_zero_dim_promotion(*args):
+    """Cast 0-d float operands to the promoted dtype, then broadcast all args.
+
+    Torch's promotion ignores a 0-d tensor's dtype when a dimensioned operand of
+    the same category exists: ``fp16_tensor * fp32_0d`` is fp16 in eager.
+    Registering a binary op with ``broadcast=True`` broadcasts before the lowering
+    runs, which turns the 0-d operand into a dimensioned view and loses that rule,
+    so the result came out fp32 (#6061). Lowerings that need eager's dtype register
+    with ``broadcast=False`` and call this first: the 0-d operand is cast while it
+    is still 0-d, and the broadcast that follows is the one ``broadcast=True``
+    would have done.
+
+    Only float-to-float casts are done here; every other dtype mix is left to the
+    lowering exactly as before.
+    """
+    dtype = _promoted_dtype(*args, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT)
+    cast = [
+        to_dtype(a, dtype)
+        if hasattr(a, "get_dtype")
+        and len(a.get_size()) == 0
+        and a.get_dtype() != dtype
+        and a.get_dtype().is_floating_point
+        and dtype.is_floating_point
+        else a
+        for a in args
+    ]
+    out, _ = lowering.transform_args(
+        cast, {}, broadcast=True, type_promotion_kind=None, convert_input_to_bool=False
+    )
+    return out
+
+
 # type_promotion_kind=None: DEFAULT performs FP16→FP32 promotion before layout
 # propagation, leaving an IR node with STANDARD EA.  With None the FP16 operand
 # survives into the fused body so propagate_layouts can assign DL16_TO_FP32 EA.
@@ -2478,9 +2510,10 @@ def lower_where(condition, self, other):
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_add(x, y, *, alpha=1):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     # Keep the explicit scale-and-realize for alpha != 1. Delegating to
     # lowering.add(x, y, alpha=alpha) fails for fractional alpha (test_add_alpha,
     # alpha=0.5) with InductorError "No FX node for buf1" from split_multi_ops.
@@ -2501,10 +2534,10 @@ def lower_add(x, y, *, alpha=1):
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_mul(x, y):
-    return lowering.mul(x, y)
+    return lowering.mul(*_broadcast_keeping_zero_dim_promotion(x, y))
 
 
 # NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
@@ -2514,9 +2547,10 @@ def lower_mul(x, y):
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_sub(x, y, *, alpha=1):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -2713,31 +2747,33 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
 
 
 @register_spyre_lowering(
-    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=False
 )
 def lower_div(x, y, *, rounding_mode=None):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return _lower_div_impl(x, y, rounding_mode=rounding_mode)
 
 
 @register_spyre_lowering(
-    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=False
 )
 def lower_floor_divide(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     # aten.floor_divide has no rounding_mode parameter; always floor division.
     return _lower_div_impl(x, y, rounding_mode="floor")
 
@@ -2745,18 +2781,20 @@ def lower_floor_divide(x, y):
 @register_spyre_lowering(
     torch.ops.aten.minimum.default,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_minimum(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return with_int64_fallback(lowering.minimum, x, y)
 
 
 @register_spyre_lowering(
     torch.ops.aten.maximum.default,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_maximum(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return with_int64_fallback(lowering.maximum, x, y)
 
 
@@ -2817,12 +2855,10 @@ def _cmp_operand_dtype(tensors):
     resolve to ONE dtype instead of reaching the native op in two different
     physical formats.
 
-    Note this cannot reproduce torch's 0-dim promotion category (where ``fp16_1d
-    <= fp32_0d`` promotes to fp16, not fp32): ``broadcast=True`` on the .Tensor
-    registration means Inductor has already expanded 0-dim operands by the time
-    the lowering runs, so the distinction is not recoverable here. The comparison
-    is therefore done in fp32 where eager would do it in fp16, which differs only
-    when rounding the fp32 operand to fp16 changes the outcome.
+    Torch's 0-dim promotion rule (``fp16_1d <= fp32_0d`` compares in fp16, not
+    fp32) is handled before this runs: the .Tensor registration uses
+    ``broadcast=False`` and calls _broadcast_keeping_zero_dim_promotion, which
+    casts the 0-dim operand to fp16 while it is still 0-dim.
 
     Unifying the dtype does not make every mixed pair run on device, and the
     three outcomes are worth keeping straight:
@@ -2937,11 +2973,12 @@ def _register_cmp_lowerings(aten_op, op_name: str):
         name=aten_op,
         type_promotion_kind=None,
         override_return_dtype=torch.bool,
-        broadcast=True,
+        broadcast=False,
     )
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
+        x, y = _broadcast_keeping_zero_dim_promotion(x, y)
         return _lower_cmp_impl(x, y, pw)
 
     @register_spyre_lowering(

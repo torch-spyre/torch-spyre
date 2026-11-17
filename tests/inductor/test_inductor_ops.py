@@ -3676,7 +3676,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # back permuted with no error (#4393).
             "expect_fail": {
                 "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
-                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
