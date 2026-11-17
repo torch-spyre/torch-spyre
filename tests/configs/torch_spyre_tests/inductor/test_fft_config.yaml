@@ -12,4 +12,7 @@ test_suite_config:
             - TestFFT::test_fft2_matches_reference
             - TestFFT::test_fftn_matches_reference
             - TestFFT::test_ifftn_roundtrip
+            - TestFFT::test_fft_large_fourstep
+            - TestFFT::test_ifft_large_roundtrip
+            - TestFFT::test_fft_large_prime_unsupported
           mode: mandatory_success

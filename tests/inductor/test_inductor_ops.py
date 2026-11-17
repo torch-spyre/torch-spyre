@@ -15190,6 +15190,25 @@ class TestFFT(unittest.TestCase):
         err = (spyre_ifftn(spyre_fftn(x)) - x).abs().max().item()
         self.assertLessEqual(err, 2e-2 * x.abs().max().item())
 
+    def test_fft_large_fourstep(self):
+        # Above the threshold a composite length uses the four-step
+        # factorization (two sub-DFTs + twiddle) instead of one O(n^2) matmul.
+        x = torch.randn(2, 8192, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_large_roundtrip(self):
+        x = torch.randn(2, 8192, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_prime_unsupported(self):
+        # A prime above the threshold would need an O(n^2) matrix; it is
+        # rejected with a clear error rather than attempted.
+        with self.assertRaisesRegex(NotImplementedError, "prime"):
+            spyre_fft(torch.randn(8209, dtype=torch.complex64))
+
 
 if __name__ == "__main__":
     unittest.main()

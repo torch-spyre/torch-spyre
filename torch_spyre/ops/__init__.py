@@ -44,9 +44,14 @@ def _from_interleaved(v: torch.Tensor, n: int) -> torch.Tensor:
     return torch.view_as_complex(v.reshape(*v.shape[:-1], n, 2).contiguous())
 
 
-def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
-    if not torch.is_complex(x):
-        x = x.to(torch.complex64)
+# Transform lengths above this use the four-step factorization; a single
+# (2n, 2n) matmul is O(n^2) in compute and weight memory, so it is only used
+# for small n. The crossover is ~4096 on current hardware.
+_FOUR_STEP_THRESHOLD = 4096
+
+
+def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
+    """Length-n DFT along the last axis as one real interleaved matmul."""
     n = x.shape[-1]
     # Interleave and cast to fp16 on the host, then run the matmul on device.
     u = _to_interleaved(x).to(torch.float16).to(device)
@@ -58,6 +63,60 @@ def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     # the device reorders elements within the stick and would corrupt the order.
     v = _COMPILED[device](u, inverse).cpu().float()
     return _from_interleaved(v, n)
+
+
+def _factor(n: int) -> tuple[int, int]:
+    """Split n = n1 * n2 with factors near sqrt(n); (1, n) if n is prime."""
+    for a in range(int(n**0.5), 1, -1):
+        if n % a == 0:
+            return a, n // a
+    return 1, n
+
+
+def _twiddle(n1: int, n2: int, inverse: bool) -> torch.Tensor:
+    """Four-step twiddle T[k1, n2] = exp(sign * 2pi i k1 n2 / (n1 n2))."""
+    k1 = torch.arange(n1)[:, None]
+    n2a = torch.arange(n2)[None, :]
+    sign = 1.0 if inverse else -1.0
+    ang = sign * 2.0 * torch.pi * k1 * n2a / (n1 * n2)
+    return torch.polar(torch.ones(n1, n2), ang)
+
+
+def _four_step(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
+    """Cooley-Tukey four-step DFT for large n = n1 * n2.
+
+    Replaces one O(n^2) matmul with two smaller DFTs plus an elementwise
+    twiddle. The reshape, twiddle and transpose are host complex ops; only the
+    two sub-DFTs (reused via :func:`_run_1d`) run on the device, so this also
+    recurses automatically when a sub-factor is itself above the threshold.
+    """
+    n = x.shape[-1]
+    n1, n2 = _factor(n)
+    batch = x.shape[:-1]
+    xm = x.reshape(*batch, n1, n2)
+    # Stage A: DFT along the n1 axis (-2) -> A[..., k1, n2].
+    a = _run_1d(xm.movedim(-2, -1), inverse, device).movedim(-1, -2)
+    # Stage B: twiddle (host complex elementwise), broadcast over any batch dims.
+    a = a * _twiddle(n1, n2, inverse)
+    # Stage C: DFT along the n2 axis (-1) -> C[..., k1, k2].
+    c = _run_1d(a, inverse, device)
+    # Output reorder X[..., k1 + n1 k2] = C[..., k1, k2].
+    return c.transpose(-2, -1).reshape(*batch, n)
+
+
+def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
+    if not torch.is_complex(x):
+        x = x.to(torch.complex64)
+    n = x.shape[-1]
+    if n > _FOUR_STEP_THRESHOLD:
+        if _factor(n)[0] == 1:
+            raise NotImplementedError(
+                f"FFT length {n} is a prime larger than {_FOUR_STEP_THRESHOLD}; "
+                "not supported (a single prime-length transform would need an "
+                f"O(n^2) {2 * n}x{2 * n} matrix). Use a composite length."
+            )
+        return _four_step(x, inverse, device)
+    return _direct(x, inverse, device)
 
 
 def fft(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
