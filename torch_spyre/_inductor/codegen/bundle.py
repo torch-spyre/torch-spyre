@@ -28,6 +28,7 @@ from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
+    CountSource,
     LoopSpec,
     OpSpec,
     format_op_spec_list,
@@ -280,6 +281,17 @@ def generate_bundle(
 
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = any(sk.is_pool for sk in symbol_kinds)
+
+    # Each loop's device-read count source, or None, in the same outer-first
+    # order as loop_bounds. A device-read count is addressed off %pool, and
+    # %pool is only defined (in either pool mode below) when has_pool is set.
+    loop_sources: list[CountSource | None] = [
+        loop.count_from_buffer for loop in walk_loop_specs(specs_list)
+    ]
+    if not has_pool and any(src is not None for src in loop_sources):
+        raise Unsupported(
+            "a device-read loop count needs the bundle's device_mem_allocate pool"
+        )
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
     # the same logical tensor arg share one function parameter (the first-seen
@@ -490,9 +502,15 @@ def generate_bundle(
 
         # One LoopLevel per loop, in _collect_loop_bounds order. A concrete count
         # keeps the constant-bound, step-1 form this emitter has always produced;
-        # a symbolic one becomes "to <dim> step <G>". See _loop_level.
+        # a symbolic one becomes "to <dim> step <G>"; a device-read one reads
+        # its bound right before the loop. See _loop_level.
         loop_levels = [
-            _loop_level(lb, lb_idx, loop_dim_ssa)
+            _loop_level(
+                lb,
+                lb_idx,
+                loop_dim_ssa,
+                loop_sources[lb_idx] if lb_idx < len(loop_sources) else None,
+            )
             for lb_idx, lb in enumerate(loop_bounds)
         ]
 
@@ -851,12 +869,17 @@ class LoopLevel:
     loop variable must be divided by. It is exact by construction: a level's
     stride is its per-element step times the tile size, so dividing by the tile
     size leaves the per-element step.
+
+    ``setup`` lines are written once at the top of the bundle. ``pre_loop``
+    lines are written right before this level's ``scf.for``, for a value that
+    only exists once the ops before the loop have run.
     """
 
     setup: "tuple[str, ...]"
     bound: str
     step: str
     stride_scale: int
+    pre_loop: "tuple[str, ...]" = ()
 
 
 def _count_scale(count: sympy.Expr) -> int:
@@ -879,11 +902,18 @@ def _loop_level(
     count: sympy.Expr,
     lb_idx: int,
     loop_dim_ssa: "dict[str, str]",
+    source: "CountSource | None" = None,
 ) -> LoopLevel:
     """Pick the ``scf.for`` form for one loop level.
 
     A concrete count keeps the form this emitter has always produced: a constant
     upper bound with step 1, loop variable counting TILES.
+
+    A device-read count (``source`` set) also counts tiles with step 1, but its
+    bound is read from device memory with ``load_value_at_address``. The count
+    is written by an earlier op in the same bundle, so the read goes in
+    ``pre_loop``, right before the loop, while its address, which is fixed, goes
+    in ``setup`` with the other constants. ``count`` is the static maximum.
 
     A symbolic count becomes ``to <dim> step <G>``, so the loop variable counts
     ELEMENTS along the varying dimension and the device works the trip count out
@@ -904,14 +934,19 @@ def _loop_level(
         lb_idx: Index used to name this level's SSA values.
         loop_dim_ssa: Symbol name to the SSA value its ``input_arg`` extracted
             to, so a symbolic bound can be wired to its parameter.
+        source: Where a device-read count sits in the pool, or None.
 
     Returns:
-        The level's setup lines, bound, step and stride scale.
+        The level's setup lines, pre-loop lines, bound, step and stride scale.
 
     Raises:
         Unsupported: The count is symbolic but not a shape this emitter
-            recognises, or it names a symbol with no ``input_arg`` parameter.
+            recognises, or it names a symbol with no ``input_arg`` parameter, or
+            a device-read count does not match its loop.
     """
+    if source is not None:
+        return _device_read_loop_level(count, lb_idx, source)
+
     if isinstance(count, (sympy.Integer, int)):
         return LoopLevel(
             setup=(f"%loop_bound_{lb_idx} = arith.constant {int(count)} : index",),
@@ -951,6 +986,52 @@ def _loop_level(
         bound=dim_ssa,
         step=f"%step_{lb_idx}",
         stride_scale=tile,
+    )
+
+
+def _device_read_loop_level(
+    count: sympy.Expr,
+    lb_idx: int,
+    source: CountSource,
+) -> LoopLevel:
+    """The ``scf.for`` form for a loop whose count is read from device memory.
+
+    Refuses rather than emits whenever the loop and its source disagree, since
+    the backend plans every such loop for ``max_value`` trips.
+    """
+    if not isinstance(count, (sympy.Integer, int)):
+        raise Unsupported(
+            f"loop count {count} is symbolic and also read from device memory; "
+            "a loop takes one kind of bound"
+        )
+    if source.max_value <= 0 or source.granularity <= 0:
+        raise Unsupported(
+            "device-read loop count needs a positive max_value and granularity, "
+            f"got max_value={source.max_value}, granularity={source.granularity}"
+        )
+    if int(count) != source.max_value:
+        raise Unsupported(
+            f"device-read loop count has max_value={source.max_value} but the "
+            f"loop is planned for {int(count)} trips; the two must be equal"
+        )
+    if source.max_value % source.granularity:
+        raise Unsupported(
+            f"device-read loop count max_value={source.max_value} is not a "
+            f"multiple of granularity={source.granularity}"
+        )
+    return LoopLevel(
+        setup=(
+            f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index",
+            f"%cnt_addr_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
+        ),
+        pre_loop=(
+            f"%n_{lb_idx} = sdscbundle.load_value_at_address %cnt_addr_{lb_idx} "
+            f"{{granularity = {source.granularity}, "
+            f"max_value = {source.max_value}}} : index",
+        ),
+        bound=f"%n_{lb_idx}",
+        step="%c1",
+        stride_scale=1,
     )
 
 
@@ -1057,6 +1138,8 @@ def _emit_specs(
             )
             bound = level.bound if level is not None else f"%loop_bound_{lb_idx}"
             step = level.step if level is not None else "%c1"
+            for line in level.pre_loop if level is not None else ():
+                f.write(f"{tab}{line}\n")
             f.write(f"{tab}scf.for {loop_var} = %c0 to {bound} step {step} {{\n")
             _emit_specs(
                 entry.body,
