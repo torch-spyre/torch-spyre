@@ -20,15 +20,12 @@ name: crcr-regression-triage
 # 'success'. The merged upstream-beta-reports-<sha> JUnit artifact is the
 # only authoritative per-test signal.
 #
-# Opt-in switches (repo variables, set by an admin):
-#   CRCR_DIAGNOSE    = 'true' -> diagnose job runs (Claude comments the
-#                     failure classification on the tracking issues;
-#                     issues: write only).
-#   CRCR_AUTO_RECOVER = 'true' -> auto-recover job runs (Claude opens the
-#                     skip PR; contents+pull-requests write via the
-#                     SPYRE_BOT app so PR checks trigger). Takes over
-#                     diagnosis from CRCR_DIAGNOSE.
-# Both need secrets.ANTHROPIC_API_KEY. Detect + notify always run.
+# Opt-in switch (repo variable, set by an admin):
+#   CRCR_AUTO_RECOVER = 'true' -> auto-recover job runs (Claude comments
+#                     the failure diagnosis on the tracking issues and
+#                     opens the skip PR; contents+pull-requests write via
+#                     the SPYRE_BOT app so PR checks trigger). Needs
+#                     secrets.ANTHROPIC_API_KEY. Detect + notify always run.
 on:
   workflow_run:
     workflows:
@@ -45,8 +42,8 @@ on:
         default: ''
       dry_run:
         description: >-
-          Detect and notify only; never run the Claude diagnose/recover
-          steps
+          Detect and notify only; never run the Claude auto-recover
+          step
         type: boolean
         default: true
 
@@ -85,9 +82,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       has_failures: ${{ steps.detect.outputs.has_failures }}
-      failure_count: ${{ steps.detect.outputs.failure_count }}
-      total_tests: ${{ steps.detect.outputs.total_tests }}
-      new_failure_count: ${{ steps.detect.outputs.new_failure_count }}
       mass_failure: ${{ steps.detect.outputs.mass_failure }}
       skip_needed: ${{ steps.detect.outputs.skip_needed }}
       run_url: ${{ steps.resolve.outputs.run_url }}
@@ -269,7 +263,7 @@ jobs:
 
       - name: Open or update bucketed issues
         id: issues
-        # Best-effort: a failure here must not block diagnose/auto-recover.
+        # Best-effort: a failure here must not block auto-recover.
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -299,82 +293,6 @@ jobs:
           path: issue_map.json
           retention-days: 7
           if-no-files-found: warn
-
-  diagnose:
-    name: Diagnose new failures (Claude, comment-only)
-    needs: [detect, notify]
-    # Phase 2 of the rollout: classification comments on the tracking
-    # issues. Skipped once CRCR_AUTO_RECOVER is on (that prompt includes
-    # the diagnosis, and running both would double-comment).
-    if: >-
-      !cancelled() &&
-      needs.detect.outputs.has_failures == 'true' &&
-      needs.detect.outputs.new_failure_count != '0' &&
-      needs.detect.outputs.new_failure_count != '' &&
-      needs.detect.outputs.mass_failure == 'false' &&
-      (github.event_name != 'workflow_dispatch' || !inputs.dry_run) &&
-      vars.CRCR_DIAGNOSE == 'true' &&
-      vars.CRCR_AUTO_RECOVER != 'true'
-    runs-on:
-      - x86_64
-      - spyre_pf_x0
-      - linux
-      - image_spyre_backend
-    timeout-minutes: 30
-    continue-on-error: true # advisory only; never blocks anything
-    permissions:
-      contents: read
-      actions: read
-      issues: write # comment the diagnosis on the tracking issues
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Download triage inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: crcr-triage-inputs
-
-      - name: Download issue map
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: crcr-triage-issues
-
-      - name: Merge triage inputs
-        run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          failures = json.loads(Path("failures.json").read_text())
-          issue_map = {"buckets": {}}
-          if Path("issue_map.json").is_file():
-              issue_map = json.loads(Path("issue_map.json").read_text())
-          failures["issue_map"] = issue_map.get("buckets", {})
-          Path("triage_input.json").write_text(json.dumps(failures, indent=2))
-          PY
-
-      - name: Install Claude Code CLI
-        run: |
-          if command -v npm >/dev/null 2>&1; then
-            npm install -g @anthropic-ai/claude-code
-          else
-            curl -fsSL https://claude.ai/install.sh | bash
-            echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-          fi
-
-      - name: Run Claude (diagnosis only)
-        id: claude
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          claude -p "$(cat .github/scripts/crcr_diagnose_prompt.md)" \
-            --permission-mode bypassPermissions \
-            --max-turns 30 --output-format json > claude_result.json || true
-          python3 -c "import json; \
-          print(json.load(open('claude_result.json')).get('result', '')[:2000])" \
-            >> "${GITHUB_STEP_SUMMARY}" || true
 
   auto-recover:
     name: Auto-skip newly failing tests (Claude)
