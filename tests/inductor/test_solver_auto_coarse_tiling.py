@@ -968,6 +968,37 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # sum(0) drops the producer's dim 0, so the consumer's d0 is dim 1.
         self._assert_group_split(lambda x, y: (x + y).sum(dim=0))
 
+    def test_apply_builds_each_tiled_group_into_a_loop_node(self):
+        """The allocator's tiling goes through the same transform as span-overflow
+        and is built into LoopNodes after the pass, one per group, each with its own
+        loop variable."""
+        from torch_spyre._inductor.loop_checker import find_violations
+        from torch_spyre._inductor.loop_node import LoopNode, all_ops
+
+        seen: dict = {}
+        original = ts_passes._hand_off_loop_nodes
+
+        def spy(graph):
+            nodes = [op for op in graph.operations if isinstance(op, LoopNode)]
+            seen["nodes"] = [
+                (
+                    n.get_name(),
+                    n.induction,
+                    [o.get_operation_name() for o in all_ops(n.body)],
+                )
+                for n in nodes
+            ]
+            seen["violations"] = find_violations(list(graph.operations))
+            return original(graph)
+
+        with patch.object(ts_passes, "_hand_off_loop_nodes", spy):
+            self._assert_group_split(lambda x, y: (x + y).sum(dim=0))
+        self.assertEqual(len(seen["nodes"]), 2, seen["nodes"])
+        inductions = [n[1] for n in seen["nodes"]]
+        self.assertNotIn(None, inductions)
+        self.assertEqual(len({i.name for i in inductions}), 2, inductions)
+        self.assertEqual(seen["violations"], [])
+
     def test_apply_splits_a_narrowing_consumer_from_the_nest(self):
         # Same dim, half the rows: tile t reads 8 rows where the producer
         # wrote 16.
