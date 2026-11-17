@@ -45,7 +45,17 @@ REASON_CODES = tuple(gen_schemas.INVALIDATION_SHAPE["properties"]["code"]["enum"
 SETTABLE = ("suspect", "invalidated")
 SHOWN_RUNS = 20
 SHOWN_CHANGES = 20
-INGEST_ARGV = [sys.executable, "-I", "-m", "spyre_clickhouse_ingest", "results", "--from-bundle"]
+# An invalidation is an admin event: the ingest takes it only from a ci or lab channel; a person at a terminal is lab.
+INGEST_ARGV = [
+    sys.executable,
+    "-I",
+    "-m",
+    "spyre_clickhouse_ingest",
+    "results",
+    "--channel-trust",
+    "lab",
+    "--from-bundle",
+]
 INGEST_TIMEOUT = 300
 
 
