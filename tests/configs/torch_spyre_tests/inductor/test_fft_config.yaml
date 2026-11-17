@@ -13,4 +13,5 @@ test_suite_config:
             - TestFFT::test_fft_large_fourstep
             - TestFFT::test_ifft_large_roundtrip
             - TestFFT::test_fft_large_prime_unsupported
+            - TestFFT::test_fft_direct_max_env_forces_fourstep
           mode: mandatory_success

@@ -20,6 +20,7 @@ only the real interleaved matmul (``u @ W`` -> ``matmul_fp16_fwd``) runs on
 device.
 """
 
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -71,10 +72,25 @@ def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
     return w
 
 
-# Transform lengths above this use the four-step factorization; a single
-# (2n, 2n) matmul is O(n^2) in compute and weight memory, so it is only used
-# for small n. The crossover is ~4096 on current hardware.
-_FOUR_STEP_THRESHOLD = 4096
+# Largest single-transform length run as one direct (2n, 2n) matmul. The
+# direct weight is 8*n^2 bytes in HBM; measured on device it is correct and
+# fastest up to n=32768, above which it exceeds either the 256 MiB per-core
+# access span (MAX_SPAN_BYTES, at low batch) or HBM capacity (at high batch),
+# and fp16 accumulation error nears the usable limit. Longer transforms fall
+# back to the four-step factorization -- slower (a serial chain of sub-DFTs)
+# but it fits and is more accurate. Override with TORCH_SPYRE_FFT_DIRECT_MAX.
+_DIRECT_MATMUL_MAX_DEFAULT = 32768
+
+
+def _direct_matmul_max() -> int:
+    raw = os.environ.get("TORCH_SPYRE_FFT_DIRECT_MAX")
+    if raw is None:
+        return _DIRECT_MATMUL_MAX_DEFAULT
+    try:
+        v = int(raw)
+    except ValueError:
+        return _DIRECT_MATMUL_MAX_DEFAULT
+    return v if v > 0 else _DIRECT_MATMUL_MAX_DEFAULT
 
 
 def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
@@ -127,12 +143,13 @@ def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     if not torch.is_complex(x):
         x = x.to(torch.complex64)
     n = x.shape[-1]
-    if n > _FOUR_STEP_THRESHOLD:
+    threshold = _direct_matmul_max()
+    if n > threshold:
         if _factor(n)[0] == 1:
             raise NotImplementedError(
-                f"FFT length {n} is a prime larger than {_FOUR_STEP_THRESHOLD}; "
-                "not supported (a single prime-length transform would need an "
-                f"O(n^2) {2 * n}x{2 * n} matrix). Use a composite length."
+                f"FFT length {n} has a prime factor larger than {threshold}; "
+                "not supported (it would need an O(n^2) "
+                f"{2 * n}x{2 * n} matrix). Use a composite length."
             )
         return _four_step(x, inverse, device)
     return _direct(x, inverse, device)

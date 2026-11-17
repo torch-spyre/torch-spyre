@@ -15172,23 +15172,33 @@ class TestFFT(unittest.TestCase):
         self.assertLessEqual(err, 2e-2 * x.abs().max().item())
 
     def test_fft_large_fourstep(self):
-        # Above the threshold a composite length uses the four-step
-        # factorization (two sub-DFTs + twiddle) instead of one O(n^2) matmul.
-        x = torch.randn(2, 8192, dtype=torch.complex64)
+        # Above the direct ceiling (32768) a composite length uses the
+        # four-step factorization (two sub-DFTs + twiddle), which also lets a
+        # transform too large for one direct matmul complete.
+        x = torch.randn(2, 65536, dtype=torch.complex64)
         ref = torch.fft.fft(x)
         err = (spyre_fft(x) - ref).abs().max().item()
         self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
 
     def test_ifft_large_roundtrip(self):
-        x = torch.randn(2, 8192, dtype=torch.complex64)
+        x = torch.randn(2, 65536, dtype=torch.complex64)
         err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
         self.assertLessEqual(err, 2e-2 * x.abs().max().item())
 
     def test_fft_large_prime_unsupported(self):
-        # A prime above the threshold would need an O(n^2) matrix; it is
-        # rejected with a clear error rather than attempted.
-        with self.assertRaisesRegex(NotImplementedError, "prime"):
-            spyre_fft(torch.randn(8209, dtype=torch.complex64))
+        # A prime above the ceiling cannot be factored for four-step and
+        # would need an O(n^2) matrix; it is rejected rather than attempted.
+        with self.assertRaisesRegex(NotImplementedError, "prime factor"):
+            spyre_fft(torch.randn(65537, dtype=torch.complex64))
+
+    def test_fft_direct_max_env_forces_fourstep(self):
+        # TORCH_SPYRE_FFT_DIRECT_MAX lowers the direct/four-step boundary, so a
+        # small composite length takes the four-step path and still matches.
+        x = torch.randn(3, 128, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        with mock.patch.dict(os.environ, {"TORCH_SPYRE_FFT_DIRECT_MAX": "64"}):
+            err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
 
 
 if __name__ == "__main__":
