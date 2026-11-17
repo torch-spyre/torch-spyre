@@ -15127,32 +15127,13 @@ _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shap
 
 
 class TestFFT(unittest.TestCase):
-    """DFT via matmul: the spyre::dft op and the fft/ifft host wrappers.
-
-    spyre::dft takes a real interleaved tensor (``[re0, im0, re1, ...]``) and
-    lowers to a single matmul, so -- like the conv/avgpool op tests -- it is
-    checked with ``compare_with_cpu`` (run_eager=False: Spyre has no eager dft
-    kernel, only the decomposed/compiled path). The complex fft/ifft wrappers
-    are then checked end-to-end against ``torch.fft``.
+    """DFT via matmul: the fft/ifft host wrappers run a real interleaved
+    ``u @ W`` on device and are checked end-to-end against ``torch.fft``.
     """
 
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
-
-    def test_dft_forward(self):
-        def fn(u):
-            return torch.ops.spyre.dft(u, False)
-
-        u = cached_randn((3, 128), dtype=torch.float16)  # interleaved real, n=64
-        compare_with_cpu(fn, u, atol=0.5, rtol=0.1, run_eager=False)
-
-    def test_dft_inverse(self):
-        def fn(u):
-            return torch.ops.spyre.dft(u, True)
-
-        u = cached_randn((3, 128), dtype=torch.float16)
-        compare_with_cpu(fn, u, atol=0.5, rtol=0.1, run_eager=False)
 
     def test_fft_matches_reference(self):
         # End-to-end vs torch.fft (validates the interleaved DFT matrix), for

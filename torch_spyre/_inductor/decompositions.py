@@ -3808,20 +3808,6 @@ def spyre_conv2d_with_bias_decomp(
     return output
 
 
-@register_spyre_decompositions([torch.ops.spyre.dft.default])
-def dft_decomp(u: torch.Tensor, inverse: bool) -> torch.Tensor:
-    """Lower spyre::dft to a single real matmul (-> matmul_fp16_fwd).
-
-    The interleaved DFT matrix is a constant depending only on the transform
-    length, so the whole discrete Fourier transform becomes one ``u @ W``.
-    """
-    from torch_spyre._inductor.customops import _interleaved_dft_matrix
-
-    n = u.shape[-1] // 2
-    w = _interleaved_dft_matrix(n, inverse, u.dtype).to(u.device)
-    return u @ w
-
-
 # Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
 @register_spyre_decompositions([torch.ops.spyre.dequantize_fp8_with_scale])
 def dequantize_fp8_with_scale_decomp(

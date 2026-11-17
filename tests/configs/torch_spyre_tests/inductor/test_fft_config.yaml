@@ -5,8 +5,6 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestFFT::test_dft_forward
-            - TestFFT::test_dft_inverse
             - TestFFT::test_fft_matches_reference
             - TestFFT::test_ifft_roundtrip
             - TestFFT::test_fft2_matches_reference

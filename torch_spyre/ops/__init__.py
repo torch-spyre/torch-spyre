@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public ops for torch_spyre.
+"""Discrete Fourier transform on Spyre.
 
-``fft`` / ``ifft`` (1-D) and ``fft2`` / ``ifft2`` / ``fftn`` / ``ifftn`` (N-D)
-compute the discrete Fourier transform on Spyre; the N-D transforms are
-separable and reuse the 1-D transform along each axis. The device cannot hold
-complex tensors, so the complex<->real conversion and the
-(bitwidth-changing) fp16<->fp32 cast are done here on the host; only the real
-interleaved matmul runs on the device, via the ``spyre::dft`` custom op whose
-decomposition lowers it to ``matmul_fp16_fwd`` (see
-``torch_spyre/_inductor/{customops,decompositions}.py``).
+``fft`` / ``ifft`` (1-D) and ``fft2`` / ``ifft2`` / ``fftn`` / ``ifftn`` (N-D,
+separable). Complex<->real packing and the fp16<->fp32 casts run on the host;
+only the real interleaved matmul (``u @ W`` -> ``matmul_fp16_fwd``) runs on
+device.
 """
 
 from typing import Optional, Sequence
@@ -30,8 +26,10 @@ import torch
 
 __all__ = ["fft", "ifft", "fft2", "ifft2", "fftn", "ifftn"]
 
-# Compiled ``spyre::dft`` wrapper, one per device.
+# Compiled real matmul (u @ W), one per device.
 _COMPILED: dict = {}
+# Interleaved DFT matrix on device, keyed by (device, length, inverse).
+_W_CACHE: dict = {}
 
 
 def _to_interleaved(x: torch.Tensor) -> torch.Tensor:
@@ -44,6 +42,35 @@ def _from_interleaved(v: torch.Tensor, n: int) -> torch.Tensor:
     return torch.view_as_complex(v.reshape(*v.shape[:-1], n, 2).contiguous())
 
 
+def _dft_matrix(n: int, inverse: bool) -> torch.Tensor:
+    """``(2n, 2n)`` real interleaved DFT matrix.
+
+    Complex ``W[j, k] = exp(-2pi i jk/n)`` (``conj/n`` for the inverse) expanded
+    into real ``[[Re, Im], [-Im, Re]]`` blocks so a complex DFT runs as one real
+    matmul on interleaved ``[re0, im0, ...]`` data.
+    """
+    k = torch.arange(n, dtype=torch.float64)
+    theta = 2.0 * torch.pi * torch.outer(k, k) / n
+    ang = theta if inverse else -theta
+    re, im = torch.cos(ang), torch.sin(ang)
+    if inverse:
+        re, im = re / n, im / n
+    m = torch.empty(2 * n, 2 * n, dtype=torch.float32)
+    m[0::2, 0::2], m[0::2, 1::2] = re, im
+    m[1::2, 0::2], m[1::2, 1::2] = -im, re
+    return m
+
+
+def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
+    """fp16 DFT matrix on ``device``, built once per (device, n, inverse)."""
+    key = (device, n, inverse)
+    w = _W_CACHE.get(key)
+    if w is None:
+        w = _dft_matrix(n, inverse).to(torch.float16).to(device)
+        _W_CACHE[key] = w
+    return w
+
+
 # Transform lengths above this use the four-step factorization; a single
 # (2n, 2n) matmul is O(n^2) in compute and weight memory, so it is only used
 # for small n. The crossover is ~4096 on current hardware.
@@ -53,16 +80,15 @@ _FOUR_STEP_THRESHOLD = 4096
 def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     """Length-n DFT along the last axis as one real interleaved matmul."""
     n = x.shape[-1]
-    # Interleave and cast to fp16 on the host, then run the matmul on device.
-    u = _to_interleaved(x).to(torch.float16).to(device)
-    if device not in _COMPILED:
-        _COMPILED[device] = torch.compile(
-            lambda t, inv: torch.ops.spyre.dft(t, inv), dynamic=False
-        )
-    # Cast fp16 -> fp32 on the host (.cpu().float()); a bitwidth-changing cast on
-    # the device reorders elements within the stick and would corrupt the order.
-    v = _COMPILED[device](u, inverse).cpu().float()
-    return _from_interleaved(v, n)
+    u = _to_interleaved(x).to(torch.float16).to(device)  # pack + cast on host
+    comp = _COMPILED.get(device)
+    if comp is None:
+        comp = torch.compile(lambda a, b: a @ b, dynamic=False)
+        _COMPILED[device] = comp
+    w = _device_dft_matrix(n, inverse, device)
+    # fp16 -> fp32 on the host: a bitwidth cast on device reorders within the
+    # stick and would corrupt element order.
+    return _from_interleaved(comp(u, w).cpu().float(), n)
 
 
 def _factor(n: int) -> tuple[int, int]:
@@ -83,24 +109,17 @@ def _twiddle(n1: int, n2: int, inverse: bool) -> torch.Tensor:
 
 
 def _four_step(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
-    """Cooley-Tukey four-step DFT for large n = n1 * n2.
-
-    Replaces one O(n^2) matmul with two smaller DFTs plus an elementwise
-    twiddle. The reshape, twiddle and transpose are host complex ops; only the
-    two sub-DFTs (reused via :func:`_run_1d`) run on the device, so this also
-    recurses automatically when a sub-factor is itself above the threshold.
-    """
+    """Cooley-Tukey two-factor split for large n; recurses via _run_1d."""
     n = x.shape[-1]
     n1, n2 = _factor(n)
     batch = x.shape[:-1]
     xm = x.reshape(*batch, n1, n2)
     # Stage A: DFT along the n1 axis (-2) -> A[..., k1, n2].
     a = _run_1d(xm.movedim(-2, -1), inverse, device).movedim(-1, -2)
-    # Stage B: twiddle (host complex elementwise), broadcast over any batch dims.
+    # Stage B: twiddle, broadcast over any batch dims.
     a = a * _twiddle(n1, n2, inverse)
-    # Stage C: DFT along the n2 axis (-1) -> C[..., k1, k2].
+    # Stage C: DFT along the n2 axis (-1), then reorder k1 + n1 k2.
     c = _run_1d(a, inverse, device)
-    # Output reorder X[..., k1 + n1 k2] = C[..., k1, k2].
     return c.transpose(-2, -1).reshape(*batch, n)
 
 
@@ -120,22 +139,12 @@ def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
 
 
 def fft(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
-    """One-dimensional DFT along the last axis, computed on Spyre.
-
-    Args:
-        x: complex (or real, promoted to complex) tensor; the last dimension is
-            transformed, leading dimensions are batched.
-        device: device to run the matmul on (default ``"spyre"``).
-
-    Returns:
-        A ``torch.complex64`` tensor on the host, matching
-        :func:`torch.fft.fft` within fp16 accuracy.
-    """
+    """1-D DFT along the last axis (real input promoted to complex)."""
     return _run_1d(x, inverse=False, device=device)
 
 
 def ifft(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
-    """Inverse one-dimensional DFT along the last axis (includes 1/n)."""
+    """Inverse 1-D DFT along the last axis (includes 1/n)."""
     return _run_1d(x, inverse=True, device=device)
 
 
@@ -145,10 +154,7 @@ def _run_nd(
     inverse: bool,
     device: str,
 ) -> torch.Tensor:
-    # An N-D DFT is separable: transform each axis in turn. Each axis is moved
-    # to the last position, run through the 1-D transform, and moved back. The
-    # movedim and complex handling stay on the host; only the matmuls hit the
-    # device.
+    """Separable N-D DFT: transform each axis in turn (host movedim)."""
     if not torch.is_complex(x):
         x = x.to(torch.complex64)
     dims = tuple(range(x.ndim)) if dim is None else tuple(dim)
@@ -166,7 +172,7 @@ def fftn(
     *,
     device: str = "spyre",
 ) -> torch.Tensor:
-    """N-dimensional DFT over ``dim`` (all axes if ``dim`` is None)."""
+    """N-D DFT over ``dim`` (all axes if ``dim`` is None)."""
     return _run_nd(x, dim, inverse=False, device=device)
 
 
@@ -176,15 +182,15 @@ def ifftn(
     *,
     device: str = "spyre",
 ) -> torch.Tensor:
-    """Inverse N-dimensional DFT over ``dim`` (all axes if ``dim`` is None)."""
+    """Inverse N-D DFT over ``dim`` (all axes if ``dim`` is None)."""
     return _run_nd(x, dim, inverse=True, device=device)
 
 
 def fft2(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
-    """Two-dimensional DFT over the last two axes."""
+    """2-D DFT over the last two axes."""
     return _run_nd(x, (-2, -1), inverse=False, device=device)
 
 
 def ifft2(x: torch.Tensor, *, device: str = "spyre") -> torch.Tensor:
-    """Inverse two-dimensional DFT over the last two axes."""
+    """Inverse 2-D DFT over the last two axes."""
     return _run_nd(x, (-2, -1), inverse=True, device=device)
