@@ -1828,6 +1828,40 @@ def test_strict_transpose_0_last_clone(shape, dtype):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# Regression coverage for issue #5216: the second half of x.split(704, dim=-1)
+# reads the source at host offset 704, which simplifies the device stick
+# expression Mod(d0 + 704, stick_size) down to Mod(d0, stick_size) because 704
+# is an exact multiple of every supported stick size (32 and 64 elements) --
+# but compute_restickify_target_layout's coord/expr offset-compatibility check
+# compared the chunk's raw, unreduced offset (704) against the already-reduced
+# expression's offset (0) and rejected the restickify as misaligned even though
+# 704 is itself stick-aligned. The downstream .transpose(0, 1) forces the stick
+# onto a different axis than the source, so this is the only geometry that
+# reaches that check (a pointwise/sum consumer with no transpose keeps the same
+# stick axis and never needs a restickify, regardless of chunk offset).
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+def test_split_offset_transpose_restickify(dtype):
+    # Small dyadic values survive device conversion exactly for every dtype
+    # here; a wrong row or chunk must fail an exact comparison, not hide in a
+    # tolerance.
+    gen = torch.Generator().manual_seed(5216)
+    if dtype.is_floating_point:
+        x = torch.randint(-16, 17, (256, 1408), generator=gen).to(dtype) / 8
+    else:
+        x = torch.randint(-1000, 1000, (256, 1408), generator=gen, dtype=dtype)
+
+    def fn(t):
+        chunks = t.split(704, dim=-1)
+        return torch.stack([c.transpose(0, 1) for c in chunks])
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to(DEVICE)).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
+
+
 # -------- torch.cat on the target-model shapes (#1094) ----------
 #
 # ``torch.cat`` lowers to two slice writes into one freshly cloned buffer, so a
@@ -2761,17 +2795,17 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 #
 # A restickify whose old stick has host size 1 collapses one operand's
 # within-stick coordinate to a constant, so that operand's STL carries the old
-# stick as a size-1 ``stride_map == -1`` singleton dim, while the restore
+# stick as a size-1 ``stride_map == 0`` singleton dim, while the restore
 # (_restickify_restore_elided_dim) rebuilds the descriptor to sweep a full
 # 64-plane stick.  The grow is two coupled halves: padding._pad_elided_dim
-# prepends an outermost size-64 ``-1`` gap dim to the (intact) operand's STL so
+# prepends an outermost size-64 ``0`` gap dim to the (intact) operand's STL so
 # the allocation covers the sweep, and the restore REUSES that dim (binds the
 # shared iteration symbol to it) rather than inserting its own, keeping the
 # descriptor total equal to the grown allocation.  These tests pin each half
 # against the real STL / OpSpec APIs, without a device (the functional
 # lane-displacement checks are the *_stick_crossing_* tests above).
 _SIZE1_COLLAPSED_DEVICE_SIZE = [67, 1, 1, 64]
-_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, -1, 1]
+_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, 0, 1]
 _SIZE1_HOST_SIZE = [1, 67, 7]
 _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
@@ -2810,10 +2844,10 @@ def test_size1_grow_prepends_size64_gap_dim():
     _pad_elided_dim(buf)
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map -1) is prepended; the original
+    # An outermost size-64 gap dim (stride_map 0) is prepended; the original
     # device dims follow unchanged.
     assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
     # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])

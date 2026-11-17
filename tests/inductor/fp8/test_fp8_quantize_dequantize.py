@@ -15,7 +15,6 @@
 from __future__ import annotations
 import pytest
 import torch
-from torch._inductor.exc import InductorError
 from torch_spyre.constants import DEVICE_NAME
 
 E4M3 = torch.float8_e4m3fn
@@ -51,29 +50,6 @@ _XFAIL_3033 = pytest.mark.xfail(
     reason="https://github.com/torch-spyre/torch-spyre/issues/3033: for K>=16 a host "
     "FP8 copy is STANDARD but the FP8 kernels read and write QFP8CH, so from the 9th "
     "element of a row on, values come from the wrong offset",
-)
-
-_XFAIL_3024 = pytest.mark.xfail(
-    strict=True,
-    raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: some stick-"
-    "unaligned K (13, 50, 9) trip a compiler assertion 'Unsupported coordinate "
-    "expression 13*c0/64'; other unaligned K (77, 129) work",
-)
-
-_XFAIL_3999 = pytest.mark.xfail(
-    strict=True,
-    raises=RuntimeError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() of the FP16 "
-    "output raises 'Invalid device sizes and stride map': the conversion from FP8 pads "
-    "this stick-unaligned K to two FP16 sticks",
-)
-
-_XFAIL_3026 = pytest.mark.xfail(
-    strict=True,
-    raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: head_dim=64 roundtrip "
-    "fails to compile: 'Unexpected stick expression d2 + 64*(Mod(d1, 2))' or its 4D form",
 )
 
 
@@ -282,7 +258,7 @@ class TestFP8Dequantize:
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
+            ((4, 8), 2.0),
             ((2, 2, 8), 1.0),
         ],
         ids=["2x8_s1", "4x8_s2", "2x2x8_s1"],
@@ -451,7 +427,6 @@ class TestFP8Dequantize:
         out = _compile(_dequantize_fn)(x_fp8_cpu.to(DEVICE), scale)
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0, equal_nan=True)
 
-    @_XFAIL_3999
     def test_shape_guard_recompile(self):
         """(2,8) then (4,8): shape guard must recompile, correct output for both shapes."""
         from torch._dynamo.testing import CompileCounterWithBackend
@@ -470,12 +445,6 @@ class TestFP8Dequantize:
             f"got {counter.frame_count}"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed FP8 "
-        "input fails to compile: 'no mechanism to resolve stick incompatibility'",
-    )
     def test_transposed_fp8_input(self):
         """Transposed non-contiguous FP8 input via .t()."""
         base = _make_arange_fp8((8, 2))
@@ -549,17 +518,7 @@ class TestWeightRoundtrip:
         "shape",
         [
             (2, 8),
-            pytest.param(
-                (4, 8),
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=RuntimeError,
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() "
-                    "of the FP16 output raises 'Invalid device sizes and stride map': "
-                    "the conversion from FP8 pads this stick-unaligned K to two FP16 "
-                    "sticks. Wrong values from issue 3022 are behind it",
-                ),
-            ),
+            (4, 8),
             (8, 8),
         ],
         ids=["2x8", "4x8", "8x8"],
@@ -596,7 +555,7 @@ class TestRoundtripBaseline:
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
+            ((4, 8), 2.0),
             ((8, 8), 1.0),
             ((2, 2, 8), 2.0),
         ],
@@ -653,7 +612,7 @@ class TestRoundtripBaseline:
         "seed,shape",
         [
             (42, (2, 8)),
-            pytest.param(0, (4, 8), marks=_XFAIL_3999),
+            (0, (4, 8)),
             (7, (2, 2, 8)),
         ],
         ids=["seed42_2x8", "seed0_4x8", "seed7_2x2x8"],
@@ -708,9 +667,9 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((2, 4), marks=_XFAIL_3999),
+            (2, 4),
             (4, 4),
-            pytest.param((2, 2, 4), marks=_XFAIL_3999),
+            (2, 2, 4),
         ],
         ids=["2x4", "4x4", "2x2x4"],
     )
@@ -892,13 +851,6 @@ class TestRoundtripShapes:
             out.cpu(), _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: (2,16,8) is "
-        "exact, but (2,17,8) and (2,32,8) return wrong values; the mismatch count "
-        "varies between runs",
-    )
     @pytest.mark.parametrize("S", [17, 32], ids=["S17", "S32"])
     def test_3d_shapes_varying_seq_k8(self, S):
         """3D (2,S,8) non-uniform input."""
@@ -914,7 +866,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((2, 128, 64), marks=_XFAIL_3026),
+            (2, 128, 64),
             (4, 64, 256),
             (2, 32, 4096),
             (1, 512, 4096),
@@ -936,10 +888,10 @@ class TestRoundtripShapes:
         "shape",
         [
             (63, 8),
-            pytest.param((63, 13), marks=_XFAIL_3024),
+            (63, 13),
             (63, 129),
-            pytest.param((17, 13), marks=_XFAIL_3024),
-            pytest.param((100, 50), marks=_XFAIL_3024),
+            (17, 13),
+            (100, 50),
             (7, 77),
             (67, 256),
         ],
@@ -959,7 +911,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((3, 7, 9), marks=_XFAIL_3024),
+            (3, 7, 9),
             (67, 71, 77),
             (2, 63, 128),
         ],
@@ -978,7 +930,10 @@ class TestRoundtripShapes:
 
     @pytest.mark.parametrize(
         "shape",
-        [pytest.param((2, 8, 64, 64), marks=_XFAIL_3026), (1, 4, 32, 128)],
+        [
+            (2, 8, 64, 64),
+            (1, 4, 32, 128),
+        ],
         ids=["2x8x64x64", "1x4x32x128"],
     )
     def test_4d_attention_layout(self, shape):
@@ -1189,13 +1144,6 @@ class TestRoundtripEdgeCases:
 class TestRoundtripInputVariants:
     """Activation roundtrip with non-standard inputs: non-contiguous (transposed) and BF16."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed input "
-        "fails to compile: dbo-opt raises DtException 'Expect valid lower and upper bound "
-        "parameters'",
-    )
     def test_transposed_non_contiguous_input(self):
         """Transposed non-contiguous input, non-uniform."""
         base = _make_arange_fp16((8, 2))
