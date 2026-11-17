@@ -343,3 +343,54 @@ def test_a_timeout_or_a_statusless_report_is_not_success(capsys):
 def test_json_output_stays_one_document(capsys):
     rc, *_, out = run(["--device", "SN1", *CODE, "--json"], capsys=capsys)
     assert rc == 0 and json.loads(out.out)["invalidation_id"] == INV
+
+
+def test_apply_asks_the_ingest_for_the_lab_channel(capsys, tmp_path):
+    _, _, runner, _ = run(["--node", "n1", *CODE, "--apply", "--out", str(tmp_path / "b")], capsys=capsys)
+    argv = runner.calls[0][0]
+    assert argv[argv.index("--channel-trust") + 1] == "lab"
+    assert argv.index("--channel-trust") < argv.index("--from-bundle")
+
+
+def test_the_event_and_the_channel_are_accepted_by_the_real_ingest(capsys, tmp_path, monkeypatch):
+    """The bundle the verb writes, ingested with the trust the verb asks for, through the ingest's own writer."""
+    be = pytest.importorskip("spyre_clickhouse_ingest.bench_invalidation")
+    pytest.importorskip("chdb.session")
+    from pathlib import Path
+
+    ingest_tests = Path(__file__).resolve().parents[2] / "clickhouse-ingest" / "tests"
+    if not (ingest_tests / "bench_chdb.py").exists():
+        pytest.skip("the ingest's chdb test helpers are not in this tree")
+    sys.path.insert(0, str(ingest_tests))
+    try:
+        from bench_chdb import ChdbClient, Db
+        from spyre_clickhouse_ingest import bundle, offline
+        from spyre_clickhouse_ingest import client as client_mod
+    finally:
+        sys.path.remove(str(ingest_tests))
+    _, fake, runner, _ = run(
+        ["--node", "n1", "--from", "2026-10-01T00:00:00Z", *CODE, "--apply", "--out", str(tmp_path / "b")],
+        capsys=capsys,
+    )
+    argv = runner.calls[0][0]
+    trust = argv[argv.index("--channel-trust") + 1]
+    ((_, events, _),) = fake.bundles
+    out = be.write_bundle(tmp_path / "real", events, uploader="amy@example.com")
+    db = Db()
+    c = ChdbClient(db)
+    monkeypatch.setattr(client_mod.ClickHouse, "connect", staticmethod(lambda **k: c))
+    monkeypatch.setattr(client_mod.ClickHouseEnv, "target_database", staticmethod(lambda: "default"))
+    try:
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(
+            from_bundle=str(out), dry_run=False, uploader="amy@example.com", bundle_prop=[], channel_trust="",
+            expect_key="", trusted_job_prefix=[], append_to_run=False,
+        )  # fmt: skip
+        with offline.opened(out) as root:
+            with pytest.raises(offline.BundleError, match="not none"):
+                bundle._ingest(root, args)
+            args.channel_trust = trust
+            assert bundle._ingest(root, args)["status"] == "ingested"
+    finally:
+        db.s.close()
