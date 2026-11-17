@@ -77,11 +77,15 @@ sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lowe
 )
 
 # Sparse physical core placement for ops using fewer cores than the card
-# has: "stride" (default) spreads slices at equal stride i*(sencores/n);
-# "neg_shift" dispatches logical slice i to (i - n//2) % sencores, which
-# balances the two 16-core halves (low ids of the first, high ids of the
-# second) — the scheme validated by the [0, 31] two-core experiment.
-core_placement_mode: str = os.environ.get("SPYRE_CORE_PLACEMENT", "stride")
+# has: "neg_shift" (default) dispatches logical slice i to (i - n//2)
+# % sencores — the clamshell, which balances the two 16-core halves (low
+# ids of the first, high ids of the second) and wraps the fold boundary;
+# "stride" spreads slices at equal stride i*(sencores/n) and stays inside
+# monotonic fold order. The clamshell requires the deeptools gather-buffer
+# fix (GatherBuffers.cpp filtering the original SDSC's coreIdsUsed_); on
+# an unfixed backend it faults with a PCIe BusFence on indirect-access
+# ops with wrapping sets.
+core_placement_mode: str = os.environ.get("SPYRE_CORE_PLACEMENT", "neg_shift")
 
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via

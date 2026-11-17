@@ -1714,3 +1714,112 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
                     == core % 8
                 )
     assert prep.dep_device_coordinates == coordinates
+
+
+class TestCorePlacementStrategies:
+    """Placement strategies for ops using fewer cores than the card.
+
+    Contract under test, shared by every strategy: the returned owner map
+    must give every dispatched core its work slice (dispatched set and
+    owner map agree), every non-dispatched fold position must stay in
+    range, and to_core_slices must accept the whole fold. Strategy-specific
+    tests pin each scheme's dispatched ids and non-member evaluation.
+    """
+
+    CORE_ID = sympy.Symbol("core_id")
+
+    def _placed(self, num_cores, physical_cores=32):
+        dim = sympy.Symbol("out")
+        return core_mapping_module.apply_neg_shift(
+            {dim: self.CORE_ID}, num_cores, physical_cores
+        )
+
+    def _owner_map(self, strategy, num_cores, physical_cores=32):
+        dim = sympy.Symbol("out")
+        fn = (
+            core_mapping_module.apply_neg_shift
+            if strategy == "neg_shift"
+            else core_mapping_module.apply_core_stride
+        )
+        return fn({dim: self.CORE_ID}, num_cores, physical_cores)
+
+    @pytest.mark.parametrize(
+        "strategy, num_cores, expected_ids",
+        [
+            ("neg_shift", 2, (31, 0)),
+            ("neg_shift", 4, (30, 31, 0, 1)),
+            ("neg_shift", 8, (28, 29, 30, 31, 0, 1, 2, 3)),
+            ("neg_shift", 16, (24, 25, 26, 27, 28, 29, 30, 31, 0, 1, 2, 3, 4, 5, 6, 7)),
+            ("stride", 2, (0, 16)),
+            ("stride", 4, (0, 8, 16, 24)),
+            ("stride", 8, (0, 4, 8, 12, 16, 20, 24, 28)),
+            ("stride", 16, tuple(range(0, 32, 2))),
+        ],
+    )
+    def test_dispatched_ids_match_strategy(self, strategy, num_cores, expected_ids):
+        _, _, ids = self._owner_map(strategy, num_cores)
+        assert ids == expected_ids
+
+    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
+    def test_members_get_their_work_slices(self, strategy, num_cores):
+        owner_map, span, ids = self._owner_map(strategy, num_cores)
+        assert span == 32
+        for slot, core in enumerate(ids):
+            value = int(owner_map[sympy.Symbol("out")].subs(self.CORE_ID, core))
+            assert value == slot, (
+                f"{strategy}: dispatched core {core} owns slice {value}, want {slot}"
+            )
+
+    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
+    def test_non_members_stay_in_range(self, strategy, num_cores):
+        # Every fold position must evaluate to a slice inside [0, num_cores):
+        # to_core_slices validates exactly this over the full fold, and the
+        # backend requires the shared base symbol to be reachable from the
+        # non-dispatched positions.
+        owner_map, span, ids = self._owner_map(strategy, num_cores)
+        dim = sympy.Symbol("out")
+        division = TensorWorkDivision({dim: num_cores}, owner_map, num_cores=span)
+        slices = division.to_core_slices(span)
+        assert len(slices) == span
+
+    def test_neg_shift_zeroes_non_members(self):
+        # Load-bearing for address planning: non-dispatched fold positions
+        # evaluate to slice 0 so the shared base symbol (anchored on the
+        # slice-0 owner) covers them.
+        owner_map, span, ids = self._placed(8)
+        expr = owner_map[sympy.Symbol("out")]
+        for core in range(32):
+            if core not in ids:
+                assert int(expr.subs(self.CORE_ID, core)) == 0
+
+    def test_stride_non_members_repeat_preceding_slice(self):
+        # Stride's floor(core/stride) maps non-members onto the slice of the
+        # dispatched core below them; in range, never slice 0 in general.
+        owner_map, span, ids = self._owner_map("stride", 8)
+        expr = owner_map[sympy.Symbol("out")]
+        for core in range(32):
+            if core not in ids:
+                assert int(expr.subs(self.CORE_ID, core)) == core // 4
+
+    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    def test_no_op_cases(self, strategy):
+        # Single-slice ops and full-card ops never shift under any strategy.
+        for num_cores in (1, 32):
+            owner_map, span, ids = self._owner_map(strategy, num_cores)
+            assert ids == tuple(range(num_cores))
+            assert span == num_cores
+
+    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    def test_non_dividing_slice_counts_stay_dense(self, strategy):
+        # Neither strategy spreads a slice count that does not divide the
+        # physical core count (e.g. 12 slices over 32 cores).
+        owner_map, span, ids = self._owner_map(strategy, 12)
+        assert ids == tuple(range(12))
+        assert span == 12
+
+    def test_default_mode_is_neg_shift(self):
+        import torch_spyre._inductor.config as config_module
+
+        assert config_module.core_placement_mode == "neg_shift"
