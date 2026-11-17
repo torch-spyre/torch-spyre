@@ -512,6 +512,8 @@ class SymbolicArg:
     tensor_id: int
     dim_index: int
     num_shards: int
+    granularity: int
+    max_value: int
     def __init__(
         self,
         kind: SymbolicArgKind,
@@ -519,6 +521,8 @@ class SymbolicArg:
         dim_index: int = -1,
         value: int = -1,
         num_shards: int = -1,
+        granularity: int = -1,
+        max_value: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 

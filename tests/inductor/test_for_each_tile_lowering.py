@@ -5891,6 +5891,62 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
         ]
         self.assertTrue(readers)
 
+    def test_split_input_clone_has_representable_scheduler_transport(self):
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.pass_utils import (
+            PerCoreView,
+            apply_splits_from_index_coeff,
+            finalize_work_division_for_scheduler,
+            iteration_space_from_op,
+            op_read_writes,
+            select_work_division_transport_indexes,
+        )
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_group_path,
+            get_buffer_users,
+        )
+
+        graph = self._spliced_graph()
+        with V.set_graph_handler(graph):
+            users = get_buffer_users(graph)
+            name = next(
+                name
+                for name in graph.graph_input_names
+                if users.get(name) and counted_loop_group_path(users[name][0])
+            )
+            box = self._tile_input(graph, name)
+            core_id = sympy.Symbol("core_id")
+            clone = GraphEditor(graph).push_allocation_with_clone(
+                box,
+                users[name],
+                input=True,
+                lx_view=PerCoreView(
+                    ((1, 2),), ((1, sympy.Mod(core_id, 2)),), num_cores=2
+                ),
+            )
+            expected_splits = dict(clone.iteration_space_ownership.work_slices)
+            self.assertEqual(clone.iteration_space_ownership.physical_core_count, 2)
+            self.assertEqual(sorted(expected_splits.values()), [1, 2])
+            clone_space = iteration_space_from_op(clone)
+            clone_writes = [
+                dep
+                for dep in op_read_writes(clone).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(len(clone_writes), 1)
+
+            finalize_work_division_for_scheduler(graph)
+            write_index, read_index = select_work_division_transport_indexes(
+                clone, op_read_writes(clone), clone_space
+            )
+            decoded = apply_splits_from_index_coeff(
+                clone.op_it_space_splits, write_index, read_index, clone_space
+            )
+            self.assertEqual(decoded, expected_splits)
+
 
 class TestRepointRefsToBuffer(unittest.TestCase):
     """An outside consumer of a spliced loop output is repointed at the carry."""
