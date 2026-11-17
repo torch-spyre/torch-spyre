@@ -100,7 +100,6 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     op_read_writes,
-    rescale_stl_for_dtype,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
 )
