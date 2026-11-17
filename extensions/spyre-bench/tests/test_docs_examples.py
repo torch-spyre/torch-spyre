@@ -161,7 +161,7 @@ class DocsCatalogs(unittest.TestCase):
 # catalog -> [(selection, purpose, cases)]: the nightly and weekly Selections of docs/dev/12
 REAL = {
     "real-vllm-bench": [("smoke", "pr", 1), ("nightly-small", "nightly", 4), ("weekly-full", "weekly", 12)],
-    "real-perf-suite": [("smoke", "pr", 1), ("ops-core", "nightly", 6), ("ops-extended", "weekly", 6)],
+    "real-perf-suite": [("smoke", "pr", 1), ("ops-core", "nightly", 19), ("ops-extended", "weekly", 19)],
     "real-perf-suite-models": [("smoke", "pr", 1), ("models-nightly", "nightly", 12), ("models-weekly", "weekly", 36)],
 }
 # producer checkout of benchmarks/ -> env var that points at it; torch-spyre defaults to this repository
@@ -233,7 +233,7 @@ class RealCatalogs(unittest.TestCase):
         for c in cat.cases:
             ing = cat.ingest_inputs(c)
             self.assertEqual((ing["profile"], tuple(ing["disc_keys"])), ("perf-kernel", engine.INGEST_DISC_KEYS))
-            self.assertEqual(ing["disc"]["input_shapes"], c["workload"]["flags"]["input_shapes"])
+            self.assertEqual(ing["disc"]["input_shapes"], c["workload"]["flags"].get("input_shapes", ""))
 
     def test_shared_definitions_match_their_producers(self):
         checked = 0

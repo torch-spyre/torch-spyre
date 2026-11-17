@@ -17,17 +17,20 @@ spec:
       iterations: 100
       warmup_iterations: 3
   run:
+    est: 6m
     command:
       - python3
       - benchmarks/tools/run_kernel_case.py
       - --op
-      - '{case.op}'
+      - '{benchmark}'
       - --shape
       - '{case.flags.input_shapes}'
       - --suite-dir
       - '{out_dir}/suite'
       - --raw-dir
       - '{raw_dir}'
+      - --repeat-dir
+      - '{repeat_dir}'
   identity:
     mode: ingest
     profile: perf-kernel
@@ -42,7 +45,7 @@ spec:
     name_template: softmax_{shape}
     axes:
       shape:
-        - token: s1
-          patch: {workload: {flags: {input_shapes: '1_512_4096__4096_4096'}}}
-        - token: s2
-          patch: {workload: {flags: {input_shapes: '1_128_1024'}}}
+        - token: prefill
+          patch: {workload: {flags: {input_shapes: '[[1, 512, 4096]]'}}}
+        - token: decode
+          patch: {workload: {flags: {input_shapes: '[[4, 1, 4096]]'}}}

@@ -523,7 +523,7 @@ spec:
 ```
 
 The catalog also has `smoke` (one case, never ingested) and `ops-sanity`. Nightly runs `ops-core`; weekly runs
-`ops-extended`. Today every declared case is at most `core`, so the two select the same six cases: the weekly Selection
+`ops-extended`. Today every declared case is at most `core`, so the two select the same 19 cases: the weekly Selection
 is there so that an operator added at tier `extended` joins the weekly run alone.
 
 ### Metrics
@@ -566,17 +566,20 @@ spec:
       iterations: 100
       warmup_iterations: 3
   run:
+    est: 6m
     command:
       - python3
       - benchmarks/tools/run_kernel_case.py
       - --op
-      - '{case.op}'
+      - '{benchmark}'
       - --shape
       - '{case.flags.input_shapes}'
       - --suite-dir
       - '{out_dir}/suite'
       - --raw-dir
       - '{raw_dir}'
+      - --repeat-dir
+      - '{repeat_dir}'
   identity:
     mode: ingest
     profile: perf-kernel
@@ -591,14 +594,22 @@ spec:
     name_template: matmul_{shape}
     axes:
       shape:
-        - token: s1
-          patch: {workload: {flags: {input_shapes: '1_512_4096__4096_4096'}}}
-        - token: s2
-          patch: {workload: {flags: {input_shapes: '1_128_1024__1024_1024'}}}
+        - token: prefill-n1024
+          patch: {workload: {flags: {input_shapes: '[[1, 512, 4096], [4096, 1024]]'}}}
+        - token: prefill-n4096
+          patch: {workload: {flags: {input_shapes: '[[1, 512, 4096], [4096, 4096]]'}}}
+        - token: prefill-n12800
+          patch: {workload: {flags: {input_shapes: '[[1, 512, 4096], [4096, 12800]]'}}}
+        - token: decode-n1024
+          patch: {workload: {flags: {input_shapes: '[[4, 1, 4096], [4096, 1024]]'}}}
+        - token: decode-n4096
+          patch: {workload: {flags: {input_shapes: '[[4, 1, 4096], [4096, 4096]]'}}}
+        - token: decode-n12800
+          patch: {workload: {flags: {input_shapes: '[[4, 1, 4096], [4096, 12800]]'}}}
 ```
 
 - The Benchmark name is the operation name the report uses, because the ingest hashes it. One matrix axis lists the
-  shapes; each becomes a case `matmul_s1`, `matmul_s2`. Replace the shape strings with the report's own when you add a
+  shapes; each becomes a case `matmul_prefill-n1024`, `matmul_decode-n4096`, and so on. Replace the shape strings with the report's own when you add a
   real operator: a case whose operation and shape the report does not contain fails at run time instead of ingesting a
   row.
 - `perf-kernel` hashes six keys. An operator-level row has an empty `kernel_name` and `is_total`; per-kernel and total rows
@@ -677,19 +688,19 @@ spec:
 
 ```bash validated
 spyre-bench validate examples/real-perf-suite
-spyre-bench explain matmul_s1 --catalog examples/real-perf-suite
+spyre-bench explain matmul_prefill-n4096 --catalog examples/real-perf-suite
 spyre-bench ids --catalog examples/real-perf-suite --inputs
 spyre-bench validate examples/real-perf-suite-models
 spyre-bench explain "gpt2/config=one-block/mode=prefill-only" --catalog examples/real-perf-suite-models
 ```
 
-The ingest identity of `matmul_s1` reads:
+The ingest identity of `matmul_prefill-n4096` reads:
 
 ```text
 ingest_identity:
   component: torch-spyre
   name: matmul
-  disc: {record_type: op, config_name: '', input_shapes: '1_512_4096__4096_4096', run_mode: op_benchmark, kernel_name: '', is_total: ''}
+  disc: {record_type: op, config_name: '', input_shapes: '[[1, 512, 4096], [4096, 4096]]', run_mode: op_benchmark, kernel_name: '', is_total: ''}
   profile: perf-kernel
 ```
 
@@ -708,8 +719,8 @@ spyre-bench plan --catalog examples/real-perf-suite-models --purpose nightly --s
 ```json validated subset-of=plan-b-ops-nightly.json
 {
   "purpose": "nightly",
-  "summary": {"cases": 6, "run": 6, "reuse": 0, "skip": 0},
-  "cases": [{"name": "matmul_s1", "environment": "one-device", "id_mode": "ingest", "id_profile": "perf-kernel"}]
+  "summary": {"cases": 19, "run": 19, "reuse": 0, "skip": 0},
+  "cases": [{"name": "attention_prefill", "environment": "one-device", "id_mode": "ingest", "id_profile": "perf-kernel"}]
 }
 ```
 
