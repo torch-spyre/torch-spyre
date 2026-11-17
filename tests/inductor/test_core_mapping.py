@@ -578,7 +578,13 @@ def test_alignment_preview_is_repeatable_and_does_not_consume_repeat_info():
     original = {symbol: dict(info) for symbol, info in repeat_info.items()}
     args = (
         {dim: (sympy.Integer(4), 2)},
-        [{"size": [2, 64], "coordinates": [sympy.floor(dim / 2), dim]}],
+        [
+            {
+                "elems_per_stick": 64,
+                "size": [2, 64],
+                "coordinates": [sympy.floor(dim / 2), dim],
+            }
+        ],
     )
 
     preview = align_tensors(*args, repeat_info=repeat_info)

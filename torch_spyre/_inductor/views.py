@@ -1343,11 +1343,8 @@ def align_tensors_pure(
             # if no candidate outer stick dim, add 1 to desired rank
             rank = max(rank, len(t["size"]) + not_found)
         else:
-            # An outer coordinate is the stick's outer dim if it carries the stick
-            # variable, or one of its split segments (the rewritten tile, e.g. z0).
-            stick_vars = {stick_dim[i]} | set(remap.get(stick_dim[i], []))
             for c, s in zip(t["coordinates"][:-n_stick], t["size"][:-n_stick]):
-                if (c.free_symbols & stick_vars) or (s == 1 and c == 0):
+                if stick_dim[i] in c.free_symbols or (s == 1 and c == 0):
                     not_found = 0
                     break
             # if no candidate outer stick dim, add 1 to desired rank
@@ -1364,14 +1361,10 @@ def align_tensors_pure(
         vars = t["coordinates"][-1].free_symbols
         if len(vars) == 1:
             stick_dim_var = next(iter(vars))
-            # The stick variable may already occur outside the stick as one of its
-            # split segments (e.g. the rewritten N-tile z0 of d1): that is an
-            # occurrence, so no second copy is synthesized.
-            occurrences = {stick_dim_var} | set(remap.get(stick_dim_var, []))
             found = False
             for i in range(len(t["coordinates"]) - 1):
                 vars = t["coordinates"][i].free_symbols
-                if vars & occurrences:
+                if stick_dim_var in vars:
                     found = True
                     continue
             if not found:

@@ -954,7 +954,27 @@ def _clone_layout(
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
     in_device_coords = device_coordinates(in_stl, in_dep, None)
-    stick_expr = in_device_coords[-1]
+    in_stick_dims = stick_dims(in_stl)
+    multi_dim_stick = len(in_stick_dims) > 1
+    if multi_dim_stick:
+        # A QFP8WT input's stick is two device dims. The stick that carries the
+        # innermost host element (the variable with stride 1 in the read index)
+        # is the one the clone's element order depends on; its extent is its own
+        # device size, not the whole fp8 stick.
+        inner_vars = [
+            v for v in in_dep.index.free_symbols if in_dep.index.coeff(v) == 1
+        ]
+        stick_dim = next(
+            (
+                d
+                for d in in_stick_dims
+                if inner_vars and inner_vars[0] in in_device_coords[d].free_symbols
+            ),
+            in_stick_dims[-1],
+        )
+        stick_expr = in_device_coords[stick_dim]
+    else:
+        stick_expr = in_device_coords[-1]
 
     # Clone preserves physical format, so a bool output must match its
     # input's -- substitute the equivalent logical dtype since
@@ -964,12 +984,19 @@ def _clone_layout(
     else:
         dtype_for_layout = output.dtype
     stick_size = get_elem_in_stick(dtype_for_layout)
+    if multi_dim_stick:
+        stick_size = int(in_stl.device_size[stick_dim])
 
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    out_stl = SpyreTensorLayout(
-        c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
-    )
+    if in_stl.element_arrangement == ElementArrangement.QFP8WT:
+        # Clone preserves the physical format: a QFP8WT input yields a QFP8WT
+        # output for the (contiguous) output shape, not a standard layout.
+        out_stl = qfp8wt_layout(c_size, c_stride, dtype_for_layout)
+    else:
+        out_stl = SpyreTensorLayout(
+            c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
+        )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
         # Case 1: No restickify insertion needed.
@@ -3008,8 +3035,18 @@ def _find_alt_target_stl(
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size) and not (
+    write_coords = device_coordinates(target_stl, output_dep, None)
+    write_stick = write_coords[-1]
+    if target_stl.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT stick is two device dims, [N/64, K/2, 64, 2]. Each stick dim is
+        # offset-free against its own size; the last coordinate is only K's 2-wide
+        # dim, so it cannot stand for the stick (see _check_supported_input_sticks).
+        if all(
+            is_stick_expr_offset_free(write_coords[d], int(target_stl.device_size[d]))
+            for d in stick_dims(target_stl)
+        ):
+            return None
+    elif is_stick_expr_offset_free(write_stick, stick_size) and not (
         _is_substick_write(write_stick, target_layout, output_dep, stick_size)
     ):
         return None
@@ -3647,6 +3684,17 @@ def propagate_spyre_tensor_layouts(
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
                 op.layouts = [target_stl]
+                if (
+                    args
+                    and args[0].layouts
+                    and len(stick_dims(next(iter(args[0].layouts)))) > 1
+                ):
+                    # A copy from a multi-dim-stick input (QFP8WT's [K/2, 64]) cannot
+                    # restickify that input, and AllSameNode would demand the input
+                    # match the target's stick. The copy's data conversion repacks
+                    # the elements, so no edge is needed.
+                    op.restick_cost_fn = AnyInNode.from_args()
+                    continue
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )
