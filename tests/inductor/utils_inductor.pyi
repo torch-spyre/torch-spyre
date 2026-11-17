@@ -1,5 +1,6 @@
 from typing import Any, overload
 
+def expects_raise(test: Any) -> Any: ...
 @overload
 def make_test(_base_func: Any, _op: Any, _params: Any) -> Any: ...
 @overload

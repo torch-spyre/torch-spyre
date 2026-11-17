@@ -16,7 +16,20 @@ import torch
 import torch.distributed as dist
 import os
 import pytest
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from utils import (
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
+    _native_bfloat16_tensor,
+)
 
 # Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
 if "RANK" not in os.environ:
@@ -48,6 +61,7 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
+@instantiate_parametrized_tests
 class TestBroadcast(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -224,6 +238,66 @@ class TestBroadcast(TestCase):
             fill_value=7.5,
             async_op=True,
         )
+
+    @parametrize("shape", [(128,), (4, 64), (4, 96)])
+    @parametrize("async_op", [False, True])
+    def test_broadcast_bfloat16(self, shape, async_op):
+        x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+        work = dist.broadcast(x, src=self.comm_size - 1, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+        else:
+            self.assertIsNone(work)
+        self.assertEqual(
+            x.cpu(),
+            _bfloat16_collective_expected("broadcast", shape, self.comm_size),
+            rtol=0,
+            atol=0,
+        )
+
+    @parametrize("async_op", [False, True])
+    def test_broadcast_float16_padded(self, async_op):
+        shape = (4, 96)
+        x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+        work = dist.broadcast(x, src=self.comm_size - 1, async_op=async_op)
+        if async_op:
+            work.wait()
+        self.assertEqual(
+            x.cpu(),
+            _collective_expected("broadcast", shape, self.comm_size, torch.float16),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_broadcast_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            dist.broadcast(x, src=0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    @parametrize("last_rank", [False, True])
+    def test_broadcast_scalar(self, dtype, async_op, last_rank):
+        """A logical scalar still communicates its full padded device stick."""
+        root = self.comm_size - 1 if last_rank else 0
+        value = 2.0**20 if dtype == torch.bfloat16 else 16.0
+        expected = torch.tensor(value, dtype=dtype)
+        x = torch.tensor(value if self.comm_rank == root else -1.0, dtype=dtype).to(
+            DEVICE
+        )
+        work = dist.broadcast(x, src=root, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work)
+        result = x.cpu()
+        self.assertEqual(result.shape, torch.Size([]))
+        self.assertEqual(result, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

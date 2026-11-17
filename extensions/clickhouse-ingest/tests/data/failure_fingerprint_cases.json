@@ -1,0 +1,105 @@
+{
+  "note": "Synthetic messages; expectations recorded from v_failure_fingerprint on a sandbox. fp_* are cityHash64 values as strings. Regenerate in a sandbox when the rules change.",
+  "cases": [
+    {
+      "case": "wrapper_indented_error",
+      "test": "t1",
+      "status": "failed",
+      "message": "torch._inductor.exc.InductorError: SubprocException: An exception occurred in a subprocess:\n\nName=k_0\nTraceback (most recent call last):\n  File \"/a/b/c.py\", line 3, in f\nsubprocess.CalledProcessError: Command x failed\n\nThe above exception was the direct cause of the following exception:\nRuntimeError: tool failed with exit code 1.\n  Error: Missing required field fooProp_\n",
+      "exception_class": "torch._inductor.exc.InductorError",
+      "fp_coarse": "4816688463292796012",
+      "fp_fine": "1390830460311079462",
+      "fp_text": "Error: Missing required field fooProp_"
+    },
+    {
+      "case": "wrapper_mlir_error",
+      "test": "t1",
+      "status": "failed",
+      "message": "torch._inductor.exc.InductorError: SubprocException: An exception occurred in a subprocess:\nsubprocess.CalledProcessError: Command x failed\nRuntimeError: tool failed with exit code 1.\n/tmp/aa/bb/bundle.mlir:696:3: error: sbf-ddc: DtException: size 496 != 64\n/tmp/aa/bb/bundle.mlir:697:3: error: other",
+      "exception_class": "DtException",
+      "fp_coarse": "10681988093345301868",
+      "fp_fine": "2599028388927647857",
+      "fp_text": "sbf-ddc: DtException: size # != #"
+    },
+    {
+      "case": "truncated_no_cause",
+      "test": "t1",
+      "status": "failed",
+      "message": "  File \"/a/b/c.py\", line 5, in f\n    proc = run(\n           ^^^^^^^^\n",
+      "exception_class": "",
+      "fp_coarse": "6733622022244653007",
+      "fp_fine": "6220337137973275890",
+      "fp_text": "File \"<path>\", line #, in f"
+    },
+    {
+      "case": "numbers_a",
+      "test": "t2",
+      "status": "failed",
+      "message": "RuntimeError: shape mismatch (496, 64) vs 3\n  at /x/y/z.py:12",
+      "exception_class": "RuntimeError",
+      "fp_coarse": "7371935389810920998",
+      "fp_fine": "15636300910304097430",
+      "fp_text": "RuntimeError: shape mismatch (#, #) vs #"
+    },
+    {
+      "case": "numbers_b",
+      "test": "t2",
+      "status": "failed",
+      "message": "RuntimeError: shape mismatch (16, 64) vs 3\n  at /x/y/z.py:12",
+      "exception_class": "RuntimeError",
+      "fp_coarse": "7371935389810920998",
+      "fp_fine": "12413132700182575493",
+      "fp_text": "RuntimeError: shape mismatch (#, #) vs #"
+    },
+    {
+      "case": "same_cause_other_test",
+      "test": "t3",
+      "status": "failed",
+      "message": "RuntimeError: shape mismatch (16, 64) vs 3",
+      "exception_class": "RuntimeError",
+      "fp_coarse": "7371935389810920998",
+      "fp_fine": "2995866249541393288",
+      "fp_text": "RuntimeError: shape mismatch (#, #) vs #"
+    },
+    {
+      "case": "tensor_likes_a",
+      "test": "t4",
+      "status": "failed",
+      "message": "AssertionError: Tensor-likes are not equal!\nMismatched elements: 5 / 100 (5.0%)",
+      "exception_class": "AssertionError",
+      "fp_coarse": "8443516869392285431",
+      "fp_fine": "17601126569060969482",
+      "fp_text": "AssertionError: Tensor-likes are not equal!"
+    },
+    {
+      "case": "tensor_likes_b",
+      "test": "t4",
+      "status": "failed",
+      "message": "AssertionError: Tensor-likes are not equal!\nMismatched elements: 7 / 900 (0.8%)",
+      "exception_class": "AssertionError",
+      "fp_coarse": "8443516869392285431",
+      "fp_fine": "17601126569060969482",
+      "fp_text": "AssertionError: Tensor-likes are not equal!"
+    },
+    {
+      "case": "unrelated_a",
+      "test": "t5",
+      "status": "error",
+      "message": "ValueError: bad axis 3",
+      "exception_class": "ValueError",
+      "fp_coarse": "672893233196715639",
+      "fp_fine": "15093994454763804221",
+      "fp_text": "ValueError: bad axis #"
+    },
+    {
+      "case": "unrelated_b",
+      "test": "t6",
+      "status": "error",
+      "message": "KeyError: abc",
+      "exception_class": "KeyError",
+      "fp_coarse": "6182007773122291675",
+      "fp_fine": "17363793583901301449",
+      "fp_text": "KeyError: abc"
+    }
+  ]
+}

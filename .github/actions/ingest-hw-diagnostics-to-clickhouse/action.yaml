@@ -160,42 +160,17 @@ runs:
         source .venv/bin/activate
         mkdir -p raw_logs
 
-        retry() {
-          # ~2 min of backoff: GitHub's 502 spells outlast 30s.
-          local max_attempts=7 attempt=1 delay=2
-          until "$@"; do
-            if [ "${attempt}" -ge "${max_attempts}" ]; then
-              echo "::error::command failed after ${attempt} attempts: $*" >&2
-              return 1
-            fi
-            echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
-            sleep "${delay}"
-            attempt=$((attempt + 1))
-            delay=$((delay * 2))
-          done
-        }
-
-        # filter=latest excludes a prior attempt of this run leaking in and doubling every
-        # row. --method GET is required: gh api infers POST as soon as any -f/-F field is
-        # given, and this endpoint has no POST route. The redirect lives inside the function
-        # so each retry starts from an empty file, not the pages an earlier attempt wrote.
-        list_jobs() {
-          gh api \
-            --method GET \
-            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-            --paginate \
-            -f filter=latest \
-            -f per_page=100 \
-            --jq '.jobs[] | {id: .id, name: .name}' \
-          > /tmp/jobs.jsonl
-        }
-        retry list_jobs
-
         python3 - << 'PYEOF'
         import os
 
-        from spyre_clickhouse_ingest.gha_logs import download_job_logs_or_die, load_jobs
+        from spyre_clickhouse_ingest.gha_logs import (
+            download_job_logs_or_die,
+            list_jobs,
+            load_jobs,
+        )
 
+        # filter=latest keeps a prior attempt of this run from doubling every row.
+        list_jobs(os.environ["REPO"], os.environ["RUN_ID"], "/tmp/jobs.jsonl")
         download_job_logs_or_die(
             load_jobs("/tmp/jobs.jsonl"),
             repo=os.environ["REPO"],

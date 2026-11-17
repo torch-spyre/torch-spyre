@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the matmul M/N/K decode in ``dump_cost_model._matmul_features``.
+"""Unit tests for the matmul M/N/K decode in ``cost_features._matmul_features``.
 
 Regression guard for the batchmatmul decode bug: for a 3D ``[B, M, N]`` output the
 batch stride is the LARGEST write-index coefficient, so the old "largest coeff = M"
@@ -40,17 +40,18 @@ from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor.cost_model import ArgTraffic
-from torch_spyre._inductor.dump_cost_model import (
+from torch_spyre._inductor.cost_features import (
     _level_loop_vars,
     _loop_factor_for_index,
     _loop_var_advances,
     _stamped_advances,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
 
 
 class _FakeDep:
@@ -1461,6 +1462,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[hidden // 64, _T, 64],
                     stride_map=[64, hidden, 1],
                     device_dtype=DataFormats.SEN169_FP16,
+                    valid_elements={(0, 2): hidden, (1,): _T},
                 ),
             ),
             "arg1": (
@@ -1469,6 +1471,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[_E, hidden, cols // 64, 64],
                     stride_map=[hidden * cols, cols, 64, 1],
                     device_dtype=bank_dtype,
+                    valid_elements={(0,): _E, (1,): hidden, (2, 3): cols},
                 ),
             ),
         }
@@ -1533,6 +1536,9 @@ def test_operand_geometry_declines_an_indirect_bank_index(monkeypatch):
     op.get_read_writes = lambda: SimpleNamespace(
         reads=[rw.reads[0], bank], writes=rw.writes
     )
+    # The op now reads differently, in place: the extraction above is memoized
+    # on it (op_read_writes), so drop it as any in-place edit must.
+    invalidate_op_read_writes(op)
     feature = _features(monkeypatch, op, space, **kwargs)
     read = _read(feature, "arg1")
     with V.set_graph_handler(graph):

@@ -1401,6 +1401,33 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertEqual(result.chosen_division, 1)
         self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
 
+    def test_solve_runs_without_the_variable_shaving_subsolvers(self):
+        from ortools.sat.python import cp_model
+
+        ignored = []
+        solve = cp_model.CpSolver.Solve
+
+        def record_and_solve(solver, model, *args, **kwargs):
+            ignored.append(list(solver.parameters.ignore_subsolvers))
+            return solve(solver, model, *args, **kwargs)
+
+        buf = CoreDivisionBuffer("out", 100, [0, 1], core_divisions=_whole())
+        with mock.patch.object(cp_model.CpSolver, "Solve", record_and_solve):
+            self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+
+        self.assertTrue(ignored)
+        for names in ignored:
+            self.assertEqual(
+                set(names),
+                {
+                    "variables_shaving",
+                    "variables_shaving_no_lp",
+                    "variables_shaving_max_lp",
+                },
+            )
+
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
         # child.start_time + 1) with whole-only divisions and capacity for just

@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from functools import lru_cache
 from typing import Optional
 
+import sympy
 import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
@@ -233,12 +234,30 @@ def _strip_debug_handles(obj):
     return obj
 
 
+def _normalized_expr_str(expr) -> str:
+    """``str(expr)`` in the spelling the reload path will produce.
+
+    Hashing a raw ``str`` makes the cache key depend on which side of a reload
+    the expression was last on. Normalising means both sides agree. Falls back
+    to the raw string if the expression does not survive a parse, which keeps a
+    key computable rather than failing a compile over a hash input.
+    """
+    raw = str(expr)
+    try:
+        return str(sympy.sympify(raw))
+    except (sympy.SympifyError, SyntaxError, TypeError):
+        # A spelling sympify cannot parse is still a usable key. Anything else
+        # is a real bug and propagates.
+        return raw
+
+
 def compute_specs_hash(
     specs: Sequence,
     kernel_name: str = "",
     pool_size: int = 0,
     *,
     backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
 
@@ -258,6 +277,8 @@ def compute_specs_hash(
                      their pool size get different cache keys.
         backend_loop_unroll: Resolved setting passed to the backend compiler.
                              Defaults to the active Spyre config.
+        ktir_device_mlir: Resolved device override passed to the backend compiler.
+                          Defaults to the active Spyre config.
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -265,6 +286,8 @@ def compute_specs_hash(
 
     if backend_loop_unroll is None:
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -286,10 +309,49 @@ def compute_specs_hash(
                 # Include the trip count so loops with different iteration
                 # counts never collide, even when their body OpSpecs produce
                 # identical SDSC JSON.
-                loop_count_str = str(entry.count)
+                # Normalised through one sympify, because str() is NOT stable
+                # across the reload. The serializer writes sympify('<str>') and
+                # str(FloorDiv(s0, 64)) is "(s0//64)", which re-parses as
+                # floor(s0/64) and prints as "floor(s0/64)". Hashing the raw
+                # string would give a reloaded kernel a different key from the
+                # one that produced it, so it misses its own entry and
+                # recompiles, in the one feature whose point is not recompiling.
+                # The round trip is idempotent: both spellings normalise to the
+                # same string, and a concrete count is unaffected.
+                loop_count_str = _normalized_expr_str(entry.count)
                 content_parts.append(f"loop_count:{loop_count_str}".encode())
                 _debug_loop_counts.append(loop_count_str)
                 logger.debug("  [hash] LoopSpec  count=%s", loop_count_str)
+                # The per-symbol max and tile size are NOT recoverable from the
+                # count string: two kernels can share "FloorDiv(s0, 64)" while
+                # declaring different maxima, and the max reaches the bundle's
+                # input_arg rather than the SDSC JSON hashed below. Without this
+                # they collide and the second is served a binary built for the
+                # first one's range.
+                if entry.count_symbol_bounds:
+                    bounds = json.dumps(
+                        {
+                            name: list(bound)
+                            for name, bound in entry.count_symbol_bounds.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_bounds:{bounds}".encode())
+                    logger.debug("  [hash] LoopSpec  bounds=%s", bounds)
+                # Which argument and dim the runtime reads each symbol from is
+                # baked into the bundle's parameter list, so two otherwise
+                # identical kernels reading the same dimension off different
+                # arguments are different binaries.
+                if entry.count_symbol_sources:
+                    sources = json.dumps(
+                        {
+                            name: list(source)
+                            for name, source in entry.count_symbol_sources.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_sources:{sources}".encode())
+                    logger.debug("  [hash] LoopSpec  sources=%s", sources)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
@@ -392,6 +454,7 @@ def compute_specs_hash(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
     content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
+    content_parts.append(f"ktir_device_mlir:{ktir_device_mlir}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(

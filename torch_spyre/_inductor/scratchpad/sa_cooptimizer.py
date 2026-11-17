@@ -835,13 +835,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 chosen[idx].menu_index
             )
             for key, sym in buf.sym_core_divs.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
-                    chosen[idx].splits.get(key, 1)
-                )
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: chosen[
+                    idx
+                ].splits.get(key, 1)
             for key, sym in buf.sym_tile_counts.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
-                    chosen[idx].tiling.count_for(key)
-                )
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: chosen[
+                    idx
+                ].tiling.count_for(key)
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):
@@ -1268,6 +1268,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # division-dependent ineligibility is deliberately *not* expressed here: it
         # must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
+        # FirstFit rejects an in-place child larger than its parent outright; the
+        # packer instead skips such a pair per move, as sizes change with the
+        # division. Drop those pairs for the seed pass only, as
+        # ExhaustiveSearchSolver does (an unsized parent clamps to 0 here).
+        for b in ff_bufs:
+            child_size = sizes[self._name_to_idx[b.name]]
+            b.in_place_parents = [
+                p
+                for p in b.in_place_parents
+                if sizes[self._name_to_idx[p]] >= child_size
+            ]
         # Deep-copied so FirstFit lays out its own objects, never the ones the
         # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(
@@ -1926,20 +1937,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _log_tilings(self) -> None:
         """Report the tiled runs the search kept, each with its companion
-        traffic, or that it kept none although some buffer could tile."""
+        traffic, or that it kept none although some buffer could tile; and
+        which buffers that could tile it left untiled."""
         if not self._tilings_are_possible:
             return
         charges: dict[tuple[int, int], int] = {}
         for run, nbytes in self._companion_charges(self.packer.addresses):
             charges[run] = charges.get(run, 0) + nbytes
         tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
+        could_tile = [
+            idx
+            for idx, source in enumerate(self._sources)
+            if isinstance(source, _GeneratedDivisions) and source.can_tile()
+        ]
         if not tiled:
             logger.info(
                 "SA co-optimizer kept no coarse tiling; %d buffer(s) could tile",
-                sum(
-                    isinstance(source, _GeneratedDivisions) and source.can_tile()
-                    for source in self._sources
-                ),
+                len(could_tile),
+            )
+        left_untiled = [
+            self._bufs[idx].name
+            for idx in could_tile
+            if self.chosen[idx].tiling.is_untiled
+        ]
+        if left_untiled:
+            # What each was offered is logged by wsr.enumerate_tilings.
+            logger.debug(
+                "SA co-optimizer left untiled, though each could tile: %s",
+                ", ".join(left_untiled),
             )
         for lo, hi in tiled:
             logger.debug(

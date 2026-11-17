@@ -2282,11 +2282,11 @@ class CompanionBufferPricingTest(TestCase):
     def test_a_search_that_keeps_no_tiling_says_so(self):
         # Everything fits untiled, so no tiling pays.
         solver = _run_solver("AB", parents={"B": ["A"]})
-        with self.assertLogs(sa_module.logger, level="INFO") as logs:
+        with self.assertLogs(sa_module.logger, level="DEBUG") as logs:
             solver.plan_layout_and_core_divisions()
-        self.assertIn(
-            "kept no coarse tiling; 2 buffer(s) could tile", "\n".join(logs.output)
-        )
+        output = "\n".join(logs.output)
+        self.assertIn("kept no coarse tiling; 2 buffer(s) could tile", output)
+        self.assertIn("left untiled, though each could tile: A, B", output)
 
     @staticmethod
     def _sized_run_buffer(name, position):

@@ -18,9 +18,11 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
+#include <c10/util/safe_numerics.h>
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -52,6 +54,25 @@ enum class ElementArrangement {
   FP32_TO_DL16 = 4,  // non-sequential order produced by fp32->dl16 on-device
                      // conversions
   QFP8WT = 5,        // 2D stick layout for FP8 weight tensors
+};
+
+/**
+ * Per-dim bounds for a reserved (max-strided) dimension: the runtime-legal
+ * range [min, max] and the step size (granularity) within it. Every legal
+ * runtime size at that dim is a multiple of granularity, min <= size <= max.
+ * granularity == 1 means "any size in [min, max]" (no step restriction).
+ *
+ * `max` is required to be a multiple of `granularity` (enforced in
+ * spyre_empty_reserved); `min` is not, and is not symmetric with `max`
+ * here. `min` is only a floor on which steps count as legal, not itself
+ * a value anything needs to land on -- if `min` is not a multiple of
+ * `granularity`, the smallest actually-legal runtime size is the next
+ * multiple of `granularity` at or above `min`, not `min` itself.
+ */
+struct ReservedDimInfo {
+  int64_t min;
+  int64_t max;
+  int64_t granularity;
 };
 
 inline std::string elementArrangementToString(ElementArrangement ea) {
@@ -133,10 +154,10 @@ class SpyreTensorLayout {
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
    *
-   * When valid_elements is omitted, it defaults to
-   * compute_valid_elements(device_size), which conservatively treats every
-   * device element as valid. This is incorrect for padded tensors and should
-   * not be relied upon until the caller supplies accurate valid_elements.
+   * When valid_elements is omitted, it defaults to {}, meaning the valid
+   * extents are unknown. No consumer uses valid_elements for layout decisions
+   * yet, but one that does must not treat {} as "every device element is
+   * valid".
    *
    * @deprecated Use the overload that takes valid_elements as a required
    * parameter (before element_arrangement) to ensure accurate padding
@@ -156,14 +177,14 @@ class SpyreTensorLayout {
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
         valid_elements(std::move(valid_elements)) {
+    normalize_stride_map();
     validate_shape();
   }
 
   /**
    * Construct a SpyreTensorLayout with the specified device_size, stride_map,
    * and valid_elements. Unlike the overload above, valid_elements is required
-   * here, so callers must supply accurate padding information rather than
-   * relying on the conservative compute_valid_elements(device_size) default.
+   * here, so callers must supply accurate padding information.
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
@@ -175,7 +196,20 @@ class SpyreTensorLayout {
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
         valid_elements(std::move(valid_elements)) {
+    normalize_stride_map();
     validate_shape();
+  }
+
+  /**
+   * Normalize a legacy -1 ("synthetic") stride_map entry to 0 and reject
+   * anything below -1. Every constructor taking a stride_map must call this.
+   */
+  void normalize_stride_map() {
+    for (auto& s : stride_map) {
+      TORCH_CHECK(s >= -1, "Invalid SpyreTensorLayout: stride_map entry ", s,
+                  " is not a valid stride (must be >= -1)");
+      if (s == -1) s = 0;
+    }
   }
 
   /**
@@ -197,6 +231,10 @@ class SpyreTensorLayout {
    * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
    * Consistency between stride_map and the host strides is only knowable at
    * use time and is checked in get_device_stride_infos.
+   *
+   * valid_elements is validated here, too: keys are disjoint, strictly
+   * increasing, in-range dimension tuples, and each count is between 0 and the
+   * product of the group's device extents. This is vacuously true for {}.
    */
   void validate_shape() const {
     TORCH_CHECK(!device_size.empty(),
@@ -209,6 +247,58 @@ class SpyreTensorLayout {
                   "Invalid SpyreTensorLayout: device dimension ", i,
                   " has negative size ", device_size[i],
                   "; every device dimension must be non-negative (device_size=",
+                  c10::ArrayRef<int64_t>(device_size), ")");
+    }
+    std::vector<uint8_t> seen(device_size.size());
+    for (const auto& [device_dim_indices, element_count] : valid_elements) {
+      TORCH_CHECK(!device_dim_indices.empty(),
+                  "Invalid SpyreTensorLayout: valid_elements contains an empty "
+                  "device dimension tuple");
+
+      for (size_t i = 0; i + 1 < device_dim_indices.size(); ++i) {
+        TORCH_CHECK(device_dim_indices[i] < device_dim_indices[i + 1],
+                    "Invalid SpyreTensorLayout: valid_elements entry has key "
+                    "that is not strictly increasing (key=",
+                    c10::ArrayRef<int64_t>(device_dim_indices), ")");
+      }
+
+      int64_t device_space = 1;
+      for (int64_t device_dim_index : device_dim_indices) {
+        TORCH_CHECK(device_dim_index >= 0,
+                    "Invalid SpyreTensorLayout: keys in valid_elements must "
+                    "consist of nonnegative integers, but encountered ",
+                    device_dim_index, " (the full key is ",
+                    c10::ArrayRef<int64_t>(device_dim_indices), ")");
+        TORCH_CHECK(
+            device_dim_index < static_cast<int64_t>(device_size.size()),
+            "Invalid SpyreTensorLayout: keys in valid_elements must "
+            "consist of integers less than len(device_size) == ",
+            device_size.size(), ", but encountered ", device_dim_index,
+            " (the full key is ", c10::ArrayRef<int64_t>(device_dim_indices),
+            " and device_size=", c10::ArrayRef<int64_t>(device_size), ")");
+
+        TORCH_CHECK(seen[device_dim_index] == 0,
+                    "Invalid SpyreTensorLayout: multiple keys in "
+                    "valid_elements contain the device dimension index ",
+                    device_dim_index);
+        seen[device_dim_index] = 1;
+
+        // On overflow the true product exceeds any int64 count, so saturate.
+        if (c10::mul_overflows(device_space, device_size[device_dim_index],
+                               &device_space)) {
+          device_space = std::numeric_limits<int64_t>::max();
+        }
+      }
+
+      TORCH_CHECK(element_count >= 0,
+                  "Invalid SpyreTensorLayout: valid_elements' values must be "
+                  "nonnegative integers, but found value ",
+                  element_count);
+      TORCH_CHECK(element_count <= device_space,
+                  "Invalid SpyreTensorLayout: valid_elements[",
+                  c10::ArrayRef<int64_t>(device_dim_indices),
+                  "] = ", element_count, " exceeds the ", device_space,
+                  " positions of those device dimensions (device_size=",
                   c10::ArrayRef<int64_t>(device_size), ")");
     }
   }
@@ -256,6 +346,37 @@ class SpyreTensorImpl : public at::TensorImpl {
   std::vector<int64_t> dma_sizes;
   std::vector<int64_t> dma_strides;
 
+  /**
+   * Maps each reserved dim to its [min, max, granularity]. An empty map
+   * means no reservation; there is deliberately no second, optional-
+   * wrapped way to say that. This tensor's physical allocation
+   * (spyre_layout/storage) is sized for host_size[dim] ==
+   * reserved_dims.at(dim).max for every key `dim` rather than the
+   * tensor's current logical size at that dim. Used to support
+   * `tensor.to("spyre", dynamic={dim: {min, max, granularity}})`: the
+   * buffer is allocated once for the declared ceiling so later in-place
+   * resizes to a smaller/larger (but still within [min, max] and a
+   * multiple of granularity) concrete shape never require reallocation
+   * or invalidate the compiled graph's layout guard. Scope today: at most
+   * one entry (dim 0). This field and spyre_resize_()'s guard already
+   * loop per-dim and are ready for more; spyre_empty_reserved() still
+   * takes a single scalar `dim`, so adding a second reserved dim needs a
+   * signature change there, not here. See spyre_empty_reserved() and
+   * spyre_resize_() in spyre_mem.cpp.
+   */
+  std::map<int64_t, ReservedDimInfo> reserved_dims;
+
+  /**
+   * True if this tensor has a reservation AND is still the tensor it was
+   * allocated as. reserved_dims keys are absolute dim indices, so they only
+   * mean something while the axes are unchanged. dma_sizes/dma_strides are
+   * set at allocation and on every spyre_resize_, but in-place metadata ops
+   * (t_, transpose_, squeeze_, unsqueeze_, as_strided_) change
+   * sizes()/strides() without touching them. A mismatch therefore means the
+   * map is stale, and callers must not trust it.
+   */
+  bool has_intact_reservation() const;
+
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
@@ -292,6 +413,22 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
 std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
+
+/**
+ * Read back a tensor's reservation contract (see reserved_dims above),
+ * or nullopt if the tensor has no reservation. Returns the typed struct
+ * directly, not a Python-friendly dict -- a C++ caller gets compile-time
+ * field checking instead of string lookups; the pybind binding in
+ * module.cpp does the dict-of-strings conversion for the Python side.
+ *
+ * Unlike the accessors above, this never throws: it returns nullopt for a
+ * non-Spyre tensor instead of requiring the caller to check first. It has no
+ * caller in the compiler yet. It is written to be safe to call from a pass
+ * that visits every graph input of every compile, Spyre or not, where a throw
+ * would turn an ordinary CPU input into a compile crash.
+ */
+std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
+    const at::Tensor& tensor);
 
 }  // namespace spyre
 

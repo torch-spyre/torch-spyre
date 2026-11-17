@@ -34,6 +34,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    :caption: Overview
 
    architecture
+   sharded_tensors
 
 .. toctree::
    :maxdepth: 2

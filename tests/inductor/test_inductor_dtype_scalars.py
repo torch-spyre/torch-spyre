@@ -530,7 +530,7 @@ class TestNegativeScalarOperations:
             return x / 0.0
 
         x = cached_randn((10, 10))
-        # Checked on the host: the device has no aten::index kernel (#1219).
+        # Checked on the host: the device has no boolean-mask index kernel (#1219).
         result = _run_spyre(execution_mode, div_zero, x).cpu()
         non_zero_mask = x.abs() > 1e-6
         if non_zero_mask.any():
@@ -562,8 +562,8 @@ class TestNegativeScalarOperations:
             strict_xfail(
                 request,
                 NotImplementedError,
-                "the test indexes the device result with a mask, which needs "
-                "aten::index.Tensor_out (#1219)",
+                "the test indexes the device result with a boolean mask; the Spyre "
+                "aten::index.Tensor kernel supports only a 1-D integer index (#1219)",
             )
         elif expected_behavior == "all_neg_inf":
             strict_xfail(
