@@ -49,6 +49,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -3572,7 +3573,7 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
-    arg_buf: Optional[Buffer] = None,
+    arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -3610,6 +3611,11 @@ def lower_pad_sequence(
     a ``ComputedBuffer``, to recover the within-stick host dim from coordinate
     identity via ``_stick_host_dim`` -- see the device-layout-construction
     section below.
+
+    ``arg_buf`` may also be a ``ReinterpretView`` of a buffer, to pad that view
+    rather than the whole buffer; the padded buffer then has the view's shape.
+    ``insert_bmm_padding`` passes the part of y a matmul reads when y's buffer does
+    not hold K as one whole dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -3834,7 +3840,9 @@ def lower_pad_sequence(
         # an actual operand.
         from .lowering import lower_constant_pad_nd
 
-        arg_tb = TensorBox(StorageBox(arg_buf))
+        arg_tb = TensorBox(
+            arg_buf if isinstance(arg_buf, ReinterpretView) else StorageBox(arg_buf)
+        )
         with fx_graph.inserting_before(insert_before):
             pad_fx = fx_graph.create_node(
                 "call_function",
