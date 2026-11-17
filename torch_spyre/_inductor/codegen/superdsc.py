@@ -55,9 +55,9 @@ from torch_spyre._inductor.core_mapping import (
     apply_core_stride,
     apply_neg_shift,
     matmul_reduction_dim,
+    placement_applies,
     resolve_core_stride,
 )
-from torch_spyre._inductor.config import core_placement_mode
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
@@ -2200,9 +2200,10 @@ def _apply_dense_placement(
 ) -> tuple[dict, int, tuple[int, ...]]:
     """Identity placement: keep the logical map, fold, and dispatched ids.
 
-    Runs through the same call path as the sparse placements so every
-    consumer sees the same frames (per-tensor spans, active ids, producer
-    remap) — only the placement itself is a no-op.
+    Relayouts route through here so every mode shares the same frames
+    (per-tensor spans, active ids, producer remap) — only the placement
+    itself is a no-op. Non-relayout ops skip placement entirely under
+    dense: the dispatching call site only runs for the sparse modes.
     """
     return dict(core_map), num_cores, tuple(range(num_cores))
 
@@ -2213,14 +2214,25 @@ def _remap_producer_cores(
     logical_cores: int,
     sencores: int,
 ) -> tuple[int, ...]:
-    """Convert producer cores into the current placement's frame."""
+    """Convert producer cores into the current placement's frame.
+
+    Consults ``placement_applies`` — the same gate the placement functions
+    use — so a producer route stays untouched exactly when its op was left
+    dense (single slice, full card, or a slice count that does not divide
+    the physical core count). Sorting the ids keeps the emitted
+    ``coreIdsUsed_`` order a sorted contract; consumers treat it as a set.
+    """
+    if not placement_applies(logical_cores, sencores):
+        return completed_producer_cores
     if mode == "neg_shift":
         shift = logical_cores // 2
-        return tuple((core - shift) % sencores for core in completed_producer_cores)
+        return tuple(
+            sorted((core - shift) % sencores for core in completed_producer_cores)
+        )
     if mode == "dense":
         return completed_producer_cores
     stride = resolve_core_stride(logical_cores, sencores)
-    return tuple(core * stride for core in completed_producer_cores)
+    return tuple(sorted(core * stride for core in completed_producer_cores))
 
 
 def _finalize_tensor_work_divisions(
@@ -2230,9 +2242,15 @@ def _finalize_tensor_work_divisions(
     core_map: dict[Symbol, Expr],
     num_cores: int,
     is_lx_relayout: bool,
-    completed_producer_cores: tuple[int, ...],
+    dispatched_ids: tuple[int, ...],
 ) -> None:
-    """Give every tensor one effective ownership after SDSC normalization."""
+    """Give every tensor one effective ownership after SDSC normalization.
+
+    ``dispatched_ids`` is the set of physical cores actually carrying work:
+    the completed producer route for a relayout, the placement's dispatched
+    ids for an ordinary op. The sparse-span admission below consumes either
+    spelling — one dispatched core per owned slice.
+    """
 
     operation_work_division = TensorWorkDivision(
         {dim: work_slices[dim] for dim in mapping_dims},
@@ -2258,11 +2276,7 @@ def _finalize_tensor_work_divisions(
                 num_cores=override.num_cores or num_cores,
             )
         )
-        active_core_ids = (
-            completed_producer_cores
-            if completed_producer_cores and index == 0
-            else None
-        )
+        active_core_ids = dispatched_ids if dispatched_ids and index == 0 else None
         tensor_cores = effective.num_cores or num_cores
         tensor_owners = math.prod(effective.work_slices.values())
 
@@ -2273,9 +2287,10 @@ def _finalize_tensor_work_divisions(
         # dispatched list is exactly one core per slice.
         sparse_span = (
             num_cores > tensor_owners
+            and num_cores % tensor_owners == 0
             and tensor_cores == num_cores
-            and bool(completed_producer_cores)
-            and len(completed_producer_cores) == tensor_owners
+            and bool(dispatched_ids)
+            and len(dispatched_ids) == tensor_owners
         )
         valid = (
             tensor_cores == num_cores == tensor_owners or sparse_span
@@ -2939,9 +2954,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             completed_producer_cores,
         )
         operation_cores = math.prod(dim_splits.values())
-        _place = _select_placement(core_placement_mode)
+        _place = _select_placement(_spyre_config.core_placement_mode)
         core_id_to_work_slice, operation_span, destination_ids = _place(
-            core_id_to_work_slice, operation_cores, _spyre_config.sencores
+            core_id_to_work_slice, operation_cores, _spyre_config.sencores_physical
         )
         active = set(destination_ids)
         num_cores = max(num_cores, operation_span)
@@ -2952,15 +2967,15 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             owner_map, physical_span, tensor_ids = _place(
                 division.core_id_to_work_slice,
                 logical_cores,
-                _spyre_config.sencores,
+                _spyre_config.sencores_physical,
             )
             num_cores = max(num_cores, physical_span)
             if index == 0 and completed_producer_cores:
                 tensor_ids = _remap_producer_cores(
-                    core_placement_mode,
+                    _spyre_config.core_placement_mode,
                     completed_producer_cores,
                     logical_cores,
-                    _spyre_config.sencores,
+                    _spyre_config.sencores_physical,
                 )
                 completed_producer_cores = tensor_ids
             arg.active_core_ids = tensor_ids
@@ -2969,15 +2984,27 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 division.work_slices, owner_map, num_cores=physical_span
             )
         active_core_ids = tuple(sorted(active))
-    elif core_placement_mode != "dense" and (
-        resolve_core_stride(num_cores, _spyre_config.sencores) > 1
-        or core_placement_mode in ("neg_shift", "dense")
+    elif _spyre_config.core_placement_mode != "dense" and placement_applies(
+        num_cores, _spyre_config.sencores_physical
     ):
-        _place = _select_placement(core_placement_mode)
-        core_id_to_work_slice, num_cores, completed_producer_cores = _place(
-            core_id_to_work_slice, num_cores, _spyre_config.sencores
+        # A non-relayout op only shifts when the placement actually moves
+        # its slice count; dense and every no-op case keep the dense map.
+        _place = _select_placement(_spyre_config.core_placement_mode)
+        core_id_to_work_slice, num_cores, dispatched_ids = _place(
+            core_id_to_work_slice, num_cores, _spyre_config.sencores_physical
         )
+        # completed_producer_cores stays a reduction route (see the
+        # SDSCSpec field comment); the placement's dispatched ids are a
+        # separate frame. Non-relayout ops never carry real producer
+        # routes here — the relayout certificate is what populates them.
+        assert not completed_producer_cores, (
+            "non-relayout ops cannot carry completed producer cores"
+        )
+        active_core_ids = dispatched_ids
     if not is_relayout:
+        # The sparse-span admission needs the dispatched ids a sparse
+        # placement produced (one per owned slice); a dense op passes its
+        # producer route, which is empty for ordinary ops.
         _finalize_tensor_work_divisions(
             args,
             mapping_dims,
@@ -2985,7 +3012,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             core_id_to_work_slice,
             num_cores,
             False,
-            completed_producer_cores,
+            active_core_ids or completed_producer_cores,
         )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [

@@ -24,7 +24,7 @@ from itertools import permutations, product
 from typing import Any, Callable
 
 import sympy
-from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy import Expr, Integer, Max, Mod, Symbol, floor, sympify
 from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
@@ -597,15 +597,31 @@ def core_to_slice_mapping(
     return result
 
 
+def placement_applies(num_cores: int, physical_cores: int) -> bool:
+    """Whether a sparse placement moves ``num_cores`` slices at all.
+
+    The single applicability gate shared by ``apply_core_stride``,
+    ``apply_neg_shift``, and every consumer that mirrors their decisions
+    (route remapping, dispatch admission). A placement never moves a
+    single slice, a full card, or a count that does not divide the
+    physical core count, so those cases must stay dense everywhere —
+    shifting routes without moving the placement would strand them.
+    """
+    if num_cores <= 1 or num_cores >= physical_cores:
+        return False
+    return physical_cores % num_cores == 0
+
+
 def resolve_core_stride(num_cores: int, physical_cores: int) -> int:
     """Spread ``num_cores`` logical slices evenly over a wider physical span.
 
     Returns the largest ``S`` with ``num_cores * S <= physical_cores`` and
     ``physical_cores % num_cores == 0``, so slice ``i`` lands on physical core
     ``i * S`` and every placement uses equally spaced ids. Returns 1 (no
-    spreading) when ``num_cores`` does not divide ``physical_cores``, when
-    either count is non-positive, or when there is only one slice to place:
-    with nothing to space out, widening the fold would only add overhead.
+    spreading) when the placement does not apply (see ``placement_applies``),
+    when ``physical_cores`` is non-positive, or when there is only one slice
+    to place: with nothing to space out, widening the fold would only add
+    overhead.
     """
     if num_cores <= 1 or physical_cores <= 0 or physical_cores % num_cores != 0:
         return 1
@@ -650,9 +666,10 @@ def apply_neg_shift(
     of the card (low ids of the first half, high ids of the second) at
     every active count, mirroring the validated [0, 31] two-core placement.
     Returns the rewritten map, the fold size (``max(physical_cores,
-    num_cores)``), and the dispatched physical ids. A no-op for
-    ``num_cores <= 1``, when the slice count does not divide the physical
-    core count, or when the shift would be zero.
+    num_cores)``), and the sorted dispatched physical ids. A no-op — the
+    original map, fold, and ``range(num_cores)`` ids — whenever
+    ``placement_applies`` is false (single slice, full card, or a slice
+    count that does not divide the physical core count).
 
     Owner rewrite: each owner expression is rebuilt by substituting
     ``core_id`` with the operation-logical slice of the physical core,
@@ -665,15 +682,15 @@ def apply_neg_shift(
     (the slice-0 address that address planning anchors on the fold
     position owning work slice 0), not a derived per-core address.
     """
-    if num_cores <= 1 or num_cores >= physical_cores or physical_cores % num_cores != 0:
+    if not placement_applies(num_cores, physical_cores):
         return dict(core_map), num_cores, tuple(range(num_cores))
     shift = num_cores // 2
-    ids = tuple((i - shift) % physical_cores for i in range(num_cores))
+    ids = tuple(sorted((i - shift) % physical_cores for i in range(num_cores)))
     # Owner expression: the wrapping term t = Mod(core_id + shift,
     # physical_cores) is the logical slice at dispatched members (t < n, so
     # the gate below stays open and members map to their exact slices,
     # including across the fold wrap — the clamshell window, n=8 -> ids
-    # [28..31, 0..3]). At non-dispatched fold positions t >= n and the gate
+    # [0..3, 28..31]). At non-dispatched fold positions t >= n and the gate
     # floor(t / n) zeroes the expression, so non-members evaluate to
     # slice 0. That is load-bearing, not cosmetic: address planning anchors
     # the shared HBM base symbol on the fold position that owns work slice
@@ -684,10 +701,8 @@ def apply_neg_shift(
     # in-bounds. Zeroing non-members reproduces exactly the symbol-sharing
     # structure of the validated non-wrap legs.
     core_id = Symbol("core_id")
-    from sympy import Max, floor as sympy_floor
-
     t = Mod(core_id + Integer(shift), Integer(physical_cores))
-    op_logical = t * Max(Integer(1) - sympy_floor(t / Integer(num_cores)), Integer(0))
+    op_logical = t * Max(Integer(1) - floor(t / Integer(num_cores)), Integer(0))
     rewritten = {
         dim: owner.xreplace({core_id: op_logical}) for dim, owner in core_map.items()
     }

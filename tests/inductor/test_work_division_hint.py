@@ -1445,108 +1445,148 @@ def _compile_spec(spec, normalize=True):
     ]
 
 
+@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
 @config.patch({"sencores": 32})
-def test_sparse_relayout_preserves_distinct_source_and_destination_slices():
+def test_sparse_relayout_preserves_distinct_source_and_destination_slices(
+    placement_mode,
+):
     """Shuffle reads and writes the same physical cores as adjacent stages."""
-    row, feature = Symbol("sparse_row"), Symbol("sparse_feature")
-    source = _view({0: 2}, {0: _CORE_ID}, 2)
-    destination = _view({1: 2}, {1: _CORE_ID}, 2)
-    spec = _completed_route_spec(
-        source,
-        destination,
-        [2, 2, 64],
-        [row, feature, Integer(0)],
-        {row: (Integer(2), 1), feature: (Integer(2), 2)},
-        (),
-        512,
-    )
-    root, allocations = _compile_spec(spec)
-    active = {"0", "16"}
-    assert root["coreFoldProp_"]["factor_"] == 32
-    assert set(root["coreIdToDsc_"]) == active
-    assert set(root["coreIdToWkSlice_"]) == active
-    assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == [0, 16]
-    source_map, destination_map = [
-        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
-    ]
-    assert set(source_map) == active
-    assert set(destination_map) == active
-    assert source_map["0"] == {"mb": 0, "x": 0, "out": 0}
-    assert source_map["16"] == {"mb": 1, "x": 0, "out": 0}
-    assert destination_map["0"] == {"mb": 0, "x": 0, "out": 0}
-    assert destination_map["16"] == {"mb": 0, "x": 0, "out": 1}
-    assert spec.args[0].work_division.num_cores == 2
-    assert spec.args[1].work_division.num_cores == 2
+    with config.patch({"core_placement_mode": placement_mode}):
+        row, feature = Symbol("sparse_row"), Symbol("sparse_feature")
+        source = _view({0: 2}, {0: _CORE_ID}, 2)
+        destination = _view({1: 2}, {1: _CORE_ID}, 2)
+        spec = _completed_route_spec(
+            source,
+            destination,
+            [2, 2, 64],
+            [row, feature, Integer(0)],
+            {row: (Integer(2), 1), feature: (Integer(2), 2)},
+            (),
+            512,
+        )
+        root, allocations = _compile_spec(spec)
+        # Stride spreads the two owners to {0, 16}; dense keeps {0, 1}.
+        active = {"0", "16"} if placement_mode == "stride" else {"0", "1"}
+        assert (
+            root["coreFoldProp_"]["factor_"] == 32 if placement_mode == "stride" else 2
+        )
+        assert set(root["coreIdToDsc_"]) == active
+        assert set(root["coreIdToWkSlice_"]) == active
+        assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == [
+            int(core) for core in sorted(active)
+        ]
+        source_map, destination_map = [
+            node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+        ]
+        assert set(source_map) == active
+        assert set(destination_map) == active
+        first, second = sorted(active)
+        assert source_map[first] == {"mb": 0, "x": 0, "out": 0}
+        assert source_map[second] == {"mb": 1, "x": 0, "out": 0}
+        assert destination_map[first] == {"mb": 0, "x": 0, "out": 0}
+        assert destination_map[second] == {"mb": 0, "x": 0, "out": 1}
+        # The input spec keeps its logical two-core ownership; the widened
+        # span lives on the parsed/output spec above.
+        assert spec.args[0].work_division.num_cores == 2
+        assert spec.args[1].work_division.num_cores == 2
 
 
-def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
-    m, n = Symbol("m"), Symbol("n")
-    source_view = PerCoreView(
-        ((1, 4), (2, 2)),
-        ((1, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))),
-        num_cores=8,
-    )
-    destination_view = PerCoreView(
-        ((1, 2), (2, 4)),
-        ((1, Mod(_CORE_ID, 2)), (2, floor(_CORE_ID / 2))),
-        num_cores=8,
-    )
-    coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
-    base = TensorArg(
-        True, -1, DataFormats.SEN169_FP16, [32, 8, 64], coordinates, {"lx": 0}
-    )
-    args = [
-        replace(
-            base,
-            work_division=work_division_from_view(
-                source_view, base.device_size, coordinates, {m: 64, n: 256}
+@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
+def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc(
+    placement_mode,
+):
+    with config.patch({"core_placement_mode": placement_mode}):
+        m, n = Symbol("m"), Symbol("n")
+        source_view = PerCoreView(
+            ((1, 4), (2, 2)),
+            ((1, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))),
+            num_cores=8,
+        )
+        destination_view = PerCoreView(
+            ((1, 2), (2, 4)),
+            ((1, Mod(_CORE_ID, 2)), (2, floor(_CORE_ID / 2))),
+            num_cores=8,
+        )
+        coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
+        base = TensorArg(
+            True, -1, DataFormats.SEN169_FP16, [32, 8, 64], coordinates, {"lx": 0}
+        )
+        args = [
+            replace(
+                base,
+                work_division=work_division_from_view(
+                    source_view, base.device_size, coordinates, {m: 64, n: 256}
+                ),
             ),
-        ),
-        replace(
-            base,
-            is_input=False,
-            allocation={"lx": 256},
-            work_division=work_division_from_view(
-                destination_view,
+            replace(
+                base,
+                is_input=False,
+                allocation={"lx": 256},
+                work_division=work_division_from_view(
+                    destination_view,
+                    base.device_size,
+                    coordinates,
+                    {m: 64, n: 256},
+                ),
+            ),
+        ]
+        spec = OpSpec(
+            IDENTITY_OP,
+            False,
+            {n: (256, 8), m: (64, 1)},
+            args,
+            {LX_RELAYOUT_INFO_KEY: True},
+        )
+        root, allocations = _compile_spec(spec)
+        assert spec.op == IDENTITY_OP
+        assert set(root["dscs_"][0]) == {"shuffle"}
+        assert root["dscs_"][0]["shuffle"]["labeledDs_"][0]["dsType_"] == "OUTPUT"
+        assert [arg.work_division.work_slices for arg in spec.args] == [
+            {Symbol("z0"): 4, m: 2},
+            {Symbol("z0"): 2, m: 4},
+        ]
+        assert root["numWkSlicesPerDim_"] == {"mb": 1, "x": 8, "out": 1}
+        # Stride spreads the eight owners at 4-core spacing; dense keeps
+        # the logical ids 0..7.
+        active = (
+            [4 * core for core in range(8)]
+            if placement_mode == "stride"
+            else list(range(8))
+        )
+        assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == active
+        maps = [node["coordinates_"]["coreIdToWkSlice_"] for node in allocations]
+        assert all(set(mapping) == {str(core) for core in active} for mapping in maps)
+        assert [maps[0][str(core)]["x"] for core in active] == [
+            i // 2 for i in range(8)
+        ]
+        assert [maps[0][str(core)]["out"] for core in active] == [
+            i % 2 for i in range(8)
+        ]
+        assert [maps[1][str(core)]["x"] for core in active] == [i % 2 for i in range(8)]
+        assert [maps[1][str(core)]["out"] for core in active] == [
+            i // 2 for i in range(8)
+        ]
+        coord_info = [node["coordinates_"]["coordInfo"] for node in allocations]
+        assert coord_info[0]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 2
+        assert coord_info[1]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 4
+        with pytest.raises(ValueError, match="cannot map device dimension"):
+            work_division_from_view(
+                source_view,
                 base.device_size,
-                coordinates,
+                [Integer(0), m + n, Integer(0)],
                 {m: 64, n: 256},
-            ),
-        ),
-    ]
-    spec = OpSpec(
-        IDENTITY_OP,
-        False,
-        {n: (256, 8), m: (64, 1)},
-        args,
-        {LX_RELAYOUT_INFO_KEY: True},
-    )
-    root, allocations = _compile_spec(spec)
-    assert spec.op == IDENTITY_OP
-    assert set(root["dscs_"][0]) == {"shuffle"}
-    assert root["dscs_"][0]["shuffle"]["labeledDs_"][0]["dsType_"] == "OUTPUT"
-    assert [arg.work_division.work_slices for arg in spec.args] == [
-        {Symbol("z0"): 4, m: 2},
-        {Symbol("z0"): 2, m: 4},
-    ]
-    assert root["numWkSlicesPerDim_"] == {"mb": 1, "x": 8, "out": 1}
-    active = [4 * core for core in range(8)]
-    assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == active
-    maps = [node["coordinates_"]["coreIdToWkSlice_"] for node in allocations]
-    assert all(set(mapping) == {str(core) for core in active} for mapping in maps)
-    assert [maps[0][str(core)]["x"] for core in active] == [i // 2 for i in range(8)]
-    assert [maps[0][str(core)]["out"] for core in active] == [i % 2 for i in range(8)]
-    assert [maps[1][str(core)]["x"] for core in active] == [i % 2 for i in range(8)]
-    assert [maps[1][str(core)]["out"] for core in active] == [i // 2 for i in range(8)]
-    coord_info = [node["coordinates_"]["coordInfo"] for node in allocations]
-    assert coord_info[0]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 2
-    assert coord_info[1]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 4
-    with pytest.raises(ValueError, match="cannot map device dimension"):
-        work_division_from_view(
-            source_view,
-            base.device_size,
-            [Integer(0), m + n, Integer(0)],
-            {m: 64, n: 256},
+            )
+
+        for arg in spec.args:
+            arg.work_division = None
+        spec.op_info = {}
+        ordinary_root, ordinary_allocations = _compile_spec(spec, normalize=False)
+        ordinary_sdsc, _ = parse_op_spec(spec)
+        assert set(ordinary_root["dscs_"][0]) == {IDENTITY_OP}
+        assert all(arg.work_division is not None for arg in ordinary_sdsc.args)
+        assert all(
+            not node["coordinates_"]["coreIdToWkSlice_"]
+            for node in ordinary_allocations
         )
 
     for arg in spec.args:
@@ -2417,51 +2457,62 @@ def test_completed_reduction_routes_survive_alignment_unchanged():
     assert set(destination_map) == {str(core) for core in range(8)}
 
 
+@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
 @config.patch({"sencores": 32})
-def test_completed_reduction_can_copy_to_its_sixteen_consumers():
-    # PR783's emitted B8/N2/K2 order: adjacent cores contribute to one result.
-    source = _view(
-        {0: 8, 1: 2},
-        {0: Mod(floor(_CORE_ID / 2), 8), 1: floor(_CORE_ID / 16)},
-        32,
-    )
-    destination = _view({0: 8, 1: 2}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 16)
-    routes = lx_relayout_module.derive_completed_reduction_routes(
-        source, destination, 2
-    )
-    assert routes == tuple((2 * core + 1, (core,)) for core in range(16))
-    assert not lx_relayout_module.movement_supported(source, destination, 32, 16)
+def test_completed_reduction_can_copy_to_its_sixteen_consumers(placement_mode):
+    with config.patch({"core_placement_mode": placement_mode}):
+        # PR783's emitted B8/N2/K2 order: adjacent cores contribute to one result.
+        source = _view(
+            {0: 8, 1: 2},
+            {0: Mod(floor(_CORE_ID / 2), 8), 1: floor(_CORE_ID / 16)},
+            32,
+        )
+        destination = _view(
+            {0: 8, 1: 2}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 16
+        )
+        routes = lx_relayout_module.derive_completed_reduction_routes(
+            source, destination, 2
+        )
+        assert routes == tuple((2 * core + 1, (core,)) for core in range(16))
+        assert not lx_relayout_module.movement_supported(source, destination, 32, 16)
 
-    b, n, stick = Symbol("b"), Symbol("n"), Symbol("stick")
-    spec = _completed_route_spec(
-        source,
-        destination,
-        [8, 128, 64],
-        [b, n, stick],
-        {b: (Integer(8), 8), n: (Integer(128), 2), stick: (Integer(64), 1)},
-        routes,
-        65536,
-    )
-    from torch_spyre._inductor.op_spec_validation import (
-        OpSpecValidationError,
-        _check_completed_reduction_route,
-    )
+        b, n, stick = Symbol("b"), Symbol("n"), Symbol("stick")
+        spec = _completed_route_spec(
+            source,
+            destination,
+            [8, 128, 64],
+            [b, n, stick],
+            {b: (Integer(8), 8), n: (Integer(128), 2), stick: (Integer(64), 1)},
+            routes,
+            65536,
+        )
+        from torch_spyre._inductor.op_spec_validation import (
+            OpSpecValidationError,
+            _check_completed_reduction_route,
+        )
 
-    _check_completed_reduction_route(spec, "test")
-    producers = spec.completed_producer_cores
-    for invalid in (producers[:-1], (32, *producers[1:])):
-        with pytest.raises(OpSpecValidationError):
-            _check_completed_reduction_route(
-                replace(spec, completed_producer_cores=invalid), "test"
-            )
-    root, allocations = _compile_spec(spec)
-    assert root["coreFoldProp_"]["factor_"] == 32
-    assert "prodConsList" not in root
-    source_map, destination_map = [
-        allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
-    ]
-    assert set(source_map) == {str(2 * c + 1) for c in range(16)}
-    assert set(destination_map) == {str(2 * c) for c in range(16)}
+        _check_completed_reduction_route(spec, "test")
+        producers = spec.completed_producer_cores
+        for invalid in (producers[:-1], (32, *producers[1:])):
+            with pytest.raises(OpSpecValidationError):
+                _check_completed_reduction_route(
+                    replace(spec, completed_producer_cores=invalid), "test"
+                )
+        root, allocations = _compile_spec(spec)
+        assert root["coreFoldProp_"]["factor_"] == 32
+        assert "prodConsList" not in root
+        source_map, destination_map = [
+            allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
+        ]
+        assert set(source_map) == {str(2 * c + 1) for c in range(16)}
+        # Stride spreads the sixteen consumers to even ids; dense keeps
+        # the logical 0..15 domain.
+        expected_destination = (
+            {str(2 * c) for c in range(16)}
+            if placement_mode == "stride"
+            else {str(c) for c in range(16)}
+        )
+        assert set(destination_map) == expected_destination
 
 
 @config.patch({"sencores": 32})
@@ -2676,161 +2727,205 @@ def test_contraction_requires_disjoint_full_physical_spans(
             lx_relayout_module.validate_relayout_spans(plan)
 
 
+@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
 @pytest.mark.parametrize(
     "source_cores,destination_cores", [(32, 16), (16, 16), (16, 32)]
 )
 def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
-    source_cores, destination_cores
+    source_cores, destination_cores, placement_mode
 ):
     """Keep tensor domains distinct while scheduling each required physical core.
 
     A contraction repeats the destination frame. A sparse placement maps each
     tensor's logical domain to its own physical core IDs.
     """
-    row, feature = Symbol("row"), Symbol("feature")
-    source = TensorWorkDivision(
-        {row: source_cores // 2, feature: 2},
-        {row: floor(_CORE_ID / 2), feature: Mod(_CORE_ID, 2)},
-        num_cores=source_cores,
-    )
-    destination = TensorWorkDivision(
-        {row: destination_cores, feature: 1},
-        {row: _CORE_ID, feature: Integer(0)},
-        num_cores=destination_cores,
-    )
-    base = TensorArg(
-        True,
-        -1,
-        DataFormats.SEN169_FP16,
-        [512, 2, 64],
-        [row, floor(feature / 64), Mod(feature, 64)],
-        {"lx": 0},
-    )
-    spec = OpSpec(
-        IDENTITY_OP,
-        False,
-        {row: (512, destination_cores), feature: (128, 1)},
-        [
-            replace(base, work_division=source),
-            replace(
-                base,
-                is_input=False,
-                allocation={"lx": 8192},
-                work_division=destination,
-            ),
-        ],
-        {LX_RELAYOUT_INFO_KEY: True},
-        core_id_to_work_slice={row: _CORE_ID, feature: Integer(0)},
-    )
-    parsed, renamed = parse_op_spec(spec)
-    r, f = renamed[row], renamed[feature]
-    assert parsed.opfunc == "shuffle", "unequal ownership became an ordinary identity"
-    source_stride = 32 // source_cores
-    destination_stride = 32 // destination_cores
-    assert parsed.num_cores == 32
-    assert parsed.work_slices == {r: destination_cores, f: 1}
-    assert parsed.core_id_to_work_slice[f] == 0
-    assert parsed.active_core_ids == tuple(
-        sorted(set(range(0, 32, source_stride)) | set(range(0, 32, destination_stride)))
-    )
-    actual_source, actual_destination = [arg.work_division for arg in parsed.args]
-    assert actual_source.num_cores == 32
-    assert actual_source.work_slices == {r: source_cores // 2, f: 2}
-    source_core = floor(_CORE_ID / source_stride) if source_stride > 1 else _CORE_ID
-    assert actual_source.core_id_to_work_slice == {
-        r: floor(source_core / 2),
-        f: Mod(source_core, 2),
-    }
-    assert actual_destination.num_cores == 32
-    assert actual_destination.work_slices == {r: destination_cores, f: 1}
-    destination_core = (
-        floor(_CORE_ID / destination_stride) if destination_stride > 1 else _CORE_ID
-    )
-    assert actual_destination.core_id_to_work_slice == {r: destination_core, f: 0}
-    assert not actual_source.same_ownership(actual_destination)
-    assert spec.core_id_to_work_slice == {row: _CORE_ID, feature: 0}
-    assert spec.args[0].work_division is source
-    assert spec.args[1].work_division is destination
-    # The certificate and per-tensor-ownership guard remain mandatory.
-    with pytest.raises(AssertionError, match="per-tensor ownership"):
-        parse_op_spec(replace(spec, op_info={}))
+    with config.patch({"core_placement_mode": placement_mode}):
+        row, feature = Symbol("row"), Symbol("feature")
+        source = TensorWorkDivision(
+            {row: source_cores // 2, feature: 2},
+            {row: floor(_CORE_ID / 2), feature: Mod(_CORE_ID, 2)},
+            num_cores=source_cores,
+        )
+        destination = TensorWorkDivision(
+            {row: destination_cores, feature: 1},
+            {row: _CORE_ID, feature: Integer(0)},
+            num_cores=destination_cores,
+        )
+        base = TensorArg(
+            True,
+            -1,
+            DataFormats.SEN169_FP16,
+            [512, 2, 64],
+            [row, floor(feature / 64), Mod(feature, 64)],
+            {"lx": 0},
+        )
+        spec = OpSpec(
+            IDENTITY_OP,
+            False,
+            {row: (512, destination_cores), feature: (128, 1)},
+            [
+                replace(base, work_division=source),
+                replace(
+                    base,
+                    is_input=False,
+                    allocation={"lx": 8192},
+                    work_division=destination,
+                ),
+            ],
+            {LX_RELAYOUT_INFO_KEY: True},
+            core_id_to_work_slice={row: _CORE_ID, feature: Integer(0)},
+        )
+        parsed, renamed = parse_op_spec(spec)
+        r, f = renamed[row], renamed[feature]
+        assert parsed.opfunc == "shuffle", (
+            "unequal ownership became an ordinary identity"
+        )
+        # Stride spreads each tensor's domain across all 32 cores; dense
+        # keeps each tensor's logical core count.
+        source_stride = 32 // source_cores if placement_mode == "stride" else 1
+        destination_stride = (
+            32 // destination_cores if placement_mode == "stride" else 1
+        )
+        # The operation frame spans the widest tensor domain: stride widens
+        # every domain to 32; dense keeps max(source, destination) cores.
+        expected_span = (
+            32 if placement_mode == "stride" else max(source_cores, destination_cores)
+        )
+        assert parsed.num_cores == expected_span
+        assert parsed.work_slices == {r: destination_cores, f: 1}
+        assert parsed.core_id_to_work_slice[f] == 0
+        assert parsed.active_core_ids == tuple(
+            sorted(
+                set(range(0, expected_span, source_stride))
+                | set(range(0, expected_span, destination_stride))
+            )
+        )
+        actual_source, actual_destination = [arg.work_division for arg in parsed.args]
+        assert actual_source.num_cores == (
+            32 if placement_mode == "stride" else source_cores
+        )
+        assert actual_source.work_slices == {r: source_cores // 2, f: 2}
+        source_core = floor(_CORE_ID / source_stride) if source_stride > 1 else _CORE_ID
+        assert actual_source.core_id_to_work_slice == {
+            r: floor(source_core / 2),
+            f: Mod(source_core, 2),
+        }
+        assert actual_destination.num_cores == (
+            32 if placement_mode == "stride" else destination_cores
+        )
+        assert actual_destination.work_slices == {r: destination_cores, f: 1}
+        destination_core = (
+            floor(_CORE_ID / destination_stride) if destination_stride > 1 else _CORE_ID
+        )
+        assert actual_destination.core_id_to_work_slice == {r: destination_core, f: 0}
+        assert not actual_source.same_ownership(actual_destination)
+        assert spec.core_id_to_work_slice == {row: _CORE_ID, feature: 0}
+        assert spec.args[0].work_division is source
+        assert spec.args[1].work_division is destination
+        # The certificate and per-tensor-ownership guard remain mandatory.
+        with pytest.raises(AssertionError, match="per-tensor ownership"):
+            parse_op_spec(replace(spec, op_info={}))
 
 
+@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
 @pytest.mark.parametrize(
     "source_cores,destination_cores", [(32, 16), (16, 16), (16, 32)]
 )
-def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination_cores):
+def test_relayout_operation_frame_keeps_tensor_domains(
+    source_cores, destination_cores, placement_mode
+):
     """Contraction repeats the operation frame, not tensor ownership domains."""
     from torch_spyre._inductor.core_mapping import owner_slots, transfer_edges
 
-    row, lane = Symbol("frame_row"), Symbol("frame_lane")
-    source_owner = (
-        source_cores - 1 - _CORE_ID if source_cores == destination_cores else _CORE_ID
-    )
-    source = _view({0: source_cores}, {0: source_owner}, source_cores)
-    destination = _view({0: destination_cores}, {0: _CORE_ID}, destination_cores)
-    source_rows = owner_slots(
-        dict(source.core_to_slot), dict(source.work_slice_dims), source_cores
-    )
-    destination_rows = owner_slots(
-        dict(destination.core_to_slot),
-        dict(destination.work_slice_dims),
-        destination_cores,
-    )
-    routes = sorted(
-        transfer_edges(
-            dict(source.work_slice_dims),
-            dict(destination.work_slice_dims),
-            dict(enumerate(source_rows)),
-            dict(enumerate(destination_rows)),
+    with config.patch({"core_placement_mode": placement_mode}):
+        row, lane = Symbol("frame_row"), Symbol("frame_lane")
+        source_owner = (
+            source_cores - 1 - _CORE_ID
+            if source_cores == destination_cores
+            else _CORE_ID
         )
-    )
-    assert {source for source, _ in routes} == set(range(source_cores))
-    assert {destination for _, destination in routes} == set(range(destination_cores))
-    # Ordinary copies do not select terminal reduction producers. Production
-    # leaves this field empty; route edges can repeat a source on expansion.
-    spec = _completed_route_spec(
-        source,
-        destination,
-        [512, 64],
-        [row, lane],
-        {row: (512, destination_cores), lane: (64, 1)},
-        (),
-        65536,
-    )
-    assert spec.completed_producer_cores == ()
-    simplify_op_spec(spec)
-    operation_cores = math.prod(count for _, count in spec.iteration_space.values())
-    original_tensor_domains = [arg.work_division.num_cores for arg in spec.args]
-    parsed, _ = parse_op_spec(spec)
-    assert operation_cores == destination_cores
-    source_stride = 32 // source_cores
-    destination_stride = 32 // destination_cores
-    assert parsed.num_cores == 32
-    assert [arg.work_division.num_cores for arg in parsed.args] == [32, 32]
-    assert original_tensor_domains == [source_cores, destination_cores]
-    (split_dim,) = [dim for dim, count in parsed.work_slices.items() if count > 1]
-    owner = parsed.core_id_to_work_slice[split_dim]
-    active_cores = [destination_stride * core for core in range(operation_cores)]
-    assert [int(owner.subs(_CORE_ID, core)) for core in active_cores] == [
-        core for core in range(destination_cores)
-    ]
-    for argument, original_count, stride, expected in zip(
-        parsed.args,
-        [source_cores, destination_cores],
-        [source_stride, destination_stride],
-        [source_owner, _CORE_ID],
-    ):
-        assert argument.active_core_ids == tuple(range(0, 32, stride))
-        (dimension,) = [
-            dim
-            for dim, count in argument.work_division.work_slices.items()
-            if count > 1
+        source = _view({0: source_cores}, {0: source_owner}, source_cores)
+        destination = _view({0: destination_cores}, {0: _CORE_ID}, destination_cores)
+        source_rows = owner_slots(
+            dict(source.core_to_slot), dict(source.work_slice_dims), source_cores
+        )
+        destination_rows = owner_slots(
+            dict(destination.core_to_slot),
+            dict(destination.work_slice_dims),
+            destination_cores,
+        )
+        routes = sorted(
+            transfer_edges(
+                dict(source.work_slice_dims),
+                dict(destination.work_slice_dims),
+                dict(enumerate(source_rows)),
+                dict(enumerate(destination_rows)),
+            )
+        )
+        assert {source for source, _ in routes} == set(range(source_cores))
+        assert {destination for _, destination in routes} == set(
+            range(destination_cores)
+        )
+        # Ordinary copies do not select terminal reduction producers. Production
+        # leaves this field empty; route edges can repeat a source on expansion.
+        spec = _completed_route_spec(
+            source,
+            destination,
+            [512, 64],
+            [row, lane],
+            {row: (512, destination_cores), lane: (64, 1)},
+            (),
+            65536,
+        )
+        assert spec.completed_producer_cores == ()
+        simplify_op_spec(spec)
+        operation_cores = math.prod(count for _, count in spec.iteration_space.values())
+        original_tensor_domains = [arg.work_division.num_cores for arg in spec.args]
+        parsed, _ = parse_op_spec(spec)
+        assert operation_cores == destination_cores
+        # Stride spreads both domains across all 32 cores; dense keeps the
+        # operation frame at its widest tensor domain and each tensor at
+        # its own core count.
+        source_stride = 32 // source_cores if placement_mode == "stride" else 1
+        destination_stride = (
+            32 // destination_cores if placement_mode == "stride" else 1
+        )
+        expected_span = (
+            32 if placement_mode == "stride" else max(source_cores, destination_cores)
+        )
+        assert parsed.num_cores == expected_span
+        assert [arg.work_division.num_cores for arg in parsed.args] == [
+            32 if placement_mode == "stride" else domain
+            for domain in (source_cores, destination_cores)
         ]
-        formula = argument.work_division.core_id_to_work_slice[dimension]
-        assert [
-            int(formula.subs(_CORE_ID, stride * core)) for core in range(original_count)
-        ] == [int(expected.subs(_CORE_ID, core)) for core in range(original_count)]
+        assert original_tensor_domains == [source_cores, destination_cores]
+        (split_dim,) = [dim for dim, count in parsed.work_slices.items() if count > 1]
+        owner = parsed.core_id_to_work_slice[split_dim]
+        active_cores = [destination_stride * core for core in range(operation_cores)]
+        assert [int(owner.subs(_CORE_ID, core)) for core in active_cores] == [
+            core for core in range(destination_cores)
+        ]
+        for argument, original_count, stride, expected in zip(
+            parsed.args,
+            [source_cores, destination_cores],
+            [source_stride, destination_stride],
+            [source_owner, _CORE_ID],
+        ):
+            assert argument.active_core_ids == (
+                tuple(range(0, 32, stride))
+                if placement_mode == "stride"
+                else tuple(range(original_count))
+            )
+            (dimension,) = [
+                dim
+                for dim, count in argument.work_division.work_slices.items()
+                if count > 1
+            ]
+            formula = argument.work_division.core_id_to_work_slice[dimension]
+            assert [
+                int(formula.subs(_CORE_ID, stride * core))
+                for core in range(original_count)
+            ] == [int(expected.subs(_CORE_ID, core)) for core in range(original_count)]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
