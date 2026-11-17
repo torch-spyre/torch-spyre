@@ -26,11 +26,13 @@ from unittest.mock import patch
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     finalize_work_division_for_scheduler,
     splits_by_index_coeff,
+    unrepresentable_splits_by_index_coeff,
 )
 
 # Pre-scheduler symbols
@@ -188,6 +190,46 @@ class TestItSpaceSplits(TestCase):
         # s1 must NOT receive the split=4 meant for s0
         self.assertEqual(recovered, {s0: 4, s1: 1, s2: 1})
 
+    def test_split_colliding_with_nontrivial_unsplit_axis_is_unrepresentable(self):
+        # Same coefficient collision as test_size1_dim_not_assigned_split,
+        # but i1 has real extent (8, not 1) -- it simply isn't split in this
+        # candidate. The apply side's size<=1 guard does not protect it, so
+        # the encode/decode round trip alone silently splits it too.
+        write_idx = 8 * i0 + 8 * i1 + i2
+        splits = {i0: 4, i1: 1, i2: 1}
+        stored = splits_by_index_coeff(splits, write_idx, write_idx)
+        recovered = apply_splits_from_index_coeff(
+            stored,
+            8 * s0 + 8 * s1 + s2,
+            8 * s0 + 8 * s1 + s2,
+            {s0: 8, s1: 8, s2: 64},  # s1 has extent 8, not 1
+        )
+        # The transport cannot tell s0 and s1 apart by coefficient alone, so
+        # s1 wrongly inherits s0's split -- the hazard the representability
+        # check below must reject before this split is ever committed.
+        self.assertEqual(recovered, {s0: 4, s1: 4, s2: 1})
+
+        problems = unrepresentable_splits_by_index_coeff(
+            splits, {i0: 8, i1: 8, i2: 64}, write_idx, write_idx
+        )
+        self.assertTrue(problems, "collision with an unsplit axis must be flagged")
+
+    def test_split_colliding_only_with_a_size1_axis_is_representable(self):
+        # Contrast with test_split_colliding_with_nontrivial_unsplit_axis_is_-
+        # unrepresentable above: here i1 is genuinely size-1 (extent 1, like
+        # test_size1_dim_not_assigned_split), so the decoder's size<=1 guard
+        # already makes the shared coefficient harmless -- the decoder never
+        # looks up i1's coefficient at all. The representability check must
+        # not reject this as a false collision.
+        write_idx = 8 * i0 + 8 * i1 + i2
+        splits = {i0: 4, i1: 1, i2: 1}
+        problems = unrepresentable_splits_by_index_coeff(
+            splits, {i0: 8, i1: 1, i2: 8}, write_idx, write_idx
+        )
+        self.assertEqual(
+            problems, [], "a collision solely with a size-1 axis is not a hazard"
+        )
+
     def test_broadcast_dim_not_assigned_split(self):
         # Broadcast dim has stride 0 — coeff==0, so absent from stored splits
         # and correctly defaults to 1 on the apply side.
@@ -220,7 +262,11 @@ class TestItSpaceSplits(TestCase):
         recovered = apply_splits_from_index_coeff(stored, s0, s0, {s0: 8})
         self.assertEqual(recovered, {s0: 1})
 
-    def test_scheduler_transport_warns_and_uses_last_axis_for_collision(self):
+    def test_scheduler_transport_raises_on_collision(self):
+        """Two distinct split axes sharing one write-index coefficient can no
+        longer be silently resolved by iteration-order last-axis-wins:
+        finalize now raises rather than committing a lossy encoding."""
+
         class Op:
             def __init__(self):
                 self.op_it_space_splits = None
@@ -240,17 +286,18 @@ class TestItSpaceSplits(TestCase):
 
         op = Op()
         graph = type("Graph", (), {"operations": [op]})()
-        with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
             with patch(
                 "torch_spyre._inductor.pass_utils.iteration_space_from_op",
                 return_value={i0: 8, i1: 8},
             ):
                 finalize_work_division_for_scheduler(graph)
 
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("lossy work-division scheduler transport", logs.output[0])
-        self.assertEqual(op.op_it_space_splits, ({8: 4}, {}))
-        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+        self.assertIsNone(op.op_it_space_splits)
+        self.assertTrue(hasattr(op, "iteration_space_ownership"))
 
 
 if __name__ == "__main__":

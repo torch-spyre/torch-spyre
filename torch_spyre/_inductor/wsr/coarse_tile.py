@@ -117,7 +117,6 @@ from .loop_tiling_common import (  # noqa: F401
     _LOOPS_INNER_FN_OPCOUNT_KEY,
     _LOOPS_INNER_FN_STR_KEY,
     _LogicalIterationSymbol,
-    _LoopVarRebaseHandler,
     _NameSwapHandler,
     _PointReadRebaseHandler,
     _REDUCTION_FREE_SYMS_KEY,
@@ -155,6 +154,7 @@ from .loop_tiling_common import (  # noqa: F401
     logger,
     reduction_loop_vars,
 )
+from .span_overflow_loop_terms import add_loop_terms
 
 
 # ---------------------------------------------------------------------------
@@ -2091,7 +2091,7 @@ def coarse_tile_post_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
-) -> None:
+) -> dict[int, sympy.Symbol]:
     """Span-overflow coarse tiling.  Runs POST-stickification.
 
     Parameters
@@ -2204,6 +2204,12 @@ def coarse_tile_post_stickify(
     _log_propagation_self_check(operations, predicted_kind_by_name)
     validate_writer_tile_advance(operations)
     validate_reader_tile_advance(operations)
+
+    # The legacy lowering records each access's advance and leaves the index
+    # without a loop term. Add the term to every copy_out group, so the kernel
+    # reads the advance from the index and checks it against that record
+    # (stage 7a.2). Returns {group index: loop variable} for the groups it did.
+    return add_loop_terms(graph, groups, group_idx_offset)
 
 
 def validate_writer_tile_advance(operations: list[Operation]) -> None:
@@ -3670,7 +3676,7 @@ def _propagate_tiled_reduction_op(
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
     )
-    # SpyreTensorLayout([], dtype) yields device_size=[1, 64], stride_map=[-1, -1]
+    # SpyreTensorLayout([], dtype) yields device_size=[1, 64], stride_map=[0, 0]
     # — a 0-d broadcast scalar in Spyre's device coordinate system.
     scalar_stl = SpyreTensorLayout([], dtype)
     scalar_op.layout = FixedTiledLayout(device, dtype, [], [], scalar_stl)

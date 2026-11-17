@@ -48,6 +48,10 @@ DETERMINISTIC_CODES = frozenset(
 )
 
 
+# Replication and quorum failures that pass once the cluster recovers.
+REPLICATION_CODES = frozenset({242, 285, 286, 319, 999})
+
+
 class BatchFailed(RuntimeError):
     """A batch failed through every retry; `landed` rows of this call are already stored."""
 
@@ -77,10 +81,16 @@ def retriable(err: BaseException) -> bool:
     if isinstance(err, OperationalError):
         return True
     if isinstance(err, DatabaseError):
-        text = str(err)
-        status = _after(text, "HTTP status ")
-        code = _after(text, "Code: ")
-        return bool(status and status >= 500 and code not in DETERMINISTIC_CODES)
+        # Newer drivers carry the server code on the exception and drop the status from the text.
+        code = getattr(err, "code", None)
+        if not isinstance(code, int):
+            code = _after(str(err), "Code: ")
+        if code in DETERMINISTIC_CODES:
+            return False
+        if code in REPLICATION_CODES:
+            return True
+        status = _after(str(err), "HTTP status ")
+        return bool(status and status >= 500)
     return False
 
 
