@@ -365,8 +365,8 @@ class TestPassUtils(unittest.TestCase):
         assert result == (1024, 64)
 
     def test_compute_symbolic_bounds_infinite_upper_falls_back_to_hint(self):
-        # dynamic=True without mark_dynamic(max=...) gives upper=oo.
-        # max_size must fall back to optimization_hint, not oo. lower=2 is
+        # A bare mark_dynamic (no max=...) or automatic dynamic shapes gives
+        # upper=oo. max_size must fall back to optimization_hint, not oo. lower=2 is
         # ShapeEnv's default (no mark_dynamic(min=...) given), so
         # granularity comes from compute_granularity's default-divisor
         # branch: smallest divisor of 256 >= min_default_granularity(4)
