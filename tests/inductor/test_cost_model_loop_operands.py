@@ -106,8 +106,8 @@ def test_the_excess_follows_a_candidate_tile_count():
     excess = _loop_repeated_read_excess_ns(
         [_carry_reader(resident=False, loop_factor=tiles)], p
     )
-    assert excess.subs(tiles, 1) == 0
-    assert excess.subs(tiles, TRIPS) == _loop_repeated_read_excess_ns(
+    assert excess.xreplace({tiles: 1}) == 0
+    assert excess.xreplace({tiles: TRIPS}) == _loop_repeated_read_excess_ns(
         [_carry_reader(resident=False)], p
     )
 
@@ -220,7 +220,7 @@ def test_burst_excess_follows_a_symbolic_split():
     p = CostParams()
     stick = p.transport_dma_word_bytes
     expr = _read_burst_excess_ns([_streamed(64 * stick / split)], p)
-    assert float(expr.subs(split, 32)) > float(expr.subs(split, 1))
+    assert float(expr.xreplace({split: 32})) > float(expr.xreplace({split: 1}))
 
 
 @pytest.mark.parametrize("broadcast", [False, True])
@@ -248,7 +248,7 @@ def test_burst_price_agrees_before_and_after_replication_is_chosen(broadcast):
                 concrete = dataclasses.replace(op, args=[op.args[0], concrete_arg])
                 expected = float(_read_burst_excess_ns([concrete], p))
                 actual = float(
-                    expr.subs(
+                    expr.xreplace(
                         {replication: replicas, split: divisor, resident: int(is_lx)}
                     )
                 )
@@ -409,7 +409,7 @@ def test_batch_split_cost_follows_symbolic_splits(monkeypatch):
     rate = CostParams().mm_batch_split_ns_per_step
 
     def at(b0, b1, m):
-        return float(expr.subs({s0: b0, s1: b1, sm: m}))
+        return float(expr.xreplace({s0: b0, s1: b1, sm: m}))
 
     assert at(1, 1, 32) == pytest.approx(0, abs=1e-6)
     assert at(4, 2, 2) == pytest.approx(rate * 8 * 2)

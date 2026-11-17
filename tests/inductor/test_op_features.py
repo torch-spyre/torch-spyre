@@ -704,7 +704,7 @@ class SymbolicTileCountCostTest(TestCase):
                 expr = sympy.sympify(predict_ops([self._at(op, self.TILE)]))
                 for count in (1, 4):
                     want = float(predict_ops([self._at(op, count)]))
-                    got = float(expr.subs(self.TILE, count))
+                    got = float(expr.xreplace({self.TILE: count}))
                     self.assertAlmostEqual(
                         got,
                         want,
