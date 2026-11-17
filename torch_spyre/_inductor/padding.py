@@ -455,6 +455,9 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         y_buf = graph.get_buffer(y_name)
         if x_buf is None or y_buf is None:
             continue
+        # lower_qfp8wt already zero-padded this weight's K (#2831).
+        if getattr(y_buf, "spyre_qfp8wt_valid_k", None) == k_val:
+            continue
 
         device = x_buf.get_device()
         pad = compute_padding(k_val, dtype)
