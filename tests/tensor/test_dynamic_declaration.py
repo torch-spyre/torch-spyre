@@ -23,20 +23,19 @@ and unknown-key rejection in the same validation pass.
 """
 
 import warnings
-from types import SimpleNamespace
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
 from torch_spyre._C import (
+    get_device_dtype,
     get_reserved_dims,
     get_spyre_tensor_layout,
     spyre_empty_reserved,
     SpyreTensorLayout,
 )
 from torch_spyre._inductor import config as inductor_config
-from torch_spyre._monkey_patch import _check_layout_for_reservation, _DynamicSpec
 
 DEVICE = torch.device("spyre")
 
@@ -184,7 +183,7 @@ class TestDynamicDeclarationValidation(TestCase):
         # The explicit layout describes the buffer at the declared max. A
         # layout for today's 560 rows would be silently too small for 630.
         stl = SpyreTensorLayout((560, 1024), torch.float16)
-        with self.assertRaisesRegex(ValueError, "extent max=630, got 560"):
+        with self.assertRaisesRegex(RuntimeError, "extent max=630, got 560"):
             self.x.to(
                 DEVICE,
                 device_layout=stl,
@@ -196,7 +195,7 @@ class TestDynamicDeclarationValidation(TestCase):
         # on the stick-elements device dim (stride_map 1024 at the last position)
         # and would be interleaved across sticks: not resizable in place.
         stl = SpyreTensorLayout((630, 1024), (1024, 1), torch.float16, [1, 0])
-        with self.assertRaisesRegex(ValueError, "stick-elements"):
+        with self.assertRaisesRegex(RuntimeError, "stick-elements"):
             self.x.to(
                 DEVICE,
                 device_layout=stl,
@@ -220,24 +219,21 @@ class TestDynamicDeclarationValidation(TestCase):
             list(get_spyre_tensor_layout(y).device_size), list(stl.device_size)
         )
 
-    def test_layout_check_is_a_pure_function(self) -> None:
-        # The rule, without a device: the reserved host dim must sit whole in
-        # exactly one device dim, not the stick one, with extent max.
-        spec = _DynamicSpec(dim=0, min=8, max=16, granularity=1)
-        size, stride = (12, 32, 1), (32, 1, 1)
-        ok = SimpleNamespace(device_size=[16, 1, 32, 32], stride_map=[32, 0, 1, 0])
-        _check_layout_for_reservation(ok, spec, size, stride)
-        too_small = SimpleNamespace(
-            device_size=[12, 1, 32, 32], stride_map=[32, 0, 1, 0]
+    def test_device_layout_folded_rejected(self) -> None:
+        # A layout that folds the rows into the stick dimension has no device
+        # dim carrying host stride 1024 on its own: "found 0" carriers.
+        stl = SpyreTensorLayout(
+            [1, 630 * 1024 // 64, 64],
+            [0, 1, 0],
+            get_device_dtype(torch.float16),
+            {(0,): 1, (1, 2): 630 * 1024},
         )
-        with self.assertRaisesRegex(ValueError, "extent max=16, got 12"):
-            _check_layout_for_reservation(too_small, spec, size, stride)
-        folded = SimpleNamespace(device_size=[1, 32, 32], stride_map=[0, 1, 0])
-        with self.assertRaisesRegex(ValueError, "found 0"):
-            _check_layout_for_reservation(folded, spec, size, stride)
-        on_stick = SimpleNamespace(device_size=[32, 1, 16], stride_map=[1, 0, 32])
-        with self.assertRaisesRegex(ValueError, "stick-elements"):
-            _check_layout_for_reservation(on_stick, spec, size, stride)
+        with self.assertRaisesRegex(RuntimeError, "found 0"):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
 
     def test_reserved_transfer_does_not_warn(self) -> None:
         # The transfer used to warn that compiled kernels were built for the

@@ -484,23 +484,38 @@ reserved buffer, so it is the layout of the tensor at `max`, not at its current
 size:
 
 ```
+from torch_spyre._C import get_device_dtype, SpyreTensorLayout
+
+# 12 rows of 32 page ids today, up to 16 rows over the tensor's life.
 ids = torch.arange(12 * 32, dtype=torch.int32).reshape(12, 32, 1)
-# One int32 id per 128-byte stick, 16 rows reserved.
+# The layout of the buffer at max: one int32 id per 128-byte stick (32 int32
+# slots per stick, one of them holding data), 16 rows.
 layout = SpyreTensorLayout(
-    [16, 1, 32, 32], [32, 0, 1, 0], get_device_dtype(torch.int32),
-    {(0,): 16, (2,): 32, (1, 3): 1},
+    device_size=[16, 1, 32, 32],  # rows at max, 1, ids per row, slots per stick
+    stride_map=[32, 0, 1, 0],  # the host stride each device dim walks, 0 = none
+    device_dtype=get_device_dtype(torch.int32),
+    valid_elements={(0,): 16, (2,): 32, (1, 3): 1},  # data-holding extents
 )
 spec = {0: {"min": 8, "max": 16, "granularity": 1}}
 d = ids.to("spyre", device_layout=layout, dynamic=spec)
 d.resize_((9, 32, 1))  # exact, the layout stays the one given
 ```
 
+`stride_map` names, for each device dimension, the host stride it walks: 32 is
+host dimension 0 (the rows), 1 is host dimension 1 (the ids), and 0 marks a
+device dimension that carries no host dimension. `valid_elements` maps a group
+of device dimensions to how many of its elements hold data, so `(1, 3): 1` says
+that of the 32 slots in each stick one is an id.
+
 The reserved host dimension must occupy exactly one device dimension of the
 layout, whole: the device dimension whose `stride_map` entry is the host stride
 of the reserved dimension. That dimension's extent must be `max`, and it cannot
 be the stick-elements dimension. A layout that folds the reserved dimension
 into another, splits it across the stick, or sizes it for anything but `max`
-is refused with a `ValueError` before anything is allocated. The derived layout
+is refused before anything is allocated, with a `RuntimeError` from the native
+allocation that names the rule. The layout's other dimensions are not checked
+against the host shape, the same contract as `device_layout=` without
+`dynamic=`: sizing them for the tensor is the caller's responsibility. The derived layout
 satisfies these rules by construction, so giving
 `SpyreTensorLayout(max_shape, dtype)` explicitly is the same as the call
 without `device_layout=`.

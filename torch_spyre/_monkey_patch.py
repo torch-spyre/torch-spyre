@@ -224,59 +224,18 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     return dst
 
 
-def _check_layout_for_reservation(device_layout, spec: _DynamicSpec, size, stride):
-    """Refuse an explicit device layout that cannot hold the reservation.
-
-    The layout describes the buffer at ``max``, so the reserved host dimension
-    must occupy exactly one device dimension, whole, with extent ``max``: that
-    is the dimension the transfer and every later ``resize_`` move along. A
-    device dimension is "the reserved one" when its stride-map entry is the
-    host stride of the reserved dimension. The native allocation re-checks the
-    same rules; this pure function exists for the earlier, clearer error.
-    """
-    device_size = list(device_layout.device_size)
-    stride_map = list(device_layout.stride_map)
-    where = f"dynamic={{{spec.dim}: ...}} together with device_layout="
-    if not device_size or len(stride_map) != len(device_size):
-        raise ValueError(f"{where}: the layout has no usable device dimensions")
-    host_stride = stride[spec.dim]
-    carriers = [
-        d
-        for d, (s, n) in enumerate(zip(stride_map, device_size))
-        if s == host_stride and n > 1
-    ]
-    if len(carriers) != 1:
-        raise ValueError(
-            f"{where}: the reserved host dimension {spec.dim} (host stride "
-            f"{host_stride}) must occupy exactly one device dimension of the "
-            f"layout, found {len(carriers)} (device_size={device_size}, "
-            f"stride_map={stride_map})"
-        )
-    (carrier,) = carriers
-    if carrier == len(device_size) - 1:
-        raise ValueError(
-            f"{where}: the reserved host dimension {spec.dim} lands on the "
-            "stick-elements dimension of the layout, which cannot be resized"
-        )
-    if device_size[carrier] != spec.max:
-        raise ValueError(
-            f"{where}: the layout describes the buffer at the declared max, so "
-            f"device dimension {carrier} (the reserved host dimension "
-            f"{spec.dim}) must have extent max={spec.max}, got "
-            f"{device_size[carrier]}"
-        )
-
-
 def _transfer_reserved_with_layout(src, spec: _DynamicSpec, device_layout):
     """``_transfer_reserved`` with the device layout given instead of derived.
 
     Same sequence: allocate at the ceiling, copy the real rows in, mark the
-    dimension dynamic. The layout is checked against the declaration first,
-    here and again natively.
+    dimension dynamic. The layout describes the buffer at ``max``, so the
+    reserved host dimension must occupy exactly one device dimension of it,
+    whole (the one whose stride-map entry is the host stride of the reserved
+    dimension), not the stick-elements dimension, with extent ``max``. The
+    native allocation checks that before anything is allocated and raises a
+    ``RuntimeError`` naming the rule it broke.
     """
     import torch
-
-    _check_layout_for_reservation(device_layout, spec, src.size(), src.stride())
 
     if not torch.spyre.is_initialized():
         torch.spyre._impl._lazy_init()

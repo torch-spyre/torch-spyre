@@ -1139,8 +1139,7 @@ at::Tensor spyre_empty_reserved_with_layout(
   TORCH_CHECK(!device_size.empty() && stride_map.size() == device_size.size(),
               "device_layout with a reservation: the layout has no usable "
               "device dimensions");
-  TORCH_CHECK(device_layout.device_dtype ==
-                  SpyreTensorLayout(size.vec(), dtype).device_dtype,
+  TORCH_CHECK(device_layout.device_dtype == get_device_dtype(dtype),
               "device_layout with a reservation: the layout's device dtype "
               "does not match tensor dtype ",
               dtype);
