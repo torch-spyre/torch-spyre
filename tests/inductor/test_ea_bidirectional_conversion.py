@@ -101,6 +101,9 @@ STICK_ONLY_SHAPES = [
     (1, 1),
     (1, 1, 1),
     (1, 1, 1, 1),
+    # A size-1 stick dim with several rows also holds one element per stick (#5566).
+    (2, 1),
+    (3, 1, 1),
 ]
 
 # Stick aligned shape
@@ -1156,8 +1159,8 @@ def _build_ea_dci_tests(is_h2d: bool = False):
     BASE_SHAPES = STICK_ALIGNED_SHAPES + SMALL_N_SHAPES + STICK_ONLY_SHAPES
 
     # fp16 -> fp32 doubles the stick count, so the output is always whole stick
-    # pairs once the stick dim is at least 64 wide. Stick dims narrower than 64
-    # only get a single fp32 stick; these are rejected on D2H.
+    # pairs once the stick dim is wider than 32 (padded by #5048). Stick dims of
+    # at most 32 only get a single fp32 stick; these are rejected on D2H.
     FP16_TO_FP32_SHAPES = BASE_SHAPES + [
         # Partial last stick or pair
         (68,),
@@ -1170,7 +1173,7 @@ def _build_ea_dci_tests(is_h2d: bool = False):
         (8, 16, 100),
         (4, 160),
         (8, 16, 160),
-        # Narrower than one stick (rejected on D2H)
+        # 44 is padded to a stick pair; 16 and 32 are rejected on D2H
         (44,),
         (4, 16),
         (4, 32),
@@ -1180,9 +1183,8 @@ def _build_ea_dci_tests(is_h2d: bool = False):
         (2, 3, 4, 44),
     ]
 
-    # fp32 -> fp16 halves the stick count, so the compiler only accepts an even
-    # number of 32-element fp32 sticks (rescale_stl_for_dtype). Shapes with an odd
-    # stick count (68, 96, 160 and 32 wide) are not supported.
+    # fp32 -> fp16 halves the stick count; an odd number of 32-element fp32 sticks
+    # (32 wide, 68, 96, 160) is padded to a whole pair by #5048.
     FP32_TO_FP16_SHAPES = BASE_SHAPES + [
         # One stick + a partial stick
         (4, 100),
@@ -1268,31 +1270,14 @@ def _build_ea_dci_tests(is_h2d: bool = False):
 EA_D2H_TEST_PARAMS = _build_ea_dci_tests()
 
 
-def _rescale_rejected(src_dtype, dst_dtype, shape):
-    # FP32 -> FP16/BF16 conversion requires an even number of FP32 sticks because two
-    # 32-element FP32 sticks combine to form one 64-element FP16/BF16 stick.  If the
-    # input shape results in an odd number of FP32 sticks (e.g., shape (32,) has 1
-    # stick, shape (4, 32) has 1 stick in the last dim), `rescale_stl_for_dtype` rejects
-    # the layout as it cannot form whole output sticks. See #3809, #5361.
-    _RESCALE_REJECTED_SHAPES = [
-        (32,),
-        (4, 32),
-    ]
-
-    return (
-        src_dtype == torch.float32
-        and dst_dtype in (torch.float16, torch.bfloat16)
-        and shape in _RESCALE_REJECTED_SHAPES
-    )
-
-
 def _whole_stick_pairs_rejected(expected_ea, shape):
-    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim narrower than
-    # 64 only gets a single fp32 stick, so half of each pair has nowhere to go.
+    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim of at most one fp32
+    # stick (32 elements) only gets a single fp32 stick, so half of each pair has
+    # nowhere to go. Wider dims are padded to a whole pair by #5048.
     # Note: shape[-1] is safe for 0-dim shapes () because expected_ea is forced
     # to STANDARD in those cases, so the expected_ea == DL16_TO_FP32 check
     # short-circuits and will not reach shape[-1].
-    return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] < 64
+    return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] <= 32
 
 
 def _convert_one_row_per_core(x, dst_dtype):
@@ -1328,11 +1313,6 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
     x = values.to(src_dtype)
     ref = values.to(dst_dtype)
-
-    if _rescale_rejected(src_dtype, dst_dtype, shape):
-        with pytest.raises(InductorError, match="cannot rescale device layout"):
-            _convert_one_row_per_core(x, dst_dtype)
-        return
 
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
@@ -1382,11 +1362,6 @@ def _make_x_and_new(shape, src_dtype, dst_dtype, offset=100.0):
 )
 def test_ea_restore_h2d(src_dtype, dst_dtype, expected_ea, shape):
     x, new = _make_x_and_new(shape, src_dtype, dst_dtype)
-
-    if _rescale_rejected(src_dtype, dst_dtype, shape):
-        with pytest.raises(InductorError, match="cannot rescale device layout"):
-            _convert_one_row_per_core(x, dst_dtype)
-        return
 
     # Create staggered tensor on device
     y = _convert_one_row_per_core(x, dst_dtype)

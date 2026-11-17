@@ -769,27 +769,13 @@ TO_DTYPE_OP_EXPECT_FAIL = {
 }
 
 
-# Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
-# elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
-# 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
-# element arrangement cannot use a partially filled stick, so
-# rescale_stl_for_dtype rejects the conversion with Unsupported instead of
-# dropping data (flooring) or returning wrong values (rounding up) (#3809, #3604).
-# This is a rejection by design, so these cases assert it.
-_RESCALE_REJECTION = "cannot rescale device layout"
-_RESCALE_REJECTED_SHAPES = ("4x32", "4x68", "68")
-TO_DTYPE_OP_RESCALE_REJECTED = {
-    f"float32_to_{dst}_{shape}"
-    for dst in ("float16", "bfloat16")
-    for shape in _RESCALE_REJECTED_SHAPES
-}
-
 # After type conversion elements are staggered on device, in DCI path they are restored
 # to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
-# narrower than 64 is converted to a single fp32 stick, so half of each stick pair has
-# nowhere to go and the DCO restore rejects it instead of reading back wrong data.
+# of at most 32 elements is converted to a single fp32 stick, so half of each stick
+# pair has nowhere to go and the EA DCI rejects it instead of reading back wrong
+# data. Wider dims are padded to whole stick pairs (#5048).
 _D2H_PAIR_REJECTION = "requires whole stick pairs"
-_D2H_PAIR_REJECTED_SHAPES = ("4x16", "4x32", "4x63")
+_D2H_PAIR_REJECTED_SHAPES = ("4x16", "4x32")
 TO_DTYPE_OP_D2H_PAIR_REJECTED = {
     f"{src}_to_float32_{shape}"
     for src in ("float16", "bfloat16")
@@ -798,7 +784,6 @@ TO_DTYPE_OP_D2H_PAIR_REJECTED = {
 
 TO_DTYPE_OP_EXPECT_RAISE = {
     **dict.fromkeys(TO_DTYPE_OP_D2H_PAIR_REJECTED, _D2H_PAIR_REJECTION),
-    **dict.fromkeys(TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION),
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
