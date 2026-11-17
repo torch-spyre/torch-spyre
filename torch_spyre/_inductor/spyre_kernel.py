@@ -35,6 +35,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import CeilDiv
 from torch._inductor.virtualized import V
 
 
@@ -72,9 +73,13 @@ from .scratchpad.lx_relayout import (
 )
 from .pass_utils import (
     concretize_expr,
+    declared_dims_in,
     op_read_writes,
     compute_symbolic_bounds,
+    max_trip_count,
+    require_declared_count,
     symbolic_count_bounds,
+    with_shape_env_replacements,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -704,10 +709,29 @@ class SpyreKernel(Kernel[CSEVariable]):
         so their sympy.Add terms never combine into one coefficient.
         """
         if level_idx not in self._tile_advance_symbols:
-            self._tile_advance_symbols[level_idx] = sympy.Symbol(
-                f"_tile_adv_{op_name}_lvl{level_idx}"
-            )
+            self._tile_advance_symbols[level_idx] = self._induction_symbol(
+                level_idx
+            ) or sympy.Symbol(f"_tile_adv_{op_name}_lvl{level_idx}")
         return self._tile_advance_symbols[level_idx]
+
+    def _induction_symbol(self, level_idx: int) -> "sympy.Symbol | None":
+        """The loop's own induction variable for level ``level_idx``, if known.
+
+        An op inside a counted loop lists the loop's variable in its ``dim_hints``
+        (level ``i`` is the ``i``-th loop-variable hint, outermost first), and that
+        variable is what ``dep.index`` carries, so the advance is expressed in it
+        directly. Returns ``None`` for an op with no loop-variable hint, and when the
+        hint count differs from the loop depth (the pairing is then unknown, the same
+        rule as ``_index_tile_advance``); the caller mints a per-(op, level) symbol.
+        """
+        node = getattr(self, "current_node", None)
+        ir_node = getattr(node, "node", None)
+        if ir_node is None:
+            return None
+        hinted = list(loop_var_ranges_from_dim_hints(ir_node))
+        if not hinted or len(hinted) != len(enclosing_loops(ir_node)):
+            return None
+        return hinted[level_idx] if level_idx < len(hinted) else None
 
     @staticmethod
     def _host_dim_to_index_symbol(ir_node: Any, dim: int) -> sympy.Symbol:
@@ -879,7 +903,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym not in subs
                     }
                 )
-                host_expr += dep.index.subs(subs)
+                # Simultaneous: the level symbol can be the loop's own induction
+                # variable, which is also a free symbol of the index (zeroed here).
+                # A sequential substitution would zero the symbol it just introduced.
+                host_expr += dep.index.subs(subs, simultaneous=True)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
@@ -1096,6 +1123,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
             non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
+            stride_map=list(tensor.layout.device_layout.stride_map),
         )
         if (
             _spyre_config.lx_planner_relayout
@@ -1304,18 +1332,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    count = loop_count[lvl]
-                    # A symbolic count needs its op geometry built at the declared
-                    # maximum, and a launch slot that reads the size, before it
-                    # can run. Neither exists yet, so say that plainly here
-                    # instead of failing in int() with "Cannot convert symbols".
-                    if getattr(count, "free_symbols", None):
-                        raise Unsupported(
-                            f"{op_name} inside a for_each_tile loop whose trip "
-                            f"count {count} depends on a varying size. Building its "
-                            "geometry at the declared maximum is not implemented yet"
-                        )
-                    trip_count = int(count)
+                    # Not int(): a symbolic count has no single value and int()
+                    # on one raises. What the SDSC needs here is the dimension's
+                    # largest extent. See max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1329,6 +1349,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         for _, (size_expr, _) in it_space_extended.items():
             if not (hasattr(size_expr, "free_symbols") and size_expr.free_symbols):
                 continue
+            declared = declared_dims_in(size_expr)
+            if declared:
+                # A declared dimension reaches a kernel only as the trip count of
+                # a for_each_tile loop over it: the body is one static tile and
+                # the loop runs for the size the launch reads. An op whose own
+                # iteration space depends on it has no such loop, so it would be
+                # built at one size, right there and silently wrong at every
+                # other (#5937), or at the maximum and writing past an output
+                # allocated at the real size. Refuse instead.
+                raise Unsupported(
+                    f"{op} ({ir_node.get_operation_name()}): its iteration space "
+                    f"has size {size_expr}, which depends on the dimension(s) "
+                    f"{sorted(declared)} declared with "
+                    'tensor.to("spyre", dynamic=...), outside any for_each_tile '
+                    "loop. A declared dimension is consumed by a for_each_tile "
+                    "loop over it (dims=(d,), tile_size=granularity), whose body "
+                    "sees one tile and whose trip count is bound at launch."
+                )
             if finite_upper_or_none(size_expr) is None:
                 logger.debug(
                     f"[work_division/symbolic] skipping auto-dynamic symbol "
@@ -1697,7 +1735,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         scheduler's _codegen_loop_body) both come through here, so each level's
         per-symbol bounds are resolved exactly once, and at codegen time, the
         last point the ShapeEnv is available.
+
+        The ShapeEnv's replacements are applied to the count here, once, so a
+        pair tied with ``torch._check(a == b)`` reaches the LoopSpec, its
+        bounds, its sources and the bundle as the one surviving symbol. A count
+        over a dimension nobody declared is refused here, the one place every
+        level passes (see ``require_declared_count``).
         """
+        count = with_shape_env_replacements(count)
+        require_declared_count(count)
         return LoopSpec(
             count=count,
             body=body,
@@ -2305,6 +2351,178 @@ def _check_relayout_boundary(
         )
 
 
+def _has_staggered_ea(op_spec: OpSpec) -> bool:
+    """Whether this op reads or writes a staggered arrangement, as padding decides.
+
+    Mirrors ``insert_staggered_ea_padding``: a typecast, one input and one output
+    differing in elements per stick, or an op writing a DL16_TO_FP32 value.  A
+    reduction is never a typecast: it keeps its input dtype, and a separate
+    pointwise op converts the result.
+    """
+    if not op_spec.args:
+        return False
+    in_arg, out_arg = op_spec.args[0], op_spec.args[-1]
+    in_eps = in_arg.device_size[-1]
+    out_eps = out_arg.device_size[-1]
+    is_typecast = (
+        not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps != out_eps
+    )
+    return is_typecast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+
+
+def _holds_stick_pair(arg: TensorArg, max_eps: int) -> bool:
+    """Whether ``arg`` keeps a stick pair on the gap dim ``_pad_num_sticks`` prepends."""
+    return (
+        arg.device_size[-1] < max_eps
+        and arg.stride_map is not None
+        and arg.stride_map[0] == 0
+        and arg.device_size[0] > 1
+    )
+
+
+def _add_size1_stick_var(op_spec: OpSpec, max_eps: int) -> None:
+    """Give a size-1 stick dim a stick var, so its stick pair can be bound.
+
+    A size-1 stick dim has no loop var, so no operand's stick coordinate names
+    one and the pair's gap dim stays unbound.  SDSC codegen would then pad the
+    stick dim to a whole wide stick, spanning the pair, and treat the unbound gap
+    dim as a back gap besides: the pair counted twice, the access overruns the
+    buffer.  The new var spans one stick of the side with more elements per
+    stick; it is given to the operands holding the pair and, for a typecast, to
+    both operands.  Other operands are broadcasts and keep their constant stick
+    coordinate.
+    """
+    if any(arg.device_coordinates[-1].free_symbols for arg in op_spec.args):
+        return
+    pair_args = [arg for arg in op_spec.args if _holds_stick_pair(arg, max_eps)]
+    if not pair_args:
+        return
+    is_typecast = (
+        not op_spec.is_reduction
+        and len(op_spec.args) == 2
+        and len({arg.device_size[-1] for arg in op_spec.args}) == 2
+    )
+    targets = op_spec.args if is_typecast else pair_args
+    stick_var = next(
+        sym
+        for idx in itertools.count()
+        if (sym := sympy.Symbol(f"st{idx}")) not in op_spec.iteration_space
+    )
+    op_spec.iteration_space[stick_var] = (sympy.Integer(max_eps), 1)
+    for arg in targets:
+        arg.device_coordinates = [*arg.device_coordinates[:-1], stick_var]
+
+
+def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
+    """Make an op with a staggered arrangement iterate whole sticks.
+
+    ``insert_staggered_ea_padding`` pads such an op's buffers to whole sticks, but
+    the op's iteration space still spans only the live elements.  This rounds the
+    range of each stick var up to match, and binds the stick index of an operand
+    with fewer elements per stick to the dim holding its stick pair.
+
+    Runs before ``align_tensors``, which re-intersects the split work division
+    planned with each stick var's stick count on the first operand.  On an
+    unrounded range the two can share no factor, e.g. 96 FP32 elements are 3 FP32
+    sticks against a 2-way split of 2 FP16 sticks.  The op then drops to one core
+    on that dim, so its core mapping no longer matches the cores its LX operands
+    were placed on, and kernel preparation moves those operands to HBM and
+    prepares the kernels again.
+    """
+    # A typecast converts whole sticks of its side with more elements per stick.
+    max_eps = max(arg.device_size[-1] for arg in op_spec.args)
+    if any(
+        arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+        for arg in op_spec.args
+    ):
+        # A DL16_TO_FP32 value spreads each FP16 stick over an FP32 stick pair, so
+        # an op whose operands are all FP32 still iterates whole FP16 sticks.
+        max_eps = max(max_eps, DataFormats.SEN169_FP16.elems_per_stick())
+    _add_size1_stick_var(op_spec, max_eps)
+
+    rounded_stick_vars = set()
+    for arg in op_spec.args:
+        coords = list(arg.device_coordinates)
+        stick_coord = coords[-1]
+        if not stick_coord.free_symbols:
+            # A broadcast or size-1 stick dim has no stick var.
+            continue
+        # The stick-expression check upstream admits only one stick var.
+        assert len(stick_coord.free_symbols) == 1, stick_coord
+        (stick_var,) = stick_coord.free_symbols
+        # Round the stick var's extent up to whole sticks of the side with more
+        # elements per stick, e.g. 96 -> 128 for an FP32 <-> FP16 typecast.
+        if stick_var in op_spec.iteration_space and stick_var not in rounded_stick_vars:
+            extent, split = op_spec.iteration_space[stick_var]
+            op_spec.iteration_space[stick_var] = (
+                CeilDiv(extent, max_eps) * max_eps,
+                split,
+            )
+            rounded_stick_vars.add(stick_var)
+
+        eps = arg.device_size[-1]
+        if eps == max_eps:
+            # The rounded stick var spans exactly one of the operand's sticks.
+            continue
+        if any(stick_var in c.free_symbols for c in coords[:-1]):
+            # Indexing already puts the stick index on an outer dim, as for a read
+            # of whole pairs.
+            continue
+        # Every supported typecast halves or doubles the elements per stick.
+        assert max_eps == 2 * eps, (max_eps, arg)
+
+        # Find the dim holding the pair, to take the stick index.
+        stride_map, size = arg.stride_map, arg.device_size
+        assert stride_map is not None, arg
+        if stride_map[0] == 0 and size[0] > 1:
+            # The gap dim ``_pad_num_sticks`` prepends when the num-sticks dim holds
+            # a single stick.  A size-1 dim with ``stride_map`` 0 is an elided
+            # host dim instead.
+            stick_index_dim = 0
+        else:
+            # The num-sticks dim, which steps the host by one stick.  Of the padded
+            # operands, only a read of one stick of a wider buffer gets here, e.g.
+            # ``x32[..., 64:96]``; a read of more sticks already indexes this dim.
+            stick_stride = eps * stride_map[-1]
+            candidate_dims = [
+                d
+                for d in range(len(size) - 1)
+                if stride_map[d] == stick_stride and size[d] > 1
+            ]
+            if len(candidate_dims) != 1:
+                # TODO: bind an operand whose stick pair is on no single dim,
+                # e.g. one that padding left alone or with a folded num-sticks dim.
+                raise Unsupported(
+                    f"staggered read with no unique num-sticks dim {candidate_dims}: "
+                    f"{arg}"
+                )
+            (stick_index_dim,) = candidate_dims
+        stick_index_offset = coords[stick_index_dim]
+        if not stick_index_offset.is_Integer:
+            # TODO: support a pair whose position varies over the iteration.
+            raise Unsupported(
+                f"staggered read starting at a varying stick {stick_index_offset}: {arg}"
+            )
+        if stick_index_offset % 2 != 0:
+            # TODO: support a slice starting at the second stick of a pair, e.g.
+            # ``x32[..., 32:64]``, unlike ``64:96``; its lanes run into the next
+            # pair.
+            raise Unsupported(
+                f"staggered read starting at stick {stick_index_offset}, inside a stick "
+                f"pair: {arg}"
+            )
+        assert size[stick_index_dim] >= stick_index_offset + 2, arg
+
+        # The rounded stick var spans a pair of the operand's sticks, so its stick
+        # coordinate becomes two: the stick index, on the dim holding the pair, and
+        # the offset within the stick, innermost.  Otherwise lanes past the first
+        # stick read beyond it, and a gap dim is left for align to treat as a
+        # separate back gap.
+        coords[stick_index_dim] = stick_index_offset + sympy.floor(stick_coord / eps)
+        coords[-1] = sympy.Mod(stick_coord, eps)
+        arg.device_coordinates = coords
+
+
 def simplify_op_spec(
     op_spec,
     indirect_sizes=None,
@@ -2319,6 +2537,11 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
+
+    if _has_staggered_ea(op_spec):
+        # Iterate whole sticks before align_tensors re-intersects the planned split
+        # with the first operand's stick count, so the split and LX placement survive.
+        _adjust_for_staggered_ea(op_spec)
 
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,

@@ -28,6 +28,14 @@ test_suite_config:
             - LxPlanning.*::test_pointwise_binary_op_div_67x71x256_67x71x256_lx_planning_reduction
             - LxPlanning.*::test_log_log_zero_val_lx_planning_(pointwise|reduction)
           mode: xfail
+        # Known LX-planning failures -- run and must fail (strict). An
+        # unexpected pass (XPASS) fails CI so a fixed bug is noticed.
+        - names:
+            # Issue#6054 : Hardware vector addition on positive infinity (+inf + +inf) evaluates to NaN instead of +inf
+            # clamp_min_ leaves the inf input as inf, then the LX wrappers compute
+            # (y + y) / 2 or sum(y, dim=0) on it, which is inf + inf and gives NaN.
+            - LxPlanning.*::test_clamp_inplace_clamp_min__5d_inf_lx_planning_(pointwise|reduction)
+          mode: xfail_strict
         - names:
             - LxPlanning.*::test_(pointwise|sqrt|rsqrt|log_|pow_|alias_operands|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int|clamp).*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_binary_op_stick_crossing_last_dim_lx_planning_(pointwise|reduction)

@@ -282,8 +282,13 @@ class TestForEachTileCarryIsCollected(unittest.TestCase):
         X = cached_xavier((M, K)).to(DEVICE_NAME)
         Y = cached_xavier((K, N)).to(DEVICE_NAME)
         # Patch the post-splice call site: the pipeline's own earlier call runs
-        # before the carry scaffolding exists.
-        with patch.object(for_each_tile_lowering, "deadcode_elimination", record):
+        # before the carry scaffolding exists. The cache is off because a compile
+        # served from the FX graph cache never runs the splice, so the recorder
+        # would see nothing (the test passed on a cold cache and failed on a warm one).
+        with (
+            patch.object(for_each_tile_lowering, "deadcode_elimination", record),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             torch.compile(split_m_fn, backend="inductor", fullgraph=True)(X, Y)
 
         self.assertTrue(tallies, "post-splice deadcode_elimination never ran")

@@ -231,10 +231,65 @@ def _resolve_scan_shapes_by_expression():
         _post_grad.resolve_shape_to_proxy = original
 
 
+def _contiguous_stride_first(sizes, strides, false_if_dde=False):
+    """torch's check_contiguous_sizes_strides, but compares the stride before
+    asking size == 1, so a correct stride installs no Ne(size, 1) guard (#6018).
+    Remove if upstream does the same (pytorch/pytorch#203781).
+    tests/inductor/test_contiguity_patch.py checks it against upstream."""
+    from torch.fx.experimental.symbolic_shapes import (
+        guard_or_false,
+        guard_or_true,
+        is_nested_int,
+        statically_known_true,
+    )
+
+    maybe_false = guard_or_false if false_if_dde else bool
+    maybe_true = guard_or_true if false_if_dde else bool
+    expected, expected_max = 1, 1
+    for x, y in reversed(tuple(zip(sizes, strides))):
+        if statically_known_true(y == expected) or statically_known_true(
+            y == expected_max
+        ):
+            pass
+        elif maybe_false(x == 1):
+            continue
+        elif maybe_true(y != expected) and maybe_true(y != expected_max):
+            return False
+        expected_max *= x if is_nested_int(x) else torch.sym_max(x, 1)
+        expected *= x
+    return True
+
+
 @contextmanager
-def enable_spyre_context(example_inputs: list[InputType]):
+def _contiguity_stride_first():
+    # Replaces the module attribute, so it reaches only callers that look it up
+    # at call time: the callers inside torch._prims_common do. A caller that
+    # imported the name earlier keeps upstream's version, and torch's C++
+    # contiguity path never calls it.
+    import torch._prims_common as prims_common
+
+    original = prims_common.check_contiguous_sizes_strides
+    prims_common.check_contiguous_sizes_strides = _contiguous_stride_first
+    try:
+        yield
+    finally:
+        prims_common.check_contiguous_sizes_strides = original
+
+
+@contextmanager
+def enable_spyre_context(
+    example_inputs: list[InputType],
+    declared_dims: "dict[str, tuple[int, int, int]] | None" = None,
+):
     """
     Context manager that sets up the complete Spyre compilation environment.
+
+    ``declared_dims`` maps the ShapeEnv symbol name of every graph input
+    dimension declared with ``tensor.to("spyre", dynamic=...)`` to its
+    ``(min, max, granularity)``. It is made the compile's declared set for the
+    whole block (``pass_utils.declared_dims``), so ``concretize_expr`` builds a
+    declared dimension's geometry at its declared maximum from the first
+    lowering call on.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
       - Enabling Spyre-specific data type handling
@@ -369,14 +424,20 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # release, so only a LoopNode handed to the scheduler is refused there
     # (CustomPreSchedulingPasses refuses one earlier, naming the release).
     # On a graph with no LoopNode each patched method takes its original path.
+    # Local import: pass_utils pulls in the lowering machinery, which this module
+    # is imported ahead of.
+    from .pass_utils import declared_dims as _declared_dims_for_compile
+
     with (
         # First in the header: the same ``with`` closes it however the body, or
         # the entry of a later manager, exits.
         loop_scheduler_patches_for_compile(),
+        _declared_dims_for_compile(declared_dims),
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
         _unique_operation_names(),
         _resolve_scan_shapes_by_expression(),
+        _contiguity_stride_first(),
         enable_spyre_lowerings(),
         # Analysis-call counters ride the timing gate: they exist to annotate
         # timing records, and a second knob would let the two disagree.
