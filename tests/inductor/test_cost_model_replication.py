@@ -137,10 +137,10 @@ def test_shared_load_keeps_consumer_degree_without_reloading_each_copy():
     excess = _shared_operand_read_excess([op, op], params)
     for count in (1, 8, 12, 16, 32):
         expected = BYTES * (_matmul_multicast_penalty(count) - 1) / params.bw_peak_gbps
-        assert float(excess.subs({degree: count, resident: 0})) == pytest.approx(
+        assert float(excess.xreplace({degree: count, resident: 0})) == pytest.approx(
             expected
         )
-        assert excess.subs({degree: count, resident: 1}) == 0
+        assert excess.xreplace({degree: count, resident: 1}) == 0
     arg.broadcast = False
     assert _shared_operand_read_excess([op], params) == 0
     assert arg.hbm_elems() == ELEMS * degree * (1 - resident)
@@ -718,8 +718,8 @@ def test_loop_operand_requests_skip_resident_and_single_pass_reads():
     is_lx = sympy.Symbol("is_lx_w", integer=True, nonnegative=True)
     resident = _with_run(_expert_loop_projection(16), 128, is_lx=is_lx)
     term = sympy.sympify(_loop_operand_request_excess([resident], p))
-    assert term.subs(is_lx, 1) == 0
-    assert float(term.subs(is_lx, 0)) == pytest.approx(added, rel=1e-9)
+    assert term.xreplace({is_lx: 1}) == 0
+    assert float(term.xreplace({is_lx: 0})) == pytest.approx(added, rel=1e-9)
     assert _read_burst_excess_ns([resident], p) == 0
     single = _with_run(_projection(16, 1), 128)
     assert _loop_operand_request_excess([single], p) == 0
@@ -809,7 +809,7 @@ def test_cp_sat_composes_two_symbolic_readers_by_ownership(boundary):
         rows.append([max(a, b) for a, b in zip(parts, requests)])
         expected = aggregate(rows[-1])
         assert float(
-            (delivery + extra).subs(dict(zip((n, k), cores)))
+            (delivery + extra).xreplace(dict(zip((n, k), cores)))
         ) == pytest.approx(expected)
         assert _solve_pinned(delivery + extra, menu, i) == pytest.approx(
             expected, abs=2.0

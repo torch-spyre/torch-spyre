@@ -175,6 +175,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
+- **find-numerical-divergence** — the first kernel where a right run and a wrong run part
 - **check-docs** — documentation consistency and staleness audit
 - **daily-status** — automated standup updates from git activity
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow

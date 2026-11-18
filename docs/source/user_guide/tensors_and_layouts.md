@@ -560,9 +560,6 @@ What is refused, with an error naming `for_each_tile`:
   made dynamic, with no `dynamic=` declaration. Without the reservation each
   size is a new allocation and a new layout, so there is no one binary to build,
   and the loop is refused with the declaration named as the fix.
-- A declared minimum equal to the granularity: declare `min` as at least
-  `2 * granularity` for now (issue #6018). The one-tile call recompiles on a
-  PyTorch contiguity guard, which #6060 removes.
 
 What changed: before the compile half landed (PR #6066), a compiled graph over a
 reserved tensor was built for the size it was first compiled at and could return
@@ -571,6 +568,20 @@ wrong values after a `resize_`, which the documentation warned about. Now a
 compile and be silently wrong raises `Unsupported` at compile time. Code that
 compiled a plain op over a reserved tensor has to tile it, or move the op out of
 the compiled region.
+
+A `for_each_tile` body may also gather rows out of a pool that was itself moved
+with `dynamic=`, as in `pool.index_select(0, idx)`. The pool's length is
+resolved to its declared maximum at compile time. It never becomes a trip count
+or a bundle parameter, it only bounds the values the index may take, and the
+loop's own trip count still follows the walked tensor as above. Only a
+declaration counts for that bound: a pool made dynamic with
+`torch._dynamo.mark_dynamic` or bounded with `torch._check`, but not declared,
+is refused with an error naming the symbol. The declaration bounds the index
+values by the maximum, not by the pool's current size, so an index at or past
+the current size reads whatever the reserved rows hold at that moment and no
+error is raised. Keeping every index below the current size is the caller's
+contract. Only one declared dimension per pool is supported, since a tensor
+declares only dimension 0 today (see the reservation rules above).
 
 #### Data Semantics
 
