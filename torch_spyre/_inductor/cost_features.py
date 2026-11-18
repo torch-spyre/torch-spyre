@@ -55,8 +55,8 @@ _FEATURE_MEMO: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def feature_memo() -> Iterator[None]:
-    """Reuse a read's contiguous device axes, which feature extraction derives
-    from the access alone, across the calls made inside.
+    """Reuse what feature extraction derives from an op's reads alone (device
+    coordinates, a read's contiguous axes) across the calls made inside.
 
     For a caller that extracts the same op's features under many candidate
     work divisions while nothing mutates the graph -- the relayout shortlist
@@ -64,8 +64,9 @@ def feature_memo() -> Iterator[None]:
     depend on the division are reused, so every result is what an unscoped call
     returns. A nested scope shares the outer one.
 
-    An op's reads and its device coordinates need no scope: ``op_read_writes``
-    and ``compute_coordinates`` memoize them for every caller.
+    An op's reads need no scope: ``op_read_writes`` memoizes them for every
+    caller, the post-pass cost report included, under its own contract (an
+    in-place edit of an op's reads must call ``invalidate_op_read_writes``).
     """
     if _FEATURE_MEMO.get() is not None:
         yield
@@ -85,6 +86,26 @@ def _memoized(key: tuple, compute: Callable[[], _T]) -> _T:
     if key not in memo:
         memo[key] = compute()
     return memo[key]
+
+
+def _read_device_coordinates(src, read, op):
+    """``device_coordinates(src, read, None, op=op)``, reused inside
+    :func:`feature_memo`: a function of the op and the read (``src`` is the
+    read buffer's layout, fixed while nothing mutates the graph).
+
+    ``compute_coordinates`` has a memo of its own, but it declines a symbolic
+    range or a dynamic size, and it sits below the index concretization and
+    the stick-expression check that every call here would repeat."""
+    # Outside a scope, exactly the plain call: the key needs the op's name,
+    # which only a scoped caller (the allocator, over real ops) promises.
+    if _FEATURE_MEMO.get() is None:
+        return device_coordinates(src, read, None, op=op)
+    return list(
+        _memoized(
+            ("device_coordinates", op.get_name(), read),
+            lambda: tuple(device_coordinates(src, read, None, op=op)),
+        )
+    )
 
 
 def _int(x, default: int = 1) -> int:
@@ -711,7 +732,7 @@ def _transport_read_geometry(op, work_slices=None):
         if any(dl.device_dtype != DataFormats.SEN169_FP16 for dl in (src, dst)):
             return None, None
         it_space = iteration_space_from_op(op)
-        src_coords = device_coordinates(src, read, None, op=op)
+        src_coords = _read_device_coordinates(src, read, op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
         run = _contiguous_device_run(src_coords, src.device_size, it_space, slices)
         if run is None:
@@ -851,7 +872,7 @@ def _operand_read_geometry(op, dep, work_slices, candidate_work_slices=None):
         it_space = iteration_space_from_op(op)
         slices = _resolved_work_slices(op, work_slices)
         found = _operand_device_run(
-            device_coordinates(src, dep, None, op=op),
+            _read_device_coordinates(src, dep, op),
             src.device_size,
             it_space,
             slices,
@@ -883,7 +904,7 @@ def _read_run_bytes(op, read, work_slices=None):
         write = next(iter(rw.writes))
         src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
         it_space = iteration_space_from_op(op)
-        coords = device_coordinates(src, read, None, op=op)
+        coords = _read_device_coordinates(src, read, op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
         run = _contiguous_device_run(
             coords, src.device_size, it_space, slices, stick_planes=True
