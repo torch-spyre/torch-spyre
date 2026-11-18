@@ -6034,6 +6034,59 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 8192))
 
+    def test_loop_bound_takes_the_declared_maximum_for_a_symbolic_count(self):
+        # A for_each_tile over a dim declared {min 8, max 64, granularity 8}
+        # walks FloorDiv(s0, 8) trips. The proof bounds the advance at the
+        # declared maximum, 64 // 8 = 8 trips, the conservative count: the
+        # reach at any admissible size is inside it (#6433).
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.pass_utils import declared_dims
+        from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
+
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
+        )
+        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.floor(s0 / 8)],
+            loop_tiled_dims=[[0]],
+            tiled_dims_per_read=[[[]]],
+            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
+        )
+
+        with declared_dims({"s0": (8, 64, 8)}):
+            self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 4096 * (8 - 1)))
+
+    def test_loop_bound_declines_a_symbolic_count_without_a_declaration(self):
+        # The same count with no declaration has no finite bound, so the proof
+        # declines as it did for every symbolic count before #6433.
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch_spyre._inductor.pass_utils import declared_dims
+        from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
+
+        shape_env = ShapeEnv()
+        # A symbol the ShapeEnv knows but nothing bounds: an unbacked size.
+        s1 = shape_env.create_unbacked_symint().node.expr
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
+        )
+        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.floor(s1 / 8)],
+            loop_tiled_dims=[[0]],
+            tiled_dims_per_read=[[[]]],
+            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
+        )
+        graph = SimpleNamespace(sizevars=SimpleNamespace(shape_env=shape_env))
+
+        with declared_dims({}), V.set_graph_handler(graph):
+            self.assertIsNone(_loop_advance_bound(op, dep, info, 0))
+
     def test_unsqueezed_loop_step_uses_dependency_stride(self):
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
