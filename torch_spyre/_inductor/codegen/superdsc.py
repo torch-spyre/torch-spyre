@@ -1395,20 +1395,24 @@ def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
 def _check_qfp8wt_offset(arg: TensorArg) -> None:
     """Reject a QFP8WT offset that cannot be addressed.
 
-    An odd K start falls inside a stick, and offsets on other axes (column
-    slices) are not modelled; either would read the wrong data.
+    The device layout is ``[outer..., N/64, K/2, 64, 2]`` (see
+    ``propagate_layouts.qfp8wt_layout``): the N tile and K tile carry whole
+    sticks, so an offset there is a whole-stick start and is addressable. The
+    stick dims (64 and 2) and the outer dims must start at 0: an offset inside a
+    stick, or on a dim this check does not model, would read the wrong data.
     """
     origin = [c.subs({s: 0 for s in c.free_symbols}) for c in arg.device_coordinates]
-    k_axis = len(origin) - 2
-    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+    if len(origin) < 4:
+        raise Unsupported(f"QFP8WT device layout has rank {len(origin)}; expected >= 4")
+    n_tile_axis, k_tile_axis = len(origin) - 4, len(origin) - 3
+    if any(
+        o != 0
+        for axis, o in enumerate(origin)
+        if axis not in (n_tile_axis, k_tile_axis)
+    ):
         raise Unsupported(
-            f"a column offset into a QFP8WT weight (device origin {origin}); "
-            "only a row slice of a QFP8WT weight is supported"
-        )
-    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
-        raise Unsupported(
-            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
-            f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
+            f"an offset inside a QFP8WT stick or on an outer dim (device origin "
+            f"{origin}); only whole-stick N and K tile offsets are supported"
         )
 
 

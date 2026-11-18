@@ -462,7 +462,7 @@ class TestFP8Dequantize:
 # dequantize of the weight is rejected at OpSpec validation. When element-wise
 # reads of QFP8WT are supported, these become positive roundtrip tests against
 # the CPU reference.
-QFP8WT_NON_MATMUL_REJECTION = "QFP8WT input to a non-matmul op"
+QFP8WT_NON_MATMUL_REJECTION = "QFP8WT input to fp8todl16"
 
 
 class TestWeightRoundtrip:

@@ -1415,6 +1415,14 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
         in_layout = in_buf.get_layout()
         if not isinstance(in_layout, FixedTiledLayout):
             continue
+        if ElementArrangement.QFP8WT in (
+            in_layout.device_layout.element_arrangement,
+            out_stl.element_arrangement,
+        ):
+            # A QFP8WT conversion is a quantization with its own 2D [K/2, 64] stick,
+            # not a stagger: its device_size[-1] is K's 2, not an elements-per-stick
+            # count, so comparing it here invents a typecast.
+            continue
         in_eps = in_layout.device_layout.device_size[-1]
         out_eps = out_stl.device_size[-1]
 

@@ -671,15 +671,14 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
 
     op = op_spec.op
 
-    if op not in MATMUL_OPS:
-        _check_qfp8wt_inputs_are_matmul_only(op_spec, stage)
-
     if op in MATMUL_OPS:
         _check_stick_matmul(op_spec, stage)
     elif op in NORM_OPS:
         _check_stick_norm(op_spec, stage)
     elif op in TOPK_OPS:
         _check_stick_topk(op_spec, stage)
+    elif op == constants.FP8TODL16_OP:
+        _check_fp8todl16_input(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
     elif op in constants.CONV_OPS:
@@ -696,20 +695,19 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_all_same(op_spec, stage)
 
 
-def _check_qfp8wt_inputs_are_matmul_only(op_spec: OpSpec, stage: str) -> None:
-    """Reject a QFP8WT input to a non-matmul op.
+def _check_fp8todl16_input(op_spec: OpSpec, stage: str) -> None:
+    """Reject a QFP8WT input to fp8todl16 (the FP8 -> FP16 dequantize).
 
-    A QFP8WT tensor's 2D [64, 2] stick is read only by the matmul (its weight
-    operand). Element-wise ops such as the fp8 to fp16 dequantize have no
-    conversion for it, and the backend fails to compile them.
+    fp8todl16 converts a standard FP8 stick; it does not accept a QFP8WT tensor's
+    2D [K/2, 64] stick, and the backend cannot compile that read.
     """
     for arg in op_spec.args:
         if arg.is_input and arg.element_arrangement == ElementArrangement.QFP8WT:
             raise OpSpecValidationError(
                 op_spec,
-                "QFP8WT input to a non-matmul op",
-                f"{op_spec.op} reads a QFP8WT tensor, whose 2D [64, 2] stick only "
-                "a matmul can read; dequantize the weight with a matmul consumer",
+                "QFP8WT input to fp8todl16",
+                "fp8todl16 does not accept a QFP8WT input; dequantize the weight "
+                "with a matmul consumer",
                 stage,
             )
 
