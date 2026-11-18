@@ -502,6 +502,10 @@ def _patch_tensor_for_spyre():
     orig_clone = torch.Tensor.clone
 
     def spyre_clone(self, *, memory_format=torch.preserve_format):
+        # Under tracing the tensor is a FakeTensor/FunctionalTensor with no device
+        # layout to read; dynamo traces the original clone, so leave it alone.
+        if torch.compiler.is_compiling():
+            return orig_clone(self, memory_format=memory_format)
         if self.device.type == DEVICE_NAME and not isinstance(
             self, torch._subclasses.FakeTensor
         ):

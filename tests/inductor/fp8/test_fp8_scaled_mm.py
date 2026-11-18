@@ -71,13 +71,6 @@ _XFAIL_4310 = pytest.mark.xfail(
     "raises StopIteration at compile",
 )
 
-_XFAIL_4311 = pytest.mark.xfail(
-    strict=True,
-    raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous "
-    "activation fails to compile: 'batchmatmulfp8: cannot restickify any input layout'",
-)
-
 
 def _amax_scale(t: torch.Tensor) -> float:
     """Amax-based scale: amax(|t|)/448 — maps max→FP8 max."""
@@ -259,7 +252,6 @@ class TestFP8Correctness:
         assert not out.isinf().any(), "Inf in identity-weight output"
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @_XFAIL_4311
     def test_noncontiguous_activation(self):
         """Non-contiguous activation (strides=(1,K)): quantize_fp8_with_scale on transposed view."""
         M, K, N = 16, 128, 128
@@ -885,7 +877,6 @@ class TestFP8LargeShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
-    @_XFAIL_4311
     def test_noncontiguous_activation_k4096(self):
         """@slow — non-contiguous activation (strides=(1,K)) at K=4096; extends K=128 TC."""
         M, K, N = 16, 4096, 4096

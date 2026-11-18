@@ -1395,27 +1395,29 @@ def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
 def _check_qfp8wt_offset(arg: TensorArg) -> None:
     """Reject a QFP8WT offset that cannot be addressed.
 
-    The device layout is ``[outer..., N/64, K/2, 64, 2]`` (see
-    ``propagate_layouts.qfp8wt_layout``): the N tile and K tile carry whole
-    sticks, so an offset there is a whole-stick start and is addressable. The
-    stick dims (64 and 2) and the outer dims must start at 0: an offset inside a
-    stick, or on a dim this check does not model, would read the wrong data.
+    The device layout is ``[outer..., N/64, K/2, 64, 2]`` (``qfp8wt_layout``).
+    The N tile and K tile dims (``len-4``, ``len-3``) hold whole sticks, so an
+    origin there is a whole-stick start and is addressed. The stick dims
+    (``len-2``, ``len-1``) cannot start inside a stick, and outer dims are not
+    modelled, so those must start at 0.
     """
-    origin = [
-        c.xreplace({s: Integer(0) for s in c.free_symbols})
-        for c in arg.device_coordinates
-    ]
-    if len(origin) < 4:
-        raise Unsupported(f"QFP8WT device layout has rank {len(origin)}; expected >= 4")
-    n_tile_axis, k_tile_axis = len(origin) - 4, len(origin) - 3
-    if any(
-        o != 0
-        for axis, o in enumerate(origin)
-        if axis not in (n_tile_axis, k_tile_axis)
-    ):
+    origin = [c.subs({s: 0 for s in c.free_symbols}) for c in arg.device_coordinates]
+    tile_axes = {len(origin) - 4, len(origin) - 3}
+    for axis, o in enumerate(origin):
+        if o == 0 or axis in tile_axes:
+            continue
+        if axis == len(origin) - 1:
+            raise Unsupported(
+                f"a slice starting at an odd row of a QFP8WT weight (device origin "
+                f"{origin}); a row slice must start on a multiple of "
+                f"{_QFP8WT_ROWS_PER_STICK} rows"
+            )
+        if axis == len(origin) - 2:
+            raise Unsupported(
+                f"an offset inside a QFP8WT 64-column stick (device origin {origin})"
+            )
         raise Unsupported(
-            f"an offset inside a QFP8WT stick or on an outer dim (device origin "
-            f"{origin}); only whole-stick N and K tile offsets are supported"
+            f"an offset on an outer dim of a QFP8WT weight (device origin {origin})"
         )
 
 
@@ -1648,7 +1650,13 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim == stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            # A QFP8WT stick dim (the matmul's K) has its own K tile axis, which is
+            # not the positional -2 of the old layout: keep that physical axis.
+            if (
+                dim == stick_dim
+                and physical_axis not in gap_factor_by_inner_axis
+                and not (is_qfp8wt_2d_stick and physical_axis is not None)
+            ):
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
@@ -1728,7 +1736,9 @@ def _create_sdsc_tensors(
                         arg.device_size, arg.device_dtype.elems_per_stick()
                     )
                     own_stick_extent = 1
-                    if len(stick_dim_ids_here) > 1:
+                    # The stick dim's own stick extent is applied by the stick branch
+                    # below, so only a non-stick dim riding the stick counts it here.
+                    if len(stick_dim_ids_here) > 1 and dim != stick_dim:
                         for d in stick_dim_ids_here:
                             if (
                                 dim
