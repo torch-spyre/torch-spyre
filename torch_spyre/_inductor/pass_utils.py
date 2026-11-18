@@ -84,7 +84,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .logging_utils import get_inductor_logger
+from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
@@ -328,6 +328,31 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
                 )
         return at_max
     return int(expr)
+
+
+def trip_count_estimate(count) -> int:
+    """A loop's trip count as an ``int`` (at least 1), for pricing re-reads.
+
+    A symbolic count resolves with :func:`concretize_expr`. An unbacked count,
+    or one that does not resolve, is 1.
+    """
+    try:
+        return max(1, int(count))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if free_unbacked_symbols(count):
+            return 1
+        return max(1, int(concretize_expr(count)))
+    except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
+        warn_once(
+            logger,
+            f"trip_count_estimate:{type(e).__name__}",
+            "trip count %s not resolved, priced as 1 trip: %r",
+            count,
+            e,
+        )
+        return 1
 
 
 # The dimensions declared with ``tensor.to("spyre", dynamic=...)`` for the compile

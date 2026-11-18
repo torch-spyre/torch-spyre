@@ -50,6 +50,7 @@ from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     _is_matmul_op,
     op_short_name,
+    trip_count_estimate,
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
@@ -378,22 +379,17 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
-    concrete ``int`` -- coerced the same way ``dump_cost_model._loop_features``
-    does for this exact field: ``int()`` when it resolves to a concrete
-    value, 1 (not a propagated symbol that would later crash numeric code
-    expecting a plain float) when it doesn't.
+    concrete ``int``; :func:`trip_count_estimate` resolves it, the same way
+    ``cost_features._loop_features`` does for this field.
     """
     if not _is_coarse_tiled(op):
         return 1
 
-    def _resolved(c) -> int:
-        try:
-            return int(c)
-        except (TypeError, ValueError):
-            return 1
-
     return max(
-        1, math.prod(_resolved(level.trip_count) for level in enclosing_loops(op))
+        1,
+        math.prod(
+            trip_count_estimate(level.trip_count) for level in enclosing_loops(op)
+        ),
     )
 
 
