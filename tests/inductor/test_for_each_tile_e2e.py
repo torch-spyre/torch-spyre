@@ -55,6 +55,7 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -829,6 +830,16 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile fails to preserve input EA tag in identity op. The "
+            "output is incorrectly tagged STANDARD (default) when data is "
+            "staggered it causes EA DCI to incorrectlly apply / restore EA. "
+            "See issue #6462."
+        ),
+    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
