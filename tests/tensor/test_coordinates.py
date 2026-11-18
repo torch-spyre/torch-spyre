@@ -1512,7 +1512,7 @@ class TestStickVarFromDep(TestCase):
         )
         dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (2, 128))
         result = stick_var_from_dep(stl, dep)
-        # stick_var_from_dep must return d1; stick_compatible will reject it.
+        # stick_var_from_dep must return d1; stick_compatible does not reject it.
         self.assertEqual(result, d1)
 
 
@@ -1558,17 +1558,23 @@ class TestStickCompatibleWithoutCoords(TestCase):
         dep_b = MemoryDep("b", d1 * 4 + d0, (d0, d1), (64, 4))
         self.assertFalse(stick_compatible_v2([(stl_a, dep_a), (stl_b, dep_b)]))
 
-    def test_factorized_var_incompatible(self):
-        """Stick var range > elems_per_stick — factorized, incompatible."""
+    def test_factorized_var_compatible(self):
+        """Stick var range > elems_per_stick is still compatible.
+
+        A large range means the loop variable spans more than one stick, but
+        the old coordinate-based stick_compatible considers this compatible —
+        the backend handles it correctly.  Range alone does not make a layout
+        incompatible; only having *different* stick variables across tensors does.
+        """
         from torch_spyre._inductor.pass_utils import stick_compatible_v2
 
         d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
-        # d1 ranges over 128 > 64 eps: factorized across stick and outer dim
+        # d1 ranges over 128 > 64 eps but both tensors share the same stick var
         stl = SpyreTensorLayout([2, 64], [64, 1], get_device_dtype(torch.float16))
         dep = MemoryDep("a", d0 * 64 + d1, (d0, d1), (2, 128))
         stl_out = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
         dep_out = MemoryDep("out", d0 * 64 + d1, (d0, d1), (4, 64))
-        self.assertFalse(stick_compatible_v2([(stl, dep), (stl_out, dep_out)]))
+        self.assertTrue(stick_compatible_v2([(stl, dep), (stl_out, dep_out)]))
 
 
 if __name__ == "__main__":

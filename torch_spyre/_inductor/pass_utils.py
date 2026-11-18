@@ -2979,11 +2979,6 @@ def stick_compatible_v2(
             if s in dep.ranges and not is_indirect(s.name)
         }
         nonstick = all_vars - ({sv} if sv else set())
-        if sv is not None:
-            eps = stl.elems_per_stick()
-            rng = dep.ranges.get(sv)
-            if rng is not None and int(concretize_expr(rng)) > eps:
-                nonstick.add(sv)
         nonstick_vars |= nonstick
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
@@ -3076,6 +3071,25 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
+def _dual_stick_compatible(
+    in_stl: SpyreTensorLayout,
+    in_dep: MemoryDep,
+    out_stl: SpyreTensorLayout,
+    out_dep: MemoryDep,
+    idc: "list[sympy.Expr]",
+    out_idc: "list[sympy.Expr]",
+) -> bool:
+    """Temporary: run both old and new stick_compatible, assert they agree."""
+    old = stick_compatible([idc, out_idc])
+    new = stick_compatible_v2([(in_stl, in_dep), (out_stl, out_dep)])
+    assert old == new, (
+        f"stick_compatible mismatch: old={old} new={new}\n"
+        f"  in_stl={in_stl} in_dep.index={in_dep.index}\n"
+        f"  out_stl={out_stl} out_dep.index={out_dep.index}"
+    )
+    return old
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3140,7 +3154,7 @@ def compute_restickify_needed(
     if (
         not factorized_layout_mismatch
         and in_stick_offset_free
-        and stick_compatible([idc, out_idc])
+        and _dual_stick_compatible(in_stl, in_dep, out_stl, out_dep, idc, out_idc)
     ):
         return False, None
 
