@@ -1496,6 +1496,25 @@ class TestStickVarFromDep(TestCase):
         result = stick_var_from_dep(stl, dep)
         self.assertIsNone(result)
 
+    def test_factorized_var_still_returned(self):
+        """stick_var_from_dep returns the symbol even when range > elems_per_stick.
+
+        The factorized case (loop var spans both stick and outer device dim)
+        is for stick_compatible to reject — stick_var_from_dep just identifies
+        the variable and must not add a range guard of its own.
+        """
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # d1 has range 128 > 64 eps: factorized layout.
+        stl = SpyreTensorLayout(
+            [2, 64], [64, 1], get_device_dtype(torch.float16)
+        )
+        dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (2, 128))
+        result = stick_var_from_dep(stl, dep)
+        # stick_var_from_dep must return d1; stick_compatible will reject it.
+        self.assertEqual(result, d1)
+
 
 if __name__ == "__main__":
     run_tests()
