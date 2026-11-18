@@ -1638,3 +1638,63 @@ class TestFP8ScaledMMRegressions:
             return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
+
+
+class TestFP8UnalignedKAcrossGraphs:
+    """K%128 != 0 with the FP8 weight quantized in one compiled graph and used in another.
+
+    The quantize graph returns the weight, so the matmul graph receives it as an
+    input: the K padding has to survive the graph boundary in the weight's device
+    layout, which keeps K rounded up to an FP8 stick (128 rows) while the host K
+    stays unpadded. Padding it again in the matmul graph copies it as plain
+    sticks, which moves only K rows of an image laid out for K_padded, so the
+    output is wrong from column 64 on (the second 64-column strip of the [2, 64]
+    QFP8WT stick).
+    """
+
+    def setup_method(self):
+        torch._dynamo.reset()
+
+    @pytest.mark.parametrize(
+        "M, K, N", [(110, 110, 110), (128, 110, 128), (64, 200, 128)]
+    )
+    @pytest.mark.parametrize("batched", [True, False], ids=["scaled_bmm", "scaled_mm"])
+    def test_returned_weight_matmul(self, M, K, N, batched):
+        one = _st16(1.0, DEVICE)
+        a, w = _make_rand_inputs(M, K, N)
+        ref = _pipeline_ref(a, w, 1.0, 1.0, FP16)
+        if batched:
+            a, w, ref = a.unsqueeze(0), w.unsqueeze(0), ref.unsqueeze(0)
+
+        quant_a = _compile(lambda t, s: torch.ops.spyre.quantize_fp8_with_scale(t, s))
+        quant_w = _compile(
+            lambda t, s: torch.ops.spyre.quantize_weight_fp8_with_scale(t, s)
+        )
+        a_fp8 = quant_a(a.to(DEVICE), one)
+        w_fp8 = quant_w(w.to(DEVICE), one)
+
+        if batched:
+
+            def mm(a8, w8, sa, sw):
+                return torch.ops.spyre.scaled_bmm(a8, w8, sa, sw, FP16)
+
+        else:
+
+            def mm(a8, w8, sa, sw):
+                return torch._scaled_mm(a8, w8, scale_a=sa, scale_b=sw, out_dtype=FP16)
+
+        out = _compile(mm, fullgraph=True)(a_fp8, w_fp8, one, one).cpu()
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
+
+    @pytest.mark.parametrize("K", [110, 130])
+    def test_returned_weight_reads_back(self, K):
+        """The returned weight's device layout pads K; .cpu() must still read it right."""
+        _, w = _make_rand_inputs(1, K, 128)
+        w = w.unsqueeze(0)
+        fn = _compile(lambda t, s: torch.ops.spyre.quantize_weight_fp8_with_scale(t, s))
+        out = fn(w.to(DEVICE), _st16(1.0, DEVICE)).cpu()
+        # The device rounds normals to within one E4M3 step (rtol 2**-3) and handles
+        # subnormals (below 2**-6) differently from the CPU cast, often as zero.
+        torch.testing.assert_close(
+            out.float(), w.to(E4M3).float(), atol=2**-6, rtol=2**-3
+        )
