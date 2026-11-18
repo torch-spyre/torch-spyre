@@ -155,43 +155,15 @@ class SpyreTensorLayout {
   }
 
   /**
-   * Construct a SpyreTensorLayout with the specified device_size and
-   * stride_map. This constructor is intended for use only by the compiler
-   * or the expert programmer. It enables complete control over the
-   * device memory layout, but callers are responsible for ensuring
-   * that all device layout invariants are satisfied.
-   *
-   * When valid_elements is omitted it defaults to compute_valid_elements():
-   * every device position is treated as valid, padding included.
-   *
-   * @deprecated Use the overload that takes valid_elements as a required
-   * parameter (before element_arrangement) to ensure accurate padding
-   * information is always provided.
-   */
-  [[deprecated(
-      "Pass valid_elements explicitly using the "
-      "SpyreTensorLayout(device_size, stride_map, device_dtype, valid_elements"
-      "[, element_arrangement]) overload.")]]
-  SpyreTensorLayout(
-      std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
-      DataFormats device_dtype,
-      ElementArrangement element_arrangement = ElementArrangement::STANDARD,
-      std::map<std::vector<int64_t>, int64_t> valid_elements = {})
-      : device_size(device_size),
-        stride_map(stride_map),
-        device_dtype(device_dtype),
-        element_arrangement(element_arrangement),
-        valid_elements(valid_elements.empty()
-                           ? compute_valid_elements(device_size)
-                           : std::move(valid_elements)) {
-    normalize_stride_map();
-    validate_shape();
-  }
-
-  /**
    * Construct a SpyreTensorLayout with the specified device_size, stride_map,
-   * and valid_elements. Unlike the overload above, valid_elements is required
-   * here, so callers must supply accurate padding information.
+   * and valid_elements. This constructor is intended for use only by the
+   * compiler or the expert programmer. It enables complete control over the
+   * device memory layout, but callers are responsible for ensuring that all
+   * device layout invariants are satisfied. valid_elements is required so
+   * callers supply accurate padding information; pass {} when the valid
+   * extents are unknown. No consumer uses valid_elements for layout decisions
+   * yet, but one that does must not treat {} as "every device element is
+   * valid".
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
