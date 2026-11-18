@@ -107,20 +107,27 @@ def default_vocab():
 
 
 # ---------------------------------------------------------------- resolving values
-def _norm(rec):
-    """A record of any shape as {metric: str, value, unit, statistic: str|None, n, ctx: dict}; never raises."""
-    if not isinstance(rec, dict):
-        rec = {}
-    st = rec.get("statistic")
-    ctx = rec.get("ctx")
-    return {
-        "metric": rec["metric"] if isinstance(rec.get("metric"), str) else "",
-        "value": rec.get("value", ""),
-        "unit": rec.get("unit") if isinstance(rec.get("unit"), str) else "",
-        "statistic": st if isinstance(st, str) and st else None,
-        "n": rec.get("n"),
-        "ctx": {k: v for k, v in ctx.items() if isinstance(k, str)} if isinstance(ctx, dict) else {},
-    }
+MAX_DEPTH = 8  # deepest container nesting that is read; deeper is malformed
+MAX_NODES = 10_000  # items visited in one container before it is malformed
+
+
+class _Box:
+    """A container value reduced to what the renderer needs: its length, whether all leaves are unrecorded."""
+
+    __slots__ = ("count", "unrecorded")
+
+    def __init__(self, count, unrecorded):
+        self.count, self.unrecorded = count, unrecorded
+
+    def __repr__(self):
+        return f"<{self.count} values>"
+
+
+def _safe_str(v):
+    try:
+        return str(v)
+    except Exception:  # noqa: BLE001 - hostile __str__
+        return "?"
 
 
 def _nonfinite(v):
@@ -129,12 +136,96 @@ def _nonfinite(v):
         return False
     try:
         return not math.isfinite(float(v))
-    except (TypeError, ValueError, OverflowError):
+    except Exception:  # noqa: BLE001 - duck-typed conversion may raise anything but BaseException
         return False
 
 
+def _clen(v):
+    """Length of a non-string container, or None when v is not one (or its length cannot be read)."""
+    if isinstance(v, _Box):
+        return v.count
+    try:
+        if isinstance(v, (str, bytes)) or not hasattr(v, "__len__"):
+            return None
+        return len(v)
+    except Exception:  # noqa: BLE001 - hostile or 0-d array-likes
+        return None
+
+
+def _items(v, n):
+    try:
+        return list(v.values()) if hasattr(v, "values") and callable(v.values) else [v[i] for i in range(n)]
+    except Exception:  # noqa: BLE001
+        try:
+            return list(v)
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _leaf_unrecorded(x):
+    return x is None or _nonfinite(x) or (isinstance(x, str) and x.strip().lower() in PLACEHOLDERS)
+
+
+def _walk(v):
+    """(length, all_unrecorded) of a container, or None when v is not one.
+
+    A cycle, more than MAX_NODES items, nesting deeper than MAX_DEPTH, or an unreadable level makes the value
+    malformed, reported as all_unrecorded.
+    """
+    n = _clen(v)
+    if n is None:
+        return None
+    seen, budget, stack, all_unrec = {id(v)}, MAX_NODES, [(v, n, 0)], True
+    while stack:
+        node, size, depth = stack.pop()
+        items = _items(node, size)
+        if items is None:
+            return n, True
+        for x in items:
+            budget -= 1
+            if budget < 0:
+                return n, True
+            m = _clen(x)
+            if m is None:
+                all_unrec = all_unrec and _leaf_unrecorded(x)
+            elif id(x) in seen or depth + 1 > MAX_DEPTH:
+                return n, True
+            else:
+                seen.add(id(x))
+                stack.append((x, m, depth + 1))
+    return n, all_unrec
+
+
+def _sanitize(v):
+    """A context value made safe to handle: scalars as is, containers as a _Box, other objects as float or text."""
+    if v is None or isinstance(v, (str, int, float, bool, _Box)):
+        return v
+    w = _walk(v)
+    if w is not None:
+        return _Box(*w)
+    try:
+        return float(v)
+    except Exception:  # noqa: BLE001
+        return _safe_str(v)
+
+
+def _norm(rec):
+    """A record of any shape as {metric: str, value, unit, statistic: str|None, n, ctx: dict}; never raises."""
+    if not isinstance(rec, dict):
+        rec = {}
+    st, n, ctx = rec.get("statistic"), rec.get("n"), rec.get("ctx")
+    return {
+        "metric": rec["metric"] if isinstance(rec.get("metric"), str) else "",
+        "value": _safe_str(rec.get("value", "")),
+        "unit": rec.get("unit") if isinstance(rec.get("unit"), str) else "",
+        "statistic": st if isinstance(st, str) and st else None,
+        "n": n if isinstance(n, (int, float, str)) and not isinstance(n, bool) else None,
+        "ctx": {k: _sanitize(v) for k, v in ctx.items() if isinstance(k, str)} if isinstance(ctx, dict) else {},
+    }
+
+
 def _unrecorded(fid, v, vocab):
-    """True for None, placeholder spellings, NaN/inf and empty containers.
+    """True for None, placeholder spellings, NaN/inf, empty containers and containers of unrecorded leaves.
 
     "none" is a value where the facet lists it in `values` or sets `none_ok`; everywhere else (model, ...) it is a
     placeholder.
@@ -147,46 +238,14 @@ def _unrecorded(fid, v, vocab):
             f = vocab.facets.get(fid) or {}
             return not (f.get("none_ok") or "none" in [str(x).lower() for x in f.get("values", [])])
         return s in PLACEHOLDERS
-    leaves = _leaves(v)
-    return leaves is not None and all(_leaf_unrecorded(x) for x in leaves)
-
-
-def _clen(v):
-    """Length of a non-string container, or None when v is not one (or its length cannot be read)."""
-    if isinstance(v, (str, bytes)) or not hasattr(v, "__len__"):
-        return None
-    try:
-        return len(v)
-    except Exception:  # noqa: BLE001 - hostile or 0-d array-likes
-        return None
-
-
-def _leaves(v, depth=0):
-    """Flattened leaves of a container ([] when empty), or None when v is not a readable container."""
-    n = _clen(v)
-    if n is None:
-        return None
-    try:
-        items = list(v.values()) if hasattr(v, "values") and callable(v.values) else [v[i] for i in range(n)]
-    except Exception:  # noqa: BLE001
-        try:
-            items = list(v)
-        except Exception:  # noqa: BLE001
-            return None
-    out = []
-    for x in items:
-        sub = _leaves(x, depth + 1) if depth < 8 else None
-        out.extend([x] if sub is None else sub)
-    return out
-
-
-def _leaf_unrecorded(x):
-    return x is None or _nonfinite(x) or (isinstance(x, str) and x.strip().lower() in PLACEHOLDERS)
+    if isinstance(v, _Box):
+        return v.count == 0 or v.unrecorded
+    return False
 
 
 def _show(v):
     n = _clen(v)
-    return str(v) if n is None else f"{n} values"
+    return _safe_str(v) if n is None else f"{n} values"
 
 
 def _canon(fid, v, vocab):

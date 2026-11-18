@@ -587,3 +587,115 @@ def test_builtin_metrics_are_recognised_through_relative_and_symlinked_paths(tmp
         reg = engine.Registry()
         reg.load(path)
         assert "kernel.time.mean" in reg.builtin_metrics, path
+
+
+# ---- review round 5: hostile and pathological values
+def _fast(fn, limit=1.0):
+    import time
+
+    t0 = time.monotonic()
+    out = fn()
+    assert time.monotonic() - t0 < limit
+    return out
+
+
+def _everything(r):
+    nc.missing(r, V)
+    nc.render(r, V)
+    nc.expanded_view(r, V)
+    nc.compare(r, rec(), V)
+    nc.page_header([r, rec()], V)
+
+
+def test_self_containing_containers_finish_fast_and_read_as_unrecorded():
+    import yaml
+
+    cyc = [1, 2, 3, 4, 5, 6, 7]
+    cyc.append(cyc)
+    anchored = yaml.safe_load("a: &a [1, 2, *a]")["a"]
+    d = {"k": 1}
+    d["self"] = d
+    wide_deep = [[[[[[[[list(range(30))] * 30] * 30]] * 30] * 30]] * 30] * 30
+    for junk in (cyc, anchored, d, wide_deep):
+        r = rec(ctx={"tp": junk, "concurrency": junk})
+        _fast(lambda: _everything(r))
+        assert "tp" in nc.missing(r, V)
+
+
+def test_depth_cap_and_node_budget_are_pinned():
+    def nest(levels, leaf=5):
+        v = leaf
+        for _ in range(levels):
+            v = [v]
+        return v
+
+    known = lambda x: "tp" not in nc.missing(rec(ctx={"tp": x}), V)  # noqa: E731
+    assert nc.MAX_DEPTH == 8 and nc.MAX_NODES == 10_000
+    assert known(nest(9)) and not known(nest(10))  # 9 brackets = containers at depths 0..8
+    assert known([5] * 10_000) and not known([5] * 10_001)
+    assert not known(nest(30, leaf=None))
+
+
+class _Hostile:
+    def __init__(self, exc, where):
+        self.exc, self.where = exc, where
+
+    def _go(self, name):
+        if name == self.where:
+            raise self.exc("boom")
+
+    def __float__(self):
+        self._go("float")
+        return 1.0
+
+    def __len__(self):
+        self._go("len")
+        return 1
+
+    def __getitem__(self, i):
+        self._go("getitem")
+        return 1
+
+    def __iter__(self):
+        self._go("iter")
+        return iter([1])
+
+    def __bool__(self):
+        self._go("bool")
+        return True
+
+    def __str__(self):
+        self._go("str")
+        return "h"
+
+
+def test_hostile_objects_never_escape_the_renderer():
+    for exc in (RuntimeError, RecursionError, MemoryError, KeyError):
+        for where in ("float", "len", "getitem", "iter", "bool", "str"):
+            h = _Hostile(exc, where)
+            for fid in ("tp", "model", "concurrency", "kv_span", "input_len", "clean"):
+                _everything(rec(ctx={fid: h}))
+            _everything({"metric": "llm.output_throughput", "value": h, "unit": "x", "n": h, "statistic": h, "ctx": {}})
+
+
+def test_base_exceptions_still_propagate():
+    import pytest
+
+    for exc in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(exc):
+            nc.render(rec(ctx={"tp": _Hostile(exc, "getitem")}), V)
+
+
+def test_hostile_length_of_another_type_is_not_a_container_and_core_dir_resolves(tmp_path, monkeypatch):
+    import os
+
+    class BadLen:
+        def __len__(self):
+            raise RuntimeError("x")
+
+    assert nc._clen(BadLen()) is None
+    link = tmp_path / "core-link"
+    link.symlink_to(engine.CORE_DIR)
+    for path in (link, Path(os.path.relpath(engine.CORE_DIR))):
+        monkeypatch.setattr(engine, "CORE_DIR", path)
+        assert "core.duration" in engine.Registry().builtin_metrics, path

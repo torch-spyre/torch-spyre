@@ -70,6 +70,8 @@ taken as `false`, which the vocabulary, renderer and `compare` treat as `off`. `
 
 A container in a record's `ctx` holding only unrecorded leaves (`[nan]`, `[None]`) is unrecorded. A container with
 values is known but not renderable as a single value, so it shows as a count (`TP 2 values`).
+A container that contains itself, nests deeper than 8 levels, or holds more than 10,000 items is malformed and
+reads as unrecorded. Ordinary exceptions raised by duck-typed values are swallowed; `BaseException`s propagate.
 
 ## Vocabulary changes to mirror in other readers
 
