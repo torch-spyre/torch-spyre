@@ -6998,9 +6998,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Regression for #5351: two reductions fused into one op, one fed by
-        # a broadcast (expand_as()) operand. On main this silently produced
-        # wrong values rather than a backend error.
+        # x.sum(1) + y.expand_as(x).sum(1) fuses into one op with two reduction
+        # operands sharing output dims: a plain operand (x) and a broadcast
+        # operand (y, expanded along dim -1). Checks that the merged dim order
+        # accounts for both, including an unaligned (non-stick-multiple) last
+        # dim.
         (
             "test_expand_broadcast_reduction_fused",
             "test_expand_broadcast_reduction_fused_base",

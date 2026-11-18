@@ -835,10 +835,13 @@ def _reduction_layout_from_stl(
         data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
         and reduction_var in x_stick_expr.free_symbols
     ):
-        # Try to preserve input layout. Over an expanded input, a stick on an
-        # expanded dim comes first: the back-end compiler cannot divide a
-        # reduction into a one-element-per-stick output of unaligned width
-        # across cores.
+        # Try to preserve input layout. _compatible_output_stick_exprs starts
+        # with the preserved stick and, only for a size-1 (expanded) stick,
+        # appends one candidate per expanded output dim; reversed() puts those
+        # expanded-dim candidates first, since the back-end compiler cannot
+        # divide a reduction into a one-element-per-stick output of unaligned
+        # width across cores. For an ordinary (non-expanded) stick the list
+        # has one element, so reversed() has no effect.
         output_stls = [
             out_stl
             for expr in reversed(

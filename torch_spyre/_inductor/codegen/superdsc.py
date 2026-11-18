@@ -2459,7 +2459,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if op_spec.is_reduction:
         if (
             not (is_matmul or is_pool or has_indirect_access)
-            and not _is_conv(op_spec.op)
+            and not is_conv
             and not _is_topk(op_spec.op)
             and not _is_keep_by_index(op_spec.op)
         ):
