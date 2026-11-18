@@ -81,7 +81,7 @@ class Vocab:
             base = self.class_by_id(cid) if cid else self.classify(metric)
         ctx = spec.get("context") or {}
         if not cid and self.builtin is not None and metric not in self.builtin:
-            base = {"id": "unclassified", "match": [], "required": [], "optional": []}
+            base = None if "required" in ctx else {"id": "unclassified", "match": [], "required": [], "optional": []}
         if base is None and "required" not in ctx:
             return None
         base = base or {"id": "custom", "match": [], "required": [], "optional": []}
@@ -147,16 +147,59 @@ def _unrecorded(fid, v, vocab):
             f = vocab.facets.get(fid) or {}
             return not (f.get("none_ok") or "none" in [str(x).lower() for x in f.get("values", [])])
         return s in PLACEHOLDERS
+    leaves = _leaves(v)
+    return leaves is not None and all(_leaf_unrecorded(x) for x in leaves)
+
+
+def _clen(v):
+    """Length of a non-string container, or None when v is not one (or its length cannot be read)."""
+    if isinstance(v, (str, bytes)) or not hasattr(v, "__len__"):
+        return None
     try:
-        return hasattr(v, "__len__") and len(v) == 0
-    except TypeError:
-        return False
+        return len(v)
+    except Exception:  # noqa: BLE001 - hostile or 0-d array-likes
+        return None
+
+
+def _leaves(v, depth=0):
+    """Flattened leaves of a container ([] when empty), or None when v is not a readable container."""
+    n = _clen(v)
+    if n is None:
+        return None
+    try:
+        items = list(v.values()) if hasattr(v, "values") and callable(v.values) else [v[i] for i in range(n)]
+    except Exception:  # noqa: BLE001
+        try:
+            items = list(v)
+        except Exception:  # noqa: BLE001
+            return None
+    out = []
+    for x in items:
+        sub = _leaves(x, depth + 1) if depth < 8 else None
+        out.extend([x] if sub is None else sub)
+    return out
+
+
+def _leaf_unrecorded(x):
+    return x is None or _nonfinite(x) or (isinstance(x, str) and x.strip().lower() in PLACEHOLDERS)
+
+
+def _show(v):
+    n = _clen(v)
+    return str(v) if n is None else f"{n} values"
+
+
+def _canon(fid, v, vocab):
+    """YAML 1.1 reads an unquoted `off` as False: an enum facet that lists "off" takes False as "off"."""
+    if v is False and "off" in [str(x).lower() for x in (vocab.facets.get(fid) or {}).get("values", [])]:
+        return "off"
+    return v
 
 
 def resolve(rec, vocab):
     """Facet values after derivation: (values, derived_ids). Unknown values are dropped."""
     rec = _norm(rec)
-    vals = {k: v for k, v in rec["ctx"].items() if not _unrecorded(k, v, vocab)}
+    vals = {k: _canon(k, v, vocab) for k, v in rec["ctx"].items() if not _unrecorded(k, v, vocab)}
     derived = set()
     st = rec.get("statistic")
     if st and "statistic" not in vals:
@@ -242,7 +285,7 @@ def _k(n, approx=False):
     try:
         n = int(float(n))
     except (TypeError, ValueError, OverflowError):
-        return str(n)
+        return _show(n)
     if n >= 1024 and n % 1024 == 0:
         return f"{n // 1024}k"
     if approx and n >= 1024:
@@ -390,9 +433,9 @@ def _text(group, vals, derived):
     """Text of one chip for a tuple of facets; None when the chip has nothing known; empty slot via EMPTY."""
     if group == ("concurrency", "request_rate"):
         if "concurrency" in vals:
-            return f"c={vals['concurrency']}"
+            return f"c={_show(vals['concurrency'])}"
         if "request_rate" in vals:
-            return f"rate {vals['request_rate']}/s"
+            return f"rate {_show(vals['request_rate'])}/s"
         return None
     if group == ("input_len", "output_len"):
         a, b = vals.get("input_len"), vals.get("output_len")
@@ -402,6 +445,8 @@ def _text(group, vals, derived):
     fid = group[0]
     if fid not in vals:
         return None
+    if _clen(vals[fid]) is not None:
+        return f"{_label(fid)} {_show(vals[fid])}"
     v = _chip_value(fid, vals[fid], derived)
     lab = _label(fid)
     if fid in ("cache_state", "dtype", "arch", "backend", "window") and fid != "window":
@@ -662,6 +707,22 @@ def pack_errors(metrics, vocab):
     return errs
 
 
+def _context_value_warning(f, key, v):
+    """Why a Benchmark `context:` value is not usable, or None. YAML 1.1 turns unquoted off/on into booleans."""
+    legal = [str(x).lower() for x in f.get("values", [])]
+    if v is None:
+        return f"context.{key} has no value (YAML null); give a value or remove the key"
+    if f.get("type") != "enum" or not legal:
+        return None
+    if v is False and "off" in legal:
+        return None
+    if v is True and "off" in legal:
+        return f"context.{key}: true is ambiguous (YAML reads an unquoted on as true); quote one of {legal}"
+    if str(v).lower() not in legal:
+        return f"context.{key}={v!r} is not one of {legal}"
+    return None
+
+
 def lint_catalog(cat, vocab=None, detail=False):
     """Warnings about metric context in a catalog. Never an error.
 
@@ -677,10 +738,9 @@ def lint_catalog(cat, vocab=None, detail=False):
             if k not in vocab.facets and not _custom(k):
                 warns.append(f"Benchmark/{b.name}: context.{k} is not a facet in the metric-context vocabulary")
             elif k in vocab.facets:
-                f = vocab.facets[k]
-                legal = [str(x).lower() for x in f.get("values", [])]
-                if f.get("type") == "enum" and legal and str(b.spec["context"][k]).lower() not in legal:
-                    warns.append(f"Benchmark/{b.name}: context.{k}={b.spec['context'][k]!r} is not one of {legal}")
+                w = _context_value_warning(vocab.facets[k], k, b.spec["context"][k])
+                if w:
+                    warns.append(f"Benchmark/{b.name}: {w}")
     for c in cat.cases:
         b = benches.get(c["benchmark"])
         if b is None:

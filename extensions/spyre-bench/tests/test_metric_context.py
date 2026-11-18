@@ -538,3 +538,52 @@ def test_third_party_metrics_without_a_class_are_unclassified_and_quiet():
     assert B.cls_for("pg.latency.mean")["id"] == "unclassified"
     assert nc.missing({"metric": "pg.latency.mean", "value": 1}, B) == []
     assert not [w for w in nc.lint_catalog(cat, detail=True) if "pg." in w]
+
+
+# ---- review round 4
+def test_declared_requirements_on_a_third_party_metric_are_linted():
+    spec = {"name": "pg.x", "context": {"required": ["timer"]}}
+    B = V.bind({"pg.x": spec}, builtin=set())
+    assert B.cls_for("pg.x")["required"] == ["timer"] and B.cls_for("pg.x")["id"] != "unclassified"
+    assert V.bind({"pg.x": {"name": "pg.x"}}, builtin=set()).cls_for("pg.x")["id"] == "unclassified"
+
+
+def test_yaml_boolean_off_is_prefix_cache_off_everywhere():
+    assert nc.resolve(rec(ctx={"prefix_cache": False}), V)[0]["prefix_cache"] == "off"
+    out = nc.compare(rec(ctx={"prefix_cache": False}), rec(ctx={"prefix_cache": "off"}), V)
+    assert out["status"] == "comparable"
+    assert nc.compare(rec(ctx={"prefix_cache": False}), rec(ctx={"prefix_cache": "on_warm"}), V)["status"] == "differs"
+    f = V.facets["prefix_cache"]
+    assert nc._context_value_warning(f, "prefix_cache", False) is None
+    assert "ambiguous" in nc._context_value_warning(f, "prefix_cache", True)
+    assert "YAML null" in nc._context_value_warning(f, "prefix_cache", None)
+    assert "stopwatch" in nc._context_value_warning(V.facets["timer"], "timer", "stopwatch")
+
+
+def test_containers_without_recorded_leaves_are_unrecorded_and_others_render_as_counts():
+    class Arr:
+        def __init__(self, *v):
+            self.v = v
+
+        def __len__(self):
+            return len(self.v)
+
+        def __getitem__(self, i):
+            return self.v[i]
+
+    for junk in ([float("nan")], [None], [[None], [float("nan")]], {"a": None}, Arr(float("nan"), float("nan"))):
+        assert "tp" in nc.missing(rec(ctx={"tp": junk}), V), repr(junk)
+    line = nc.context_line(rec(ctx={"tp": [1, 2], "concurrency": {"a": 1}}), V)
+    assert "TP 2 values" in line and "c=1 values" in line and "[1, 2]" not in line
+
+
+def test_builtin_metrics_are_recognised_through_relative_and_symlinked_paths(tmp_path):
+    import os
+
+    pack = Path(engine.__file__).resolve().parent / "packs" / "kernel"
+    link = tmp_path / "kernel-link"
+    link.symlink_to(pack)
+    for path in (link, Path(os.path.relpath(pack)), pack / ".." / "kernel"):
+        reg = engine.Registry()
+        reg.load(path)
+        assert "kernel.time.mean" in reg.builtin_metrics, path

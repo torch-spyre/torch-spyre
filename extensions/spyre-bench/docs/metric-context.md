@@ -62,6 +62,29 @@ spec:
 prints one summary line when Benchmarks have undeclared author-only facets or metrics without a class. `--lint-context`
 lists every one. Facets the engine, probes, ingest or derivation supply are not checked.
 
+## YAML booleans in `context:`
+
+YAML 1.1 reads an unquoted `off` as `false` and `on` as `true`. A `context:` value `prefix_cache: off` is therefore
+taken as `false`, which the vocabulary, renderer and `compare` treat as `off`. `true` is ambiguous (`on_cold` or
+`on_warm`), so the lint warns; quote the value you mean. An empty value (YAML null) also warns. Quote enum values.
+
+A container in a record's `ctx` holding only unrecorded leaves (`[nan]`, `[None]`) is unrecorded. A container with
+values is known but not renderable as a single value, so it shows as a count (`TP 2 values`).
+
+## Vocabulary changes to mirror in other readers
+
+A reader that ports the vocabulary (the dashboard) must apply these:
+
+- `clean` has the values `enforced`, `observed`, `none`. The raw run property `run.clean.exclusive` still allows
+  `unknown` (it is a recorded raw value); a raw `unknown` maps to the facet being missing. There is no `clean?` chip.
+- `prefix_cache` has the values `off`, `on_cold`, `on_warm`; boolean `false` is `off`.
+- `none_ok: true` marks facets where `none` is a real answer: `device_type`, `quant_scheme`, `baseline`,
+  `mem_alloc_policy`. `none` is also legal for facets that list it in `values`.
+- Classes `diagnostic` (no requirements) and `collective` (`comms.*`) exist; `x-` classes and facets carry no
+  requirements.
+- A metric of a non-built-in pack with no `class` is `unclassified`: no requirements. If it declares
+  `context.required`, those requirements apply and are linted.
+
 ## Rendering
 
 `spyre_bench.metric_context` renders a record `{metric, value, unit, statistic, n, ctx}`:

@@ -685,7 +685,7 @@ class Registry:
                     f"{p.where}: metric {m['name']}: unit {m['unit']!r} is not a UCUM unit in the allowed subset"
                 )
             self.metrics[m["name"]] = m
-            if pack_dir == CORE_DIR or pack_dir.parent == PACKS_DIR:
+            if pack_dir.resolve() == CORE_DIR.resolve() or pack_dir.resolve().parent == PACKS_DIR.resolve():
                 self.builtin_metrics.add(m["name"])
         vocab = metric_context.default_vocab()
         self.errors += [f"{p.where}: {e}" for e in metric_context.pack_errors(sp.get("metrics", []), vocab)]
