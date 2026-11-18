@@ -1258,6 +1258,9 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
             symbolic_dim_bounds={"s0": (512, 64)},
         )
 
+    @config.patch(
+        {"sencores": 8, "sencores_physical": 32, "core_placement_mode": "stride"}
+    )
     def test_per_core_symbolic_addresses_emitted(self):
         op_spec = self._make_symbolic_op_spec()
         sdsc_json, _, _, symbol_kinds = compile_op_spec(
@@ -1267,11 +1270,14 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         top = next(iter(sdsc_json.values()))
         dsc = next(iter(top["dscs_"][0].values()))
         physical_cores = top["coreFoldProp_"]["factor_"]
-        active_cores = tuple(
-            range(0, physical_cores, physical_cores // self._NUM_CORES)
-        )
+        active_cores = (0, 4, 8, 12, 16, 20, 24, 28)
+        self.assertEqual(physical_cores, 32)
         self.assertEqual(dsc["coreIdsUsed_"], list(active_cores))
-        self.assertEqual(set(top["coreIdToWkSlice_"]), {str(c) for c in active_cores})
+        self.assertEqual(set(top["coreIdToDsc_"]), {str(c) for c in active_cores})
+        self.assertEqual(
+            top["coreIdToWkSlice_"],
+            {str(c): {"mb": i, "out": 0} for i, c in enumerate(active_cores)},
+        )
 
         # The dim symbol s0 -> mb is still bound the same way; per-core
         # addresses use the physical IDs selected by sparse placement.

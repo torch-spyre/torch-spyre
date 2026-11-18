@@ -2975,6 +2975,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             )
             num_cores = max(num_cores, physical_span)
             if index == 0 and completed_producer_cores:
+                # Planning admits source_view only when its core count equals
+                # the producer's; work_division_from_view keeps that count in
+                # division.num_cores. The completed route names those cores.
                 tensor_ids = _remap_producer_cores(
                     _spyre_config.core_placement_mode,
                     completed_producer_cores,
