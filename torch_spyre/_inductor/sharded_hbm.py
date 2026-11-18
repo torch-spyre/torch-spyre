@@ -312,27 +312,18 @@ def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
 _SHARD_LOCAL_REDUCTIONS = ("sum", "mean", "max", "min")
 
 
-def _input_dim_symbols(read: MemoryDep, in_size: list[int]) -> dict[int, sympy.Symbol]:
-    """Input dim -> its iteration symbol (validated by ``_reduced_input_dims``)."""
-    strides = [math.prod(in_size[d + 1 :]) for d in range(len(in_size))]
-    return {
-        d: sym
-        for d, extent in enumerate(in_size)
-        if extent != 1
-        for sym, rng in read.ranges.items()
-        if read.index.coeff(sym) == strides[d] and int(rng) == extent
-    }
-
-
 def _reduced_input_dims(
     name: str, read: MemoryDep, write: MemoryDep, in_size: list[int]
-) -> tuple[list[int], dict[int, sympy.Symbol]]:
-    """Which input dims a reduction reduces, and the kept dims' symbols.
+) -> tuple[list[int], dict[int, sympy.Symbol], dict[int, sympy.Symbol]]:
+    """Which input dims a reduction reduces, the kept dims' symbols, and
+    every dim's symbol.
 
     The read index walks a contiguous input: input dim ``d`` is the symbol
     whose coefficient is ``stride(d)`` and whose range is ``in_size[d]``. A
     dim is reduced when its symbol does not appear in the write index.
-    Returns the reduced dims and, for each kept dim, its symbol.
+    Returns the reduced dims, for each kept dim its symbol, and the full
+    dim -> symbol map (the cross-shard planner needs the reduced dims'
+    symbols too).
     """
     strides = [math.prod(in_size[d + 1 :]) for d in range(len(in_size))]
     dim_symbol: dict[int, sympy.Symbol] = {}
@@ -361,7 +352,7 @@ def _reduced_input_dims(
     write_symbols = write.index.free_symbols
     reduced = [d for d, sym in dim_symbol.items() if sym not in write_symbols]
     kept = {d: sym for d, sym in dim_symbol.items() if sym in write_symbols}
-    return reduced, kept
+    return reduced, kept, dim_symbol
 
 
 def _plan_cross_shard_reduction(
@@ -435,14 +426,13 @@ def _plan_shard_local_reduction(
             f"{name}: non-unified kernels need operands and result of one "
             f"dtype; got {in_buf.get_dtype()} -> {op.get_dtype()}"
         )
-    reduced, kept = _reduced_input_dims(name, read, write, in_size)
+    reduced, kept, dim_symbol = _reduced_input_dims(name, read, write, in_size)
     s = placement.shard_dim
     if in_size[s] % placement.num_shards:
         raise Unsupported(
             f"{name}: non-unified kernels need the shard dim to divide evenly"
         )
     if s not in kept:
-        dim_symbol = _input_dim_symbols(read, in_size)
         _plan_cross_shard_reduction(op, name, in_size, reduced, dim_symbol, placement)
         return None
     stick_dim = len(in_size) - 1

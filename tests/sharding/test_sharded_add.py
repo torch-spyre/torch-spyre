@@ -549,15 +549,35 @@ def test_dynamic_shapes_fail_at_compile():
 
 @requires_emulation
 @expects_raise
+def test_mixed_placement_consumer_fails_at_compile():
+    """A consumer that mixes sharded and unsharded storage is rejected at
+    compile, not at launch with an error that names neither the op nor the
+    sharding. cumsum decomposes to a matmul whose triu_mask operand is
+    unsharded, so the add over its result and a sharded tensor fails the
+    same-placement check."""
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+    b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="need every operand sharded with the same placement"
+    ):
+        torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
+
+
+@requires_emulation
+@expects_raise
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
     from torch_spyre.ops.fallbacks import fallback_ops
 
-    # The op must still be a Spyre fallback. An op that gets a lowering becomes
-    # a ComputedBuffer, which the op-kind check rejects first, so this test
-    # would no longer reach the fallback-consumer check (torch.cumsum, used
-    # here before, got a lowering in #3389).
+    # The op must still be a Spyre fallback. An op that gets a lowering
+    # becomes a ComputedBuffer, which the op-kind check rejects first, so
+    # this test would no longer reach the fallback-consumer check
+    # (torch.cumsum, used in the mixed-placement test above, decomposes to
+    # a matmul with an unsharded triu_mask operand).
     assert torch.ops.aten.tril.default in fallback_ops, (
         "aten.tril is no longer a Spyre fallback; pick another op from "
         "torch_spyre/ops/fallbacks.py"
@@ -566,10 +586,11 @@ def test_fallback_consumer_fails_at_compile():
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    # The fallback's result is the graph output: an op that combined it with
-    # a sharded operand would be rejected first, as mixed sharded/unsharded.
-    # The message names the ops non-unified kernels support since the
-    # cross-shard-reduction work: pointwise and shard-local reductions.
+    # The fallback's result is the graph output: an op that combined it
+    # with a sharded operand would be rejected first, as mixed
+    # sharded/unsharded. The message names the ops non-unified kernels
+    # support since the cross-shard-reduction work: pointwise and
+    # shard-local reductions.
     with pytest.raises(
         RuntimeError, match="shard-local reductions on sharded operands only"
     ):
