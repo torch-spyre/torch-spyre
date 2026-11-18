@@ -29,5 +29,5 @@ spec:
   metrics:
     - {name: kernel.time.mean, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
     - {name: kernel.total_duration, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}
-    - {name: kernel.moe.fetch_bytes, class: kernel_time, unit: By, direction: lower_is_better, category: diagnostic, statistic: mean, compare: relative, description: "expert weight bytes fetched per launch"}
-    - {name: kernel.moe.loop_trips, class: kernel_time, unit: "{trip}", direction: none, category: diagnostic, statistic: max, compare: absolute, description: "largest runtime trip count of the expert loop"}
+    - {name: kernel.moe.fetch_bytes, class: kernel_time, unit: By, direction: lower_is_better, category: diagnostic, statistic: mean, compare: relative, noise: {min_repeats: 1}, description: "expert weight bytes fetched per launch"}
+    - {name: kernel.moe.loop_trips, class: kernel_time, unit: "{trip}", direction: none, category: diagnostic, statistic: max, compare: exact, noise: {min_repeats: 1}, description: "largest runtime trip count of the expert loop"}

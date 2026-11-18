@@ -25,6 +25,7 @@ spec:
   environment: ref-8card-one-node
   metrics: {required: [llm.ttft.p99, llm.itl.median, llm.output_throughput], headline: [llm.itl.median]}
   env: {MOE_DISPATCH: routed}
+  context: {length_mode: dataset, ttft_def: arrival_to_first_token, itl_def: token_gap, token_basis: tokenizer}
   run: {repeats: 3, cache: warm, isolation: session, timeout: 40m}
   matrix:
     name_template: moe_serve_{conc}

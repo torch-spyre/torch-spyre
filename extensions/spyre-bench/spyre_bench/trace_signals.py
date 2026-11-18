@@ -17,9 +17,41 @@
 A run declares which stored signal plays which role through `role.<family>.<role>` run properties; the roles a pack
 knows are its registered `role.<family>.*` attributes. Unknown signals and roles are ignored, so an older reader keeps
 working on newer data, and a missing signal is never reported as zero.
+
+Result per role: NOT_CAPTURED (no string name declared, the name is not stored, or the stored value is not an array),
+or a Signal. An empty array is captured but empty (`Signal([], ())`). Entries that are None or NaN stay in `values` and
+their positions are listed in `missing_at`, so a partial array is never passed off as complete.
 """
 
-NOT_CAPTURED = None
+import math
+from dataclasses import dataclass
+
+
+class _NotCaptured:
+    """Singleton marker distinct from None, 0 and []; always falsy."""
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "NOT_CAPTURED"
+
+
+NOT_CAPTURED = _NotCaptured()
+
+
+@dataclass(frozen=True)
+class Signal:
+    values: tuple
+    missing_at: tuple
+
+    @property
+    def complete(self):
+        return not self.missing_at
+
+
+def _absent(v):
+    return v is None or (isinstance(v, float) and math.isnan(v))
 
 
 def declared_roles(reg, family):
@@ -29,9 +61,13 @@ def declared_roles(reg, family):
 
 
 def resolve_roles(reg, family, run_props, measurements):
-    """{role: values or NOT_CAPTURED} for every registered role of the family."""
+    """{role: Signal or NOT_CAPTURED} for every registered role of the family."""
     out = {}
     for role in declared_roles(reg, family):
         name = run_props.get(f"role.{family}.{role}")
-        out[role] = measurements[name] if name and name in measurements else NOT_CAPTURED
+        arr = measurements.get(name) if isinstance(name, str) else None
+        if not isinstance(arr, (list, tuple)):
+            out[role] = NOT_CAPTURED
+            continue
+        out[role] = Signal(tuple(arr), tuple(i for i, v in enumerate(arr) if _absent(v)))
     return out
