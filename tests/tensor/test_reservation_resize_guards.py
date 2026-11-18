@@ -305,5 +305,44 @@ class TestReservationWithExplicitLayout(TestCase):
             )
 
 
+# The derived layout puts the reserved dim outermost, so a transfer of fewer
+# than max rows fills one contiguous prefix of the buffer and goes over in one
+# DMA chunk instead of one per outer position (#6026).
+class TestReservedDimOutermost(TestCase):
+    MAX = 16
+    SPEC = {0: {"min": 8, "max": 16, "granularity": 1}}
+
+    def _assert_reserved_dim_outermost(self, x_dev: torch.Tensor) -> None:
+        layout = get_spyre_tensor_layout(x_dev)
+        self.assertEqual(layout.device_size[0], self.MAX)
+        self.assertEqual(layout.stride_map[0], x_dev.stride(0))
+
+    def test_rank3_reserved_dim_is_outermost(self) -> None:
+        x = torch.rand(9, 512, 128, dtype=torch.float16)
+        self._assert_reserved_dim_outermost(x.to(DEVICE, dynamic=self.SPEC))
+
+    def test_rank2_reserved_dim_is_outermost(self) -> None:
+        x = torch.rand(9, 4096, dtype=torch.float16)
+        self._assert_reserved_dim_outermost(x.to(DEVICE, dynamic=self.SPEC))
+
+    def test_partial_transfer_reads_back_and_keeps_layout_across_resize(
+        self,
+    ) -> None:
+        # Compared with a plain round trip of the same rows, so the device's
+        # own fp16 rounding is on both sides.
+        x = torch.rand(16, 512, 128, dtype=torch.float16)
+        expected = x.to(DEVICE).cpu()
+        x_dev = x[:9].to(DEVICE, dynamic=self.SPEC)
+        self.assertTrue(torch.equal(x_dev.cpu(), expected[:9]))
+
+        x_dev.resize_((8, 512, 128))
+        self.assertTrue(torch.equal(x_dev.cpu(), expected[:8]))
+        self._assert_reserved_dim_outermost(x_dev)
+
+        x_dev.resize_((9, 512, 128))
+        self.assertTrue(torch.equal(x_dev.cpu()[:8], expected[:8]))
+        self._assert_reserved_dim_outermost(x_dev)
+
+
 if __name__ == "__main__":
     run_tests()
