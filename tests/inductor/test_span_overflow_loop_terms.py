@@ -25,7 +25,7 @@ import sympy
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.wsr.span_overflow_loop_terms import (
+from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     _plan_carries,
     _taken_symbols,
     mint_induction,
@@ -151,9 +151,7 @@ def test_a_step_with_a_symbolic_coefficient_is_refused():
 # --- the carry declaration, on stub ops (no device) ----------------------------
 
 
-def _carry_member(
-    name, data_cls, *, target=None, reads=(), writes=(), kind="reduction"
-):
+def _carry_member(name, data_cls, *, target=None, reads=(), writes=()):
     """A group member with just what ``_plan_carries`` reads."""
     from types import SimpleNamespace
 
@@ -166,7 +164,6 @@ def _carry_member(
     return SimpleNamespace(
         data=mock.MagicMock(spec=data_cls),
         layout=layout,
-        loop_info=SimpleNamespace(propagation=SimpleNamespace(kind=kind)),
         get_read_writes=lambda: SimpleNamespace(
             reads=[SimpleNamespace(name=n) for n in reads],
             writes=[SimpleNamespace(name=n) for n in writes],
@@ -174,6 +171,11 @@ def _carry_member(
         get_name=lambda: name,
         get_operation_name=lambda: name,
     )
+
+
+def _names(*ops):
+    """The reduction names the lowering hands ``_plan_carries``: partial and combine."""
+    return {op.get_operation_name() for op in ops}
 
 
 def _carry_storage(name, **attrs):
@@ -207,7 +209,11 @@ def _k_tiled_group(acc="buf1", suffix=""):
 
 def test_a_reduction_group_declares_one_carry_naming_its_storage_and_update():
     storage, partial, combine = _k_tiled_group()
-    (edit,) = _plan_carries(_carry_graph(storage, partial, combine), [partial, combine])
+    (edit,) = _plan_carries(
+        _carry_graph(storage, partial, combine),
+        [partial, combine],
+        _names(partial, combine),
+    )
     assert edit.update is combine and edit.storage is storage
     assert (edit.record.storage_name, edit.record.update_name) == ("buf1", "combine")
     assert edit.record.loop_origin is None
@@ -215,17 +221,21 @@ def test_a_reduction_group_declares_one_carry_naming_its_storage_and_update():
 
 def test_a_group_that_is_not_a_reduction_declares_nothing():
     storage, partial, combine = _k_tiled_group()
-    for op in (partial, combine):
-        op.loop_info.propagation.kind = "copy_out"
+    # no member is named a reduction: a copy-out or loop-internal group
     assert (
-        _plan_carries(_carry_graph(storage, partial, combine), [partial, combine]) == []
+        _plan_carries(_carry_graph(storage, partial, combine), [partial, combine], ())
+        == []
     )
 
 
 def test_two_reductions_in_one_group_declare_two_distinct_carries():
     s1, p1, c1 = _k_tiled_group("buf1", "_a")
     s2, p2, c2 = _k_tiled_group("buf2", "_b")
-    edits = _plan_carries(_carry_graph(s1, s2, p1, c1, p2, c2), [p1, c1, p2, c2])
+    edits = _plan_carries(
+        _carry_graph(s1, s2, p1, c1, p2, c2),
+        [p1, c1, p2, c2],
+        _names(p1, c1, p2, c2),
+    )
     assert [(e.record.storage_name, e.record.update_name) for e in edits] == [
         ("buf1", "combine_a"),
         ("buf2", "combine_b"),
@@ -249,16 +259,14 @@ def test_a_reduction_group_that_cannot_declare_its_carry_is_left_whole(case, mat
     if case == "partial_without_a_combine":
         members = [partial]
     elif case == "another_op_touches_the_accumulator":
-        extra = _carry_member(
-            "reader", Pointwise, reads=["buf1"], writes=["out"], kind="loop_internal"
-        )
+        extra = _carry_member("reader", Pointwise, reads=["buf1"], writes=["out"])
         members = [partial, combine, extra]
     elif case == "storage_already_declares_a_carry":
         storage._loop_carry_record = object()
     elif case == "storage_is_not_in_the_graph":
         graph = _carry_graph(partial, combine)
     with pytest.raises(Unsupported, match=match):
-        _plan_carries(graph, members)
+        _plan_carries(graph, members, _names(partial, combine))
 
 
 def test_a_storage_that_is_a_loop_member_is_left_whole():
@@ -268,11 +276,15 @@ def test_a_storage_that_is_a_loop_member_is_left_whole():
     storage.loop_info = SimpleNamespace(loop_group_id=(3,), loop_count=[4])
     # a ComputedBuffer in a counted loop has a loop path; the stub stands for one
     with mock.patch(
-        "torch_spyre._inductor.wsr.span_overflow_loop_terms.counted_loop_path",
+        "torch_spyre._inductor.wsr.loop_tiling_lowering.counted_loop_path",
         lambda op: (3,) if op is storage else (),
     ):
         with pytest.raises(Unsupported, match="member of the loop"):
-            _plan_carries(_carry_graph(storage, partial, combine), [partial, combine])
+            _plan_carries(
+                _carry_graph(storage, partial, combine),
+                [partial, combine],
+                _names(partial, combine),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +298,7 @@ from torch._inductor.dependencies import MemoryDep  # noqa: E402
 from torch._inductor.ir import Pointwise  # noqa: E402
 
 from torch_spyre._inductor import config, passes  # noqa: E402
-from torch_spyre._inductor.wsr import span_overflow_loop_terms as slt  # noqa: E402
+from torch_spyre._inductor.wsr import loop_tiling_lowering as slt  # noqa: E402
 
 from test_span_overflow_gate import (  # noqa: E402
     CASES,
@@ -832,7 +844,7 @@ def test_adding_a_term_invalidates_the_memoized_read_writes():
     from types import SimpleNamespace
     from unittest import mock
 
-    from torch_spyre._inductor.wsr import span_overflow_loop_terms as terms
+    from torch_spyre._inductor.wsr import loop_tiling_lowering as terms
 
     op = SimpleNamespace(
         data=SimpleNamespace(inner_fn=lambda *a: None, store_output=lambda *a: None),

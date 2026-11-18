@@ -528,7 +528,6 @@ def _compile_with_menu(fn, args, menu):
                 "auto_coarse_tiling": True,
                 "layout_solver": "cpsat",
                 "allow_all_ops_in_lx_planning": True,
-                "loop_tiling_lowering": "plan",
             }
         ),
         mock.patch.object(passes, "CustomPreSchedulingPasses", CollectTilingPasses),

@@ -39,7 +39,6 @@ Covers six areas, each in its own class group:
 No Spyre device or backend compiler is required.
 """
 
-import contextlib
 import os
 import tempfile
 import unittest
@@ -77,8 +76,9 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
-    _apply_plan,
+    _apply_work_div_symbol_remap,
     _consumer_own_dim_symbol,
+    _divide_reduction_ranges,
     _divide_ranges,
     _index_var_prefix,
     _loop_var_to_reduction_ranges_pos,
@@ -88,12 +88,13 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index,
     _should_patch_retiled_load_indexes,
     _squeezed_retile_dims,
-    coarse_tile_post_stickify,
-    plan_coarse_tile_groups,
     reduction_loop_vars,
 )
 
-
+from torch_spyre._inductor.wsr.loop_tiling_lowering import (
+    build_loop_tiling_plan,
+    tile_groups,
+)
 from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
@@ -132,7 +133,6 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_stride,
 )
 from utils_inductor import (
-    expects_raise,
     ir_computed_buffer,
     ir_input_loader,
     patch_tiling_helper,
@@ -494,6 +494,22 @@ def _make_real_reduction_op(
         for hint_id, dim_index in hints
     ]
     return buf
+
+
+def _divide_like_the_lowering(op, levels):
+    """Divide ``op`` the way the lowering does: the builder says which dim the level
+    tiles, and the same functions divide the output range or the reduction range. One
+    level only: the plan refuses a nest."""
+    (group,) = build_loop_tiling_plan([op], [([op], levels)]).groups
+    (planned,) = group.ops
+    if planned.tiled is None:
+        return
+    count = Integer(group.trip_count)
+    if planned.tiled.in_reduction:
+        remap = _divide_reduction_ranges(op, count, [planned.tiled.position])
+    else:
+        remap = _divide_ranges(op, count, [planned.tiled.position]).symbol_remap
+    _apply_work_div_symbol_remap(op, remap)
 
 
 def _graph(operations):
@@ -2850,21 +2866,6 @@ class TestCoarseTileNested(unittest.TestCase):
             _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
 
 
-def _legacy_lowering_only(cls):
-    """Run a test class against the legacy lowering alone.
-
-    These tests assert what the transform itself records and divides (hint lists,
-    ``loop_info`` fields, layouts) on mocked ops. The loop-term pass of stage 7a.2
-    appends one hint per op and reads real buffers, which a mocked graph does not
-    have; it has its own tests on real graphs (``test_span_overflow_loop_terms.py``).
-    """
-    return patch(
-        "torch_spyre._inductor.wsr.coarse_tile.add_loop_terms",
-        lambda *args, **kwargs: {},
-    )(cls)
-
-
-@_legacy_lowering_only
 class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
     output_tiled_dims, using the small example from
@@ -4978,179 +4979,6 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [other_group])
 
 
-class TestPlanTilingPropagation(unittest.TestCase):
-    """Cross-check: _plan_tiling_propagation's kind decision must match what
-    _propagate_tiled_op / _propagate_tiled_reduction_op actually do today.
-
-    This is the load-bearing regression net for front-loaded planning: it
-    validates the planning decision against current (still transformation-
-    driving) behavior, before transformation ever consumes the
-    new field. Built with the same mock-based fixtures
-    (_make_tiled_op/_make_consumer_op/_make_inside_consumer_op/
-    _make_tiled_reduction_op) TestCoarseTileBufferPropagation already uses
-    for its plain _find_outside_consumers checks --
-    _plan_tiling_propagation's own helpers are direct planning-time analogs
-    of those same functions.
-    """
-
-    def _plan_for(self, op, group_ops=None):
-        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
-
-        group_ops = group_ops if group_ops is not None else [op]
-        info = op.loop_info
-        plan = {id(op): info}
-        levels = [(0, c) for c in info.loop_count]
-        with patch(
-            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
-            return_value=set(),
-        ):
-            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
-        return info.propagation
-
-    # --- the in-place write that advances through its target is refused (#6256) --
-
-    def _mutation_op(self, name, target_name):
-        """A tiled op whose layout is an in-place write into ``target_name``."""
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-
-        op = _make_tiled_op(name, [Integer(16)], (0,), [Integer(4)], [[0]])
-        target = MagicMock()
-        target.get_name.return_value = target_name
-        target.layout.stride = [Integer(1)]
-        op.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
-        op.layout.get_buffer.return_value = target
-        return op
-
-    def _plan_mutation(self, group_ops, *, outputs=(), graph_inputs=(), splice=False):
-        from types import SimpleNamespace
-
-        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
-
-        op = group_ops[0]
-        plan = {id(op): op.loop_info}
-        levels = [(0, Integer(4))]
-        fake_v = MagicMock()
-        fake_v.graph = SimpleNamespace(graph_inputs={n: object() for n in graph_inputs})
-        patches = [
-            patch("torch_spyre._inductor.wsr.coarse_tile.V", fake_v),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
-                return_value=set(outputs),
-            ),
-        ]
-        if splice:
-            patches += [
-                patch(
-                    "torch_spyre._inductor.wsr.coarse_tile._splice_loop_vars",
-                    return_value=[Symbol("u0")],
-                ),
-                patch(
-                    "torch_spyre._inductor.wsr.coarse_tile."
-                    "_splice_write_targets_full_buffer",
-                    return_value=True,
-                ),
-            ]
-        with contextlib.ExitStack() as stack:
-            for p in patches:
-                stack.enter_context(p)
-            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
-        return op.loop_info.propagation
-
-    @expects_raise
-    def test_a_write_into_a_graph_input_that_is_also_an_output_is_refused(self):
-        """TODO(#6256): supporting it needs a write term on the op's own store and no
-        copy-out; this becomes a positive test then."""
-        op = self._mutation_op("op0", "arg0_1")
-        with self.assertRaisesRegex(Unsupported, r"in place into arg0_1.*#6256"):
-            self._plan_mutation([op], outputs={"arg0_1"}, graph_inputs={"arg0_1"})
-
-    @expects_raise
-    def test_a_for_each_tile_stacking_write_is_refused(self):
-        op = self._mutation_op("op0", "buf9")
-        with self.assertRaisesRegex(Unsupported, r"in place into buf9.*#6256"):
-            self._plan_mutation([op], splice=True)
-
-    @expects_raise
-    def test_a_local_accumulator_read_by_the_next_tile_is_refused(self):
-        """The flash-attention running-max shape: a pure intra-loop carry."""
-        op = self._mutation_op("op0", "acc")
-        reader = _make_inside_consumer_op("op1", "acc", (0,))
-        with self.assertRaisesRegex(Unsupported, r"in place into acc.*#6256"):
-            self._plan_mutation([op, reader])
-
-    def test_an_in_place_write_nothing_reads_is_not_refused(self):
-        """Control: the refusal is for a write that advances through its target. A
-        local target with no reader and no graph output stays loop_internal."""
-        op = self._mutation_op("op0", "acc")
-        propagation = self._plan_mutation([op])
-        self.assertEqual(propagation.kind, "loop_internal")
-
-
-def _make_full_buffer_read_fixture():
-    """Build a real tiled Pointwise op that reads a full-size SpyreEmptyFallback.
-
-    Mirrors ``_make_real_pointwise_op`` (real IR, not mocks) but the input is
-    a genuine ``SpyreEmptyFallback`` buffer (constructed directly, bypassing
-    FX-node lowering) rather than a plain ``InputBuffer`` -- this is what
-    the tiled-op-reads-full-buffer shape.  The op's own
-    ranges are smaller than the full buffer's shape (8 rows out of 64),
-    modeling the tile-vs-full-buffer mismatch.
-
-    Caller must have an active graph handler (``V.set_graph_handler(...)``)
-    around this call, matching every other real-IR helper in this file.
-    Returns ``(tiled_op, full_deps, operations)`` ready to pass straight into
-    ``_insert_all_read_copy_ops``.
-    """
-    from torch._inductor.ir import (
-        ComputedBuffer,
-        FixedLayout,
-        Pointwise,
-        StorageBox,
-        TensorBox,
-    )
-
-    from torch_spyre._inductor.ir import SpyreEmptyFallback
-
-    device = torch.device("cpu")
-    dtype = torch.float32
-
-    full_buf = SpyreEmptyFallback(
-        torch.ops.spyre.empty.default, [64, 128], device, dtype
-    )
-    full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
-    full_box = TensorBox(StorageBox(full_buf))
-
-    def inner_fn(index):
-        return full_box.make_loader()(index)
-
-    pw = Pointwise.create(
-        device=device,
-        dtype=dtype,
-        inner_fn=inner_fn,
-        ranges=[Integer(8), Integer(128)],
-    )
-    pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
-    tiled_op = ComputedBuffer(
-        name="tiled_op0",
-        layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
-        data=pw_data,
-    )
-    tiled_op.operation_name = "tiled_op0"
-    tiled_op.origins = OrderedSet()
-    tiled_op.loop_info = CoarseTileInfo(
-        loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
-    )
-    V.graph.name_to_buffer["tiled_op0"] = tiled_op
-
-    operations = [full_buf, tiled_op]
-    full_deps = [
-        dep
-        for dep in tiled_op.get_read_writes().reads
-        if dep.name == full_buf.get_name()
-    ]
-    return tiled_op, full_deps, operations
-
-
 class TestReadCopyElisionProof(unittest.TestCase):
     def test_record_is_frozen(self):
         from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
@@ -5456,144 +5284,69 @@ class TestReadCopyElisionProof(unittest.TestCase):
         )
 
 
-class TestPointSpliceAdvance(unittest.TestCase):
-    """_point_splice_advance_for_dep: the per-trip step of a point read.
+def _make_full_buffer_read_fixture():
+    """Build a real tiled Pointwise op that reads a full-size SpyreEmptyFallback.
 
-    Paged attention's in-body page gather reads one int32 page index per trip
-    (`index = 32*u0`, no iteration var), so its advance cannot be attributed
-    to a tiled dim and travels in squeezed_advance_per_read instead. The
-    coefficient recorded here is what SpyreKernel builds the
-    device_tile_advance_expr from, so dropping it re-reads the same page every
-    trip -- which compiles and returns a plausible-looking wrong answer.
+    Mirrors ``_make_real_pointwise_op`` (real IR, not mocks) but the input is
+    a genuine ``SpyreEmptyFallback`` buffer (constructed directly, bypassing
+    FX-node lowering) rather than a plain ``InputBuffer`` -- this is what
+    the tiled-op-reads-full-buffer shape.  The op's own
+    ranges are smaller than the full buffer's shape (8 rows out of 64),
+    modeling the tile-vs-full-buffer mismatch.
+
+    Caller must have an active graph handler (``V.set_graph_handler(...)``)
+    around this call, matching every other real-IR helper in this file.
+    Returns ``(tiled_op, full_deps, operations)`` ready to pass straight into
+    ``_insert_all_read_copy_ops``.
     """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
 
-    @staticmethod
-    def _dep(index, var_names=(), size=()):
-        return inductor_deps.MemoryDep(
-            name="block_table", index=index, var_names=var_names, size=size
-        )
+    from torch_spyre._inductor.ir import SpyreEmptyFallback
 
-    def test_rebase_handler_matches_exact_index(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _PointReadRebaseHandler
+    device = torch.device("cpu")
+    dtype = torch.float32
 
-        u0 = sympy.Symbol("u0", integer=True)
+    full_buf = SpyreEmptyFallback(
+        torch.ops.spyre.empty.default, [64, 128], device, dtype
+    )
+    full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
+    full_box = TensorBox(StorageBox(full_buf))
 
-        class Recorder:
-            def __init__(self):
-                self.loads = []
+    def inner_fn(index):
+        return full_box.make_loader()(index)
 
-            def load(self, name, index):
-                self.loads.append((name, index))
-                return sympy.S.Zero
+    pw = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=[Integer(8), Integer(128)],
+    )
+    pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
+    tiled_op = ComputedBuffer(
+        name="tiled_op0",
+        layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+        data=pw_data,
+    )
+    tiled_op.operation_name = "tiled_op0"
+    tiled_op.origins = OrderedSet()
+    tiled_op.loop_info = CoarseTileInfo(
+        loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+    )
+    V.graph.name_to_buffer["tiled_op0"] = tiled_op
 
-        recorder = Recorder()
-        handler = _PointReadRebaseHandler(
-            recorder, {("block_table", 32 * u0): sympy.S.Zero}
-        )
-        handler.load("block_table", 32 * u0)
-        handler.load("block_table", 32 * u0 + 1)
-        handler.load("other", 32 * u0)
-
-        self.assertEqual(
-            recorder.loads,
-            [
-                ("block_table", sympy.S.Zero),
-                ("block_table", 32 * u0 + 1),
-                ("other", 32 * u0),
-            ],
-        )
-
-    def test_restickify_metadata_resolves_exact_dependency(self):
-        from torch_spyre._inductor.insert_restickify import (
-            _restickify_dep_index,
-            RestickifyArgInfo,
-        )
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
-
-        dummy_layout = FixedTiledLayout(
-            torch.device("cpu"),
-            torch.float16,
-            [Integer(1)],
-            [Integer(1)],
-            SpyreTensorLayout([1], torch.float16),
-        )
-
-        u0 = sympy.Symbol("u0", integer=True)
-        deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
-
-        self.assertEqual(
-            _restickify_dep_index(
-                deps,
-                RestickifyArgInfo(
-                    arg_name="block_table",
-                    dep_index=32 * u0 + 1,
-                    occurrence=0,
-                    target_layout=dummy_layout,
-                ),
-            ),
-            1,
-        )
-
-    def test_legacy_restickify_metadata_rejects_ambiguous_name(self):
-        from torch_spyre._inductor.insert_restickify import (
-            _restickify_dep_index,
-            RestickifyArgInfo,
-        )
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
-
-        dummy_layout = FixedTiledLayout(
-            torch.device("cpu"),
-            torch.float16,
-            [Integer(1)],
-            [Integer(1)],
-            SpyreTensorLayout([1], torch.float16),
-        )
-
-        u0 = sympy.Symbol("u0", integer=True)
-        deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
-
-        with self.assertRaisesRegex(AssertionError, "matches multiple reads"):
-            _restickify_dep_index(
-                deps,
-                RestickifyArgInfo(
-                    arg_name="block_table",
-                    dep_index=None,
-                    occurrence=0,
-                    target_layout=dummy_layout,
-                ),
-            )
-
-    def test_restickify_metadata_rejects_missing_exact_dependency(self):
-        from torch_spyre._inductor.insert_restickify import (
-            _restickify_dep_index,
-            RestickifyArgInfo,
-        )
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
-
-        dummy_layout = FixedTiledLayout(
-            torch.device("cpu"),
-            torch.float16,
-            [Integer(1)],
-            [Integer(1)],
-            SpyreTensorLayout([1], torch.float16),
-        )
-
-        u0 = sympy.Symbol("u0", integer=True)
-        deps = [self._dep(32 * u0)]
-
-        with self.assertRaisesRegex(AssertionError, "no matching"):
-            _restickify_dep_index(
-                deps,
-                RestickifyArgInfo(
-                    arg_name="block_table",
-                    dep_index=32 * u0 + 1,
-                    occurrence=0,
-                    target_layout=dummy_layout,
-                ),
-            )
+    operations = [full_buf, tiled_op]
+    full_deps = [
+        dep
+        for dep in tiled_op.get_read_writes().reads
+        if dep.name == full_buf.get_name()
+    ]
+    return tiled_op, full_deps, operations
 
 
 class TestIsReadAdvancingAnywhere(unittest.TestCase):
@@ -7270,7 +7023,6 @@ def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
     return op
 
 
-@_legacy_lowering_only
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -7302,7 +7054,7 @@ class TestPredictFrame(unittest.TestCase):
 
         # mutate the IR and check that the mutation matches the predicted values
         op.dim_hints = tile_spec_to_dim_hints(op, tiling, list(range(len(tiling.axes))))
-        coarse_tile_post_stickify(_graph([op]), [([op], levels)])
+        _divide_like_the_lowering(op, levels)
 
         self.assertEqual(pred_ranges, [int(r) for r in op.data.ranges])
         self.assertEqual(pred_devsize, list(op.layout.device_layout.device_size))
@@ -7472,8 +7224,7 @@ class TestPredictFrameReduction(unittest.TestCase):
 
         op.dim_hints = tile_spec_to_dim_hints(op, tiling, [hint_id])
         levels = [(hint_id, Integer(tiling.axes[0].count))]
-        plan = plan_coarse_tile_groups([op], [([op], levels)])
-        _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+        _divide_like_the_lowering(op, levels)
 
         # the applier must actually have tiled something
         self.assertNotEqual(
@@ -8632,7 +8383,7 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
         # The live graph's own list: _allocate_full_buffer lowers into it.
         operations = V.graph.operations
         operations.extend([op, reader])
-        coarse_tile_post_stickify(V.graph, [([op], levels)])
+        tile_groups(V.graph, [([op], levels)])
         return operations
 
     def _assert_full_buffers_keep(self, operations, op, size, device_layout):
@@ -8659,17 +8410,6 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
                     list(buf.layout.device_layout.stride_map),
                     list(device_layout.stride_map),
                 )
-
-    def _assert_reduction_accumulator_keeps_layout(self, axes):
-        # The stick dim tiled down to one stick, beside a reduction-range
-        # level: the tile's tile-count device dim has extent 1, like dim 0's
-        # would if it were 1.
-        op = _make_real_tiled_op("red_full", [6, 256], [8])
-        original = op.layout.device_layout
-        operations = self._tile(op, axes)
-        self.assertEqual(op.loop_info.propagation.kind, "reduction")
-        self.assertEqual([int(s) for s in op.layout.size], [6, 64])
-        self._assert_full_buffers_keep(operations, op, [6, 256], original)
 
     def test_full_buffer_without_a_planned_layout_raises(self):
         # Post-stickify, the full buffer's layout is not grown back from the
@@ -8837,7 +8577,6 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
-@_legacy_lowering_only
 class TestApplyTilingsEquivalence(unittest.TestCase):
     """``apply_tilings`` reduces to the hint path.
 

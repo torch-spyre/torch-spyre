@@ -379,7 +379,6 @@ def _loop_info_without_advance(info, new_op):
         output_tiled_dims=[[] for _ in range(levels)],
         squeezed_advance_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
         squeezed_advance_output=[[] for _ in range(levels)],
-        propagation=None,
     )
 
 
