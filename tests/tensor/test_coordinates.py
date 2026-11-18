@@ -1566,6 +1566,45 @@ class TestStickCompatibleWithoutCoords(TestCase):
         dep_out = MemoryDep("out", d0 * 64 + d1, (d0, d1), (4, 64))
         self.assertTrue(stick_compatible([(stl, dep), (stl_out, dep_out)]))
 
+    def test_repeat_mod_indexed_stick(self):
+        """Mod(d1, eps) in index — stick var is d1 even without linear coeff."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # Repeat input: device_size=[1,2,64], stride_map=[64,64,1]
+        stl = SpyreTensorLayout(
+            [1, 2, 64], [64, 64, 1], get_device_dtype(torch.float16)
+        )
+        # index = 64*Mod(d0,2) + Mod(d1,64) — repeat pattern
+        dep = MemoryDep(
+            "buf0",
+            64 * sympy.Mod(d0, 2) + sympy.Mod(d1, 64),
+            (d0, d1),
+            (6, 128),
+        )
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d1)
+
+    def test_repeat_input_compatible_with_dense_output(self):
+        """Repeat input (Mod-indexed stick) + dense output with same stick var — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        in_stl = SpyreTensorLayout(
+            [1, 2, 64], [64, 64, 1], get_device_dtype(torch.float16)
+        )
+        in_dep = MemoryDep(
+            "arg0",
+            64 * sympy.Mod(d0, 2) + sympy.Mod(d1, 64),
+            (d0, d1),
+            (6, 128),
+        )
+        out_stl = SpyreTensorLayout(
+            [6, 8, 64], [64, 384, 1], get_device_dtype(torch.float16)
+        )
+        out_dep = MemoryDep("buf0", d0 * 384 + d1, (d0, d1), (6, 128))
+        self.assertTrue(stick_compatible([(in_stl, in_dep), (out_stl, out_dep)]))
+
 
 if __name__ == "__main__":
     run_tests()

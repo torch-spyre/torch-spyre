@@ -57,7 +57,7 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
-from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
@@ -2940,6 +2940,18 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
+def _stick_compatible_from_coords(coords: "list[list[sympy.Expr]]") -> bool:
+    """Old coordinate-based stick_compatible — kept for dual-path validation."""
+    stick_vars: set[sympy.Symbol] = set()
+    nonstick_vars: set[sympy.Symbol] = set()
+    for dc in coords:
+        tensor_stick_vars = dc[-1].free_symbols
+        stick_vars |= tensor_stick_vars
+        for coord in dc[:-1]:
+            nonstick_vars |= coord.free_symbols - tensor_stick_vars
+    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+
+
 def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol | None":
     """Return the loop variable that iterates on the stick, or None.
 
@@ -2955,6 +2967,26 @@ def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol 
     for sym in index.free_symbols:
         if sym in dep.ranges and index.coeff(sym) == stick_stride:
             return sym
+    # Mod case: index contains ModularIndexing(sym, 1, N) or Mod(sym, N) where
+    # N matches the stick stride.  This covers repeat ops where dep.index has
+    # the form k*ModularIndexing(d0,1,M) + ModularIndexing(d1,1,eps).
+    eps = stl.elems_per_stick()
+    for mod_expr in index.atoms(ModularIndexing):
+        base, divisor, modulus = mod_expr.args
+        if int(divisor) != 1:
+            continue
+        if not isinstance(base, sympy.Symbol) or base not in dep.ranges:
+            continue
+        mod_int = int(modulus)
+        if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
+            return base
+    for mod_expr in index.atoms(sympy.Mod):
+        base, modulus = mod_expr.args
+        if not isinstance(base, sympy.Symbol) or base not in dep.ranges:
+            continue
+        mod_int = int(modulus)
+        if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
+            return base
     return None
 
 
@@ -3115,11 +3147,14 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    if (
-        not factorized_layout_mismatch
-        and in_stick_offset_free
-        and stick_compatible([(in_stl, in_dep), (out_stl, out_dep)])
-    ):
+    _old_sc = _stick_compatible_from_coords([idc, out_idc])
+    _new_sc = stick_compatible([(in_stl, in_dep), (out_stl, out_dep)])
+    assert _old_sc == _new_sc, (
+        f"stick_compatible mismatch: old={_old_sc} new={_new_sc}\n"
+        f"  in_stl={in_stl} in_dep.index={in_dep.index}\n"
+        f"  out_stl={out_stl} out_dep.index={out_dep.index}"
+    )
+    if not factorized_layout_mismatch and in_stick_offset_free and _new_sc:
         return False, None
 
     # ReStickifyOpHBM supports the DL16 format (FP16/BF16 both map to
