@@ -100,7 +100,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   // Same as shallow_copy_and_detach_core: has_intact_reservation() is the gate
   // for whether this view's shape still matches the recorded allocation.
-  // spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
+  spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
 

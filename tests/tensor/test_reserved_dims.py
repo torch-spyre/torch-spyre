@@ -209,7 +209,8 @@ class TestViewResultIntoCompiledKernel(TestCase):
             with self.subTest(op=name):
                 dev_fn = _compile_fresh(_double_per_tile, fullgraph=True)
                 cpu_fn = _compile_fresh(lambda t: t + t, backend="aot_eager")
-                seen = []  # what the compile wrapper concluded, per device compile
+                # What the compile wrapper concluded, per device compile.
+                seen: list[dict[object, tuple[int, ...]]] = []
 
                 def recording(*args, _seen=seen, **kwargs):
                     result = real_declared_dims_of(*args, **kwargs)
@@ -248,5 +249,3 @@ class TestViewResultIntoCompiledKernel(TestCase):
 
 if __name__ == "__main__":
     run_tests()
-
-
