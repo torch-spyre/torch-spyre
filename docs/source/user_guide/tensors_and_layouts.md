@@ -568,8 +568,8 @@ is refused with an error naming the symbol. The declaration bounds the index
 values by the maximum, not by the pool's current size, so an index at or past
 the current size reads whatever the reserved rows hold at that moment and no
 error is raised. Keeping every index below the current size is the caller's
-contract. Only one declared dimension per pool is supported, since only one
-dimension of a tensor can be the outermost.
+contract. Only one declared dimension per pool is supported, since a tensor
+declares only dimension 0 today (see the reservation rules above).
 
 #### Data Semantics
 
