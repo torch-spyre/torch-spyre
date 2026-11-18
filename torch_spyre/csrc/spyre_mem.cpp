@@ -800,8 +800,20 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t N = cpu_sizes[0];
     const int64_t K = cpu_sizes[1];
 
+    // device_sizes is reversed too: [stick, K, ...]. The device lays out each
+    // N-strip with K_dev / si sticks, where K_dev is the device extent of K.
+    // It exceeds K when the layout pads K to a whole stick (lower_qfp8wt pads
+    // an unaligned K and returns a slice of the padded weight), and then the
+    // strips are K_dev / si sticks apart, not K / si. Only the K valid rows are
+    // copied.
+    const int64_t K_dev = device_sizes.size() >= 2 ? device_sizes[1] : K;
+    TORCH_CHECK(K_dev >= K, "QFP8WT device K=", K_dev,
+                " is smaller than K=", K);
+
     // Expanded device shape: [si, so, K/si, N/so]
     TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+    TORCH_CHECK(K_dev % si == 0, "QFP8WT device K=", K_dev,
+                " must be divisible by si=", si);
     TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
@@ -809,7 +821,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     // Host strides for the expanded layout
     const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
     const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
+        (K_dev / si) * eps;  // = K_dev * so (one N-strip of sticks)
 
     // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
     // dim3]:

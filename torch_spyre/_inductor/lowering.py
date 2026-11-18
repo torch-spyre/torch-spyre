@@ -444,15 +444,21 @@ def lower_bmm_fp8(
     # [B, M, K] × [K, N] → [B, M, N] shares one mat2 across the batch.
     shared_mat2 = mat1_ndim == 3 and mat2_ndim == 2
     mat1_batch = [] if shared_mat2 else list(mat1_size[:-2])
-    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))) or any(
-        sympy.simplify(d1 - d2) != 0
-        for d1, d2 in zip(
-            [*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
-        )
-    ):
+    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))):
         raise Unsupported(
             f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
         )
+    # The batch and contraction dims must match. A provable mismatch is
+    # rejected. A symbolic size against a concrete one (a weight's K left
+    # dynamic, an activation's K static) is not provably equal, so guard on
+    # it, as Inductor's own mm lowerings do.
+    sizevars = V.graph.sizevars
+    for d1, d2 in zip([*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]):
+        if sizevars.statically_known_true(sympy.Ne(d1, d2)):
+            raise Unsupported(
+                f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+            )
+        sizevars.check_equals(d1, d2)
 
     output_dtype = out_dtype if out_dtype is not None else torch.float16
     reduction_numel = mat1_size[-1]  # K
@@ -3030,8 +3036,12 @@ def lower_qfp8wt(x):
     # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
     # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
     # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    # The shape_env lets get_stride_order order symbolic strides.
     pw.freeze_layout_with_stride_order(
-        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+        ir.get_stride_order(
+            ir.FlexibleLayout.contiguous_strides(pw.get_size()),
+            V.graph.sizevars.shape_env,
+        )
     )
     return pw
 
