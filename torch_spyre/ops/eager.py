@@ -193,6 +193,9 @@ def _rebuild_view_on_device(x):
         def view_copy(b):
             return twice(twice(b.as_strided(size, stride, offset)))
 
+        # Not a no-op: ``replace`` mints a distinct code object, so each geometry
+        # gets its own dynamo cache line and recompile budget instead of sharing
+        # one with every other ``view_copy`` closure (see ``_op_frame``). Keep it.
         view_copy.__code__ = view_copy.__code__.replace(
             co_varnames=view_copy.__code__.co_varnames
         )

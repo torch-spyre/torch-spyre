@@ -12523,7 +12523,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(lambda a: (view(a) * 2).exp(), x, atol=0.5, rtol=0.1)
 
     def test_stick_splitting_read_reduction_cpu(self, view, x):
-        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, atol=1.0, rtol=0.1)
+        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, rtol=0.1)
 
     def test_stick_splitting_read_strided_to_dtype_cpu(self, x):
         """``t[:, ::2].float().half()`` (issue #2851), compiled only.
