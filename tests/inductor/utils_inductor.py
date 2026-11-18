@@ -688,6 +688,11 @@ class ParameterizedTestMeta(type):
                             namespace[test_name] = pytest.mark.skip(
                                 reason=f"Skipped for {marked}"
                             )(namespace[test_name])
+                        elif test_case in device_fault or op_case in device_fault:
+                            marked = op_case if op_case in device_fault else test_case
+                            namespace[test_name] = pytest.mark.skip(
+                                reason=f"Faults the device: {device_fault[marked]}"
+                            )(namespace[test_name])
                         elif test_case in expect_raise or op_case in expect_raise:
                             marked = op_case if op_case in expect_raise else test_case
                             # A bare key covers every op, so compare per test, not just
