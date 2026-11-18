@@ -2940,6 +2940,26 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
+def stick_var_from_dep(
+    stl: SpyreTensorLayout, dep: MemoryDep
+) -> "sympy.Symbol | None":
+    """Return the loop variable that iterates on the stick, or None.
+
+    Uses the STL's stride_map[-1] (the host stride mapped to the stick
+    device dimension) to identify which symbol in dep.index has that
+    coefficient.  Returns None for broadcast (stride_map[-1] == 0) or
+    when no loop variable matches.
+    """
+    stick_stride = int(stl.stride_map[-1])
+    if stick_stride == 0:
+        return None
+    index = concretize_index(dep.index, set(dep.ranges))
+    for sym in index.free_symbols:
+        if sym in dep.ranges and index.coeff(sym) == stick_stride:
+            return sym
+    return None
+
+
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     """Return True if all tensors are stick-compatible.
 
