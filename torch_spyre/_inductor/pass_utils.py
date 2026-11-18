@@ -3077,6 +3077,9 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    # stick_compatible no longer needs device coordinates (uses STL+dep
+    # directly), but the offset and factorized-layout-mismatch checks
+    # below still do.  Eliminating those is future work.
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         # The layouts has a stick expression the backend cannot
