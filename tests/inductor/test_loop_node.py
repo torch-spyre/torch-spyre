@@ -48,6 +48,7 @@ from torch_spyre._inductor.loop_node import (
     LoopNode,
     OpsView,
     all_ops,
+    build_pending_loop_nodes,
     building_loop,
     collapse,
     expand,
@@ -56,6 +57,7 @@ from torch_spyre._inductor.loop_node import (
     insert_after,
     owning_list,
     peel_non_members,
+    request_loop_nodes,
 )
 
 
@@ -403,6 +405,70 @@ def _nested():
     inner = _node("inner", [c, d])
     outer = _node("outer", [b, inner, e])
     return [a, outer, f], outer, inner, (a, b, c, d, e, f)
+
+
+class TestPendingLoopNodes(unittest.TestCase):
+    """``request_loop_nodes`` / ``build_pending_loop_nodes``: a lowering records the
+    loops it built mid-pipeline and the pass loop wraps them once the pass is over."""
+
+    def test_only_the_requested_group_is_wrapped(self):
+        u1 = sympy.Symbol("u1")
+        a, b = _Op("a", (0,), [2]), _Op("b", (0,), [2])  # a flat loop nobody asked for
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph = _graph([a, b, c, d])
+        request_loop_nodes(graph, {1: u1})
+        build_pending_loop_nodes(graph)
+        first, node = graph.operations[:2], graph.operations[2]
+        self.assertEqual(first, [a, b])
+        self.assertIsInstance(node, LoopNode)
+        self.assertEqual((node.body, node.induction, node.trip_count), ([c, d], u1, 4))
+
+    def test_an_existing_node_is_kept_and_the_new_one_is_numbered_after_it(self):
+        u0, u1 = sympy.Symbol("u0"), sympy.Symbol("u1")
+        a = _Op("a", (0,), [2])
+        graph = _graph([a])
+        collapse(graph, inductions={0: u0})
+        (existing,) = graph.operations
+        self.assertEqual(existing.get_name(), "loopnode0")
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph.operations.extend([c, d])
+        request_loop_nodes(graph, {1: u1})
+        build_pending_loop_nodes(graph)
+        self.assertIs(graph.operations[0], existing)
+        self.assertEqual(
+            [o.get_name() for o in graph.operations], ["loopnode0", "loopnode1"]
+        )
+        self.assertEqual(graph.operations[1].body, [c, d])
+
+    def test_building_twice_changes_nothing(self):
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph = _graph([c, d])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        built = list(graph.operations)
+        build_pending_loop_nodes(graph)
+        self.assertEqual(graph.operations, built)
+
+    def test_requests_accumulate_until_built(self):
+        a, b = _Op("a", (0,), [2]), _Op("b", (1,), [3])
+        graph = _graph([a, b])
+        request_loop_nodes(graph, {0: sympy.Symbol("u0")})
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        self.assertEqual([type(o) for o in graph.operations], [LoopNode, LoopNode])
+
+    def test_an_empty_request_is_not_recorded(self):
+        graph = _graph([_Op("a")])
+        request_loop_nodes(graph, {})
+        build_pending_loop_nodes(graph)
+        self.assertEqual(len(graph.operations), 1)
+
+    def test_the_flat_view_is_refused(self):
+        graph = _graph([_Op("c", (1,), [4])])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        graph.operations = OpsView(graph.operations)
+        with self.assertRaises(AssertionError):
+            build_pending_loop_nodes(graph)
 
 
 class TestOpsView(unittest.TestCase):
