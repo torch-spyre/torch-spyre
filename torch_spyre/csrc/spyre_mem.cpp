@@ -1943,6 +1943,19 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
+
   // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
   // to the dtype-specific fill pattern; launchFillAsync submits it.
   auto* params = flex::createFillAsyncParams(get_composite_address(self), value,

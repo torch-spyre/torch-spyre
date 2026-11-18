@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import itertools
+import math
 from types import SimpleNamespace
+from unittest import mock
 
+import pytest
 import sympy
 
 import torch
@@ -33,7 +38,13 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    _check_stick_expr_supported,
+    compute_restickify_needed,
     device_coordinates,
+    is_stick_expr_offset_free,
+    restickify_dense_stl_to_sparse,
+    sparse_stl_from_host,
+    sparse_target_for_unservable_read,
     try_device_coordinates,
 )
 from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
@@ -43,6 +54,7 @@ from torch_spyre._inductor.propagate_layouts import (
     _find_alt_target_stl,
     generate_stl_with_required_stick,
 )
+from torch_spyre._inductor import views as views_module
 from torch_spyre._inductor.views import (
     _compute_coordinates_memo,
     _compute_coordinates_uncached,
@@ -223,6 +235,44 @@ class TestCoordinates(TestCase):
             coords = compute_coordinates([2, 6], [6, 1], {p0: count}, 3 * p0)
             expected = [0, 3 * p0] if count == 2 else [(3 * p0) // 6, (3 * p0) % 6]
             self.assertEqual(coords, expected)
+
+    def test_flat_read_across_unaligned_rows_wraps_stick_by_row_stride(self):
+        # Dense fp16 [8, 65]: device [2, 8, 64], stride_map [64, 65, 1]. Element
+        # c0 = 65 is row 1, column 0, so it sits at position 0 of its stick; the
+        # stick coordinate must wrap by the row stride 65 first (issue #5872).
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        coords = compute_coordinates([2, 8, 64], [64, 65, 1], {c0: 520}, c0)
+        self.assertEqual(coords[-1], sympy.Mod(sympy.Mod(c0, 65), 64))
+        for flat in range(520):
+            row, col = divmod(flat, 65)
+            actual = [int(c.subs({c0: flat})) for c in coords]
+            self.assertEqual(actual, [col // 64, row, col % 64], f"c0={flat}")
+
+    def test_wrap_by_every_larger_stride_folds_when_strides_divide(self):
+        # Where the larger strides divide each other, the chain folds back to the
+        # single wrap, so the coordinates of aligned layouts do not change.
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        coords = compute_coordinates([2, 8, 64], [64, 128, 1], {c0: 1024}, c0)
+        self.assertEqual(coords[-1], sympy.Mod(c0, 64))
+
+    def test_wrap_chain_drops_strides_that_a_later_one_divides(self):
+        # Device [3, 4, 1, 2, 64], strides [256, 64, 64, 768, 1] (a 4-D aligned
+        # tensor): d0 crosses the strides 768 and 256, and 256 divides 768.  The
+        # chain Mod(Mod(64*d0, 768), 256) must stay a single wrap.  sympy folds
+        # it to 64*Mod(Mod(d0, 12)**2, 4), which is not the same function.
+        d0, d2 = sympy.symbols("d0 d2", integer=True, nonnegative=True)
+        coords = compute_coordinates(
+            [3, 4, 1, 2, 64],
+            [256, 64, 64, 768, 1],
+            {d0: 24, d2: 64},
+            64 * d0 + d2,
+        )
+        self.assertEqual(coords[1], sympy.Mod(d0, 4))
+        self.assertFalse(any(c.has(sympy.Pow) for c in coords))
+        for value in range(24):
+            actual = [int(c.subs({d0: value, d2: 0})) for c in coords]
+            self.assertEqual(actual[:2], [(value % 12) // 4, value % 4], f"d0={value}")
+            self.assertEqual(actual[3], value // 12, f"d0={value}")
 
     def test_compute_coordinates_mixed_radix_flattened_dim(self):
         """A flattened H*D loop maps back to separate H and D coordinates."""
@@ -1439,6 +1489,489 @@ class TestFlatDenseProjectionLayout(TestCase):
             x, y, output, out_dep, contraction, M, N
         )
         self.assertIsNone(result)
+
+
+def _contiguous_host(shape, dtype=torch.float16):
+    strides = [math.prod(shape[i + 1 :]) for i in range(len(shape))]
+    return FixedLayout(torch.device("spyre:0"), dtype, list(shape), strides)
+
+
+def _non_unit_dims(stl):
+    """(size, stride) of every device dim of size other than 1, outermost first."""
+    return [
+        (size, stride)
+        for size, stride in zip(stl.device_size, stl.stride_map)
+        if size != 1
+    ]
+
+
+def _flat_read(numel):
+    c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+    return c0, MemoryDep("arg0_1", c0, (c0,), (numel,))
+
+
+class TestHostSparseLayout(TestCase):
+    """``sparse_stl_from_host`` keeps the host dims and puts the former stick dim on
+    a new size-1 dim.  The former stick dim is padded at its end, so it has to be
+    the outermost device dim: only then does the padding sit at the end of the
+    buffer, and not between the slices of another dim."""
+
+    def test_2d_layout(self):
+        sp = sparse_stl_from_host(_contiguous_host([8, 65]))
+        self.assertEqual(list(sp.device_size), [65, 1, 8, 64])
+        self.assertEqual(list(sp.stride_map), [1, 0, 65, 0])
+
+    def test_3d_former_stick_dim_is_outermost(self):
+        sp = sparse_stl_from_host(_contiguous_host([2, 3, 65]))
+        self.assertEqual(list(sp.device_size), [65, 3, 1, 2, 64])
+        self.assertEqual(list(sp.stride_map), [1, 65, 0, 195, 0])
+
+    def test_former_stick_dim_outermost_for_every_rank(self):
+        for shape in ([8, 65], [2, 3, 65], [4, 2, 100], [2, 3, 4, 65]):
+            with self.subTest(shape=shape):
+                sp = sparse_stl_from_host(_contiguous_host(shape))
+                self.assertEqual(sp.device_size[0], shape[-1])
+                self.assertEqual(sp.stride_map[0], 1)
+
+    def test_every_host_dim_and_the_stick_stay_in_the_layout(self):
+        sp = sparse_stl_from_host(_contiguous_host([2, 3, 4, 65]))
+        self.assertEqual(sorted(sp.device_size), sorted([65, 3, 4, 1, 2, 64]))
+        # One device dim per host dim plus the new size-1 dim and the stick; the
+        # host strides are kept, the new dims have none.
+        self.assertEqual(sorted(sp.stride_map), sorted([1, 260, 65, 0, 780, 0]))
+
+    def test_size_one_dims_do_not_change_the_rule(self):
+        for shape in ([1, 65], [2, 1, 65], [1, 3, 65], [1, 1, 65]):
+            with self.subTest(shape=shape):
+                sp = sparse_stl_from_host(_contiguous_host(shape))
+                self.assertEqual(sp.device_size[0], 65)
+                self.assertEqual(sp.stride_map[0], 1)
+
+    def test_dtype_override(self):
+        host = _contiguous_host([2, 3, 65])
+        default = sparse_stl_from_host(host)
+        as_bool = sparse_stl_from_host(host, torch.bool)
+        self.assertEqual(
+            default.device_dtype, SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        )
+        self.assertEqual(
+            as_bool.device_dtype, SpyreTensorLayout([1, 1], torch.bool).device_dtype
+        )
+        self.assertEqual(list(as_bool.device_size), list(default.device_size))
+
+
+class TestSparseLayoutServesRead(TestCase):
+    """A flat read that splits a stick on the dense layout is served by the input's
+    sparse layout.  Whatever form the coordinates take, they have to land on the
+    element the read names."""
+
+    def _assert_flat_read_exact(self, sp, numel):
+        c0, dep = _flat_read(numel)
+        coords = try_device_coordinates(sp, dep, None)
+        self.assertIsNotNone(coords)
+        strides = list(sp.stride_map)
+        for flat in range(numel):
+            values = [int(c.subs({c0: flat})) for c in coords]
+            # The stick and any size-1 dim sit at coordinate 0.
+            for value, stride in zip(values, strides):
+                if stride == 0:
+                    self.assertEqual(value, 0, f"c0={flat}")
+            # Contiguous host: the host offset of the element is the flat index.
+            offset = sum(v * st for v, st in zip(values, strides) if st > 0)
+            self.assertEqual(offset, flat, f"c0={flat}")
+
+    def test_flat_read_is_served_and_exact(self):
+        for shape in (
+            [8, 65],
+            [3, 65],
+            [4, 130],
+            [2, 100],
+            [2, 3, 65],
+            [4, 2, 100],
+            # 4D, including size-1 dims in the middle and in the front.
+            [2, 3, 4, 65],
+            [2, 2, 2, 100],
+            [3, 1, 2, 65],
+            [1, 2, 3, 65],
+        ):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                numel = math.prod(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(numel)
+                sparse = sparse_target_for_unservable_read(dense, host, dep)
+                self.assertIsNotNone(sparse)
+                # Size-1 dims carry no data, so only the non-unit dims must match.
+                self.assertEqual(
+                    _non_unit_dims(sparse), _non_unit_dims(sparse_stl_from_host(host))
+                )
+                self._assert_flat_read_exact(sparse, numel)
+
+    def test_flat_read_is_exact_for_fp32(self):
+        # fp32: 32 elements per stick, so 33 is the unaligned row length.
+        shape = [4, 33]
+        host = _contiguous_host(shape, torch.float32)
+        dense = SpyreTensorLayout(shape, torch.float32)
+        _, dep = _flat_read(math.prod(shape))
+        sparse = sparse_target_for_unservable_read(dense, host, dep)
+        self.assertIsNotNone(sparse)
+        self._assert_flat_read_exact(sparse, math.prod(shape))
+
+    def test_aligned_read_is_not_redirected(self):
+        for shape in ([8, 128], [2, 3, 64], [2, 2, 2, 128], [2, 2, 3, 64]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(math.prod(shape))
+                self.assertIsNone(sparse_target_for_unservable_read(dense, host, dep))
+
+    def test_sparse_input_is_not_redirected(self):
+        host = _contiguous_host([8, 65])
+        _, dep = _flat_read(520)
+        self.assertIsNone(
+            sparse_target_for_unservable_read(sparse_stl_from_host(host), host, dep)
+        )
+
+    def test_restickify_target_for_unserved_read(self):
+        # compute_restickify_needed asks for the sparse layout instead of
+        # returning "no restickify needed" or "infeasible".
+        for shape in ([8, 65], [2, 3, 65], [2, 3, 4, 65], [3, 1, 2, 65]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                numel = math.prod(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(numel)
+                needed, target = compute_restickify_needed(
+                    dense, host, dep, SpyreTensorLayout([numel], torch.float16), dep
+                )
+                self.assertTrue(needed)
+                self.assertIsNotNone(target)
+                self.assertEqual(
+                    _non_unit_dims(target), _non_unit_dims(sparse_stl_from_host(host))
+                )
+
+
+class TestRestickifyDenseStlToSparse(TestCase):
+    """The target built from the dense layout keeps its outer dims and matches the
+    host-built layout for a contiguous host."""
+
+    def test_matches_host_layout_for_contiguous_hosts(self):
+        for shape in ([8, 65], [2, 3, 65], [4, 2, 100], [2, 3, 4, 65]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                target = restickify_dense_stl_to_sparse(dense, host)
+                self.assertIsNotNone(target)
+                self.assertEqual(
+                    _non_unit_dims(target), _non_unit_dims(sparse_stl_from_host(host))
+                )
+                self.assertEqual(
+                    list(target.stride_map), list(sparse_stl_from_host(host).stride_map)
+                )
+
+    def test_keeps_the_dense_outer_dim_order(self):
+        # The dense layout puts host dim 0 outside host dim 1 (dim_order [1, 0, 2]).
+        # The target must keep that order, which the host-shape layout does not.
+        shape = [2, 3, 65]
+        host = _contiguous_host(shape)
+        dense = SpyreTensorLayout(shape, host.stride, torch.float16, [1, 0, 2])
+        target = restickify_dense_stl_to_sparse(dense, host)
+        self.assertIsNotNone(target)
+        self.assertEqual(list(target.device_size), [65, 2, 1, 3, 64])
+        self.assertEqual(list(target.stride_map), [1, 195, 0, 65, 0])
+        self.assertNotEqual(
+            list(target.device_size), list(sparse_stl_from_host(host).device_size)
+        )
+        # The target serves the flat read exactly.
+        c0, dep = _flat_read(math.prod(shape))
+        coords = try_device_coordinates(target, dep, None)
+        self.assertIsNotNone(coords)
+        for flat in range(math.prod(shape)):
+            values = [int(c.subs({c0: flat})) for c in coords]
+            offset = sum(v * st for v, st in zip(values, target.stride_map) if st > 0)
+            self.assertEqual(offset, flat, f"c0={flat}")
+
+
+class TestStickExprOffsetFree(TestCase):
+    def test_stick_split_by_a_row_boundary_is_not_a_stick(self):
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        self.assertFalse(
+            is_stick_expr_offset_free(sympy.Mod(sympy.Mod(c0, 65), 64), 64)
+        )
+
+    def test_plain_stick_expressions_stay_supported(self):
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        self.assertTrue(is_stick_expr_offset_free(sympy.Mod(c0, 64), 64))
+        self.assertTrue(is_stick_expr_offset_free(c0, 64))
+        self.assertTrue(is_stick_expr_offset_free(sympy.S.Zero, 64))
+
+
+def _reshape_read(rows, cols, a_n, b_n, stick=64):
+    """Dense ``x[rows, cols]`` read as ``reshape(a_n, b_n)`` (``a_n == 1``: flat).
+
+    ``stick`` is the number of elements per stick (64 for fp16, 32 for fp32).
+    Returns the device size, the coordinates, the loop ranges, and every point
+    where the coordinates differ from the true (tile, row, stick position).
+    """
+    tiles = math.ceil(cols / stick)
+    if tiles > 1:
+        size, stride = [tiles, rows, stick], [stick, cols, 1]
+    else:
+        size, stride = [rows, stick], [cols, 1]
+    c0, c1 = sympy.symbols("c0 c1", integer=True, nonnegative=True)
+    if a_n == 1:
+        var_ranges, index, names = {c0: b_n}, c0, (c0,)
+    else:
+        var_ranges, index, names = {c0: a_n, c1: b_n}, b_n * c0 + c1, (c0, c1)
+    coords = compute_coordinates(size, stride, var_ranges, index)
+    wrong = []
+    for point in itertools.product(*(range(var_ranges[v]) for v in names)):
+        subs = {v: sympy.Integer(p) for v, p in zip(names, point)}
+        row, col = divmod(int(index.xreplace(subs)), cols)
+        want = (col // stick, row, col % stick) if tiles > 1 else (row, col)
+        got = tuple(int(sympy.floor(c.xreplace(subs))) for c in coords)
+        if got != want:
+            wrong.append((point, got, want))
+    return size, coords, var_ranges, wrong
+
+
+# The reads of ``x[R, C].reshape(-1, K)`` swept below.  Rows and columns include
+# unaligned (65, 100), partly aligned (96, 192) and aligned (128) cases; K covers
+# a divisor of a stick (32), a whole stick (64), and rows that do not divide it.
+_SWEEP_GRID = [
+    (rows, cols, k, stick)
+    for rows, cols, stick in itertools.product(
+        (2, 3, 8), (65, 96, 100, 128, 192), (64, 32)
+    )
+    for k in (32, 64, 96, 128)
+    if (rows * cols) % k == 0 and k < rows * cols
+]
+
+# Reads whose coordinates are wrong although ``_check_stick_expr_supported``
+# accepts the stick coordinate, so layout selection trusts them (they fail later,
+# in codegen).  Several loop variables carry across a row stride that does not
+# divide them, which ``_has_misaligned_step`` does not see.
+# TODO(#5872): one method that is exact for every read empties these sets.
+_WRONG_AND_ACCEPTED = {
+    "default": {
+        (2, 96, 64, 32),
+        (2, 96, 64, 64),
+        (2, 192, 128, 32),
+        (2, 192, 128, 64),
+        (3, 128, 96, 32),
+        (8, 96, 64, 32),
+        (8, 96, 64, 64),
+        (8, 100, 32, 32),
+        (8, 192, 128, 32),
+        (8, 192, 128, 64),
+    },
+    "per_variable": {
+        (2, 96, 64, 32),
+        (2, 96, 64, 64),
+        (2, 192, 96, 64),
+        (2, 192, 128, 32),
+        (2, 192, 128, 64),
+        (3, 128, 96, 32),
+        (3, 128, 96, 64),
+        (3, 192, 96, 64),
+        (8, 96, 64, 32),
+        (8, 96, 64, 64),
+        (8, 96, 128, 32),
+        (8, 100, 32, 32),
+        (8, 192, 96, 64),
+        (8, 192, 128, 32),
+        (8, 192, 128, 64),
+    },
+    "whole_index": set(),
+}
+
+
+class TestReshapeReadCoordinates(TestCase):
+    """The coordinates of reshaped reads of an unaligned dense tensor (issue #5872).
+
+    Every point is checked against the true (tile, row, position) of the element.
+    The tests below record the scope: exact and accepted, exact but not yet
+    expressible by the frontend, and not exact (missing carry).
+
+    The sweep tests at the end compare every read of ``x[R, C].reshape(-1, K)``
+    (issue #5872), at both stick sizes, with the true position of each element,
+    for each way of building the coordinates:
+
+    - ``default``: ``compute_coordinates`` as it is, which builds the coordinates
+      per loop variable and switches to the whole index when
+      ``_has_misaligned_step`` fires;
+    - ``per_variable``: never switches;
+    - ``whole_index``: always decomposes the whole index.
+
+    A read is "accepted" when ``_check_stick_expr_supported`` takes its stick
+    coordinate, which is all layout selection checks.  The dangerous reads are
+    the wrong ones that are accepted; they are listed in ``_WRONG_AND_ACCEPTED``,
+    so a read that becomes exact makes the test fail until it is removed.
+    """
+
+    def test_flat_and_reshaped_reads_are_exact(self):
+        for rows, cols, a_n, b_n in (
+            (8, 65, 1, 520),
+            (3, 65, 1, 195),
+            (4, 130, 1, 520),
+            (2, 100, 1, 200),
+            (16, 30, 1, 480),
+            (8, 96, 1, 768),
+            (8, 65, 4, 130),
+            (8, 65, 2, 260),
+            (3, 128, 2, 192),
+        ):
+            with self.subTest(read=(rows, cols, a_n, b_n)):
+                self.assertEqual(_reshape_read(rows, cols, a_n, b_n)[3], [])
+
+    def test_misaligned_step_read_is_exact(self):
+        # Issue #5872 case 2: [3, 128].reshape(-1, 96), step 96 is not a multiple
+        # of the stride 64 it lands on.
+        self.assertEqual(_reshape_read(3, 128, 4, 96)[3], [])
+
+    # The reads below are exact, but ``Term.from_coordinate`` cannot express the
+    # coordinate, so the frontend rejects them.
+    # TODO: when it can, these become positive tests (and join the list above).
+    def _assert_frontend_rejects(self, read, error, match):
+        size, coords, var_ranges, wrong = _reshape_read(*read)
+        self.assertEqual(wrong, [])
+        counter = [0]
+
+        def synthetic_var():
+            counter[0] += 1
+            return sympy.Symbol(f"z{counter[0]}", integer=True, nonnegative=True)
+
+        with self.assertRaisesRegex(error, match):
+            normalize_coordinates(dict(var_ranges), size, coords, synthetic_var)
+
+    def test_stepped_modular_coordinate_is_rejected_by_the_frontend(self):
+        # [3, 128].reshape(4, 96): the coordinate is Mod(3*c0, 4).
+        self._assert_frontend_rejects(
+            (3, 128, 4, 96),
+            Unsupported,
+            r"Unsupported modular coordinate expression Mod\(3\*c0, 4\)",
+        )
+
+    def test_non_unit_fraction_is_rejected_by_the_frontend(self):
+        # [8, 96].reshape(6, 128): the coordinate has 4*c0/3 (issue #1353).
+        self._assert_frontend_rejects(
+            (8, 96, 6, 128), AssertionError, "Unsupported coordinate expression"
+        )
+
+    def test_non_unit_fraction_with_modulus_is_rejected_by_the_frontend(self):
+        # [8, 65].reshape(5, 104): the coordinate has 13*Mod(3*c0, 5)/64.
+        self._assert_frontend_rejects(
+            (8, 65, 5, 104), AssertionError, "Unsupported coordinate expression"
+        )
+
+    # LIMIT: several loop variables add into one device dim and the sum can exceed
+    # it, but the carry into the next dim is not computed, so the coordinates are
+    # wrong.  The frontend rejects all of them today (no wrong value reaches the
+    # device); this will matter once it can express Mod(3*c0, 8).
+    # TODO(#5872): a coordinate method that is exact for every read replaces these.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="#5872: [3,128].reshape(8,48): stick coordinate c1 + 16*Mod(3*c0, 4) "
+        "reaches 95 > 64 and the carry is lost (96 of 384 elements wrong)",
+    )
+    def test_carry_between_variables_3x128_to_8x48(self):
+        self.assertEqual(_reshape_read(3, 128, 8, 48)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="#5872: [8,65].reshape(65,8): stick coordinate "
+        "c1 + Mod(Mod(8*c0, 65), 64) lacks the carry (35 of 520 elements wrong)",
+    )
+    def test_carry_between_variables_8x65_to_65x8(self):
+        self.assertEqual(_reshape_read(8, 65, 65, 8)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="#5872: [2,100].reshape(4,50): sympy squares the inner Mod, "
+        "Mod(25*Mod(c0, 2)**2, 32) (72 of 200 elements wrong; the device result is "
+        "right only because the operator reads the sparse layout)",
+    )
+    def test_carry_between_variables_2x100_to_4x50(self):
+        self.assertEqual(_reshape_read(2, 100, 4, 50)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="#5872: [8,96].reshape(12,64): the row coordinate floor(2*c0/3) and the "
+        "carry are wrong (384 of 768 elements wrong)",
+    )
+    def test_carry_between_variables_8x96_to_12x64(self):
+        self.assertEqual(_reshape_read(8, 96, 12, 64)[3], [])
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        forced = {"default": None, "per_variable": False, "whole_index": True}
+        cls.reads = {}
+        for mode, force in forced.items():
+            patch = (
+                mock.patch.object(
+                    views_module, "_has_misaligned_step", return_value=force
+                )
+                if force is not None
+                else contextlib.nullcontext()
+            )
+            # compute_coordinates is memoized on its arguments, which do not
+            # include the patched helper: drop the memo so each mode recomputes.
+            _compute_coordinates_memo.cache_clear()
+            with patch:
+                cls.reads[mode] = {read: cls._classify(*read) for read in _SWEEP_GRID}
+            _compute_coordinates_memo.cache_clear()
+
+    @staticmethod
+    def _classify(rows, cols, k, stick):
+        _, coords, _, wrong = _reshape_read(rows, cols, rows * cols // k, k, stick)
+        try:
+            _check_stick_expr_supported(coords[-1], stick)
+            accepted = True
+        except Unsupported:
+            accepted = False
+        return not wrong, accepted
+
+    def _wrong_and_accepted(self, mode):
+        return {r for r, (exact, ok) in self.reads[mode].items() if ok and not exact}
+
+    def test_default_wrong_reads_accepted_by_the_stick_check_are_known(self):
+        self.assertEqual(
+            self._wrong_and_accepted("default"), _WRONG_AND_ACCEPTED["default"]
+        )
+
+    def test_per_variable_wrong_reads_accepted_by_the_stick_check_are_known(self):
+        self.assertEqual(
+            self._wrong_and_accepted("per_variable"),
+            _WRONG_AND_ACCEPTED["per_variable"],
+        )
+
+    def test_whole_index_is_exact_for_every_read(self):
+        reads = self.reads["whole_index"]
+        inexact = [r for r, (exact, _) in reads.items() if not exact]
+        self.assertEqual(inexact, [])
+
+    def test_default_is_never_worse_than_per_variable(self):
+        # The switch to the whole index only ever fixes a read.
+        worse = [
+            r
+            for r, (exact, _) in self.reads["default"].items()
+            if self.reads["per_variable"][r][0] and not exact
+        ]
+        self.assertEqual(worse, [])
+
+    def test_whole_index_gives_up_reads_the_stick_check_accepts(self):
+        # Exact, but not in a form the stick check recognizes: why it cannot
+        # simply replace the per-variable construction.
+        default, whole = self.reads["default"], self.reads["whole_index"]
+        lost = [
+            r for r, (exact, ok) in default.items() if exact and ok and not whole[r][1]
+        ]
+        self.assertGreater(len(lost), 0)
 
 
 if __name__ == "__main__":

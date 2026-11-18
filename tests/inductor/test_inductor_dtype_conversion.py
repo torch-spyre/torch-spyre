@@ -164,7 +164,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
