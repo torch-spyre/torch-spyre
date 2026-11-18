@@ -819,6 +819,73 @@ def max_trip_count(count) -> int:
     return upper
 
 
+def indirect_index_range(size) -> int:
+    """The valid range of an indirect index, as a plain int.
+
+    ``ops.indirect_indexing(index, size)`` carries the extent of the indexed
+    (source) dimension. For a gathered pool whose own length is symbolic, e.g. a
+    page pool reserved with ``.to("spyre", dynamic=...)``, that size is the
+    pool's symbol. It is a TABLE LENGTH, not a loop extent: it only bounds the
+    index values and never becomes a trip count, so it needs no bundle
+    parameter.
+
+    It resolves to the DECLARED MAXIMUM, never this call's hint. Every downstream
+    consumer uses the range to build static geometry and bounds, and the pool
+    buffer is reserved at the maximum, so every index valid at any runtime size
+    is inside it. Sizing it from the warm-up call would make a larger pool's
+    upper pages unaddressable while the binary claims to serve the whole range.
+
+    Resolving to the maximum also makes an out-of-range index unobservable: an
+    index at or above the current size but below the maximum reads a stale row
+    of the reservation, and nothing downstream can tell it from a valid one. A
+    device-side bounds check would need the source's LOGICAL size at launch.
+    No launch slot carries it today (the only ``kDimension`` slot of a gather
+    loop is its trip count, the index count), so such a check needs a new slot
+    for the source extent, not a change here.
+
+    Only a declared dimension has that maximum: the pool's reservation is what
+    makes it addressable. A ``mark_dynamic(max=...)`` or ``torch._check`` bound
+    reserves nothing, so it is refused rather than taken as the range.
+
+    Raises:
+        Unsupported: the size is symbolic and not a declared dimension, so no
+            static range exists.
+    """
+    if not (hasattr(size, "free_symbols") and size.free_symbols):
+        return int(size)
+    upper = declared_max_or_none(size)
+    if upper is None:
+        raise Unsupported(
+            undeclared_maximum_message(f"indirect index range {size}", size)
+        )
+    logger.debug(
+        "[symbolic-gather] indirect index range %s resolved to its declared "
+        "maximum %d (the source pool is reserved at that maximum)",
+        size,
+        upper,
+    )
+    return upper
+
+
+def undeclared_maximum_message(subject: str, expr) -> str:
+    """Refusal text for a symbolic extent that is not a declared dimension.
+
+    Shared by every site that must size a symbolic extent statically at its
+    declared maximum, so the advice is the same wherever the refusal fires.
+    Only ``.to("spyre", dynamic=...)`` declares a range: it reserves the buffer
+    at the maximum, which is what makes that maximum addressable. A
+    ``mark_dynamic(max=...)`` or ``torch._check`` bound reserves nothing.
+    """
+    syms = sorted(map(str, getattr(expr, "free_symbols", ()) or ()))
+    return (
+        f"{subject} is symbolic with no declared maximum for {syms}, so it "
+        "cannot be sized statically. Declare the dimension's range on the "
+        'tensor, e.g. x.to("spyre", dynamic={0: dict(min=8, max=16, '
+        "granularity=8)}); a mark_dynamic(max=...) or torch._check bound is "
+        "not a declaration"
+    )
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension. SDSC route only.
 
@@ -1519,7 +1586,7 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            self._pending_indirect_index_size = indirect_index_range(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):

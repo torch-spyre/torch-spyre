@@ -1044,7 +1044,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
 def scaled_mm(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 matrix multiplication, with no scaling or bias applied.
@@ -1062,7 +1062,7 @@ def scaled_mm(
 
 @scaled_mm.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     if mat1.ndim != 2 or mat2.ndim != 2:
         raise ValueError(
@@ -1076,7 +1076,7 @@ def _(
 
 @torch.library.custom_op("spyre::bmm_fp8", mutates_args=(), device_types="spyre")
 def bmm_fp8(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 batched matrix multiplication, with no scaling applied.
@@ -1095,7 +1095,7 @@ def bmm_fp8(
 
 @bmm_fp8.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
     output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
@@ -1108,7 +1108,7 @@ def scaled_bmm(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
@@ -1138,7 +1138,7 @@ def _(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
