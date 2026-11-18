@@ -1766,6 +1766,58 @@ def test_gate_up_full_parent_repartition(monkeypatch):
     assert _core_slices(plan.destination_view, 32) == {c: {1: c} for c in range(32)}
 
 
+def test_gate_up_halves_read_the_matmul_output_in_place(monkeypatch):
+    """TP4 gemma-4 GeluAndMul: the readers share the matmul's row split, so no
+    relayout is planned and both halves read the matmul's own LX output. Kernel
+    preparation must decode a reduction producer's division, not demote it."""
+    import torch_spyre._inductor.spyre_kernel as sk_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+    offsets = []
+    normalize = sk_mod.normalize_local_lx_subrange
+
+    def capture(contract, name, argument, iteration_space, **kwargs):
+        result = normalize(contract, name, argument, iteration_space, **kwargs)
+        if result is not argument:
+            offsets.append(result.allocation["lx"] - argument.allocation["lx"])
+        return result
+
+    monkeypatch.setattr(sk_mod, "normalize_local_lx_subrange", capture)
+    rows, inner, half = 512, 128, 576
+
+    def fn(x, weight):
+        with spyre_hint(work_div={"R": 32}):
+            fused = torch.nn.functional.linear(x, weight)
+        with spyre_hint(work_div={"R": 32}):
+            d = fused.shape[-1] // 2
+            gelu = torch.nn.functional.gelu(fused[..., :d], approximate="tanh")
+            return -(gelu * fused[..., d:])
+
+    host = ((torch.arange(rows * inner).reshape(rows, inner) % 33) - 16).to(
+        torch.float16
+    ) / 8
+    columns = torch.arange(2 * half) % inner
+    scales = torch.where(torch.arange(2 * half) < half, 1.0, 0.5).to(torch.float16)
+    weight = torch.zeros(2 * half, inner, dtype=torch.float16)
+    weight[torch.arange(2 * half), columns] = scales
+    for name, size in (("R", rows), ("K", inner), ("F", 2 * half)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["F", "K"])
+    gate, up = (host[:, columns] * scales).chunk(2, dim=-1)
+    expected = -(
+        torch.nn.functional.gelu(gate.float(), approximate="tanh") * up.float()
+    )
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(x, w)
+    torch.testing.assert_close(out.cpu().float(), expected, rtol=0.01, atol=0.01)
+    observed.assert_emitted_in_lx(expected_plans=0)
+    # Per core: 16 rows of 9 sticks precede the up half.
+    assert sorted(offsets) == [0, (half // 64) * (rows // 32) * 64 * 2]
+
+
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
     """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
     _run_prefix_linear_case(monkeypatch, mode="served")

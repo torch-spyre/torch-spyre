@@ -31,6 +31,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
+    Reduction,
     Scatter,
 )
 from torch_spyre._C import ElementArrangement
@@ -1409,15 +1410,18 @@ def local_lx_subrange_source(graph, name: str, uses: list[int]) -> bool:
 
 
 def _local_lx_emission_view(op, dep, name):
-    """Use the pointwise division transported to the scheduler at emission.
+    """Use the division transported to the scheduler at emission.
 
-    Scheduler finalization removes iteration_space_ownership. Decode its
-    existing coefficient transport exactly as create_op_spec does; retain all
-    physical-view comparisons and final TensorArg ownership checks below.
+    Scheduler finalization removes iteration_space_ownership from every op,
+    matmul producers included. Decode its existing coefficient transport
+    exactly as create_op_spec does; retain all physical-view comparisons and
+    final TensorArg ownership checks below.
     """
     ownership = getattr(op, "iteration_space_ownership", None)
     if ownership is None:
-        if not isinstance(op.data, Pointwise) or not hasattr(op, "op_it_space_splits"):
+        if not isinstance(op.data, (Pointwise, Reduction)) or not hasattr(
+            op, "op_it_space_splits"
+        ):
             raise ValueError(f"{name}: local LX emission lacks a committed division")
         transported = iteration_space_with_splits(
             op, op_read_writes(op), iteration_space_from_op(op)
