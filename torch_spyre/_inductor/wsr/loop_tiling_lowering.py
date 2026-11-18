@@ -265,7 +265,7 @@ def _tile_step(
     # (``loop_facts._loop_coefficient``, which evaluates it at u = 0, 1, 2); for the
     # ``step * u`` term added here the two agree by construction, and the parity tests
     # check that they agree on real graphs.
-    delta = sympy.simplify(dep.index.subs(symbol, symbol + extent) - dep.index)
+    delta = sympy.simplify(dep.index.xreplace({symbol: symbol + extent}) - dep.index)
     if delta.free_symbols:
         raise Unsupported(
             f"lower_loop_tiling: the index {dep.index} of {dep.name} is not affine in "

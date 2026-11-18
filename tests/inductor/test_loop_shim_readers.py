@@ -104,7 +104,6 @@ def test_cost_features_of_a_shim_op_equal_those_of_its_coarsetileinfo(case):
 # End to end: the same compile with the shim swapped in must not change the kernel
 # ---------------------------------------------------------------------------
 
-from test_span_overflow_loop_terms import _normalised  # noqa: E402
 from test_span_overflow_gate import _relative_error  # noqa: E402
 
 
@@ -143,12 +142,24 @@ def _compile(case, *, swap_in_the_shim):
 
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_swapping_in_the_shim_does_not_change_the_kernel(case):
+    from test_loop_tiling_parity import _assert_same_text, _comparable
+
     with_info, error_info = _compile(case, swap_in_the_shim=False)
     with_shim, error_shim = _compile(case, swap_in_the_shim=True)
-    assert _normalised(with_shim.code) == _normalised(with_info.code)
     assert with_shim.groups == with_info.groups
     assert with_shim.added == with_info.added
-    assert error_shim == error_info < 2e-2
+    # Both compiles use the legacy lowering, which does not give the same text twice
+    # (CP-SAT in the LX planner: a loaded CI runner failed this case with a strict
+    # comparison). A shim that read an advance differently changes every compile.
+    _assert_same_text(
+        lambda: _comparable(_compile(case, swap_in_the_shim=False)[0].code),
+        _comparable(with_info.code),
+        lambda: _comparable(_compile(case, swap_in_the_shim=True)[0].code),
+        _comparable(with_shim.code),
+    )
+    # Each against the fp32 reference; not against each other, which would also
+    # require the two compiles to divide the work the same way.
+    assert error_info < 2e-2 and error_shim < 2e-2
 
 
 @pytest.mark.parametrize("dim", [0, 1])
