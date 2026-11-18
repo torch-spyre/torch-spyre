@@ -29,6 +29,7 @@ from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
 from torch._inductor.virtualized import V
 
 
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
 from torch_spyre.ops import fft as spyre_fft
 from torch_spyre.ops import fft2 as spyre_fft2
@@ -1047,6 +1048,12 @@ def _floordiv_inplace(x, y):
     x = x.clone()
     x //= y
     return x
+
+
+# The host copy of a float16/bfloat16 index of at most 32 elements refuses its
+# staggered layout, whose stick pair is completed by padding; the values on the
+# device are right.
+_ARG_REDUCE_DL16_READBACK = r"requires whole stick pairs"
 
 
 def _attention_fn(q, k, v, scale=True):
@@ -2536,6 +2543,130 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_argmax_of_staggered_input", "test_argmax_of_staggered_input_base"): {
+            # With 8 rows the upcast's stick dim holds them in one stick.
+            "param_sets": {"8_rows": (8,), "128_rows": (128,)},
+        },
+        ("test_to_int_floored", "test_to_int_floored_base"): {
+            "param_sets": {
+                f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
+                for src in (torch.float32, torch.float16, torch.bfloat16)
+                for dst in (torch.int32, torch.int64)
+            },
+        },
+        ("test_arg_reduce", "test_arg_reduce_base"): {
+            "ops_dict": {"argmax": torch.argmax, "argmin": torch.argmin},
+            # (shape, dtype, view, ((dim, keepdim), ...)): the base builds the
+            # input from shape and view, and compares each reduction of it.
+            "param_sets": {
+                **{
+                    f"{_dtype_name(dtype)}_{rows}x{v}": (
+                        (rows, v),
+                        dtype,
+                        "rows",
+                        ((-1, False), (1, True)),
+                    )
+                    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    for rows, v in (
+                        (8, 256),
+                        (8, 768),
+                        # A batch of whole sticks: the index fills them.
+                        (64, 256),
+                        (128, 256),
+                        (64, 32000),
+                        (8, 128256),
+                        (64, 151936),
+                        (8, 262144),
+                        (128, 2048),
+                        (5344, 768),
+                    )
+                },
+                **{
+                    f"{_dtype_name(dtype)}_dim_0{suffix}": (
+                        (rows, 256),
+                        dtype,
+                        "transposed",
+                        ((0, False), (0, True)),
+                    )
+                    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    for rows, suffix in ((8, ""), (64, "_64"))
+                },
+                # A dim 0 longer than 1024, ranked in chunks, with the stick on
+                # the other dim (transposed) and on dim 0 itself (the transpose
+                # taken in the graph). 63 chunks and a tail of 256.
+                **{
+                    f"{_dtype_name(dtype)}_dim_0_long{suffix}": (
+                        (64, 64768),
+                        dtype,
+                        view,
+                        ((0, False), (0, True)),
+                    )
+                    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    for view, suffix in (
+                        ("transposed", ""),
+                        ("transposed_in_graph", "_stick"),
+                    )
+                },
+                "float32_dim_none_1d": (
+                    (8, 768),
+                    torch.float32,
+                    "tied_row",
+                    ((None, False), (None, True)),
+                ),
+                "float32_dim_none_1d_nan": (
+                    (8, 768),
+                    torch.float32,
+                    "nan_row",
+                    ((None, False),),
+                ),
+                "float32_size1_dim": (
+                    (8, 256),
+                    torch.float32,
+                    "first_column",
+                    ((-1, False), (-1, True)),
+                ),
+                "float32_0dim": (
+                    (),
+                    torch.float32,
+                    "scalar",
+                    ((None, False), (0, False)),
+                ),
+                "float32_dim_none_2d": (
+                    (8, 256),
+                    torch.float32,
+                    "rows",
+                    ((None, False),),
+                ),
+            },
+            "expect_raise": {
+                # TODO: flattening the input does not compile today (#5850).
+                "float32_dim_none_2d": r"dim=None of a multi-dim tensor",
+                # TODO(#6685): positive once the host copy restores the layout of
+                # _ARG_REDUCE_DL16_READBACK. With a tail (8x128256), the index of
+                # the 8 rows lies on one stick.
+                **{
+                    f"{dtype}_{case}": _ARG_REDUCE_DL16_READBACK
+                    for dtype in ("float16", "bfloat16")
+                    for case in ("8x256", "8x768", "dim_0", "8x128256")
+                },
+            },
+            "expect_fail": {
+                **{
+                    f"{op}_float32_dim_0_long": (
+                        "the chunk view of the head slice reads columns 32-63 from "
+                        "256 rows too early (#6738)"
+                    )
+                    for op in ("argmax", "argmin")
+                },
+                **{
+                    f"{op}_float32_dim_0_long_stick": (
+                        "the chunk view of the head slice is 63 rows on a dim of "
+                        "1024 chunks, which the work_div hint cannot split (#6738)"
+                    )
+                    for op in ("argmax", "argmin")
+                },
+            },
+        },
         ("test_topk_indices", "test_topk_indices_cpu"): {
             "param_sets": {
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
@@ -2552,19 +2683,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((1, 128), dim=1),
                     4,
                     1,
-                ),
-            },
-            # The cast's fp32 value lacks the second stick of a stick pair, so it
-            # reads memory that was never written: the result is wrong on most runs
-            # and right on some, and a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "2d_batch1_k4_dim1_lt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on most runs"
-                ),
-                "2d_batch1_k4_dim1_gt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on some runs"
                 ),
             },
         },
@@ -12010,21 +12128,113 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with pytest.raises(Exception, match="the indices are held in float16"):
             _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
 
+    @expects_raise
     def test_min_tuple_output_keepdim0(self):
+        # TODO(#6685): positive once the host copy restores a float16 index of at
+        # most 32 elements (_ARG_REDUCE_DL16_READBACK).
         x = unique_randn_along_dim((5, 7), dim=1)
+        with pytest.raises(RuntimeError, match=_ARG_REDUCE_DL16_READBACK):
+            self.compare_with_cpu(
+                lambda x: torch.min(x, dim=1, keepdim=False),
+                x,
+                run_eager=False,
+            )
+
+    def test_to_int_floored_base(self, src, dst):
+        # Integers, and fractions of both signs: floor rounds -0.5 to -1 where a
+        # cast truncates it to 0. Every value is exact in float16 and bfloat16.
+        values = torch.tensor([-3.0, -2.5, -1.0, -0.5, 0.0, 0.5, 1.0, 2.5, 3.0, 1000.0])
+        x = values.repeat(8, 7)[:, :64].contiguous().to(src)
+        # A compiled-graph op with no CPU kernel, so the reference is given.
+        ref = torch.floor(x).to(dst)
         self.compare_with_cpu(
-            lambda x: torch.min(x, dim=1, keepdim=False),
+            lambda t: torch.ops.spyre.to_int_floored(t, dst),
             x,
+            atol=0,
+            rtol=0,
+            run_eager=False,
+            cpu_eager_result=ref,
+            cpu_compile_result=ref,
+        )
+
+    def test_argmax_of_staggered_input_base(self, rows):
+        # A float32 upcast of a float16 input is staggered on the device; the
+        # topk reads it through an element-arrangement shuffle.
+        x = cached_randn((rows, 256))
+        self.compare_with_cpu(
+            lambda t: torch.argmax(t.float(), dim=-1),
+            x,
+            atol=0,
+            rtol=0,
             run_eager=False,
         )
 
+    def test_arg_reduce_base(self, op, shape, dtype, view, reductions):
+        # The rows hold the cases argmax must break like PyTorch, where the
+        # lowest index wins a tie and a NaN of either sign wins over any number:
+        # row 0 ties its max at three columns, row 1 ties +inf, row 2 holds two
+        # NaN and a +inf, row 3 is all -inf, row 4 all equal, row 5 holds one NaN
+        # with the sign bit set, and row 6 a negative NaN before a positive one;
+        # the rest are random. The device topk ranks a negative NaN last in
+        # float32; float16/bfloat16 rank every NaN first, lowest index first.
+        # view takes them as they are, down dim 0 ("transposed", or
+        # "transposed_in_graph" with the transpose taken in the compiled graph),
+        # row 0 or row 2 alone, or only their first column; "scalar" is a 0-dim
+        # input.
+        if view == "scalar":
+            x = torch.tensor(2.5)
+        else:
+            rows, v = shape
+            x = torch.randn(shape, generator=torch.Generator().manual_seed(rows * v))
+            x[0, [3, v // 2, v - 1]] = 9.0
+            x[1, [5, 9]] = float("inf")
+            x[2, [v - 1, 11]] = float("nan")
+            x[2, 4] = float("inf")
+            x[3] = float("-inf")
+            x[4] = 1.0
+            x[5, 13] = -float("nan")
+            x[6, [7, v - 2]] = torch.tensor([-float("nan"), float("nan")])
+            if view == "transposed":
+                x = x.T.contiguous()
+            elif view == "tied_row":
+                x = x[0]
+            elif view == "nan_row":
+                x = x[2]
+            elif view == "first_column":
+                x = x[:, :1].contiguous()
+        # Indices are exact, so compare them exactly. The CPU reference reads the
+        # card-rounded input, as float16 and bfloat16 round to DLFloat16 on the
+        # device and make more ties.
+        x = x.to(dtype).to("spyre").cpu()
+
+        def fn(t):
+            if view == "transposed_in_graph":
+                t = t.T
+            return tuple(op(t, dim=dim, keepdim=keepdim) for dim, keepdim in reductions)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    @expects_raise
+    def test_argmax_of_too_long_dim_rejected(self):
+        # TODO: positive once a dim longer than 2**24 elements is ranked with an
+        # exact index (a second level of chunks, or an int32 index).
+        x = torch.zeros(1, (1 << 24) + 1)
+        # The decomposition refuses it, so the error surfaces from the backend
+        # compile rather than from a lowering.
+        with pytest.raises(BackendCompilerFailed, match=r"at most 16777216 have an"):
+            self.compare_with_cpu(lambda t: torch.argmax(t, dim=-1), x, run_eager=False)
+
+    @expects_raise
     def test_argmin_keepdim0(self):
+        # TODO(#6685): positive once the host copy restores a float16 index of at
+        # most 32 elements (_ARG_REDUCE_DL16_READBACK).
         x = unique_randn_along_dim((5, 7), dim=1)
-        self.compare_with_cpu(
-            lambda x: torch.argmin(x, dim=1, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match=_ARG_REDUCE_DL16_READBACK):
+            self.compare_with_cpu(
+                lambda x: torch.argmin(x, dim=1, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
     @expects_raise
     def test_count_nonzero_float_dim0_rejected(self):

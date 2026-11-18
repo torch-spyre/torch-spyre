@@ -35,6 +35,10 @@ from utils_inductor import expects_raise
 
 F = torch.nn.functional
 
+# Subtests whose float16 argmax index, of at most 32 elements, the host copy
+# refuses: its stick pair is completed by padding.
+_READBACK_REFUSED = {("merge (1,32,20,20) (dense)", "argmax")}
+
 # A dense relocation measured at most 2x the input on these shapes; the sparse
 # layout measured 64x and more. 8x separates the two with room on either side.
 DENSE_MAX_MEMORY_RATIO = 8.0
@@ -230,6 +234,18 @@ class TestStickRelocation(unittest.TestCase):
                 with self.subTest(f"{read_name} {kind}"):
                     whole = _reduce_after(view, kind)
                     torch.compiler.reset()
+                    if (read_name, kind) in _READBACK_REFUSED:
+                        # TODO(#6685): check the index once the host copy restores a
+                        # float16 index of at most 32 elements, whose stick pair
+                        # is completed by padding.
+                        with (
+                            inductor_config.patch(force_disable_caches=True),
+                            pytest.raises(
+                                RuntimeError, match=r"requires whole stick pairs"
+                            ),
+                        ):
+                            torch.compile(whole, dynamic=False)(x.to("spyre")).cpu()
+                        continue
                     with inductor_config.patch(force_disable_caches=True):
                         out = torch.compile(whole, dynamic=False)(x.to("spyre")).cpu()
                     torch.spyre.synchronize()
