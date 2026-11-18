@@ -762,7 +762,8 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
 // Peer-to-peer (RDMA) copies: flex reports RDMA singlecast/multicast data CBs
 // as MEMCPY2 records. Same slice and args as a host memcpy, plus the source
 // and destination ranks. A multicast has no single destination, so flex sets
-// dst_device_id to UINT32_MAX; that is emitted as "" rather than a fake rank.
+// dst_device_index to UINT32_MAX; that is emitted as "" rather than a fake
+// rank.
 // The record has no timestamps_estimated flag, so no timestamp_source arg.
 void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
     const AIUpti_ActivityMemcpyPtoP* activity,
@@ -778,7 +779,7 @@ void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
   memcpy_activity->startTime = activity->start;
   memcpy_activity->endTime = activity->end;
   memcpy_activity->id = activity->correlation_id;
-  memcpy_activity->device = activity->device_id;
+  memcpy_activity->device = activity->device_index;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
   memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -797,13 +798,13 @@ void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
   memcpy_activity->addMetadata("stream", activity->stream_id);
-  memcpy_activity->addMetadata("src_device", activity->src_device_id);
+  memcpy_activity->addMetadata("src_device", activity->src_device_index);
   memcpy_activity->addMetadataQuoted("src_context",
                                      std::to_string(activity->src_context_id));
-  if (activity->dst_device_id == UINT32_MAX) {
+  if (activity->dst_device_index == UINT32_MAX) {
     memcpy_activity->addMetadataQuoted("dst_device", "");
   } else {
-    memcpy_activity->addMetadata("dst_device", activity->dst_device_id);
+    memcpy_activity->addMetadata("dst_device", activity->dst_device_index);
   }
   memcpy_activity->addMetadataQuoted("dst_context",
                                      std::to_string(activity->dst_context_id));
