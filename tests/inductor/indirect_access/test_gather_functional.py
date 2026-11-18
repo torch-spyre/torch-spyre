@@ -14,29 +14,28 @@
 
 """2D–4D gather shapes, diverse (M,N) sizes, all index access patterns (ascending/descending/strided/hotspot/random/repeated/2D), and PyTorch gather API correctness."""
 
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import cached_randn
+from conftest import _xfail_existing, compare_mode, rejection
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
 
-_INDEX_2D_EAGER = (
+_INDEX_2D_EAGER = rejection(
     6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_GATHER_EAGER = (
+_GATHER_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
 )
-_REMAINDER_EAGER = (
+_REMAINDER_EAGER = rejection(
     4416,
     "aten::remainder.Tensor_out is not registered on Spyre.",
     r"Could not run 'aten::remainder.Tensor_out'",
@@ -46,22 +45,22 @@ _DXP_STANDALONE_FAIL = (
     "compile gather dxp_standalone returned non-zero exit status 1.",
     r"SubprocException",
 )
-_RESTICKIFY_3ARGS = (
+_RESTICKIFY_3ARGS = rejection(
     4327,
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
-_INCOMPATIBLE_HOST_SIZE = (
+_INCOMPATIBLE_HOST_SIZE = rejection(
     3732,
     "compile flat take_along_dim: Pointwise no mechanism to resolve stick incompatibility.",
     r"no mechanism to resolve stick incompatibility",
 )
-_REMAINDER_COMPILED = (
+_REMAINDER_COMPILED = rejection(
     4416,
     "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
     r"unimplemented operation remainder",
 )
-_MULTIPLE_INDIRECT_SYMBOLS = (
+_MULTIPLE_INDIRECT_SYMBOLS = rejection(
     4471,
     "Unsupported: multiple indirect symbols in arg.",
     r"multiple indirect symbols",

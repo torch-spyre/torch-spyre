@@ -14,19 +14,23 @@
 
 """LLM inference serving patterns: MoE expert routing (random and topk-based), paged KV cache (pool shapes, 2D slot index, block table), vLLM serving scenarios, FMS 4D/5D layouts, multi-layer transformer KV gather, and real model shapes (Granite/Llama/Mistral)."""
 
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import DEVICE, cached_randn
+from conftest import (
+    _xfail_existing,
+    compare_mode,
+    expect_dynamic_true_refused,
+    rejection,
+)
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
 
-_INDEX_2D_EAGER = (
+_INDEX_2D_EAGER = rejection(
     6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
@@ -36,27 +40,22 @@ _FP16_TO_FP32_EAGER = (
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_POINTWISE_NO_LAYOUT = (
+_POINTWISE_NO_LAYOUT = rejection(
     4713,
     "compile topk-2 routing (4 rows): topk indices flatten -> int64 -> gather: aten.clamp.default has no supported output layout for any candidate input layout.",
     r"aten\.clamp\.default\): no supported output layout found",
 )
-_SYMBOLIC_INT_CONV = (
-    4304,
-    "compile(dynamic=True): Cannot convert symbols to int.",
-    r"Cannot convert symbols to int",
-)
-_GATHER_OUT_EAGER = (
+_GATHER_OUT_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
 )
-_RESTICKIFY_3ARGS = (
+_RESTICKIFY_3ARGS = rejection(
     4327,
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
-_CAST_STAGGERED_READ = (
+_CAST_STAGGERED_READ = rejection(
     5856,
     "Eager topk of an fp16 tensor cast to fp32 on device: the fp16 to fp32 copy_from_d2d of a small tensor raises 'staggered read with no unique num-sticks dim'.",
     r"staggered read with no unique num-sticks dim",
@@ -71,12 +70,12 @@ _TOPK_CAST_COMPILED = (
     "Compiled topk of an fp16 tensor cast to fp32 on device: the cast gives wrong values, so topk picks different ids than on CPU and the gathered rows mismatch CPU.",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_WEIGHTED_NO_LAYOUT = (
+_WEIGHTED_NO_LAYOUT = rejection(
     6390,
     "compile gather followed by a broadcast multiply by a size-1-last-dim tensor: Multi-arg pointwise has no supported output layout.",
     r"Multi-arg pointwise \(buf\d+\): no supported output layout found",
 )
-_TOPK_K_PER_CORE = (
+_TOPK_K_PER_CORE = rejection(
     4716,
     "topk(k=16): no divisor within 1 cores gives k_per_core <= 4.",
     r"no divisor within 1 cores gives k_per_core",
@@ -86,12 +85,12 @@ _GATHER_EXPANDED_MISMATCH = (
     "compile gather along dim>=1 with expanded index produces numerical mismatch vs CPU.",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_INDEX_PUT_IMPL_EAGER = (
+_INDEX_PUT_IMPL_EAGER = rejection(
     692,
     "aten::_index_put_impl_ is not registered on Spyre.",
     r"Could not run 'aten::_index_put_impl_'",
 )
-_INDEX_PUT_NO_LAYOUT = (
+_INDEX_PUT_NO_LAYOUT = rejection(
     4636,
     "compile index_put: no supported output layout for aten.index_put.default.",
     r"aten\.index_put\.default\): no supported output layout found",
@@ -154,8 +153,8 @@ class TestGatherInferencePatternsEagerCompile:
             w1,
             w2,
             ids,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -253,16 +252,13 @@ class TestGatherInferencePatternsEagerCompile:
             k,
             v,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
+    @expect_dynamic_true_refused
     def test_paged_kv_dynamic_seqlen(self, execution_mode):
         """Dynamic Lk; compile once, run at Lk=32 and Lk=64."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing(
-            execution_mode, eager=_SYMBOLIC_INT_CONV, compiled=_SYMBOLIC_INT_CONV
-        )
         kv = cached_randn((512, 8, 64), differentiation="gpa22", dtype=torch.float16)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for lk in (32, 64):
@@ -282,8 +278,8 @@ class TestGatherInferencePatternsEagerCompile:
             lambda x, i: torch.unbind(x[i], dim=1),
             kv,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_paged_kv_sentinel_boundary(self, execution_mode):
@@ -314,9 +310,7 @@ class TestGatherInferencePatternsEagerCompile:
         def fn(cache, key, pos):
             return cache.index_copy(2, pos, key[:, :, :11, :])
 
-        compare_mode(
-            execution_mode, fn, cache, key, pos, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, cache, key, pos, atol=0, rtol=0)
 
     def test_vllm_logit_extraction(self, execution_mode):
         """Decode-step per-request last-token gather: logits[b, last_pos[b], :] via torch.gather."""
@@ -376,8 +370,8 @@ class TestGatherInferencePatternsEagerCompile:
             emb,
             slot_idx,
             tok_idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_vllm_mistral_small_24b(self, execution_mode):
@@ -516,9 +510,7 @@ class TestGatherInferencePatternsEagerCompile:
             )
             return expert_w[ids]
 
-        compare_mode(
-            execution_mode, fn, expert_w, logits, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, expert_w, logits, atol=0, rtol=0)
 
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
@@ -631,8 +623,8 @@ class TestGatherInferencePatternsEagerCompile:
                 k,
                 v,
                 slot_idxs,
-                atol=_ATOL_F16,
-                rtol=_ATOL_F16,
+                atol=0,
+                rtol=0,
             )
 
     def test_multi_layer_growing_decode_history(self, execution_mode):

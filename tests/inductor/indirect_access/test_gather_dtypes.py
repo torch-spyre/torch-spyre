@@ -15,27 +15,25 @@
 """Value dtype coverage (float16/bfloat16/float32/int32/int64/bool), index dtype variants (int32/int64), int64 auto-downcast warning, downstream dtype fusion, and SDSC wordLength validation."""
 
 import os
-import sys
 import warnings
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import cached_randn
+from conftest import _xfail_existing, compare_mode, rejection
 
-_INT32_TO_INT64_CONV = (
+_INT32_TO_INT64_CONV = rejection(
     4332,
     "Eager Spyre aten::index.Tensor does not support bool source tensors.",
     r"does not support bool source tensors",
 )
-_BOOL_OPERANDS = (
+_BOOL_OPERANDS = rejection(
     4332,
     "torch.bool result from operands with device format(s) {SEN169_FP16, IEEE_INT32}.",
     r"torch\.bool result from operands with device format",
 )
-_DOUBLE_UNSUPPORTED = (
+_DOUBLE_UNSUPPORTED = rejection(
     1228,
     "Spyre backend does not support dtype Double.",
     r"does not support dtype Double",

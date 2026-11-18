@@ -15,29 +15,32 @@
 """GATHER_OP_SPEC emission, compiler pass ordering, stick-aligned and non-aligned memory layouts, dynamic shape specialization (M/P/D), SENCORES 1/4/32, LX budget control, and index computation inside the compiled graph."""
 
 import os
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import DEVICE, cached_randn
+from conftest import (
+    _xfail_existing,
+    compare_mode,
+    expect_dynamic_true_refused,
+    rejection,
+)
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
+# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
 _ATOL_BF16 = 2e-2
 
-_SYMBOLIC_INT_CONV = (
-    4304,
-    "compile(dynamic=True): Cannot convert symbols to int.",
-    r"Cannot convert symbols to int",
-)
 _DXP_STANDALONE_FAIL = (
     4321,
     "compile gather dxp_standalone returned non-zero exit status 1.",
     r"SubprocException",
 )
-_RESTICKIFY_3ARGS = (
+_RESTICKIFY_3ARGS = rejection(
     4327,
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
@@ -79,8 +82,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             x,
             y,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_reshape_before_gather(self):
@@ -92,14 +95,13 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: x.reshape(64, 128)[i],
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
+    @expect_dynamic_true_refused
     def test_symbolic_args_encoding(self):
         """BUNDLE_SYMBOLIC_ARGS encoding in SDSC; dynamic idx shape."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         x = cached_randn((64, 128), differentiation="gcp08", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -149,10 +151,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
 
     # ------------------------------------------------------------------
 
+    @expect_dynamic_true_refused
     def test_dynamic_source_size(self):
         """Dynamic M (source rows); compiled once, different M at runtime."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for M in (32, 64):
             x = cached_randn(
@@ -162,10 +163,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_index_size(self):
         """Dynamic P (index length); compiled once, P=16 and P=32."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         x = cached_randn((64, 128), differentiation="dyn02", dtype=torch.float16)
         for P in (16, 32):
@@ -173,10 +173,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_inner_dim(self):
         """Dynamic D (inner dim); D=64 and D=128 in same session."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         for D in (64, 128):
@@ -184,20 +183,18 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_symbolic_gather_dim0(self):
         """Symbolic shape at gather dim=0; GATHER_OP_SPEC generated."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         x = cached_randn((64, 64), differentiation="dyn05", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
         torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_symbolic_batch_seqlen(self):
         """Dynamic batch × seqlen; slot_idxs (B*Lk) varies."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         kv = cached_randn((512, 8, 64), differentiation="dyn06", dtype=torch.float16)
         for B_Lk in (32, 64):
@@ -205,10 +202,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(kv.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, kv[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_3d_source(self):
         """Dynamic 3D source (M, H, D); gather at dim=0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for M in (32, 64):
             x = cached_randn(
@@ -218,10 +214,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_with_downstream(self):
         """Dynamic shape + downstream fused op (tanh)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: torch.tanh(x[i]), dynamic=True)
         x = cached_randn((64, 128), differentiation="dyn08", dtype=torch.float16)
         for P in (16, 32):
@@ -230,10 +225,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             expected = torch.tanh(x[idx])
             torch.testing.assert_close(result, expected, atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_bfloat16(self):
         """Dynamic shape with bfloat16; SDSC wordLength=2."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for P in (16, 32):
             x = cached_randn(
@@ -243,10 +237,9 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, x[idx], atol=_ATOL_BF16, rtol=_ATOL_BF16)
 
+    @expect_dynamic_true_refused
     def test_dynamic_vocab_size(self):
         """Dynamic vocab size; embedding-like lookup with varying M."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for V in (256, 512):
             w = cached_randn(
@@ -256,13 +249,12 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             result = fn(w.to(DEVICE), idx.to(DEVICE)).cpu()
             torch.testing.assert_close(result, w[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
 
+    @expect_dynamic_true_refused
     def test_take_dynamic_true(self):
-        """torch.take compile(dynamic=True) — Cannot convert symbols to int (#4304).
+        """torch.take compile(dynamic=True) is refused (#5578).
 
         Existing dynamic tests are x[i] gather. This extra is take's reshape(-1)[index] path.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing("compiled", compiled=_SYMBOLIC_INT_CONV)
         inp = torch.arange(64, dtype=torch.float16) / 7.0 - 1.5
         idx = torch.tensor([0, 16, 32, 63], dtype=torch.int64)
         fn = torch.compile(torch.take, dynamic=True)
@@ -292,8 +284,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: torch.relu(x[i]),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_lxd_lx_overlap(self):
@@ -314,9 +306,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         """LX_PLANNING=1 works correctly for non-gather ops."""
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((64, 128), differentiation="lxd08", dtype=torch.float16)
-        compare_mode(
-            "compiled", lambda x: torch.relu(x), x, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode("compiled", lambda x: torch.relu(x), x, atol=0, rtol=0)
 
     def test_lxd_large_tensor_lx(self):
         """Large tensor with LX_PLANNING; allocation pressure test."""
@@ -342,24 +332,12 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             "compiled",
             lambda x: x[torch.arange(seqlen, dtype=torch.int64)],
             x,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
-    @pytest.mark.skip(
-        reason="Compiled topk indices used to gather table rows give an unstable result: \
-        the second row is wrong (both output rows are table[0], see issue #4713), the same \
-        run can return the correct rows, and some runs raise ComputeHardwareError 0x9b01, \
-        after which StreamInErrorState poisons the session. A strict xfail cannot hold. \
-        See issue #4713."
-    )
     def test_topk_index_inside_graph(self):
-        """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC.
-
-        The gather alone is correct (ids computed on the host match CPU at 1 and 32
-        cores); with topk in the same graph the outcome varies run to run.
-        """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
+        """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC."""
         expert_w = cached_randn(
             (8, 64, 32), differentiation="ing02", dtype=torch.float16
         )
@@ -371,8 +349,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             ],
             expert_w,
             logits,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_nonzero_index_inside_graph(self):
@@ -402,8 +380,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, s: x[torch.argmax(s).unsqueeze(0).to(torch.int64)],
             x,
             scores,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_two_different_indices_same_source(self):
@@ -417,8 +395,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             x,
             idx1,
             idx2,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_two_different_sources_different_indices(self):
@@ -434,8 +412,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             y,
             idx_x,
             idx_y,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------

@@ -51,20 +51,26 @@ Known xfail markers
 -------------------
 _INDEX_EAGER : issue #1219 — aten::index.Tensor_out not registered on Spyre
                eager (and int32 type-conversion that precedes it).
-_SYMBOLIC_INT_CONV : issue #4304 — dynamic=True / symbolic size Cannot convert
-               symbols to int.
 """
 
 import math
-import sys
-import os
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn, compare_with_cpu  # noqa: E402
-from conftest import _xfail_existing, compare_mode, dl16_snap  # noqa: E402
+from utils_inductor import (
+    DEVICE,
+    cached_randint,
+    cached_randn,
+    compare_with_cpu,
+)
+from conftest import (
+    _xfail_existing,
+    compare_mode,
+    dl16_snap,
+    expect_dynamic_true_refused,
+    rejection,
+)
 
 try:
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
@@ -75,7 +81,16 @@ except ImportError:
 
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
+# bit fewer than fp16), so the error grows with the number of rows and depends on
+# which rows are drawn.  Measured over 1500 random index draws against an fp32
+# reference: worst 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps ~25%
+# above that worst case and stays 10x below an error of one whole row (~1).
+_ATOL_F16_SUM = 3e-2
 
 # ---------------------------------------------------------------------------
 # Module-level xfail issue markers
@@ -83,7 +98,7 @@ _ATOL_F16 = 1e-2
 
 # aten::index.Tensor_out is not registered on Spyre eager.  Also covers the
 # int32→int64 type-conversion InductorError which fires before the gather op.
-_INDEX_EAGER = (
+_INDEX_EAGER = rejection(
     1219,
     "aten::index.Tensor_out is not registered on Spyre.",
     r"Could not run 'aten::index\.Tensor_out'",
@@ -94,12 +109,6 @@ _FP16_TO_FP32_EAGER = (
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
-# torch.compile(dynamic=True): Cannot convert symbols to int during codegen.
-_SYMBOLIC_INT_CONV = (
-    4304,
-    "compile(dynamic=True): Cannot convert symbols to int.",
-    r"Cannot convert symbols to int",
-)
 
 _requires_stl = pytest.mark.skipif(
     not _HAS_STL, reason="SpyreTensorLayout C extension not available"
@@ -272,21 +281,23 @@ class TestGatherImplicitLayout:
             lambda x, i: x[i] / 8.0,
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_2d_with_sum_reduction(self, execution_mode):
         """(24,192) gather + sum(dim=1) reduction; shape collapses to (12,)."""
         x = cached_randn((24, 192), differentiation="gstl07", dtype=torch.float16)
-        idx = torch.randint(0, 24, (12,), dtype=torch.int64)
+        idx = cached_randint(
+            (12,), differentiation="gstl07i", low=0, high=24, dtype=torch.int64
+        )
         compare_mode(
             execution_mode,
             lambda x, i: x[i].sum(dim=1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_ATOL_F16_SUM,
+            rtol=_ATOL_F16_SUM,
         )
 
     def test_interior_dim_no_stl_needed(self, execution_mode):
@@ -325,15 +336,13 @@ class TestGatherImplicitLayout:
         _pnd.name_tensor_dims(idx, ["P"])
         compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
+    @expect_dynamic_true_refused
     def test_dynamic_compile(self, execution_mode):
         """torch.compile(dynamic=True); three runtime index sizes.
 
-        Fails in all modes with 'Cannot convert symbols to int' (issue #4304).
+        Refused in all modes: torch.compile(dynamic=True) is not supported on
+        Spyre (#5578); declare the varying dimension with ``.to("spyre", dynamic=...)``.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4304
-        _xfail_existing(
-            execution_mode, eager=_SYMBOLIC_INT_CONV, compiled=_SYMBOLIC_INT_CONV
-        )
         x = cached_randn((40, 128), differentiation="gstl11", dtype=torch.float16)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         for p in (8, 16, 24):

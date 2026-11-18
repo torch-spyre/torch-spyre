@@ -15,17 +15,27 @@
 """Fused downstream operations after gather: unary (neg/sigmoid/relu/tanh/exp/log/sqrt/cos), scalar arithmetic, reductions (mean/sum), named tensor dimensions, and multi-core SENCORES variants."""
 
 import os
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import DEVICE, cached_randint, cached_randn
+from conftest import _xfail_existing, compare_mode
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
+# bit fewer than fp16), so the error grows with the number of rows and depends on
+# which rows are drawn.  Measured over 1500 random index draws against an fp32
+# reference: worst 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps ~25%
+# above that worst case and stays 10x below an error of one whole row (~1).
+_ATOL_F16_SUM = 3e-2
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
+# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
 _ATOL_BF16 = 2e-2
+# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
 _ATOL_F32 = 1e-5
 
 _NUMERICAL_MISMATCH = (
@@ -149,8 +159,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: x[i] / 8.0,
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_mean_reduction(self, execution_mode):
@@ -167,16 +177,22 @@ class TestGatherFusedDownstreamOperations:
         )
 
     def test_gather_sum_dim0(self, execution_mode):
-        """sum(dim=0) after gather; output shape (128,)."""
+        """sum(dim=0) after gather; output shape (128,).
+
+        Index is seeded: the device accumulates 16 fp16 rows in dl16, and the error
+        depends on which rows are drawn (see _ATOL_F16_SUM).
+        """
         x = cached_randn((32, 128), differentiation="gds10", dtype=torch.float16)
-        idx = torch.randint(0, 32, (16,), dtype=torch.int64)
+        idx = cached_randint(
+            (16,), differentiation="gds10i", low=0, high=32, dtype=torch.int64
+        )
         compare_mode(
             execution_mode,
             lambda x, i: x[i].sum(dim=0),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_ATOL_F16_SUM,
+            rtol=_ATOL_F16_SUM,
         )
 
     def test_gather_cos_cpu_fallback(self, execution_mode):
@@ -248,8 +264,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: x[i] * 2.0,
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------

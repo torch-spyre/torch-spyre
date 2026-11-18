@@ -28,15 +28,15 @@ Eager is never collected as [1-eager] / [32-eager]. Request patch_sencores
 only when the compiled dest can split across cores.
 """
 
+import functools
 import os
 import regex as re
-import sys
 
 import pytest
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import compare_with_cpu, strict_xfail  # noqa: E402
+from utils_inductor import compare_with_cpu, expects_raise, strict_xfail
 
 try:
     from torch_spyre._inductor import config as _spyre_config
@@ -146,6 +146,36 @@ def pytest_runtest_makereport(item, call):
     """
     outcome = yield
     rep = outcome.get_result()
+    reject = getattr(item, "_reject_match", None)
+    if (
+        call.when == "call"
+        and reject is not None
+        and rep.outcome != "skipped"
+        and not (call.excinfo and call.excinfo.errisinstance(pytest.skip.Exception))
+    ):
+        if call.excinfo is None:
+            rep.outcome = "failed"
+            rep.longrepr = (
+                "Strict rejection: the test no longer raises.\n"
+                f"  documented rejection: {item._reject_reason}\n"
+                f"  expected message to match: {reject!r}\n"
+                "  The gap looks fixed: turn this into a positive test and remove "
+                "the rejection."
+            )
+        else:
+            message = str(call.excinfo.value)
+            if re.search(reject, message, re.DOTALL):
+                rep.outcome = "passed"
+                rep.longrepr = None
+            else:
+                rep.outcome = "failed"
+                rep.longrepr = (
+                    "Strict rejection: the test raised, but not the error its "
+                    f"reason documents.\n  expected message to match: {reject!r}\n"
+                    f"  documented rejection: {item._reject_reason}\n"
+                    f"  actual: {type(call.excinfo.value).__name__}: {message[:600]}"
+                )
+        return
     pattern = getattr(item, "_xfail_match", None)
     if (
         call.when != "call"
@@ -167,6 +197,25 @@ def pytest_runtest_makereport(item, call):
     )
 
 
+class _Rejection(tuple):
+    """An (issue, reason, match) spec for a stable rejection, not a bug.
+
+    AGENTS.md: a missing feature that fails with a stable error (``Could not run
+    'aten::X'``, ``Unsupported``, a layout rejection) is an assertion, not an
+    xfail. ``xfail_existing`` registers a ``_Rejection`` spec as one: the test
+    passes only if the body raises an error whose message matches, and fails if it
+    no longer raises (the gap is fixed: make the test positive) or raises
+    something else. Wrong values and dbo-opt crashes stay plain strict xfails.
+    """
+
+    __slots__ = ()
+
+
+def rejection(issue, reason, match):
+    """Build the spec of a stable rejection; see ``_Rejection``."""
+    return _Rejection((issue, reason, match))
+
+
 def xfail_existing(
     execution_mode,
     *,
@@ -184,6 +233,9 @@ def xfail_existing(
     match the exception message; a different failure of an allowed type is
     reported as FAILED (see pytest_runtest_makereport above), and a pass is a
     strict XPASS failure.
+
+    A spec built with ``rejection(...)`` is asserted instead: it passes when the
+    body raises a matching error and fails when it does not raise.
     """
     global _current_request
     if execution_mode == "eager":
@@ -203,6 +255,10 @@ def xfail_existing(
             else (f"({issue})" if issue else "")
         )
         reason_msg = f"{reason} {issue_str}".strip()
+        if isinstance(spec, _Rejection):
+            _current_request.node._reject_match = match
+            _current_request.node._reject_reason = reason_msg
+            return
         _current_request.node._xfail_match = match
         _current_request.node._xfail_reason = reason_msg
         strict_xfail(
@@ -213,6 +269,30 @@ def xfail_existing(
 
 
 _xfail_existing = xfail_existing
+
+# torch.compile(dynamic=True) is refused on Spyre (#5578, _refuse_dynamic_true in
+# torch_spyre/_inductor/patches.py), before any lowering runs.
+_DYNAMIC_TRUE_REFUSAL = r"does not support: torch\.compile\(dynamic=True\)"
+
+
+def expect_dynamic_true_refused(test):
+    """Assert that a test which compiles with ``dynamic=True`` is refused.
+
+    The refusal is deliberate, so it is an assertion and not an xfail (AGENTS.md,
+    "Say exactly what is expected"). The body stays the positive test it would be
+    if the refusal were lifted: the first compile must raise
+    ``BackendCompilerFailed`` with the refusal text, and a different error, or no
+    error, fails the test. The supported route for a varying dimension is
+    ``x.to("spyre", dynamic={dim: dict(min=..., max=...)})`` with the default
+    ``dynamic=None``.
+    """
+
+    @functools.wraps(test)
+    def refused(*args, **kwargs):
+        with pytest.raises(BackendCompilerFailed, match=_DYNAMIC_TRUE_REFUSAL):
+            test(*args, **kwargs)
+
+    return expects_raise(refused)
 
 
 _DL16_MAX = 65472.0  # 1023/1024 * 2**16, largest finite dl16 value

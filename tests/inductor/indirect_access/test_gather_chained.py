@@ -14,42 +14,43 @@
 
 """Sequential and composed gather chains: gather→gather, gather→matmul, RoPE cos/sin lookup, K/V split, chunked prefill, RoPE interleaved (GPT-J/NeoX), and end-to-end prefill/decode/beam/speculative pipelines."""
 
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import cached_randn
+from conftest import _xfail_existing, compare_mode, rejection
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
+# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
 _ATOL_BF16 = 2e-2
 
 
-_GATHER_EAGER = (
+_GATHER_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
 )
-_SCATTER_ADD_EAGER = (
+_SCATTER_ADD_EAGER = rejection(
     4396,
     "aten::scatter_add.out is not registered on Spyre.",
     r"Could not run 'aten::scatter_add.out'",
 )
-_SLICE_OFFSET_ALIGNMENT = (
+_SLICE_OFFSET_ALIGNMENT = rejection(
     5383,
     "compile copy_from_d2d of a sliced view requires a stick-aligned storage_offset.",
     r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
 )
-_POINTWISE_NO_LAYOUT = (
+_POINTWISE_NO_LAYOUT = rejection(
     6388,
     "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
     r"Multi-arg pointwise .*no supported output layout found",
 )
-_RESTICKIFY_3ARGS = (
+_RESTICKIFY_3ARGS = rejection(
     4327,
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
@@ -59,7 +60,7 @@ _MATMUL_MISMATCH = (
     "compile gather followed by matmul / linear numerical mismatch.",
     r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_LN_MIXED_EA = (
+_LN_MIXED_EA = rejection(
     4714,
     "compile LayerNorm after gather: multi-arg pointwise with mixed EA.",
     r"Multi-arg pointwise with mixed EA",
@@ -74,7 +75,7 @@ _SCATTER_STICK = (
     "compile gather followed by scatter_add produces numerical mismatch vs CPU.",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_CHUNK_REDUCE_MUTATION = (
+_CHUNK_REDUCE_MUTATION = rejection(
     4754,
     "compile chunk reduce: no offset-free alternative stick dim for mutation target.",
     r"no offset-free alternative stick dim for mutation target",
@@ -184,8 +185,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda cs, p: torch.chunk(cs[p], 2, dim=-1),
             cos_sin,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_two_tables_add(self, execution_mode):
@@ -241,8 +242,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda cs, p: torch.chunk(cs[p], 2, dim=-1),
             cos_sin,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_split_gather_qkv(self, execution_mode):
@@ -273,8 +274,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda f, p: f[p].unsqueeze(1),
             freqs,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_concat(self, execution_mode):
@@ -290,8 +291,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             k2,
             i1,
             i2,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_chunk_then_reduce(self, execution_mode):
@@ -348,8 +349,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda x, i: torch.stack(torch.unbind(x[i], dim=1), dim=0),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_chunk_gather_parallel_k_v(self, execution_mode):
@@ -363,8 +364,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             k,
             v,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_reshape_chunk(self, execution_mode):
@@ -376,8 +377,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda e, i: torch.chunk(e[i].reshape(32, 8, 64), 2, dim=1),
             emb,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_split_apply_merge(self, execution_mode):
@@ -391,8 +392,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             ),
             emb,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------
@@ -410,8 +411,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             kv,
             tok_id,
             slot,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_decode_single_step(self, execution_mode):
@@ -431,8 +432,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             kv_v,
             tok,
             slots,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_e2e_prefill_kv_fill(self, execution_mode):
@@ -524,8 +525,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             kv,
             tok,
             slots,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=0,
+            rtol=0,
         )
 
     # ------------------------------------------------------------------

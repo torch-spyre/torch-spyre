@@ -20,46 +20,51 @@ request patch_sencores (eager once at default config; compiled at 1 and chip-max
 Small dests stay eager + compiled at default config. Eager is never a SENCORES variant.
 """
 
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import DEVICE, cached_randn
+from conftest import (
+    _xfail_existing,
+    compare_mode,
+    expect_dynamic_true_refused,
+    rejection,
+)
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
 _ATOL_F32 = 1e-5
 
 
-_MASKED_FILL_FP32 = (
+_MASKED_FILL_FP32 = rejection(
     4714,
     "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA that is refused as Multi-arg pointwise with mixed EA.",
     r"Multi-arg pointwise with mixed EA",
 )
-_IR_OUT = (
+_IR_OUT = rejection(
     4634,
     "aten::index_reduce.out is not registered on Spyre.",
     r"Could not run 'aten::index_reduce.out'",
 )
-_IR_MEAN_CONST = (
+_IR_MEAN_CONST = rejection(
     4472,
     "compile index_reduce_ mean stores a rank-0 Constant.",
-    r"store value of unexpected type Constant|rank-0 Constant|Constant",
+    r"store value of unexpected type <class '[\w.]*Constant'>",
 )
-_PUT_EAGER = (
+_PUT_EAGER = rejection(
     4540,
     "aten::put_ is not registered on Spyre.",
     r"Could not run 'aten::put_'",
 )
-_PUT_COMPILED = (
+_PUT_COMPILED = rejection(
     4636,
     "compile put_: no supported output layout for aten.index_put.default.",
     r"aten\.index_put\.default\): no supported output layout found",
 )
-_SR_TWO = (
+_SR_TWO = rejection(
     4361,
     "aten::scatter_reduce.two_out is not registered on Spyre.",
     r"Could not run 'aten::scatter_reduce.two_out'",
@@ -186,15 +191,15 @@ class TestIndexFillEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4414,
                 "aten::index_fill_.int_Scalar is not registered on Spyre.",
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
-            compiled=(
+            compiled=rejection(
                 4472,
                 "compile index_fill_ stores a rank-0 Constant.",
-                r"Constant",
+                r"store value of unexpected type <class '[\w.]*Constant'>",
             ),
         )
         x = cached_randn((4, 16), differentiation="ifill_f16_01", dtype=torch.float16)
@@ -214,12 +219,12 @@ class TestIndexFillEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4414,
                 "aten::index_fill_.int_Scalar is not registered on Spyre.",
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -242,12 +247,12 @@ class TestIndexFillEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4414,
                 "aten::index_fill_.int_Scalar is not registered on Spyre.",
                 r"Could not run 'aten::index_fill_.int_Scalar'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -280,8 +285,8 @@ class TestMaskedFillStandaloneEagerCompile:
     def test_masked_fill_float16(self, execution_mode):
         """masked_fill on (8,16) float16; every even position receives -inf sentinel.
 
-        Compiled uses _ATOL_F16: atol=0 differs by 1 fp16 ULP on unmasked elements,
-        which is not a missed write.
+        Exact (atol=0): masked_fill copies or overwrites, so on dl16-snapped
+        inputs the device result is bit-identical to the CPU result.
         """
         x = cached_randn((8, 16), differentiation="mfill_f16_01", dtype=torch.float16)
         mask = torch.arange(8 * 16).reshape(8, 16) % 2 == 0
@@ -290,8 +295,8 @@ class TestMaskedFillStandaloneEagerCompile:
             lambda x, m: x.masked_fill(m, float("-inf")),
             x,
             mask,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_masked_fill_float32(self, execution_mode):
@@ -335,8 +340,8 @@ class TestMaskedFillStandaloneEagerCompile:
             lambda x, m: x.masked_fill(m, -1e4),
             x,
             mask,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
 
@@ -479,7 +484,7 @@ class TestScatterAddGroupedMmOffs:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4395
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4396,
                 "aten::scatter_add.out is not registered on Spyre.",
                 r"Could not run 'aten::scatter_add.out'",
@@ -531,12 +536,12 @@ class TestScatterRouterMaps:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 1002,
                 "aten::scatter.src_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.src_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -565,12 +570,12 @@ class TestScatterRouterMaps:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 1002,
                 "aten::scatter.src_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.src_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -613,15 +618,15 @@ class TestScatterValueStamp:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4473,
                 "aten::scatter.value_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.value_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4472,
                 "compile scatter_(value=) stores a rank-0 Constant.",
-                r"Constant",
+                r"store value of unexpected type <class '[\w.]*Constant'>",
             ),
         )
         G, T = 128, 192
@@ -641,15 +646,15 @@ class TestScatterValueStamp:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4473,
                 "aten::scatter.value_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.value_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4472,
                 "compile scatter_(value=) stores a rank-0 Constant.",
-                r"Constant",
+                r"store value of unexpected type <class '[\w.]*Constant'>",
             ),
         )
         dst = cached_randn((256, 8, 128), differentiation="sc_kv", dtype=torch.bfloat16)
@@ -680,12 +685,12 @@ class TestScatter1DDestRestickify:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 1002,
                 "aten::scatter.src_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.src_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -708,12 +713,12 @@ class TestScatter1DDestRestickify:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 1002,
                 "aten::scatter.src_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.src_out'",
             ),
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -756,7 +761,7 @@ class TestScatterReduceLegacyGroupedMm:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4407
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4413,
                 "aten::scatter.reduce_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.reduce_out'",
@@ -785,7 +790,7 @@ class TestScatterReduceLegacyGroupedMm:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4407
         _xfail_existing(
             execution_mode,
-            eager=(
+            eager=rejection(
                 4413,
                 "aten::scatter.reduce_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.reduce_out'",
@@ -908,7 +913,7 @@ class TestScatterReduceTwoColliding:
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -943,7 +948,7 @@ class TestScatterReduceTwoColliding:
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
-            compiled=(
+            compiled=rejection(
                 4399,
                 "compile scatter-family write (index_fill_ / scatter / scatter_reduce): cannot re-tile buf, no size-1 stick target.",
                 r"cannot re-tile \S+: no size-1 stick target",
@@ -964,23 +969,11 @@ class TestScatterReduceTwoColliding:
 
 
 class TestScatterReduceCompileDynamic:
-    """compile(dynamic=True) scatter_reduce sum dim=0.
+    """compile(dynamic=True) scatter_reduce sum dim=0 is refused (#5578)."""
 
-    Unique abort is alignment input is not concrete: s11 (#4638), not #4346
-    (indirect symbol tmp0 not found in indirect_sizes {}).
-    """
-
+    @expect_dynamic_true_refused
     def test_scatter_reduce_sum_dim0_dynamic(self):
-        """compile(dynamic=True) scatter_reduce sum dim=0 — alignment s11 (#4638)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4638
-        _xfail_existing(
-            "compiled",
-            compiled=(
-                4638,
-                "compile(dynamic=True) scatter_reduce hits alignment input is not concrete: s11.",
-                r"alignment input is not concrete",
-            ),
-        )
+        """compile(dynamic=True) scatter_reduce sum dim=0 is refused."""
         dst = (
             (torch.arange(4 * 64, dtype=torch.float32) / 7.0)
             .reshape(4, 64)

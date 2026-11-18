@@ -14,27 +14,29 @@
 
 """Boundary conditions, NaN/Inf source values, non-contiguous index tensors, mask-based gather, all gather API forms, non-contiguous sources, known bug regressions (#2662/#2661/#2654/#2653), and numeric correctness checks."""
 
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import DEVICE, cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import DEVICE, cached_randn
+from conftest import _xfail_existing, compare_mode, rejection
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
+# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
 _ATOL_BF16 = 2e-2
+# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
 _ATOL_F32 = 1e-5
 
-_INDEX_2D_EAGER = (
+_INDEX_2D_EAGER = rejection(
     6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_BOOL_SOURCE_EAGER = (
+_BOOL_SOURCE_EAGER = rejection(
     4332,
     "Eager Spyre aten::index.Tensor does not support bool source tensors.",
     r"does not support bool source tensors",
@@ -54,57 +56,57 @@ _FP16_TO_FP32_EAGER = (
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_CLAMP_MIN_EAGER = (
+_CLAMP_MIN_EAGER = rejection(
     6340,
     "aten::clamp_min.out is not registered on Spyre.",
     r"Could not run 'aten::clamp_min.out'",
 )
-_STICK_INCOMPATIBLE = (
+_STICK_INCOMPATIBLE = rejection(
     3732,
     "compile single-row gather: Pointwise no mechanism to resolve stick incompatibility.",
     r"no mechanism to resolve stick incompatibility",
 )
-_MASKED_SELECT = (
+_MASKED_SELECT = rejection(
     4371,
     "aten::masked_select is not registered on Spyre.",
     r"Could not run 'aten::masked_select'",
 )
-_NONZERO = (
+_NONZERO = rejection(
     6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_BOOL_OPERANDS = (
+_BOOL_OPERANDS = rejection(
     4332,
     "torch.bool result from operands with device format(s) {SEN169_FP16, IEEE_INT32}.",
     r"torch\.bool result from operands with device format",
 )
-_RESTICKIFY_3ARGS = (
+_RESTICKIFY_3ARGS = rejection(
     4327,
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
-_TAKE_EAGER = (
+_TAKE_EAGER = rejection(
     4307,
     "aten::take is not registered on Spyre.",
     r"Could not run 'aten::take'",
 )
-_HOST_SIZE_DIM_ORDER = (
+_HOST_SIZE_DIM_ORDER = rejection(
     3732,
     "compile take / flatten-take: Pointwise no mechanism to resolve stick incompatibility.",
     r"no mechanism to resolve stick incompatibility",
 )
-_REMAINDER = (
+_REMAINDER = rejection(
     4416,
     "aten::remainder.Tensor_out is not registered on Spyre.",
     r"Could not run 'aten::remainder.Tensor_out'",
 )
-_REMAINDER_COMPILED = (
+_REMAINDER_COMPILED = rejection(
     4416,
     "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
     r"unimplemented operation remainder",
 )
-_GATHER_OUT = (
+_GATHER_OUT = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
@@ -242,8 +244,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda s, i: torch.where(s[i] > 0, s[i], torch.zeros_like(s[i])),
             scores,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_gather_masked_output(self, execution_mode):
@@ -257,8 +259,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             x,
             idx,
             out_mask,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_where_based_gather(self, execution_mode):
@@ -272,8 +274,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             a,
             b,
             cond,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_masked_select_bfloat16(self, execution_mode):
@@ -394,8 +396,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.relu(torch.index_select(x, 0, i)),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_index_select_float32(self, execution_mode):
@@ -464,8 +466,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             execution_mode,
             lambda x: torch.repeat_interleave(x, 2, dim=0),
             x,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_api_fullgraph(self, execution_mode):
@@ -704,8 +706,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: x[i] * 0.5,
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_cor_gather_accumulate(self, execution_mode):

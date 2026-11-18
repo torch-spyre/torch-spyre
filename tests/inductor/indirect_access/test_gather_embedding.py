@@ -14,22 +14,28 @@
 
 """Token and positional embedding table lookup, RoPE position cache gather, EmbeddingBag (sum/mean/max modes, per-sample weights), multi-table gather, pooling variants, and downstream linear/norm projections."""
 
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import cached_randn  # noqa: E402
-from conftest import _xfail_existing, compare_mode  # noqa: E402
+from utils_inductor import cached_randint, cached_randn
+from conftest import _xfail_existing, compare_mode, rejection
 
+# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
+# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
+# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
+# fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
+# bit fewer than fp16), so the error grows with the number of rows and depends on
+# which rows are drawn.  Measured over 1500 random index draws against an fp32
+# reference: worst 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps ~25%
+# above that worst case and stays 10x below an error of one whole row (~1).
+_ATOL_F16_SUM = 3e-2
+# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
 _ATOL_F32 = 1e-5
 
-_INDEX_2D_EAGER = (
+_INDEX_2D_EAGER = rejection(
     6335,
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
@@ -44,12 +50,12 @@ _EAGER_TIED_MISMATCH = (
     "Eager FP16 matmul (tied LM head) after an embedding lookup mismatches CPU.",
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_EMBEDDING_BAG_UNSUPPORTED = (
+_EMBEDDING_BAG_UNSUPPORTED = rejection(
     4319,
     "aten::_embedding_bag / _embedding_bag_forward_only is not registered on Spyre.",
-    r"embedding_bag|backend='inductor' raised",
+    r"Could not run 'aten::_embedding_bag",
 )
-_EMBEDDING_RENORM = (
+_EMBEDDING_RENORM = rejection(
     4320,
     "aten::embedding_renorm_ is not registered on Spyre.",
     r"Could not run 'aten::embedding_renorm_'",
@@ -353,15 +359,18 @@ class TestGatherEmbeddingTableLookupAndPooling:
             eager=_EMBEDDING_BAG_UNSUPPORTED,
             compiled=_EMBEDDING_BAG_UNSUPPORTED,
         )
-        emb_bag = nn.EmbeddingBag(64, 64, mode="sum")
+        # The module is built from the table tensor inside the function, so its
+        # weight is on the device being tested; a module built on the host would
+        # fail with a device mismatch before reaching the op.
+        w = cached_randn((64, 64), differentiation="emb2_07", dtype=torch.float32)
         input_ids = torch.randint(0, 64, (8,), dtype=torch.int64)
         offsets = torch.tensor([0, 4], dtype=torch.int64)
         compare_mode(
             execution_mode,
-            lambda i, o, m: m(i, o),
+            lambda i, o, w: nn.EmbeddingBag.from_pretrained(w, mode="sum")(i, o),
             input_ids,
             offsets,
-            emb_bag,
+            w,
             atol=_ATOL_F32,
             rtol=_ATOL_F32,
         )
@@ -379,21 +388,27 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w2,
             i1,
             i2,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_lookup_table_sum_pooling(self, execution_mode):
-        """GEMB2-09: Lookup + sum pooling; table[idx].sum(dim=0)."""
+        """GEMB2-09: Lookup + sum pooling; table[idx].sum(dim=0).
+
+        Index is seeded: the device accumulates 16 fp16 rows in dl16, and the error
+        depends on which rows are drawn (see _ATOL_F16_SUM).
+        """
         w = cached_randn((64, 128), differentiation="emb2_09", dtype=torch.float16)
-        idx = torch.randint(0, 64, (16,), dtype=torch.int64)
+        idx = cached_randint(
+            (16,), differentiation="emb2_09i", low=0, high=64, dtype=torch.int64
+        )
         compare_mode(
             execution_mode,
             lambda w, i: w[i].sum(dim=0),
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_ATOL_F16_SUM,
+            rtol=_ATOL_F16_SUM,
         )
 
     def test_lookup_table_mean_pooling(self, execution_mode):
@@ -420,8 +435,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w1,
             w2,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=0,
+            rtol=0,
         )
 
     def test_lookup_table_bfloat16(self, execution_mode):
