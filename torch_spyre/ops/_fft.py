@@ -45,6 +45,10 @@ _COMPILED_LOCK = threading.Lock()
 _W_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 _W_CACHE_LOCK = threading.Lock()
 _W_BUILDING: "dict[tuple, threading.Event]" = {}
+# Bytes reserved by in-flight builds (allocated on device but not yet in
+# _W_CACHE); guarded by the lock so concurrent builds of different keys
+# collectively respect the budget.
+_W_RESERVED = 0
 
 
 def _to_interleaved(x: torch.Tensor) -> torch.Tensor:
@@ -121,14 +125,16 @@ def _w_cache_budget_bytes() -> int:
 def _evict_w_cache_locked(reserve: int) -> None:
     """Evict LRU entries until ``reserve`` more bytes fit the budget (lock held).
 
-    Called before inserting a new ``reserve``-byte entry, so the device never
-    transiently holds the new matrix on top of a full cache. If ``reserve``
-    alone exceeds the budget the cache is emptied and the entry is still kept.
+    Called before a build allocates its matrix on the device, so cached entries
+    plus the already-reserved in-flight builds (``_W_RESERVED``) plus this
+    ``reserve`` stay within budget -- the device never holds the new matrix on
+    top of a full cache. If ``reserve`` alone exceeds the budget the cache is
+    emptied and the build still proceeds.
     """
     budget = _w_cache_budget_bytes()
     total = sum(_entry_bytes(k) for k in _W_CACHE)
     for k in list(_W_CACHE):  # OrderedDict iterates least-recently-used first
-        if total + reserve <= budget:
+        if total + reserve + _W_RESERVED <= budget:
             break
         del _W_CACHE[k]
         total -= _entry_bytes(k)
@@ -138,12 +144,15 @@ def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
     """fp16 DFT matrix on ``device``, from a byte-bounded LRU cache.
 
     The build runs outside the lock, so a cache hit for another length is not
-    blocked behind a multi-gigabyte build; a per-key event still ensures two
-    callers never build the same matrix at once. Room is evicted before the new
-    entry is inserted, so the device does not hold the new matrix plus a full
-    cache even momentarily.
+    blocked behind a multi-gigabyte build; a per-key event ensures two callers
+    never build the same matrix at once. Room is evicted -- and the in-flight
+    bytes reserved -- *before* the build allocates the new matrix on the device,
+    so the device never holds the new matrix on top of a full cache, even with
+    concurrent builds of different keys.
     """
+    global _W_RESERVED
     key = (device, n, inverse)
+    nbytes = _entry_bytes(key)
     while True:
         with _W_CACHE_LOCK:
             w = _W_CACHE.get(key)
@@ -153,19 +162,25 @@ def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
             ev = _W_BUILDING.get(key)
             if ev is None:
                 ev = _W_BUILDING[key] = threading.Event()
+                _evict_w_cache_locked(reserve=nbytes)  # free room before build
+                _W_RESERVED += nbytes
                 break  # this caller builds
         ev.wait()  # another caller is building this key; wait, then recheck
 
     try:
         w = _build_device_dft_matrix(n, inverse, device)
+    except BaseException:
         with _W_CACHE_LOCK:
-            _evict_w_cache_locked(reserve=_entry_bytes(key))
-            _W_CACHE[key] = w
-            _W_CACHE.move_to_end(key)
-    finally:
-        with _W_CACHE_LOCK:
+            _W_RESERVED -= nbytes
             _W_BUILDING.pop(key, None)
         ev.set()
+        raise
+    with _W_CACHE_LOCK:
+        _W_RESERVED -= nbytes
+        _W_CACHE[key] = w
+        _W_CACHE.move_to_end(key)
+        _W_BUILDING.pop(key, None)
+    ev.set()
     return w
 
 
