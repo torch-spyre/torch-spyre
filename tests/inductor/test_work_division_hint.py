@@ -2424,7 +2424,9 @@ def test_completed_reduction_split_is_independent_of_output_split():
         assert get_split(op, SimpleNamespace(), "result") == 4
 
 
-@config.patch({"sencores": 8})
+# This test checks the original eight-core route and its dense SDSC maps.
+# Sparse placement widens the physical fold and remaps those core IDs.
+@config.patch({"sencores": 8, "core_placement_mode": "dense"})
 def test_completed_reduction_routes_survive_alignment_unchanged():
     m, n = Symbol("m"), Symbol("n")
     coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
