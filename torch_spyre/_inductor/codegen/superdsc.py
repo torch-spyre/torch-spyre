@@ -1361,9 +1361,10 @@ def _check_qfp8wt_offset(arg: TensorArg, reject_column_offset: bool) -> None:
             f"a column offset into a QFP8WT weight (device origin {origin}); "
             "only a row slice of a QFP8WT weight is supported"
         )
-    if origin[k_axis] is not None and origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
+    k_origin = origin[k_axis]
+    if k_origin is not None and k_origin % _QFP8WT_ROWS_PER_STICK:
         raise Unsupported(
-            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
+            f"a slice starting at row {k_origin} of a QFP8WT weight; a "
             f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
         )
 
