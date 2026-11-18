@@ -84,12 +84,14 @@ from .ir import (
     SpyreEmptyFallback,
 )
 from .pass_utils import (
+    collapse_valid_elements,
     qfp8wt_layout,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
+    forward_valid_elements,
     get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
@@ -195,10 +197,17 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
             changed = True
     if not changed:
         return stl
+    # Cap each group's count at the product of its new extents.  A collapsed
+    # broadcast dim has size 1, so any key containing it is capped to 1.
+    new_ve = {
+        key: min(val, math.prod(device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
         device_size,
         stride_map,
         stl.device_dtype,
+        new_ve,
         stl.element_arrangement,
     )
 
@@ -545,7 +554,11 @@ def rescale_stl_for_dtype(
         # A stick holding one element (a size-1 or sparse stick dim) needs no more
         # sticks at any number of elements per stick.
         return SpyreTensorLayout(
-            out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+            out_device_size,
+            out_stride_map,
+            get_device_dtype(out_dtype),
+            forward_valid_elements(stl),
+            ea,
         )
 
     stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
@@ -598,8 +611,13 @@ def rescale_stl_for_dtype(
 
     out_device_size[num_sticks_dim] = out_sticks
     out_stride_map[num_sticks_dim] = stride_map_entry
+    # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
+    out_valid = {
+        key: min(val, math.prod(out_device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
-        out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+        out_device_size, out_stride_map, get_device_dtype(out_dtype), out_valid, ea
     )
 
 
@@ -930,6 +948,7 @@ def _default_pointwise_layout(
                 stl.device_size,
                 stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(stl),
                 stl.element_arrangement,
             )
         ]
@@ -979,6 +998,33 @@ def _default_pointwise_layout(
     )
 
 
+def _origin_target(data: Pointwise | Reduction):
+    """The target of the first origin of ``data``, skipping enclosing HOPs.
+
+    A buffer lowered inside a higher-order op's subgraph, such as a
+    ``while_loop`` body (``for_each_tile``) or a reused
+    ``nested_compile_region`` (``invoke_subgraph``), inherits the origins of the
+    enclosing lowering context, which come first: the HOP, its subgraph
+    ``get_attr`` nodes and other nodes of the graph holding the HOP. Origins in
+    a graph that holds a HOP are therefore skipped, leaving the subgraph's own
+    nodes; a buffer with no origin elsewhere keeps its first one.
+    (``origin_node`` is no substitute: some lowerings set it to their input's
+    node.)
+    """
+    if not data.origins:
+        return None
+    hop_graphs = {
+        n.graph
+        for n in data.origins
+        if isinstance(n.target, torch._ops.HigherOrderOperator)
+    }
+    node = next(
+        (n for n in data.origins if n.graph not in hop_graphs),
+        next(iter(data.origins)),
+    )
+    return node.target
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -997,7 +1043,7 @@ def _single_arg_op_layout(
 
     # Reductions are laid out by _reduction_layouts.
     assert isinstance(data, Pointwise)
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
     match aten_op:
         case (
             prims.convert_element_type.default
@@ -1348,7 +1394,12 @@ def _collapse_outer_stick_dims(
         del new_size[d]
         del new_stride[d]
         del new_coords[d]
-    return SpyreTensorLayout(new_size, new_stride, stl.device_dtype), new_coords, keep
+    new_ve = collapse_valid_elements(stl, outer_dims, keep)
+    return (
+        SpyreTensorLayout(new_size, new_stride, stl.device_dtype, new_ve),
+        new_coords,
+        keep,
+    )
 
 
 def _rebuild_stl_for_matmul(
@@ -2247,6 +2298,7 @@ def _multi_arg_pointwise_layouts(
                 template_stl.device_size,
                 template_stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(template_stl),
                 output_ea,
             )
         )
@@ -2317,6 +2369,7 @@ def _multi_arg_pointwise_layouts(
             src_stl.device_size,
             src_stl.stride_map,
             out_device_dtype,
+            forward_valid_elements(src_stl),
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
@@ -2631,7 +2684,7 @@ def compute_layouts(
     if isinstance(data, Reduction):
         return _reduction_layouts(op, output, output_dep, args)
 
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
 
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
