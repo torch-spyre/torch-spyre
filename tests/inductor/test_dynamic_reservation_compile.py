@@ -28,7 +28,8 @@ dimension, outside any ``for_each_tile`` loop. Such a kernel has no loop to
 carry the size, so it would be built for one size and silently wrong at every
 other (#5937, how this file read before). It is refused at compile with a
 message that names ``for_each_tile``. Tiling such an op automatically is later
-work.
+work. A ``mark_dynamic(max=...)`` size with no declaration is refused the same
+way: it has a finite maximum but nothing reserved and no loop to carry it.
 """
 
 import os
@@ -109,6 +110,21 @@ def test_a_plain_op_over_the_declared_dim_is_refused(case):
     y.resize_((SPEC["min"], COLS))
 
     with pytest.raises(InductorError, match="outside any for_each_tile loop"):
+        torch.compile(fn)(y)
+
+
+@pytest.mark.parametrize("case", sorted(PLAIN_CASES))
+@expects_raise
+def test_a_plain_op_over_a_mark_dynamic_max_dim_is_refused(case):
+    # mark_dynamic(max=...) gives the size a finite maximum but reserves nothing
+    # and declares nothing, so no for_each_tile loop can carry it. It is refused
+    # at compile rather than emitted as an SDSC dimension symbol.
+    fn = PLAIN_CASES[case]
+    y = torch.rand(SPEC["min"], COLS, dtype=torch.float16).to(DEVICE)
+    # min must divide max, or work division refuses the bounds before this check.
+    torch._dynamo.mark_dynamic(y, 0, min=TILE, max=SPEC["max"])
+
+    with pytest.raises(InductorError, match="but no declaration"):
         torch.compile(fn)(y)
 
 
