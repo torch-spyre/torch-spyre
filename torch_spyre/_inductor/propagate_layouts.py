@@ -2313,6 +2313,13 @@ def _topk_layouts(
 ) -> list[SpyreTensorLayout]:
     _check_supported_input_sticks(args, "topk")
     x = args[0]
+    if x.layouts and all(stl.element_arrangement in STAGGERED_EAS for stl in x.layouts):
+        # TODO: restore the input's element order first (#5673). topk ranks the
+        # elements in device order, and its index and tie order are positions, so
+        # a staggered input gives wrong indices.
+        raise Unsupported(
+            f"topk of a staggered input ({x.layouts[0].element_arrangement.name})"
+        )
     x_coords = host_coordinates(x.layout, x.dep, None)
     out_coords = host_coordinates(output, output_dep, None)
 

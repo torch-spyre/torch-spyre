@@ -1070,6 +1070,14 @@ def _floordiv_inplace(x, y):
     return x
 
 
+# Regex fragments for expect_raise. Past 64 rows a float16/bfloat16 row longer
+# than 1024 elements is upcast to float32, staggered on the device until the
+# compiler restores its order (#5673): topk refuses it, as its index is a
+# position, and argmin's STANDARD NaN mask meets it.
+_ARG_REDUCE_MIXED_EA = r"Multi-arg pointwise with mixed EA"
+_ARG_REDUCE_STAGGERED_TOPK = r"topk of a staggered input"
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -2456,6 +2464,118 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_to_int_floored", "test_to_int_floored_base"): {
+            "param_sets": {
+                f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
+                for src in (torch.float32, torch.float16, torch.bfloat16)
+                for dst in (torch.int32, torch.int64)
+            },
+            # The conversion goes through a staggered float32 tensor, and the D2H
+            # copy reads the int result back without restoring its order. A
+            # plain .to(int) does the same on main.
+            "expect_fail": {
+                f"{src}_to_{dst}": "permuted readback: the D2H copy ignores the "
+                "staggered element arrangement (#4393)"
+                for src in ("float16", "bfloat16")
+                for dst in ("int32", "int64")
+            },
+        },
+        ("test_arg_reduce", "test_arg_reduce_base"): {
+            "ops_dict": {"argmax": torch.argmax, "argmin": torch.argmin},
+            # (shape, dtype, view, ((dim, keepdim), ...)): the base builds the
+            # input from shape and view, and compares each reduction of it.
+            "param_sets": {
+                **{
+                    f"{_dtype_name(dtype)}_{rows}x{v}": (
+                        (rows, v),
+                        dtype,
+                        "rows",
+                        ((-1, False), (1, True)),
+                    )
+                    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    for rows, v in (
+                        (8, 256),
+                        (8, 768),
+                        # A batch of whole sticks: the index fills them.
+                        (64, 256),
+                        (128, 256),
+                        (64, 32000),
+                        (8, 128256),
+                        (64, 151936),
+                        (8, 262144),
+                        (128, 2048),
+                        (5344, 768),
+                    )
+                },
+                **{
+                    f"{_dtype_name(dtype)}_dim_0{suffix}": (
+                        (rows, 256),
+                        dtype,
+                        "transposed",
+                        ((0, False), (0, True)),
+                    )
+                    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    for rows, suffix in ((8, ""), (64, "_64"))
+                },
+                "float32_dim_none_1d": (
+                    (8, 768),
+                    torch.float32,
+                    "tied_row",
+                    ((None, False), (None, True)),
+                ),
+                "float32_dim_none_1d_nan": (
+                    (8, 768),
+                    torch.float32,
+                    "nan_row",
+                    ((None, False),),
+                ),
+                "float32_size1_dim": (
+                    (8, 256),
+                    torch.float32,
+                    "first_column",
+                    ((-1, False), (-1, True)),
+                ),
+                "float32_0dim": (
+                    (),
+                    torch.float32,
+                    "scalar",
+                    ((None, False), (0, False)),
+                ),
+                "float32_dim_none_2d": (
+                    (8, 256),
+                    torch.float32,
+                    "rows",
+                    ((None, False),),
+                ),
+            },
+            # TODO: float16/bfloat16 rows longer than 1024 elements past 64 rows
+            # become positive once the compiler restores the order of the
+            # staggered float32 upcast (#5673).
+            "expect_raise": {
+                # TODO: flattening the input does not compile today (#5850).
+                "float32_dim_none_2d": r"dim=None of a multi-dim tensor",
+                **{
+                    f"{op}_{dtype}_{shape}": fragment
+                    for op, fragment in (
+                        ("argmax", _ARG_REDUCE_STAGGERED_TOPK),
+                        ("argmin", _ARG_REDUCE_MIXED_EA),
+                    )
+                    for dtype in ("float16", "bfloat16")
+                    for shape in ("128x2048",)
+                },
+            },
+            # A float16/bfloat16 index converts to int64 through a staggered
+            # float32 step. With several indices on a stick (128 rows ranked by
+            # topk, or a reduction over dim 0) the int64 result keeps them
+            # staggered on the device, and the host copy does not restore them.
+            "expect_fail": {
+                f"{op}_{dtype}_{case}": "wrong indices: the host copy of the "
+                "staggered int64 index does not restore its order (#4393)"
+                for op in ("argmax", "argmin")
+                for dtype in ("float16", "bfloat16")
+                for case in ("128x256", "dim_0", "dim_0_64")
+            },
+        },
         ("test_topk_indices", "test_topk_indices_cpu"): {
             "param_sets": {
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
@@ -2478,19 +2598,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # the indices is not.
             "expect_fail": {
                 "2d_k4_dim0": _STAGGERED_READBACK,
-            },
-            # The cast's fp32 value lacks the second stick of a stick pair, so it
-            # reads memory that was never written: the result is wrong on most runs
-            # and right on some, and a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "2d_batch1_k4_dim1_lt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on most runs"
-                ),
-                "2d_batch1_k4_dim1_gt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on some runs"
-                ),
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -11565,6 +11672,85 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             x,
             run_eager=False,
         )
+
+    def test_to_int_floored_base(self, src, dst):
+        # Integers, and fractions of both signs: floor rounds -0.5 to -1 where a
+        # cast truncates it to 0. Every value is exact in float16 and bfloat16.
+        values = torch.tensor([-3.0, -2.5, -1.0, -0.5, 0.0, 0.5, 1.0, 2.5, 3.0, 1000.0])
+        x = values.repeat(8, 7)[:, :64].contiguous().to(src)
+        # A compiled-graph op, like spyre.topkindex: it has no eager kernel.
+        self.compare_with_cpu(
+            lambda t: torch.ops.spyre.to_int_floored(t, dst),
+            x,
+            atol=0,
+            rtol=0,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "wrong indices: the amax route's where reads the staggered float32 "
+            "upcast in STANDARD order (#6429)"
+        ),
+    )
+    def test_argmax_of_staggered_input(self):
+        x = cached_randn((8, 256))
+        self.compare_with_cpu(
+            lambda t: torch.argmax(t.float(), dim=-1),
+            x,
+            atol=0,
+            rtol=0,
+            run_eager=False,
+        )
+
+    @expects_raise
+    def test_argmax_of_staggered_input_rejected_by_topk(self):
+        # TODO: positive once the compiler restores the order of the staggered
+        # float32 upcast (#5673). Until then topk (more than 64 rows) refuses it
+        # rather than return positions in device order.
+        x = cached_randn((128, 256))
+        with pytest.raises(InductorError, match=_ARG_REDUCE_STAGGERED_TOPK):
+            self.compare_with_cpu(
+                lambda t: torch.argmax(t.float(), dim=-1), x, run_eager=False
+            )
+
+    def test_arg_reduce_base(self, op, shape, dtype, view, reductions):
+        # The rows hold the cases argmax must break like PyTorch, where the
+        # lowest index wins a tie and a NaN wins over any number: row 0 ties
+        # its max at three columns, row 1 ties +inf, row 2 holds two NaN and a
+        # +inf, row 3 is all -inf and row 4 all equal; the rest are random.
+        # view takes them as they are, down dim 0 ("transposed"), row 0 or
+        # row 2 alone, or only their first column; "scalar" is a 0-dim input.
+        if view == "scalar":
+            x = torch.tensor(2.5)
+        else:
+            rows, v = shape
+            x = torch.randn(shape, generator=torch.Generator().manual_seed(rows * v))
+            x[0, [3, v // 2, v - 1]] = 9.0
+            x[1, [5, 9]] = float("inf")
+            x[2, [v - 1, 11]] = float("nan")
+            x[2, 4] = float("inf")
+            x[3] = float("-inf")
+            x[4] = 1.0
+            if view == "transposed":
+                x = x.T.contiguous()
+            elif view == "tied_row":
+                x = x[0]
+            elif view == "nan_row":
+                x = x[2]
+            elif view == "first_column":
+                x = x[:, :1].contiguous()
+        # Indices are exact, so compare them exactly. The CPU reference reads the
+        # card-rounded input, as float16 and bfloat16 round to DLFloat16 on the
+        # device and make more ties.
+        x = x.to(dtype).to("spyre").cpu()
+
+        def fn(t):
+            return tuple(op(t, dim=dim, keepdim=keepdim) for dim, keepdim in reductions)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
 
     def test_argmin_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

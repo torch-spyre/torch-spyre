@@ -2827,6 +2827,202 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.max((values, indices))
 
 
+# float16 and bfloat16 are both DLFloat16 on the device, whose index is exact up
+# to 1024: a row this long is ranked as is, a longer one is upcast to float32.
+_ARG_REDUCE_DL16_MAX_ELEMENTS = 1024
+
+
+# Up to this many rows a float32 row is ranked by amax and amin, which split the
+# row over the cores; topk keeps a row on one core and is faster for more rows.
+_ARG_REDUCE_AMAX_MAX_ROWS = 64
+
+
+def _negate_keeping_nan(x: torch.Tensor) -> torch.Tensor:
+    """-x with NaN kept positive.
+
+    Negating a NaN on the device sets its sign bit, which the device ranks
+    below every number. abs(x) <= inf is false only for a NaN.
+    """
+    return torch.where(x.abs() <= float("inf"), -x, float("nan"))
+
+
+def _first_max_index_fp32(x: torch.Tensor, largest: bool) -> torch.Tensor:
+    """Index of the largest (or smallest) float32 element along the last dim.
+
+    The first column equal to the row's amax, found as the amin of a column
+    ramp where the row equals its max and the ramp shifted past every column
+    elsewhere. The ramp is the cached device arange, exact in float32 to 2**24.
+    A NaN is the max of its row and equal to itself on the device, so the first
+    NaN wins as in PyTorch. An all -inf row matches no column, and its first
+    column wins. Keeps the last dim as size 1.
+    """
+    if not largest:
+        x = _negate_keeping_nan(x)
+    elements = x.shape[-1]
+    ramp = torch.ops.spyre.arange(elements, torch.float32, x.device, owned=False)
+    top = torch.amax(x, dim=-1, keepdim=True)
+    shifted = ramp + float(elements)
+    index = torch.amin(torch.where(x == top, ramp, shifted), dim=-1, keepdim=True)
+    return torch.where(index >= float(elements), index - float(elements), index)
+
+
+def _first_max_index_dl16(x: torch.Tensor, chunks: int, largest: bool) -> torch.Tensor:
+    """Index of the largest (or smallest) float16/bfloat16 element along the last dim.
+
+    Both dtypes are DLFloat16 on the device, whose index is exact up to 1024, so
+    the row is padded to ``chunks`` chunks of 1024 (with values that never win,
+    as ties go to the lowest index) and ranked as in ``_first_max_index_fp32``
+    within each chunk: the first column equal to the row's amax, as the amin of
+    a column ramp. The amin of a chunk ramp over the chunks holding a match
+    picks the chunk, and the float32 index (exact to 2**24) is
+    chunk * 1024 + column. The device does not single out a NaN under amax and
+    ==, so a row holding a NaN matches its NaN instead. An all -inf row matches
+    no column, and its first column wins. Keeps the last dim as size 1.
+    """
+    if not largest:
+        x = _negate_keeping_nan(x)
+    *lead, elements = x.shape
+    chunk_size = _ARG_REDUCE_DL16_MAX_ELEMENTS
+    padding = chunks * chunk_size - elements
+    if padding:
+        x = torch.nn.functional.pad(x, (0, padding), value=float("-inf"))
+    is_nan = ~(x.abs() <= float("inf"))
+    row_has_nan = torch.amax(is_nan.to(x.dtype), dim=-1, keepdim=True) > 0
+    top = torch.amax(x, dim=-1, keepdim=True)
+    match = torch.where(row_has_nan, is_nan, x == top)
+    match = match.view(*lead, chunks, chunk_size)
+    # The ramps are float16 for a bfloat16 row too: the cached ramp is built on
+    # the host, where bfloat16 holds integers exactly only up to 256.
+    column_ramp = torch.ops.spyre.arange(
+        chunk_size, torch.float16, x.device, owned=False
+    )
+    chunk_ramp = torch.ops.spyre.arange(chunks, torch.float16, x.device, owned=False)
+    first_column = torch.amin(
+        torch.where(match, column_ramp, float(chunk_size)), dim=-1
+    )
+    chunk = torch.amin(
+        torch.where(first_column < chunk_size, chunk_ramp, float(chunks)),
+        dim=-1,
+        keepdim=True,
+    )
+    column = torch.amin(
+        torch.where(chunk_ramp == chunk, first_column, float(chunk_size)),
+        dim=-1,
+        keepdim=True,
+    )
+    no_match = chunk >= chunks
+    chunk = torch.where(no_match, 0.0, chunk)
+    column = torch.where(no_match, 0.0, column)
+    return chunk.to(torch.float32) * chunk_size + column.to(torch.float32)
+
+
+def _topk_index_fp32(x: torch.Tensor, dim: int, largest: bool) -> torch.Tensor:
+    """k=1 topk index of an fp32 tensor: the largest (or smallest) element.
+
+    The device topk returns equal values lowest index first and ranks a positive
+    NaN above every number, so a NaN wins as in PyTorch. For the smallest, x is
+    negated with NaN kept positive.
+    """
+    if not largest:
+        x = _negate_keeping_nan(x)
+    return torch.ops.spyre.topkindex(x, 1, dim)
+
+
+def _topk_index_dl16(x: torch.Tensor, dim: int, largest: bool) -> torch.Tensor:
+    """k=1 topk index of a float16/bfloat16 tensor, a NaN found by its own topk.
+
+    Both dtypes are DLFloat16 on the device. Its topk returns equal values
+    lowest index first but does not rank a NaN, so the first NaN comes from a
+    topk of the NaN mask, the best number from a topk of the values with NaN set
+    to -inf, and a where picks the NaN index for a row that holds one. The index
+    is in the input dtype, exact up to 1024.
+    """
+    # TODO: rank a NaN above every number in DLFloat16 topkindex, as fp32 does;
+    # then this is a single topk like _topk_index_fp32.
+    is_nan = ~(x.abs() <= float("inf"))
+    nan_mask = is_nan.to(x.dtype)
+    nan_index = torch.ops.spyre.topkindex(nan_mask, 1, dim)
+    has_nan = torch.amax(nan_mask, dim=dim, keepdim=True) > 0
+    values = torch.where(is_nan, float("-inf"), x if largest else -x)
+    value_index = torch.ops.spyre.topkindex(values, 1, dim)
+    return torch.where(has_nan, nan_index, value_index)
+
+
+def _arg_reduce(
+    input: torch.Tensor, dim: Optional[int], keepdim: bool, largest: bool
+) -> torch.Tensor:
+    """argmax (largest) or argmin of ``input`` along ``dim``, as PyTorch picks it.
+
+    The lowest index wins among equal values, and a NaN wins over any number.
+    The index is converted to int64. A tensor of at most 64 rows is ranked along
+    its last dim by amax and amin over a column ramp, a float16/bfloat16 one in
+    chunks of 1024; otherwise the index is a k=1 topk index. Past 64 rows a
+    float16/bfloat16 row of at most 1024 elements is ranked as is; a longer one
+    is upcast to float32, which topk refuses while it is staggered. ``dim=None``
+    ranks a 1-D tensor.
+    """
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        # TODO: integer inputs; an fp32 upcast is not exact past 2**24.
+        raise Unsupported(f"argmax/argmin of {input.dtype}")
+    if dim is None:
+        if input.dim() > 1:
+            # TODO: support it; flattening the input does not compile today (#5850).
+            raise Unsupported("argmax/argmin with dim=None of a multi-dim tensor")
+        shape = [1] * input.dim() if keepdim else []
+        return _arg_reduce(input.reshape(-1), 0, False, largest).reshape(shape)
+    if input.dim() == 0 or input.shape[dim] == 1:
+        # A single candidate is the answer. topkindex of a size-1 dim returns
+        # the value instead of index 0.
+        shape = list(input.shape)
+        if input.dim() > 0:
+            if keepdim:
+                shape[dim] = 1
+            else:
+                del shape[dim]
+        return input.new_zeros(shape, dtype=torch.int64)
+    if input.dtype == torch.float32:
+        if (
+            dim % input.dim() == input.dim() - 1
+            and math.prod(input.shape[:-1]) <= _ARG_REDUCE_AMAX_MAX_ROWS
+            and 2 * input.shape[dim] <= _FLOAT32_EXACT_LIMIT
+        ):
+            index = _first_max_index_fp32(input, largest)
+        else:
+            index = _topk_index_fp32(input, dim, largest)
+    elif (
+        dim % input.dim() == input.dim() - 1
+        and math.prod(input.shape[:-1]) <= _ARG_REDUCE_AMAX_MAX_ROWS
+        and math.ceil(input.shape[dim] / _ARG_REDUCE_DL16_MAX_ELEMENTS)
+        <= _ARG_REDUCE_DL16_MAX_ELEMENTS
+    ):
+        chunks = math.ceil(input.shape[dim] / _ARG_REDUCE_DL16_MAX_ELEMENTS)
+        index = _first_max_index_dl16(input, chunks, largest)
+    elif input.shape[dim] <= _ARG_REDUCE_DL16_MAX_ELEMENTS:
+        index = _topk_index_dl16(input, dim, largest)
+    else:
+        index = _topk_index_fp32(input.to(torch.float32), dim, largest)
+    # The index is integer-valued, so flooring converts it exactly. It converts
+    # in its keepdim shape: a float16/bfloat16 index goes through a staggered
+    # float32 step, and a squeeze read in between would tag the staggered result
+    # STANDARD (#5580).
+    index = torch.ops.spyre.to_int_floored(index, torch.int64)
+    return index if keepdim else index.squeeze(dim)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmax.default])
+def spyre_argmax(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=True)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmin.default])
+def spyre_argmin(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=False)
+
+
 @register_spyre_decompositions([torch.ops.aten.min.dim])
 def spyre_min_dim_decomp(input, dim, keepdim=False):
     """
