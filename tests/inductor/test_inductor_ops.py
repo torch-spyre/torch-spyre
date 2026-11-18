@@ -1319,6 +1319,11 @@ _MASKING_OPS_CASES = {
     "3d_dim0": ((67, 71, 256), 2, 0, 0.0),
     "4d_dim0": ((6, 17, 7, 64), 2, 0, -1.0),
     "4d_dim2": ((6, 17, 64, 64), 16, 2, 0.0),
+    # Other fill values on one aligned and one unaligned shape.
+    "2d_aligned_dim0_fill_neginf": ((64, 128), 8, 0, float("-inf")),
+    "2d_dim0_fill_neginf": ((67, 256), 8, 0, float("-inf")),
+    "2d_aligned_dim0_fill_pos": ((64, 128), 8, 0, 5.0),
+    "2d_dim0_fill_pos": ((67, 256), 8, 0, 5.0),
 }
 
 
@@ -2525,13 +2530,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test", "test_masking_ops_cpu"): {
             "ops_dict": {
-                "keep_by_index": lambda x, i, dim, fill: (
-                    torch.ops.spyre.keep_by_index(x, i, dim, fill)
-                ),
-                # mask_by_index always masks with -inf, so it ignores the fill.
-                "mask_by_index": lambda x, i, dim, fill: (
-                    torch.ops.spyre.mask_by_index(x, i, dim)
-                ),
+                "keep_by_index": torch.ops.spyre.keep_by_index,
+                "mask_by_index": torch.ops.spyre.mask_by_index,
             },
             "param_sets": {
                 **_masking_ops_params(torch.float16),
@@ -11329,13 +11329,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compiled_fn = torch.compile(fn)
         result_spyre = compiled_fn(x.to("spyre"), indices.to("spyre")).cpu()
         expected = fn(x, indices)
-        if x.dtype == torch.float32:
-            # Device fp32 looks like NaN to the host
-            expected = expected.masked_fill(torch.isneginf(expected), float("nan"))
 
-        torch.testing.assert_close(
-            result_spyre, expected, equal_nan=True, atol=0.1, rtol=0.1
-        )
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
 
     def test_keep_by_index_moe_router(self):
         """Repro: keep_by_index router mask -> SpyreReduction stick clash.

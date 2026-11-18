@@ -228,14 +228,8 @@ def mask_by_index(
     values: torch.Tensor,
     indices: torch.Tensor,
     dim: int,
+    fill_value: torch.types.Number,
 ) -> torch.Tensor:
-    """Set the elements of ``values`` selected by ``indices`` along ``dim`` to -inf.
-
-    The output matches ``values`` except where the coordinate along ``dim`` equals
-    ``indices[k]`` for some k, which becomes ``-inf``. The masking value is fixed:
-    the backend ``maskbyindex`` op always masks with ``-inf`` and has no
-    fill-value input, unlike ``keep_by_index``.
-    """
     pass
 
 
@@ -244,6 +238,7 @@ def _(
     values: torch.Tensor,
     indices: torch.Tensor,
     dim: int,
+    fill_value: torch.types.Number,
 ) -> torch.Tensor:
     return values.new_empty(values.size())
 
@@ -253,6 +248,7 @@ def mask_by_index_cpu(
     values: torch.Tensor,
     indices: torch.Tensor,
     dim: int,
+    fill_value: torch.types.Number,
 ) -> torch.Tensor:
     # Normalize dim to handle negative indices
     dim = dim % values.ndim
@@ -276,7 +272,7 @@ def mask_by_index_cpu(
         # Mark where values[dim] == indices[k, ...]
         mask = mask | (coords == idx_k)
 
-    return torch.where(mask, torch.full_like(values, float("-inf")), values)
+    return torch.where(mask, torch.full_like(values, fill_value), values)
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
