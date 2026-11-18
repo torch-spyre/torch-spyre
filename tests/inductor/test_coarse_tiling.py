@@ -345,10 +345,10 @@ def _make_real_pointwise_op(
     ``hints`` follows the same (hint_id, dim_index) convention as
     ``_make_hinted_op``.  The caller must have an active graph handler
     (``V.set_graph_handler(...)``) around both this call and any later
-    ``op.get_read_writes()`` / ``plan_coarse_tile_groups(...)``+
-    ``_apply_plan(...)`` call on the returned op -- ``InputBuffer.
+    ``op.get_read_writes()`` / ``build_loop_tiling_plan(...)``+
+    ``lower_loop_tiling(...)`` call on the returned op -- ``InputBuffer.
     make_loader()`` reads ``V.graph.sizevars`` lazily, not just at
-    construction time.  ``_apply_plan`` itself additionally requires the op
+    construction time.  ``lower_loop_tiling`` itself additionally requires the op
     to have a real ``operation_name`` (normally assigned by
     ``GraphLowering.register_operation``) for its internal
     ``_validate_contiguous`` position lookup -- set directly below rather
@@ -356,7 +356,7 @@ def _make_real_pointwise_op(
     auto-generates its own ``op{N}``-style name instead of using the name
     we pass in).  Each input ``InputBuffer`` is also registered on
     ``V.graph.name_to_buffer`` for consistency with real IR, though neither
-    ``plan_coarse_tile_groups`` nor ``_apply_plan`` resolves buffers by name
+    ``build_loop_tiling_plan`` nor ``lower_loop_tiling`` resolves buffers by name
     (that only happens in the buffer-propagation pass, which these tests
     bypass by calling the plan/apply pair directly instead of the full
     ``coarse_tile()`` entry point -- see
@@ -406,8 +406,8 @@ def _make_real_reduction_op(
     index depends on BOTH output-dim d{i} symbols and reduction-dim d{i}
     symbols (numbered continuously after the output dims, per Inductor's own
     ``Loops.get_reads()`` convention) -- exercising the
-    ``n_output_dims``-offset path in ``plan_coarse_tile_groups``/
-    ``_apply_plan`` that the two ``Pointwise``-only tests above never touch
+    ``n_output_dims``-offset path in ``build_loop_tiling_plan``/
+    ``lower_loop_tiling`` that the two ``Pointwise``-only tests above never touch
     (both have zero reduction dims).
 
     ``hints`` follows the same (hint_id, dim_index) convention as
@@ -417,7 +417,7 @@ def _make_real_reduction_op(
 
     Unlike the non-reduction ``DimHint``s (matched against
     ``_test_out_coords`` via the patched ``op_out_coords``, so any synthetic
-    symbol works), ``plan_coarse_tile_groups``'s reduction-dim lookup
+    symbol works), ``build_loop_tiling_plan``'s reduction-dim lookup
     (``_loop_var_to_reduction_ranges_pos``) matches ``dim_hint.loop_var``
     directly against the *real* ``d{i}`` symbols found in the op's own
     ``get_read_writes()`` reduction dep -- it does not go through
@@ -430,12 +430,12 @@ def _make_real_reduction_op(
 
     Like ``_make_real_pointwise_op``, the caller must have an active graph
     handler around both this call and any later ``get_read_writes()`` /
-    ``plan_coarse_tile_groups(...)``+``_apply_plan(...)`` call on the
+    ``build_loop_tiling_plan(...)``+``lower_loop_tiling(...)`` call on the
     returned op, and this helper likewise registers the input and output
     buffers directly on ``V.graph.name_to_buffer`` (see
     ``_make_real_pointwise_op``'s docstring for why
     ``register_buffer``/``register_operation`` aren't used here, and why
-    neither ``plan_coarse_tile_groups`` nor ``_apply_plan`` -- unlike the
+    neither ``build_loop_tiling_plan`` nor ``lower_loop_tiling`` -- unlike the
     full ``coarse_tile()`` -- ever needs to resolve them by name).
     """
     from torch._inductor.ir import (
@@ -783,28 +783,6 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(
             info.output_tiled_dims,
             [[(0, Integer(512))], [(1, Integer(1024))]],
-        )
-
-
-class TestComputeFillLoopInfoPlannedTopology(unittest.TestCase):
-    """_compute_fill_loop_info_planned classifies output/reduction topologies.
-
-    Levels are ordered outermost-first. A level is "output" if
-    loop_tiled_dims[i] is non-empty, "reduction" if
-    loop_tiled_reduction_dims[i] is non-empty. Flat and nested topologies
-    are supported (see the function's docstring); any topology where an
-    output level is interleaved with the reduction levels -- straddling a
-    single reduction level from both sides, or sandwiched between two
-    separate reduction levels -- must raise Unsupported.
-    """
-
-    def _info(self, loop_tiled_dims, loop_tiled_reduction_dims):
-        n = len(loop_tiled_dims)
-        return CoarseTileInfo(
-            loop_group_id=tuple([0] * n),
-            loop_count=[Integer(4)] * n,
-            loop_tiled_dims=loop_tiled_dims,
-            loop_tiled_reduction_dims=loop_tiled_reduction_dims,
         )
 
 
@@ -2866,52 +2844,6 @@ class TestCoarseTileNested(unittest.TestCase):
             _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
 
 
-class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
-    """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
-    output_tiled_dims, using the small example from
-    docs/source/compiler/coarse_tiling_loops.md (1024x4096, outer K=2 over
-    dim 0, inner M=4 over dim 1).
-
-    plan_coarse_tile_groups's/_apply_plan's new code calls
-    op.get_read_writes() on real IR (Task 3), which internally calls
-    InputBuffer.make_loader() -> checks V.graph.sizevars -- this requires an
-    active graph handler at the time plan_coarse_tile_groups/_apply_plan
-    run, not just while the op is built.  setUp/tearDown keep one open for
-    the whole test body; a fresh GraphLowering (distinct from the one
-    _make_real_pointwise_op/_make_real_reduction_op build their op under,
-    internally, to construct the IR) is sufficient -- get_read_writes() has
-    no dependency on graph-handler identity, only on one being active.
-
-    These tests call plan_coarse_tile_groups + _apply_plan directly rather
-    than the full coarse_tile() entry point.  coarse_tile() unconditionally
-    also runs the reduction-machinery pass (_insert_all_reduction_ops) after
-    stamping every group, which for a Reduction op with an actually-tiled
-    reduction dim drives _propagate_tiled_reduction_op -> _allocate_full_buffer
-    -> graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
-    FX-dispatch/lowering machinery this lightweight harness does not
-    provide (confirmed live: raises LoweringException /
-    "'NullHandler' object does not support the context manager protocol").
-    _apply_plan is the layer that actually populates tiled_dims_per_read /
-    output_tiled_dims (see Task 2/3), so calling plan_coarse_tile_groups +
-    _apply_plan directly exercises exactly what the declarative tiling pass
-    needs without pulling in buffer propagation, which it does not touch.
-    """
-
-    def setUp(self):
-        self._patch = patch_tiling_helper(
-            "op_out_coords",
-            side_effect=_mock_op_out_coords,
-        )
-        self._patch.start()
-        gm = fx.symbolic_trace(lambda: None)
-        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
-        self._graph_ctx.__enter__()
-
-    def tearDown(self):
-        self._graph_ctx.__exit__(None, None, None)
-        self._patch.stop()
-
-
 # ===========================================================================
 # 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
 # ===========================================================================
@@ -4874,7 +4806,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
-    # Ordinary (non-mutation) layout, so _plan_tiling_propagation's
+    # Ordinary (non-mutation) layout, so lower_loop_tiling's
     # isinstance(op.layout, MutationLayoutSHOULDREMOVE) check on this op
     # resolves to False instead of raising AttributeError -- layout is an
     # instance attribute ComputedBuffer sets in __init__, not a class
@@ -4897,7 +4829,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
 
     def setUp(self):
         # Only test_case2_condition_now_produces_copy_op below needs a real
-        # graph handler (it drives _propagate_tiled_op end to end with real
+        # graph handler (it drives lower_loop_tiling end to end with real
         # IR, which calls V.graph.qualify_name/run_node); the helper-level
         # tests above it use mocks and never touch V.graph, so this setup is
         # a no-op for them.
@@ -5555,7 +5487,7 @@ def _make_tiled_reduction_op(
     in wsr/coarse_tile.py). Also stamps one reduction DimHint per reduction
     dim at hint_id=0, matching TestPlanTilingPropagation._plan_for's levels
     (which pair every level with literal hint_id 0), so
-    _group_reduction_tiled_levels_in_group/_plan_tiling_propagation's
+    _group_reduction_tiled_levels_in_group/lower_loop_tiling's
     has_tiled_reduction check (added by a462da6d) can recognize the tiled
     reduction dim instead of seeing an empty dim_hints list.
     """
@@ -5686,7 +5618,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
 
 class TestValidatePlannedReductionTiling(unittest.TestCase):
     """Tests for _validate_planned_reduction_tiling: raising on unsupported
-    cases, passing on supported ones. Called from plan_coarse_tile_groups
+    cases, passing on supported ones. Called from build_loop_tiling_plan
     (planning time) with the op's own per-level tiled-dims lists, before any
     loop_info is stamped."""
 
@@ -7171,9 +7103,9 @@ class TestPredictFrameReduction(unittest.TestCase):
     ``reduction_ranges``, and only the applier says which entry, so only a test
     that pairs the two can catch the frames drifting apart.
 
-    Applies via ``plan_coarse_tile_groups`` + ``_apply_plan`` rather than
-    ``coarse_tile_post_stickify``: the full entry point also runs
-    ``_insert_all_reduction_ops``, whose accumulator construction lowers a real
+    Applies via ``build_loop_tiling_plan`` + ``lower_loop_tiling`` rather than
+    ``tile_groups``: the full entry point also runs
+    ``_lower_reduction``, whose accumulator construction lowers a real
     ``spyre.empty`` FX node that this harness cannot provide (see
     ``TestApplyPlanTiledDims``' docstring). That is the right scope anyway --
     ``predict_frame`` predicts the *frame*, and deliberately does not predict
@@ -8580,7 +8512,7 @@ class TestDerivedBases(unittest.TestCase):
 class TestApplyTilingsEquivalence(unittest.TestCase):
     """``apply_tilings`` reduces to the hint path.
 
-    Both paths call the same coarse_tile_post_stickify(); the pass just builds
+    Both paths call the same tile_groups(); the pass just builds
     its (groups, group_idx_offset, dim_hints) inputs from a TileSpec instead of
     pre-stamped hints. Feeding structurally identical inputs to the identical function
     yields identical output, which is asserted end-to-end here on the stamped

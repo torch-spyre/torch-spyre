@@ -5907,6 +5907,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     #   "writer-advance check failed for 'coarse_tile_copy_buf1' -- level 0
     #    tiles output dims [1] but output_tiled_dims has no extents for that
     #    level, so its write pointer would not advance there."
+    # (The names below are the legacy transform's, deleted in stage 7a.6.)
     # _insert_copy_op keyed the synthesized copy-out writer's per-level
     # extents by RAW dim index, while _tiled_dims_for_dep matched those keys
     # against the SQUEEZED dN symbols of dep.index. This group's terminal
@@ -7700,7 +7701,10 @@ class TestSpanOverflowMutationE2E(InductorTestCase):
         }
     )
     def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
-        """Originally a regression repro for the Case 2/"Case 3"
+        """(History: the functions named here are the legacy transform's, deleted in
+        stage 7a.6; the lowering has no Case 2/"Case 3" branch.)
+
+        Originally a regression repro for the Case 2/"Case 3"
         layout-reconciliation gap; now an xfail for a separate, deeper,
         pre-existing bug this task's fix newly exposes on this exact op.
 

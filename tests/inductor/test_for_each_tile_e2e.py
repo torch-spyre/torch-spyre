@@ -679,8 +679,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
+        the span-overflow lowering's index-derived advance (the legacy
+        _point_splice_advance_for_dep recorded it), leave the read direct (never staged into scratch),
         keep the loop term in the index (per_trip_index pins it in the base
         coordinates, so the advance is not applied twice), and
         insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be

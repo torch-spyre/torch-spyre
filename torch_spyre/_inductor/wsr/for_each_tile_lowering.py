@@ -1213,9 +1213,8 @@ def _consume_tile_dim_markers(
     stable across such a reconstruction -- every rebuild-via-
     ``replace_computed_buffer_body`` site in this package (this one
     included) preserves the original name, and other Spyre metadata
-    (``PropagationPlan.outside_consumer_names``, etc.) already keys by name
-    for exactly this reason -- see that field's own docstring on name
-    stability. The returned map is keyed by ``(op.get_name(), dep)`` --
+    (the carry records' storage and update names, etc.) already keys by name
+    for exactly this reason. The returned map is keyed by ``(op.get_name(), dep)`` --
     ``lookup_marker_dim`` (the map's only reader) recomputes ``op.get_name()``
     itself, so callers never need the key's ``str`` half spelled out
     explicitly. For a StarDep-shaped consumer the dep stored is the StarDep
@@ -1553,7 +1552,7 @@ def lookup_marker_dim(
     ExternKernelOut -- see _consume_tile_dim_markers). StarDep has no
     .index/.ranges (.index raises NotImplementedError) and no coordinate
     space to resolve a position in at all -- but this is moot, not a gap:
-    plan_coarse_tile_groups (coarse_tile.py, this function's only real
+    build_loop_tiling_plan (loop_tiling_lowering.py, this function's only real
     caller path) already skips every non-ComputedBuffer op before ever
     calling _hint_ranges_pos, and every StarDep-shaped consumer
     (ExternKernelOut and the rest of the InputsKernel family) has no
@@ -1672,10 +1671,8 @@ def _stamp_direct_loop_info(
     inference is unnecessary and unsafe -- one
     level's committed metadata (e.g. tiled_dims_per_read computed against a
     provisional buffer name) can go stale once a later-spliced nested level
-    renames or rewires the buffers it depended on. propagation is never
-    produced -- every CoarseTileInfo built here leaves it None -- because
-    PropagationPlan has zero consumers outside coarse_tile.py's own Pass
-    2/3, which while_loop groups skip entirely.
+    renames or rewires the buffers it depended on. no
+    per-group propagation record is produced for a while_loop group.
 
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
@@ -1713,9 +1710,9 @@ def _stamp_direct_loop_info(
     index carries a nonzero coefficient on loop_var that neither
     _extent_at_pos nor _structural_resolve could attribute to one of this
     op's own tiled dims (e.g. a point-shaped or already-resolved-elsewhere
-    read/write) -- mirroring coarse_tile.py's own
-    _point_splice_advance_for_dep, which records the identical
-    (coefficient, 1) shape for its own splice-only advances. This is
+    read/write) -- the same
+    (coefficient, 1) shape the span-overflow lowering derives from the index for a
+    splice-only advance. This is
     stamped explicitly here, at ground-truth time, specifically so
     SpyreKernel._general_tile_advance never needs to re-derive whether a
     splice symbol merely appearing in dep.index implies a real per-trip
@@ -2017,9 +2014,8 @@ def _stamp_direct_loop_info(
                     # nothing to record here), or -- the case this branch
                     # exists for -- a point-shaped or otherwise dim-less
                     # dependency where loop_var is the SOLE source of the
-                    # per-trip address step (mirrors coarse_tile.py's
-                    # _point_splice_advance_for_dep, which records the
-                    # identical shape for its own splice-only advances).
+                    # per-trip address step (the span-overflow
+                    # lowering reads the same shape off the index).
                     # Stamp that coefficient explicitly into
                     # squeezed_advance_per_read/output rather than leaving
                     # it for SpyreKernel._general_tile_advance to re-derive

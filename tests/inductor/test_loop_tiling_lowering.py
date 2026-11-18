@@ -314,13 +314,6 @@ def test_an_inexpressible_group_raises():
         compile_span_overflow(fn, args, limit)
 
 
-class _RecordPostCallState:
-    """Substituted for the pre-scheduling pipeline: records, per loop op, what the
-    allocator's ``apply_tilings`` leaves on it after the lowering returns."""
-
-    seen: dict = {}
-
-
 def _allocator_post_call_state():
     """Compile ``(x + y) * 2`` with the allocator tiling every op d0 by 4, under
     the plan; per op in a loop: ``(has symbols_on_tile, joint-division flag)``."""

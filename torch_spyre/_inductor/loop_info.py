@@ -232,7 +232,7 @@ _SPYRE_METADATA_ATTRS = (
     "_input_layout_overrides",
     "_emit_set_layout",
     # Links a tiled reduction op to its accumulation buffer; set by
-    # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
+    # loop_tiling_lowering.lower_loop_tiling, read by finalize_layouts in
     # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
     # One immutable record shared by a for_each_tile carry's persistent

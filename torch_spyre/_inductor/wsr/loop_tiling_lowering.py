@@ -21,8 +21,9 @@ the moment the plan is lowered, so the plan cannot go stale as other passes rewr
 the ops between planning and lowering.
 
 ``build_loop_tiling_plan`` resolves each op's hint to a position with the same
-function the legacy planner uses (``resolve_level_positions``) and runs the same
-refusals as ``plan_coarse_tile_groups``.
+function the ``for_each_tile`` lowering uses (``resolve_level_positions``) and
+refuses what the lowering does not express: a nest, reduction tiling while
+``config.enable_reduction_tiling`` is off, and the cases named in its docstring.
 """
 
 from __future__ import annotations
@@ -141,8 +142,7 @@ def build_loop_tiling_plan(
 ) -> LoopTilingPlan:
     """Plan ``groups`` (``(ops, [(hint_id, trip_count)])``) without touching the IR.
 
-    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for
-    what the legacy planner refuses: a nested group (one loop level only),
+    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for: a nested group (one loop level only),
     reduction tiling while ``config.enable_reduction_tiling`` is off, a mixed or
     multi-dim reduction level, an op that reads a reduction before it is complete,
     and a matmul tiled across a broadcast batch.

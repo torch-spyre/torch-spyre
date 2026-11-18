@@ -489,7 +489,7 @@ def derive_tiling_groups(
     breaks whenever an op is untiled (absent from ``choices`` or mapped to the
     empty spec) or its nest differs from the run's. Contiguity is a hard
     requirement, not an optimization -- ``validate_coarse_tile_groups`` and
-    ``_apply_plan`` both rely on each group occupying one contiguous stretch of
+    the lowering both rely on each group occupying one contiguous stretch of
     the operation list.
 
     Two non-adjacent runs on the same nest are therefore **two groups**, each

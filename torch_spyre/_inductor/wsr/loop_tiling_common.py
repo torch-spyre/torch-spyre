@@ -352,7 +352,7 @@ def _hint_ranges_pos(
     # ``dep.index == 32*u0`` with no ``d{i}`` coordinates at all -- so
     # loop_var can appear in its index without ever being resolvable
     # through the marker map. That is not a gap: it is the shape
-    # _point_splice_advance_for_dep's caller (plan_coarse_tile_groups)
+    # _point_splice_advance_for_dep's caller (build_loop_tiling_plan)
     # handles through squeezed_advance_per_read once this function returns
     # (None, False) for it, by stashing hint.loop_var into
     # unattributed_loop_vars. Counting it here as "mentions loop_var"
@@ -1307,7 +1307,7 @@ def _index_already_at_new_scale(
 
     A consumer in the same tiling group as a retiled buffer can be resynced
     (by name) to a *replacement* ComputedBuffer object spliced in by Pass
-    2/3 after ``_apply_plan`` already ran -- see coarse_tile_post_stickify's
+    2/3 after ``_apply_plan`` already ran -- see tile_groups's
     by-name resync comment above its ``_patch_retiled_load_indexes`` call.
     That replacement's inner_fn may have been retraced against the
     producer's already-mutated (new_stride) layout, in which case its load
@@ -1427,7 +1427,7 @@ def _retile_load_index(
         # This consumer's index was traced *after* the producer's layout was
         # already mutated to new_stride (e.g. built/retraced during Pass
         # 2/3, from a same-name replacement object resynced into group_ops
-        # -- see coarse_tile_post_stickify's by-name resync comment), so it is
+        # -- see tile_groups's by-name resync comment), so it is
         # already correct at the target scale. Rewriting it again would
         # decompose already-new-scale coefficients against old_stride and
         # silently produce a wrong (but plausible-looking) index -- see
@@ -1601,7 +1601,7 @@ def _patch_retiled_load_indexes(
 
     # Only ops that were already in the group when _apply_plan ran can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
-    # by Pass 1/2 (e.g. _insert_copy_op's copy_buf) read the retiled
+    # by Pass 1/2 (e.g. _insert_copy_out's copy_buf) read the retiled
     # buffer's already-updated layout directly, so rewriting them here would
     # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).

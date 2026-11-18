@@ -12,38 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Coarse-tiling IR pass: stamp loop_group_id / loop_count on ir.Operation objects.
+"""Helpers of the loop-tiling lowering, and the ``CoarseTileInfo`` validators.
 
-Each group of operations is wrapped in one or more nested counted loops.  For
-every operation in the group the iteration ranges divided by each loop's trip
-count are scaled down by that factor; the resulting (smaller) per-iteration
-ranges are what the downstream scheduler and work-division passes will see.
+The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
+``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
+trip count and gives every member a ``LoopShim``. This module keeps what that
+lowering and ``read_copy_elision`` share:
 
-A ``loop_group_id`` tuple encodes the nesting path:
-  - ``(g,)``       — outermost loop group with index ``g``
-  - ``(g, h)``     — inner loop group ``h`` nested inside outer group ``g``
-  - etc.
-
-``loop_count`` is a *list* of trip counts, one per nesting level from outermost
-to innermost.  For a single-level group this is a 1-element list ``[K]``.
-``loop_tiled_dims`` is a *list of lists*, one sub-list per nesting level.
-
-Entry point::
-
-    coarse_tile_post_stickify(graph, groups)
+  - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
+  - consumer patching (``_patch_consumers``) and full-buffer allocation,
+  - ``validate_coarse_tile_groups`` / ``reject_nested_loops``,
+  - ``validate_reader_tile_advance`` / ``validate_writer_tile_advance``, which check
+    the stored ``CoarseTileInfo`` of ``for_each_tile`` ops until stage 7.4 removes
+    the stored half.
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
-``(hint_id, count)`` pairs, outermost first.  Each op resolves its own
-tiled dimension from its ``loop_var`` in ``dim_hints``.
-
+``(hint_id, count)`` pairs, outermost first (one level only: nesting is refused).
+Each op resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
-
-After stamping, ``coarse_tile_post_stickify`` runs
-``_insert_all_reduction_ops`` and then ``_insert_all_write_copy_ops``. Both
-passes allocate full-sized output buffers
-and insert copy/mutation/reduction ops for tiled operations whose results
-are consumed outside the loop, driven by the ``PropagationPlan`` each op's
-``loop_info`` already carries from planning.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
 rewiring in this file, read "Appendix: How IR rewiring works, and why it's
@@ -175,7 +161,7 @@ def reject_nested_loops(groups: list[tuple], source: str) -> None:
     """Raise ``Unsupported`` for a group that nests more than one loop level.
 
     Span-overflow tiling and the allocator's own tiling build their groups for
-    ``coarse_tile_post_stickify``. That transform still takes several levels, and
+    ``tile_groups``. That transform still takes several levels, and
     the unit tests drive it that way. This refusal is for the lowering that is
     meant to replace it, which builds one standalone ``LoopNode`` per group and is
     NOT built yet: until it is, a nested group is refused here so that scope is
@@ -215,9 +201,9 @@ def resolve_level_positions(
     Returns ``(tiled_dims, tiled_reduction_dims, unattributed_loop_vars)``:
     per level, the op's output-range position tiled there (a list of zero or one)
     and its reduction-range position; and the splice loop variables this op has no
-    dim to attribute (see ``_point_splice_advance_for_dep``). Shared by the legacy
-    planner and ``wsr.loop_tiling_lowering.build_loop_tiling_plan``, so the two
-    agree on positions by construction.
+    dim to attribute (the lowering reads their advance off the index).
+    Shared by ``wsr.loop_tiling_lowering.build_loop_tiling_plan`` and the
+    ``for_each_tile`` lowering, so the two agree on positions by construction.
 
     ``_hint_ranges_pos`` returns (position, is-a-reduction-dim) and is
     authoritative on which channel the dim lands in: see its docstring for why a
@@ -260,8 +246,7 @@ def _find_outside_consumers_planned(
     Same decision (does any op outside buf_name's own outermost loop group
     read it, or is it a graph output), but returns consumer *names* instead
     of objects (planning is zero-mutation, so there's no reason to carry
-    object references past this stage -- see PropagationPlan's docstring on
-    name stability), and looks up each candidate's outer loop-group key from
+    object references past this stage), and looks up each candidate's outer loop-group key from
     name_to_group_outer_key (built once by the caller from the planned
     CoarseTileInfo dict) instead of a not-yet-stamped op.loop_info attribute.
     """
@@ -289,7 +274,7 @@ def _planned_full_device_layout(
 
     ``None`` when ``op`` has no device layout yet (pre-stickify), or when the
     full buffer is not ``op``'s own shape -- a WhileLoop-splice dim, which
-    ``_compute_full_ranges_planned`` multiplies up. ``_allocate_full_buffer``
+    the full-range computation multiplies up. ``_allocate_full_buffer``
     then raises for a post-stickify op.
     """
     layout = op.layout
@@ -483,7 +468,7 @@ def _check_matmul_broadcast_batch_tiling(
     # from "unambiguous", not which candidate is the real N dim. Treat every
     # candidate whose *tiled* extent exceeds 1 element/tile as excess: the
     # real N dim's own generation loop is not a coarse-tile dim (it's the
-    # matmul's inherent output dim, not something plan_coarse_tile_groups
+    # matmul's inherent output dim, not something build_loop_tiling_plan
     # tiles down), so it will not appear in per_level_extents at all.
     #
     # Candidate symbols are always Inductor's dense "d{N}" iteration vars
@@ -537,7 +522,7 @@ def _group_reduction_tiled_levels_in_group(
 
     A Reduction op's own reduction-tiled-dims list is only ever non-empty at
     a level for that op (Pointwise ops never populate reduction dims -- see
-    plan_coarse_tile_groups's hint_id_to_reduction_ranges_pos, gated on
+    build_loop_tiling_plan's hint_id_to_reduction_ranges_pos, gated on
     isinstance(op.data, Reduction)), so this scan only needs to inspect
     Reduction ops; a Pointwise-only group always yields an empty set.
 
@@ -797,20 +782,21 @@ def _divide_reduction_ranges(
 def validate_writer_tile_advance(operations: list[Operation]) -> None:
     """Every synthesized cross-loop writer must advance at each tiled level.
 
-    For each op the plan routed to "copy_out" or nested "reduction", the
+    For each op that is copied out of the loop or accumulated across it, the
     real write into the full-sized output buffer happens in a synthesized
     copy op (`coarse_tile_copy_{name}` / `coarse_tile_reduce_copy_{name}`),
-    never on the original op itself -- both _propagate_tiled_op and
-    _propagate_tiled_reduction_op deliberately zero the original op's own
-    `output_tiled_dims` (it is per-tile scratch, redrawn every iteration).
+    never on the original op itself -- the original op's own
+    `output_tiled_dims` is zero (it is per-tile scratch, redrawn every iteration).
+    Only ``for_each_tile`` ops carry these stored lists now; the span-overflow
+    lowering derives the advance from the index (stage 7.4 removes this check).
     If the synthesized copy's own `output_tiled_dims` is missing a level
     that its `loop_tiled_dims` says it tiles, that copy's write pointer
     would not advance at that level -- every tile after the first would
     land on top of tile 0 (the exact bug this function is named for; see
-    _insert_reduction_copy_op's fix for a concrete instance).  A flat
+    _lower_reduction's fix for a concrete instance).  A flat
     (non-nested) reduction has no synthesized copy at all: accum_full is
     written directly by the combine op, which by construction never
-    advances (see _insert_combine_op) since a flat reduction has no outer
+    advances (see _make_combine_buffer) since a flat reduction has no outer
     output-dim tiling level to advance across.
     """
     name_to_op = {
@@ -878,10 +864,10 @@ def validate_reader_tile_advance(operations: list[Operation]) -> None:
     would advance alongside it and observe a partially-accumulated value
     for every iteration but the last -- silently wrong numerics.  True
     outside consumers are already redirected by _patch_consumers to read
-    accum_full instead (see _propagate_tiled_reduction_op), and legitimate
+    accum_full instead (see loop_tiling_lowering._lower_reduction), and legitimate
     inside siblings get a structurally-empty tiled_dims_per_read entry for
     this buffer (squeeze of the collapsed reduction dim, or explicit
-    zeroing by _zero_reads_of_fixed_buffers_planned) -- so this function
+    zeroing) -- so this function
     asserts that invariant holds rather than establishing it.
     """
     reduction_names = set()
@@ -961,7 +947,7 @@ def _validate_planned_reduction_tiling(
       - Mixed output+reduction tiling at the same nesting level.
       - Multiple reduction range indices tiled at one level.
 
-    Called from plan_coarse_tile_groups (planning time): tiled_dims /
+    Called from build_loop_tiling_plan (planning time): tiled_dims /
     tiled_rdims are the op's own per-level lists computed there, before any
     loop_info is stamped -- this check is a pure function of already-known
     shape data, so it doesn't need to wait for transformation to run.
@@ -1013,8 +999,7 @@ def _reads_buffer_cached(op: ComputedBuffer, buf_name: str) -> bool:
     Only safe to call from contexts that never mutate a *different* op's
     inner_fn between calls for the same op -- see the zero-mutation
     argument in coarse_tile_compile_time's design notes. Do NOT call this
-    from transform-time helpers (_propagate_tiled_op,
-    _propagate_tiled_reduction_op, _find_outside_consumers) where earlier
+    from transform-time helpers (the lowering, _find_outside_consumers) where earlier
     splices in the same pass can make another op's cached reads stale.
     """
     try:
@@ -1087,8 +1072,7 @@ def _allocate_full_buffer(
 
     ``device_layout`` is the buffer's device layout, required post-stickify:
     the one planning recorded for a full buffer
-    (``PropagationPlan.full_device_layout`` for a copy-out,
-    ``ReductionPlan.full_output_device_layout`` for an accumulator), or the
+    (the planned full layout of a copy-out or of an accumulator), or the
     tile's own for a tile-sized accumulator. It is not grown back from the
     tile's, which is ambiguous where the tile has two host dims of extent 1.
     """
@@ -1218,7 +1202,7 @@ def _make_combine_buffer(
         if reduction_type == "any":
             return vops.logical_or(accum, partial)
         raise RuntimeError(
-            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
+            f"coarse_tile: _make_combine_buffer: unsupported reduction_type "
             f"{reduction_type!r}"
         )
 
