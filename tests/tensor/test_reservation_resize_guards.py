@@ -290,6 +290,15 @@ class TestReservationWithExplicitLayout(TestCase):
             self.assertEqual(d.untyped_storage().data_ptr(), ptr, f"at {rows}")
             self.assertTrue(torch.equal(d.cpu(), self.ids[:rows]), f"at {rows} rows")
 
+    def test_write_after_resize_reads_back(self) -> None:
+        # The other half of #6027: a host-to-device write through the pinned
+        # layout with dma_sizes below max, after a shrink, then a read back.
+        d = self._declare(C_MAX)
+        d.resize_((9, E, 1))
+        new_ids = self.ids[:9] + 1000
+        d.copy_(new_ids)
+        self.assertTrue(torch.equal(d.cpu(), new_ids))
+
     def test_default_layout_control(self) -> None:
         # The same sizes through the derived layout: the control the issue's
         # reproducer compared against.

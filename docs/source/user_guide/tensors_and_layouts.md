@@ -513,12 +513,13 @@ of the reserved dimension. That dimension's extent must be `max`, and it cannot
 be the stick-elements dimension. A layout that folds the reserved dimension
 into another, splits it across the stick, or sizes it for anything but `max`
 is refused before anything is allocated, with a `RuntimeError` from the native
-allocation that names the rule. The layout's other dimensions are not checked
-against the host shape, the same contract as `device_layout=` without
-`dynamic=`: sizing them for the tensor is the caller's responsibility. The
-derived layout satisfies these rules by construction, so giving
-`SpyreTensorLayout(max_shape, dtype)` explicitly is the same as the call
-without `device_layout=`.
+allocation that names the rule. The layout's other dimensions are checked only
+as a whole: the layout must hold at least the bytes of the host shape at `max`,
+and beyond that sizing them for the tensor is the caller's responsibility, the
+same contract as `device_layout=` without `dynamic=`. The derived layout
+satisfies these rules by construction, so giving
+`SpyreTensorLayout(max_shape, dtype)` explicitly gives the same layout and
+contract as the call without `device_layout=`.
 
 #### Restrictions
 

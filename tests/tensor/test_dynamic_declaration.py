@@ -254,6 +254,25 @@ class TestDynamicDeclarationValidation(TestCase):
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
 
+    def test_device_layout_too_small_elsewhere_rejected(self) -> None:
+        # The rows sit whole at device dim 0 with extent max, but the layout
+        # covers two of the four middle rows per outer row: fewer bytes than
+        # the host shape at max. Refused at allocation, where the layout can
+        # be named, not at the first resize_ past the host bytes.
+        x = torch.rand(560, 4, 1024, dtype=torch.float16)
+        stl = SpyreTensorLayout(
+            [630, 2, 1024 // 64, 64],
+            [4 * 1024, 1024, 64, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 630, (1,): 2, (2, 3): 1024},
+        )
+        with self.assertRaisesRegex(RuntimeError, "fewer than the"):
+            x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
     def test_reserved_transfer_does_not_warn(self) -> None:
         # The transfer used to warn that compiled kernels were built for the
         # first compile's size (#5937). The compiler now builds a declared

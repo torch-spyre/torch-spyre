@@ -1187,6 +1187,24 @@ at::Tensor spyre_empty_reserved_with_layout(
               ") must have extent max=", max_size, ", got ",
               device_size[carrier]);
 
+  // The layout must also hold the host shape at max_size as a whole. The
+  // storage below is sized from the layout, so a layout too small in another
+  // dimension would let today's transfer run and the first resize_ past the
+  // host bytes fail inside the reservation invariant, with a message that
+  // does not name the layout. Overflow-checked like spyre_empty_reserved.
+  auto padded_size = size.vec();
+  padded_size[dim] = max_size;
+  const size_t layout_bytes = get_device_size_in_bytes(device_layout);
+  const size_t host_bytes_at_max = at::detail::computeStorageNbytesContiguous(
+      padded_size, c10::elementSize(dtype));
+  TORCH_CHECK(layout_bytes >= host_bytes_at_max,
+              "device_layout with a reservation: the layout holds ",
+              layout_bytes, " bytes, fewer than the ", host_bytes_at_max,
+              " bytes of the host shape at max=", max_size,
+              " (every dimension of the layout must cover the host shape at "
+              "the declared maximum): ",
+              device_layout.toString());
+
   // From here on exactly spyre_empty_with_layout, plus the contract. Storage
   // is sized from the layout, which is at max_size by the check above, and
   // dma_sizes/dma_strides stay at the real shape as for spyre_empty_reserved.
