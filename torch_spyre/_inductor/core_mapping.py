@@ -601,7 +601,7 @@ def placement_applies(num_cores: int, physical_cores: int) -> bool:
     """Whether a sparse placement moves ``num_cores`` slices at all.
 
     The single applicability gate shared by ``apply_core_stride``,
-    ``apply_neg_shift``, and every consumer that mirrors their decisions
+    ``apply_clamshell``, and every consumer that mirrors their decisions
     (route remapping, dispatch admission). A placement never moves a
     single slice, a full card, or a count that does not divide the
     physical core count, so those cases must stay dense everywhere —
@@ -656,7 +656,7 @@ def apply_core_stride(
     return rewritten, span, tuple(range(0, span, stride))
 
 
-def apply_neg_shift(
+def apply_clamshell(
     core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
 ) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
     """Place ``num_cores`` logical slices with a downward half-count shift.

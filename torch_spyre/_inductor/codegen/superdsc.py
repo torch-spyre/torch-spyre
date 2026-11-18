@@ -52,8 +52,8 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
 )
 from torch_spyre._inductor.core_mapping import (
+    apply_clamshell,
     apply_core_stride,
-    apply_neg_shift,
     matmul_reduction_dim,
     placement_applies,
     resolve_core_stride,
@@ -2188,8 +2188,8 @@ def _inject_implicit_conv_kernel_dims(
 
 def _select_placement(mode: str):
     """Placement function for ``mode``; dense is the identity placement."""
-    if mode == "neg_shift":
-        return apply_neg_shift
+    if mode == "clamshell":
+        return apply_clamshell
     if mode == "dense":
         return _apply_dense_placement
     return apply_core_stride
@@ -2224,7 +2224,7 @@ def _remap_producer_cores(
     """
     if not placement_applies(logical_cores, sencores):
         return completed_producer_cores
-    if mode == "neg_shift":
+    if mode == "clamshell":
         shift = logical_cores // 2
         return tuple(
             sorted((core - shift) % sencores for core in completed_producer_cores)

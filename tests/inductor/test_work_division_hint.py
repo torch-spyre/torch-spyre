@@ -1445,7 +1445,7 @@ def _compile_spec(spec, normalize=True):
     ]
 
 
-@pytest.mark.parametrize("placement_mode", ["dense", "stride"])
+@pytest.mark.parametrize("placement_mode", ["dense", "stride", "clamshell"])
 @config.patch({"sencores": 32})
 def test_sparse_relayout_preserves_distinct_source_and_destination_slices(
     placement_mode,
@@ -1465,22 +1465,24 @@ def test_sparse_relayout_preserves_distinct_source_and_destination_slices(
             512,
         )
         root, allocations = _compile_spec(spec)
-        # Stride spreads the two owners to {0, 16}; dense keeps {0, 1}.
-        active = {"0", "16"} if placement_mode == "stride" else {"0", "1"}
-        assert (
-            root["coreFoldProp_"]["factor_"] == 32 if placement_mode == "stride" else 2
-        )
+        # The clamshell wraps the two owners across the physical ring boundary.
+        logical_ids = {
+            "dense": (0, 1),
+            "stride": (0, 16),
+            "clamshell": (31, 0),
+        }[placement_mode]
+        active = {str(core) for core in logical_ids}
+        expected_span = 2 if placement_mode == "dense" else 32
+        assert root["coreFoldProp_"]["factor_"] == expected_span
         assert set(root["coreIdToDsc_"]) == active
         assert set(root["coreIdToWkSlice_"]) == active
-        assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == [
-            int(core) for core in sorted(active)
-        ]
+        assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == sorted(logical_ids)
         source_map, destination_map = [
             node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
         ]
         assert set(source_map) == active
         assert set(destination_map) == active
-        first, second = sorted(active)
+        first, second = (str(core) for core in logical_ids)
         assert source_map[first] == {"mb": 0, "x": 0, "out": 0}
         assert source_map[second] == {"mb": 1, "x": 0, "out": 0}
         assert destination_map[first] == {"mb": 0, "x": 0, "out": 0}

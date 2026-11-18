@@ -569,7 +569,25 @@ body. `simplify_op_spec` moves these batch loops to the front, so K stays last.
 Setting it to the K dimension puts the cores that reduce the same output
 tile next to each other, so their partial sums accumulate over one ring
 hop instead of several.
+
 :::
+
+### Physical core placement
+
+Work division sets the number of logical slices. At SDSC emission,
+`SPYRE_CORE_PLACEMENT` selects the physical core IDs for those slices.
+With `dense` (the default), slice `i` uses core `i`, so adjacent
+K-collaborators stay adjacent on the ring. With `stride`, slice `i`
+uses core `i × (SENCORES_PHYSICAL / n)` for `n` slices. This multiplies
+the ring distance between K-collaborators. With `clamshell`, slice
+`i` uses core `(i - n//2) % SENCORES_PHYSICAL`. It keeps adjacent
+K-collaborators adjacent, including the pair across the ring boundary.
+The sparse modes apply only when `1 < n < SENCORES_PHYSICAL` and `n`
+divides `SENCORES_PHYSICAL`; otherwise placement stays dense. The
+physical count defaults to 32 and is separate from `SENCORES`, the
+logical planning limit. Clamshell placement needs the deeptools
+`GatherBuffers.cpp` fix (commit `209ca4aa5a`) for wrapping windows
+with indirect access.
 
 ### Scratchpad planning
 

@@ -1731,15 +1731,15 @@ class TestCorePlacementStrategies:
 
     def _placed(self, num_cores, physical_cores=32):
         dim = sympy.Symbol("out")
-        return core_mapping_module.apply_neg_shift(
+        return core_mapping_module.apply_clamshell(
             {dim: self.CORE_ID}, num_cores, physical_cores
         )
 
     def _owner_map(self, strategy, num_cores, physical_cores=32):
         dim = sympy.Symbol("out")
         fn = (
-            core_mapping_module.apply_neg_shift
-            if strategy == "neg_shift"
+            core_mapping_module.apply_clamshell
+            if strategy == "clamshell"
             else core_mapping_module.apply_core_stride
         )
         return fn({dim: self.CORE_ID}, num_cores, physical_cores)
@@ -1747,11 +1747,11 @@ class TestCorePlacementStrategies:
     @pytest.mark.parametrize(
         "strategy, num_cores, expected_ids",
         [
-            ("neg_shift", 2, (0, 31)),
-            ("neg_shift", 4, (0, 1, 30, 31)),
-            ("neg_shift", 8, (0, 1, 2, 3, 28, 29, 30, 31)),
+            ("clamshell", 2, (0, 31)),
+            ("clamshell", 4, (0, 1, 30, 31)),
+            ("clamshell", 8, (0, 1, 2, 3, 28, 29, 30, 31)),
             (
-                "neg_shift",
+                "clamshell",
                 16,
                 (0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31),
             ),
@@ -1767,7 +1767,7 @@ class TestCorePlacementStrategies:
         _, _, ids = self._owner_map(strategy, num_cores)
         assert ids == expected_ids
 
-    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
     @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
     def test_members_get_their_work_slices(self, strategy, num_cores):
         owner_map, span, ids = self._owner_map(strategy, num_cores)
@@ -1781,7 +1781,7 @@ class TestCorePlacementStrategies:
             f"want a permutation of 0..{num_cores - 1}"
         )
 
-    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
     @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
     def test_non_members_stay_in_range(self, strategy, num_cores):
         # Every fold position must evaluate to a slice inside [0, num_cores):
@@ -1794,7 +1794,7 @@ class TestCorePlacementStrategies:
         slices = division.to_core_slices(span)
         assert len(slices) == span
 
-    def test_neg_shift_zeroes_non_members(self):
+    def test_clamshell_zeroes_non_members(self):
         # Load-bearing for address planning: non-dispatched fold positions
         # evaluate to slice 0 so the shared base symbol (anchored on the
         # slice-0 owner) covers them.
@@ -1813,7 +1813,7 @@ class TestCorePlacementStrategies:
             if core not in ids:
                 assert int(expr.subs(self.CORE_ID, core)) == core // 4
 
-    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
     def test_no_op_cases(self, strategy):
         # Single-slice ops and full-card ops never shift under any strategy.
         for num_cores in (1, 32):
@@ -1821,7 +1821,7 @@ class TestCorePlacementStrategies:
             assert ids == tuple(range(num_cores))
             assert span == num_cores
 
-    @pytest.mark.parametrize("strategy", ["neg_shift", "stride"])
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
     def test_non_dividing_slice_counts_stay_dense(self, strategy):
         # Neither strategy spreads a slice count that does not divide the
         # physical core count (e.g. 12 slices over 32 cores).
@@ -1837,4 +1837,4 @@ class TestCorePlacementStrategies:
         if os.environ.get("SPYRE_CORE_PLACEMENT") is None:
             assert config_module.core_placement_mode == "dense"
         else:
-            assert config_module.core_placement_mode in ("dense", "stride", "neg_shift")
+            assert config_module.core_placement_mode in ("dense", "stride", "clamshell")

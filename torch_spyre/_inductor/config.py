@@ -78,20 +78,20 @@ sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lowe
 
 # Sparse physical core placement for ops using fewer cores than the card
 # has: "dense" (default) keeps the original mapping — logical slice i runs
-# on core i, no remapping; "neg_shift" dispatches logical slice i to
-# (i - n//2) % sencores — the clamshell, which balances the two 16-core
+# on core i, no remapping; "clamshell" dispatches logical slice i to
+# (i - n//2) % sencores_physical, balancing the two 16-core
 # halves (low ids of the first, high ids of the second) and wraps the fold
-# boundary; "stride" spreads slices at equal stride i*(sencores/n) and
+# boundary; "stride" spreads slices at equal stride i*(sencores_physical/n) and
 # stays inside monotonic fold order. The clamshell requires the deeptools
 # gather-buffer fix (GatherBuffers.cpp filtering the original SDSC's
 # coreIdsUsed_); on an unfixed backend it faults with a PCIe BusFence on
 # indirect-access ops with wrapping sets.
-core_placement_mode: Literal["dense", "stride", "neg_shift"] = os.environ.get(
+core_placement_mode: Literal["dense", "stride", "clamshell"] = os.environ.get(
     "SPYRE_CORE_PLACEMENT", "dense"
 )  # type: ignore[assignment]
-if core_placement_mode not in ("dense", "stride", "neg_shift"):
+if core_placement_mode not in ("dense", "stride", "clamshell"):
     raise ValueError(
-        "SPYRE_CORE_PLACEMENT must be one of dense/stride/neg_shift, got "
+        "SPYRE_CORE_PLACEMENT must be one of dense/stride/clamshell, got "
         f"{core_placement_mode!r}"
     )
 
