@@ -38,6 +38,8 @@ from xml.etree import ElementTree
 
 import pytest
 import torch
+
+from torch_spyre._inductor import config as spyre_config
 from device_env import device_available, emulation_ready, mode_usable
 from torch.distributed.tensor import Shard
 
@@ -605,11 +607,15 @@ def test_mixed_dtypes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_dynamic_shapes_fail_at_compile():
+    """torch.compile(dynamic=True) is refused before lowering, so a sharded
+    operand never reaches the non-unified static-shape check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="need static shapes"):
+    with pytest.raises(
+        RuntimeError, match=r"does not support: torch\.compile\(dynamic=True\)"
+    ):
         torch.compile(lambda x, y: x + y, dynamic=True)(a, a)
 
 
@@ -629,12 +635,10 @@ def test_fallback_consumer_fails_at_compile():
 
 @_requires_emulation
 @expects_raise
-def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
+@spyre_config.patch(bundle_symbolic_args=False)
+def test_bundle_symbolic_args_disabled_fails_at_compile():
     """Every core's start address is a bundle input_arg, so a sharded kernel
     cannot be compiled onto the launch-time-bound path."""
-    from torch_spyre._inductor import config as spyre_config
-
-    monkeypatch.setattr(spyre_config, "bundle_symbolic_args", False)
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
