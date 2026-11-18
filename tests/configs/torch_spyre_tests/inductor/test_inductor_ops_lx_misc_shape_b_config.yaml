@@ -63,4 +63,4 @@ test_suite_config:
             - LxPlanning.*::test_to_dtype_float32_to_float16_4x63_lx_planning_reduction
             - LxPlanning.*::test_to_dtype_float32_to_float16_4x64_lx_planning_reduction
             - LxPlanning.*::test_to_dtype_float32_to_float16_4x8x128_lx_planning_reduction
-          mode: xfail
+          mode: xfail_strict
