@@ -674,7 +674,7 @@ def _device_run_axes(coords, dims, iteration_space, stick_planes):
             sympy.Mod(symbol, stick), r
         )
         if symbol in index.free_symbols:
-            index = index.subs(symbol, stick * q + r)
+            index = index.xreplace({symbol: stick * q + r})
         position = list(space)
         at = position.index(symbol)
         items = list(space.items())
@@ -814,7 +814,7 @@ def _split_stick_axes(coords, iteration_space, work_slices, candidates):
         coords = [
             c.xreplace(
                 {sympy.floor(symbol / stick): hi, sympy.Mod(symbol, stick): lo}
-            ).subs(symbol, stick * hi + lo)
+            ).xreplace({symbol: stick * hi + lo})
             for c in coords
         ]
         space[hi], space[lo] = planes, stick
@@ -833,8 +833,8 @@ def _operand_device_run(coords, dims, iteration_space, work_slices, candidates):
     product of the remaining symbols' extents.
     """
     present = set().union(*(sympy.sympify(c).free_symbols for c in coords))
-    unit = {s: 0 for s, size in iteration_space.items() if size == 1}
-    coords = [sympy.sympify(c).subs(unit) if unit else c for c in coords]
+    unit = {s: sympy.S.Zero for s, size in iteration_space.items() if size == 1}
+    coords = [sympy.sympify(c).xreplace(unit) if unit else c for c in coords]
     space = {
         s: size for s, size in iteration_space.items() if s in present and s not in unit
     }

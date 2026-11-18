@@ -143,7 +143,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
 from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
+    COUNTED_LOOP_INFO,
     LoopCarryRecord,
     ReadCopyElisionRecord,
 )
@@ -346,7 +346,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), CoarseTileInfo)
+    return isinstance(getattr(op, "loop_info", None), COUNTED_LOOP_INFO)
 
 
 def _sibling_pinned_divisions(
