@@ -58,11 +58,11 @@ from ..views import convert_modular_indexing
 from ..work_division_constraints import JOINT_TILING_AND_DIVISION_ATTR
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
-    coarse_tile_post_stickify,
     reduction_loop_vars,
     reject_nested_loops,
     validate_coarse_tile_groups,
 )
+from ..wsr.loop_tiling_lowering import tile_groups
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
@@ -789,9 +789,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
     }
     request_loop_nodes(
         graph,
-        coarse_tile_post_stickify(
-            graph, groups=groups, group_idx_offset=group_idx_offset
-        ),
+        tile_groups(graph, groups=groups, group_idx_offset=group_idx_offset),
     )
     for op in graph.operations:
         was = untiled_symbols.get(op.get_name())

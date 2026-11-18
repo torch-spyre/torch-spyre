@@ -704,3 +704,21 @@ def lower_loop_tiling(graph: Any, plan: LoopTilingPlan) -> dict[int, sympy.Symbo
         _lower_group(graph, group, induction)
         inductions[group.index] = induction
     return inductions
+
+
+def tile_groups(
+    graph: Any, groups: list[tuple], group_idx_offset: int = 0
+) -> dict[int, sympy.Symbol]:
+    """Tile ``groups`` (``(ops, [(hint_id, trip_count)])``): the one entry point of
+    the span-overflow pass and of the allocator's tiling. Plans them, lowers the plan
+    and returns ``{group index: loop variable}`` for ``request_loop_nodes``.
+
+    While the legacy transform still exists (until it is deleted) the setting
+    ``config.loop_tiling_lowering`` can send the groups to it instead."""
+    if config._choose_loop_tiling_lowering(config.loop_tiling_lowering) == "legacy":
+        from .coarse_tile import coarse_tile_post_stickify as legacy
+
+        return legacy(graph, groups, group_idx_offset)
+    return lower_loop_tiling(
+        graph, build_loop_tiling_plan(graph.operations, groups, group_idx_offset)
+    )

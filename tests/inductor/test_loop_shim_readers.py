@@ -35,7 +35,6 @@ from torch_spyre._inductor import config, passes
 from torch_spyre._inductor.cost_features import extract_op_features
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
 from torch_spyre._inductor.loop_node import all_ops
-from torch_spyre._inductor.wsr import coarse_tile
 
 from test_span_overflow_gate import CASES, _shaped, compile_span_overflow
 
@@ -53,7 +52,7 @@ def _features_both_ways(case):
     """For each looped op of ``case``: (name, features with its CoarseTileInfo,
     features with the equal LoopShim)."""
     rows = []
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -75,8 +74,7 @@ def _features_both_ways(case):
     fn, shapes, limit, *_ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     with (
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
         config.patch({"loop_tiling_lowering": "legacy"}),
     ):
         compile_span_overflow(fn, args, limit)
@@ -113,7 +111,7 @@ def _shim_swapped_in(enabled=True):
     the same four fields in place of its ``CoarseTileInfo``, straight after the
     transform, so every later reader (cost features, work division, LX planning,
     the kernel) sees a shim op."""
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -125,8 +123,7 @@ def _shim_swapped_in(enabled=True):
         return result
 
     with (
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
         config.patch({"loop_tiling_lowering": "legacy"}),
     ):
         yield

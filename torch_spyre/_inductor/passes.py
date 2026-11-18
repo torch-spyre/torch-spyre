@@ -116,7 +116,7 @@ from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
-from .wsr.coarse_tile import coarse_tile_post_stickify
+from .wsr.loop_tiling_lowering import tile_groups
 from .dump_cost_model import dump_cost_model
 
 # The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
@@ -394,7 +394,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 @_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
-    coarse_tile_post_stickify,
+    tile_groups,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -403,7 +403,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Loops built from for_each_tile (splice_while_loops) are intentionally
     absent: they have already run pre-stickification.
 
-    Uses coarse_tile_post_stickify: layout propagation has already
+    Uses tile_groups: layout propagation has already
     committed every op's device layout by this point, so a read-copy here
     would only produce an HBM-to-HBM copy with no layout-reconciliation
     benefit.
@@ -415,9 +415,8 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         return
     # span_overflow_groups is a pure planning step: it decides each op's
     # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/coarse_tile_post_stickify run, since
-    # dim_hints is an input those consume (via plan_coarse_tile_groups's
-    # hint lookups), not something they produce.
+    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
+    # those consume (the plan's hint lookups), not something they produce.
     for op, dim_hints in dim_hint_assignments:
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any groups already
@@ -435,7 +434,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     reject_nested_loops(groups, "span-overflow coarse tiling")
     request_loop_nodes(
         graph,
-        coarse_tile_post_stickify(
+        tile_groups(
             graph,
             groups=groups,
             group_idx_offset=group_idx_offset,

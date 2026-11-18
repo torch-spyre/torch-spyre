@@ -349,7 +349,7 @@ def _recording(run, *, terms=True):
     ``(result, [_Looped])``; ``terms=False`` switches the new pass off, which gives
     the legacy lowering to compare against."""
     seen: list[_Looped] = []
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -363,8 +363,7 @@ def _recording(run, *, terms=True):
         return result
 
     patches = [
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
     ]
     if not terms:
         patches.append(
@@ -573,7 +572,7 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
     shapes = [(256, 256), (256, 64), (4096, 1024), (4096, 1024)]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     seen: dict[int, set[str]] = {}
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
@@ -589,8 +588,7 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
         return result
 
     with (
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
     ):
         compiled = compile_span_overflow(fn, args, 4 * 1024 * 1024)
     assert compiled.groups, "no span-overflow group formed"
