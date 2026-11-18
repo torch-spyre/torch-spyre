@@ -14,8 +14,11 @@
     "fp32",
     "bf16",
     "fp16",
-    "fp8"
-   ]
+    "fp8",
+    "int32",
+    "int8"
+   ],
+   "description": "df16 is the device-side name of fp16; write fp16"
   },
   "shape": {
    "type": "array",
