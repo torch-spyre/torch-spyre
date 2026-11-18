@@ -15,7 +15,7 @@
 
 import math
 from collections.abc import Collection, Mapping, Sequence
-from typing import Optional
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -33,6 +33,7 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advances_anywhere,
 )
+from torch_spyre._inductor.loop_info import LoopCarryRecord
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -42,6 +43,14 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+
+def is_loop_carry_storage(op: Any) -> bool:
+    """True only for storage explicitly created as a counted-loop carry."""
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
 # default. `convolution` is aten's direct-conv op name; it is listed because a

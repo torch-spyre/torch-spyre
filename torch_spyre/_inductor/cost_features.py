@@ -38,6 +38,7 @@ from .pass_utils import (
     iteration_space_from_op,
     loop_var_ranges_from_dim_hints,
     op_read_writes,
+    trip_count_estimate,
 )
 
 logger = get_logger("cost_model")
@@ -274,7 +275,7 @@ def _loop_features(op):
         return 1, False, False
     trip = 1
     for c in getattr(li, "loop_count", None) or []:
-        trip *= _int(c, 1)
+        trip *= trip_count_estimate(c)
     red_dims = getattr(li, "loop_tiled_reduction_dims", None) or []
     out_dims = getattr(li, "loop_tiled_dims", None) or []
     return (
@@ -346,7 +347,7 @@ def _tiled_symbols_per_level(op):
             p = red_map.get(_int(h, -1))
             if p is not None and p < len(it_syms):
                 syms.add(it_syms[p])
-        trip = max(1, _int(counts[lv], 1) if lv < len(counts) else 1)
+        trip = trip_count_estimate(counts[lv]) if lv < len(counts) else 1
         # ``declared`` is kept separate from ``syms`` so the two ways a level can end up
         # with no symbols are not conflated: an op that tiles NOTHING at this level
         # (declared == 0) is loop-invariant there and every arg repeats, whereas a level
@@ -674,7 +675,7 @@ def _device_run_axes(coords, dims, iteration_space, stick_planes):
             sympy.Mod(symbol, stick), r
         )
         if symbol in index.free_symbols:
-            index = index.subs(symbol, stick * q + r)
+            index = index.xreplace({symbol: stick * q + r})
         position = list(space)
         at = position.index(symbol)
         items = list(space.items())
@@ -814,7 +815,7 @@ def _split_stick_axes(coords, iteration_space, work_slices, candidates):
         coords = [
             c.xreplace(
                 {sympy.floor(symbol / stick): hi, sympy.Mod(symbol, stick): lo}
-            ).subs(symbol, stick * hi + lo)
+            ).xreplace({symbol: stick * hi + lo})
             for c in coords
         ]
         space[hi], space[lo] = planes, stick
@@ -833,8 +834,8 @@ def _operand_device_run(coords, dims, iteration_space, work_slices, candidates):
     product of the remaining symbols' extents.
     """
     present = set().union(*(sympy.sympify(c).free_symbols for c in coords))
-    unit = {s: 0 for s, size in iteration_space.items() if size == 1}
-    coords = [sympy.sympify(c).subs(unit) if unit else c for c in coords]
+    unit = {s: sympy.S.Zero for s, size in iteration_space.items() if size == 1}
+    coords = [sympy.sympify(c).xreplace(unit) if unit else c for c in coords]
     space = {
         s: size for s, size in iteration_space.items() if s in present and s not in unit
     }

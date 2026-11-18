@@ -50,6 +50,7 @@ from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     _is_matmul_op,
     op_short_name,
+    trip_count_estimate,
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.views import stick_dims_from_size
@@ -122,6 +123,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_entry,
     counted_loop_group_path,
     counted_loop_lifetime_overrides,
+    is_loop_carry_storage as _is_loop_carry_storage,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
@@ -144,7 +146,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
 from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
+    COUNTED_LOOP_INFO,
     LoopCarryRecord,
     ReadCopyElisionRecord,
 )
@@ -302,13 +304,6 @@ def _multi_output_extern_kernel_in_live_range(
     return False
 
 
-def _is_loop_carry_storage(op: Any) -> bool:
-    """True only for storage explicitly created as a counted-loop carry."""
-
-    record = getattr(op, "_loop_carry_record", None)
-    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
-
-
 def _loop_carry_mutation_target(
     op: Operation, op_by_name: Mapping[str, Operation]
 ) -> Optional[str]:
@@ -347,7 +342,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), CoarseTileInfo)
+    return isinstance(getattr(op, "loop_info", None), COUNTED_LOOP_INFO)
 
 
 def _sibling_pinned_divisions(
@@ -379,22 +374,17 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
-    concrete ``int`` -- coerced the same way ``dump_cost_model._loop_features``
-    does for this exact field: ``int()`` when it resolves to a concrete
-    value, 1 (not a propagated symbol that would later crash numeric code
-    expecting a plain float) when it doesn't.
+    concrete ``int``; :func:`trip_count_estimate` resolves it, the same way
+    ``cost_features._loop_features`` does for this field.
     """
     if not _is_coarse_tiled(op):
         return 1
 
-    def _resolved(c) -> int:
-        try:
-            return int(c)
-        except (TypeError, ValueError):
-            return 1
-
     return max(
-        1, math.prod(_resolved(level.trip_count) for level in enclosing_loops(op))
+        1,
+        math.prod(
+            trip_count_estimate(level.trip_count) for level in enclosing_loops(op)
+        ),
     )
 
 
@@ -4405,7 +4395,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
-        self._add_carry_writer_edges(
+        carry_writers = self._add_carry_writer_edges(
             graph, op_by_name, prep_cache, residency_by_buf, carry_update_edges
         )
 
@@ -4596,6 +4586,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 prep_cache,
                 residency_by_buf,
                 cd_parent_matches,
+                carry_writers=carry_writers,
             )
             for storage_name in carry_storage_names:
                 if storage_name not in parent_proj:
@@ -4730,12 +4721,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
         carry_update_edges: dict[str, ResidencyEdge],
-    ) -> None:
+    ) -> dict[str, list[str]]:
         """Give each other writer of a carry, e.g. the copy-back of an
         all_reduce_ into the loop result, the storage's ownership edge.
 
         A writer without one leaves the storage in HBM and drops every edge
-        on it. Records the writers of each storage in ``_carry_writers``.
+        on it. Records the writers of each storage in ``_carry_writers`` and
+        returns them.
         """
         self._carry_writers: dict[str, list[str]] = {}
         for writer in graph.operations:
@@ -4767,6 +4759,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if edge.buf_name == storage_name
             ]:
                 del carry_update_edges[name]
+        return self._carry_writers
 
     @staticmethod
     def _carry_writer_edge(
@@ -5291,6 +5284,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
         cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]] = None,
+        *,
+        carry_writers: Mapping[str, Sequence[str]],
     ) -> dict[str, list[RelayoutCandidate]]:
         """Priced relayout candidates for each divided producer this op reads.
 
@@ -5300,10 +5295,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         the producer could stay LX-resident by paying a shuffle - as
         :class:`RelayoutCandidate` records priced by the fitted relayout law. The division-independent edge gates (single non-indirect
         write, activation source, pointwise-or-matmul consumer, ...) mirror
-        ``collect_lx_relayout_plans``; the per-pair gates (permutation
-        compatibility, projectable ownership on both frames, the law's fitted
-        split range) live in ``solver_relayout_pair_cost``. Gated on the
-        solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
+        ``collect_lx_relayout_plans``, with one addition that only this path
+        has: the sum after a counted loop may read a copy of the loop's carry
+        (``solver_relayout_edge_context``). A carry that another op writes
+        after the loop is no source. ``carry_writers`` is what
+        ``_add_carry_writer_edges`` returns; it is a required argument, so the
+        writers are recorded before any candidate is built. The per-pair gates
+        (permutation compatibility, projectable ownership on both frames, the
+        law's fitted split range) live in ``solver_relayout_pair_cost``. Gated
+        on the solver's ``decides_lx_relayouts`` and on
+        ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
         gives a coarse-tiled parent's cap-and-rank step the other parents'
@@ -5324,6 +5325,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             # The source must be residency-eligible: a relayout keeps it in LX.
             if residency_by_buf.get(parent, "not in graph") is not None:
+                continue
+            # One copy serves every reader of its view. A carry that another op
+            # writes after the loop (the copy-back of an in-place collective)
+            # has readers before and after that write, so it is no source.
+            if parent in carry_writers:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "relayout source %s declined for %s: written after its "
+                        "loop by %s",
+                        parent,
+                        consumer_op.get_name(),
+                        ", ".join(carry_writers[parent]),
+                    )
                 continue
             parent_op = op_by_name[parent]
             padded_axis = prefix_lx_contraction_axis(parent_op, consumer_op)
