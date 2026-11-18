@@ -17,14 +17,11 @@
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
 trip count and gives every member a ``LoopShim``. This module keeps what that
-lowering and ``read_copy_elision`` share:
+lowering shares with the ``for_each_tile`` lowering:
 
   - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
   - consumer patching (``_patch_consumers``) and full-buffer allocation,
-  - ``validate_coarse_tile_groups`` / ``reject_nested_loops``,
-  - ``validate_reader_tile_advance`` / ``validate_writer_tile_advance``, which check
-    the stored ``CoarseTileInfo`` of ``for_each_tile`` ops until stage 7.4 removes
-    the stored half.
+  - ``validate_coarse_tile_groups`` / ``reject_nested_loops``.
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
 ``(hint_id, count)`` pairs, outermost first (one level only: nesting is refused).
@@ -777,150 +774,6 @@ def _divide_reduction_ranges(
 # ---------------------------------------------------------------------------
 # Transformation entry point
 # ---------------------------------------------------------------------------
-
-
-def validate_writer_tile_advance(operations: list[Operation]) -> None:
-    """Every synthesized cross-loop writer must advance at each tiled level.
-
-    For each op that is copied out of the loop or accumulated across it, the
-    real write into the full-sized output buffer happens in a synthesized
-    copy op (`coarse_tile_copy_{name}` / `coarse_tile_reduce_copy_{name}`),
-    never on the original op itself -- the original op's own
-    `output_tiled_dims` is zero (it is per-tile scratch, redrawn every iteration).
-    Only ``for_each_tile`` ops carry these stored lists now; the span-overflow
-    lowering derives the advance from the index (stage 7.4 removes this check).
-    If the synthesized copy's own `output_tiled_dims` is missing a level
-    that its `loop_tiled_dims` says it tiles, that copy's write pointer
-    would not advance at that level -- every tile after the first would
-    land on top of tile 0 (the exact bug this function is named for; see
-    _lower_reduction's fix for a concrete instance).  A flat
-    (non-nested) reduction has no synthesized copy at all: accum_full is
-    written directly by the combine op, which by construction never
-    advances (see _make_combine_buffer) since a flat reduction has no outer
-    output-dim tiling level to advance across.
-    """
-    name_to_op = {
-        op.get_name(): op for op in operations if isinstance(op, ComputedBuffer)
-    }
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        propagation = getattr(getattr(op, "loop_info", None), "propagation", None)
-        if propagation is None:
-            continue
-        buf_name = op.get_name()
-        if propagation.kind == "copy_out":
-            writer_name = f"coarse_tile_copy_{buf_name}"
-            writer = name_to_op.get(writer_name)
-            if writer is None:
-                continue
-            writer_info = writer.loop_info  # type: ignore[attr-defined]
-        elif propagation.kind == "reduction" and propagation.reduction.is_nested:
-            writer_name = f"coarse_tile_reduce_copy_{buf_name}"
-            writer = name_to_op.get(writer_name)
-            if writer is None:
-                continue
-            writer_info = writer.loop_info  # type: ignore[attr-defined]
-        elif propagation.kind == "mutation_write_back":
-            # The op itself IS the writer — check its own output_tiled_dims.
-            writer_info = op.loop_info  # type: ignore[attr-defined]
-        else:
-            continue
-        output_tiled_dims = writer_info.output_tiled_dims
-        squeezed_advance_output = (
-            getattr(writer_info, "squeezed_advance_output", None) or []
-        )
-        for level_idx, tiled_dims in enumerate(writer_info.loop_tiled_dims):
-            if not tiled_dims:
-                continue
-            level_extents = (
-                output_tiled_dims[level_idx]
-                if level_idx < len(output_tiled_dims)
-                else []
-            )
-            squeezed_level_extents = (
-                squeezed_advance_output[level_idx]
-                if level_idx < len(squeezed_advance_output)
-                else []
-            )
-            if not level_extents and not squeezed_level_extents:
-                raise RuntimeError(
-                    f"coarse_tile: writer-advance check failed for "
-                    f"{writer_name!r} -- level {level_idx} tiles output dims "
-                    f"{tiled_dims} but output_tiled_dims has no extents for "
-                    f"that level, so its write pointer would not advance "
-                    f"there."
-                )
-
-
-def validate_reader_tile_advance(operations: list[Operation]) -> None:
-    """No op may read a tiled-reduction op's own (per-tile scratch) buffer.
-
-    A Reduction op tiled over a reduction dim writes per-tile partial
-    results into its own buffer every inner iteration -- that buffer is
-    drained by the combine op and is never fully accumulated except at the
-    very last inner iteration.  Any op other than the combine/reduce-copy
-    machinery that reads it with a non-empty `tiled_dims_per_read` entry
-    would advance alongside it and observe a partially-accumulated value
-    for every iteration but the last -- silently wrong numerics.  True
-    outside consumers are already redirected by _patch_consumers to read
-    accum_full instead (see loop_tiling_lowering._lower_reduction), and legitimate
-    inside siblings get a structurally-empty tiled_dims_per_read entry for
-    this buffer (squeeze of the collapsed reduction dim, or explicit
-    zeroing) -- so this function
-    asserts that invariant holds rather than establishing it.
-    """
-    reduction_names = set()
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        propagation = getattr(getattr(op, "loop_info", None), "propagation", None)
-        if propagation is not None and propagation.kind == "reduction":
-            reduction_names.add(op.get_name())
-    if not reduction_names:
-        return
-    allowed_reader_prefixes = ("coarse_tile_combine_", "coarse_tile_reduce_copy_")
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        reader_name = op.get_name()
-        if reader_name.startswith(allowed_reader_prefixes):
-            continue
-        if reader_name in reduction_names:
-            continue
-        try:
-            reads = [
-                dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
-            ]
-        except Exception as e:
-            # This validator exists to catch otherwise-silent wrong numerics,
-            # so silently skipping an op whose deps couldn't even be computed
-            # would itself be a blind spot -- log at warning, not debug.
-            logger.warning(
-                "validate_reader_tile_advance: get_read_writes() raised for %s: %s",
-                reader_name,
-                e,
-            )
-            continue
-        loop_info = getattr(op, "loop_info", None)
-        tiled_dims_per_read = getattr(loop_info, "tiled_dims_per_read", None) or []
-        for dep_idx, dep in enumerate(reads):
-            if getattr(dep, "name", None) not in reduction_names:
-                continue
-            level_extents = (
-                tiled_dims_per_read[dep_idx]
-                if dep_idx < len(tiled_dims_per_read)
-                else []
-            )
-            if any(level_extents):
-                raise RuntimeError(
-                    f"coarse_tile: reader-advance check failed -- "
-                    f"{reader_name!r} reads tiled-reduction op {dep.name!r}'s "
-                    f"own per-tile scratch buffer with a non-empty "
-                    f"tiled_dims_per_read entry {level_extents}, so it would "
-                    f"observe a partially-accumulated value on every "
-                    f"iteration but the last."
-                )
 
 
 # ---------------------------------------------------------------------------

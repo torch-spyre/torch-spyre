@@ -48,10 +48,6 @@ from .pass_utils import (
     per_core_views_equal,
     replace_computed_buffer_body,
 )
-from .wsr.coarse_tile import (
-    validate_reader_tile_advance,
-    validate_writer_tile_advance,
-)
 
 logger = get_inductor_logger("read_copy_elision")
 
@@ -548,23 +544,6 @@ def _prove_matmul_direct_read(
     return direct_op, "proved"
 
 
-def _validate_proposal(
-    operations: list[Operation],
-    consumer: ComputedBuffer,
-    direct_op: ComputedBuffer,
-    copy_op: ComputedBuffer,
-) -> str | None:
-    proposed = [
-        direct_op if op is consumer else op for op in operations if op is not copy_op
-    ]
-    try:
-        validate_writer_tile_advance(proposed)
-        validate_reader_tile_advance(proposed)
-    except Exception as exc:
-        return f"coarse-tile validation failed: {exc}"
-    return None
-
-
 def project_transport_read_copies(graph, division_splits, *, relayout_sources=()):
     """Non-mutating cost view of transport copies removable for every candidate.
 
@@ -613,9 +592,6 @@ def project_transport_read_copies(graph, division_splits, *, relayout_sources=()
             commit_iteration_space_ownership(candidate, splits)
             direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)
             if direct_op is None:
-                break
-            if _validate_proposal(operations, consumer, direct_op, copy_op) is not None:
-                direct_op = None
                 break
         if direct_op is not None:
             operations = [
@@ -674,15 +650,6 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 detail,
             )
             continue
-        validation_error = _validate_proposal(operations, consumer, direct_op, copy_op)
-        if validation_error is not None:
-            logger.debug(
-                "read-copy elision declined for %s: %s",
-                record.consumer_name,
-                validation_error,
-            )
-            continue
-
         replacement = replace_computed_buffer_body(
             consumer,
             direct_op.data,
