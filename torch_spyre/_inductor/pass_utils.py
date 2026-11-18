@@ -100,6 +100,8 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
+    convert_modular_indexing,
+    find_repeat_vars,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -2940,16 +2942,8 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
-def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
-    """Return True if all tensors are stick-compatible.
-
-    coords: list of device_coordinates() results, one per tensor.
-
-    Compatible means: the union of stick variables (free symbols in the last
-    device coordinate) across all tensors has at most one element, and is
-    disjoint from the union of nonstick variables (free symbols in all other
-    device coordinates, excluding each tensor's own stick variable).
-    """
+def _stick_compatible_from_coords(coords: "list[list[sympy.Expr]]") -> bool:
+    """Old coordinate-based stick_compatible — kept for dual-path validation."""
     stick_vars: set[sympy.Symbol] = set()
     nonstick_vars: set[sympy.Symbol] = set()
     for dc in coords:
@@ -2957,6 +2951,63 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
         stick_vars |= tensor_stick_vars
         for coord in dc[:-1]:
             nonstick_vars |= coord.free_symbols - tensor_stick_vars
+    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+
+
+def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol | None":
+    """Return the loop variable that iterates on the stick, or None.
+
+    Uses the STL's stride_map[-1] (the host stride mapped to the stick
+    device dimension) to identify which symbol in dep.index has that
+    coefficient.  Returns None for broadcast (stride_map[-1] == 0) or
+    when no loop variable matches.
+    """
+    stick_stride = int(stl.stride_map[-1])
+    if stick_stride == 0:
+        return None
+    index = concretize_index(dep.index, set(dep.ranges))
+    index = convert_modular_indexing(index)
+    for sym in index.free_symbols:
+        if sym in dep.ranges and index.coeff(sym) == stick_stride:
+            return sym
+    # Repeat/mod case: use find_repeat_vars to classify Mod-based variables.
+    # Covers repeat ops where dep.index has the form k*Mod(d0,M) + Mod(d1,eps).
+    eps = stl.elems_per_stick()
+    index_vars = {s: dep.ranges[s] for s in dep.ranges if s in index.free_symbols}
+    repeat_info = find_repeat_vars([index], index_vars)
+    for var, info in repeat_info.items():
+        if info["kind"] == "mod":
+            mod_int = int(info["modulus"])
+            if mod_int == stick_stride or (stick_stride == 1 and mod_int % eps == 0):
+                return var
+        elif info["kind"] == "mul_mod":
+            if int(info["coeff"]) == stick_stride:
+                return var
+    return None
+
+
+def stick_compatible(
+    pairs: "list[tuple[SpyreTensorLayout, MemoryDep]]",
+) -> bool:
+    """Return True if all tensors are stick-compatible.
+
+    Compatible means: the union of stick variables across all tensors has at
+    most one element, and is disjoint from the union of non-stick variables
+    (all other loop variables in each tensor's index).
+    """
+    stick_vars: set[sympy.Symbol] = set()
+    nonstick_vars: set[sympy.Symbol] = set()
+    for stl, dep in pairs:
+        sv = stick_var_from_dep(stl, dep)
+        if sv is not None:
+            stick_vars.add(sv)
+        all_vars = {
+            s
+            for s in dep.index.free_symbols
+            if s in dep.ranges and not is_indirect(s.name)
+        }
+        nonstick = all_vars - ({sv} if sv else set())
+        nonstick_vars |= nonstick
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
@@ -3053,6 +3104,9 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    # stick_compatible no longer needs device coordinates (uses STL+dep
+    # directly), but the offset and factorized-layout-mismatch checks
+    # below still do.  Eliminating those is future work.
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         # The layouts has a stick expression the backend cannot
@@ -3089,11 +3143,14 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    if (
-        not factorized_layout_mismatch
-        and in_stick_offset_free
-        and stick_compatible([idc, out_idc])
-    ):
+    _old_sc = _stick_compatible_from_coords([idc, out_idc])
+    _new_sc = stick_compatible([(in_stl, in_dep), (out_stl, out_dep)])
+    assert _old_sc == _new_sc, (
+        f"stick_compatible mismatch: old={_old_sc} new={_new_sc}\n"
+        f"  in_stl={in_stl} in_dep.index={in_dep.index}\n"
+        f"  out_stl={out_stl} out_dep.index={out_dep.index}"
+    )
+    if not factorized_layout_mismatch and in_stick_offset_free and _new_sc:
         return False, None
 
     # ReStickifyOpHBM supports the DL16 format (FP16/BF16 both map to

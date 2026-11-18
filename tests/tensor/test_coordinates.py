@@ -1441,5 +1441,184 @@ class TestFlatDenseProjectionLayout(TestCase):
         self.assertIsNone(result)
 
 
+class TestStickVarFromDep(TestCase):
+    """Tests for stick_var_from_dep — extracts the stick loop variable
+    from an STL + MemoryDep without computing full device coordinates."""
+
+    def test_broadcast_returns_none(self):
+        """stride_map[-1] == 0 means broadcast on the stick — no stick var."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        # 2D device layout: [num_sticks, eps], stride_map[-1]=0 (broadcast)
+        stl = SpyreTensorLayout([4, 64], [1, 0], get_device_dtype(torch.float16))
+        dep = MemoryDep("buf0", d0, (d0,), (4,))
+        result = stick_var_from_dep(stl, dep)
+        self.assertIsNone(result)
+
+    def test_simple_innermost_stride1(self):
+        """stride_map[-1] == 1: the symbol with coefficient 1 is the stick var."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # [N, 64] row-major: stride_map = [64, 1]
+        stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (4, 64))
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d1)
+
+    def test_non_unit_stride(self):
+        """stride_map[-1] == stride for a non-innermost host dim on the stick."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # Transposed layout: host dim with stride 4 feeds the stick
+        # device_size = [64, 64], stride_map = [1, 4]
+        stl = SpyreTensorLayout([64, 64], [1, 4], get_device_dtype(torch.float16))
+        dep = MemoryDep("buf0", d0 + d1 * 4, (d0, d1), (64, 64))
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d1)
+
+    def test_scalar_index_returns_none(self):
+        """A scalar tensor (index = 0) has no stick var."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        stl = SpyreTensorLayout([1, 64], [0, 0], get_device_dtype(torch.float16))
+        dep = MemoryDep("buf0", sympy.S.Zero, (), ())
+        result = stick_var_from_dep(stl, dep)
+        self.assertIsNone(result)
+
+    def test_factorized_var_still_returned(self):
+        """stick_var_from_dep returns the symbol even when range > elems_per_stick.
+
+        The factorized case (loop var spans both stick and outer device dim)
+        is for stick_compatible to reject — stick_var_from_dep just identifies
+        the variable and must not add a range guard of its own.
+        """
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # d1 has range 128 > 64 eps: factorized layout.
+        stl = SpyreTensorLayout([2, 64], [64, 1], get_device_dtype(torch.float16))
+        dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (2, 128))
+        result = stick_var_from_dep(stl, dep)
+        # stick_var_from_dep must return d1; stick_compatible does not reject it.
+        self.assertEqual(result, d1)
+
+
+class TestStickCompatibleWithoutCoords(TestCase):
+    """Tests for stick_compatible with (STL, MemoryDep) pairs."""
+
+    def test_two_tensors_same_stick_var(self):
+        """Two tensors with the same loop var on the stick — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        dep_a = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_b = MemoryDep("b", d0 * 64 + d1, (d0, d1), (4, 64))
+        self.assertTrue(stick_compatible([(stl, dep_a), (stl, dep_b)]))
+
+    def test_broadcast_and_dense_compatible(self):
+        """One broadcast tensor + one dense tensor — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        dense_stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        bcast_stl = SpyreTensorLayout([4, 64], [0, 0], get_device_dtype(torch.float16))
+        dep_dense = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_bcast = MemoryDep("b", d0, (d0,), (4,))
+        self.assertTrue(
+            stick_compatible([(dense_stl, dep_dense), (bcast_stl, dep_bcast)])
+        )
+
+    def test_different_stick_vars_incompatible(self):
+        """Two tensors with different loop vars on the stick — incompatible.
+
+        stl_a has stride_map[-1]=1, index d0*64+d1 → stick var is d1 (coeff 1).
+        stl_b has stride_map[-1]=1, index d1*4+d0 → stick var is d0 (coeff 1).
+        Different stick vars → incompatible.
+        """
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        stl_a = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        stl_b = SpyreTensorLayout([64, 4], [4, 1], get_device_dtype(torch.float16))
+        dep_a = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_b = MemoryDep("b", d1 * 4 + d0, (d0, d1), (64, 4))
+        self.assertFalse(stick_compatible([(stl_a, dep_a), (stl_b, dep_b)]))
+
+    def test_factorized_var_compatible(self):
+        """Stick var range > elems_per_stick is still compatible.
+
+        A large range means the loop variable spans more than one stick, but
+        the old coordinate-based stick_compatible considers this compatible —
+        the backend handles it correctly.  Range alone does not make a layout
+        incompatible; only having *different* stick variables across tensors does.
+        """
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # d1 ranges over 128 > 64 eps but both tensors share the same stick var
+        stl = SpyreTensorLayout([2, 64], [64, 1], get_device_dtype(torch.float16))
+        dep = MemoryDep("a", d0 * 64 + d1, (d0, d1), (2, 128))
+        stl_out = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        dep_out = MemoryDep("out", d0 * 64 + d1, (d0, d1), (4, 64))
+        self.assertTrue(stick_compatible([(stl, dep), (stl_out, dep_out)]))
+
+    def test_repeat_mod_indexed_stick(self):
+        """Mod(d1, eps) in index — stick var is d1 even without linear coeff."""
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # Repeat input: device_size=[1,2,64], stride_map=[64,64,1]
+        stl = SpyreTensorLayout(
+            [1, 2, 64], [64, 64, 1], get_device_dtype(torch.float16)
+        )
+        # index = 64*Mod(d0,2) + Mod(d1,64) — repeat pattern
+        dep = MemoryDep(
+            "buf0",
+            64 * sympy.Mod(d0, 2) + sympy.Mod(d1, 64),
+            (d0, d1),
+            (6, 128),
+        )
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d1)
+
+    def test_repeat_fp32_mod_indexed_stick(self):
+        """Mod(d0, 64) with fp32 stl (eps=32) — modulus is a multiple of eps."""
+        from torch._inductor.ir import ModularIndexing
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        # fp32 repeat: device_size=[2,32], stride_map=[32,1], eps=32
+        # index = ModularIndexing(d0, 1, 64) → Mod(d0, 64)
+        # modulus 64 is a multiple of eps 32 → d0 is the stick var
+        stl = SpyreTensorLayout([2, 32], [32, 1], get_device_dtype(torch.float32))
+        dep = MemoryDep("buf0", ModularIndexing(d0, 1, 64), (d0,), (128,))
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d0)
+
+    def test_repeat_input_compatible_with_dense_output(self):
+        """Repeat input (Mod-indexed stick) + dense output with same stick var — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        in_stl = SpyreTensorLayout(
+            [1, 2, 64], [64, 64, 1], get_device_dtype(torch.float16)
+        )
+        in_dep = MemoryDep(
+            "arg0",
+            64 * sympy.Mod(d0, 2) + sympy.Mod(d1, 64),
+            (d0, d1),
+            (6, 128),
+        )
+        out_stl = SpyreTensorLayout(
+            [6, 8, 64], [64, 384, 1], get_device_dtype(torch.float16)
+        )
+        out_dep = MemoryDep("buf0", d0 * 384 + d1, (d0, d1), (6, 128))
+        self.assertTrue(stick_compatible([(in_stl, in_dep), (out_stl, out_dep)]))
+
+
 if __name__ == "__main__":
     run_tests()
