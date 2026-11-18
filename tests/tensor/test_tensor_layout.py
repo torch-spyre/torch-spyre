@@ -1898,6 +1898,8 @@ class TestComputeValidElements(TestCase):
     @parametrize(
         "device_size, valid_elements",
         [
+            # {} (valid extents unknown) stays accepted: the v1-v3 pickles load with it.
+            ([4, 512, 64], {}),
             ([4, 512, 64], {(0, 2): 256, (1,): 512}),
             ([4, 512, 64], {(0, 2): 200, (1,): 7}),
             ([4, 512, 64], {(0, 2): 0, (1,): 0}),
