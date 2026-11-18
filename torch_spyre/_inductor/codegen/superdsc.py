@@ -1336,28 +1336,32 @@ _QFP8WT_ROWS_PER_STICK = 2
 
 def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
     """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
-    return (
-        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
-    )
+    return arg.element_arrangement == ElementArrangement.QFP8WT and op != FP8TODL16_OP
 
 
-def _check_qfp8wt_offset(arg: TensorArg) -> None:
+def _check_qfp8wt_offset(arg: TensorArg, reject_column_offset: bool) -> None:
     """Reject a QFP8WT offset that cannot be addressed.
 
     An odd K start falls inside a stick, and offsets on other axes (column
-    slices) are not modelled; either would read the wrong data.
+    slices) are not modelled for every op; either would read the wrong data.
     """
     origin = [
-        c.xreplace({s: Integer(0) for s in c.free_symbols})
+        None
+        if isinstance(c, IndirectAccess)
+        else c.xreplace({s: Integer(0) for s in c.free_symbols})
         for c in arg.device_coordinates
     ]
     k_axis = len(origin) - 2
-    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+    if k_axis < 0:
+        return
+    if reject_column_offset and any(
+        o is not None and o != 0 for axis, o in enumerate(origin) if axis != k_axis
+    ):
         raise Unsupported(
             f"a column offset into a QFP8WT weight (device origin {origin}); "
             "only a row slice of a QFP8WT weight is supported"
         )
-    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
+    if origin[k_axis] is not None and origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
         raise Unsupported(
             f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
             f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
@@ -1423,7 +1427,7 @@ def _create_sdsc_tensors(
     for i, arg in enumerate(op_spec.args):
         is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
         if is_qfp8wt_2d_stick:
-            _check_qfp8wt_offset(arg)
+            _check_qfp8wt_offset(arg, op_spec.op in FP8_2D_STICK_OPS)
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1638,18 +1642,9 @@ def _create_sdsc_tensors(
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
 
-        # QFP8WT tensors are stored as sticks of 2 K rows x 64 N columns, so the
-        # K axis (device coordinate -2) advances one stick per *pair* of rows.
-        # The device-coordinate offset counts rows; it is halved below to count
-        # sticks. Ops in FP8_2D_STICK_OPS halve it through is_qfp8wt_2d_stick
-        # instead; this covers the other ops that use the 2D stick (identity).
+        # The K axis of a QFP8WT 2D stick is device coordinate -2.
         qfp8wt_k_sym = None
-        if (
-            arg.element_arrangement == ElementArrangement.QFP8WT
-            and op_spec.op != FP8TODL16_OP
-            and not is_qfp8wt_2d_stick
-            and len(arg.device_coordinates) >= 2
-        ):
+        if is_qfp8wt_2d_stick and len(arg.device_coordinates) >= 2:
             _k_syms = arg.device_coordinates[-2].xreplace(symbol_mapping).free_symbols
             if len(_k_syms) == 1:
                 qfp8wt_k_sym = next(iter(_k_syms))
@@ -1781,13 +1776,6 @@ def _create_sdsc_tensors(
                 and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
-                if dim == qfp8wt_k_sym:
-                    if dim_offset % 2:
-                        raise ValueError(
-                            f"QFP8WT tensor sliced at odd K offset {dim_offset}; "
-                            "the 2-row stick cannot start mid-pair"
-                        )
-                    dim_offset //= 2
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
                 n_coords = len(arg.device_coordinates)
                 if is_qfp8wt_2d_stick and coord_idx % n_coords == n_coords - 2:

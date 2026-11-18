@@ -2367,7 +2367,7 @@ class TestFp8Qfp8wtSliceCopy:
             buf[1:65].copy_(qb[1:65])
             return torch.ops.aten._scaled_mm(qa, buf, **self._SCALED_MM)
 
-        with pytest.raises(Exception, match="odd K offset"):
+        with pytest.raises(Exception, match="multiple of 2 rows"):
             torch.compile(fn)(qa, qb, buf)
 
 
