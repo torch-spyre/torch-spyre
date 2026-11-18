@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helpers of the loop-tiling lowering, and the ``CoarseTileInfo`` validators.
+"""Helpers of the loop-tiling lowering.
 
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
@@ -158,18 +158,14 @@ def reject_nested_loops(groups: list[tuple], source: str) -> None:
     """Raise ``Unsupported`` for a group that nests more than one loop level.
 
     Span-overflow tiling and the allocator's own tiling build their groups for
-    ``tile_groups``. That transform still takes several levels, and
-    the unit tests drive it that way. This refusal is for the lowering that is
-    meant to replace it, which builds one standalone ``LoopNode`` per group and is
-    NOT built yet: until it is, a nested group is refused here so that scope is
-    fixed before the replacement is written (#6088). Lifting it means building
+    ``tile_groups``, which lowers one loop level per group (one standalone
+    ``LoopNode``). A nested group is refused (#6088); lifting that means building
     nested nodes, one induction variable per level.
 
-    Called by the two production callers, not by the transform: it is also driven
-    directly with several levels by about 25 unit tests, and a ``for_each_tile``
-    nest never reaches either caller (``span_overflow_groups`` skips an op that
-    carries ``dim_hints``). A third caller of the transform would not be
-    covered. ``source`` names the caller in the message.
+    Called by the two production callers and by ``build_loop_tiling_plan``; a
+    ``for_each_tile`` nest never reaches either caller (``span_overflow_groups``
+    skips an op that carries ``dim_hints``). ``source`` names the caller in the
+    message.
     """
     for group_ops, levels in groups:
         if len(levels) > 1:
@@ -178,11 +174,6 @@ def reject_nested_loops(groups: list[tuple], source: str) -> None:
                 f"{source}: nested loop tiling is not supported in this release "
                 f"({len(levels)} levels over {names}; #6088)"
             )
-
-
-# ---------------------------------------------------------------------------
-# Cache-invalidation helpers
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

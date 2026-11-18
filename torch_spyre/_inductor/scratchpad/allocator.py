@@ -3161,13 +3161,11 @@ def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> Non
         op = op_by_name.get(buf.name)
         info = getattr(op, "loop_info", None)
         group = getattr(info, "loop_group_id", None)
-        propagation = getattr(info, "propagation", None)
         logger.debug(
-            "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+            "solver_out: %s group=%s loop=%s div=%s tiling=%s lx=%s "
             "size=%s committed=%s",
             buf.name,
             group if group is not None else "-",
-            getattr(propagation, "kind", "-"),
             getattr(info, "loop_count", "-"),
             cd.label if cd is not None else "-",
             cd.tiling.label if cd is not None else "-",

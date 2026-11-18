@@ -440,27 +440,6 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     return ConstraintResult(blocked=set(window_dims))
 
 
-# Generated scratch-copy ops (loop_tiling_lowering.py's _lower_reduction) inherit their tiled dims from the sizing op they
-# copy for, but their own write is per-tile scratch reused in place and
-# never advances (a scratch tile the loop rewrites every trip) -- no sibling op
-# in the fused loop body depends on which cores a copy op's OWN internal
-# work is split across the way it depends on a self-planning op's shared
-# coarse-tile-local loop variable. A copy op's read, by contrast, is often
-# into the full, un-tiled source tensor, so splitting its tile-local dims
-# across cores is exactly what lets the normal per-core span-limit search
-# (raise_if_per_core_overflow) shrink that read's footprint -- pinning them
-# to 1 forecloses that and can make an otherwise-legal plan look
-# Unsupported (confirmed: test_copy_running_max_4d_H4_Lq4 fails with
-# "per-core tensor span ... exceeds hardware limit" once its read-copy op's
-# H/Lq dims are pinned, and passes once they aren't).
-#
-# These prefixes are matched cross-module against names coarse_tile.py
-# constructs via V.graph.qualify_name: "coarse_tile_reduce_copy_..." in
-# _lower_reduction and its _make_combine_buffer/reduction-drain
-# call sites. If the naming site changes, update this tuple to match.
-_GENERATED_COPY_OP_PREFIXES = ("coarse_tile_reduce_copy_",)
-
-
 # Set on an operation whose coarse tiling and core division were chosen by one
 # solver, together. It exempts the op from
 # :func:`coarse_tile_local_dim_split_domains`, whose pin guards against
@@ -526,12 +505,6 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    Skips generated scratch-copy ops entirely (see
-    ``_GENERATED_COPY_OP_PREFIXES``): a copy op's own tile-local dims are not
-    shared, cross-op, ownership the way a self-planning op's loop variable
-    is, and pinning them can defeat the per-core span-limit search on a copy
-    whose read spans the full, un-tiled source tensor.
-
     ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
@@ -593,9 +566,6 @@ def coarse_tile_local_dim_split_domains(
 
     if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
         return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
-
-    if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
-        return ConstraintResult()
 
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
     hinted_syms = _hinted_work_div_syms(ctx)

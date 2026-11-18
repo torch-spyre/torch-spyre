@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 # The ops this lowering adds keep the names ``coarse_tile_copy_<buf>``,
 # ``coarse_tile_fill_<buf>`` and ``coarse_tile_combine_<buf>``. No source file keys on
 # those prefixes (comments mention them); 19 test files match them, so the names stay
-# until the legacy transform is deleted and the tests are rewritten together.
+# until those tests are rewritten together (stage 9).
 
 
 @dataclass(frozen=True)
@@ -141,8 +141,8 @@ def build_loop_tiling_plan(
 ) -> LoopTilingPlan:
     """Plan ``groups`` (``(ops, [(hint_id, trip_count)])``) without touching the IR.
 
-    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for: a nested group (one loop level only),
-    reduction tiling while ``config.enable_reduction_tiling`` is off, a mixed or
+    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for:
+    a nested group (one loop level only), reduction tiling while ``config.enable_reduction_tiling`` is off, a mixed or
     multi-dim reduction level, an op that reads a reduction before it is complete,
     and a matmul tiled across a broadcast batch.
     """
@@ -489,8 +489,8 @@ def _tile_step(
     # in the symbol (``d0 + 7*floor(d0/8)``), and a symbolic one (``d0*d1``) has none.
     # The kernel reads the same advance back from the final index
     # (``loop_facts._loop_coefficient``, which evaluates it at u = 0, 1, 2); for the
-    # ``step * u`` term added here the two agree by construction, and the parity tests
-    # check that they agree on real graphs.
+    # ``step * u`` term added here the two agree by construction, and
+    # ``test_loop_index_advance`` checks that they agree on real graphs.
     delta = sympy.simplify(dep.index.xreplace({symbol: symbol + extent}) - dep.index)
     if delta.free_symbols:
         raise Unsupported(

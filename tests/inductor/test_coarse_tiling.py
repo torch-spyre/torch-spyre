@@ -133,6 +133,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_stride,
 )
 from utils_inductor import (
+    expects_raise,
     ir_computed_buffer,
     ir_input_loader,
     patch_tiling_helper,
@@ -8510,13 +8511,9 @@ class TestDerivedBases(unittest.TestCase):
 
 
 class TestApplyTilingsEquivalence(unittest.TestCase):
-    """``apply_tilings`` reduces to the hint path.
-
-    Both paths call the same tile_groups(); the pass just builds
-    its (groups, group_idx_offset, dim_hints) inputs from a TileSpec instead of
-    pre-stamped hints. Feeding structurally identical inputs to the identical function
-    yields identical output, which is asserted end-to-end here on the stamped
-    loop_info and the divided ranges.
+    """``apply_tilings`` builds the groups, hint ids and dim hints from a TileSpec
+    and hands them to ``tile_groups``; these tests pin what it leaves on the ops
+    (hint ids, group ids, divided ranges, ``symbols_on_tile``) and what it refuses.
     """
 
     def setUp(self):
@@ -8545,14 +8542,6 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(len(ranges))]
         op.dim_hints = []
         return op
-
-    def _loop_fields(self, op):
-        li = op.loop_info
-        return (
-            tuple(li.loop_group_id),
-            list(li.loop_count),
-            [list(x) for x in li.loop_tiled_dims],
-        )
 
     def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
         spec = TileSpec((TileAxis(0, 4),))
@@ -8602,9 +8591,44 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
-            self.assertFalse(
-                hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
+            self.assertFalse(hasattr(op, "loop_info"))
+            self.assertEqual(op.data.ranges[0], Integer(64))
+
+    def test_a_single_level_spec_divides_the_range_and_keeps_its_symbol(self):
+        got = self._bare([256], "op0")
+        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
+        self.assertEqual(got.data.ranges[0], Integer(64))
+        self.assertEqual(tuple(got.loop_info.loop_group_id), (0,))
+        self.assertEqual(list(got.loop_info.loop_count), [Integer(4)])
+        # The tile still iterates dim 0, so its one symbol is the one it had.
+        c0 = sympy.Symbol("c0")
+        self.assertEqual(got.symbols_on_tile, {c0: c0})
+
+    @expects_raise
+    def test_a_nest_is_refused_by_apply_tilings(self):
+        """The lowering builds one standalone loop per group (#6088).
+
+        TODO(#6088): when nested loops are supported this becomes a positive test:
+        ranges ``[64, 64]`` and two loop levels."""
+        got = self._bare([256, 128], "op0")
+        with self.assertRaisesRegex(
+            Unsupported, r"allocator coarse tiling: nested loop tiling.*#6088"
+        ):
+            apply_tilings(
+                {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
             )
+
+    @expects_raise
+    def test_a_group_that_is_not_contiguous_is_refused(self):
+        """A gap in the operation list means a dependency crosses the group; the
+        lowering says so before it divides anything."""
+        ops = [
+            _make_hinted_op(_make_pointwise([Integer(32)]), f"op{i}", hints=((0, 0),))
+            for i in range(3)
+        ]
+        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
+            tile_groups(_graph(ops), [([ops[0], ops[2]], [(0, Integer(4))])])
+        self.assertEqual([op.data.ranges[0] for op in ops], [Integer(32)] * 3)
 
 
 class TestApplyTilingsRegionRefusal(unittest.TestCase):

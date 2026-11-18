@@ -1007,8 +1007,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         stored per-read fields are deleted (stage 7.4) the record is still built, and
         the two must agree: a difference is a compiler bug (a pass edited one source
         and not the other), so it raises instead of emitting a kernel that advances
-        by the wrong amount. Every other op (span-overflow and the allocator's
-        tiling have no loop variable) keeps the record.
+        by the wrong amount. Every other op keeps the record.
         """
         ir_node = self.current_node.node
         if isinstance(getattr(ir_node, "loop_info", None), LoopShim):
