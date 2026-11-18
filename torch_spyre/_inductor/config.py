@@ -17,6 +17,7 @@ import math
 import os
 import sys
 from typing import Literal
+import warnings
 
 from torch.utils._config_module import install_config_module
 
@@ -336,6 +337,24 @@ ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
+
+# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
+# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
+# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
+# the CoarseTileInfo transform is deleted.
+def _choose_loop_tiling_lowering(value: str) -> str:
+    if value not in ("legacy", "plan"):
+        raise ValueError(
+            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
+            "'plan'"
+        )
+    return value
+
+
+loop_tiling_lowering: str = _choose_loop_tiling_lowering(
+    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
+)
+
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
 # hardware limitation that can't support it) makes planning treat any op
@@ -545,6 +564,40 @@ _cache_config_ignore_prefix: list[str] = [
     "timing",
     "dump_cost_expr_file",
     "spyre_kernel_cache",
+    # Read at call time; the generated code is the same for every value.
+    "precomputed_kernel_key",
 ]
+
+
+def _precomputed_kernel_key_from_env() -> str:
+    value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return "1"
+    if normalized == "verify":
+        return "verify"
+    if normalized not in ("", "0", "false", "no"):
+        warnings.warn(
+            "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY must be 1/true/yes, verify or "
+            f"0/false/no, got {value!r}; leaving it off",
+            stacklevel=2,
+        )
+    return "0"
+
+
+# Trust the kernel-cache key that codegen stored in the generated wrapper.
+# Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
+# (None when it could not be computed): <key> is compute_specs_hash() of the
+# call's specs and pool_size, <fp> a fingerprint of everything else that key
+# depends on (see kernel_key_fingerprint in torch_spyre.execution.kernel_cache
+# for the list). With the kernel cache on and this set to "1",
+# sdsc() uses <key> when <fp> matches the running process instead of
+# regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
+# mismatch falls back to compute_specs_hash(). "verify" computes both and
+# raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
+# time; the generated code is the same for every value, so it is left out of
+# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
+# (true and yes work too). Any other value warns and leaves it off.
+precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
 
 install_config_module(sys.modules[__name__])
