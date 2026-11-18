@@ -1585,6 +1585,20 @@ class TestStickCompatibleWithoutCoords(TestCase):
         result = stick_var_from_dep(stl, dep)
         self.assertEqual(result, d1)
 
+    def test_repeat_fp32_mod_indexed_stick(self):
+        """Mod(d0, 64) with fp32 stl (eps=32) — modulus is a multiple of eps."""
+        from torch._inductor.ir import ModularIndexing
+        from torch_spyre._inductor.pass_utils import stick_var_from_dep
+
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        # fp32 repeat: device_size=[2,32], stride_map=[32,1], eps=32
+        # index = ModularIndexing(d0, 1, 64) → Mod(d0, 64)
+        # modulus 64 is a multiple of eps 32 → d0 is the stick var
+        stl = SpyreTensorLayout([2, 32], [32, 1], get_device_dtype(torch.float32))
+        dep = MemoryDep("buf0", ModularIndexing(d0, 1, 64), (d0,), (128,))
+        result = stick_var_from_dep(stl, dep)
+        self.assertEqual(result, d0)
+
     def test_repeat_input_compatible_with_dense_output(self):
         """Repeat input (Mod-indexed stick) + dense output with same stick var — compatible."""
         from torch_spyre._inductor.pass_utils import stick_compatible

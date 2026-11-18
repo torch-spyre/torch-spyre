@@ -2978,7 +2978,7 @@ def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol 
     for var, info in repeat_info.items():
         if info["kind"] == "mod":
             mod_int = int(info["modulus"])
-            if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
+            if mod_int == stick_stride or (stick_stride == 1 and mod_int % eps == 0):
                 return var
         elif info["kind"] == "mul_mod":
             if int(info["coeff"]) == stick_stride:
