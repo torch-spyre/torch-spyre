@@ -2960,6 +2960,34 @@ def stick_var_from_dep(
     return None
 
 
+def stick_compatible_v2(
+    pairs: "list[tuple[SpyreTensorLayout, MemoryDep]]",
+) -> bool:
+    """Return True if all tensors are stick-compatible.
+
+    Equivalent to stick_compatible() but takes (STL, MemoryDep) pairs
+    instead of pre-computed device_coordinates results.
+    """
+    stick_vars: set[sympy.Symbol] = set()
+    nonstick_vars: set[sympy.Symbol] = set()
+    for stl, dep in pairs:
+        sv = stick_var_from_dep(stl, dep)
+        if sv is not None:
+            stick_vars.add(sv)
+        all_vars = {
+            s for s in dep.index.free_symbols
+            if s in dep.ranges and not is_indirect(s.name)
+        }
+        nonstick = all_vars - ({sv} if sv else set())
+        if sv is not None:
+            eps = stl.elems_per_stick()
+            rng = dep.ranges.get(sv)
+            if rng is not None and int(concretize_expr(rng)) > eps:
+                nonstick.add(sv)
+        nonstick_vars |= nonstick
+    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+
+
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     """Return True if all tensors are stick-compatible.
 
