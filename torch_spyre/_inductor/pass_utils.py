@@ -2940,9 +2940,7 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
-def stick_var_from_dep(
-    stl: SpyreTensorLayout, dep: MemoryDep
-) -> "sympy.Symbol | None":
+def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol | None":
     """Return the loop variable that iterates on the stick, or None.
 
     Uses the STL's stride_map[-1] (the host stride mapped to the stick
@@ -2976,7 +2974,8 @@ def stick_compatible(
         if sv is not None:
             stick_vars.add(sv)
         all_vars = {
-            s for s in dep.index.free_symbols
+            s
+            for s in dep.index.free_symbols
             if s in dep.ranges and not is_indirect(s.name)
         }
         nonstick = all_vars - ({sv} if sv else set())

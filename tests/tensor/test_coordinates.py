@@ -1451,9 +1451,7 @@ class TestStickVarFromDep(TestCase):
 
         d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
         # 2D device layout: [num_sticks, eps], stride_map[-1]=0 (broadcast)
-        stl = SpyreTensorLayout(
-            [4, 64], [1, 0], get_device_dtype(torch.float16)
-        )
+        stl = SpyreTensorLayout([4, 64], [1, 0], get_device_dtype(torch.float16))
         dep = MemoryDep("buf0", d0, (d0,), (4,))
         result = stick_var_from_dep(stl, dep)
         self.assertIsNone(result)
@@ -1464,9 +1462,7 @@ class TestStickVarFromDep(TestCase):
 
         d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
         # [N, 64] row-major: stride_map = [64, 1]
-        stl = SpyreTensorLayout(
-            [4, 64], [64, 1], get_device_dtype(torch.float16)
-        )
+        stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
         dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (4, 64))
         result = stick_var_from_dep(stl, dep)
         self.assertEqual(result, d1)
@@ -1478,9 +1474,7 @@ class TestStickVarFromDep(TestCase):
         d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
         # Transposed layout: host dim with stride 4 feeds the stick
         # device_size = [64, 64], stride_map = [1, 4]
-        stl = SpyreTensorLayout(
-            [64, 64], [1, 4], get_device_dtype(torch.float16)
-        )
+        stl = SpyreTensorLayout([64, 64], [1, 4], get_device_dtype(torch.float16))
         dep = MemoryDep("buf0", d0 + d1 * 4, (d0, d1), (64, 64))
         result = stick_var_from_dep(stl, dep)
         self.assertEqual(result, d1)
@@ -1489,9 +1483,7 @@ class TestStickVarFromDep(TestCase):
         """A scalar tensor (index = 0) has no stick var."""
         from torch_spyre._inductor.pass_utils import stick_var_from_dep
 
-        stl = SpyreTensorLayout(
-            [1, 64], [0, 0], get_device_dtype(torch.float16)
-        )
+        stl = SpyreTensorLayout([1, 64], [0, 0], get_device_dtype(torch.float16))
         dep = MemoryDep("buf0", sympy.S.Zero, (), ())
         result = stick_var_from_dep(stl, dep)
         self.assertIsNone(result)
@@ -1507,9 +1499,7 @@ class TestStickVarFromDep(TestCase):
 
         d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
         # d1 has range 128 > 64 eps: factorized layout.
-        stl = SpyreTensorLayout(
-            [2, 64], [64, 1], get_device_dtype(torch.float16)
-        )
+        stl = SpyreTensorLayout([2, 64], [64, 1], get_device_dtype(torch.float16))
         dep = MemoryDep("buf0", d0 * 64 + d1, (d0, d1), (2, 128))
         result = stick_var_from_dep(stl, dep)
         # stick_var_from_dep must return d1; stick_compatible does not reject it.
