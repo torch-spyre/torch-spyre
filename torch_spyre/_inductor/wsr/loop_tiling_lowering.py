@@ -224,7 +224,7 @@ def _outer_key(op: Any) -> int | None:
 def _extent(op: ComputedBuffer, tiled: TiledDim, trip: sympy.Integer) -> sympy.Integer:
     """The tile's extent along the tiled dim, from the undivided range."""
     position = tiled.position
-    size = (
+    size = sympy.sympify(
         op.data.reduction_ranges[position]
         if tiled.in_reduction
         else op.data.ranges[position]

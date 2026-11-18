@@ -19,7 +19,7 @@ These tests intentionally mirror the compiler layers used by user
 
 1. Planner: span_overflow_hint_analysis returns a selected dim and split count.
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
-3. Coarse-tile IR: coarse_tile consumes the group and stamps CoarseTileInfo.
+3. Coarse-tile IR: the lowering consumes the group and stamps a LoopShim.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
 
 Coverage in this file:
@@ -30,7 +30,7 @@ Coverage in this file:
 - planner boundary errors when no legal divisor validates post-tile span;
 - hard failure when output MemoryDep address math is unavailable;
 - adapter mapping with both constant and symbolic batch output coordinates;
-- coarse_tile stamping of ranges/layout/CoarseTileInfo;
+- the lowering's stamping of ranges/layout/LoopShim;
 - equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 
@@ -73,10 +73,11 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.wsr.coarse_tile import (
-    _apply_plan,
-    coarse_tile_post_stickify,
-    plan_coarse_tile_groups,
+from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
+from torch_spyre._inductor.wsr.loop_tiling_lowering import (
+    TiledDim,
+    build_loop_tiling_plan,
+    tile_groups,
 )
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
@@ -4086,14 +4087,13 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
         _out_coords_for_bhld,
     )
-    @config.patch({"loop_tiling_lowering": "legacy"})  # reads the legacy stamp
     def test_coarse_tile_consumes_auto_group_and_stamps_op(self):
         op = _pointwise_op(_E2E_SHAPE)
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
             groups = _apply_span_overflow(graph)
-            coarse_tile_post_stickify(graph, groups)
+            tile_groups(graph, groups)
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
@@ -4174,7 +4174,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
         ):
             groups = _apply_span_overflow(graph)
-            coarse_plan = plan_coarse_tile_groups(graph.operations, groups)
 
         self.assertEqual(groups[0][0], [bmm])
         self.assertEqual(
@@ -4182,10 +4181,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             [sympy.Integer(5), sympy.Integer(4)],
         )
         self.assertEqual([hint.is_reduction for hint in bmm.dim_hints], [False, True])
-        info = coarse_plan[id(bmm)]
-        self.assertEqual(info.loop_count, [sympy.Integer(5), sympy.Integer(4)])
-        self.assertEqual(info.loop_tiled_dims, [[1], []])
-        self.assertEqual(info.loop_tiled_reduction_dims, [[], [0]])
         self.assertEqual(list(bmm.data.ranges), [1, 20, 16, 64])
         self.assertEqual(list(bmm.data.reduction_ranges), [256])
 
@@ -5316,10 +5311,13 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
                     op, ((0, 2, True),), [_SPAN_OVERFLOW_HINT_ID]
                 )
                 levels = [(_SPAN_OVERFLOW_HINT_ID, sympy.Integer(2))]
-                plan = plan_coarse_tile_groups([op], [([op], levels)])
-                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
-                self.assertEqual(op.loop_info.loop_count, [2])
-                self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[tiled_pos]])
+                # One level only: the lowering refuses a nest, so the plan's position
+                # and the divide are checked directly.
+                (group,) = build_loop_tiling_plan([op], [([op], levels)]).groups
+                (planned,) = group.ops
+                self.assertEqual(group.trip_count, 2)
+                self.assertEqual(planned.tiled, TiledDim(tiled_pos, True))
+                _divide_reduction_ranges(op, sympy.Integer(2), [planned.tiled.position])
                 self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
 
     def test_output_only_overflow_on_reduction_op_is_not_a_reduction_tile(self):
@@ -5605,7 +5603,6 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
 class TestSpanOverflowLargeShapeContract(InductorTestCase):
     """Unit-style coverage for the real large shape used in E2E testing."""
 
-    @config.patch({"loop_tiling_lowering": "legacy"})  # reads the legacy stamp
     def test_large_shape_planner_adapter_and_coarse_tile_match_manual_hint(self):
         auto_op = _pointwise_op(_E2E_SHAPE, name="auto_buf")
         manual_op = _pointwise_op(_E2E_SHAPE, name="manual_buf")
@@ -5640,9 +5637,9 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                 self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
                 self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
-                # Layer 3: coarse_tile stamps identical per-tile IR shape.
-                coarse_tile_post_stickify(auto_graph, auto_groups)
-                coarse_tile_post_stickify(manual_graph, manual_groups)
+                # Layer 3: the lowering stamps identical per-tile IR shape.
+                tile_groups(auto_graph, auto_groups)
+                tile_groups(manual_graph, manual_groups)
 
         self.assertEqual(list(auto_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)

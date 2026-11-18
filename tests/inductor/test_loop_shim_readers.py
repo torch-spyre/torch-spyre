@@ -12,45 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Readers of a loop shim op that need the device (the device-free ones are in
-``test_loop_shim.py``).
+"""A reader that takes its facts from a shim op's index: the cost features.
 
-The cost features price an op's traffic by the levels at which its operands advance.
-For a ``CoarseTileInfo`` op that verdict is stamped in the stored lists; a
-``LoopShim`` has no lists, so the reader falls back to the index rule (an operand
-advances at a level iff its index has a nonzero coefficient on that level's loop
-variable). This test pins that the two give the same features, on real compiled ops.
+``LoopShim`` carries no per-read lists, so ``cost_features.extract_op_features`` reads
+whether an operand advances at a level from the access's index. The device-free
+accessor tests are in ``test_loop_shim.py``; this file runs the reader on the shim ops
+of real compiled graphs and checks the loop facts it reports against what the plan
+decided for each op.
 """
-
-import dataclasses
-from unittest import mock
-
-import contextlib
 
 import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
-from torch_spyre._inductor import config, passes
+from torch_spyre._inductor import passes
 from torch_spyre._inductor.cost_features import extract_op_features
-from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+from torch_spyre._inductor.loop_info import LoopShim
 from torch_spyre._inductor.loop_node import all_ops
 
 from test_span_overflow_gate import CASES, _shaped, compile_span_overflow
+from unittest import mock
 
 
-def _shim_of(info):
-    return LoopShim(
-        loop_group_id=tuple(info.loop_group_id),
-        loop_count=list(info.loop_count),
-        loop_tiled_dims=[list(d) for d in info.loop_tiled_dims],
-        loop_tiled_reduction_dims=[list(d) for d in info.loop_tiled_reduction_dims],
-    )
-
-
-def _features_both_ways(case):
-    """For each looped op of ``case``: (name, features with its CoarseTileInfo,
-    features with the equal LoopShim)."""
+def _features_of_the_looped_ops(case):
+    """``[(loop_trip, tiles_output_dim, tiles_reduction_dim, [(role, advances)])]`` of
+    every shim op of ``case``, in graph order, read straight after the lowering;
+    ``advances`` is whether that operand moves with the loop variable."""
     rows = []
     original = passes.tile_groups
 
@@ -58,116 +45,57 @@ def _features_both_ways(case):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         for op in all_ops(graph.operations):
             info = getattr(op, "loop_info", None)
-            if not isinstance(op, ComputedBuffer) or not isinstance(
-                info, CoarseTileInfo
-            ):
-                continue
-            legacy = extract_op_features(op)
-            op.loop_info = _shim_of(info)
-            try:
-                shim = extract_op_features(op)
-            finally:
-                op.loop_info = info
-            rows.append((op.get_operation_name(), legacy, shim))
+            if isinstance(op, ComputedBuffer) and isinstance(info, LoopShim):
+                features = extract_op_features(op)
+                rows.append(
+                    (
+                        features.loop_trip,
+                        features.tiles_output_dim,
+                        features.tiles_reduction_dim,
+                        [(a.role, a.advances_with_loop_var) for a in features.args],
+                    )
+                )
         return result
 
     fn, shapes, limit, *_ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with (
-        mock.patch.object(passes, "tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
+    with mock.patch.object(passes, "tile_groups", spy):
         compile_span_overflow(fn, args, limit)
     return rows
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        "pointwise_copy_out",
-        "pointwise_chain",
-        "matmul_output_tiled_n",
-        "matmul_pointwise_consumer",
-        "matmul_k_tiled",
+# case -> one row per looped op. Every op of an output-tiled group tiles an output dim,
+# the copy-out included; the K-tiled matmul tiles its reduction dim and its combine,
+# which only folds the partial result into the accumulator, tiles neither. An operand
+# advances when the loop reads a new slice of it each trip: a graph input does, the tile
+# one op leaves for the next (rewritten every trip) does not.
+_OUT, _IN, _MOVES, _STAYS = "output", "input", True, False
+EXPECTED_FEATURES = {
+    "pointwise_copy_out": [
+        (2, True, False, [(_OUT, _STAYS), (_IN, _MOVES), (_IN, _MOVES)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS)]),
     ],
-)
-def test_cost_features_of_a_shim_op_equal_those_of_its_coarsetileinfo(case):
-    rows = _features_both_ways(case)
-    assert rows, "the case formed no loop"
-    for name, legacy, shim in rows:
-        assert dataclasses.asdict(shim) == dataclasses.asdict(legacy), name
+    "pointwise_chain": [
+        (2, True, False, [(_OUT, _STAYS), (_IN, _MOVES), (_IN, _MOVES)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS), (_IN, _MOVES)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS)]),
+    ],
+    "matmul_output_tiled_n": [
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS), (_IN, _MOVES)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS)]),
+    ],
+    "matmul_pointwise_consumer": [
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS), (_IN, _MOVES)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS), (_IN, _STAYS)]),
+        (2, True, False, [(_OUT, _STAYS), (_IN, _STAYS)]),
+    ],
+    "matmul_k_tiled": [
+        (8, False, True, [(_OUT, _STAYS), (_IN, _MOVES), (_IN, _MOVES)]),
+        (8, False, False, [(_OUT, _STAYS), (_IN, _STAYS), (_IN, _STAYS)]),
+    ],
+}
 
 
-# ---------------------------------------------------------------------------
-# End to end: the same compile with the shim swapped in must not change the kernel
-# ---------------------------------------------------------------------------
-
-from test_span_overflow_gate import _relative_error  # noqa: E402
-
-
-@contextlib.contextmanager
-def _shim_swapped_in(enabled=True):
-    """Inside the block every op the transform stamped gets a ``LoopShim`` carrying
-    the same four fields in place of its ``CoarseTileInfo``, straight after the
-    transform, so every later reader (cost features, work division, LX planning,
-    the kernel) sees a shim op."""
-    original = passes.tile_groups
-
-    def spy(graph, groups, group_idx_offset=0):
-        result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
-        if enabled:
-            for op in all_ops(graph.operations):
-                info = getattr(op, "loop_info", None)
-                if isinstance(info, CoarseTileInfo):
-                    op.loop_info = _shim_of(info)
-        return result
-
-    with (
-        mock.patch.object(passes, "tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
-        yield
-
-
-def _compile(case, *, swap_in_the_shim):
-    fn, shapes, limit, *_ = CASES[case]
-    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with _shim_swapped_in(swap_in_the_shim):
-        compiled = compile_span_overflow(fn, args, limit)
-    return compiled, _relative_error(compiled.outputs, fn(*[a.float() for a in args]))
-
-
-@pytest.mark.parametrize("case", sorted(CASES))
-def test_swapping_in_the_shim_does_not_change_the_kernel(case):
-    from test_loop_tiling_parity import _assert_same_text, _comparable
-
-    with_info, error_info = _compile(case, swap_in_the_shim=False)
-    with_shim, error_shim = _compile(case, swap_in_the_shim=True)
-    assert with_shim.groups == with_info.groups
-    assert with_shim.added == with_info.added
-    # Both compiles use the legacy lowering, which does not give the same text twice
-    # (CP-SAT in the LX planner: a loaded CI runner failed this case with a strict
-    # comparison). A shim that read an advance differently changes every compile.
-    _assert_same_text(
-        lambda: _comparable(_compile(case, swap_in_the_shim=False)[0].code),
-        _comparable(with_info.code),
-        lambda: _comparable(_compile(case, swap_in_the_shim=True)[0].code),
-        _comparable(with_shim.code),
-    )
-    # Each against the fp32 reference; not against each other, which would also
-    # require the two compiles to divide the work the same way.
-    assert error_info < 2e-2 and error_shim < 2e-2
-
-
-@pytest.mark.parametrize("dim", [0, 1])
-def test_a_dim_squeezed_to_extent_one_still_advances_with_the_shim(dim):
-    """Host dim 0 of the permuted buffer tiled 8 ways is squeezed out of the copy-out
-    (no ``d{i}`` symbol survives), so nothing in ``loop_tiled_dims`` names its level;
-    only the index says it advances. Without the shim's advancing levels the level
-    symbol is never minted and the address stays pinned across the trips."""
-    from test_span_overflow_gate import _forced_one_level, _permuted
-
-    with _shim_swapped_in():
-        wrong, loops, counts = _forced_one_level((8, 8, 64, 512), [(dim, 8)], _permuted)
-    assert (loops, counts) == (1, [8]), (loops, counts)
-    assert wrong == 0.0, wrong
+@pytest.mark.parametrize("case", sorted(EXPECTED_FEATURES))
+def test_the_cost_features_of_a_shim_op_report_the_loop_the_plan_built(case):
+    assert _features_of_the_looped_ops(case) == EXPECTED_FEATURES[case]

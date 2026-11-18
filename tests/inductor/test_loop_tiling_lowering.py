@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The loop-tiling plan type and its builder (``wsr/loop_tiling_lowering.py``).
+"""The loop-tiling plan type, its builder and the lowering (``wsr/loop_tiling_lowering.py``).
 
 The plan holds positions and a trip count and nothing that can be read back from the
-graph. The builder is held to the legacy planner (``plan_coarse_tile_groups``) by
-running both at the same call, on the same undivided graph.
+graph. The builder is checked on real graphs at the call of ``tile_groups`` (the graph is
+still undivided); the lowering by what it refuses, what it builds and what the allocator
+reads after it.
 """
 
 import contextlib
 import dataclasses
-import os
 from unittest import mock
 
 import pytest
@@ -31,7 +31,6 @@ from torch._inductor.ir import ComputedBuffer
 
 from torch_spyre._inductor import config, passes
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.wsr import coarse_tile
 from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     LoopTilingGroup,
     LoopTilingPlan,
@@ -45,9 +44,6 @@ from test_span_overflow_gate import (
     _relative_error,
     CASES,
     MB,
-    _forced_one_level,
-    _permuted,
-    _plain,
     _shaped,
     compile_span_overflow,
 )
@@ -78,105 +74,59 @@ def test_the_plan_types_are_frozen_and_hold_only_positions():
     assert LoopTilingPlan((group,)).groups[0].ops[1].tiled is None
 
 
-def _legacy_position(info):
-    if info is None:
-        return None
-    if info.loop_tiled_dims[0]:
-        return (info.loop_tiled_dims[0][0], False)
-    if info.loop_tiled_reduction_dims[0]:
-        return (info.loop_tiled_reduction_dims[0][0], True)
-    return None
-
-
 @contextlib.contextmanager
-def _built_beside_the_legacy_planner(into, *, regroup=None):
-    """At every call of ``plan_coarse_tile_groups`` build the new plan from the same
-    arguments first (the graph is still undivided), then run the legacy planner.
+def _before_tile_groups(before):
+    """Call ``before(operations, groups, group_idx_offset)`` at every call of
+    ``tile_groups`` (the graph is still undivided), then let the lowering run."""
+    original = passes.tile_groups
 
-    ``into`` gets ``(legacy positions by op name, new plan or the Unsupported it
-    raised, trip counts)`` per call. ``regroup(operations, groups)`` may change the
-    groups the builder (only) is given."""
-    original = coarse_tile.plan_coarse_tile_groups
+    def spy(graph, groups, group_idx_offset=0):
+        before(graph.operations, groups, group_idx_offset)
+        return original(graph, groups, group_idx_offset)
 
-    def spy(operations, groups):
-        given = regroup(operations, groups) if regroup else groups
-        try:
-            built = build_loop_tiling_plan(operations, given)
-        except Unsupported as error:
-            built = error
-        legacy = original(operations, groups)
-        positions = {
-            o.get_operation_name(): _legacy_position(legacy.get(id(o)))
-            for ops, _ in groups
-            for o in ops
-            if isinstance(o, ComputedBuffer)
-        }
-        into.append((positions, built, [int(c) for _, lv in groups for _, c in lv]))
-        return legacy
-
-    with (
-        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
+    with mock.patch.object(passes, "tile_groups", spy):
         yield
 
 
-def _assert_same_as_legacy(calls):
-    assert calls, "the planner was never reached"
-    for positions, built, counts in calls:
-        assert isinstance(built, LoopTilingPlan), built
-        assert [g.trip_count for g in built.groups] == counts
-        for group in built.groups:
-            for op in group.ops:
-                tiled = op.tiled
-                got = None if tiled is None else (tiled.position, tiled.in_reduction)
-                assert got == positions[op.op_name], (op.op_name, got, positions)
-        # A ComputedBuffer the legacy planner left alone is in the plan with tiled=None.
-        planned = {o.op_name for g in built.groups for o in g.ops}
-        assert planned == set(positions)
+# case of ``test_span_overflow_gate.CASES`` -> the plan's tiled position of each op in
+# its one group: (dim, in_reduction), None for an op the loop does not tile. Dim 1 of a
+# matmul or bmm is its M dim; the K-tiled matmul tiles its reduction dim 0.
+EXPECTED_POSITIONS = {
+    "bmm_output_tiled": [(1, False)],
+    "matmul_add_second_input": [(1, False), (1, False)],
+    "matmul_k_tiled": [(0, True)],
+    "matmul_output_tiled_m": [(1, False)],
+    "matmul_output_tiled_n": [(1, False)],
+    "matmul_pointwise_consumer": [(1, False), (1, False)],
+    "matmul_pointwise_producer": [(1, False)],
+    "matmul_relu_consumer": [(1, False), (1, False)],
+    "pointwise_chain": [(1, False), (1, False)],
+    "pointwise_copy_out": [(1, False)],
+    "pointwise_independent_pair": [(1, False), (1, False)],
+}
 
 
-@pytest.mark.parametrize("case", sorted(CASES))
-def test_the_plan_equals_the_legacy_planners_positions_on_the_gate_cases(case):
-    fn, shapes, limit, *_ = CASES[case]
+@pytest.mark.parametrize("case", sorted(EXPECTED_POSITIONS))
+def test_the_plan_holds_the_expected_positions(case):
+    """What the builder decides for a real graph, before anything is divided: which dim
+    of each op the loop tiles and how many trips it takes."""
+    fn, shapes, limit, groups, *_ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    calls = []
-    with _built_beside_the_legacy_planner(calls):
+    plans = []
+
+    def build(operations, groups_, offset):
+        plans.append(build_loop_tiling_plan(operations, groups_, offset))
+
+    with _before_tile_groups(build):
         compile_span_overflow(fn, args, limit)
-    _assert_same_as_legacy(calls)
-    # Some case must tile an op, or the equality above is vacuous.
-    assert any(
-        o.tiled is not None
-        for _, built, _ in calls
-        for g in built.groups
-        for o in g.ops
-    )
-
-
-@pytest.mark.parametrize(
-    "make_input, levels",
-    [(_plain, [(0, 8)]), (_permuted, [(0, 8)]), (_permuted, [(1, 8)])],
-    ids=["plain-0", "permuted-0", "permuted-1"],
-)
-def test_the_plan_equals_the_legacy_planners_positions_on_forced_plans(
-    make_input, levels
-):
-    calls = []
-    with _built_beside_the_legacy_planner(calls):
-        _forced_one_level(_SHAPE, levels, make_input)
-    _assert_same_as_legacy(calls)
-
-
-def test_a_group_of_two_ops_is_planned_op_by_op():
-    fn, shapes, limit, *_ = CASES["pointwise_chain"]
-    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    calls = []
-    with _built_beside_the_legacy_planner(calls):
-        compile_span_overflow(fn, args, limit)
-    (_, built, _), *_ = calls
-    assert [len(g.ops) for g in built.groups] == [2]
-    first, second = (o.tiled for o in built.groups[0].ops)
-    assert first is not None and first == second
+    (plan,) = plans
+    (group,) = plan.groups
+    got = [
+        None if op.tiled is None else (op.tiled.position, op.tiled.in_reduction)
+        for op in group.ops
+    ]
+    assert got == EXPECTED_POSITIONS[case], got
+    assert group.trip_count == groups[0][2][0]
 
 
 def test_a_reduction_with_reduction_tiling_disabled_is_refused():
@@ -185,21 +135,16 @@ def test_a_reduction_with_reduction_tiling_disabled_is_refused():
     fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     seen = []
-    original = coarse_tile.plan_coarse_tile_groups
 
-    def spy(operations, groups):
-        build_loop_tiling_plan(operations, groups)  # fine with the flag on
+    def build_with_the_flag_off(operations, groups, offset):
+        build_loop_tiling_plan(operations, groups, offset)  # fine with the flag on
         with config.patch({"enable_reduction_tiling": False}):
             try:
-                build_loop_tiling_plan(operations, groups)
+                build_loop_tiling_plan(operations, groups, offset)
             except Unsupported as error:
                 seen.append(str(error))
-        return original(operations, groups)
 
-    with (
-        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
+    with _before_tile_groups(build_with_the_flag_off):
         compile_span_overflow(fn, args, limit)
     assert seen and "enable_reduction_tiling" in seen[0], seen
 
@@ -207,8 +152,9 @@ def test_a_reduction_with_reduction_tiling_disabled_is_refused():
 def test_a_partial_reduction_read_in_the_group_is_refused():
     """A pointwise op that reads a K-tiled reduction in the same loop would see a
     partial sum. The grouping never forms this group, so hand the builder one."""
+    seen = []
 
-    def sum_then_its_consumer(operations, groups):
+    def build_a_group_with_the_reader(operations, groups, offset):
         (ops, levels), *_ = groups
         names = {o.get_name() for o in ops if isinstance(o, ComputedBuffer)}
         consumer = next(
@@ -218,39 +164,30 @@ def test_a_partial_reduction_read_in_the_group_is_refused():
             and o not in ops
             and any(n in names for n in o.get_read_names())
         )
-        return [([*ops, consumer], levels)]
-
-    def fn(x):
-        return x.sum(dim=1) * 2
+        try:
+            build_loop_tiling_plan(operations, [([*ops, consumer], levels)], offset)
+        except Unsupported as error:
+            seen.append(str(error))
 
     x = _shaped((64, 8192), 1)
-    calls = []
-    with _built_beside_the_legacy_planner(calls, regroup=sum_then_its_consumer):
-        compile_span_overflow(fn, [x], 256 * 1024)
-    assert calls, "the planner was never reached"
-    (_, built, _), *_ = calls
-    assert isinstance(built, Unsupported), built
-    assert "partial reduction result consumed" in str(built)
+    with _before_tile_groups(build_a_group_with_the_reader):
+        compile_span_overflow(lambda x: x.sum(dim=1) * 2, [x], 256 * 1024)
+    assert seen and "partial reduction result consumed" in seen[0], seen
 
 
 def test_two_levels_are_refused():
     seen = []
-    original = coarse_tile.plan_coarse_tile_groups
 
-    def spy(operations, groups):
+    def build_two_levels(operations, groups, offset):
         ((ops, levels), *_) = groups
         try:
-            build_loop_tiling_plan(operations, [(ops, [*levels, *levels])])
+            build_loop_tiling_plan(operations, [(ops, [*levels, *levels])], offset)
         except Unsupported as error:
             seen.append(str(error))
-        return original(operations, groups)
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with (
-        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
+    with _before_tile_groups(build_two_levels):
         compile_span_overflow(fn, args, limit)
     assert seen and "nested" in seen[0].lower(), seen
 
@@ -259,33 +196,18 @@ def test_the_group_index_counts_from_the_offset():
     fn, shapes, limit, *_ = CASES["pointwise_independent_pair"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     seen = []
-    original = coarse_tile.plan_coarse_tile_groups
 
-    def spy(operations, groups):
+    def indexes(operations, groups, offset):
         seen.append(
             (
                 [g.index for g in build_loop_tiling_plan(operations, groups).groups],
                 [g.index for g in build_loop_tiling_plan(operations, groups, 5).groups],
             )
         )
-        return original(operations, groups)
 
-    with (
-        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "legacy"}),
-    ):
+    with _before_tile_groups(indexes):
         compile_span_overflow(fn, args, limit)
     assert seen == [([0], [5])], seen
-
-
-def test_the_switch_defaults_and_rejects_nonsense():
-    assert config._choose_loop_tiling_lowering("plan") == "plan"
-    assert config._choose_loop_tiling_lowering("legacy") == "legacy"
-    with pytest.raises(ValueError, match="bogus"):
-        config._choose_loop_tiling_lowering("bogus")
-    # Unset in the environment the default is the plan.
-    if "SPYRE_INDUCTOR_LOOP_TILING_LOWERING" not in os.environ:
-        assert config.loop_tiling_lowering == "plan"
 
 
 @expects_raise
@@ -307,7 +229,6 @@ def test_a_group_holding_an_op_with_loop_info_is_refused():
 
     with (
         mock.patch.object(passes, "tile_groups", spy),
-        config.patch({"loop_tiling_lowering": "plan"}),
         pytest.raises(Exception, match="existing loop_info"),
     ):
         compile_span_overflow(fn, args, limit)
@@ -315,8 +236,7 @@ def test_a_group_holding_an_op_with_loop_info_is_refused():
 
 @pytest.mark.parametrize("case", ["pointwise_copy_out", "pointwise_chain"])
 def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
-    """Every looped op carries a LoopShim, and the stage-7a.2 pass that adds terms to
-    a legacy record is not involved."""
+    """Every looped op carries a LoopShim: nothing keeps a stored per-read record."""
     from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
     from torch_spyre._inductor.loop_node import all_ops
 
@@ -335,20 +255,16 @@ def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
 
     with (
         mock.patch.object(passes, "_hand_off_loop_nodes", spy),
-        mock.patch.object(coarse_tile, "add_loop_terms") as add_loop_terms,
-        config.patch({"loop_tiling_lowering": "plan"}),
     ):
         compile_span_overflow(fn, args, limit)
     assert infos and all(isinstance(i, LoopShim) for i in infos), infos
     assert not any(isinstance(i, CoarseTileInfo) for i in infos)
-    add_loop_terms.assert_not_called()
 
 
 def _carries(fn, args, limit):
     from test_span_overflow_loop_terms import _compile_seeing_carries
 
-    with config.patch({"loop_tiling_lowering": "plan"}):
-        return _compile_seeing_carries(fn, args, limit)
+    return _compile_seeing_carries(fn, args, limit)
 
 
 def test_the_k_tiled_accumulator_is_declared_as_a_carry_under_plan():
@@ -377,26 +293,18 @@ def test_a_nested_accumulator_is_refused():
     TODO: when nested loops are supported this becomes a positive test."""
     args = [_shaped((4096, 4096), seed) for seed in range(2)]
     with (
-        config.patch({"loop_tiling_lowering": "plan"}),
         pytest.raises(Exception, match="#6088"),
     ):
         compile_span_overflow(lambda a, b: a @ b, args, 4 * MB)
 
 
 @expects_raise
-def test_an_inexpressible_group_raises_under_plan_and_does_not_run_legacy():
-    """A group the plan cannot lower raises; it does not fall back to the legacy
-    transform."""
+def test_an_inexpressible_group_raises():
+    """A group the plan cannot lower raises ``Unsupported``; nothing else runs in its
+    place."""
     fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-
-    def fail(*a, **k):
-        raise AssertionError("the legacy transform ran under the plan setting")
-
     with (
-        config.patch({"loop_tiling_lowering": "plan"}),
-        mock.patch.object(coarse_tile, "_apply_plan", fail),
-        mock.patch.object(coarse_tile, "_insert_all_reduction_ops", fail),
         mock.patch(
             "torch_spyre._inductor.wsr.loop_tiling_lowering._plan_carries",
             side_effect=Unsupported("carry cannot be declared"),
@@ -413,9 +321,9 @@ class _RecordPostCallState:
     seen: dict = {}
 
 
-def _allocator_post_call_state(lowering):
+def _allocator_post_call_state():
     """Compile ``(x + y) * 2`` with the allocator tiling every op d0 by 4, under
-    ``lowering``; per op in a loop: ``(has symbols_on_tile, joint-division flag)``."""
+    the plan; per op in a loop: ``(has symbols_on_tile, joint-division flag)``."""
     from test_solver_auto_coarse_tiling import (
         _D0_BY_4,
         CollectTilingPasses,
@@ -461,7 +369,6 @@ def _allocator_post_call_state(lowering):
                 "auto_coarse_tiling": True,
                 "layout_solver": "cpsat",
                 "allow_all_ops_in_lx_planning": True,
-                "loop_tiling_lowering": lowering,
             }
         ),
         mock.patch.object(passes, "CustomPreSchedulingPasses", Record),
@@ -471,18 +378,15 @@ def _allocator_post_call_state(lowering):
     return seen
 
 
-def test_the_post_call_contract_is_kept_under_plan():
+def test_the_post_call_contract_is_kept():
     """The allocator reads two things after the lowering returns: ``symbols_on_tile`` on
     each op it tiled, and ``JOINT_TILING_AND_DIVISION_ATTR`` on the tiled ops and on
-    the ops the lowering added. Both are set by ``apply_tilings`` around the call, so
-    they must hold under the plan exactly as under the legacy lowering."""
-    legacy = _allocator_post_call_state("legacy")
-    plan = _allocator_post_call_state("plan")
-    assert plan == legacy
-    assert plan, "no op was tiled"
-    assert any(n.startswith("coarse_tile_copy_") for n in plan), sorted(plan)
-    assert all(joint for _, joint in plan.values()), plan
-    assert any(symbols for symbols, _ in plan.values()), plan
+    the ops the lowering added. Both are set by ``apply_tilings`` around the call."""
+    state = _allocator_post_call_state()
+    assert state, "no op was tiled"
+    assert any(n.startswith("coarse_tile_copy_") for n in state), sorted(state)
+    assert all(joint for _, joint in state.values()), state
+    assert any(symbols for symbols, _ in state.values()), state
 
 
 def _mixed_graph():
@@ -517,7 +421,6 @@ def test_no_for_each_tile_op_has_a_loop_shim():
 
     with (
         mock.patch.object(passes, "_hand_off_loop_nodes", spy),
-        config.patch({"loop_tiling_lowering": "plan"}),
     ):
         compiled = compile_span_overflow(fn, args, limit)
     assert sorted(map(sorted, ([t.__name__ for t in k] for k in kinds))) == [
@@ -527,14 +430,6 @@ def test_no_for_each_tile_op_has_a_loop_shim():
     assert CoarseTileInfo and LoopShim
     x, y, a, b = (t.float() for t in args)
     assert _relative_error(compiled.outputs, (x @ y, a + b)) < 2e-2
-
-
-def test_a_for_each_tile_loop_beside_a_span_overflow_loop_matches_legacy():
-    """The ``for_each_tile`` kernel is untouched by the setting."""
-    from test_loop_tiling_parity import _assert_parity
-
-    fn, args, limit = _mixed_graph()
-    _assert_parity(fn, args, limit)
 
 
 def _stub_op(ranges):
@@ -604,22 +499,9 @@ def test_a_member_the_loop_does_not_tile_may_not_read_a_tiled_members_tile():
 
     with (
         mock.patch.object(lowering, "build_loop_tiling_plan", untile_the_consumer),
-        config.patch({"loop_tiling_lowering": "plan"}),
         pytest.raises(Exception, match="does not tile"),
     ):
         compile_span_overflow(fn, args, limit)
-
-
-def test_lx_offsets_compare_by_which_buffers_share_an_address():
-    from test_loop_tiling_parity import _comparable
-
-    two = "a allocation={'lx': 0} b allocation={'lx': 262144} c allocation={'lx': 0}"
-    swapped = (
-        "a allocation={'lx': 262144} b allocation={'lx': 0} c allocation={'lx': 262144}"
-    )
-    merged = "a allocation={'lx': 0} b allocation={'lx': 0} c allocation={'lx': 0}"
-    assert _comparable(two) == _comparable(swapped)
-    assert _comparable(two) != _comparable(merged)
 
 
 def _compile_with_menu(fn, args, menu):
@@ -723,19 +605,6 @@ def test_a_unit_row_consumer_in_the_next_nest_reads_every_row_of_a_tiled_reducti
     _one_row_consumer_reads_the_whole_producer(infos, advances)
 
 
-@expects_raise
-def test_an_unknown_lowering_setting_raises_instead_of_running_legacy():
-    """``config.patch`` can set a value the import-time check never saw; a typo must
-    not quietly select the legacy transform."""
-    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
-    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with (
-        config.patch({"loop_tiling_lowering": "plna"}),
-        pytest.raises(Exception, match="plna"),
-    ):
-        compile_span_overflow(fn, args, limit)
-
-
 def _with_plan(rewrite):
     """Patch ``build_loop_tiling_plan`` as the dispatch calls it, so ``rewrite(plan,
     operations)`` can hand the lowering a plan the builder would not have made."""
@@ -766,7 +635,6 @@ def test_a_trip_count_that_does_not_divide_the_tiled_range_is_refused():
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     with (
         _with_plan(trip_of_three),
-        config.patch({"loop_tiling_lowering": "plan"}),
         pytest.raises(
             Exception, match="lower_loop_tiling: .*not divisible by loop_count"
         ),
@@ -804,7 +672,6 @@ def test_a_loop_member_may_not_read_a_reductions_partial_result():
     x = _shaped((64, 8192), 1)
     with (
         _with_plan(add_the_reader),
-        config.patch({"loop_tiling_lowering": "plan"}),
         pytest.raises(Exception, match="partial result"),
     ):
         compile_span_overflow(lambda x: x.sum(dim=1) * 2, [x], 256 * 1024)
@@ -841,3 +708,18 @@ def test_both_callers_tile_through_tile_groups():
         _compile_with_menu(lambda x, y: (x + y) * 2, (x, y), lambda op: [by_four])
     assert seen["passes"] and all(n >= 1 for n in seen["passes"]), seen
     assert seen["coarse_tiling"] and all(n >= 1 for n in seen["coarse_tiling"]), seen
+
+
+def test_a_plain_int_range_is_a_range():
+    """Ranges built by hand (and by some lowerings) can be Python ints, not sympy
+    Integers; the tile extent must come out the same."""
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import TiledDim, _extent
+
+    op = _stub_op([512, 256])
+    op.get_name = lambda: "buf0"
+    op.data.ranges = [512, 256]  # plain ints, not sympy.Integer
+    assert _extent(op, TiledDim(0, False), sympy.Integer(4)) == 128
+    op.data.reduction_ranges = [64]
+    assert _extent(op, TiledDim(0, True), sympy.Integer(8)) == 8
+    with pytest.raises(Unsupported, match="not divisible"):
+        _extent(op, TiledDim(1, False), sympy.Integer(3))
