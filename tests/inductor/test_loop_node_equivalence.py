@@ -262,14 +262,17 @@ def test_loop_nodes_change_nothing_downstream(case):
 
     # The nodes really existed while the passes ran: the pass right after the
     # splice (deadcode_elimination) saw at least one node in the real list.
+    # Per-pass counts are a pre-pass snapshot, so splice_while_loops's own
+    # entry still reads 0 (looked up by name, not assumed to be first, since
+    # apply_reserved_dims_contract now runs ahead of it).
     names = [name for name, _, _ in with_nodes["per_pass"]]
-    assert names[0] == "splice_while_loops"
-    first_after_splice = with_nodes["per_pass"][1]
+    splice_idx = names.index("splice_while_loops")
+    first_after_splice = with_nodes["per_pass"][splice_idx + 1]
     assert first_after_splice[1] > 0, (
         f"no LoopNode in graph.operations at {first_after_splice[0]}"
     )
     # Every pass after the splice saw them (none removes a whole loop here).
-    assert all(count > 0 for _, count, _ in with_nodes["per_pass"][1:])
+    assert all(count > 0 for _, count, _ in with_nodes["per_pass"][splice_idx + 1 :])
     # ...and none were built with the switch off.
     assert all(count == 0 for _, count, _ in flat["per_pass"])
     # expand left none behind.
