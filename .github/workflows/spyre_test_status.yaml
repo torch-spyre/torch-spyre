@@ -1,0 +1,54 @@
+name: spyre_test_status
+
+# Posts the required "Spyre Test (amd64)" status on a pull request's head once the tests run has finished. Fork PR runs
+# cannot read repo variables, so ownership is decided here, in the base repo, from GHA_FULL_MERGE_QUEUE_TESTS. No PR code
+# runs here: the only input taken from the run is a "<verdict> <attempt>" artifact, checked against a fixed list and
+# against the run's own attempt number. Same-repo PRs are skipped: their gate job already posts the check run itself.
+run-name: spyre-test-status
+
+on:
+  workflow_run:
+    workflows: [tests]
+    types: [completed]
+
+permissions:
+  actions: read
+  statuses: write
+
+jobs:
+  post:
+    name: Post Spyre Test (amd64)
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.head_repository.full_name != github.repository &&
+      vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post the status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          if ! gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name spyre-test-verdict --dir "$dir"; then
+            echo "no verdict artifact on run ${RUN_ID}; not posting"
+            exit 0
+          fi
+          read -r verdict attempt _ < "$dir/verdict.txt" || true
+          if [ "${attempt:-}" != "$ATTEMPT" ]; then
+            echo "verdict is from attempt '${attempt:-?}', run is attempt ${ATTEMPT}; not posting"
+            exit 0
+          fi
+          case "$verdict" in
+            success) description="Test suites passed" ;;
+            failure) description="Test suites failed or did not run" ;;
+            *) echo "verdict '${verdict}': suites did not run for this PR; not posting"; exit 0 ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$verdict" -f context="Spyre Test (amd64)" -f description="$description" -f target_url="$RUN_URL"
+          echo "posted Spyre Test (amd64)=${verdict} on ${HEAD_SHA}"

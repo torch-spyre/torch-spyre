@@ -42,7 +42,11 @@ from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import (
+    insert_bmm_padding,
+    insert_restickify_padding,
+    insert_staggered_ea_padding,
+)
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -99,10 +103,12 @@ from .loop_checker import check_loops
 from .loop_node import (
     OpsView,
     all_ops,
+    build_pending_loop_nodes,
     expand,
     expanded,
     has_loop_nodes,
     peel_non_members,
+    request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
@@ -423,10 +429,13 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
     reject_nested_loops(groups, "span-overflow coarse tiling")
-    coarse_tile_post_stickify(
+    request_loop_nodes(
         graph,
-        groups=groups,
-        group_idx_offset=group_idx_offset,
+        coarse_tile_post_stickify(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+        ),
     )
 
 
@@ -635,6 +644,7 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims_mutation,
             insert_post_mutation_restickify,
             insert_restickify_padding,
+            insert_staggered_ea_padding,
             #
             dedup_and_promote_constants,
             #
@@ -749,6 +759,9 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
                 self._run_one_pass(graph, pipeline, pass_fn, pass_name)
+            # Loops a pass lowered (span-overflow tiling) become nodes here, once
+            # the view is back and the pass has stopped iterating the list.
+            build_pending_loop_nodes(graph)
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
