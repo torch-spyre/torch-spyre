@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,10 +40,11 @@ _COMPILED_LOCK = threading.Lock()
 
 # Interleaved DFT matrix on device, keyed by (device, length, inverse). An LRU
 # bounded by total bytes (TORCH_SPYRE_FFT_W_CACHE_BYTES); each entry is
-# 8*n**2 bytes. Build + insert run under the lock so two callers never build
-# the same multi-gigabyte matrix at once.
+# 8*n**2 bytes. The lock guards the dict and _W_BUILDING; the (slow) build runs
+# outside it, with a per-key event so two callers never build the same matrix.
 _W_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 _W_CACHE_LOCK = threading.Lock()
+_W_BUILDING: "dict[tuple, threading.Event]" = {}
 
 
 def _to_interleaved(x: torch.Tensor) -> torch.Tensor:
@@ -117,39 +118,55 @@ def _w_cache_budget_bytes() -> int:
     return v if v > 0 else default
 
 
-def _evict_w_cache_locked(keep: tuple) -> None:
-    """Evict least-recently-used entries until within budget (caller holds lock).
+def _evict_w_cache_locked(reserve: int) -> None:
+    """Evict LRU entries until ``reserve`` more bytes fit the budget (lock held).
 
-    ``keep`` (the just-built entry) is never evicted, so a single matrix larger
-    than the whole budget is still returned -- just not retained across calls.
+    Called before inserting a new ``reserve``-byte entry, so the device never
+    transiently holds the new matrix on top of a full cache. If ``reserve``
+    alone exceeds the budget the cache is emptied and the entry is still kept.
     """
     budget = _w_cache_budget_bytes()
     total = sum(_entry_bytes(k) for k in _W_CACHE)
     for k in list(_W_CACHE):  # OrderedDict iterates least-recently-used first
-        if total <= budget:
+        if total + reserve <= budget:
             break
-        if k == keep:
-            continue
         del _W_CACHE[k]
         total -= _entry_bytes(k)
 
 
 def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
-    """fp16 DFT matrix on ``device``, built once per (device, n, inverse).
+    """fp16 DFT matrix on ``device``, from a byte-bounded LRU cache.
 
-    Returned from a byte-bounded LRU cache; build and insert run under a lock so
-    concurrent callers do not build the same matrix twice.
+    The build runs outside the lock, so a cache hit for another length is not
+    blocked behind a multi-gigabyte build; a per-key event still ensures two
+    callers never build the same matrix at once. Room is evicted before the new
+    entry is inserted, so the device does not hold the new matrix plus a full
+    cache even momentarily.
     """
     key = (device, n, inverse)
-    with _W_CACHE_LOCK:
-        w = _W_CACHE.get(key)
-        if w is not None:
-            _W_CACHE.move_to_end(key)
-            return w
+    while True:
+        with _W_CACHE_LOCK:
+            w = _W_CACHE.get(key)
+            if w is not None:
+                _W_CACHE.move_to_end(key)
+                return w
+            ev = _W_BUILDING.get(key)
+            if ev is None:
+                ev = _W_BUILDING[key] = threading.Event()
+                break  # this caller builds
+        ev.wait()  # another caller is building this key; wait, then recheck
+
+    try:
         w = _build_device_dft_matrix(n, inverse, device)
-        _W_CACHE[key] = w
-        _evict_w_cache_locked(keep=key)
-        return w
+        with _W_CACHE_LOCK:
+            _evict_w_cache_locked(reserve=_entry_bytes(key))
+            _W_CACHE[key] = w
+            _W_CACHE.move_to_end(key)
+    finally:
+        with _W_CACHE_LOCK:
+            _W_BUILDING.pop(key, None)
+        ev.set()
+    return w
 
 
 # Largest single-transform length run as one direct (2n, 2n) matmul. The
@@ -188,16 +205,19 @@ def _direct_matmul_max() -> int:
 def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     """Length-n DFT along the last axis as one real interleaved matmul.
 
-    The input is prescaled by its max magnitude on the host so the fp16 cast
+    Each row is prescaled by its own max magnitude on the host so the fp16 cast
     and the fp16 matmul output stay in range -- the transform is linear, so the
     scale is reapplied afterward. Without it the unnormalized DC term reaches
     ``n*|x|`` and overflows fp16 at the ceiling, and an input ``|x| > 65504``
-    overflows on the cast itself. The inverse ``1/n`` is applied here too, in
-    fp32, since the matrix is unit-magnitude (see :func:`_build_device_dft_matrix`).
+    overflows on the cast itself. The scale is per row, not per tensor: a batch
+    with one large row would otherwise divide the small rows by that large scale
+    and push their entries into the fp16 subnormal range. The inverse ``1/n`` is
+    applied here too, in fp32, since the matrix is unit-magnitude (see
+    :func:`_build_device_dft_matrix`).
     """
     n = x.shape[-1]
-    s = x.abs().amax()
-    xs = x / s if s > 0 else x
+    s = x.abs().amax(dim=-1, keepdim=True)  # (*batch, 1), per-row scale
+    xs = x / torch.where(s > 0, s, torch.ones_like(s))
     u = _to_interleaved(xs).to(torch.float16)  # (*batch, 2n), pack + cast on host
     # Flatten every leading dim into one so the matmul always sees a 2D
     # (B, 2n) @ (2n, 2n); otherwise each distinct batch rank/shape recompiles

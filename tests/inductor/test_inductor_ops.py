@@ -15456,6 +15456,20 @@ class TestFFT(unittest.TestCase):
         err = (y - ref).abs().max().item()
         self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
 
+    def test_fft_per_row_prescale(self):
+        # The prescale is per row, not per tensor: a batch with a large row and
+        # a tiny row (here ~1e-5 apart in magnitude) must not cost the tiny row
+        # precision. Each row is checked against its own spectrum peak.
+        big = torch.randn(256, dtype=torch.complex64)
+        small = torch.randn(256, dtype=torch.complex64) * 1e-5
+        x = torch.stack([big, small])
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        for r in range(x.shape[0]):
+            peak = ref[r].abs().max().item()
+            err = (y[r] - ref[r]).abs().max().item()
+            self.assertLessEqual(err, 2e-2 * peak)
+
     def test_inverse_matrix_unit_magnitude(self):
         # The inverse matrix stays unit-magnitude (1/n applied on the host in
         # fp32, not baked in): baked entries would be ~1/n, subnormal below the

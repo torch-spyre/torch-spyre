@@ -32,4 +32,6 @@ def __getattr__(name: str):
 
 
 def __dir__():
-    return sorted(__all__)
+    # Keep the real submodules (eager, fallbacks, ...) visible alongside the
+    # lazily re-exported FFT names, so tab-completion is not narrowed to __all__.
+    return sorted(set(globals()) | set(__all__))
