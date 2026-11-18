@@ -33,7 +33,7 @@
 
 namespace spyre {
 
-int64_t elems_per_stick(const DataFormats& df);
+int64_t elems_per_stick(const deeptools::DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
@@ -110,7 +110,7 @@ class SpyreTensorLayout {
    */
   std::vector<int64_t> stride_map;
 
-  DataFormats device_dtype;
+  deeptools::DataFormats device_dtype;
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
@@ -169,7 +169,7 @@ class SpyreTensorLayout {
       "[, element_arrangement]) overload.")]]
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
-      DataFormats device_dtype,
+      deeptools::DataFormats device_dtype,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD,
       std::map<std::vector<int64_t>, int64_t> valid_elements = {})
       : device_size(device_size),
@@ -188,7 +188,7 @@ class SpyreTensorLayout {
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
-      DataFormats device_dtype,
+      deeptools::DataFormats device_dtype,
       std::map<std::vector<int64_t>, int64_t> valid_elements,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD)
       : device_size(device_size),
@@ -407,7 +407,7 @@ class SpyreTensorImpl : public at::TensorImpl {
 
 uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl);
 uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
-                                  const DataFormats& device_dtype);
+                                  const deeptools::DataFormats& device_dtype);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);

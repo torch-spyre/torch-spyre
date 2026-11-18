@@ -31,7 +31,7 @@
 #include "kernel_provenance_registry.h"
 #include "logging.h"
 #include "spyre_allocator.h"
-#include "spyrecode-host-functions/spyrecode.h"
+#include "spyrecode-host-functions/hcm.h"
 
 namespace spyre {
 
@@ -484,7 +484,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
   // Parse hcm JSON
   TORCH_CHECK(hc_props.contains("hcm"),
               "ComputeOnHost command missing 'hcm' property");
-  auto hcm_data = std::make_unique<Hcm>();
+  auto hcm_data = std::make_unique<deeptools::Hcm>();
   std::string hcm_json_str = hc_props["hcm"].dump();
   try {
     hcm_data->importJsonStr(hcm_json_str);

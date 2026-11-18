@@ -29,7 +29,7 @@
 #include <variant>
 #include <vector>
 
-#include "spyrecode-host-functions/spyrecode.h"
+#include "spyrecode-host-functions/hcm.h"
 
 namespace spyre {
 
@@ -543,11 +543,11 @@ class JobPlanStepCompute final : public JobPlanStep {
 /**
  * @brief Host-side computation step (e.g., program correction)
  *
- * Stores compiler metadata (Hcm) and the destination device address for the
- * correction blob.  construct() builds a producer lambda (one of four cases
- * depending on input source), calls it to allocate + fill a RaiiBuffer, then
- * launches the correction H2D — both produce and transfer happen in one step,
- * retiring the shared output_buffer_ pin.
+ * Stores compiler metadata (deeptools::Hcm) and the destination device address
+ * for the correction blob.  construct() builds a producer lambda (one of four
+ * cases depending on input source), calls it to allocate + fill a RaiiBuffer,
+ * then launches the correction H2D — both produce and transfer happen in one
+ * step, retiring the shared output_buffer_ pin.
  *
  * The RaiiBuffer produced at launch time carries the correction bytes; the
  * adjacent DataTransfer H2D is collapsed into this step by the builder.
@@ -567,7 +567,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    *            Cases 2 and 3.
    * @param ishape used to discriminate case 2 (fake symbols)
    */
-  JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, size_t correction_size,
+  JobPlanStepHostCompute(std::unique_ptr<deeptools::Hcm> hcm,
+                         size_t correction_size,
                          flex::CompositeAddress device_address,
                          const void* input_buffer, std::vector<int64_t> ishape)
       : correction_size_(correction_size),

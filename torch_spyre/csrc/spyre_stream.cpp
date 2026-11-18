@@ -57,9 +57,9 @@ std::optional<flex::CompositeAddress> narrowD2HRange(
     const flex::CompositeAddress& allocation) {
   if (!allocation.is_single_chunk() ||
       layout.element_arrangement != ElementArrangement::STANDARD ||
-      (layout.device_dtype != DataFormats::SEN169_FP16 &&
-       layout.device_dtype != DataFormats::IEEE_FP32 &&
-       layout.device_dtype != DataFormats::IEEE_INT32) ||
+      (layout.device_dtype != deeptools::DataFormats::SEN169_FP16 &&
+       layout.device_dtype != deeptools::DataFormats::IEEE_FP32 &&
+       layout.device_dtype != deeptools::DataFormats::IEEE_INT32) ||
       dci.dcsi_.empty() || dci.input_shape_.empty()) {
     return std::nullopt;
   }
@@ -377,7 +377,8 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                                 const DataConversionInfo* dci, bool host2device,
                                 std::shared_ptr<void> host_lifetime) const {
   // Wrap dci in shared_ptr for flex API
-  auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
+  auto dci_ptr =
+      dci ? std::make_shared<deeptools::data_conversion_info>(*dci) : nullptr;
 
   // A pinned CPU source/destination skips flex's IOMMU shadow-buffer path:
   // the pre-mapped pinned buffer is submitted directly. The allocation state

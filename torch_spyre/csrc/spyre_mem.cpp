@@ -404,8 +404,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   auto dev_str_type = torchScalarToString[dev_tensor->scalar_type()];
   const auto [cpu_format_host, cpu_format_dev] =
       stringToDTDataFormatPair(cpu_str_type);
-  TORCH_CHECK(cpu_format_host != DataFormats::INVALID &&
-                  cpu_format_dev != DataFormats::INVALID,
+  TORCH_CHECK(cpu_format_host != deeptools::DataFormats::INVALID &&
+                  cpu_format_dev != deeptools::DataFormats::INVALID,
               "Unsupported CPU tensor dtype for DMA transfer: ", cpu_str_type);
 
   // stl.device_dtype is the authoritative on-device element format.  For bool
@@ -418,7 +418,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // than silently transferring data with the wrong element size.
   TORCH_CHECK(
       !(host2device && dev_tensor->scalar_type() == c10::ScalarType::Bool &&
-        stl.device_dtype == DataFormats::IEEE_FP32),
+        stl.device_dtype == deeptools::DataFormats::IEEE_FP32),
       "Unexpected H2D transfer to a bool tensor with IEEE_FP32 device format; "
       "fp32-format bool tensors are on-device intermediates and should never "
       "be H2D transfer destinations");
@@ -870,7 +870,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
  */
 bool dci_is_identity_copy(const DataConversionInfo& dci) {
   if (dci.dataformat_src_ != dci.dataformat_dst_) return false;
-  if (dci.dcOpName_ != DataConvertOpFuncs::GENERAL_SHUFFLE) return false;
+  if (dci.dcOpName_ != deeptools::DataConvertOpFuncs::GENERAL_SHUFFLE)
+    return false;
   if (!dci.pre_input_shape_.empty() || !dci.post_output_shape_.empty())
     return false;
   if (!dci.pre_expand_dcsi_.empty() || !dci.post_slice_dcsi_.empty())
@@ -1939,21 +1940,22 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
         "). Fill the whole tensor, or fill a CPU copy and copy it back.");
   }
 
-  // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // flex::createFillAsyncParams performs internally.
-  DataFormats dtype = get_device_dtype(self.scalar_type());
+  // Map torch dtype to deeptools::DataFormats for the value->pattern
+  // conversion, which flex::createFillAsyncParams performs internally.
+  deeptools::DataFormats dtype = get_device_dtype(self.scalar_type());
 
   // flex::createFillAsyncParams has no value->pattern conversion for the fp8
   // formats. Zero is the all-zero bit pattern in every format, and the fill
   // writes raw bytes, so a zero fill of fp8 storage can use any supported
   // format. A nonzero fp8 value would need an fp8 encoding, which we do not
   // have, so reject it here instead of failing inside the runtime.
-  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+  if (dtype == deeptools::DataFormats::SEN143_FP8 ||
+      dtype == deeptools::DataFormats::SEN152_FP8) {
     TORCH_CHECK(value == 0.0,
                 "fill_ of a float8 Spyre tensor is only supported with the "
                 "value 0 (the device fill has no fp8 pattern); got ",
                 value);
-    dtype = DataFormats::SEN169_FP16;
+    dtype = deeptools::DataFormats::SEN169_FP16;
   }
 
   // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value

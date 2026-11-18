@@ -33,17 +33,19 @@
 
 namespace spyre {
 
-int64_t elems_per_stick(const DataFormats& df) {
+int64_t elems_per_stick(const deeptools::DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
-  auto it = dataFormatToStickSize.find(df);
-  if (it != dataFormatToStickSize.end() && it->second > 0) {
+  auto it = deeptools::dataFormatToStickSize.find(df);
+  if (it != deeptools::dataFormatToStickSize.end() && it->second > 0) {
     return static_cast<int64_t>(it->second);
   }
   // DCI already accepts these storage formats, missing from the map above.
   // Complete their geometry without enabling unmapped compute formats.
-  if (df == DataFormats::IEEE_INT32 || df == DataFormats::IEEE_INT64 ||
-      df == DataFormats::BOOL || df == DataFormats::BFLOAT16) {
-    return getNumElemsInStick(df);
+  if (df == deeptools::DataFormats::IEEE_INT32 ||
+      df == deeptools::DataFormats::IEEE_INT64 ||
+      df == deeptools::DataFormats::BOOL ||
+      df == deeptools::DataFormats::BFLOAT16) {
+    return deeptools::getNumElemsInStick(df);
   }
   // Capability queries use zero for unsupported geometry; storage sizing below
   // rejects it rather than allocating an unknown format.
@@ -93,7 +95,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
   this->device_dtype = sen_dtype_dev;
-  TORCH_CHECK(this->device_dtype != DataFormats::INVALID,
+  TORCH_CHECK(this->device_dtype != deeptools::DataFormats::INVALID,
               "Spyre backend does not support dtype ", dtype);
   TORCH_CHECK(this->elems_per_stick() > 0,
               "No stick size mapping for device data format ",
@@ -185,7 +187,7 @@ std::string SpyreTensorLayout::toString() const {
     }
   }
   ss << "], device_dtype=DataFormats.";
-  ss << EnumsConversion::dataFormatsToString(this->device_dtype);
+  ss << deeptools::EnumsConversion::dataFormatsToString(this->device_dtype);
   if (this->element_arrangement != ElementArrangement::STANDARD) {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
@@ -297,14 +299,14 @@ uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl) {
 }
 
 uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
-                                  const DataFormats& device_dtype) {
+                                  const deeptools::DataFormats& device_dtype) {
   // Size complete device sticks, including padding and sparse positions. The
   // trailing extent may expose fewer values, but does not shorten a stick.
   // A compute format without storage geometry must not be sized by bit width.
   const auto elems = elems_per_stick(device_dtype);
   TORCH_CHECK(elems > 0, "No device stick geometry for data format ",
               static_cast<int>(device_dtype));
-  const auto bits = getSizeInBits(device_dtype);
+  const auto bits = deeptools::getSizeInBits(device_dtype);
   TORCH_CHECK(bits > 0, "No device element width for data format ",
               static_cast<int>(device_dtype));
   uint64_t size_bytes = (elems * bits + 7) / 8;

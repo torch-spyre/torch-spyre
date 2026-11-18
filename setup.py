@@ -68,6 +68,7 @@ INCLUDE_DIRS = [
     # "tracy/public"
 ]
 LIBRARY_DIRS = []
+RUNTIME_LIBRARY_DIRS = []  # rpath entries
 
 
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
@@ -100,6 +101,10 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
         DEEPTOOLS_DIR / "include",
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+    # libdeeptools-host.so is linked directly (see LIBRARIES); find it again at
+    # run time through the prefix it was built against.
+    LIBRARY_DIRS += [DEEPTOOLS_DIR / "lib"]
+    RUNTIME_LIBRARY_DIRS += [DEEPTOOLS_DIR / "lib"]
 
 # The USE_SPYRE_CCL environment variable can be used to build torch-spyre
 # without support for Multi-Spyre. This is for developers only.
@@ -139,7 +144,9 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-LIBRARIES = ["flex"]
+# deeptools-host is listed before flex so that "aiupti" can still be inserted
+# directly before flex below.
+LIBRARIES = ["deeptools-host", "flex"]
 
 
 if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
@@ -248,6 +255,7 @@ if __name__ == "__main__":
                 sources=core_src_paths + distributed_src_paths + profiler_src_paths,
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
+                runtime_library_dirs=[str(p) for p in RUNTIME_LIBRARY_DIRS],
                 libraries=LIBRARIES,
                 extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
                 define_macros=base_define_macros

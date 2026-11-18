@@ -23,8 +23,8 @@
 #include <flex/flex.hpp>
 #include <memory>
 
-using DataConversionStrideInfo = data_conversion_stride_info;
-using DataConversionInfo = data_conversion_info;
+using DataConversionStrideInfo = deeptools::data_conversion_stride_info;
+using DataConversionInfo = deeptools::data_conversion_info;
 
 namespace spyre {
 
@@ -54,7 +54,7 @@ class GlobalRuntime {
 bool get_downcast_warn_enabled();
 bool get_hazard_tracker_enabled();
 bool is_supported_dtype(c10::ScalarType dtype);
-DataFormats get_device_dtype(c10::ScalarType torch_dtype);
+deeptools::DataFormats get_device_dtype(c10::ScalarType torch_dtype);
 
 int device_count();
 void startRuntime();
