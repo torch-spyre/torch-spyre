@@ -685,11 +685,17 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     ``ops.load(name, index)`` receives ``index`` already flattened by the
     loaded buffer's own indexer into ``sum(idx[i] * stride[i]) + offset``;
     this undoes that. Every per-dim loop-index symbol appears in exactly
-    one additive term with coefficient ``stride[i]`` (the same one-symbol-
-    per-term linearity every coordinate-recovery helper in this package
-    already assumes), so dividing each matched term by its own stride
-    recovers ``idx[i]`` directly; a size-1 dim contributes no term, so its
-    coordinate is simply 0.
+    one additive term whose coefficient is a multiple of exactly one dim's
+    stride (the same one-symbol-per-term linearity every coordinate-
+    recovery helper in this package already assumes), so dividing each
+    matched term by its own stride recovers ``idx[i]`` directly; a size-1
+    dim contributes no term, so its coordinate is simply 0. A term whose
+    coefficient is a multiple of a dim's stride rather than equal to it --
+    e.g. a reduction variable flattened through a contiguous reshape of
+    the marker, entering as ``512*d2`` where the marker's dim stride is
+    64 -- is folded into that dim's coordinate (``8*d2``) below, after
+    the ``.coeff``-based extraction; see the leftover-distribution comment
+    there for why ``.coeff`` alone cannot see it.
 
     A dim's coordinate can also be a compile-time-constant integer rather
     than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
@@ -780,6 +786,38 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
         f"_delinearize_index: unresolved coordinate for index {index!r} "
         f"(size {size!r}, stride {stride!r}, offset {offset!r})"
     )
+
+    # .coeff(st) only sees terms where st is an explicit Mul factor, so a
+    # symbol entering with a stride that is a MULTIPLE of a dim's stride --
+    # a reduction variable flattened through a contiguous reshape, 512*d2
+    # against stride 64 -- is silently dropped from every coordinate
+    # (issue #6407: the reduce axis vanished from the composed read, so all
+    # reduce steps read the same window). Fold each unrecovered term into
+    # the largest stride that divides it exactly: for a load flattened
+    # through this layout that is the dim the term belongs to (a smaller
+    # stride would put the coordinate out of bounds), and a term no stride
+    # divides is not expressible in this layout at all.
+    recovered = sum(
+        (coords[i] * stride[i] for i in range(len(coords)) if stride[i] != 0),
+        sympy.S.Zero,
+    )
+    leftover = sympy.expand(remaining - recovered)
+    for term in leftover.as_ordered_terms():
+        coeff = term.as_coeff_Mul()[0]
+        eligible = [
+            i
+            for i in range(len(coords))
+            if stride[i] != 0 and size[i] != 1 and coeff % stride[i] == 0
+        ]
+        if not eligible:
+            raise AssertionError(
+                f"_delinearize_index: term {term!r} of index {index!r} is "
+                f"not a coordinate multiple of any dim (size {size!r}, "
+                f"stride {stride!r}, offset {offset!r}); cannot recover "
+                "per-dim coordinates for this index."
+            )
+        best = max(eligible, key=lambda i: stride[i])
+        coords[best] = coords[best] + term / stride[best]
     return coords
 
 

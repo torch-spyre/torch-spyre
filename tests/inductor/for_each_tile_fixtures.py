@@ -1086,6 +1086,35 @@ def softmax_row_tiled_reference(X: torch.Tensor) -> torch.Tensor:
     return torch.softmax(X, dim=-1)
 
 
+def reshape_sum_tiled_fn(X: torch.Tensor, tile_size: int, group: int) -> torch.Tensor:
+    """Map mode: reshape each row-tile to (group, -1, cols) and reduce dim 0.
+
+    The reduction axis exists only in the reshaped view of the tile, so its
+    input stride is a multiple of the tile's own row stride -- the load
+    shape whose reduce variable used to be dropped while inlining the tile
+    marker (issue #6407), making every reduce step read the same window.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        return None, x_tile.reshape(group, -1, x_tile.shape[-1]).sum(dim=0)
+
+    _, out = for_each_tile(body, (X,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def reshape_sum_tiled_reference(
+    X: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    return torch.cat(
+        [
+            tile.reshape(group, -1, X.shape[-1]).sum(dim=0)
+            for tile in X.split(tile_size, dim=0)
+        ],
+        dim=0,
+    )
+
+
 def nested_add_outer_row_inner_col_fn(
     A: torch.Tensor,
     B: torch.Tensor,

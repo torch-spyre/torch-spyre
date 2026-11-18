@@ -132,6 +132,8 @@ from for_each_tile_fixtures import (
     paged_gather_nested_fn,
     paged_gather_nested_reference,
     paged_gather_reference,
+    reshape_sum_tiled_fn,
+    reshape_sum_tiled_reference,
     scatter_carry_fn,
     scatter_carry_old_value_fn,
     softmax_row_tiled_fn,
@@ -879,6 +881,39 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         # corrupt stick groups after the first with an error far exceeding
         # fp16 rounding noise on random inputs in [0, 1).
         torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+    def test_reshape_sum_tiled_small(self):
+        X = cached_randn((2 * ROWS, COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 8, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 8, 4)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_multi_stick(self):
+        """Issue #6407 shape class: the reduce axis only exists in a reshaped
+        view of the tile, entering the load with a stride that is a multiple
+        of the tile's row stride (here 16*128 vs 128)."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128, 8)
+
+        # The old bug read the same window on every reduce step, so the sum
+        # came out as a multiple of one slice -- far outside fp16 noise.
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 class TestForEachTileNestedMapE2E(_DynamoResetTestCase):

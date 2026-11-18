@@ -256,6 +256,35 @@ class TestDelinearizeIndex(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._delinearize(sympy.Integer(7), size=[2], stride=[4], offset=0)
 
+    def test_symbol_at_multiple_of_dim_stride_is_folded_into_that_dim(self):
+        """Core #6407 repro: a reduction symbol flattened through a contiguous
+        reshape enters as 512*d2 where the marker's dim stride is 64; .coeff(64)
+        cannot see it, so it used to vanish from every coordinate -- silently
+        making every reduce step read the same window."""
+        import sympy
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        coords = self._delinearize(
+            64 * d0 + d1 + 512 * d2, size=[72, 64], stride=[64, 1], offset=0
+        )
+        self.assertEqual(coords, [8 * d2 + d0, d1])
+
+    def test_leftover_symbolic_terms_compose_into_same_dim(self):
+        import sympy
+
+        i0, i1, i2 = sympy.symbols("i0 i1 i2")
+        coords = self._delinearize(
+            8 * i0 + i1 + 24 * i2, size=[4, 8], stride=[8, 1], offset=0
+        )
+        self.assertEqual(coords, [i0 + 3 * i2, i1])
+
+    def test_leftover_term_indivisible_by_every_stride_raises(self):
+        import sympy
+
+        d0 = sympy.Symbol("d0")
+        with self.assertRaises(AssertionError):
+            self._delinearize(4 * d0, size=[4], stride=[8], offset=0)
+
 
 class TestIndirectIndexStepGuard(unittest.TestCase):
     """_check_indirect_index_step refuses a sub-stick per-trip index advance."""
