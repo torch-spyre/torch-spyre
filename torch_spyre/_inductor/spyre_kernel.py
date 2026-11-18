@@ -1932,7 +1932,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"{pool_var_name} = spyre_empty_with_layout("
                 f"({self.pool_size},), (1,), torch.uint8, "
                 f"SpyreTensorLayout(device_size=[{self.pool_size}], "
-                f"stride_map=[1], device_dtype=DataFormats.SENINT8), "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8, "
+                f"valid_elements={{(0,): {self.pool_size}}}), "
                 f"device=torch.device('{device}'))"
             )
             call_args.append(pool_var_name)
