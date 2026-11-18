@@ -8,6 +8,7 @@ Please:
 * Open an issue before large PRs
 * Follow our code style and tests
 * Sign off commits with `git commit -s`
+* Sign commits with a GPG or SSH key registered on your GitHub account (`git commit -s -S`, or set `git config commit.gpgsign true` once). `main` requires signed commits, so an unsigned commit blocks the merge. See [GitHub's guide to signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
 # Code Quality
 

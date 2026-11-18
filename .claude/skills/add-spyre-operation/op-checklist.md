@@ -75,7 +75,7 @@ that synthetic tests miss.
   minimum)
 - [ ] Verify Apache 2.0 license headers on all new/modified files
 - [ ] Use `import regex` not `import re` in any new Python files
-- [ ] Sign off commit: `git commit -s`
+- [ ] Sign off and sign commit: `git commit -s -S`
 
 ## 7. Fallback (if needed)
 

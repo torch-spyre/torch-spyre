@@ -217,13 +217,15 @@ If warnings appear, fix them before opening a PR. Common causes:
 | `image file not readable` | Verify the image path under `_static/images/` |
 | `Title underline too short` | Fix the RST heading underline length in `.rst` files |
 
-### 4. Sign off your commit
+### 4. Sign off and sign your commit
 
 Torch-Spyre uses the [Developer Certificate of Origin](https://developercertificate.org/).
-All commits must be signed off:
+All commits must be signed off (`-s`). `main` also requires signed commits, so every
+commit must carry a GPG or SSH signature (`-S`) from a key registered on your GitHub
+account; see [GitHub's guide to signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
 ```bash
-git commit -s -m "docs: add section on tensor DMA encoding"
+git commit -s -S -m "docs: add section on tensor DMA encoding"
 ```
 
 ### 5. Open a pull request
