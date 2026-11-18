@@ -2293,6 +2293,23 @@
         "$ref": "#/$defs/metric"
        }
       },
+      "context": {
+       "type": "object",
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "description": "metric-context facets only the author knows (token_basis, timer, ...); never identity"
+      },
       "env": {
        "$ref": "#/$defs/env"
       },
@@ -4545,6 +4562,32 @@
             "minimum": 0
            }
           }
+         },
+         "class": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "metric class of the metric-context vocabulary; default: matched by name"
+         },
+         "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+           "required": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "pattern": "^[a-z0-9_|]+$"
+            }
+           },
+           "optional": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "pattern": "^[a-z0-9_]+$"
+            }
+           }
+          },
+          "description": "facets numbers of this metric must carry; `required` replaces the class default"
          },
          "otel": {
           "type": "string"

@@ -33,7 +33,7 @@ from pathlib import Path
 import regex as re
 import yaml
 
-from spyre_bench import ingest_adapter, placement
+from spyre_bench import ingest_adapter, metric_context, placement
 from spyre_bench.ingest_adapter import IngestUnavailable
 from spyre_bench.placement import parse_cpu_list
 
@@ -684,6 +684,8 @@ class Registry:
                     f"{p.where}: metric {m['name']}: unit {m['unit']!r} is not a UCUM unit in the allowed subset"
                 )
             self.metrics[m["name"]] = m
+        vocab = metric_context.default_vocab()
+        self.errors += [f"{p.where}: {e}" for e in metric_context.pack_errors(sp.get("metrics", []), vocab)]
         self.relations |= {f"{prefix}/{r}" for r in sp.get("relations", [])}
         for kind, reg in (("runners", self.runners), ("probes", self.probes)):
             for r in sp.get(kind, []):

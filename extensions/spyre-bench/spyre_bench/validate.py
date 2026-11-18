@@ -25,7 +25,7 @@ import json
 import sys
 from pathlib import Path
 
-from spyre_bench import engine
+from spyre_bench import engine, metric_context
 
 
 def identity_changes(base, cur):
@@ -82,6 +82,8 @@ def main(argv=None):
             base = engine.Catalog([Path(a.base_dir) / Path(d).name], a.pack, a.central)
             changed, notes = identity_changes(base, cat)
             warns += changed + notes
+        if not cat.errors:
+            warns += metric_context.lint_catalog(cat)
         kinds = {}
         for doc in cat.docs:
             kinds[doc.kind] = kinds.get(doc.kind, 0) + 1
