@@ -1,0 +1,120 @@
+test_suite_config:
+  labels: [trunk]
+  files:
+    - path: ${TORCH_ROOT}/test/test_scatter_gather_ops.py
+      unlisted_test_mode: skip
+      tests:
+        # ---------------------------------------------------------------------------
+        # torch.gather
+        # Reads src values at positions specified by an index tensor.
+        # test_gather_large dies before gather on stride-2 copy_ (#3454).
+        # The other three die on aten::gather.out (#4328).
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestScatterGather::test_gather_large  # issue 3454
+          mode: xfail  # xfail: Unexpected stick expression 2*(Mod(d1, 32)) 
+        # ---------------------------------------------------------------------------
+        # aten::gather.out not registered. Covered by
+        # https://github.com/torch-spyre/torch-spyre/issues/4328
+        # Compiled gather hits other bugs (#4321 / #4327 / #1796); 
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestScatterGather::test_gather  # issue 4328
+            - TestScatterGather::test_gather_bool  # issue 4328
+            - TestScatterGather::test_gather_expanded_index  # issue 4328
+          mode: xfail  # xfail: Could not run 'aten::gather.out' 
+
+        # ---------------------------------------------------------------------------
+        # torch.scatter / torch.scatter_
+        # Three distinct missing kernels — keep separate. YAML xfails one group at a time.
+        #   test_scatter_            aten::scatter.src_out     (#1002)
+        #   test_scatter__reductions aten::scatter.reduce_out  (#4413)
+        #   test_scatter__scalar     aten::scatter.value_out   (#4473)
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestScatterGather::test_scatter_  # issue 1002
+          mode: xfail  # xfail: Could not run 'aten::scatter.src_out'
+        - names:
+            - TestScatterGather::test_scatter__reductions  # issue 4413
+          mode: xfail  # xfail: Could not run 'aten::scatter.reduce_out'
+        - names:
+            - TestScatterGather::test_scatter__scalar  # issue 4473
+          mode: xfail  # xfail: Could not run 'aten::scatter.value_out'
+
+        # ---------------------------------------------------------------------------
+        # torch.scatter_add / torch.scatter_add_
+        # Eager: aten::scatter_add.out not registered (#4396).
+        #
+        # Upstream dtype coverage:
+        #   test_scatter_add_                                    @dtypes(float16, float32, complex64) — complex64 excluded
+        #   test_scatter_add_mult_index_base                     @dtypes(float32)
+        #   test_scatter_add_broadcasted_index_deterministic     @dtypes(float32)
+        #   test_scatter_expanded_index @dtypes(float32, float64, bfloat16, float16); @onlyCPU
+        #                               — float64 excluded; @onlyCPU does NOT skip on Spyre
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestScatterGather::test_scatter_add_  # issue 4396
+            - TestScatterGather::test_scatter_add_mult_index_base  # issue 4396
+            - TestScatterGather::test_scatter_add_broadcasted_index_deterministic  # issue 4396
+            - TestScatterGather::test_scatter_expanded_index  # issue 4396
+          mode: xfail  # xfail: Could not run 'aten::scatter_add.out'
+
+        # ---------------------------------------------------------------------------
+        # torch.scatter_reduce / torch.scatter_reduce_
+        # Reduce-mode scatter: sum, prod, mean, amax, amin.
+        # Eager: aten::scatter_reduce.two_out not registered (#4361).
+        # Upstream dtype coverage (excluded dtypes noted; active dtypes from supported_dtypes):
+        #   test_scatter_reduce_sum   all except bool       — float16, float32, int64, bfloat16
+        #   test_scatter_reduce_prod  all (incl bool)       — float16, float32, int64, bfloat16, bool
+        #   test_scatter_reduce_mean  all except bool       — float16, float32, int64, bfloat16
+        #   test_scatter_reduce_amax  all except complex    — float16, float32, int64, bfloat16, bool
+        #   test_scatter_reduce_amin  all except complex    — float16, float32, int64, bfloat16, bool
+        #   Excluded from all: complex64, complex128, float64, int8, int16, int32, uint8
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestScatterGather::test_scatter_reduce_sum  # issue 4361
+            - TestScatterGather::test_scatter_reduce_prod  # issue 4361
+            - TestScatterGather::test_scatter_reduce_mean  # issue 4361
+            - TestScatterGather::test_scatter_reduce_amax  # issue 4361
+            - TestScatterGather::test_scatter_reduce_amin  # issue 4361
+          mode: xfail  # xfail: Could not run 'aten::scatter_reduce.two_out'
+
+  global:
+    supported_dtypes:
+      # -----------------------------------------------------------------------
+      # Active dtypes — run on Spyre today
+      # -----------------------------------------------------------------------
+      - name: float16
+        description: Spyre primary dtype. Required by scatter_ / scatter_add_ / scatter_reduce tests that use @dtypes(float16, float32, ...).
+      - name: float32
+        description: Required for test_gather (@dtypes(float32, complex64)), test_scatter_add_mult_index_base and test_scatter_add_broadcasted_index_deterministic
+          (@dtypes(float32)), and test_gather_expanded_index (@dtypes(float32, float64, bfloat16)).
+      - name: int64
+        description: Covered by scatter_reduce get_all_dtypes set and needed for integer index tensors throughout the test body.
+      - name: bfloat16
+        description: Required for test_gather_large (@dtypes(int8, bfloat16)) and scatter_reduce get_all_dtypes set.
+      - name: bool
+        description: Required for test_gather_bool (@dtypes(bool)), test_scatter_reduce_prod/amax/amin (get_all_dtypes includes bool). Also prevents extract_dtype_from_name
+          from filtering tests whose names contain "bool".
+      # -----------------------------------------------------------------------
+      # Excluded dtypes — present in upstream @dtypes but NOT yet supported on Spyre.
+      # Uncomment each entry when Spyre adds support for that dtype.
+      # -----------------------------------------------------------------------
+      # - name: float64    # upstream: test_gather_expanded_index @dtypes(float32,float64,bfloat16);
+      #                    #   test_scatter_expanded_index @dtypes(float32,float64,bfloat16,float16);
+      #                    #   scatter_reduce get_all_dtypes set.
+      #                    # reason: Spyre maximum floating-point precision is float32.
+      # - name: int8       # upstream: test_gather_large @dtypes(int8, bfloat16);
+      #                    #   scatter_reduce get_all_dtypes set.
+      #                    # reason: 8-bit integer ops not supported on Spyre.
+      # - name: int16      # upstream: scatter_reduce get_all_dtypes set.
+      #                    # reason: 16-bit integer ops not supported on Spyre.
+      # - name: int32      # upstream: scatter_reduce get_all_dtypes set.
+      #                    # reason: 32-bit integer ops not supported on Spyre.
+      # - name: uint8      # upstream: scatter_reduce get_all_dtypes set.
+      #                    # reason: unsigned integer ops not supported on Spyre.
+      # - name: complex64  # upstream: test_gather @dtypes(float32, complex64);
+      #                    #   test_scatter_ / test_scatter_add_ @dtypes(float16, float32, complex64).
+      #                    # reason: complex arithmetic not supported on Spyre.
+      # - name: complex128 # upstream: scatter_reduce get_all_dtypes (include_complex=True variants).
+      #                    # reason: complex arithmetic not supported on Spyre.
