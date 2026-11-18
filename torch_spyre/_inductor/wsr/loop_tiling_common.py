@@ -1306,9 +1306,9 @@ def _index_already_at_new_scale(
     """Return True when index's atom coefficients already match new_stride.
 
     A consumer in the same tiling group as a retiled buffer can be resynced
-    (by name) to a *replacement* ComputedBuffer object spliced in by Pass
-    2/3 after ``_apply_plan`` already ran -- see tile_groups's
-    by-name resync comment above its ``_patch_retiled_load_indexes`` call.
+    (by name) to a *replacement* ComputedBuffer object spliced in after
+    the group was divided (the lowering resyncs by name before its
+    ``_patch_retiled_load_indexes`` call).
     That replacement's inner_fn may have been retraced against the
     producer's already-mutated (new_stride) layout, in which case its load
     index is already correct and must not be decomposed against old_stride
@@ -1599,9 +1599,9 @@ def _patch_retiled_load_indexes(
     if not infos_by_name:
         return
 
-    # Only ops that were already in the group when _apply_plan ran can hold a
+    # Only ops that were already in the group when the group was divided can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
-    # by Pass 1/2 (e.g. _insert_copy_out's copy_buf) read the retiled
+    # (e.g. _insert_copy_out's copy_buf) read the retiled
     # buffer's already-updated layout directly, so rewriting them here would
     # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).
