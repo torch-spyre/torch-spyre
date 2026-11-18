@@ -85,6 +85,30 @@ def num_shards() -> int:
     return int(os.environ.get("SENCORES", "0") or 0)
 
 
+def promote_vf_mode_to_emulation() -> bool:
+    """Rewrite ``FLEX_DEVICE=VF`` to ``EMUL1p5`` before Flex loads.
+
+    A VF-mode host can back the emulation device (the wrapper's probe and
+    children rely on that), but a process started with ``FLEX_DEVICE=VF``
+    loads the real-VF runtime instead of the emulation code. Call this
+    before anything loads the Flex runtime — the sharding ``conftest.py``
+    does so at import time — so a plain pytest run on a VF-mode host
+    triggers the emulation path. Returns whether the rewrite happened.
+    No-op once the runtime is already open (the mode is fixed then).
+    """
+    if os.environ.get("FLEX_DEVICE") != "VF":
+        return False
+    try:
+        if torch.spyre.is_initialized():
+            return False
+    except Exception:
+        # Not loadable here (e.g. a plain-CPU process): nothing is open,
+        # so the rewrite is safe.
+        pass
+    os.environ["FLEX_DEVICE"] = "EMUL1p5"
+    return True
+
+
 def device_mode_admits_sharded() -> bool:
     # Mirror of flex's admitsShardedAllocations() (runtime_scheduler_factory):
     # the EMUL1p5 device always admits; anything else no.

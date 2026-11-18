@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+
+import torch
 
 import pytest
 from torch.distributed.tensor import Replicate, Shard
@@ -206,3 +209,91 @@ def test_receipt_rejects_nonpositive_shard_bytes():
 
     with pytest.raises(ValueError, match="positive"):
         validate_sharded_receipt(receipt, 8, -128)
+
+
+def test_coverage_guard_passes_when_device_tests_executed():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=2,
+        vf_capable=True,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "pass"
+    assert message is None
+
+
+def test_coverage_guard_fails_when_vf_host_ran_nothing():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=0,
+        vf_capable=True,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "fail"
+    assert "bound VFs" in message
+
+
+def test_coverage_guard_warns_when_no_device():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=0,
+        vf_capable=False,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "warn"
+    assert "0 of 36" in message
+
+
+def test_coverage_guard_passes_on_collect_only_and_subsets():
+    from device_suite import device_coverage_verdict
+
+    # --collect-only: nothing was supposed to run.
+    assert device_coverage_verdict(36, 0, 2, 0, True, False, True)[0] == "pass"
+    # A -k selection that deselected the wrapper: the in-process skip of a
+    # hand-picked device test is by design, not silent rot.
+    assert device_coverage_verdict(1, 0, 0, 0, True, False, False)[0] == "pass"
+    # Runtime already open: the wrapper skips by design (run files alone).
+    verdict, _ = device_coverage_verdict(36, 0, 2, 0, True, True, False)
+    assert verdict == "warn"
+
+
+def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
+    from device_env import promote_vf_mode_to_emulation
+
+    # The promotion must be a no-op once the runtime is open (the mode is
+    # fixed then). Earlier tests in a combined run may have opened it, so
+    # pin the state this test reasons about instead of inheriting it.
+    monkeypatch.setattr(torch.spyre, "is_initialized", lambda: False)
+
+    monkeypatch.setenv("FLEX_DEVICE", "VF")
+    assert promote_vf_mode_to_emulation() is True
+    assert os.environ["FLEX_DEVICE"] == "EMUL1p5"
+
+    # Other modes are left alone (PF stays PF; unset stays unset).
+    monkeypatch.setenv("FLEX_DEVICE", "PF")
+    assert promote_vf_mode_to_emulation() is False
+    assert os.environ["FLEX_DEVICE"] == "PF"
+    monkeypatch.delenv("FLEX_DEVICE")
+    assert promote_vf_mode_to_emulation() is False
+    assert "FLEX_DEVICE" not in os.environ
+
+    # With the runtime already open, even VF is left alone.
+    monkeypatch.setattr(torch.spyre, "is_initialized", lambda: True)
+    monkeypatch.setenv("FLEX_DEVICE", "VF")
+    assert promote_vf_mode_to_emulation() is False
+    assert os.environ["FLEX_DEVICE"] == "VF"
