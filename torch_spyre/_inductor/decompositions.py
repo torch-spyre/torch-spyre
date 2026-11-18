@@ -3946,13 +3946,26 @@ def where_scalar_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
+def _quantize_fp8_clamped_input(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Compute clamped input scaled for FP8 quantization.
+
+    On Spyre hardware, reciprocal(0.0) produces NaN instead of +inf.
+    To prevent NaN propagation when scale=0, use safe reciprocal so that
+    scaled inputs remain finite and dequantization by scale=0 correctly
+    evaluates to 0.0 (see #3037).
+    """
+    safe_recip = torch.where(scale == 0, 1.0, torch.reciprocal(scale))
+    x_scaled = input * safe_recip
+    return torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+
+
 @register_spyre_decompositions([torch.ops.spyre.quantize_fp8_with_scale])
 def spyre_quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 
@@ -3960,9 +3973,7 @@ def spyre_quantize_fp8_with_scale(
 def spyre_quantize_weight_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8wt(x_clamped)
 
 
