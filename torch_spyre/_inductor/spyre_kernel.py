@@ -182,7 +182,7 @@ def _serialize_value(v):
             subs = {
                 s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
             }
-            concrete = float(v.subs(subs))
+            concrete = float(v.xreplace(subs))
             return repr(concrete)
         try:
             return repr(float(v))
@@ -562,7 +562,7 @@ def _tile_advance_expr_from_dep(
     subs.update(
         {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
     )
-    return dep.index.subs(subs)
+    return dep.index.xreplace(subs)
 
 
 def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
@@ -629,7 +629,7 @@ def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
     """
     if variable not in index.free_symbols:
         return sympy.S.Zero
-    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    at = [sympy.expand(index.xreplace({variable: k})) for k in (0, 1, 2)]
     if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
         raise Unsupported(
             f"the loop variable {variable} is used non-affinely in the index "
@@ -704,10 +704,29 @@ class SpyreKernel(Kernel[CSEVariable]):
         so their sympy.Add terms never combine into one coefficient.
         """
         if level_idx not in self._tile_advance_symbols:
-            self._tile_advance_symbols[level_idx] = sympy.Symbol(
-                f"_tile_adv_{op_name}_lvl{level_idx}"
-            )
+            self._tile_advance_symbols[level_idx] = self._induction_symbol(
+                level_idx
+            ) or sympy.Symbol(f"_tile_adv_{op_name}_lvl{level_idx}")
         return self._tile_advance_symbols[level_idx]
+
+    def _induction_symbol(self, level_idx: int) -> "sympy.Symbol | None":
+        """The loop's own induction variable for level ``level_idx``, if known.
+
+        An op inside a counted loop lists the loop's variable in its ``dim_hints``
+        (level ``i`` is the ``i``-th loop-variable hint, outermost first), and that
+        variable is what ``dep.index`` carries, so the advance is expressed in it
+        directly. Returns ``None`` for an op with no loop-variable hint, and when the
+        hint count differs from the loop depth (the pairing is then unknown, the same
+        rule as ``_index_tile_advance``); the caller mints a per-(op, level) symbol.
+        """
+        node = getattr(self, "current_node", None)
+        ir_node = getattr(node, "node", None)
+        if ir_node is None:
+            return None
+        hinted = list(loop_var_ranges_from_dim_hints(ir_node))
+        if not hinted or len(hinted) != len(enclosing_loops(ir_node)):
+            return None
+        return hinted[level_idx] if level_idx < len(hinted) else None
 
     @staticmethod
     def _host_dim_to_index_symbol(ir_node: Any, dim: int) -> sympy.Symbol:
@@ -879,7 +898,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym not in subs
                     }
                 )
-                host_expr += dep.index.subs(subs)
+                # xreplace is simultaneous: the level symbol can be the loop's
+                # own induction variable, which is also a free symbol of the index
+                # (zeroed here). A sequential substitution would zero the symbol it
+                # just introduced.
+                host_expr += dep.index.xreplace(subs)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
@@ -1044,9 +1067,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
         )
         it_space = iteration_space(current_node)
-        # With dynamic=True the host index may contain symbolic strides
-        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
-        # can correctly isolate each loop variable's contribution.
 
         # insert_post_mutation_restickify may override the input layout for this input tensor.
         # Restore it here because the tensor data was uploaded as orig_stl.
