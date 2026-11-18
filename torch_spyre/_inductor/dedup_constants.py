@@ -23,6 +23,7 @@ from torch._inductor.virtualized import V
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
+from .loop_node import OpsView
 from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance
 
@@ -289,10 +290,16 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
     constants = [op for op in operations if isinstance(op, SpyreConstantFallback)]
     if not constants:
         return
-    non_constants = [
-        op for op in operations if not isinstance(op, SpyreConstantFallback)
-    ]
-    operations[:] = constants + non_constants
+    if isinstance(operations, OpsView):
+        # A constant in a loop body leaves it: its key is a scalar, a dtype and a
+        # device, so it cannot depend on the iteration. A flat
+        # ``operations[:] = ...`` would only move it to the head of its own body.
+        operations.hoist_to_front(constants)
+    else:
+        non_constants = [
+            op for op in operations if not isinstance(op, SpyreConstantFallback)
+        ]
+        operations[:] = constants + non_constants
     logger.debug(
         "dedup_and_promote_constants: %d constant(s) promoted to front of operations",
         len(constants),

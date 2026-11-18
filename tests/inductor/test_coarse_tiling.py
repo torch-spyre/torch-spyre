@@ -39,6 +39,7 @@ Covers six areas, each in its own class group:
 No Spyre device or backend compiler is required.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -93,6 +94,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     plan_coarse_tile_groups,
     reduction_loop_vars,
 )
+
+
 from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
@@ -131,10 +134,12 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_stride,
 )
 from utils_inductor import (
+    expects_raise,
     ir_computed_buffer,
     ir_input_loader,
     patch_tiling_helper,
 )
+
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -2417,11 +2422,8 @@ class TestDivideRanges(unittest.TestCase):
             _resize_device_layout(stl, [1, 128], [4, 128])
 
     def test_resize_device_layout_keeps_a_broadcast_stick_sparse(self):
-        """A broadcast stick compacted to stride_map -1 stays -1 when another
-        dim shrinks, so the tile's layout is the one compaction gives the tile.
-        The host stride, 0, would undo the compaction, and
-        _multi_arg_pointwise_layouts recognizes a broadcast stick only by -1.
-        Device coordinates ignore both, so either addresses the same element."""
+        """A broadcast stick compacted to stride_map 0 stays 0 when another
+        dim shrinks, so the tile's layout is the one compaction gives the tile."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.propagate_layouts import (
             _compact_broadcast_device_dims,
@@ -2440,7 +2442,7 @@ class TestDivideRanges(unittest.TestCase):
                 stl = _compact_broadcast_device_dims(
                     SpyreTensorLayout(size, stride, torch.float16, order)
                 )
-                self.assertEqual(stl.stride_map[-1], -1)
+                self.assertEqual(stl.stride_map[-1], 0)
                 result = _resize_device_layout(
                     stl,
                     size,
@@ -2464,7 +2466,7 @@ class TestDivideRanges(unittest.TestCase):
         order = [0, 1, 2, 3]
         stl = SpyreTensorLayout(size, stride, torch.float16, order)
         self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
-        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+        self.assertEqual(list(stl.stride_map), [32, 0, 32, 0, 1])
 
         tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
         result = _resize_device_layout(
@@ -2582,8 +2584,8 @@ class TestDivideRanges(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
-        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
-        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        # device_size=[1, 128, 64], stride_map=[0, 1, 0] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at 0.
         stl = SpyreTensorLayout([128], [1], torch.float16, [0])
         # Tile the non-stick dim: [128] -> [64].
         result = _resize_device_layout(stl, [128], [64])
@@ -2599,7 +2601,7 @@ class TestDivideRanges(unittest.TestCase):
         Flash-attention QK^T output: logical [B, H, Sq, Skv] with Sq == Skv,
         stored transposed.  The device layout is byte-identical whether Sq or
         Skv is the stick dim (device_size=[32,512,8,1,64],
-        stride_map=[512,16384,64,-1,1]), so size-based elimination cannot tell
+        stride_map=[512,16384,64,0,1]), so size-based elimination cannot tell
         the two size-512 host dims apart.
 
         Without identity (``stick_host_dim=None``) this is genuinely ambiguous
@@ -2616,7 +2618,7 @@ class TestDivideRanges(unittest.TestCase):
         # is a non-stick dim of the same size (512), so they collide by size.
         stl = SpyreTensorLayout(
             [32, 512, 8, 1, 64],
-            [512, 16384, 64, -1, 1],
+            [512, 16384, 64, 0, 1],
             dev,
             {(0,): 32, (1,): 512, (2, 4): 512, (3,): 1},
         )
@@ -2631,7 +2633,7 @@ class TestDivideRanges(unittest.TestCase):
             stl, host_size, [1, 32, 256, 512], stick_host_dim=3
         )
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
-        self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+        self.assertEqual(list(result.stride_map), [512, 16384, 64, 0, 1])
 
     def test_resize_device_layout_follows_permuted_host_strides(self):
         """A buffer written in a permuted order: host dim 1 is the outer one,
@@ -3175,6 +3177,21 @@ class TestCoarseTileNested(unittest.TestCase):
                     self.assertIsNotNone(getattr(op, "loop_info", None))
 
 
+def _legacy_lowering_only(cls):
+    """Run a test class against the legacy lowering alone.
+
+    These tests assert what the transform itself records and divides (hint lists,
+    ``loop_info`` fields, layouts) on mocked ops. The loop-term pass of stage 7a.2
+    appends one hint per op and reads real buffers, which a mocked graph does not
+    have; it has its own tests on real graphs (``test_span_overflow_loop_terms.py``).
+    """
+    return patch(
+        "torch_spyre._inductor.wsr.coarse_tile.add_loop_terms",
+        lambda *args, **kwargs: {},
+    )(cls)
+
+
+@_legacy_lowering_only
 class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
     output_tiled_dims, using the small example from
@@ -4641,7 +4658,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         k = Symbol("K")
         a = _make_minimal_op_spec("a")
         loop = LoopSpec(count=k, body=[a])
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(Unsupported):
             self._bundle([loop])
 
 
@@ -5670,6 +5687,84 @@ class TestPlanTilingPropagation(unittest.TestCase):
         self.assertEqual(propagation.kind, "copy_out")
         self.assertTrue(propagation.is_graph_output)
 
+    # --- the in-place write that advances through its target is refused (#6256) --
+
+    def _mutation_op(self, name, target_name):
+        """A tiled op whose layout is an in-place write into ``target_name``."""
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+        op = _make_tiled_op(name, [Integer(16)], (0,), [Integer(4)], [[0]])
+        target = MagicMock()
+        target.get_name.return_value = target_name
+        target.layout.stride = [Integer(1)]
+        op.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        op.layout.get_buffer.return_value = target
+        return op
+
+    def _plan_mutation(self, group_ops, *, outputs=(), graph_inputs=(), splice=False):
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        op = group_ops[0]
+        plan = {id(op): op.loop_info}
+        levels = [(0, Integer(4))]
+        fake_v = MagicMock()
+        fake_v.graph = SimpleNamespace(graph_inputs={n: object() for n in graph_inputs})
+        patches = [
+            patch("torch_spyre._inductor.wsr.coarse_tile.V", fake_v),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+                return_value=set(outputs),
+            ),
+        ]
+        if splice:
+            patches += [
+                patch(
+                    "torch_spyre._inductor.wsr.coarse_tile._splice_loop_vars",
+                    return_value=[Symbol("u0")],
+                ),
+                patch(
+                    "torch_spyre._inductor.wsr.coarse_tile."
+                    "_splice_write_targets_full_buffer",
+                    return_value=True,
+                ),
+            ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+        return op.loop_info.propagation
+
+    @expects_raise
+    def test_a_write_into_a_graph_input_that_is_also_an_output_is_refused(self):
+        """TODO(#6256): supporting it needs a write term on the op's own store and no
+        copy-out; this becomes a positive test then."""
+        op = self._mutation_op("op0", "arg0_1")
+        with self.assertRaisesRegex(Unsupported, r"in place into arg0_1.*#6256"):
+            self._plan_mutation([op], outputs={"arg0_1"}, graph_inputs={"arg0_1"})
+
+    @expects_raise
+    def test_a_for_each_tile_stacking_write_is_refused(self):
+        op = self._mutation_op("op0", "buf9")
+        with self.assertRaisesRegex(Unsupported, r"in place into buf9.*#6256"):
+            self._plan_mutation([op], splice=True)
+
+    @expects_raise
+    def test_a_local_accumulator_read_by_the_next_tile_is_refused(self):
+        """The flash-attention running-max shape: a pure intra-loop carry."""
+        op = self._mutation_op("op0", "acc")
+        reader = _make_inside_consumer_op("op1", "acc", (0,))
+        with self.assertRaisesRegex(Unsupported, r"in place into acc.*#6256"):
+            self._plan_mutation([op, reader])
+
+    def test_an_in_place_write_nothing_reads_is_not_refused(self):
+        """Control: the refusal is for a write that advances through its target. A
+        local target with no reader and no graph output stays loop_internal."""
+        op = self._mutation_op("op0", "acc")
+        propagation = self._plan_mutation([op])
+        self.assertEqual(propagation.kind, "loop_internal")
+
     def test_tiled_reduction_matches_reduction_kind(self):
         """A Reduction op tiling a reduction dim -> kind="reduction", with
         the same identity/nesting decisions _propagate_tiled_reduction_op
@@ -5938,6 +6033,59 @@ class TestReadCopyElisionProof(unittest.TestCase):
         )
 
         self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 8192))
+
+    def test_loop_bound_takes_the_declared_maximum_for_a_symbolic_count(self):
+        # A for_each_tile over a dim declared {min 8, max 64, granularity 8}
+        # walks FloorDiv(s0, 8) trips. The proof bounds the advance at the
+        # declared maximum, 64 // 8 = 8 trips, the conservative count: the
+        # reach at any admissible size is inside it (#6433).
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.pass_utils import declared_dims
+        from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
+
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
+        )
+        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.floor(s0 / 8)],
+            loop_tiled_dims=[[0]],
+            tiled_dims_per_read=[[[]]],
+            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
+        )
+
+        with declared_dims({"s0": (8, 64, 8)}):
+            self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 4096 * (8 - 1)))
+
+    def test_loop_bound_declines_a_symbolic_count_without_a_declaration(self):
+        # The same count with no declaration has no finite bound, so the proof
+        # declines as it did for every symbolic count before #6433.
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch_spyre._inductor.pass_utils import declared_dims
+        from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
+
+        shape_env = ShapeEnv()
+        # A symbol the ShapeEnv knows but nothing bounds: an unbacked size.
+        s1 = shape_env.create_unbacked_symint().node.expr
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
+        )
+        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.floor(s1 / 8)],
+            loop_tiled_dims=[[0]],
+            tiled_dims_per_read=[[[]]],
+            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
+        )
+        graph = SimpleNamespace(sizevars=SimpleNamespace(shape_env=shape_env))
+
+        with declared_dims({}), V.set_graph_handler(graph):
+            self.assertIsNone(_loop_advance_bound(op, dep, info, 0))
 
     def test_unsqueezed_loop_step_uses_dependency_stride(self):
         from torch._inductor.dependencies import MemoryDep
@@ -7951,6 +8099,7 @@ def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
     return op
 
 
+@_legacy_lowering_only
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -8113,7 +8262,7 @@ class TestPredictFrame(unittest.TestCase):
         With a stick host dim of exactly one stick (64 elems at fp16), the
         tile-count dim has size 1 too. ``_resize_device_layout`` used to match
         it to host dim 0 by size once level 1 put that at extent 1, collapsing
-        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        its stride to ``0`` at level 2, which a one-shot full->tile resize
         never did; hence ``_predict_output_layout`` resizes once per level,
         as ``_divide_ranges`` does.
         """
@@ -8492,7 +8641,7 @@ class TestValidateTiling(unittest.TestCase):
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
             [64, 80, 1, 64],
-            [5120, 64, -1, 1],
+            [5120, 64, 0, 1],
             dl.device_dtype,
             {(0,): 64, (1,): 80, (2, 3): 64},
             dl.element_arrangement,
@@ -9638,6 +9787,7 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
+@_legacy_lowering_only
 class TestApplyTilingsEquivalence(unittest.TestCase):
     """``apply_tilings`` reduces to the hint path.
 
@@ -9701,23 +9851,30 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         c0 = sympy.Symbol("c0")
         self.assertEqual(got.symbols_on_tile, {c0: c0})
 
-    def test_nested_two_level_matches_direct_call(self):
+    @expects_raise
+    def test_nested_two_level_is_refused_by_apply_tilings(self):
+        """The transform still takes a two-level group (the direct call below, and
+        the other direct tests); ``apply_tilings`` refuses one, because the
+        lowering builds one standalone loop per group (#6088).
+        ``test_single_level_matches_direct_call`` covers the equivalence.
+
+        TODO(#6088): when nested loops are supported, restore the comparison with
+        the direct call: equal ``loop_info`` and ranges `[64, 64]`."""
         ref = _make_hinted_op(
             _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
         )
         coarse_tile_post_stickify(
             _graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])]
         )
-        ref_fields = self._loop_fields(ref)
-        ref_ranges = list(ref.data.ranges)
+        self.assertEqual(list(ref.data.ranges), [Integer(64), Integer(64)])
 
         got = self._bare([256, 128], "op0")
-        apply_tilings(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
-        )
-        self.assertEqual(self._loop_fields(got), ref_fields)
-        self.assertEqual(list(got.data.ranges), ref_ranges)
-        self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+        with self.assertRaisesRegex(
+            Unsupported, r"allocator coarse tiling: nested loop tiling.*#6088"
+        ):
+            apply_tilings(
+                {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+            )
 
     def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
         spec = TileSpec((TileAxis(0, 4),))
@@ -11164,3 +11321,27 @@ class TestHoistedInputClone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _pin_the_tests_to_the_legacy_lowering():
+    """Every test here exercises the legacy transform's own internals (the
+    ``CoarseTileInfo`` it stamps, its planner and its phases), which
+    ``coarse_tile_post_stickify`` runs only under ``loop_tiling_lowering == "legacy"``.
+    They go with the transform.
+
+    Each test method is wrapped, not each class: the OOT wrapper that CI runs this file
+    through re-creates the classes, and a class decorator (or a module fixture) does not
+    survive that."""
+    for obj in list(globals().values()):
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, unittest.TestCase)
+            and obj.__module__ == __name__
+        ):
+            for name, method in list(vars(obj).items()):
+                if name.startswith("test") and callable(method):
+                    patched = config.patch({"loop_tiling_lowering": "legacy"})(method)
+                    setattr(obj, name, patched)
+
+
+_pin_the_tests_to_the_legacy_lowering()

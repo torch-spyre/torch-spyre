@@ -36,6 +36,9 @@ Each compiles on the device with the flow-through on and off.
 import contextlib
 import copy
 import unittest
+
+import regex as re
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -536,37 +539,52 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
     )
 
 
+class _Stub:
+    """An op with a name and, optionally, a loop group: all ``_check_members`` reads."""
+
+    def __init__(self, name, group=None):
+        self._name = name
+        if group is not None:
+            self.loop_info = SimpleNamespace(loop_group_id=group)
+
+    def get_name(self):
+        return self._name
+
+
 def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     """``collapse`` keeps an op that sits between two members of a loop in
     the node's span.  A kernel op there that is not a member (no loop_info)
-    would run every trip on the flow-through and once on the flat path: here
-    the accumulator's zero-fill, re-run each trip, so the flow-through
-    returned only the last tile's product (max error 0.146 against the
-    reference, 0.0007 on the flat path).  It is refused instead."""
-    from torch_spyre._inductor import loop_node
-    from torch_spyre._inductor.loop_facts import counted_loop_path
+    would run every trip on the flow-through and once on the flat path: the
+    accumulator's zero-fill, re-run each trip, returned only the last tile's
+    product (max error 0.146 against the reference, 0.0007 on the flat path).
+    ``_check_members`` refuses it.
 
-    X, Y = _matmul_inputs()
+    This calls the check directly. It used to compile a graph with a patch that
+    made the body's constant count as a member, so the span opened early and took
+    the zero-fill in; that no longer happens, because
+    ``dedup_and_promote_constants`` now hoists the constant out of the body before
+    the nodes are built (the graph compiles and is right, error 0.00073), so no
+    compiled graph reaches this check any more. The check guards a future pass
+    that places an op between two members without stamping its ``loop_info``."""
+    from torch_spyre._inductor.loop_scheduler import _check_members
 
-    def patch():
-        # Count an extern op with loop_info as a member: the body's constant,
-        # which precedes the zero-fill, then opens the span early.
-        return mock.patch.object(
-            loop_node,
-            "_group_path",
-            lambda op: counted_loop_path(op, include_extern=True),
-        )
+    node = _Stub("loopnode0")
+    member_a, member_b = _Stub("buf0", (0,)), _Stub("buf2", (0,))
+    outsider = _Stub("buf1")
 
-    torch._dynamo.reset()
-    with (
-        patch(),
-        torch._inductor.config.patch(force_disable_caches=True),
-        pytest.raises(Exception, match="not all members of it") as info,
-    ):
-        torch.compile(_scaled_split_k_fn, fullgraph=True, dynamic=False)(
-            X.to("spyre"), Y.to("spyre")
-        )
+    # members only: nothing to refuse, in one loop or in a nest
+    _check_members(node, [member_a, member_b])
+    _check_members(node, [])
+
+    # a non-member between two members is refused, and named
+    with pytest.raises(Exception, match="not all members of it") as info:
+        _check_members(node, [member_a, outsider, member_b])
     assert "are in no counted loop" in str(info.value)
+    assert "buf1" in str(info.value)
+
+    # members of two different loops in one node are refused too
+    with pytest.raises(Exception, match="their loop_group_ids differ"):
+        _check_members(node, [member_a, _Stub("buf3", (1,))])
 
 
 def test_cumsum_reading_a_body_buffer_runs_on_device():
@@ -596,12 +614,13 @@ def test_cumsum_reading_a_body_buffer_runs_on_device():
 
 
 def test_structured_and_span_overflow_loops_in_one_graph():
-    """span-overflow stamps flat loop ops (stage 1b is held), which
-    ``build_loop_scheduler_nodes`` still groups.  Its ``group_idx_offset``
-    is computed inside the pass loop, against the flat view, so it sees the
-    structured loop's body ops and starts above their group id: the flat
-    loop is group 1, the LoopSchedulerNode group 0, and both reach the
-    kernel as separate counted loops."""
+    """span-overflow stamps its group above the structured loop's group id (its
+    ``group_idx_offset`` is computed inside the pass loop, against the flat view,
+    so it sees the structured loop's body ops), and since stage 7a.2 the pass loop
+    wraps that group in a ``LoopNode`` too: the structured loop is group 0, the
+    span-overflow loop group 1, both reach the scheduler as LoopSchedulerNodes and
+    the kernel as separate counted loops.  With the flow-through scheduler off both
+    are flat counted loops again."""
     torch.manual_seed(0)
     X, Y = _matmul_inputs()
     big = torch.randn(1, 8195, 256, 64, dtype=torch.float16)
@@ -660,15 +679,27 @@ def test_structured_and_span_overflow_loops_in_one_graph():
     acc, out, code = run(True)
     assert seen[True] == [
         ("LoopSchedulerNode", [(0,)]),
-        ("CountedLoopSchedulerNode", [(1,)]),
+        ("LoopSchedulerNode", [(1,)]),
     ], seen[True]
     assert seen[False] == [
         ("CountedLoopSchedulerNode", [(0,)]),
         ("CountedLoopSchedulerNode", [(1,)]),
     ], seen[False]
-    assert _HBM_POOL.sub(r"\g<1>N", _mask(code)) == _HBM_POOL.sub(
-        r"\g<1>N", _mask(code_flat)
-    )
+
+    # One comment in the generated file differs: the fused kernel's list of fx
+    # placeholders names the full output buffer a span-overflow copy-out mutates
+    # (``empty_default``) for a flat loop and not for a LoopSchedulerNode, which
+    # orders itself after that allocation through a dependency of its own. No kernel
+    # code differs.
+    def same_code(text):
+        text = re.sub(
+            r"(?m)^#\s+%empty_default\w* : Tensor .*PlaceHolder\[target=empty_default\w*\]\n",
+            "",
+            text,
+        )
+        return _HBM_POOL.sub(r"\g<1>N", _mask(text))
+
+    assert same_code(code) == same_code(code_flat)
     torch.testing.assert_close(acc, acc_flat, atol=0, rtol=0)
     torch.testing.assert_close(out, out_flat, atol=0, rtol=0)
     torch.testing.assert_close(

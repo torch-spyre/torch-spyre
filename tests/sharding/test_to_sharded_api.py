@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 import torch
+
+from torch_spyre._inductor import config as spyre_config
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 import torch_spyre._sharded_api as sharded_api
@@ -192,11 +194,8 @@ def test_shard_count_must_equal_active_cores(
     assert no_runtime == []
 
 
-def test_active_core_count_reads_inductor_sencores(monkeypatch):
-    from torch_spyre._inductor import config
-
-    monkeypatch.setattr(config, "sencores", 16)
-
+@spyre_config.patch(sencores=16)
+def test_active_core_count_reads_inductor_sencores():
     assert _REAL_ACTIVE_CORE_COUNT() == 16
 
 
@@ -365,17 +364,25 @@ def test_device_each_shard_is_in_its_own_chunk():
 
 
 @_requires_spyre
-def test_device_fill_fails_instead_of_writing_one_chunk(active_cores):
+@pytest.mark.parametrize("op", ["fill", "zero"])
+def test_device_fill_fails_instead_of_writing_one_chunk(active_cores, op):
     # TODO: positive once fills are shard-aware.
     # fill_ takes one device address; the runtime guard rejects sharded
-    # storage. Compiled ops on sharded tensors are covered by
+    # storage with the sharding message (not as a partial view) and leaves
+    # every shard untouched. Compiled ops on sharded tensors are covered by
     # test_sharded_add.py.
-    result = torch.spyre.to_sharded(torch.randn(16, 64), Shard(0))
+    expected = torch.randn(16, 64)
+    result = torch.spyre.to_sharded(expected, Shard(0))
 
     with pytest.raises(
         RuntimeError, match="does not support sharded Spyre tensors yet"
     ):
-        result.fill_(0)
+        if op == "fill":
+            result.fill_(0)
+        else:
+            result.zero_()
+
+    torch.testing.assert_close(result.cpu(), expected)
 
 
 test_device_fill_fails_instead_of_writing_one_chunk._expects_raise = True

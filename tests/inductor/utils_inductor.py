@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 
 DEVICE = torch.device("spyre")
 
+try:
+    from ortools.sat.python import cp_model as _cp_model  # noqa: F401
+
+    HAS_ORTOOLS = True
+except ImportError:
+    HAS_ORTOOLS = False
+
 
 def _make_generator(*args) -> torch.Generator:
     """Return a seeded Generator whose seed is a stable hash of ``args``.
@@ -834,7 +841,7 @@ def _compile_and_run(
     if compile:
         comp_func = torch.compile(fn, backend=backend)
 
-        if source_check is not None and device == "spyre":
+        if source_check is not None and device.type == "spyre":
             result, source_codes = run_and_get_code(
                 comp_func, *device_args, **device_kwargs
             )

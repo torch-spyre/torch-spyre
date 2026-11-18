@@ -1526,6 +1526,50 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 ):
                     lowering.splice_while_loops(graph)
 
+    def test_a_symint_operand_the_body_reads_splices(self):
+        # The SymInt operand drops out of while_op.inputs, so the bridge rebuilds
+        # the operand list. The body names the same symbol as the parent, so
+        # the spliced body stays bound and no WhileLoop is left behind.
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertLess(
+            len(loop.inputs), len(loop.body_subgraph.graph.graph_inputs), loop.inputs
+        )
+
+        with V.set_graph_handler(graph):
+            lowering.splice_while_loops(graph)
+
+        self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
+
+    @expects_raise
+    def test_a_symint_operand_the_body_names_differently_is_refused(self):
+        # If the body's placeholder were a symbol other than the operand's own,
+        # the spliced reads would name a symbol the parent never binds. Refuse
+        # that at the splice instead of failing later on a missing symbol.
+        import sympy
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        body_inputs = loop.body_subgraph.graph.graph_inputs
+        (name,) = [k for k, v in body_inputs.items() if isinstance(v, sympy.Expr)]
+        body_inputs[name] = sympy.Symbol("s_unbound", integer=True, positive=True)
+
+        with V.set_graph_handler(graph):
+            with self.assertRaisesRegex(Unsupported, "does not bind"):
+                lowering.splice_while_loops(graph)
+
     def test_every_nested_level_is_checked(self):
         # Break only the INNER loop's step: the outer loop splices fine, then the
         # inner loop is found and must still be refused.
@@ -3007,7 +3051,9 @@ class TestTryProveForEachTile(unittest.TestCase):
                 enable_spyre_lowerings(),
             ):
                 graph.run(counter)
-                self.assertEqual(_extract_trip_count(graph), 16)
+                result = _extract_trip_count(graph)
+                self.assertTrue(result.accepted, result.reason)
+                self.assertEqual(result.trip_count, 16)
                 self.assertEqual(len(graph.operations), 1)
                 self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
 
@@ -3044,7 +3090,8 @@ class TestTryProveForEachTile(unittest.TestCase):
         # insert a to_dtype cast for 0-dim integer predicates compared against
         # an int.  If it does, the cond graph grows a second op (n_ops == 2)
         # and the bound becomes float(N) instead of int(N), both of which make
-        # _extract_trip_count return None, causing silently wrong loop counts.
+        # _extract_trip_count decline, and splice_while_loops then refuses the
+        # loop.
         while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
             split_m_fn, matmul_inputs()[0]
         )
@@ -3274,6 +3321,19 @@ class TestTryProveForEachTile(unittest.TestCase):
                     self.assertTrue(result.accepted, result.reason)
                     self.assertIsInstance(loop, ir.WhileLoop)
 
+    def test_a_symint_operand_leaves_the_counter_first(self):
+        # A symbolic trip count brings a SymInt into the loop's operands. The
+        # counter must still be carried_inputs[0], since every proof above reads
+        # it by position.
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+
+        (loop,) = self._all_while_loops(_length_scaled_fn, (x,))
+        result = try_prove_for_each_tile(loop)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertTrue(result.trip_count.free_symbols, result.trip_count)
+
     def _all_while_loops(self, fn, args):
         from torch._inductor import ir
 
@@ -3281,16 +3341,43 @@ class TestTryProveForEachTile(unittest.TestCase):
         return [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
 
 
+def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
+    """A symbolic-length loop whose body reads the length, a SymInt operand."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * rows
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
 class TestPassPipelineRegistration(unittest.TestCase):
-    def test_splice_while_loops_is_first_pass(self):
+    def test_splice_while_loops_runs_right_after_the_reserved_dims_contract(self):
         from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+        from torch_spyre._inductor.reserved_dims_contract import (
+            apply_reserved_dims_contract,
+        )
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
 
         pipeline = CustomPreSchedulingPasses()
 
-        self.assertIs(pipeline.passes[0], splice_while_loops)
+        # apply_reserved_dims_contract must run before splice_while_loops (and
+        # everything else): it writes each declared dim's (min, max) into the
+        # ShapeEnv, which splice_while_loops reads when it stamps a loop's
+        # trip count / max extent. Reversing the order would make
+        # splice_while_loops see Dynamo's loose default range instead of the
+        # declared one.
+        self.assertIs(pipeline.passes[0], apply_reserved_dims_contract)
+        self.assertIs(pipeline.passes[1], splice_while_loops)
 
 
 def test_tile_dim_marker_lowering_produces_distinct_operation():
@@ -3777,6 +3864,85 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 lookup_marker_dim(new_consumer, loop_var),
                 "the retained axis must still resolve to a tiled position",
             )
+
+    def test_cached_marker_substitution_invalidates_on_edit(self):
+        """_cached_marker_substitution re-extracts once the marker is edited.
+
+        The cache on the marker is reused only while its body, ranges and host
+        layouts and its input's host layout are unchanged. A stale hit would
+        inline the marker with an old read index, which is wrong code, not a
+        crash, so pin each invalidation: patching ``inner_fn`` in place and
+        changing the input buffer's host stride must both re-extract.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _cached_marker_substitution,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_m_elementwise_fn, (X, Y))
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+            marker_op = next(
+                op
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            )
+            self.assertIsInstance(marker_op, ir.ComputedBuffer)
+
+            with mock.patch.object(
+                lowering, "_marker_substitution", wraps=lowering._marker_substitution
+            ) as extract:
+                first = _cached_marker_substitution(marker_op)
+                self.assertIs(_cached_marker_substitution(marker_op), first)
+                self.assertEqual(extract.call_count, 1, "unchanged marker: a hit")
+
+                # A pass patches inner_fn in place on the same body object.
+                original_fn = marker_op.data.inner_fn
+                object.__setattr__(
+                    marker_op.data, "inner_fn", lambda index: original_fn(index)
+                )
+                self.assertEqual(_cached_marker_substitution(marker_op), first)
+                self.assertEqual(extract.call_count, 2, "new inner_fn: a miss")
+
+                # Change the input's host stride.
+                input_buf = graph.try_get_buffer(first[0])
+                while not isinstance(input_buf, ir.Buffer):
+                    input_buf = input_buf.data
+                old = input_buf.get_layout()
+                self.assertGreater(len(old.size), 1)
+                object.__setattr__(
+                    input_buf,
+                    "layout",
+                    ir.FixedLayout(
+                        old.device,
+                        old.dtype,
+                        list(old.size),
+                        [stride * 2 for stride in old.stride],
+                        old.offset,
+                    ),
+                )
+                _cached_marker_substitution(marker_op)
+                self.assertEqual(extract.call_count, 3, "new input stride: a miss")
 
     def test_marker_with_two_computed_buffer_consumers_retain_advances(self):
         """Paged attention's shape: one marker, two ComputedBuffer consumers,
@@ -5813,6 +5979,62 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)
+
+    def test_split_input_clone_has_representable_scheduler_transport(self):
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.pass_utils import (
+            PerCoreView,
+            apply_splits_from_index_coeff,
+            finalize_work_division_for_scheduler,
+            iteration_space_from_op,
+            op_read_writes,
+            select_work_division_transport_indexes,
+        )
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_group_path,
+            get_buffer_users,
+        )
+
+        graph = self._spliced_graph()
+        with V.set_graph_handler(graph):
+            users = get_buffer_users(graph)
+            name = next(
+                name
+                for name in graph.graph_input_names
+                if users.get(name) and counted_loop_group_path(users[name][0])
+            )
+            box = self._tile_input(graph, name)
+            core_id = sympy.Symbol("core_id")
+            clone = GraphEditor(graph).push_allocation_with_clone(
+                box,
+                users[name],
+                input=True,
+                lx_view=PerCoreView(
+                    ((1, 2),), ((1, sympy.Mod(core_id, 2)),), num_cores=2
+                ),
+            )
+            expected_splits = dict(clone.iteration_space_ownership.work_slices)
+            self.assertEqual(clone.iteration_space_ownership.physical_core_count, 2)
+            self.assertEqual(sorted(expected_splits.values()), [1, 2])
+            clone_space = iteration_space_from_op(clone)
+            clone_writes = [
+                dep
+                for dep in op_read_writes(clone).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(len(clone_writes), 1)
+
+            finalize_work_division_for_scheduler(graph)
+            write_index, read_index = select_work_division_transport_indexes(
+                clone, op_read_writes(clone), clone_space
+            )
+            decoded = apply_splits_from_index_coeff(
+                clone.op_it_space_splits, write_index, read_index, clone_space
+            )
+            self.assertEqual(decoded, expected_splits)
 
 
 class TestRepointRefsToBuffer(unittest.TestCase):

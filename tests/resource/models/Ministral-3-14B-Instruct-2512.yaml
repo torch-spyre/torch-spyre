@@ -4,6 +4,13 @@ defaults:
   seed: 123
   atol: 0.005
   rtol: 0.005
+dtypes:
+  - name: bfloat16
+    precision:
+      # rtol 0.008 (> 2^-7 = 0.0078125, the max relative size of one bf16 step):
+      # device results, computed via DLFloat16, can differ from the CPU reference
+      # by one bf16 step.
+      rtol: 0.008
 cases:
   - name: torch.nn.functional.embedding.1
     op: torch.nn.functional.embedding

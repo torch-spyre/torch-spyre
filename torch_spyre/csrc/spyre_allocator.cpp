@@ -80,7 +80,8 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
 
 std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
     c10::DeviceIndex device) {
-  int64_t active_device_id = flex::RuntimeContext::getInstance()->getDeviceID();
+  int64_t active_device_id =
+      flex::RuntimeContext::getInstance()->getDeviceIndex();
   TORCH_CHECK(static_cast<int64_t>(device) == active_device_id,
               "SpyreAllocator::getMemoryInfo: requested device index ", device,
               " does not match the active device (", active_device_id, ")");
@@ -249,7 +250,7 @@ std::vector<flex::CompositeAddress> allocateShardTable(
     const std::shared_ptr<flex::FlexAllocator>& flex_alloc,
     uint64_t shard_device_bytes, uint32_t logical_chunks) {
   const uint32_t num_domains =
-      static_cast<uint32_t>(flex_alloc->topology().num_domains());
+      static_cast<uint32_t>(flex_alloc->topology().numDomains());
   std::vector<flex::CompositeAddress> shards;
   shards.reserve(logical_chunks);
   for (uint32_t i = 0; i < logical_chunks; ++i) {

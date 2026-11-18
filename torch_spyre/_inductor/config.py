@@ -16,7 +16,8 @@ import decimal
 import math
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING
+import warnings
 
 from torch.utils._config_module import install_config_module
 
@@ -252,6 +253,72 @@ min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
+
+def reservation_violations(
+    dim_min: int,
+    dim_max: int,
+    granularity: int,
+    *,
+    enforce_min_floor: bool = True,
+) -> list[str]:
+    """Problems with ``(dim_min, dim_max, granularity)`` as a reservation contract.
+
+    Shared by the two places such a triple is created: a user's own
+    ``tensor.to("spyre", dynamic=...)`` declaration (``_monkey_patch.py``) and
+    a derived output contract handed from one compiled kernel to the next
+    (``reserved_dims_contract.py``'s ``output_reserved_dims``). A derived
+    contract is held to the same structural bar as a typed one, instead of
+    silently carrying a triple the declare-time path would have rejected.
+
+    ``enforce_min_floor`` defaults on for a user-typed declaration, where
+    ``min_reserved_dim_size`` matters (the serving plugin's eager row-count
+    branching, see that constant's own docstring). A derived output contract
+    is purely an internal compiler value with no such caller, and a real
+    kernel-to-kernel contract routinely has a ``min`` under that floor (a
+    reduction's output row count, say) -- so ``output_reserved_dims`` passes
+    ``False``. The two divisibility rules hold on a derived contract by
+    construction, given a valid input; the bucket cap does not (a derived
+    granularity can be finer than any input's), so it is the one rule that
+    genuinely needs checking there too.
+
+    Empty when the triple is valid. Callers decide how to report a
+    violation: a user-typed declaration raises ``ValueError``; a
+    compiler-derived contract that fails the cap raises ``Unsupported``
+    rather than silently stamping it or silently loosening the cap.
+    """
+    # install_config_module (below) moves every config value off this
+    # module's plain globals and onto its own accessor, so a bare reference
+    # to max_buckets/min_reserved_dim_size from here -- a function living in
+    # this same file -- would raise NameError once the module is installed.
+    # Re-importing it by name resolves through that accessor instead, the
+    # same way every external caller (e.g. pass_utils.py) already reads it.
+    from torch_spyre._inductor import config as _config
+
+    violations = []
+    if dim_min > dim_max:
+        violations.append(f"min={dim_min} exceeds max={dim_max}")
+    if dim_max % granularity != 0:
+        violations.append(
+            f"max={dim_max} is not a multiple of granularity={granularity}"
+        )
+    if dim_min % granularity != 0:
+        violations.append(
+            f"min={dim_min} is not a multiple of granularity={granularity}"
+        )
+    if enforce_min_floor and dim_min < _config.min_reserved_dim_size:
+        violations.append(
+            f"min={dim_min} is below the minimum supported reservation floor "
+            f"({_config.min_reserved_dim_size})"
+        )
+    num_buckets = dim_max // granularity
+    if num_buckets > _config.max_buckets:
+        violations.append(
+            f"max={dim_max} / granularity={granularity} = {num_buckets} buckets, "
+            f"exceeding the cap of {_config.max_buckets} (config.max_buckets)"
+        )
+    return violations
+
+
 # Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS", "0") == "1"
@@ -334,6 +401,24 @@ dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 # config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
+)
+
+
+# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
+# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
+# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
+# the CoarseTileInfo transform is deleted.
+def _choose_loop_tiling_lowering(value: str) -> str:
+    if value not in ("legacy", "plan"):
+        raise ValueError(
+            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
+            "'plan'"
+        )
+    return value
+
+
+loop_tiling_lowering: str = _choose_loop_tiling_lowering(
+    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
 )
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
@@ -461,6 +546,13 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
+# Check that graph.operations is topologically ordered after every
+# pre-scheduling pass, not only after the last one. The check after the last
+# pass always runs and catches any pass that breaks the order; this one names
+# the pass that did. Off by default because it re-extracts the read set of
+# every operation after every pass. Set SPYRE_VALIDATE_EVERY_PASS=1 to enable.
+validate_every_pass: bool = os.environ.get("SPYRE_VALIDATE_EVERY_PASS", "0") == "1"
+
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
 # selects. Off by default, and inert unless a joint co-opt path is active
@@ -538,6 +630,49 @@ _cache_config_ignore_prefix: list[str] = [
     "timing",
     "dump_cost_expr_file",
     "spyre_kernel_cache",
+    # Read at call time; the generated code is the same for every value.
+    "precomputed_kernel_key",
 ]
+
+
+def _precomputed_kernel_key_from_env() -> str:
+    value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return "1"
+    if normalized == "verify":
+        return "verify"
+    if normalized not in ("", "0", "false", "no"):
+        warnings.warn(
+            "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY must be 1/true/yes, verify or "
+            f"0/false/no, got {value!r}; leaving it off",
+            stacklevel=2,
+        )
+    return "0"
+
+
+# Trust the kernel-cache key that codegen stored in the generated wrapper.
+# Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
+# (None when it could not be computed): <key> is compute_specs_hash() of the
+# call's specs and pool_size, <fp> a fingerprint of everything else that key
+# depends on (see kernel_key_fingerprint in torch_spyre.execution.kernel_cache
+# for the list). With the kernel cache on and this set to "1",
+# sdsc() uses <key> when <fp> matches the running process instead of
+# regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
+# mismatch falls back to compute_specs_hash(). "verify" computes both and
+# raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
+# time; the generated code is the same for every value, so it is left out of
+# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
+# (true and yes work too). Any other value warns and leaves it off.
+precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
+
+if TYPE_CHECKING:
+    # install_config_module below adds ``patch`` (and the rest of the config
+    # API) at runtime. Declare it for mypy, which pre-commit runs without torch
+    # installed, so torch.utils._config_typing cannot supply it.
+    def patch(
+        arg1: str | dict[str, Any] | None = None, arg2: Any = None, **kwargs: Any
+    ) -> Any: ...
+
 
 install_config_module(sys.modules[__name__])

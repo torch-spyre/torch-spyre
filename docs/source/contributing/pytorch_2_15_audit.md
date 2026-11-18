@@ -1,7 +1,7 @@
 # PyTorch 2.15 compatibility audit
 
 This audit covers the Python monkey-patches in `torch_spyre`, including the
-Inductor patches brought in by merging upstream main at `2c2cda371f` into
+Inductor patches brought in by merging upstream main at `8d13d06edb` into
 the 2.15 upgrade. Upstream comparisons use PyTorch `v2.14.1` and
 `v2.15.0` (`31a77fc9c0a7c6fff15a1ff58c743f53b1a9d457`). Runtime checks use
 Python 3.12 and torch 2.15.0+cpu.
@@ -59,6 +59,10 @@ unchanged, so this upgrade does not require a new scan salt.
 | Location / upstream surface | 2.15 assessment |
 | --- | --- |
 | `loop_scheduler.py`: four replaced scheduler methods and dependent IR interfaces | The surface comparison reports 27 unchanged, two changed, none missing. `_init` adds fusion-memory state while preserving the front-half ordering. `compute_dependencies` removes the obsolete table; fixed above. All four replaced methods are unchanged. |
+| `loop_scheduler.py`: `refresh_group_node_dependencies` | Unchanged in 2.15. The new wrapper preserves the loop's unpruned fake dependencies when upstream rebuilds the group from its children, and restores the original function on exit. |
+| `patches.py`: stride-first contiguity | The copied upstream function is unchanged in 2.15; upstream still introduces the size-one guard before checking strides. Keep the workaround for pytorch#203781. |
+| `_monkey_patch.py`: `FakeTensorMode.avoid_device_init` | The property is unchanged in 2.15; the upstream PrivateUse1 opt-out is still absent. Keep the device-initialization workaround for pytorch#203190. |
+| `_inductor/__init__.py`, guards and FX hashes: declared dimensions | GraphArg example/fake-tensor access and symbolic sizes retain their contracts. Preserve the new reservation metadata in cache keys, reuse guards and compiled outputs. |
 | `patches.py`: dtype computation map | Same upstream map and lookup contract. Keep Spyre's native-width policy scoped to the compile context. |
 | `patches.py`: `GraphLowering.placeholder` | Unchanged; upstream still initially gives input layouts offset zero. Preserve Spyre input offsets before views are lowered. |
 | `patches.py`: `GraphLowering.register_operation` | Unchanged; naming by list length still needs protection after graph edits. |
@@ -82,6 +86,11 @@ unchanged, so this upgrade does not require a new scan salt.
 | Device/distributed registration and eager nested-copy guard | Registration APIs remain available. `_use_eager_on_nested_compile` and its predicate are unchanged. These are integration interfaces rather than replaced implementations. |
 
 ## Validation and limits
+
+The results below describe the November 6 validation, before the November 18
+refresh. The refresh also incorporates upstream's AIUPTI `device_index` fix
+and eager `masked_fill` support; the obsolete upgrade-branch masked-fill
+rejection is removed in favor of upstream's positive tests.
 
 The torch-spyre native extension rebuilt against 2.15. The focused CPU audit
 passed 162 tests and 89 subtests across loop scheduling, scan shape proxies,
