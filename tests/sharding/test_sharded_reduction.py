@@ -27,9 +27,16 @@ process start. ``test_device_suite_in_emulation_shape`` runs this file in a
 subprocess for each shape, so a plain ``pytest`` run (and CI) covers them; the
 per-shape tests skip in a process without that environment.
 
-Results are compared with the same reduction on unsharded device tensors,
-which run the same device arithmetic. Inputs are small integers, so ``sum``,
-``max`` and ``min`` are exact in fp16 and the comparison is ``torch.equal``.
+Results are compared with the reduction run on the CPU, so the reference does
+not depend on an unsharded device kernel being correct. Inputs are small
+integers, so ``sum``, ``amax`` and ``amin`` are exact in fp16 and those
+comparisons are ``torch.equal``; ``mean`` is compared against an fp32 CPU
+reference within fp16 rounding (exactly, where the input makes the mean
+representable) and, additionally, with the same reduction compiled on the
+unsharded device tensor — exact for shard-local ``mean`` (identical per-core
+arithmetic), within rounding order for cross-shard ``mean`` (the ring sums
+partials in a different order than one kernel; fp16 addition is not
+associative).
 """
 
 from __future__ import annotations
@@ -172,10 +179,6 @@ def _small_ints(shape, dtype=torch.float16, seed=0) -> torch.Tensor:
     return torch.randint(-8, 8, shape, generator=generator).to(dtype)
 
 
-def _reference(fn, src: torch.Tensor) -> torch.Tensor:
-    return torch.compile(fn, dynamic=False)(src.to("spyre")).cpu()
-
-
 @_requires_emulation
 @pytest.mark.parametrize(
     "fn",
@@ -186,7 +189,7 @@ def _reference(fn, src: torch.Tensor) -> torch.Tensor:
     ],
     ids=["sum", "amax", "amin"],
 )
-def test_shard_local_reduction_matches_unsharded(launched, fn):
+def test_shard_local_reduction_matches_cpu(launched, fn):
     """Reducing a dim before the shard dim keeps the result sharded.
 
     Input [3, 4n, 64] is Shard(1); reducing dim 0 leaves [4n, 64] sharded on
@@ -203,7 +206,6 @@ def test_shard_local_reduction_matches_unsharded(launched, fn):
     info = torch.spyre.sharding_info(y)
     assert info.placement == Shard(0) and info.num_shards == n
     assert tuple(y.shape) == (4 * n, 64)
-    assert torch.equal(y.cpu(), _reference(fn, src))
     assert torch.equal(y.cpu(), fn(src))
 
 
@@ -239,11 +241,22 @@ def test_each_core_reduces_only_its_own_shard():
 
 
 @_requires_emulation
-def test_mean_matches_unsharded():
+def test_shard_local_mean_close_to_cpu():
     """mean is shard-local too: every core divides by the same reduced count.
 
-    Device mean differs from the CPU mean in the last bits (measured on
-    unsharded tensors too), so the reference is the unsharded device mean.
+    Two references, each covering the other's blind spot:
+
+    - The fp32 CPU mean, within tolerances. The device's division for mean is
+      measurably inexact (~1% relative, ~0.01 absolute on these inputs; it
+      does not match a single fp16 rounding), so exactness is not available
+      here. A wrong division (by a local extent, by the shard count) is off
+      by a factor, far outside these tolerances.
+    - The same reduction compiled on the unsharded tensor, exactly. Both
+      paths run the same device arithmetic, so any difference — a core
+      reading another shard, a different divisor on the sharded path — fails
+      this equality while fitting inside the CPU tolerance above. It cannot
+      catch an error the unsharded kernel shares, which is what the CPU
+      reference is for.
     """
     n = _num_shards()
     src = _small_ints((3, 4 * n, 64), seed=2)
@@ -253,7 +266,9 @@ def test_mean_matches_unsharded():
 
     info = torch.spyre.sharding_info(y)
     assert info.placement == Shard(0)
-    assert torch.equal(y.cpu(), _reference(lambda t: t.mean(0), src))
+    assert torch.allclose(y.cpu().float(), src.float().mean(0), rtol=2e-2, atol=2e-2)
+    device_ref = torch.compile(lambda t: t.mean(0), dynamic=False)(src.to("spyre"))
+    assert torch.equal(y.cpu(), device_ref.cpu())
 
 
 @_requires_emulation
@@ -298,7 +313,6 @@ def test_cross_shard_reduction_matches_cpu(launched, fn):
     assert len(launched) == 1, launched
     assert not torch.spyre.is_sharded(y)
     assert torch.equal(y.cpu(), fn(src))
-    assert torch.equal(y.cpu(), _reference(fn, src))
 
 
 @_requires_emulation
@@ -344,6 +358,15 @@ def test_cross_shard_mean_close_to_cpu():
 
     Not exact in fp16; the tolerance is 0.5% relative, and the unsharded
     device mean is measured at 0.4% on the same inputs.
+
+    The sharded result is also compared with the same reduction compiled on
+    the unsharded device tensor. That one cannot be exact: the cross-shard
+    path sums per-core partials in ring order and the unsharded kernel
+    reduces in its own order, and fp16 addition is not associative (measured
+    at just under 0.5% on these inputs). The 1% tolerance still catches a
+    sharded path that combines or divides differently by more than rounding
+    order; the division count itself is pinned exactly by
+    ``test_cross_shard_mean_divides_by_the_global_extent``.
     """
     n = _num_shards()
     generator = torch.Generator().manual_seed(7)
@@ -354,6 +377,28 @@ def test_cross_shard_mean_close_to_cpu():
 
     expected = src.float().mean(1)
     assert torch.allclose(y.cpu().float(), expected, rtol=5e-3, atol=0)
+    device_ref = torch.compile(lambda t: t.mean(1), dynamic=False)(src.to("spyre"))
+    assert torch.allclose(y.cpu().float(), device_ref.cpu().float(), rtol=1e-2, atol=0)
+
+
+@_requires_emulation
+def test_cross_shard_mean_divides_by_the_global_extent():
+    """Pins how the backend divides for mean: once, by the global extent.
+
+    Every element of a reduced column is the same constant c, so the true
+    mean is c exactly and the comparison is ``torch.equal``. A backend that
+    divided by a core's local extent and let the ring sum the per-core means
+    would return c * num_shards instead; one that divided by the shard count
+    only would return c * (shard extent / num_shards).
+    """
+    n = _num_shards()
+    c = 3
+    src = torch.full((3, 4 * n, 64), float(c), dtype=torch.float16)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.mean(1), dynamic=False)(x)
+
+    assert torch.equal(y.cpu(), torch.full((3, 64), float(c), dtype=torch.float16))
 
 
 @_requires_emulation
@@ -407,8 +452,9 @@ def test_cross_shard_result_is_one_ordinary_chunk():
         # A real limit for now: reducing the stick dim changes each shard's
         # device layout.
         (lambda x: x.sum(-1), "reductions over the stick dim"),
-        # TODO: positive once the shard-local keepdim output layout matches
-        # the default shard layout (it gets a size-1 outer device dim today).
+        # TODO(#6170): positive once the shard-local keepdim output layout
+        # matches the default shard layout (it gets a size-1 outer device dim
+        # today).
         (lambda x: x.sum(0, keepdim=True), "default device layout"),
     ],
     ids=["full", "includes_shard_dim", "stick_dim", "local_keepdim"],
