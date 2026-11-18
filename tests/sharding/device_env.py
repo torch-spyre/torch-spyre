@@ -86,15 +86,20 @@ def num_shards() -> int:
 
 
 def promote_vf_mode_to_emulation() -> bool:
-    """Rewrite ``FLEX_DEVICE=VF`` to ``EMUL1p5`` before Flex loads.
+    """Rewrite a VF-mode environment into the emulation shape.
 
     A VF-mode host can back the emulation device (the wrapper's probe and
     children rely on that), but a process started with ``FLEX_DEVICE=VF``
     loads the real-VF runtime instead of the emulation code. Call this
     before anything loads the Flex runtime — the sharding ``conftest.py``
-    does so at import time — so a plain pytest run on a VF-mode host
-    triggers the emulation path. Returns whether the rewrite happened.
-    No-op once the runtime is already open (the mode is fixed then).
+    does so at import time — so a plain pytest run of ``tests/sharding/``
+    runs the whole suite (device tests and device-less tests alike) on
+    the emulator. ``SENCORES`` is forced to 8 when it is not already in
+    (8, 16) — the shapes that admit sharded allocations — so a full-core
+    VF environment (e.g. SENCORES=32) still yields the emulation shape.
+    Returns whether anything was rewritten. No-op once the runtime is
+    already open (the mode is fixed then), and for non-VF modes (PF stays
+    PF: a PF-only host has no VFs to emulate on).
     """
     if os.environ.get("FLEX_DEVICE") != "VF":
         return False
@@ -106,6 +111,17 @@ def promote_vf_mode_to_emulation() -> bool:
         # so the rewrite is safe.
         pass
     os.environ["FLEX_DEVICE"] = "EMUL1p5"
+    shards = num_shards()
+    if shards not in (8, 16):
+        os.environ["SENCORES"] = "8"
+        shards = 8
+    # torch_spyre._inductor.config captures SENCORES at import; the repo
+    # root's tests/conftest.py can import it before this directory's
+    # conftest runs. Fix the cached value too, or to_sharded would still
+    # see the ambient core count and reject every shard count.
+    config_module = sys.modules.get("torch_spyre._inductor.config")
+    if config_module is not None:
+        config_module.sencores = shards
     return True
 
 

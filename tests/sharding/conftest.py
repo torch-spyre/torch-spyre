@@ -95,6 +95,15 @@ def _vf_capable() -> bool:
 def pytest_sessionfinish(session, exitstatus):
     import torch
 
+    # Under pytest-xdist every worker collects the whole suite but executes
+    # only its share, so a worker that drew no wrapper test would look like
+    # "nothing executed" and falsely fail. The controller process runs no
+    # tests, so it cannot judge either: the guard is a no-op under xdist.
+    # (CI's OOT --parallel is per-file pytest processes across cards, not
+    # xdist, so the guard does apply there.)
+    if hasattr(session.config, "workerinput"):
+        return
+
     verdict, message = device_coverage_verdict(
         device_collected=len(_device_collected),
         device_executed=len(_device_executed),

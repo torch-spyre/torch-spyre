@@ -280,9 +280,26 @@ def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
     # pin the state this test reasons about instead of inheriting it.
     monkeypatch.setattr(torch.spyre, "is_initialized", lambda: False)
 
+    # The whole suite runs in the emulation shape: a full-core VF
+    # environment (SENCORES=32) is rewritten to EMUL1p5 with SENCORES
+    # forced into the sharded-admitting shapes.
     monkeypatch.setenv("FLEX_DEVICE", "VF")
+    monkeypatch.setenv("SENCORES", "8")
     assert promote_vf_mode_to_emulation() is True
     assert os.environ["FLEX_DEVICE"] == "EMUL1p5"
+    assert os.environ["SENCORES"] == "8"
+
+    monkeypatch.setenv("FLEX_DEVICE", "VF")
+    monkeypatch.setenv("SENCORES", "32")
+    assert promote_vf_mode_to_emulation() is True
+    assert os.environ["FLEX_DEVICE"] == "EMUL1p5"
+    assert os.environ["SENCORES"] == "8"
+
+    monkeypatch.setenv("FLEX_DEVICE", "VF")
+    monkeypatch.setenv("SENCORES", "16")
+    assert promote_vf_mode_to_emulation() is True
+    assert os.environ["SENCORES"] == "16"
+    monkeypatch.delenv("SENCORES")
 
     # Other modes are left alone (PF stays PF; unset stays unset).
     monkeypatch.setenv("FLEX_DEVICE", "PF")
@@ -295,5 +312,6 @@ def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
     # With the runtime already open, even VF is left alone.
     monkeypatch.setattr(torch.spyre, "is_initialized", lambda: True)
     monkeypatch.setenv("FLEX_DEVICE", "VF")
+    monkeypatch.setenv("SENCORES", "8")
     assert promote_vf_mode_to_emulation() is False
     assert os.environ["FLEX_DEVICE"] == "VF"
