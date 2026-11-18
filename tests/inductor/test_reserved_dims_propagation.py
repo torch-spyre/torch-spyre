@@ -119,6 +119,19 @@ class TestOutputGranularity(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertEqual(contract.output_granularity(size, contracts), 1)
 
+    def test_a_contract_no_size_satisfies_is_refused_not_treated_as_any_size(self):
+        # Both creation sites validate, so this should not arrive. If a third
+        # one ever does not, the failure has to be loud: answering 1 would turn
+        # it into "any size" and stamp it.
+        cases = {
+            "min above max": {s0: (512, 128, 64)},
+            "no multiple of the granularity in range": {s0: (100, 120, 64)},
+        }
+        for reason, contracts in cases.items():
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(Unsupported, "no size satisfies"):
+                    contract.output_granularity(2 * s0, contracts)
+
 
 class TestApplyReservedDimsContract(unittest.TestCase):
     def test_declared_range_and_granularity_reach_the_compile(self):

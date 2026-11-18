@@ -20,7 +20,7 @@ ShapeEnv, so a later kernel would see the dim as a new symbol with no range.
 This module has both halves of the fix:
 
 * ``apply_reserved_dims_contract`` reads each declared dimension (via
-  ``pass_utils.declared_dims_in``, the single registry ``_declared_dims_of``
+  ``pass_utils.declared_dim_of``, the single registry ``_declared_dims_of``
   already built for this compile) into the ShapeEnv. ``min``/``max`` go into
   ``shape_env.var_to_range``, intersected with the range already there, so a
   contract can only tighten a range. The full triple goes into
@@ -42,7 +42,7 @@ from torch.utils._sympy.value_ranges import ValueRanges
 from . import config
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
-from .pass_utils import declared_dims_in
+from .pass_utils import declared_dim_of
 
 logger = get_inductor_logger("reserved_dims_contract")
 
@@ -70,6 +70,11 @@ def output_granularity(expr: sympy.Expr, contracts: dict) -> int:
     (always safe: "any size") whenever that cannot be done:
     a symbol with no contract, a size count above ``_MAX_ENUMERATED_POINTS``
     (e.g. granularity 1 over a wide range), or a non-integer result.
+
+    Raises:
+        Unsupported: if a symbol's contract has no legal size at all (for
+            example min > max), since that is a contract that should have been
+            refused where it was created, not a case of "any size".
     """
     if not isinstance(expr, sympy.Basic) or not expr.free_symbols:
         return max(abs(int(expr)), 1) if expr else 1
@@ -84,7 +89,14 @@ def output_granularity(expr: sympy.Expr, contracts: dict) -> int:
         first_size = -(-dim_min // granularity) * granularity
         sizes = list(range(first_size, dim_max + 1, granularity))
         if not sizes:
-            return 1
+            # A valid contract (min <= max, max a multiple of granularity)
+            # always has at least the size max. An empty list means a contract
+            # that should have been refused where it was created; answering 1
+            # here would hide that.
+            raise Unsupported(
+                f"{symbol} has the contract (min={dim_min}, max={dim_max}, "
+                f"granularity={granularity}), which no size satisfies"
+            )
         num_points *= len(sizes)
         if num_points > _MAX_ENUMERATED_POINTS:
             return 1
@@ -170,7 +182,7 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
 def apply_reserved_dims_contract(graph: GraphLowering) -> None:
     """Apply each declared dimension to this compile's ShapeEnv.
 
-    Reads declared_dims_in (pass_utils.py), backed by _DECLARED_DIMS -- set
+    Reads declared_dim_of (pass_utils.py), backed by _DECLARED_DIMS -- set
     once per compile by _declared_dims_of (torch_spyre/_inductor/__init__.py)
     before lowering starts -- instead of independently re-deriving the
     declaration from get_reserved_dims(real_input). That keeps one source of
@@ -197,7 +209,7 @@ def apply_reserved_dims_contract(graph: GraphLowering) -> None:
             # A static dim has no symbol to constrain: nothing to record.
             if not isinstance(sym, sympy.Symbol):
                 continue
-            declared = declared_dims_in(sym).get(str(sym))
+            declared = declared_dim_of(sym)
             if declared is None:
                 continue
             dim_min, dim_max, granularity = declared

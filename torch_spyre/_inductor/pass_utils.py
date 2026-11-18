@@ -363,6 +363,11 @@ def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
     return {str(s): current[str(s)] for s in expr.free_symbols if str(s) in current}
 
 
+def declared_dim_of(symbol) -> "tuple[int, int, int] | None":
+    """The ``(min, max, granularity)`` declared for one symbol, or None."""
+    return _DECLARED_DIMS.get().get(str(symbol))
+
+
 def substitute_declared_max(expr):
     """``expr`` with every declared symbol replaced by its declared maximum.
 
