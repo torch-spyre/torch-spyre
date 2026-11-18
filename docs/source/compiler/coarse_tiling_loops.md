@@ -826,7 +826,8 @@ span arithmetic, so it runs before everything else. `_maybe_coarse_tile_span_ove
 (spans that overflow the hardware memory budget) runs in the
 post-stickification slot below, because span arithmetic needs
 `FixedTiledLayout.device_layout` (device size, stride map), which does not
-exist yet pre-stickification.
+exist yet pre-stickification. Under CP-SAT it leaves the groups the solve can
+tile to it ([Span-overflow tiling in the solve](scratchpad_planning.md#span-overflow-tiling-in-the-solve)).
 
 **Span-overflow and the allocator's tiling take one loop level per group.**
 A group whose `levels` has more than one entry raises `Unsupported`

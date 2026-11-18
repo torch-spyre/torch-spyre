@@ -42,7 +42,11 @@ it is rejected instead.
 """
 
 import contextlib
+import functools
+import itertools
+from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 import regex as re
@@ -54,7 +58,10 @@ import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor import config
 from torch_spyre._inductor import nonstick_dim_order, passes, work_division
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import coarse_tiling, ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.coarse_tiling import MAX_SEARCH_TILE_DEPTH
+from torch_spyre._inductor.scratchpad.plan_solver import SolveError, TileAxis, TileSpec
 from torch_spyre._inductor.wsr import span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
@@ -81,11 +88,14 @@ def _shaped(shape, seed):
 
 
 class _Compiled:
-    def __init__(self, outputs, groups, added, code):
+    def __init__(self, outputs, groups, added, code, paths):
         self.outputs = outputs
         self.groups = groups  # [(ops in group, [data type of each], [trip counts])]
         self.added = added  # names of ops the transform added, in order
         self.code = code  # normalised generated code
+        # Who applied each group: "pass" (passes.py, before the solve or in a
+        # failed solve's fallback) or "solve" (apply_tilings, after the solve).
+        self.paths = paths
 
 
 _RUN_SPECIFIC = (
@@ -104,12 +114,16 @@ def normalise(text):
     return text
 
 
-def compile_span_overflow(fn, args, limit_bytes):
-    """Compile ``fn`` with span-overflow on and the span limit lowered."""
-    formed, added = [], []
+def compile_span_overflow(fn, args, limit_bytes, *, in_solve=True):
+    """Compile ``fn`` with span-overflow on and the span limit lowered.
+
+    The lowering is watched from the pass and from the solve's apply, both
+    calling ``passes.tile_groups`` as it is now, so a wrapper there sees either
+    path. ``in_solve=False`` keeps every group with the pass."""
+    formed, added, paths = [], [], []
     original = passes.tile_groups
 
-    def spy(graph, groups, group_idx_offset=0):
+    def spy(graph, groups, group_idx_offset=0, *, path):
         before = {op.get_operation_name() for op in graph.operations}
         formed.extend(
             (
@@ -119,6 +133,7 @@ def compile_span_overflow(fn, args, limit_bytes):
             )
             for ops, levels in groups
         )
+        paths.extend(path for _ in groups)
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         added.extend(
             op.get_operation_name()
@@ -127,9 +142,16 @@ def compile_span_overflow(fn, args, limit_bytes):
         )
         return result
 
+    in_pass = mock.patch.object(
+        passes, "solve_decides_span_overflow_tiling", lambda: False
+    )
     torch._dynamo.reset()
     with (
-        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(passes, "tile_groups", functools.partial(spy, path="pass")),
+        mock.patch.object(
+            coarse_tiling, "tile_groups", functools.partial(spy, path="solve")
+        ),
+        contextlib.nullcontext() if in_solve else in_pass,
         span_limit(limit_bytes),
         config.patch({"ignore_span_overflow_hints": False}),
         torch._inductor.config.patch(force_disable_caches=True),
@@ -142,6 +164,7 @@ def compile_span_overflow(fn, args, limit_bytes):
         formed,
         added,
         normalise("\n".join(code)),
+        paths,
     )
 
 
@@ -289,6 +312,212 @@ def test_the_generated_code_is_deterministic_after_normalising(case):
     assert first.code == second.code
 
 
+# Who applies each case's groups under CP-SAT. The pass keeps a K tile and a
+# tiling of the stick dim, which the solve cannot take.
+TILED_BY = {
+    "pointwise_copy_out": ["solve"],
+    "pointwise_chain": ["solve"],
+    "pointwise_independent_pair": ["solve"],
+    "matmul_output_tiled_m": ["solve"],
+    "matmul_output_tiled_n": ["pass"],
+    "matmul_pointwise_consumer": ["solve"],
+    "matmul_add_second_input": ["solve"],
+    "matmul_relu_consumer": ["solve"],
+    "matmul_pointwise_producer": ["solve"],
+    "bmm_output_tiled": ["solve"],
+    "matmul_k_tiled": ["pass"],
+}
+
+_CPSAT = {
+    "lx_planning": True,
+    "co_optimizing_lx_planning": True,
+    "layout_solver": "cpsat",
+}
+
+needs_ortools = pytest.mark.skipif(
+    ilp_solver_ortools.cp_model is None,
+    reason="the CP-SAT solve, which takes span-overflow tilings, needs ortools",
+)
+
+
+def test_every_case_says_who_tiles_it():
+    assert sorted(TILED_BY) == sorted(CASES)
+
+
+@needs_ortools
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_the_solve_takes_the_groups_it_can_and_builds_the_same_loops(case):
+    """The same planner groups, the same ops added and the same result, whether
+    the pass applies a group before the solve or the solve applies it after."""
+    fn, shapes, limit, groups, patterns = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with config.patch(_CPSAT):
+        solved = compile_span_overflow(fn, args, limit)
+        passed = compile_span_overflow(fn, args, limit, in_solve=False)
+
+    assert passed.paths == ["pass"] * len(groups), passed.paths
+    assert solved.paths == TILED_BY[case], solved.paths
+    assert solved.groups == passed.groups == groups, (solved.groups, passed.groups)
+    assert _matches(solved.added, patterns), (solved.added, patterns)
+    reference = fn(*[a.float() for a in args])
+    # As in test_the_current_lowering_on_a_compiled_span_overflow_graph.
+    assert _relative_error(solved.outputs, reference) < 2e-2
+
+
+@needs_ortools
+def test_a_failed_solve_applies_the_groups_left_to_it():
+    """When the solve fails, the groups left to it are applied before greedy
+    placement, by the pass's own apply, so the compile still tiles them."""
+    fn, shapes, limit, groups, patterns = CASES["pointwise_chain"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    offered = []
+
+    def fail(solver, cost_expr):
+        offered.append(
+            sorted(
+                buf.name
+                for buf in solver.buffers
+                if any(
+                    not cd.tiling.is_untiled
+                    for cd in getattr(buf, "core_divisions", None) or ()
+                )
+            )
+        )
+        raise SolveError("failed by the test")
+
+    with (
+        config.patch(_CPSAT),
+        mock.patch.object(
+            ilp_solver_ortools.CpSatLayoutSolver,
+            "plan_layout_and_core_divisions",
+            fail,
+        ),
+    ):
+        compiled = compile_span_overflow(fn, args, limit)
+
+    # The solve was offered the chain's two tiled ops, and failed.
+    assert len(offered) == 1 and len(offered[0]) == 2, offered
+    assert compiled.paths == ["pass"], compiled.paths
+    assert compiled.groups == groups, compiled.groups
+    assert _matches(compiled.added, patterns), (compiled.added, patterns)
+    reference = fn(*[a.float() for a in args])
+    assert _relative_error(compiled.outputs, reference) < 2e-2
+
+
+def test_solve_decides_span_overflow_tiling_matches_select_allocator():
+    """The predicate holds exactly where span-overflow tiling and LX planning are
+    on and ``select_allocator`` builds an allocator that takes the tilings."""
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+    flags = (
+        "ignore_span_overflow_hints",
+        "lx_planning",
+        "co_optimizing_lx_planning",
+        "allow_exhaustive_search",
+    )
+    solvers = ("greedy", "bestfit", "firstfit", "simulated_annealing", "cpsat")
+    cp_models = {None, ilp_solver_ortools.cp_model}
+    for *values, solver, cp_model in itertools.product(
+        *[(True, False)] * len(flags), solvers, cp_models
+    ):
+        settings = {**dict(zip(flags, values)), "layout_solver": solver}
+        with (
+            config.patch(settings),
+            mock.patch.object(ilp_solver_ortools, "cp_model", cp_model),
+        ):
+            try:
+                allocator = allocator_module.select_allocator()
+            except ValueError:
+                allocator = None
+            expected = (
+                not settings["ignore_span_overflow_hints"]
+                and settings["lx_planning"]
+                and isinstance(allocator, CoOptimizingAllocator)
+                and allocator.takes_span_overflow_tilings
+            )
+            assert allocator_module.solve_decides_span_overflow_tiling() == expected, (
+                settings,
+                cp_model,
+            )
+
+
+def _stand_in(name):
+    reads = SimpleNamespace(reads=[])
+    return SimpleNamespace(
+        get_name=lambda: name,
+        get_operation_name=lambda: name,
+        get_read_writes=lambda: reads,
+    )
+
+
+def test_a_group_is_left_to_the_solve_only_whole():
+    """One member the solve cannot take keeps its whole group with the pass, and
+    a graph with sharded placements keeps every group."""
+    a, b, c = (_stand_in(name) for name in ("buf0", "buf1", "buf2"))
+    groups = [([a, b], [(10000, 2)]), ([c], [(10001, 2)])]
+    spec = TileSpec((TileAxis(host_dim=0, count=2),))
+    hints = [(op, [object()]) for op in (a, b, c)]
+
+    def for_solve(graph, op, *args):
+        return (None, "a restickify") if op is b else (spec, None)
+
+    def defer(**graph_attrs):
+        graph = SimpleNamespace(operations=[a, b, c], **graph_attrs)
+        kept = allocator_module.defer_span_overflow_tiling(graph, groups, hints, None)
+        return kept, allocator_module.deferred_span_overflow_tilings(graph)
+
+    with (
+        mock.patch.object(allocator_module, "_DivisionPins", lambda *a, **k: None),
+        mock.patch.object(
+            allocator_module, "_span_overflow_tiling_for_solve", for_solve
+        ),
+    ):
+        assert defer() == ([groups[0]], {"buf2": spec})
+        assert defer(_spyre_sharded_placements={"x": object()}) == (groups, {})
+
+
+def test_the_fallback_applies_the_groups_left_and_defers_the_ops_it_adds():
+    """The ops the pass's apply adds join the deferred work division, as they
+    would have when the pass applied the groups before work division."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    added = MagicMock(spec=ComputedBuffer, data=MagicMock(spec=Pointwise))
+    added.get_name.return_value = "coarse_tile_copy_buf2"
+    graph = SimpleNamespace(operations=[_stand_in("buf2")])
+    setattr(graph, work_division._DEFERRED_WORK_DIVISION, {"buf2"})
+    group = ([graph.operations[0]], [(10001, 2)])
+    applied = []
+
+    def apply(graph, groups):
+        applied.append(groups)
+        graph.operations.append(added)
+
+    record = allocator_module._DeferredSpanOverflowTiling(
+        {"buf2": None}, [group], apply
+    )
+    setattr(graph, allocator_module._DEFERRED_SPAN_OVERFLOW_TILING, record)
+    allocator_module.apply_deferred_span_overflow_tiling(graph)
+    allocator_module.apply_deferred_span_overflow_tiling(graph)  # nothing left
+
+    assert applied == [[group]]
+    deferred = work_division.deferred_work_division(graph)
+    assert deferred == {"buf2", "coarse_tile_copy_buf2"}
+
+
+def test_an_op_left_to_the_solve_is_offered_its_tiling_alone():
+    """Whatever ``auto_coarse_tiling`` says, and with no untiled option."""
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+    spec = TileSpec((TileAxis(host_dim=0, count=2),))
+    op = SimpleNamespace(
+        loop_info=None, get_operation_name=lambda: "op0", get_name=lambda: "buf0"
+    )
+    allocator = SimpleNamespace(_forced_tilings={"buf0": spec})
+    for auto in (False, True):
+        with config.patch({"auto_coarse_tiling": auto}):
+            assert CoOptimizingAllocator._tiling_candidates(allocator, op, 4) == [spec]
+
+
 @expects_raise
 def test_a_two_level_group_is_rejected():
     """A matmul too large for one level nests two (``[4, 4]``). The lowering builds
@@ -414,7 +643,8 @@ def test_the_allocator_asks_the_enumerator_for_one_level_only():
 
 
 def test_no_third_enumerator_call_in_the_allocator_escapes_the_bound():
-    """The test above covers the two known call sites. This is the structural
+    """The test above covers the two search call sites; the third checks a
+    span-overflow tiling left to the solve. This is the structural
     backstop for a new one: every call to the enumerator in ``allocator.py`` must
     pass ``max_dims=MAX_SEARCH_TILE_DEPTH``. (``enumerate_tilings.py`` calls itself
     with the bound it was given, and the allocator is its only other caller.)"""
@@ -431,7 +661,7 @@ def test_no_third_enumerator_call_in_the_allocator_escapes_the_bound():
         and getattr(node.func, "id", getattr(node.func, "attr", None))
         in ("enumerate_tile_options", "build_tiling_space")
     ]
-    assert len(calls) == 2, [ast.unparse(c)[:60] for c in calls]
+    assert len(calls) == 3, [ast.unparse(c)[:60] for c in calls]
     for call in calls:
         bound = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}.get("max_dims")
         assert bound == "MAX_SEARCH_TILE_DEPTH", ast.unparse(call)

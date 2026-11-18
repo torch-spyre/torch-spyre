@@ -197,6 +197,22 @@ Two ordering constraints fix this slot:
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
 
+### Span-overflow tiling in the solve
+
+Under CP-SAT with ortools (`solve_decides_span_overflow_tiling()`), the
+span-overflow pass still runs the planner, but leaves each group the solve can
+take to it (`defer_span_overflow_tiling`). Each such op's menu holds the
+planner's tiling alone, with the divisions of the per-tile frame. The cost
+objective prices it with its concrete tile counts, and `apply_chosen_tilings`
+applies the tiling after the solve. If the solve fails, the groups are applied
+before greedy placement (`apply_deferred_span_overflow_tiling`).
+
+The pass keeps a K tile, a restickify, an op the solve pins, an op in a
+`for_each_tile` region, a tiling the solver's tiling space does not admit (the
+stick dim), and every group of a graph with sharded placements. The tiling is
+the planner's either way; only the graph the solve plans on differs, so two
+adjacent groups with equal trip counts can share one nest.
+
 ## Optimizations on softmax
 
 The softmax example (`max → sub → exp → sum → div` over a `(512, 1024)`

@@ -875,7 +875,9 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups`/`coarse_tile_post_stickify` run.
+   `validate_coarse_tile_groups`/`tile_groups` run. A group it leaves to the
+   solve gets no hints (see
+   [Span-overflow tiling in the solve](scratchpad_planning.md#span-overflow-tiling-in-the-solve)).
 
 From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
 

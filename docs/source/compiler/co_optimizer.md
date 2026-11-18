@@ -403,6 +403,10 @@ the tiled graph's ops, and the placement stands.
   falling back, since `OpSplitSpace.admits` is meant to offer only tilings the apply can build.
   See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
 
+- **Span-overflow tilings (CP-SAT)**: each op the span-overflow pass leaves to the solve has
+  the planner's tiling alone on its menu, and `cost_expr` prices it with its concrete tile
+  counts. See [Span-overflow tiling in the solve](scratchpad_planning.md#span-overflow-tiling-in-the-solve).
+
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
 here for current status, rather than carrying their own stale claim.
 
