@@ -18,7 +18,10 @@ test_suite_config:
       - name: bfloat16
         precision:
           atol: 0.005
-          rtol: 0.005
+          # rtol 0.008 (> 2^-7 = 0.0078125, the max relative size of one bf16 step):
+          # device results, computed via DLFloat16, can differ from the CPU reference
+          # by one bf16 step.
+          rtol: 0.008
       - name: int8
         precision:
           atol: 0.005

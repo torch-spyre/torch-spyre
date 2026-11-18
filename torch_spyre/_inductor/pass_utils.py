@@ -65,7 +65,6 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
-    get_device_dtype,
     get_elem_in_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -208,73 +207,6 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
-
-
-def rescale_stl_for_dtype(
-    stl: SpyreTensorLayout,
-    out_dtype: torch.dtype,
-    ea: ElementArrangement,
-) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
-
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
-
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
-
-    The rescale must be exact: the dim's sticks must hold a whole number of
-    output sticks. Flooring an inexact ratio either drops data (three fp32
-    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
-    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
-    dim used to reach ``get_device_stride_infos`` and kill the process with
-    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
-    partially filled stick builds its own layout instead (see
-    ``_qfp8ch_stl`` in propagate_layouts.py).
-
-    Args:
-        stl: Input device layout to rescale.
-        out_dtype: Torch dtype of the conversion output.
-        ea: ElementArrangement to stamp on the returned layout.
-
-    Raises:
-        Unsupported: If the stick-indexing dim does not rescale to a whole
-            number of output sticks.
-    """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel 0 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            total_elems = stl.device_size[i] * in_eps
-            if total_elems % out_eps != 0:
-                raise Unsupported(
-                    f"cannot rescale device layout {list(stl.device_size)} for "
-                    f"conversion to {out_dtype}: device dim {i} holds "
-                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
-                    f"not a whole number of {out_eps}-element output sticks"
-                )
-            out_device_size[i] = total_elems // out_eps
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
-    )
 
 
 def op_read_writes(op: Operation) -> ReadWrites:
@@ -440,8 +372,12 @@ def substitute_declared_max(expr):
     declared = declared_dims_in(expr)
     if not declared:
         return expr
-    return expr.subs(
-        {s: declared[str(s)][1] for s in expr.free_symbols if str(s) in declared}
+    return expr.xreplace(
+        {
+            s: sympy.Integer(declared[str(s)][1])
+            for s in expr.free_symbols
+            if str(s) in declared
+        }
     )
 
 
@@ -837,7 +773,7 @@ def loop_induction_symbols(
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
-    With ``dynamic=True``, the host index may contain symbolic strides. When
+    With automatic dynamic shapes, the host index may contain symbolic strides. When
     ``normalize_coordinates`` isolates each loop variable's contribution
     by substituting 0 for all other free symbols, the size symbol ``s1``
     is also zeroed.  This function replaces size symbols with their concrete
@@ -880,14 +816,14 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     for s in size_syms:
         try:
             hint = V.graph.sizevars.optimization_hint(s)
-            subs[s] = hint  # Successfully concretized
+            subs[s] = sympy.Integer(hint)  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
             pass
 
     if not subs:
         return index  # No symbols concretized, return original
-    result = index.subs(subs)
+    result = index.xreplace(subs)
     return result
 
 
@@ -2818,7 +2754,7 @@ def _host_size_stride_for_expr(
     # reduced form unchanged and is a valid, stick-aligned slice.
     d = host_dims[0]
     coord = host_coords[d]
-    offset_diff = coord.subs(var, 0) - expr.subs(var, 0)
+    offset_diff = (coord - expr).xreplace({var: 0})
     if sympy.Mod(offset_diff, stick_size) != 0:
         return None
     return host_size[d], host_stride[d]
