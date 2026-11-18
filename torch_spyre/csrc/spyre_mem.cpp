@@ -420,9 +420,9 @@ auto get_device_stride_infos(
   //
   // Known limitation:
   //
-  // Slices of a staggered tensor: a copy of a slice that starts
-  // mid-stick-pair (e.g. y[:, 32:96]) misaligns the sticks and gives wrong
-  // data without an error. See issue #5556.
+  // Slices of a staggered tensor: host storage offset must be aligned to whole
+  // stick pairs (or sticks for FP32_TO_DL16); mid-pair offsets misalign the
+  // sticks and are rejected. See issue #5556.
   const bool shuffle_ea = is_ea_staggered(stl.element_arrangement);
 
   // EA shuffle: stick tiling facts. The innermost device dim holds the elements
@@ -500,6 +500,18 @@ auto get_device_stride_infos(
                 "Unable to determine the stick dimension for ",
                 elementArrangementToString(stl.element_arrangement));
 
+    constexpr int64_t kSticksPerPair = 2;
+    const int64_t elems_per_stick = stl.elems_per_stick();
+    const int64_t align_elems =
+        stl.element_arrangement == ElementArrangement::DL16_TO_FP32
+            ? kSticksPerPair * elems_per_stick
+            : elems_per_stick;
+    TORCH_CHECK(
+        cpu_offset % align_elems == 0,
+        "Staggered EA does not support a host storage offset that is not "
+        "aligned to a stick pair boundary (got cpu_offset=",
+        cpu_offset, ", alignment=", align_elems, ")");
+
     for (int i = 0; i < host_rank; i++) {
       dimwise_ea.push_back(
           identity_dim_ea(tile_map[i], stl.device_size, device_strides));
@@ -528,9 +540,6 @@ auto get_device_stride_infos(
       // D2H) has the padded row length, so every stride that steps over a whole
       // stick dim must use the padded length too. Otherwise row r lands at
       // r*valid but is read back at r*padded.
-      TORCH_CHECK(cpu_offset == 0,
-                  "Staggered EA with odd stick pairs does not support a "
-                  "non-zero host storage offset");
       const int64_t valid = ea_boundary.valid_width;
       const int64_t padded = ea_boundary.padded_width;
       const int64_t threshold = valid * strides[stick_host_dim];

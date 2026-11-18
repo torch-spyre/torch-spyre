@@ -1399,3 +1399,63 @@ def test_ea_h2d_d2h_h2d_chain(src_dtype, dst_dtype, expected_ea, shape):
     y.copy_(new1)
     assert_ea(y, expected_ea)
     assert torch.equal(y.cpu(), new1), f"{shape}: chain read3 mismatch"
+
+
+def test_ea_staggered_host_storage_offset():
+    """Host slices with pair-aligned offsets succeed; mid-pair offsets raise."""
+    # DL16_TO_FP32: pair is 64 elements (2 FP32 sticks)
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    # Mid-pair offset (32 elements) -> rejected
+    host_buf = torch.empty(32 + 4 * 128, dtype=torch.float32)
+    mid_pair_slice = host_buf[32:].view(4, 128)
+    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+        mid_pair_slice.copy_(y_fp32)
+
+    # Pair-aligned offset (64 elements) -> succeeds
+    host_buf2 = torch.empty(64 + 4 * 128, dtype=torch.float32)
+    pair_aligned_slice = host_buf2[64:].view(4, 128)
+    pair_aligned_slice.copy_(y_fp32)
+    assert torch.equal(pair_aligned_slice, y_fp32.cpu())
+
+    # FP32_TO_DL16: stick is 64 elements (1 FP16 stick)
+    x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+
+    # Mid-stick offset (32 elements) -> rejected
+    host_buf_fp16 = torch.empty(32 + 4 * 128, dtype=torch.float16)
+    mid_stick_slice = host_buf_fp16[32:].view(4, 128)
+    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+        mid_stick_slice.copy_(y_dl16)
+
+    # Stick-aligned offset (64 elements) -> succeeds
+    host_buf2_fp16 = torch.empty(64 + 4 * 128, dtype=torch.float16)
+    stick_aligned_slice = host_buf2_fp16[64:].view(4, 128)
+    stick_aligned_slice.copy_(y_dl16)
+    assert torch.equal(stick_aligned_slice, y_dl16.cpu())
+
+
+def test_ea_staggered_device_storage_offset_probe():
+    """Probe whether device-side slices with pair-aligned offsets restore correctly."""
+    # DL16_TO_FP32 D2H: pair-aligned device slice (64 elements / 2 FP32 sticks)
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    dev_slice_fp32 = y_fp32[:, 64:]
+    got_fp32 = dev_slice_fp32.cpu()
+    expected_fp32 = x_dl16[:, 64:].to(torch.float32)
+    assert torch.equal(got_fp32, expected_fp32)
+
+    # FP32_TO_DL16 D2H: stick-aligned device slice (64 elements / 1 FP16 stick)
+    x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+
+    dev_slice_dl16 = y_dl16[:, 64:]
+    got_dl16 = dev_slice_dl16.cpu()
+    expected_dl16 = x_fp32[:, 64:].to(torch.float16)
+    assert torch.equal(got_dl16, expected_dl16)

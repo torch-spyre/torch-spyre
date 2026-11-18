@@ -19,7 +19,13 @@ import pytest
 import torch
 import torch._dynamo as dynamo
 
-from utils_inductor import DEVICE, cached_randn, compare_with_cpu, strict_xfail
+from utils_inductor import (
+    DEVICE,
+    cached_randn,
+    compare_with_cpu,
+    expects_raise,
+    strict_xfail,
+)
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -685,11 +691,7 @@ class TestNegativeScalarOperations:
         result = _run_spyre(execution_mode, int_float_add, x)
         assert result.dtype in (torch.float32, torch.float64)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=RuntimeError,
-        reason="DL16_TO_FP32 D2H requires whole stick pairs; bool tensor conversion produces invalid layout (#5361)",
-    )
+    @expects_raise
     def test_bool_tensor_scalar_multiply(self, execution_mode):
         """Bool tensor * float scalar."""
 
@@ -697,11 +699,9 @@ class TestNegativeScalarOperations:
             return x * 2.0
 
         x = torch.tensor([[True, False], [False, True]], device=DEVICE)
-        result = _run_spyre(execution_mode, bool_mul, x)
-        assert result.dtype in (torch.float32, torch.float64, torch.int64)
-        expected = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
-        # Compared on the host: the device has no kernel for allclose.
-        assert torch.allclose(result.cpu().float(), expected)
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            result = _run_spyre(execution_mode, bool_mul, x)
+            result.cpu()
 
     # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
     @pytest.mark.skip(
