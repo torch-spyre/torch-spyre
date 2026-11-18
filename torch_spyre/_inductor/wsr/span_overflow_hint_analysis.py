@@ -685,7 +685,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
+        term = coord.xreplace(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):
@@ -706,12 +706,12 @@ def _coordinate_span_elems(
             candidate_points = {min(range_size, modulus) - 1 for modulus in moduli}
             candidate_points.add(0)
             candidate_points.add(range_size - 1)
-            values = [int(term.subs(sym, point)) for point in candidate_points]
+            values = [int(term.xreplace({sym: point})) for point in candidate_points]
             per_core_max += max(values)
             per_core_min += min(values)
             continue
-        per_core_max += int(term.subs(sym, range_size - 1))
-        per_core_min += int(term.subs(sym, 0))
+        per_core_max += int(term.xreplace({sym: range_size - 1}))
+        per_core_min += int(term.xreplace({sym: 0}))
     return per_core_max - per_core_min + 1
 
 
