@@ -42,6 +42,9 @@ test_suite_config:
             - TestOps::test_strided_stick_slice.*
             - TestOps::test_interleaved_rope_single_head.*
             - TestOps::test_rope_on_split_stick_view.*
+            # reads whose row or slice boundary falls inside a stick (issues
+            # #5197, #5198, #5227, #5872)
+            - TestOps::test_stick_splitting_read.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape
