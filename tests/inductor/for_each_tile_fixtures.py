@@ -1770,6 +1770,36 @@ def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
     return final
 
 
+def grouped_carry_group_sum_fn(
+    values: torch.Tensor,
+    group: int,
+    cores: int,
+    init: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """values[E, T, C].sum(0) through a grouped carry: ``group`` slabs per trip
+    add into a carry [G, T, C], and one sum over G follows the loop.
+
+    The loop and its carry use the core map {G: group, T: cores // group}; the
+    sum uses {T: cores}. Each core of the sum then reads its rows from all
+    ``group`` parts of the carry, which are on ``group`` cores. ``init``
+    is the carry's first value (zeros when None); a caller-owned one makes the
+    loop write a compiler-made copy of it.
+    """
+
+    def body(acc, ops):
+        (tile,) = ops
+        return acc + tile, None
+
+    if init is None:
+        init = values.new_zeros(group, *values.shape[1:])
+    with spyre_hint(
+        named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}
+    ):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=group, init=init)
+    with spyre_hint(named_dims=["T", "C"], work_div={"T": cores}):
+        return final.sum(0)
+
+
 def carried_routed_expert_sum_fn(
     values: torch.Tensor, routing: torch.Tensor, row_split: int
 ) -> torch.Tensor:
