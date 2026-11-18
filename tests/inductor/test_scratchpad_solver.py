@@ -293,21 +293,91 @@ class TestCoarseTileLoopTripCount(TestCase):
         op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
 
+    _UNRESOLVED = mock.patch(
+        "torch_spyre._inductor.pass_utils.concretize_expr",
+        side_effect=RuntimeError("unresolvable"),
+    )
+
     def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
-        """A dynamic-shape loop bound (for_each_tile_lowering.py's
-        _extract_trip_count) can stamp an unresolved sympy.Symbol into
-        loop_count instead of a concrete int. int() on that raises TypeError;
-        the multiplier must fall back to 1 for that level rather than
-        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
-        float, consumed by min()/round() elsewhere in the solver)."""
+        """A symbolic count that concretize_expr cannot resolve is priced as
+        one trip, not propagated as a symbol into RelayoutCandidate.cost_ns
+        (a float consumed by min()/round() in the solver)."""
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_unresolved_trip_count_warns_once(self):
+        """Falling back to one trip logs a warning, once per exception type."""
+        from torch_spyre._inductor import logging_utils, pass_utils
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        with (
+            self._UNRESOLVED,
+            mock.patch.object(logging_utils, "_warned_once", set()),
+            mock.patch.object(pass_utils.logger, "warning") as warning,
+        ):
+            self.assertEqual(pass_utils.trip_count_estimate(n), 1)
+            self.assertEqual(pass_utils.trip_count_estimate(n // 8), 1)
+        warning.assert_called_once()
+        self.assertIn("priced as 1 trip", warning.call_args.args[0])
 
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_unbacked_trip_count_is_one_trip(self):
+        """An unbacked count is one trip, not the unbacked-symint fallback hint
+        that concretize_expr would return."""
+        u = sympy.Symbol("u0", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([u // 8, 4]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=1024
+        ) as concretize:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        concretize.assert_not_called()
+
+    def test_symbolic_trip_count_resolves_through_concretize_expr(self):
+        """A symbolic count that concretize_expr resolves (the declared maximum
+        or the hint) is priced at that value, not as one trip."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8, 2]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 64)
+
+    def test_cost_features_loop_trip_resolves_a_symbolic_count(self):
+        """cost_features prices a symbolic loop with the same resolved count."""
+        from torch_spyre._inductor.cost_features import _loop_features
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_loop_features(op)[0], 32)
+
+
+class TestTripCountEstimate(TestCase):
+    """A concrete trip count converts with ``int()`` and is at least 1."""
+
+    def test_concrete_counts(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count, expected in [(5, 5), (5.0, 5), (sympy.Integer(5), 5)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), expected)
+                self.assertIs(type(trip_count_estimate(count)), int)
+
+    def test_zero_and_negative_counts_are_one_trip(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count in [0, -3, 0.0, sympy.Integer(0), sympy.Integer(-3)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), 1)
 
 
 class TestDrainLifetimeBoundary(TestCase):
@@ -1399,7 +1469,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         ).plan_layout_and_core_divisions(cost)
 
         self.assertEqual(result.chosen_division, 1)
-        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+        self.assertEqual(float(cost.xreplace(solved_bindings([result]))), 1000.0)
 
     def test_solve_runs_without_the_variable_shaving_subsolvers(self):
         from ortools.sat.python import cp_model
@@ -2129,7 +2199,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 self.assertIsInstance(approx, sympy.Piecewise)
                 for v in (1, 2, 5, 8, 16, 32):
                     self.assertAlmostEqual(
-                        float(approx.subs(split, v)), v**0.25, delta=0.045 * v**0.25
+                        float(approx.xreplace({split: v})),
+                        v**0.25,
+                        delta=0.045 * v**0.25,
                     )
         n = sympy.Symbol("n")
         self.assertEqual(printer._inv_log_sym(split**n), split**n)
@@ -2226,7 +2298,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver = cp_model.CpSolver()
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
-                expected = sum(expr.subs({x: a, y: b}) for expr in expressions)
+                expected = sum(expr.xreplace({x: a, y: b}) for expr in expressions)
                 self.assertAlmostEqual(solver.objective_value, float(expected))
 
     def test_repeated_constant_conditions_do_not_create_decisions(self):
@@ -2243,7 +2315,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver.parameters.num_search_workers = 1
         self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
         expected = min(
-            sum(expr.subs({x: 2, y: value}) for expr in expressions)
+            sum(expr.xreplace({x: 2, y: value}) for expr in expressions)
             for value in range(-2, 3)
         )
         self.assertAlmostEqual(solver.objective_value, float(expected))
@@ -2344,7 +2416,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
                 self.assertAlmostEqual(
-                    solver.objective_value, float(expression.subs({x: a, y: b}))
+                    solver.objective_value, float(expression.xreplace({x: a, y: b}))
                 )
 
     def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
@@ -2534,7 +2606,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 )
                 self.assertAlmostEqual(
                     solver.ObjectiveValue(),
-                    float(expression.subs({x: 4, enabled: flag})),
+                    float(expression.xreplace({x: 4, enabled: flag})),
                     places=6,
                 )
 
@@ -2723,7 +2795,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
             solver = cp_model.CpSolver()
             self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
             values = [
-                int(expr.subs(dict(zip(lits, bits))))
+                int(expr.xreplace(dict(zip(lits, bits))))
                 for bits in itertools.product((0, 1), repeat=len(lits))
             ]
             best = max(values) if maximize else min(values)

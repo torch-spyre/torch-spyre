@@ -65,7 +65,6 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
-    get_device_dtype,
     get_elem_in_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -85,7 +84,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .logging_utils import get_inductor_logger
+from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
@@ -210,71 +209,131 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def rescale_stl_for_dtype(
+def forward_valid_elements(
     stl: SpyreTensorLayout,
-    out_dtype: torch.dtype,
-    ea: ElementArrangement,
-) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
+) -> dict[tuple[int, ...], int]:
+    """Copy valid_elements from stl unchanged.
 
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
-
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
-
-    The rescale must be exact: the dim's sticks must hold a whole number of
-    output sticks. Flooring an inexact ratio either drops data (three fp32
-    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
-    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
-    dim used to reach ``get_device_stride_infos`` and kill the process with
-    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
-    partially filled stick builds its own layout instead (see
-    ``_qfp8ch_stl`` in propagate_layouts.py).
-
-    Args:
-        stl: Input device layout to rescale.
-        out_dtype: Torch dtype of the conversion output.
-        ea: ElementArrangement to stamp on the returned layout.
-
-    Raises:
-        Unsupported: If the stick-indexing dim does not rescale to a whole
-            number of output sticks.
+    Use when the new STL has identical geometry to the input: dtype rescale,
+    element_arrangement-only change, broadcast-zero, clone, or any reshape
+    that does not move which device dims belong to which host dim.
     """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel 0 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            total_elems = stl.device_size[i] * in_eps
-            if total_elems % out_eps != 0:
-                raise Unsupported(
-                    f"cannot rescale device layout {list(stl.device_size)} for "
-                    f"conversion to {out_dtype}: device dim {i} holds "
-                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
-                    f"not a whole number of {out_eps}-element output sticks"
-                )
-            out_device_size[i] = total_elems // out_eps
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
-    )
+    return dict(stl.valid_elements)
+
+
+def reorder_valid_elements(
+    stl: SpyreTensorLayout,
+    new_order: list[int],
+) -> dict[tuple[int, ...], int]:
+    """Remap device-dim indices through a permutation.
+
+    new_order[new_pos] = old_pos.  Use when device dims are reordered without
+    changing which host dim they map to (e.g. nonstick_dim_order swaps).
+    """
+    inv = {old: new for new, old in enumerate(new_order)}
+    return {
+        tuple(sorted(inv[d] for d in key)): val
+        for key, val in stl.valid_elements.items()
+    }
+
+
+def collapse_valid_elements(
+    stl: SpyreTensorLayout,
+    outer_dims: list[int],
+    keep: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after collapsing several outer dims into one.
+
+    outer_dims is the sorted list of device dim indices being merged; keep is
+    the surviving dim (must be outer_dims[0]).  The merged dims' valid counts
+    are multiplied together (they all covered the same variable, so the product
+    is the total valid tile count for the new dim).  Remaining dims are
+    renumbered to account for the removed indices.
+    """
+    remove = set(outer_dims[1:])
+    # Map old dim index → new dim index after deletions.
+    shift = {d: d - sum(r < d for r in remove) for d in range(len(stl.device_size))}
+    new_ve: dict[tuple[int, ...], int] = {}
+    merged_val = 1
+    for key, val in stl.valid_elements.items():
+        merged_dims = [d for d in key if d in outer_dims]
+        rest = [d for d in key if d not in outer_dims]
+        if not merged_dims:
+            new_key = tuple(sorted(shift[d] for d in key))
+            new_ve[new_key] = val
+        elif not rest:
+            merged_val *= val
+        else:
+            # A key shared with non-merged dims (e.g. the stick group (1, 3) when
+            # dim 1 is merged).  The rest keeps its positions; the merged dims
+            # get the remaining count, rounded up so no valid position is lost.
+            rest_size = math.prod(stl.device_size[d] for d in rest)
+            rest_val = min(val, rest_size)
+            merged_val *= -(-val // rest_size)
+            new_ve[tuple(sorted(shift[d] for d in rest))] = rest_val
+    new_ve[(shift[keep],)] = merged_val
+    return new_ve
+
+
+def prepend_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new outermost device dimension at index 0.
+
+    Shifts all existing dim indices by +1. The new dim at index 0 has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()
+    }
+    shifted[(0,)] = new_dim_size
+    return shifted
+
+
+def restickify_valid_elements(
+    stl: SpyreTensorLayout,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after moving the stick to a new host dimension.
+
+    Updates the stick group's count to new_sd_host_size and makes
+    new_sd_outer_dim a standalone key with old_sd_host_size. Dims that shared a
+    touched key are split out with count 1. Returns {} (valid extents unknown)
+    when old == new, or when ``stl`` has no valid_elements stick group to update.
+    """
+    if old_sd_outer_dim == new_sd_outer_dim:
+        return {}
+    stick_dim = len(stl.device_size) - 1
+    old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+    if old_stick_key is None:
+        return {}
+    # Fold the old outer dim into the stick group if it still holds sticks.
+    stick_size = stl.device_size[stick_dim]
+    new_old_outer_size = -(-new_sd_host_size // stick_size)
+    if old_sd_outer_dim not in old_stick_key and new_old_outer_size > 1:
+        old_stick_key = tuple(sorted(set(old_stick_key) | {old_sd_outer_dim}))
+    # The new outer dim becomes standalone, so it must leave the stick key.
+    old_stick_key = tuple(d for d in old_stick_key if d != new_sd_outer_dim)
+    regrouped = set(old_stick_key) | {new_sd_outer_dim}
+    # Split keys containing the old outer dim too, so it isn't duplicated.
+    touched = regrouped | {old_sd_outer_dim}
+    result = {}
+    for key, val in stl.valid_elements.items():
+        if touched.isdisjoint(key):
+            result[key] = val
+        else:
+            for d in set(key) - touched:
+                result[(d,)] = 1
+    result[old_stick_key] = new_sd_host_size
+    result[(new_sd_outer_dim,)] = old_sd_host_size
+    # A standalone old outer dim left at size 1 must hold a count of 1 at most.
+    if new_old_outer_size == 1 and old_sd_outer_dim not in old_stick_key:
+        result[(old_sd_outer_dim,)] = 1
+    return result
 
 
 def op_read_writes(op: Operation) -> ReadWrites:
@@ -398,6 +457,31 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
+def trip_count_estimate(count) -> int:
+    """A loop's trip count as an ``int`` (at least 1), for pricing re-reads.
+
+    A symbolic count resolves with :func:`concretize_expr`. An unbacked count,
+    or one that does not resolve, is 1.
+    """
+    try:
+        return max(1, int(count))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if free_unbacked_symbols(count):
+            return 1
+        return max(1, int(concretize_expr(count)))
+    except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
+        warn_once(
+            logger,
+            f"trip_count_estimate:{type(e).__name__}",
+            "trip count %s not resolved, priced as 1 trip: %r",
+            count,
+            e,
+        )
+        return 1
+
+
 # The dimensions declared with ``tensor.to("spyre", dynamic=...)`` for the compile
 # in progress, by symbol name: {name: (min, max, granularity)}. Set for the span
 # of one Spyre ``compile_fx`` by ``patches.enable_spyre_context`` from the graph
@@ -440,8 +524,12 @@ def substitute_declared_max(expr):
     declared = declared_dims_in(expr)
     if not declared:
         return expr
-    return expr.subs(
-        {s: declared[str(s)][1] for s in expr.free_symbols if str(s) in declared}
+    return expr.xreplace(
+        {
+            s: sympy.Integer(declared[str(s)][1])
+            for s in expr.free_symbols
+            if str(s) in declared
+        }
     )
 
 
@@ -837,7 +925,7 @@ def loop_induction_symbols(
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
-    With ``dynamic=True``, the host index may contain symbolic strides. When
+    With automatic dynamic shapes, the host index may contain symbolic strides. When
     ``normalize_coordinates`` isolates each loop variable's contribution
     by substituting 0 for all other free symbols, the size symbol ``s1``
     is also zeroed.  This function replaces size symbols with their concrete
@@ -880,14 +968,14 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     for s in size_syms:
         try:
             hint = V.graph.sizevars.optimization_hint(s)
-            subs[s] = hint  # Successfully concretized
+            subs[s] = sympy.Integer(hint)  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
             pass
 
     if not subs:
         return index  # No symbols concretized, return original
-    result = index.subs(subs)
+    result = index.xreplace(subs)
     return result
 
 
@@ -914,27 +1002,6 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     # intended "best-effort max estimate" semantics (a heuristic/fallback for
     # unbacked symbols) rather than raising.
     return V.graph.sizevars.optimization_hint(expr)
-
-
-def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
-    """Return (max_size, granularity) bounds for a symbolic expression from ShapeEnv.
-
-    Returns None for concrete expressions (no free symbols).
-    max_size is the computed maximum size,
-    granularity from compute_granularity.
-    """
-    if isinstance(expr, (int, sympy.Integer)):
-        return None
-    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
-        return None
-    shape_env = V.graph.sizevars.shape_env
-    if shape_env is None:
-        return None
-
-    max_size = compute_max_size(expr)
-    granularity = compute_granularity(expr, max_size)
-
-    return (max_size, granularity)
 
 
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
@@ -1840,6 +1907,8 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
+        # Mod(Mod(var, row), N) is a stick split by a row boundary, not a stick.
+        and not isinstance(stick_expr.args[0], sympy.Mod)
         and stick_expr.args[1] == elems_per_stick
     )
     is_bare_var = stick_expr.is_symbol
@@ -2106,9 +2175,10 @@ def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
         device_size[out_pos],
     )
     return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=list(out_stl.stride_map),
-        device_dtype=out_stl.device_dtype,
+        device_size,
+        list(out_stl.stride_map),
+        out_stl.device_dtype,
+        forward_valid_elements(out_stl),
     )
 
 
@@ -2733,6 +2803,20 @@ def iteration_space_with_splits(
 # but are here to avoid circular dependences in those files
 
 
+def _zero_outer_dim_for_stick(stl: SpyreTensorLayout, idc: list) -> int | None:
+    """Pick the outer device dim a stick variable that is absent from idc occupies.
+
+    Prefers a zero-coordinate dim in the stick's own valid_elements group, so the
+    restickify rewrites the stick group rather than an unrelated size-1 dim (which
+    would leave one dim in two valid_elements keys).  Falls back to the first
+    zero-coordinate dim.
+    """
+    zeros = [j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero]
+    stick_dim = len(stl.device_size) - 1
+    stick_key = next((k for k in stl.valid_elements if stick_dim in k), ())
+    return next((j for j in zeros if j in stick_key), next(iter(zeros), None))
+
+
 def restickify_device_size(
     old_device_size: list,
     old_sd_outer_dim: int,
@@ -2818,7 +2902,7 @@ def _host_size_stride_for_expr(
     # reduced form unchanged and is a valid, stick-aligned slice.
     d = host_dims[0]
     coord = host_coords[d]
-    offset_diff = coord.subs(var, 0) - expr.subs(var, 0)
+    offset_diff = (coord - expr).xreplace({var: 0})
     if sympy.Mod(offset_diff, stick_size) != 0:
         return None
     return host_size[d], host_stride[d]
@@ -2891,7 +2975,7 @@ def compute_restickify_target_layout(
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
@@ -2920,7 +3004,18 @@ def compute_restickify_target_layout(
         new_sd_host_stride,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        stl.device_dtype,
+        restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            new_sd_host_size,
+        ),
+    )
 
 
 def compute_size1_restickify_layout(
@@ -2964,7 +3059,7 @@ def compute_size1_restickify_layout(
         return None
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
@@ -3001,7 +3096,29 @@ def compute_size1_restickify_layout(
         -1,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    if old_sd_outer_dim == new_sd_outer_dim:
+        # Synthetic size-1 dim reuses the old outer slot: the stick group keeps
+        # its key but its count becomes 1 (one element per stick).
+        stick_dim = len(stl.device_size) - 1
+        old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+        # No stick group (extents unknown): nothing to update, so stay unknown.
+        new_ve = (
+            {}
+            if old_stick_key is None
+            else {
+                k: (1 if k == old_stick_key else v)
+                for k, v in stl.valid_elements.items()
+            }
+        )
+    else:
+        new_ve = restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            1,
+        )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype, new_ve)
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
@@ -3082,14 +3199,129 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
     if restick:
+        eps = in_stl.elems_per_stick()
         out_stl = SpyreTensorLayout(
-            [in_stl.elems_per_stick()] + out_stl.device_size,
+            [eps] + out_stl.device_size,
             [c_stride[0] * c_size[0]] + out_stl.stride_map,
             out_stl.device_dtype,
+            prepend_dim_valid_elements(out_stl, eps),
         )
         return True, out_stl
 
     return False, out_stl
+
+
+def sparse_stl_from_host(
+    host: FixedLayout, dtype: "torch.dtype | None" = None
+) -> SpyreTensorLayout:
+    """Build a SpyreTensorLayout from the host shape of ``host``: the stick moves
+    onto a new size-1 dim and the other host dims are kept.  The former stick dim
+    becomes the outermost device dim.
+
+    Used only when no device layout of the input can be restickified, so the host
+    shape is the only source of dims (see ``propagate_layouts``).
+
+    dim_order convention (``SpyreTensorLayout`` in spyre_tensor_impl.cpp): the
+    C++ constructor puts ``dim_order[1]`` in the OUTERMOST device slot, the entry
+    ``-1`` (the new size-1 dim) in the slot second from the innermost, and
+    ``dim_order[0]`` in the slot just before the stick.  So for rank above 2 the
+    list is rebuilt as ``[outer_first[0], outer_first[-1]] + outer_first[1:-1]``:
+    the stick (smallest stride, ``outer_first[-1]``) is ``dim_order[1]``, outermost.
+    Do not "simplify" this to a plain sort; TestHostSparseLayout checks the result.
+
+    The former stick dim is the one padded to a whole number of sticks, and the
+    padding is added at the end of that dim.  Only when it is outermost does the
+    padding sit at the end of the buffer, where a consumer that reads the sparse
+    tensor as one run of sticks expects it; inside another dim larger than 1 it
+    would fall between the slices of that dim.
+
+    ``dtype`` overrides ``host.dtype`` for an op whose layout dtype differs from
+    its host dtype (for example a bool output)."""
+    sizes = [int(concretize_expr(v)) for v in host.size]
+    strides = [int(concretize_expr(v)) for v in host.stride]
+    outer_first = sorted(range(len(sizes)), key=lambda d: -strides[d])
+    if len(outer_first) > 2:
+        outer_first = [outer_first[0], outer_first[-1]] + outer_first[1:-1]
+    return SpyreTensorLayout(
+        sizes, strides, host.dtype if dtype is None else dtype, outer_first + [-1]
+    )
+
+
+def restickify_dense_stl_to_sparse(
+    stl: SpyreTensorLayout, in_host: FixedLayout
+) -> "SpyreTensorLayout | None":
+    """The sparse layout of ``in_host`` that keeps the outer dim order of the dense
+    ``stl`` and moves the stick to the outermost device slot.
+
+    The device dims of ``stl`` are read outermost first, and each is matched to a
+    host dim by its stride.  The stick's outer part (stride ``stick_size`` times the
+    stick's host stride) is the stick dim itself, so it is skipped here.  The
+    result is built with the ``dim_order`` convention of ``sparse_stl_from_host``.
+
+    Returns None when a device dim cannot be matched to a host dim.
+    """
+    sizes = [int(concretize_expr(v)) for v in in_host.size]
+    strides = [int(concretize_expr(v)) for v in in_host.stride]
+    stick_size = stl.elems_per_stick()
+    stick_stride = stl.stride_map[-1]
+    stick_dim = next(
+        (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == stick_stride),
+        None,
+    )
+    if stick_dim is None:
+        return None
+    outer_first = [stick_dim]
+    for j in range(len(stl.device_size) - 1):
+        s = stl.stride_map[j]
+        if stl.device_size[j] == 1 or s == 0 or s == stick_size * stick_stride:
+            continue
+        d = next(
+            (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == s), None
+        )
+        if d is None or d in outer_first:
+            return None
+        outer_first.append(d)
+    outer_first += [d for d in range(len(sizes)) if d not in outer_first]
+    dim_order = [outer_first[-1]] + outer_first[:-1] + [-1]
+    return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
+
+
+def sparse_target_for_unservable_read(
+    stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    *,
+    op: "Operation | None" = None,
+) -> "SpyreTensorLayout | None":
+    """The sparse restickify target for ``in_host`` when it serves the read of
+    ``dep`` that the dense ``stl`` cannot, else ``None``.
+
+    A read whose device coordinates are unsupported on ``stl`` (for example the
+    flatten of ``[8, 65]`` into ``[520]``, which splits a stick) may still be
+    representable with the stick on a new size-1 dim.  The target keeps the dims
+    of ``stl`` (``restickify_dense_stl_to_sparse``) and is returned only if it
+    serves the read; otherwise the host-shape layout is tried.  Only a STANDARD
+    input in a restickify format can be moved.
+    """
+    if (
+        stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        or stl.element_arrangement != ElementArrangement.STANDARD
+        or is_sparse_stl(stl)
+        or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
+    ):
+        return None
+    candidates = [
+        restickify_dense_stl_to_sparse(stl, in_host),
+        sparse_stl_from_host(in_host),
+    ]
+    for target in candidates:
+        if (
+            target is not None
+            and try_device_coordinates(target, dep, indirect_sizes, op=op) is not None
+        ):
+            return target
+    return None
 
 
 def compute_restickify_needed(
@@ -3119,6 +3351,22 @@ def compute_restickify_needed(
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
+        # A read the input cannot serve (flattening [8, 65] into [520] splits a
+        # stick) may be served by the input's host shape in a sparse layout.
+        # TODO(#5872): this returns the sparse target for any output, without
+        # checking that it is stick_compatible with the output. That is safe only
+        # because _default_pointwise_layout and _reduction_layout return a sparse
+        # output early. Return the target only for an output it can feed.
+        # TODO(#5966): before the sparse layout, try a dense relocation of the
+        # stick: the first layout with the stick on another real dim (larger
+        # dims first, the former stick dim outermost) on which
+        # try_device_coordinates serves this read. Keep the sparse layout below
+        # as the fallback for a read with no such dim, such as a flatten to 1-D.
+        sparse = sparse_target_for_unservable_read(
+            in_stl, in_host, in_dep, ind_sizes, op=op
+        )
+        if sparse is not None:
+            return True, sparse
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
         # candidate can never be a feasible restickify source/target.
@@ -3212,7 +3460,26 @@ def compute_restickify_needed(
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = 0
-            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+            stick_dim = len(ds) - 1
+            y_ve: dict[tuple[int, ...], int] = {}
+            for key, val in in_stl.valid_elements.items():
+                if stick_dim in key:
+                    # The stick's group.  After moving K onto the stick, the
+                    # stick gets a count of 1; k_chunk_dim, if it shared this
+                    # group, becomes independent with the original count.
+                    if set(key) - {k_chunk_dim, stick_dim}:
+                        raise Unsupported(
+                            f"sparse-N=1 restickify with valid_elements group "
+                            f"{key} spanning dims beyond k_chunk_dim "
+                            f"{k_chunk_dim} and the stick"
+                        )
+                    if k_chunk_dim in key:
+                        y_ve[(k_chunk_dim,)] = val
+                    y_ve[(stick_dim,)] = 1
+                else:
+                    # Includes a standalone k_chunk_dim group: unchanged.
+                    y_ve[key] = val
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype, y_ve)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "
             f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"

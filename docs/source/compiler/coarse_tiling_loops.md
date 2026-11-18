@@ -1643,9 +1643,9 @@ if work division or stickification places the batch dimension at
 different positions in each op's iteration space.
 
 `OpSpec.symbolic_dim_bounds` maps a PyTorch symbol name (e.g. `"s97"`) to
-`(max, granularity)` bounds for dynamic-shape dims; it is populated by
-`compute_symbolic_bounds` during `create_op_spec` and empty for concrete
-dims.
+`(max, granularity)` bounds for dynamic-shape dims. `create_op_spec` no
+longer populates it: it refuses a `mark_dynamic(max=...)` size outside a
+`for_each_tile` loop, so the field is empty in every compile.
 
 `OpSpec.tiled_symbol_trip_counts` maps each minted level symbol appearing
 in `tiled_symbols` to that level's own trip count

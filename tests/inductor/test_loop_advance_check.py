@@ -28,6 +28,7 @@ test_fused_qkv_views_under_query_tiling``; in ``test_building_blocks.py``
 """
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import sympy
@@ -135,3 +136,59 @@ def test_the_error_is_not_unsupported():
 
     assert not issubclass(LoopAdvanceMismatch, Unsupported)
     assert issubclass(LoopAdvanceMismatch, RuntimeError)
+
+
+def _symbol_kernel(hinted, loops):
+    """A kernel whose current op lists ``hinted`` loop variables inside ``loops``
+    enclosing loops, as ``_induction_symbol`` sees them."""
+    kernel = spyre_kernel.SpyreKernel.__new__(spyre_kernel.SpyreKernel)
+    kernel._tile_advance_symbols = {}
+    kernel.current_node = SimpleNamespace(node=object())
+    patches = (
+        mock.patch.object(
+            spyre_kernel,
+            "loop_var_ranges_from_dim_hints",
+            lambda node: dict.fromkeys(hinted, 4),
+        ),
+        mock.patch.object(spyre_kernel, "enclosing_loops", lambda node: [0] * loops),
+    )
+    return kernel, patches
+
+
+def test_a_hinted_level_uses_the_loops_own_induction_variable():
+    """Stage 7.3: the advance is written in the loop's variable, outermost first."""
+    outer, inner = sympy.Symbol("u0"), sympy.Symbol("u1")
+    kernel, patches = _symbol_kernel([outer, inner], loops=2)
+    with patches[0], patches[1]:
+        assert kernel._get_or_mint_level_symbol(0, "op3") is outer
+        assert kernel._get_or_mint_level_symbol(1, "op3") is inner
+
+
+def test_an_op_without_a_loop_variable_hint_still_mints_a_symbol():
+    """Span-overflow and the allocator's tiling have no loop variable."""
+    kernel, patches = _symbol_kernel([], loops=1)
+    with patches[0], patches[1]:
+        assert kernel._get_or_mint_level_symbol(0, "op3") == sympy.Symbol(
+            "_tile_adv_op3_lvl0"
+        )
+
+
+def test_a_hint_count_that_differs_from_the_loop_depth_mints_a_symbol():
+    """The pairing of hint to level is then unknown, as in ``_index_tile_advance``."""
+    kernel, patches = _symbol_kernel([sympy.Symbol("u0")], loops=2)
+    with patches[0], patches[1]:
+        assert kernel._get_or_mint_level_symbol(0, "op3") == sympy.Symbol(
+            "_tile_adv_op3_lvl0"
+        )
+
+
+def test_the_level_symbol_survives_the_records_zeroing_of_the_index():
+    """The record builder zeroes every index symbol that is not a tiled dim. The loop
+    variable is such a symbol AND the level symbol, so the substitution must be
+    simultaneous: a sequential one zeroes the symbol it has just introduced."""
+    d1, u = sympy.symbols("d1 u0")
+    index = 128 * d1 + 16384 * u
+    subs = {d1: 128 * u}
+    subs.update({s: sympy.Integer(0) for s in index.free_symbols if s not in subs})
+    assert index.subs(subs, simultaneous=True) == 16384 * u
+    assert index.subs(subs) != 16384 * u
