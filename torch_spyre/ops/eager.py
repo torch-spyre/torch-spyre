@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from torch.utils import _pytree as pytree
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads, warn_fallback
@@ -94,6 +95,72 @@ def _guard_reentry(op):
         active.discard(op)
 
 
+# Attributes dynamo reads off a tensor to decide that a dim must be symbolic
+# (``mark_dynamic``, ``maybe_mark_dynamic``, ``mark_unbacked``, and
+# ``_dynamo_dynamic_range`` which carries the bounds for ``mark_dynamic``).
+_DYNAMO_DYNAMIC_MARKS = (
+    "_dynamo_dynamic_indices",
+    "_dynamo_dynamic_range",
+    "_dynamo_weak_dynamic_indices",
+    "_dynamo_unbacked_indices",
+    "_dynamo_strict_unbacked_indices",
+)
+
+
+def _has_dynamo_marks(t):
+    return any(getattr(t, name, None) for name in _DYNAMO_DYNAMIC_MARKS)
+
+
+def _strip_dynamo_marks(args, kwargs):
+    """Replace every tensor carrying a dynamo dynamic-dim mark by a ``detach()``.
+
+    The marks are plain Python attributes on one tensor object, and ``detach()``
+    returns a new object that shares storage and layout but not those
+    attributes. Returns ``(args, kwargs, lookup)`` where ``lookup`` maps
+    ``id(twin) -> original``, the shape ``_remap_result`` below expects, so an op
+    that returns one of its arguments hands back the caller's own tensor. The
+    twins stay alive in the returned args until the result has been remapped,
+    so their ids cannot be reused in the meantime.
+    """
+    lookup = {}
+
+    def strip(a):
+        if isinstance(a, torch.Tensor) and _has_dynamo_marks(a):
+            twin = a.detach()
+            lookup[id(twin)] = a
+            return twin
+        return a
+
+    return pytree.tree_map(strip, args), pytree.tree_map(strip, kwargs), lookup
+
+
+def _static_shape_call(compiled):
+    """Wrap a ``dynamic=False`` compiled kernel so it never sees dynamic marks.
+
+    A tensor declared with ``.to("spyre", dynamic=...)`` carries ``mark_dynamic``,
+    a promise that its dim stays symbolic. ``dynamic=False`` kernels must
+    specialise on the concrete size (a symbolic one is not yet correct, see
+    #3826), and specialising a marked dim makes dynamo raise
+    ``ConstraintViolationError`` (#6030). The promise is about the caller's
+    ``torch.compile`` code, not about this internal kernel, so the kernel gets
+    unmarked twins and the caller's tensors, marks intact, are returned.
+
+    Stripping the marks, rather than telling dynamo to ignore a violated one
+    (``allow_ignore_mark_dynamic``), is deliberate: that knob only silences the
+    error, and a kernel that does not itself specialise the marked dim (``add``,
+    ``gelu``) would still see a symbolic dim the Spyre lowering rejects.
+    """
+
+    @functools.wraps(compiled)
+    def call(*args, **kwargs):
+        args, kwargs, lookup = _strip_dynamo_marks(args, kwargs)
+        if not lookup:  # nothing was marked: leave the result untouched
+            return compiled(*args, **kwargs)
+        return _remap_result(compiled(*args, **kwargs), lookup)
+
+    return call
+
+
 # Decorator to keep track of compiled variant
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
@@ -107,6 +174,8 @@ def compile_once(op, **compile_kwargs):
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(_op_frame(op), **compile_kwargs)
+                if compile_kwargs.get("dynamic") is False:
+                    compiled = _static_shape_call(compiled)
             with _guard_reentry(op):
                 return fn(*args, compiled=compiled, **kwargs)
 
