@@ -502,15 +502,16 @@ auto get_device_stride_infos(
 
     constexpr int64_t kSticksPerPair = 2;
     const int64_t elems_per_stick = stl.elems_per_stick();
+    const bool is_dl16_to_fp32 =
+        stl.element_arrangement == ElementArrangement::DL16_TO_FP32;
     const int64_t align_elems =
-        stl.element_arrangement == ElementArrangement::DL16_TO_FP32
-            ? kSticksPerPair * elems_per_stick
-            : elems_per_stick;
+        is_dl16_to_fp32 ? kSticksPerPair * elems_per_stick : elems_per_stick;
     TORCH_CHECK(
         cpu_offset % align_elems == 0,
         "Staggered EA does not support a host storage offset that is not "
-        "aligned to a stick pair boundary (got cpu_offset=",
-        cpu_offset, ", alignment=", align_elems, ")");
+        "aligned to a stick ",
+        is_dl16_to_fp32 ? "pair " : "", "boundary (got cpu_offset=", cpu_offset,
+        ", alignment=", align_elems, ")");
 
     for (int i = 0; i < host_rank; i++) {
       dimwise_ea.push_back(

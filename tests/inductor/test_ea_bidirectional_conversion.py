@@ -1420,6 +1420,24 @@ def test_ea_staggered_host_storage_offset():
     pair_aligned_slice.copy_(y_fp32)
     assert torch.equal(pair_aligned_slice, y_fp32.cpu())
 
+    # DL16_TO_FP32 with odd stick-pair width (ea_boundary needed, shape (4, 68)):
+    # 68 elements = 3 sticks (padded to 4 sticks / 128 elements in DCI)
+    x_odd = torch.arange(4 * 68, dtype=torch.float16).reshape(4, 68)
+    y_odd_fp32 = _convert_one_row_per_core(x_odd, torch.float32)
+    assert_ea(y_odd_fp32, ElementArrangement.DL16_TO_FP32)
+
+    # Mid-pair offset (32 elements) -> rejected
+    host_buf_odd = torch.empty(32 + 4 * 68, dtype=torch.float32)
+    mid_pair_slice_odd = host_buf_odd[32:].view(4, 68)
+    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+        mid_pair_slice_odd.copy_(y_odd_fp32)
+
+    # Pair-aligned offset (64 elements) with boundary slice -> succeeds
+    host_buf2_odd = torch.empty(64 + 4 * 68, dtype=torch.float32)
+    pair_aligned_slice_odd = host_buf2_odd[64:].view(4, 68)
+    pair_aligned_slice_odd.copy_(y_odd_fp32)
+    assert torch.equal(pair_aligned_slice_odd, y_odd_fp32.cpu())
+
     # FP32_TO_DL16: stick is 64 elements (1 FP16 stick)
     x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
     y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
@@ -1428,7 +1446,7 @@ def test_ea_staggered_host_storage_offset():
     # Mid-stick offset (32 elements) -> rejected
     host_buf_fp16 = torch.empty(32 + 4 * 128, dtype=torch.float16)
     mid_stick_slice = host_buf_fp16[32:].view(4, 128)
-    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+    with pytest.raises(RuntimeError, match="not aligned to a stick boundary"):
         mid_stick_slice.copy_(y_dl16)
 
     # Stick-aligned offset (64 elements) -> succeeds
