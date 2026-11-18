@@ -715,3 +715,200 @@ def test_a_plain_int_range_is_a_range():
     assert _extent(op, TiledDim(0, True), sympy.Integer(8)) == 8
     with pytest.raises(Unsupported, match="not divisible"):
         _extent(op, TiledDim(1, False), sympy.Integer(3))
+
+
+@expects_raise
+def test_a_member_that_already_carries_a_loop_variable_hint_is_refused():
+    """A hint with ``loop_var_range`` marks a dim of a spliced loop body: its range is
+    already the per-trip extent, and the loop's trip count multiplies a larger extent
+    that is never materialized. The plan has no way to tile such an op, so it says so
+    instead of multiplying the range up.
+
+    TODO: when a spliced body can be tiled by the plan this becomes a positive test."""
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    def hint_the_first_member(plan, operations):
+        (group,) = plan.groups
+        member = next(
+            o for o in operations if o.get_operation_name() == group.ops[0].op_name
+        )
+        member.dim_hints = [
+            *(getattr(member, "dim_hints", None) or ()),
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=sympy.Symbol("u9", integer=True),
+                is_reduction=False,
+                hint_id=99,
+                loop_var_range=2,
+            ),
+        ]
+        return plan
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with (
+        _with_plan(hint_the_first_member),
+        pytest.raises(Exception, match="loop-variable hint"),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+def test_a_symbolic_trip_count_is_refused_not_a_type_error():
+    seen = []
+
+    def symbolic_trip(operations, groups, offset):
+        ((ops, levels), *_) = groups
+        symbolic = [(levels[0][0], sympy.Symbol("n", integer=True, positive=True))]
+        try:
+            build_loop_tiling_plan(operations, [(ops, symbolic)], offset)
+        except Exception as error:  # the type is what the test is about
+            seen.append(error)
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with _before_tile_groups(symbolic_trip):
+        compile_span_overflow(fn, args, limit)
+    (error,) = seen
+    assert isinstance(error, Unsupported) and "trip count" in str(error), repr(error)
+
+
+# --- the guards of ``_facts``, on stub members ----------------------------------
+
+
+def _facts_of(member, *, reads=(), writes=(), tiled=(0, False), graph_output=False):
+    """Run ``_facts`` on one stub member whose reads and writes are given."""
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor.wsr import loop_tiling_lowering as lowering
+
+    group = lowering.LoopTilingGroup(
+        0,
+        8,
+        (lowering.OpTiling("op0", lowering.TiledDim(*tiled) if tiled else None),),
+    )
+    rw = SimpleNamespace(reads=list(reads), writes=list(writes))
+    with (
+        mock.patch.object(lowering, "op_read_writes", lambda op: rw),
+        mock.patch.object(
+            lowering,
+            "_find_outside_consumers_planned",
+            lambda *args: ([], graph_output),
+        ),
+    ):
+        return lowering._facts(None, group, [member], [])
+
+
+def _member(data_cls=None, *, mutates=False):
+    from types import SimpleNamespace
+
+    from torch._inductor.ir import MutationLayoutSHOULDREMOVE, Pointwise
+
+    data = (
+        mock.MagicMock(spec=data_cls or Pointwise)
+        if data_cls is not False
+        else SimpleNamespace()
+    )
+    data.ranges = [sympy.Integer(64), sympy.Integer(32)]
+    layout = (
+        mock.MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        if mutates
+        else SimpleNamespace(stride=[32, 1])
+    )
+    return SimpleNamespace(
+        data=data,
+        layout=layout,
+        get_name=lambda: "buf0",
+        get_operation_name=lambda: "op0",
+    )
+
+
+def _read(name, index):
+    from torch._inductor.dependencies import MemoryDep
+
+    return MemoryDep(name, index, (), ())
+
+
+def _d(i):
+    from torch._inductor.utils import sympy_index_symbol
+
+    return sympy_index_symbol(f"d{i}")
+
+
+@expects_raise
+def test_a_member_that_is_neither_pointwise_nor_reduction_is_refused():
+    """TODO: a member such as a fallback kernel is not lowered by the plan; when it
+    is, this becomes a positive test."""
+    with pytest.raises(Unsupported, match="is not lowered by the plan"):
+        _facts_of(_member(False))
+
+
+@expects_raise
+def test_a_member_that_mutates_a_buffer_is_refused():
+    """TODO: the plan does not lower a mutation yet."""
+    with pytest.raises(Unsupported, match="mutates a buffer"):
+        _facts_of(_member(mutates=True))
+
+
+@expects_raise
+def test_two_reads_of_one_buffer_with_different_advances_are_refused():
+    """``a[d0, d1]`` moves 256 per trip of a tile of 8 rows; ``a[d1]`` does not move.
+    One advance per buffer is all the kernel can express."""
+    reads = [_read("a", 32 * _d(0) + _d(1)), _read("a", _d(1))]
+    with pytest.raises(Unsupported, match="twice with different advances"):
+        _facts_of(_member(), reads=reads, writes=[_read("buf0", 32 * _d(0) + _d(1))])
+
+
+@expects_raise
+def test_a_copied_out_op_with_no_write_is_refused():
+    with pytest.raises(Unsupported, match="has no write"):
+        _facts_of(_member(), reads=[_read("a", _d(1))], writes=[], graph_output=True)
+
+
+@expects_raise
+def test_a_copied_out_op_whose_write_ignores_the_tiled_dim_is_refused():
+    """Every trip would write the same rows of the full buffer."""
+    with pytest.raises(Unsupported, match="not in its write index"):
+        _facts_of(
+            _member(),
+            reads=[_read("a", 32 * _d(0) + _d(1))],
+            writes=[_read("buf0", _d(1))],
+            graph_output=True,
+        )
+
+
+def test_the_same_read_twice_with_the_same_advance_is_one_read():
+    """The guard fires on a difference only: two reads that agree are one entry."""
+    reads = [_read("a", 32 * _d(0) + _d(1)), _read("a", 32 * _d(0) + _d(1))]
+    (fact,) = _facts_of(
+        _member(), reads=reads, writes=[_read("buf0", 32 * _d(0) + _d(1))]
+    )
+    assert fact.read_steps == {"a": 256}
+
+
+def test_two_reductions_in_one_group_declare_two_carries_and_are_right():
+    """A sum and an amax of one input, tiled together over the reduction dim: each has
+    its own accumulator (an identity fill and a combine), so the one group declares
+    two carries that share nothing, and both results match fp32. The planner keeps the
+    two reductions in separate groups, so the plan is rewritten to merge them."""
+    import dataclasses
+
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import LoopTilingPlan
+
+    def merge(plan, operations):
+        first, second = plan.groups
+        assert first.trip_count == second.trip_count
+        merged = dataclasses.replace(first, ops=(*first.ops, *second.ops))
+        return LoopTilingPlan((merged,))
+
+    x = _shaped((64, 8192), 1)
+    with _with_plan(merge):
+        compiled, carries = _carries(
+            lambda x: (x.sum(dim=1), x.amax(dim=1)), [x], 256 * 1024
+        )
+    ((_, records),) = carries
+    assert len(records) == 2, carries
+    assert len({r[0] for r in records}) == 2 and len({r[1] for r in records}) == 2
+    assert all(r[2] and r[3] and r[4] for r in records), records
+    xf = x.float()
+    assert _relative_error(compiled.outputs, (xf.sum(dim=1), xf.amax(dim=1))) < 2e-2

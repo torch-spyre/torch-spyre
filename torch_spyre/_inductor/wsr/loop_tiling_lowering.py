@@ -83,7 +83,6 @@ from .coarse_tile import (
 from .loop_tiling_common import (
     _AddLoopTermHandler,
     _divide_ranges,
-    _loop_var_hinted_ranges,
     _patch_retiled_load_indexes,
     _RetiledBufferInfo,
 )
@@ -150,6 +149,11 @@ def build_loop_tiling_plan(
     reject_nested_loops(groups, "build_loop_tiling_plan")
     planned_groups: list[LoopTilingGroup] = []
     for group_idx, (group_ops, levels) in enumerate(groups):
+        if not sympy.sympify(levels[0][1]).is_Integer:
+            raise Unsupported(
+                f"build_loop_tiling_plan: the trip count {levels[0][1]} of group "
+                f"{group_idx + group_idx_offset} is symbolic; the plan holds an int."
+            )
         group_reduction_tiled_levels = _group_reduction_tiled_levels_in_group(
             group_ops, levels
         )
@@ -575,9 +579,15 @@ def _facts(
             kind = "loop_internal"
         read_steps: dict[str, sympy.Expr] = {}
         write_step = None
+        if any(
+            h.loop_var_range is not None
+            for h in getattr(member, "dim_hints", None) or ()
+        ):
+            raise Unsupported(
+                f"lower_loop_tiling: {name} already carries a loop-variable hint (a "
+                "spliced loop body); the plan does not tile it."
+            )
         full_ranges = list(member.data.ranges)
-        for d, loop_var_range in _loop_var_hinted_ranges(member).items():
-            full_ranges[d] = full_ranges[d] * loop_var_range
         if tiled is None:
             reads_a_tile = sorted(
                 {
@@ -765,7 +775,8 @@ def _lower_reduction(
     V.graph.name_to_buffer[combine.get_name()] = combine
     operations.insert(operations.index(op) + 1, combine)
 
-    # finalize_layouts gives the accumulator the reduction's device layout.
+    # insert_restickify.finalize_layouts reads this to give the accumulator the
+    # reduction's device layout.
     op._tiled_reduction_accum_name = accum.get_name()  # type: ignore[attr-defined]
 
     outside, is_graph_output = _find_outside_consumers(
