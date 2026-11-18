@@ -685,11 +685,15 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     ``ops.load(name, index)`` receives ``index`` already flattened by the
     loaded buffer's own indexer into ``sum(idx[i] * stride[i]) + offset``;
     this undoes that. Every per-dim loop-index symbol appears in exactly
-    one additive term with coefficient ``stride[i]`` (the same one-symbol-
-    per-term linearity every coordinate-recovery helper in this package
-    already assumes), so dividing each matched term by its own stride
-    recovers ``idx[i]`` directly; a size-1 dim contributes no term, so its
-    coordinate is simply 0.
+    one additive term (the same one-symbol-per-term linearity every
+    coordinate-recovery helper in this package already assumes), usually
+    with coefficient ``stride[i]``, so dividing each matched term by its
+    own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
+    term, so its coordinate is simply 0. A coefficient can also be a
+    multiple of a stride: a reduction variable flattened through a
+    contiguous reshape of the marker enters as ``512*d2`` against the
+    marker's dim stride 64 (issue #6407). Such a term is folded into the
+    dim with the largest stride that divides it (``8*d2``).
 
     A dim's coordinate can also be a compile-time-constant integer rather
     than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
@@ -704,8 +708,9 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     mixed-radix approach ``tile.py``'s ``compute_tile_offset`` uses.
 
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
-    constant portion doesn't decompose evenly across the constant dims, or
-    if a recovered digit is out of bounds for its dim's size -- all three
+    constant portion doesn't decompose evenly across the constant dims, if
+    a recovered digit is out of bounds for its dim's size, or if a symbolic
+    term's coefficient is a multiple of no dim's stride -- all four
     indicate the one-symbol/one-stride-per-term assumption above doesn't
     hold for this index.
     """
@@ -780,6 +785,37 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
         f"_delinearize_index: unresolved coordinate for index {index!r} "
         f"(size {size!r}, stride {stride!r}, offset {offset!r})"
     )
+
+    # .coeff(st) only matches a term whose numeric factor is exactly st, so
+    # a term at a multiple of a stride (512*d2 against 64) is still missing
+    # from coords here. Fold it into the largest stride that divides it: for
+    # a load flattened through this layout a smaller stride would put the
+    # coordinate out of bounds.
+    recovered = sum(
+        (coords[i] * stride[i] for i in range(len(coords)) if stride[i] != 0),
+        sympy.S.Zero,
+    )
+    leftover = sympy.expand(remaining - recovered)
+    if leftover == 0:
+        # S.Zero.as_ordered_terms() is [0], which would raise below for a
+        # layout with no foldable dim (all size-1 or broadcast).
+        return coords
+    for term in leftover.as_ordered_terms():
+        coeff = term.as_coeff_Mul()[0]
+        eligible = [
+            i
+            for i in range(len(coords))
+            if stride[i] != 0 and size[i] != 1 and coeff % stride[i] == 0
+        ]
+        if not eligible:
+            raise AssertionError(
+                f"_delinearize_index: term {term!r} of index {index!r} is "
+                f"not a coordinate multiple of any dim (size {size!r}, "
+                f"stride {stride!r}, offset {offset!r}); cannot recover "
+                "per-dim coordinates for this index."
+            )
+        best = max(eligible, key=lambda i: stride[i])
+        coords[best] = coords[best] + term / stride[best]
     return coords
 
 
