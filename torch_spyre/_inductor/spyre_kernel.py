@@ -93,7 +93,8 @@ from .pass_utils import (
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .loop_checker import LoopAdvanceMismatch
-from .loop_facts import enclosing_loops
+from .loop_info import LoopShim
+from .loop_facts import _loop_coefficient, enclosing_loops, shim_advancing_levels
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -183,7 +184,7 @@ def _serialize_value(v):
             subs = {
                 s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
             }
-            concrete = float(v.subs(subs))
+            concrete = float(v.xreplace(subs))
             return repr(concrete)
         try:
             return repr(float(v))
@@ -563,7 +564,7 @@ def _tile_advance_expr_from_dep(
     subs.update(
         {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
     )
-    return dep.index.subs(subs)
+    return dep.index.xreplace(subs)
 
 
 def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
@@ -609,40 +610,6 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
-
-
-def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
-    """The coefficient of the loop variable ``variable`` in ``index``.
-
-    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
-    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
-    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
-    advance", those would be silently wrong once the stored record, which makes such
-    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
-
-    * it must be affine in the variable (the second difference is zero), and
-    * the step must be a number (a symbolic step cannot be projected to device
-      elements),
-
-    otherwise this raises ``Unsupported``. A variable that does not occur in the
-    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
-    ``8*u0`` and has coefficient 8.
-    """
-    if variable not in index.free_symbols:
-        return sympy.S.Zero
-    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
-    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
-        raise Unsupported(
-            f"the loop variable {variable} is used non-affinely in the index "
-            f"{index}; a per-trip advance cannot be read from it"
-        )
-    step = sympy.simplify(at[1] - at[0])
-    if not step.is_number:
-        raise Unsupported(
-            f"the loop variable {variable} has the symbolic step {step} in the "
-            f"index {index}; it cannot be projected to device elements"
-        )
-    return step
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -899,10 +866,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym not in subs
                     }
                 )
-                # Simultaneous: the level symbol can be the loop's own induction
-                # variable, which is also a free symbol of the index (zeroed here).
-                # A sequential substitution would zero the symbol it just introduced.
-                host_expr += dep.index.subs(subs, simultaneous=True)
+                # xreplace is simultaneous: the level symbol can be the loop's
+                # own induction variable, which is also a free symbol of the index
+                # (zeroed here). A sequential substitution would zero the symbol it
+                # just introduced.
+                host_expr += dep.index.xreplace(subs)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
@@ -977,6 +945,45 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         return total, dep
 
+    def _shim_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "sympy.Expr | None":
+        """The advance of an op the loop-tiling lowering made: the index's, alone.
+
+        Such an op has a ``LoopShim`` for ``loop_info`` and no stored record, so
+        there is nothing to compare with and the stored-record builder must not
+        run. That builder is also what counts the reads of a buffer
+        (``_general_tile_advance_seen``) so that ``_index_tile_advance`` can pick
+        the dependency of THIS read; with it bypassed the count is kept here, the
+        same way, and a repeat load that consumes no new read answers ``None`` as it
+        does there. A shim op whose index gives no advance at all has no loop
+        variable the kernel can pair with its levels, which no valid lowering
+        produces: that is an error, not a zero.
+        """
+        if is_input:
+            ir_node = self.current_node.node
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            read_deps = [
+                d for d in ir_node.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            matches = _matching_read_deps(read_deps, name, mutation_real_name)
+            consumed = self._general_tile_advance_seen.get(name, 0)
+            if consumed >= len(matches):
+                return None
+            self._general_tile_advance_seen[name] = consumed + 1
+        indexed = self._index_tile_advance(tensor, is_input, name)
+        if indexed is None:
+            raise RuntimeError(
+                f"{self.current_node.node.get_operation_name()} is a loop shim op "
+                f"but its {'read' if is_input else 'write'} of {name} has no "
+                "advance in the index: the op lists no loop variable for its levels"
+            )
+        from_index, _ = indexed
+        return None if from_index == 0 else from_index
+
     def _checked_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
@@ -990,6 +997,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         by the wrong amount. Every other op (span-overflow and the allocator's
         tiling have no loop variable) keeps the record.
         """
+        ir_node = self.current_node.node
+        if isinstance(getattr(ir_node, "loop_info", None), LoopShim):
+            return self._shim_tile_advance(tensor, is_input, name)
         seen_before = self._general_tile_advance_seen.get(name, 0)
         recorded = self._general_tile_advance(tensor, is_input, name)
         if is_input and self._general_tile_advance_seen.get(name, 0) == seen_before:
@@ -1067,9 +1077,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
         )
         it_space = iteration_space(current_node)
-        # With dynamic=True the host index may contain symbolic strides
-        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
-        # can correctly isolate each loop variable's contribution.
 
         # insert_post_mutation_restickify may override the input layout for this input tensor.
         # Restore it here because the tensor data was uploaded as orig_stl.
@@ -1287,11 +1294,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         # extraction (which only walks tiled_symbols) silently drops the
         # advance, leaving the tensor's address pinned across that level's
         # iterations instead of stepping through it.
+        # A LoopShim op stores no lists: its advances come from the index, so the
+        # squeezed lists are empty and the advancing levels are asked of the index.
+        is_shim = isinstance(li, LoopShim)
+        shim_levels = shim_advancing_levels(ir_node) if is_shim else frozenset()
         raw_squeezed_advance_reads: list[list[list[tuple]]] = (
-            li.squeezed_advance_per_read if li is not None else []
+            li.squeezed_advance_per_read if li is not None and not is_shim else []
         )
         raw_squeezed_advance_output: list[list[tuple]] = (
-            li.squeezed_advance_output if li is not None else []
+            li.squeezed_advance_output if li is not None and not is_shim else []
         )
         # enclosing_loops gives one entry per nesting level, so the first two
         # terms are both the loop depth; max() keeps a squeezed record that
@@ -1313,7 +1324,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             for lvl in range(n_levels):
                 level_syms: list = []
                 has_any_tiled_dim = (
-                    (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
+                    lvl in shim_levels
+                    or (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
                     or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
                     or any(
                         lvl < len(levels) and levels[lvl]

@@ -384,7 +384,7 @@ def _unambiguous_physical_axis(
     positions = [
         index
         for index, coordinate in enumerate(arg.device_coordinates[:-1])
-        if dim in coordinate.subs(symbol_mapping).free_symbols
+        if dim in coordinate.xreplace(symbol_mapping).free_symbols
     ]
     return positions[0] if len(positions) == 1 else None
 
@@ -422,7 +422,7 @@ def _get_device_dim_order(
     - Explicitly includes kernel dimensions (ki, kj) even if they don't appear in device_coordinates
       (e.g., when kernel_size=1, they don't iterate naturally but are still structural dimensions).
     """
-    last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
+    last_coord = arg.device_coordinates[-1].xreplace(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
     stick_dim = free[0] if free else None
 
@@ -441,7 +441,7 @@ def _get_device_dim_order(
                         if sym not in dim_order:
                             dim_order.append(sym)
             continue
-        expr = coord.subs(symbol_mapping)
+        expr = coord.xreplace(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
         for sym in sorted(expr.free_symbols, key=str):
@@ -1340,7 +1340,10 @@ def _check_qfp8wt_offset(arg: TensorArg) -> None:
     An odd K start falls inside a stick, and offsets on other axes (column
     slices) are not modelled; either would read the wrong data.
     """
-    origin = [c.subs({s: 0 for s in c.free_symbols}) for c in arg.device_coordinates]
+    origin = [
+        c.xreplace({s: Integer(0) for s in c.free_symbols})
+        for c in arg.device_coordinates
+    ]
     k_axis = len(origin) - 2
     if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
         raise Unsupported(
@@ -1461,7 +1464,7 @@ def _create_sdsc_tensors(
                         axis
                         for axis, coordinate in enumerate(arg.device_coordinates[:-1])
                         if int(arg.device_size[axis]) > 1
-                        and not coordinate.subs(symbol_mapping).free_symbols
+                        and not coordinate.xreplace(symbol_mapping).free_symbols
                         and math.prod(arg.device_size[axis + 1 :]) == element_advance
                     ]
                     if len(candidates) == 1:
@@ -1476,7 +1479,7 @@ def _create_sdsc_tensors(
         gap_factor_by_inner_axis: dict[int, int] = {}
         for tiled_axis in tiled_constant_axes:
             for inner_axis in range(tiled_axis + 1, len(arg.device_coordinates) - 1):
-                coordinate = arg.device_coordinates[inner_axis].subs(symbol_mapping)
+                coordinate = arg.device_coordinates[inner_axis].xreplace(symbol_mapping)
                 if coordinate.free_symbols:
                     gap_factor_by_inner_axis[inner_axis] = gap_factor_by_inner_axis.get(
                         inner_axis, 1
@@ -1734,7 +1737,7 @@ def _create_sdsc_tensors(
                     dim != stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
-                    and coord_without_offset.subs(symbol_mapping) == dim
+                    and coord_without_offset.xreplace(symbol_mapping) == dim
                     and coord_without_offset in op_spec.iteration_space
                     and -(
                         -it_dim_size
@@ -1843,7 +1846,7 @@ def _create_sdsc_tensors(
             # weight (from the matmul's reduction variable), and
             # qfp8wt_dim_order does by default otherwise.
             companion = None
-            k_syms = arg.device_coordinates[-2].subs(symbol_mapping).free_symbols
+            k_syms = arg.device_coordinates[-2].xreplace(symbol_mapping).free_symbols
             if len(k_syms) == 1:
                 companion = next(iter(k_syms))
             if (
@@ -2697,7 +2700,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]
             for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
-                mapped_coord = coord.subs(symbol_mapping)
+                mapped_coord = coord.xreplace(symbol_mapping)
                 dim_sym = next(
                     (
                         s
