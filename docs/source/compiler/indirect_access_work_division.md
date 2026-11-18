@@ -33,7 +33,8 @@ enable it for **overwrite** scatters and leave **accumulating** scatters serial.
 ### Gather — indirect on a load
 
 A gather is lowered to a **Pointwise `identity` op** with three tensor
-arguments:
+arguments (or, when it fuses with its consuming pointwise op, to that op, with
+the same arguments; see [Indirect access](indirect_access.md#fusion)):
 
 | Arg | Role | Device coordinates |
 |---|---|---|

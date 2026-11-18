@@ -14,6 +14,7 @@
 
 import collections
 import dataclasses
+import operator
 import sympy
 import torch
 import torch.fx as fx
@@ -47,7 +48,7 @@ from torch_spyre.constants import DEVICE_NAME
 logger = get_inductor_logger("split_multi_ops")
 
 # Operations that don't perform computation but manage data flow
-_STRUCTURAL_OPS = frozenset({"load", "store", "get_index"})
+_STRUCTURAL_OPS = frozenset({"load", "store", "get_index", "indirect_indexing"})
 
 # Operations that involve dtype conversion
 _DTYPE_OPS = frozenset({"to_dtype", "convert_element_type"})
@@ -123,11 +124,38 @@ class _IntermediateOpHandler(WrapperHandler):
         return super()._default(name, args, kwargs)
 
 
+_VAL_SYMBOL_PREFIX = "_tracedval"
+
+
 class _Val:
+    """A traced value.
+
+    Arithmetic on a value (an indirect index in a load's index expression, e.g.
+    ``stride * tmp0 + i``) yields a sympy expression in a symbol that stands for
+    the value, so ``_TracingHandler.load`` can recover which traced values the
+    index depends on.
+    """
+
     __slots__ = ("handler", "vid")
 
     def __init__(self, handler, vid):
         self.handler, self.vid = handler, vid
+
+    @property
+    def sym(self) -> sympy.Symbol:
+        return sympy.Symbol(f"{_VAL_SYMBOL_PREFIX}{self.vid}", integer=True)
+
+
+def _install_val_operators() -> None:
+    """Give ``_Val`` arithmetic that yields sympy expressions in ``Val.sym``."""
+    for name in ("add", "sub", "mul", "floordiv", "truediv"):
+        fn = getattr(operator, name)
+        setattr(_Val, f"__{name}__", lambda self, other, fn=fn: fn(self.sym, other))
+        setattr(_Val, f"__r{name}__", lambda self, other, fn=fn: fn(other, self.sym))
+    setattr(_Val, "__neg__", lambda self: -self.sym)
+
+
+_install_val_operators()
 
 
 class _TracingHandler:
@@ -194,15 +222,27 @@ class _TracingHandler:
     def load(self, name, index):
         """Record a load operation from a named buffer.
 
+        For indirect access, the index may be a sympy expression containing _Val objects
+        from previous loads (e.g., offset + scale * tmp0). We need to extract the _Val
+        VIDs and record them as dependencies while preserving the index expression structure.
+
         Args:
             name: Buffer name to load from
-            index: Index expression for the load
+            index: Index expression (may contain _Val objects for indirect access)
 
         Returns:
             _Val representing the loaded value
         """
+        if isinstance(index, _Val):
+            index = index.sym
+        vids = sorted(
+            int(str(sym)[len(_VAL_SYMBOL_PREFIX) :])
+            for sym in getattr(index, "free_symbols", ())
+            if str(sym).startswith(_VAL_SYMBOL_PREFIX)
+        )
+
         vid = self._alloc_vid()
-        self.ops.append(("load", vid, (), {"_name": name, "_index": index}))
+        self.ops.append(("load", vid, tuple(vids), {"_name": name, "_index": index}))
         return _Val(self, vid)
 
     def store(self, name, index, value, mode=None):

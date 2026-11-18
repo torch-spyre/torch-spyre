@@ -1168,6 +1168,18 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
+    def _indirect_index_args(self, syms) -> "list[TensorArg]":
+        """Input args for the index tensors behind ``syms``, in a stable order."""
+        args = []
+        for sym in sorted(syms, key=str):
+            idx_tensor = self.indirect_vars[sym]
+            idx_arg = self.create_tensor_arg(
+                True, idx_tensor.name, idx_tensor, opspec_name=idx_tensor.name
+            )
+            self._check_indirect_index_step(idx_arg)
+            args.append(idx_arg)
+        return args
+
     def _check_indirect_index_step(self, idx_arg: TensorArg) -> None:
         """Require aligned starts and adjacent sticks in counted-loop index rows.
 
@@ -1580,18 +1592,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
-            indirect_syms = _indirect_syms_used(value, self.indirect_vars)
-            if indirect_syms:
-                for sym in sorted(indirect_syms, key=str):
-                    idx_tensor = self.indirect_vars[sym]
-                    idx_arg = self.create_tensor_arg(
-                        True,
-                        idx_tensor.name,
-                        idx_tensor,
-                        opspec_name=idx_tensor.name,
-                    )
-                    self._check_indirect_index_step(idx_arg)
-                    args.append(idx_arg)
+            args += self._indirect_index_args(
+                _indirect_syms_used(value, self.indirect_vars)
+            )
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input))
@@ -1625,17 +1628,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
                 # create_op_spec applies indirect_access_subs during simplification.
                 # Only add the indirect tensors that this specific operation uses.
-                args = []
-                for sym in sorted(indirect_syms_used, key=str):
-                    idx_tensor = self.indirect_vars[sym]
-                    idx_arg = self.create_tensor_arg(
-                        True,
-                        idx_tensor.name,
-                        idx_tensor,
-                        opspec_name=idx_tensor.name,
-                    )
-                    self._check_indirect_index_step(idx_arg)
-                    args.append(idx_arg)
+                args = self._indirect_index_args(indirect_syms_used)
                 args += [
                     self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),
@@ -1742,11 +1735,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             ):
                 raise Unsupported(f"reduction operands: {value.arguments}")
             x = value.arguments[0]
-            args = [
+            # A gather fused into the reduction: its index tensors lead the args.
+            args = self._indirect_index_args(
+                _indirect_syms_used(value, self.indirect_vars)
+            )
+            args += [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+            self.op_specs.append(
+                self.create_op_spec(
+                    value.op, True, args, op_info, self.indirect_var_names()
+                )
+            )
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""

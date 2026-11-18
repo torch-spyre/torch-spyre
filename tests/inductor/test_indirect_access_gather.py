@@ -223,6 +223,11 @@ class _GatherScenarios:
                     any(op_spec_has_indirect_input(s) for s in op_specs),
                     f"{label}: gather signature lost",
                 )
+                self.assertNotIn(
+                    IDENTITY_OP,
+                    [s.op for s in op_specs if op_spec_has_indirect_input(s)],
+                    f"{label}: gather not fused into the unary",
+                )
                 self.assert_indirect_source_indexed_dim_outermost(op_specs)
                 # Each supported unary must also lower to a well-formed
                 # indirect-access SDSC bundle, not just an op spec.
@@ -245,6 +250,7 @@ class _GatherScenarios:
         ops = [s.op for s in op_specs]
         self.assertIn("exp", ops)
         self.assertIn("tanh", ops)
+        self.assert_gather_fused_into(op_specs, "exp")
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # The fused chain must still emit a valid indirect-access SDSC bundle.
@@ -438,16 +444,20 @@ class _GatherScenarios:
 
     def test_gather_3d_then_scalar_mul(self):
         x, i = self._xi3d(P=32)
-        self._stage_and_e2e(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC, op="mul"
+        )
 
     def test_gather_3d_then_scalar_add(self):
         x, i = self._xi3d(P=32)
-        self._stage_and_e2e(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC, op="add"
+        )
 
     def test_gather_3d_chained_unaries(self):
         x, i = self._xi3d(P=32)
         self._stage_and_e2e(
-            lambda x, i: x[i].exp().tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh"
+            lambda x, i: x[i].exp().tanh(), x, i, expect=GATHER_OP_SPEC, op="exp"
         )
 
     def test_gather_3d_then_sum_reduction(self):
@@ -462,6 +472,54 @@ class _GatherScenarios:
         j = torch.randint(0, A, (32,), dtype=torch.int32).to("spyre")
         self.name_dims(j, {"P": 32})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
+        self._assert_one_gather_fused_into_add(lambda x, i, j: x[i] + x[j], x, i, j)
+
+    def _assert_one_gather_fused_into_add(self, kernel, *dev_args):
+        """Two gathers feed an add: exactly one is fused into it, the other is
+        a separate indirect identity copy (at most one indirect access per op)."""
+        indirect = self.indirect_ops(kernel, *dev_args)
+        self.assertEqual(sorted(indirect), sorted(["add", IDENTITY_OP]), indirect)
+
+    def test_gather_used_twice_in_one_op(self):
+        """g = x[i]; g * g -- one gather feeding both operands of a binary op
+        must not be inlined twice (two indirect accesses in one op)."""
+        x, i = self._xi(P=32)
+
+        def kernel(x, i):
+            g = x[i]
+            return g * g
+
+        self._stage_and_e2e(kernel, x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_fused_into_reduction_over_data_dim(self):
+        """x[i].sum(dim=1) reduces a data axis: the gather is fused into the
+        reduction (one indirect `sum` op spec, no indirect identity copy)."""
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC, op="sum")
+
+    def test_gather_not_fused_into_reduction_over_index_dim(self):
+        """x[i].sum(dim=0) reduces the index axis. The backend cannot chunk an
+        axis that is both indexed and reduced, so the gather stays a separate
+        indirect identity copy."""
+        x, i = self._xi(P=32)
+        indirect = self.indirect_ops(lambda x, i: x[i].sum(dim=0), x, i)
+        self.assertEqual(indirect, [IDENTITY_OP], indirect)
+
+    def test_gather_two_value_tensors_added(self):
+        """x[i] + y[j] -- two distinct value tensors: one gather is fused into
+        the add, the other is materialized first."""
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        y = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        j = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(y, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self.name_dims(j, {"P": P})
+        kernel = lambda x, y, i, j: x[i] + y[j]  # noqa: E731
+        self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
+        self._assert_one_gather_fused_into_add(kernel, x, y, i, j)
 
     def test_paged_kv(self):
         """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
@@ -526,12 +584,16 @@ class _GatherScenarios:
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
         x, i = self._xi(P=32)
-        self._stage_and_e2e(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC, op="mul"
+        )
 
     def test_gather_then_scalar_add(self):
         """x[i] + 1.0 -- gather fused with a scalar add."""
         x, i = self._xi(P=32)
-        self._stage_and_e2e(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC, op="add"
+        )
 
     def test_gather_two_indices_added(self):
         """x[i] + x[j] -- two independent gathers feeding a binary op."""
@@ -543,6 +605,7 @@ class _GatherScenarios:
         self.name_dims(i, {"P": P})
         self.name_dims(j, {"P": P})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
+        self._assert_one_gather_fused_into_add(lambda x, i, j: x[i] + x[j], x, i, j)
 
     def test_gather_then_sum_reduction(self):
         """x[i].sum(dim=1) -- a reduction over gathered rows."""
@@ -556,7 +619,9 @@ class _GatherScenarios:
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
 
     def test_gather_after_producer_exp_3d(self):
         """x.exp()[i] -- 3D gather with producer layout rewrite."""
@@ -565,7 +630,9 @@ class _GatherScenarios:
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
 
     def test_gather_after_producer_exp_4d(self):
         """x.exp()[i] -- 4D gather with producer layout rewrite."""
@@ -574,7 +641,9 @@ class _GatherScenarios:
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K, "L": L})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
 
     def test_gather_after_producer_exp_2d_index(self):
         """x.exp()[i] -- 2D value tensor with 2D index tensor."""
@@ -583,7 +652,9 @@ class _GatherScenarios:
         i = torch.randint(0, M, (P, Q), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P, "Q": Q})
-        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
 
     def test_gather_after_complex_producer_ops(self):
         """x.abs().neg().exp()[i] -- gather with multiple producer ops fused."""
@@ -593,8 +664,23 @@ class _GatherScenarios:
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P})
         self._stage_and_e2e(
-            lambda x, i: x.abs().neg().exp()[i], x, i, expect=GATHER_OP_SPEC
+            lambda x, i: x.abs().neg().exp()[i], x, i, expect=GATHER_OP_SPEC, op="exp"
         )
+
+    def test_gather_feeding_producer_of_gather_keeps_one_indirect_per_op(self):
+        """x[j].exp()[i] -- two gathers around one pointwise op: one gather is
+        fused with the exp, the other is a separate indirect identity copy."""
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, P, (P,), dtype=torch.int32).to("spyre")
+        j = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self.name_dims(j, {"P": P})
+        kernel = lambda x, i, j: x[j].exp()[i]  # noqa: E731
+        self._stage_and_e2e(kernel, x, i, j, expect=GATHER_OP_SPEC)
+        indirect = self.indirect_ops(kernel, x, i, j)
+        self.assertEqual(sorted(indirect), sorted(["exp", IDENTITY_OP]), indirect)
 
     def test_functional_embedding(self):
         """torch.nn.functional.embedding(idx, weight) -- like torch.embedding."""
@@ -733,7 +819,9 @@ class _GatherScenarios:
     def test_single_idx_3d_scalar_add(self):
         """P=1, 3-D value, scalar add fused after gather."""
         x, i = self._xi3d(P=1)
-        self._stage_and_e2e(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC, op="add"
+        )
 
     # 4-D value tensor, P=1
     def test_single_idx_4d_stick_aligned(self):
@@ -785,7 +873,9 @@ class _GatherScenarios:
     def test_single_idx_4d_scalar_mul(self):
         """P=1, 4-D value, scalar multiply fused after gather."""
         x, i = self._xi4d(P=1)
-        self._stage_and_e2e(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC, op="mul"
+        )
 
     # P=1 embedding API variants
     def test_single_idx_embedding_large_vocab(self):

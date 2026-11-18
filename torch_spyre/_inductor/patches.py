@@ -15,8 +15,15 @@
 import inspect
 from contextlib import contextmanager
 from functools import wraps
+from unittest import mock
 
 import torch
+from torch._inductor import ir
+from torch._inductor.dependencies import (
+    MemoryDep,
+    extract_read_writes,
+    is_indirect,
+)
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -87,6 +94,187 @@ def spyre_data_types():
         yield
     finally:
         torch._prims_common._computation_dtype_map = saved
+
+
+# Gather fusion. Spyre realizes every op right after it is lowered
+# (``has_large_inner_fn`` is True), except a gather, and a producer whose only user
+# is a gather, which stay inlineable so Inductor splices their ``inner_fn`` into the
+# consumer. Before each node is lowered, ``_run_node`` realizes any inlineable input
+# that would give the node a second indirect access. Gathers are recognized from the
+# lowered IR (indirect reads) and from the shape of the call, never from op names.
+
+
+def _inputs(node) -> list:
+    """Input nodes of ``node``, once per use (``g * g`` lists ``g`` twice)."""
+    found: list = []
+    torch.fx.node.map_arg((node.args, node.kwargs), found.append)
+    return found
+
+
+def _is_elementwise_or_reduction(node) -> bool:
+    """Whether ``node`` is a pointwise or reduction op, which has no indirect access
+    of its own and so can inline one gather."""
+    tags = node.target.tags if isinstance(node.target, torch._ops.OpOverload) else ()
+    return torch.Tag.pointwise in tags or torch.Tag.reduction in tags
+
+
+def _unrealized_pointwise(box, through_views: bool = True):
+    """The inlineable ``Pointwise`` behind ``box``, or None if it was realized."""
+    while isinstance(box, (ir.TensorBox, ir.BaseView)):
+        if isinstance(box, ir.BaseView) and not through_views:
+            return None
+        box = box.data
+    if isinstance(box, ir.StorageBox) and isinstance(box.data, ir.Pointwise):
+        return box.data
+    return None
+
+
+def _indirect_reads(pw: ir.Pointwise):
+    """Reads of ``pw`` (inlined producers included) and its loop variables."""
+    with mock.patch.object(ir.FlexibleLayout, "allow_indexing", True):
+        rw = extract_read_writes(pw.make_loader(), pw.get_size())
+    return [d for d in rw.reads if isinstance(d, MemoryDep)], rw.range_vars
+
+
+def _indirect_symbols(pw: ir.Pointwise) -> int:
+    """Number of distinct indirect indices ``pw`` reads through."""
+    reads, _ = _indirect_reads(pw)
+    return len(
+        {
+            sym
+            for dep in reads
+            for sym in dep.index.free_symbols
+            if is_indirect(sym.name)
+        }
+    )
+
+
+def _inlined_indirect_loads(box) -> int:
+    """Indirect accesses a consumer of ``box`` would inline (0 once realized)."""
+    pw = _unrealized_pointwise(box)
+    return 0 if pw is None else _indirect_symbols(pw)
+
+
+def _reads_indirectly(box) -> bool:
+    """Whether ``box`` is a pointwise op that performs an indirect access, whether
+    or not it was realized."""
+    while isinstance(box, (ir.TensorBox, ir.BaseView)):
+        box = box.data
+    data = box.data if isinstance(box, ir.StorageBox) else None
+    if isinstance(data, ir.ComputedBuffer):
+        data = data.data
+    return isinstance(data, ir.Pointwise) and _indirect_symbols(data) > 0
+
+
+def _adds_indirect_load(lowering: GraphLowering, pw: ir.Pointwise, node) -> bool:
+    """Whether ``pw``, just built for ``node``, performs an indirect access beyond
+    those inlined from its inputs, i.e. whether ``node`` is itself a gather."""
+    inherited = sum(_inlined_indirect_loads(lowering.env.get(a)) for a in _inputs(node))
+    return _indirect_symbols(pw) > inherited
+
+
+def _reduces_index_dims(reduction, box) -> bool:
+    """Whether ``reduction`` reduces an axis of the gather ``box`` that comes from
+    its index tensor: a loop variable that the non-indirect reads (the index
+    tensors) are indexed by. True whenever that cannot be told."""
+    pw = _unrealized_pointwise(box, through_views=False)
+    dims = reduction.args[1] if len(reduction.args) > 1 else None
+    if isinstance(dims, int):
+        dims = [dims]
+    if pw is None or not isinstance(dims, (list, tuple)) or not dims:
+        return True  # a full reduction touches every axis
+    reads, loop_vars = _indirect_reads(pw)
+    if not loop_vars:
+        return True
+    index_vars = {
+        sym for dep in reads if not dep.is_indirect() for sym in dep.index.free_symbols
+    }
+    return any(loop_vars[d % len(loop_vars)] in index_vars for d in dims)
+
+
+def _is_integer(dtype: torch.dtype) -> bool:
+    return not (dtype.is_floating_point or dtype.is_complex or dtype == torch.bool)
+
+
+def _feeds_a_gather(node) -> bool:
+    """Whether ``node``'s only use looks like a gather reading it as the value tensor.
+
+    Such a use is not elementwise or a reduction, takes ``node`` as its first
+    argument, once, does not mutate, and every other tensor it takes is an integer
+    index. (Views, casts and matmuls have no integer tensor input; a scatter either
+    mutates or takes a float values tensor.) ``_run_node`` checks the guess against
+    the lowered IR.
+    """
+    if len(node.users) != 1:
+        return False
+    (user,) = node.users
+    if (
+        not isinstance(user.target, torch._ops.OpOverload)
+        or user.target._schema.is_mutable
+    ):
+        return False
+    if _is_elementwise_or_reduction(user) or not user.args or user.args[0] is not node:
+        return False
+    inputs = _inputs(user)
+    if inputs.count(node) != 1:
+        return False
+    others = [
+        a.meta["val"]
+        for a in inputs
+        if a is not node and isinstance(a.meta.get("val"), torch.Tensor)
+    ]
+    return bool(others) and all(_is_integer(t.dtype) for t in others)
+
+
+@contextmanager
+def _gather_fusion_patches():
+    """Let a gather fuse into its consumer, with one indirect access per op."""
+    old_run_node = GraphLowering.run_node
+
+    def _has_large_inner_fn(self, threshold=None):
+        node = V.get_current_node()
+        keep = (
+            isinstance(self, ir.Pointwise)
+            and node is not None
+            and (_adds_indirect_load(V.graph, self, node) or _feeds_a_gather(node))
+        )
+        return not keep
+
+    def _run_node(self, n):
+        # An elementwise op or reduction may inline one indirect access. Any other
+        # op (a gather, a scatter, a matmul, ...) may inline none.
+        budget = int(_is_elementwise_or_reduction(n))
+        is_reduction = (
+            isinstance(n.target, torch._ops.OpOverload)
+            and torch.Tag.reduction in n.target.tags
+        )
+        takes_producer = False
+        for inp in _inputs(n):
+            box = self.env.get(inp)
+            loads = _inlined_indirect_loads(box)
+            takes_producer |= _feeds_a_gather(inp) and (
+                _unrealized_pointwise(box) is not None
+            )
+            if not loads:
+                continue
+            # The backend cannot chunk an axis that is both paged (indexed) and
+            # reduced: deeptools finds no valid chunk parameter.
+            if (is_reduction and _reduces_index_dims(n, box)) or loads > budget:
+                box.realize()
+            else:
+                budget -= loads
+        result = old_run_node(self, n)
+        if takes_producer and not _reads_indirectly(result):
+            raise Unsupported(
+                f"{n.target} was given an inlined producer but is not a gather"
+            )
+        return result
+
+    with (
+        mock.patch.object(ir.Loops, "has_large_inner_fn", _has_large_inner_fn),
+        mock.patch.object(GraphLowering, "run_node", _run_node),
+    ):
+        yield
 
 
 @contextmanager
@@ -377,12 +565,6 @@ def enable_spyre_context(
         "fallback_random": True,
     }
 
-    from torch._inductor.ir import Loops
-
-    # Force all operations to be realized when LoopLevel IR is initially constructed
-    old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
-
     from torch._inductor.fx_passes import joint_graph
 
     origin_pass = list(joint_graph.pass_patterns)
@@ -458,6 +640,7 @@ def enable_spyre_context(
         # First in the header: the same ``with`` closes it however the body, or
         # the entry of a later manager, exits.
         loop_scheduler_patches_for_compile(),
+        _gather_fusion_patches(),
         _declared_dims_for_compile(declared_dims),
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
@@ -476,7 +659,6 @@ def enable_spyre_context(
             yield
         finally:
             joint_graph.pass_patterns[:] = origin_pass
-            Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
