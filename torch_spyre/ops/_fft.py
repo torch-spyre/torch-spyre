@@ -65,28 +65,30 @@ def _build_device_dft_matrix(
 ) -> torch.Tensor:
     """``(2n, 2n)`` fp16 interleaved DFT matrix, assembled directly on ``device``.
 
-    Complex ``W[j, k] = exp(-2pi i jk/n)`` (``conj/n`` for the inverse) expanded
+    Complex ``W[j, k] = exp(-2pi i jk/n)`` (``conj`` for the inverse) expanded
     into real ``[[Re, Im], [-Im, Re]]`` blocks so a complex DFT runs as one real
-    matmul on interleaved ``[re0, im0, ...]`` data.
+    matmul on interleaved ``[re0, im0, ...]`` data. The matrix is kept
+    unit-magnitude: the inverse ``1/n`` is applied on the host after the matmul
+    (see :func:`_direct`), because baking it in would make the fp16 entries
+    ``~1/n`` -- subnormal below the fp16 normal minimum (~6.1e-5) for n>16384,
+    where they lose precision or flush to zero.
 
     Built a row block at a time from length-n ``cos``/``sin`` tables indexed by
     the exact integer phase ``(j*k) % n``, so no ``(n, n)`` float64 outer
     product (or float32 full matrix) is ever materialized -- host peak is
-    ``O(block*n)`` rather than ``O(n**2)``. Values match the dense construction
-    to fp16. The exact integer index also avoids the float rounding a large
-    ``j*k`` would suffer once it exceeds the mantissa.
+    ``O(block*n)`` rather than ``O(n**2)``. The exact integer index also avoids
+    the float rounding a large ``j*k`` would suffer once it exceeds the mantissa.
     """
     phase = (2.0 * torch.pi / n) * torch.arange(n, dtype=torch.float64)
     cos_t, sin_t = torch.cos(phase), torch.sin(phase)
-    scale = 1.0 / n if inverse else 1.0
     im_sign = 1.0 if inverse else -1.0  # exp(+) inverse, exp(-) forward
     k = torch.arange(n, dtype=torch.int64)
     out = torch.empty(2 * n, 2 * n, dtype=torch.float16, device=device)
     for j0 in range(0, n, block):
         j = torch.arange(j0, min(j0 + block, n), dtype=torch.int64).unsqueeze(1)
         idx = (j * k) % n  # (rows, n) exact integer phase index
-        re = (cos_t[idx] * scale).to(torch.float16)
-        im = (im_sign * sin_t[idx] * scale).to(torch.float16)
+        re = cos_t[idx].to(torch.float16)
+        im = (im_sign * sin_t[idx]).to(torch.float16)
         rows = re.shape[0]
         blk = torch.empty(2 * rows, 2 * n, dtype=torch.float16)
         blk[0::2, 0::2], blk[0::2, 1::2] = re, im
@@ -171,9 +173,19 @@ def _direct_matmul_max() -> int:
 
 
 def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
-    """Length-n DFT along the last axis as one real interleaved matmul."""
+    """Length-n DFT along the last axis as one real interleaved matmul.
+
+    The input is prescaled by its max magnitude on the host so the fp16 cast
+    and the fp16 matmul output stay in range -- the transform is linear, so the
+    scale is reapplied afterward. Without it the unnormalized DC term reaches
+    ``n*|x|`` and overflows fp16 at the ceiling, and an input ``|x| > 65504``
+    overflows on the cast itself. The inverse ``1/n`` is applied here too, in
+    fp32, since the matrix is unit-magnitude (see :func:`_build_device_dft_matrix`).
+    """
     n = x.shape[-1]
-    u = _to_interleaved(x).to(torch.float16).to(device)  # pack + cast on host
+    s = x.abs().amax()
+    xs = x / s if s > 0 else x
+    u = _to_interleaved(xs).to(torch.float16).to(device)  # pack + cast on host
     comp = _COMPILED.get(device)
     if comp is None:
         with _COMPILED_LOCK:
@@ -182,9 +194,17 @@ def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
                 comp = torch.compile(lambda a, b: a @ b, dynamic=False)
                 _COMPILED[device] = comp
     w = _device_dft_matrix(n, inverse, device)
-    # fp16 -> fp32 on the host: a bitwidth cast on device reorders within the
-    # stick and would corrupt element order.
-    return _from_interleaved(comp(u, w).cpu().float(), n)
+    # Cast fp16 -> fp32 on the host (.cpu() then .float(), never .float().cpu()).
+    # On device a bitwidth cast produces a staggered element arrangement (fp16
+    # packs 64 elements per 128-byte stick, fp32 packs 32) -- a normal device
+    # characteristic, not a bug (docs/source/user_guide/tensors_and_layouts.md);
+    # but a device->host copy reads it as standard layout and returns a
+    # permutation. The result returns to the host anyway, and casting after the
+    # fp16 D2H copy moves half the bytes of an on-device upcast. A device-side
+    # upcast (torch-spyre #5495 insert_ea_shuffle) could revisit this.
+    v = _from_interleaved(comp(u, w).cpu().float(), n)
+    post = (s / n) if inverse else s
+    return v * post
 
 
 def _factor(n: int) -> tuple[int, int]:
