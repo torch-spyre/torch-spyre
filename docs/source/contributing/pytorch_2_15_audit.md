@@ -1,7 +1,7 @@
 # PyTorch 2.15 compatibility audit
 
 This audit covers the Python monkey-patches in `torch_spyre`, including the
-Inductor patches brought in by merging upstream main at `8d13d06edb` into
+Inductor patches brought in by merging upstream main at `48a7e872eb` into
 the 2.15 upgrade. Upstream comparisons use PyTorch `v2.14.1` and
 `v2.15.0` (`31a77fc9c0a7c6fff15a1ff58c743f53b1a9d457`). Runtime checks use
 Python 3.12 and torch 2.15.0+cpu.
@@ -16,6 +16,13 @@ Python 3.12 and torch 2.15.0+cpu.
   the scan patch. The upgrade branch already contains this adaptation.
   Preserve the upstream policy for other higher-order operators, including
   FlexAttention, and retain rejection of aliased inputs requiring gradients.
+- Preserve a sliced tile's explicit extent with non-overlapping `unfold`.
+  In 2.15, `unflatten` re-derives a literal tile width as
+  `S // (S // tile_width)`, even after narrowing to whole tiles. This breaks
+  scan output-shape resolution and later integer-only loop geometry.
+- Check the bare `mark_dynamic` call instead of expecting an empty
+  `_dynamo_dynamic_range` entry. 2.15 no longer records a range when neither
+  bound is supplied; Spyre's separate reservation contract is unchanged.
 
 ## Scan and for_each_tile
 
@@ -24,6 +31,16 @@ The public scan implementation, `ScanOp.__call__`, `trace_scan`,
 `ScanHigherOrderVariable._call_function` are unchanged between these tags.
 `for_each_tile` continues to pass a flattened body, carry leaves, scanned
 operand leaves, and lifted invariant operands to `scan_op`.
+
+The sliced operand view now supplies its tile width and step explicitly.
+The existing divisibility check guarantees the view covers the input exactly;
+the view retains noncontiguous strides and storage offsets. This avoids
+depending on `unflatten`'s symbolic shape simplification. Relative indexing
+also preserves the runtime offset of an enclosing scan; a raw `as_strided`
+view is insufficient for nested CPU-compiled scans. The symbolic-loop,
+dynamic-reservation and cross-kernel reservation tests check numerical results
+at every declared size, output metadata, rejection of undeclared dimensions,
+and reuse of a single graph and cached kernel.
 
 The Dynamo alias checker changed its signature and now independently controls
 input-input aliasing. This replaces the need to override tracer alias detection.
@@ -62,7 +79,7 @@ unchanged, so this upgrade does not require a new scan salt.
 | `loop_scheduler.py`: `refresh_group_node_dependencies` | Unchanged in 2.15. The new wrapper preserves the loop's unpruned fake dependencies when upstream rebuilds the group from its children, and restores the original function on exit. |
 | `patches.py`: stride-first contiguity | The copied upstream function is unchanged in 2.15; upstream still introduces the size-one guard before checking strides. Keep the workaround for pytorch#203781. |
 | `_monkey_patch.py`: `FakeTensorMode.avoid_device_init` | The property is unchanged in 2.15; the upstream PrivateUse1 opt-out is still absent. Keep the device-initialization workaround for pytorch#203190. |
-| `_inductor/__init__.py`, guards and FX hashes: declared dimensions | GraphArg example/fake-tensor access and symbolic sizes retain their contracts. Preserve the new reservation metadata in cache keys, reuse guards and compiled outputs. |
+| `_inductor/__init__.py`, guards and FX hashes: declared dimensions | GraphArg example/fake-tensor access retains its contract. Preserve reservation metadata in cache keys, reuse guards and compiled outputs. The unflatten change above is required to keep local tile geometry concrete. |
 | `patches.py`: dtype computation map | Same upstream map and lookup contract. Keep Spyre's native-width policy scoped to the compile context. |
 | `patches.py`: `GraphLowering.placeholder` | Unchanged; upstream still initially gives input layouts offset zero. Preserve Spyre input offsets before views are lowered. |
 | `patches.py`: `GraphLowering.register_operation` | Unchanged; naming by list length still needs protection after graph edits. |
@@ -76,6 +93,7 @@ unchanged, so this upgrade does not require a new scan salt.
 | `torch_phases.py`: Chromium event start/end | Positional argument order is unchanged, including start metadata at position three. Required-phase tests pass. |
 | `_inductor/__init__.py`: `compile_fx`, `compile_fx_inner` | New compile-option handling stays in upstream, which the wrapper calls. The picklable decomposition callable and thread-local nested-region context remain necessary. |
 | `_monkey_patch.py`: Tensor.to/repr/layout and torch.empty | Existing forwarding contracts remain valid. Device layout extensions remain Spyre-specific; factory cache is warmed before replacement. |
+| `_monkey_patch.py`: `mark_dynamic` for reserved tensors | Bare marking still makes the dimension dynamic, but no longer creates an empty range record. The test now checks the real call and dynamic marking. |
 | `_monkey_patch.py`: `GuardBuilder.TENSOR_MATCH` and reuse metadata | New current-device and dimension guards are preserved by calling upstream first. `GuardCheckSpec` and tensor metadata contracts are unchanged. |
 | `_monkey_patch.py`: nested-region decomposition extraction | Upstream extractor is unchanged; inherited Spyre decompositions still need threading into nested bodies. |
 | `_monkey_patch.py`: `FxGraphHashDetails.__init__` | New upstream custom-backend hashes are preserved by calling the original initializer before adding layout, offset, and sharding fields. |
@@ -87,28 +105,35 @@ unchanged, so this upgrade does not require a new scan salt.
 
 ## Validation and limits
 
-The results below describe the November 6 validation, before the November 18
-refresh. The refresh also incorporates upstream's AIUPTI `device_index` fix
-and eager `masked_fill` support; the obsolete upgrade-branch masked-fill
-rejection is removed in favor of upstream's positive tests.
+The November 18 refresh uses the current sentient Deeptools, runtime/Flex,
+libaiupti and spyre-comms artifacts, and the installed external senlib runtime.
+The native extension rebuilt against torch 2.15.0+cpu with profiler support.
+The refresh incorporates upstream's AIUPTI `device_index`, eager `masked_fill`,
+fp8 zero-fill, and partial-view fill-guard fixes.
 
-The torch-spyre native extension rebuilt against 2.15. The focused CPU audit
-passed 162 tests and 89 subtests across loop scheduling, scan shape proxies,
-scan aliasing, nested tile tracing, recursion limits, scan caches, pass counters,
-Dynamo guards, and compile timing. All 56 safetensors hook/passthrough tests
-also passed with safetensors 0.8.0. The 17 tile-lowering tests and 21 subtests
-passed, checking generated while-loop counts, materializations, nested loops,
-carry values, pytree outputs, and attention numerics on CPU. These tests used
-`--noconftest -o addopts=`
-and `IS_INDUCTOR_SPAWNED_SUBPROCESS=1` to avoid the device-poisoning fixture
-and hardware stream discovery; they validate CPU/compiler behavior only.
+The focused compiler/device suite passed 280 tests and 156 subtests, including
+scan aliasing, shape proxies, nested tile lowering, frontend work bounds,
+cost-model checks, fused-QKV views, and the scalar rejection cases. After the
+final `unfold` change, 38 tests and 23 subtests passed for symbolic tile shapes,
+noncontiguous/offset views, nested matmul tilings, dynamic reservations,
+symbolic loops, cross-kernel reservations, and bare dynamic marking. The
+reservation tests check numerical results across declared sizes and reuse of
+one graph and its cached kernel. Cache tests used a library-version file
+containing hashes of the installed compiler and Flex library.
 
-The normal test path failed during device initialization with
-`RAS::PCI::PCIeFailure`, before executing the tests. Device building blocks,
-loop-scheduler equivalence, fused-QKV attention, offset/layout guards, model
-loading, distributed waits, profiler collection, and frontend work-bound
-calibration therefore require the all-platform CI run. No expectations or
-tolerances were weakened to accommodate that hardware failure.
+The stable local-window slice-fill limitation is now asserted explicitly for
+eager and compiled execution, with the corresponding exception and message;
+it remains tracked by torch-spyre#4502. No numerical tolerances were loosened.
+
+Full pre-commit checks and generated requirements consistency passed. OOT
+configuration validation found no duplicate, missing, or unlabelled tests;
+182 existing dead-pattern warnings remain. The scheduler surface comparison
+reports 29 names: 27 unchanged, two reviewed changes, and none missing.
+The earlier CPU audit also passed all 56 safetensors hook/passthrough tests.
+
+Local validation covers one x86_64 Spyre device. Power/Z source builds,
+multi-device distributed paths, and the full model matrix require the
+all-platform CI run.
 
 Downstream images also need torchvision 0.29.2, whose stable torch ABI supports
 torch >=2.14. There is no torchvision 0.30 release. CPU NMS and image resize
