@@ -119,6 +119,7 @@ def _kernel(*, reads=(), writes=(), hints=(), levels=1, consumed=None):
     kernel = spyre_kernel.SpyreKernel.__new__(spyre_kernel.SpyreKernel)
     kernel._general_tile_advance_seen = dict(consumed or {})
     kernel._tile_advance_symbols = {}
+    kernel._tile_advance_rw = None
     node = SimpleNamespace(
         dim_hints=[
             DimHint(

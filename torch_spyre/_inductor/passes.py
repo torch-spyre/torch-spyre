@@ -42,11 +42,17 @@ from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import (
+    insert_bmm_padding,
+    insert_restickify_padding,
+    insert_staggered_ea_padding,
+)
+from .reserved_dims_contract import apply_reserved_dims_contract
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
     mm_to_bmm_pass,
+    strided_stick_slice_to_index_select,
 )
 from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
@@ -76,7 +82,6 @@ from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
-    span_reduction,
     work_distribution,
     cost_model_matmul_division,
     defer_work_division,
@@ -99,10 +104,12 @@ from .loop_checker import check_loops
 from .loop_node import (
     OpsView,
     all_ops,
+    build_pending_loop_nodes,
     expand,
     expanded,
     has_loop_nodes,
     peel_non_members,
+    request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
@@ -310,6 +317,8 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # pass) and the mm flow through the Spyre lowerings instead of
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
+                # x[..., k::s] on the stick dim has no device coordinate; gather it.
+                strided_stick_slice_to_index_select,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
             ]
@@ -423,10 +432,13 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
     reject_nested_loops(groups, "span-overflow coarse tiling")
-    coarse_tile_post_stickify(
+    request_loop_nodes(
         graph,
-        groups=groups,
-        group_idx_offset=group_idx_offset,
+        coarse_tile_post_stickify(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+        ),
     )
 
 
@@ -559,6 +571,11 @@ class CustomPreSchedulingPasses:
     def __init__(self):
         self.passes = [
             #
+            # Read each graph input's reserved_dims (min, max, granularity)
+            # into this compile's ShapeEnv. Runs first so that every pass that
+            # reads size bounds sees the declared range.
+            apply_reserved_dims_contract,
+            #
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
             deadcode_elimination,
@@ -635,6 +652,7 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims_mutation,
             insert_post_mutation_restickify,
             insert_restickify_padding,
+            insert_staggered_ea_padding,
             #
             dedup_and_promote_constants,
             #
@@ -648,9 +666,8 @@ class CustomPreSchedulingPasses:
             # Invariant: this must run before any pass that could insert a
             # consumer of a sharded buffer (its rejection loops only see the
             # graph as of this point); compute_ops' all-sharded check is the
-            # second net.
+            # second net. Every division computes the op's span floors itself.
             plan_sharded_hbm,
-            span_reduction,
             _distribute_work,
             #
             # LX Planning
@@ -749,6 +766,9 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
                 self._run_one_pass(graph, pipeline, pass_fn, pass_name)
+            # Loops a pass lowered (span-overflow tiling) become nodes here, once
+            # the view is back and the pass has stopped iterating the list.
+            build_pending_loop_nodes(graph)
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)

@@ -59,6 +59,7 @@ from .ir import (
     BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    ReduceScatterKernel,
     SpyreReduction,
     WaitKernel,
     copy_back_view,
@@ -2469,6 +2470,38 @@ def lower_where(condition, self, other):
     return result
 
 
+def _broadcast_keeping_zero_dim_promotion(*args):
+    """Cast 0-d float operands to the promoted dtype, then broadcast all args.
+
+    Torch's promotion ignores a 0-d tensor's dtype when a dimensioned operand of
+    the same category exists: ``fp16_tensor * fp32_0d`` is fp16 in eager.
+    Registering a binary op with ``broadcast=True`` broadcasts before the lowering
+    runs, which turns the 0-d operand into a dimensioned view and loses that rule,
+    so the result came out fp32 (#6061). Lowerings that need eager's dtype register
+    with ``broadcast=False`` and call this first: the 0-d operand is cast while it
+    is still 0-d, and the broadcast that follows is the one ``broadcast=True``
+    would have done.
+
+    Only float-to-float casts are done here; every other dtype mix is left to the
+    lowering exactly as before.
+    """
+    dtype = _promoted_dtype(*args, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT)
+    cast = [
+        to_dtype(a, dtype)
+        if hasattr(a, "get_dtype")
+        and len(a.get_size()) == 0
+        and a.get_dtype() != dtype
+        and a.get_dtype().is_floating_point
+        and dtype.is_floating_point
+        else a
+        for a in args
+    ]
+    out, _ = lowering.transform_args(
+        cast, {}, broadcast=True, type_promotion_kind=None, convert_input_to_bool=False
+    )
+    return out
+
+
 # type_promotion_kind=None: DEFAULT performs FP16→FP32 promotion before layout
 # propagation, leaving an IR node with STANDARD EA.  With None the FP16 operand
 # survives into the fused body so propagate_layouts can assign DL16_TO_FP32 EA.
@@ -2478,9 +2511,10 @@ def lower_where(condition, self, other):
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_add(x, y, *, alpha=1):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     # Keep the explicit scale-and-realize for alpha != 1. Delegating to
     # lowering.add(x, y, alpha=alpha) fails for fractional alpha (test_add_alpha,
     # alpha=0.5) with InductorError "No FX node for buf1" from split_multi_ops.
@@ -2501,10 +2535,10 @@ def lower_add(x, y, *, alpha=1):
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_mul(x, y):
-    return lowering.mul(x, y)
+    return lowering.mul(*_broadcast_keeping_zero_dim_promotion(x, y))
 
 
 # NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
@@ -2514,9 +2548,10 @@ def lower_mul(x, y):
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_sub(x, y, *, alpha=1):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -2713,31 +2748,33 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
 
 
 @register_spyre_lowering(
-    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=False
 )
 @register_spyre_lowering(
-    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=False
 )
 def lower_div(x, y, *, rounding_mode=None):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return _lower_div_impl(x, y, rounding_mode=rounding_mode)
 
 
 @register_spyre_lowering(
-    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=True
+    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=False
 )
 def lower_floor_divide(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     # aten.floor_divide has no rounding_mode parameter; always floor division.
     return _lower_div_impl(x, y, rounding_mode="floor")
 
@@ -2745,18 +2782,20 @@ def lower_floor_divide(x, y):
 @register_spyre_lowering(
     torch.ops.aten.minimum.default,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_minimum(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return with_int64_fallback(lowering.minimum, x, y)
 
 
 @register_spyre_lowering(
     torch.ops.aten.maximum.default,
     type_promotion_kind=None,
-    broadcast=True,
+    broadcast=False,
 )
 def lower_maximum(x, y):
+    x, y = _broadcast_keeping_zero_dim_promotion(x, y)
     return with_int64_fallback(lowering.maximum, x, y)
 
 
@@ -2817,12 +2856,10 @@ def _cmp_operand_dtype(tensors):
     resolve to ONE dtype instead of reaching the native op in two different
     physical formats.
 
-    Note this cannot reproduce torch's 0-dim promotion category (where ``fp16_1d
-    <= fp32_0d`` promotes to fp16, not fp32): ``broadcast=True`` on the .Tensor
-    registration means Inductor has already expanded 0-dim operands by the time
-    the lowering runs, so the distinction is not recoverable here. The comparison
-    is therefore done in fp32 where eager would do it in fp16, which differs only
-    when rounding the fp32 operand to fp16 changes the outcome.
+    Torch's 0-dim promotion rule (``fp16_1d <= fp32_0d`` compares in fp16, not
+    fp32) is handled before this runs: the .Tensor registration uses
+    ``broadcast=False`` and calls _broadcast_keeping_zero_dim_promotion, which
+    casts the 0-dim operand to fp16 while it is still 0-dim.
 
     Unifying the dtype does not make every mixed pair run on device, and the
     three outcomes are worth keeping straight:
@@ -2937,11 +2974,12 @@ def _register_cmp_lowerings(aten_op, op_name: str):
         name=aten_op,
         type_promotion_kind=None,
         override_return_dtype=torch.bool,
-        broadcast=True,
+        broadcast=False,
     )
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
+        x, y = _broadcast_keeping_zero_dim_promotion(x, y)
         return _lower_cmp_impl(x, y, pw)
 
     @register_spyre_lowering(
@@ -3160,6 +3198,9 @@ def lower_any_def(x):
 # These mirror torch/_inductor/comm_lowering.py: nodes are built with the
 # upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
 # create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+# spyre-comms only supports single-tensor WSIs, so coalesced variants are
+# decomposed into per-tensor collectives; the C++ wsi_cache_ deduplicates plans
+# for same-shaped tensors.
 _c10d = torch.ops._c10d_functional
 
 
@@ -3235,6 +3276,90 @@ def lower_c10d_all_gather(tensor, group_size, group_name):
     return _all_gather(tensor, group_size, group_name)
 
 
+@register_spyre_lowering(_c10d.all_gather_into_tensor_coalesced.default)
+def lower_c10d_all_gather_coalesced(tensors, group_size, group_name):
+    """Decompose coalesced all_gather into per-tensor all_gather calls."""
+    return [_all_gather(t, group_size, group_name) for t in tensors]
+
+
+def _reduce_scatter(tensor, reduce_op, group_size, group_name):
+    """Stage the input so each rank's dim-0 chunk is one contiguous device slab.
+
+    spyre-comms splits the flat device buffer into ``group_size`` equal
+    contiguous slabs; it has no strided or per-rank-list variant.  Under the
+    default stick layout host dim 0 sits next to the stick dim, so the slab
+    rank ``r`` receives is not ``chunk(0)[r]`` (see #4273).
+
+    Instead, collapse the input to ``(g, A, B)`` -- ``B`` the stick (last) dim,
+    ``A`` everything else of one rank's chunk -- and materialize it as
+    ``(A, g, B)``.  Its default device layout is ``[g, ceil(B/stick), A,
+    stick]``: ``g`` is outermost and each slab is exactly the default device
+    image of an ``(A, B)`` tensor, which is what ``reducescatter_run``
+    allocates for the output.  The result is then viewed back to
+    ``(size(0) // g, *size[1:])``.  ``ReduceScatterKernel.codegen`` checks the
+    committed layout, so a different one raises instead of scattering wrong
+    elements.
+
+    The staging copy is needed only because spyre-comms splits a flat buffer;
+    it can go once spyre-comms offers a strided or per-rank-list
+    reduce-scatter.
+    """
+    sizes = [V.graph.sizevars.guard_int(s) for s in tensor.get_size()]
+    if not sizes:
+        raise Unsupported("reduce_scatter requires an input with at least 1 dim")
+    if sizes[0] % group_size != 0:
+        raise Unsupported(
+            f"reduce_scatter: input dim 0 ({sizes[0]}) must be divisible by "
+            f"group_size ({group_size})"
+        )
+    out_sizes = [sizes[0] // group_size, *sizes[1:]]
+    stick_dim = out_sizes[-1]
+    a_dim = math.prod(out_sizes) // stick_dim
+    if len(sizes) == 1 and stick_dim % get_elem_in_stick(tensor.get_dtype()) != 0:
+        # The staged (1, g, B) layout itself is fine (e.g. (1, 2, 50) ->
+        # [2, 1, 1, 64], one padded stick per rank).  The limit is the staging
+        # clone: it splits the 1-D input's stick dim at a non-stick boundary,
+        # and the stick index 50*d0 + d1 is not a supported stick expression.
+        # TODO: support by padding each rank's chunk to whole sticks.
+        raise Unsupported(
+            f"reduce_scatter: 1-D per-rank chunk ({stick_dim}) must be a "
+            f"multiple of the stick size "
+            f"({get_elem_in_stick(tensor.get_dtype())})"
+        )
+
+    staged = lowering.view(tensor, [group_size, a_dim, stick_dim])
+    staged = lowering.permute(staged, [1, 0, 2])
+    # Spyre's clone freezes the contiguous stride order (upstream ignores it).
+    staged = clone(staged, memory_format=torch.contiguous_format)
+    staged.realize()
+
+    result = ir.TensorBox.create(
+        ReduceScatterKernel.create_staged(
+            staged, reduce_op, group_size, group_name, [a_dim, stick_dim]
+        )
+    )
+    return lowering.view(result, out_sizes)
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor.default)
+def lower_c10d_reduce_scatter(tensor, reduce_op, group_size, group_name):
+    """Out-of-place reduce_scatter: output shape[0] = input.shape[0] // group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.reduce_scatter_tensor "
+        "(reduce_op=%s, group_size=%s, group_name='%s')",
+        reduce_op,
+        group_size,
+        group_name,
+    )
+    return _reduce_scatter(tensor, reduce_op, group_size, group_name)
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor_coalesced.default)
+def lower_c10d_reduce_scatter_coalesced(tensors, reduce_op, group_size, group_name):
+    """Decompose coalesced reduce_scatter into per-tensor reduce_scatter calls."""
+    return [_reduce_scatter(t, reduce_op, group_size, group_name) for t in tensors]
+
+
 def _all_reduce_inplace(tensor, reduce_op, group_name):
     mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
     tensor = _realize_collective_input(tensor)
@@ -3277,3 +3402,15 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
         group_name,
     )
     return _all_reduce_inplace(tensor, reduce_op, group_name)
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced.default)
+def lower_c10d_all_reduce_coalesced(tensors, reduce_op, group_name):
+    """Decompose coalesced all_reduce into per-tensor all_reduce_ on clones."""
+    return [_all_reduce_inplace(clone(t), reduce_op, group_name) for t in tensors]
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced_.default)
+def lower_c10d_all_reduce_coalesced_inplace(tensors, reduce_op, group_name):
+    """In-place variant of the coalesced all_reduce decomposition."""
+    return [_all_reduce_inplace(t, reduce_op, group_name) for t in tensors]

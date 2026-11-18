@@ -685,7 +685,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
+        term = coord.xreplace(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):
@@ -706,12 +706,12 @@ def _coordinate_span_elems(
             candidate_points = {min(range_size, modulus) - 1 for modulus in moduli}
             candidate_points.add(0)
             candidate_points.add(range_size - 1)
-            values = [int(term.subs(sym, point)) for point in candidate_points]
+            values = [int(term.xreplace({sym: point})) for point in candidate_points]
             per_core_max += max(values)
             per_core_min += min(values)
             continue
-        per_core_max += int(term.subs(sym, range_size - 1))
-        per_core_min += int(term.subs(sym, 0))
+        per_core_max += int(term.xreplace({sym: range_size - 1}))
+        per_core_min += int(term.xreplace({sym: 0}))
     return per_core_max - per_core_min + 1
 
 
@@ -1097,9 +1097,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (multi-axis
-    plain reductions are pinned to split=1), and the op reaches the backend
-    over the limit.
+    the span floors (``work_division.span_floors``) cannot split the reduced
+    axis either (multi-axis plain reductions are pinned to split=1), and the
+    op reaches the backend over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False
