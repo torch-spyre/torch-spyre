@@ -38,9 +38,16 @@ from torch._prims_common import (
     elementwise_dtypes,
 )
 
-from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .constants import (
+    DEVICE_NAME,
+    FP16_TOPK_MAX_DIM,
+    FP8_E4M3FN_MAX,
+    FP8_E4M3FN_MIN,
+    TOPK_MAX_K,
+)
 from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
+from .work_division_constraints import legal_topk_k_splits
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
     STICK,
@@ -1834,16 +1841,142 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 128:
-        raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
+    if input.dim() == 1:
+        # 1-D back-padding and peeled mask_by_index need an outer dim to carry
+        # the stick during restickification. View as (1, n) along dim 1 and
+        # squeeze the results back.
+        values, indices = spyre_topk(
+            input.unsqueeze(0), k, dim=1, largest=largest, sorted=sorted
+        )
+        return values.squeeze(0), indices.squeeze(0)
+    if dim is None:
+        dim = -1
+    dim = dim % input.dim()
+
+    # topk splits k across cores, and k > TOPK_MAX_K is peeled into chunks of
+    # TOPK_MAX_K, so only the last chunk (the remainder) can be unsplittable
+    # (e.g. a prime remainder above 32). Bump it to the next size that can.
+    full_chunks, remainder = divmod(k, TOPK_MAX_K)
+    padded_k = full_chunks * TOPK_MAX_K
+    if remainder:
+        legal_remainder = next(
+            (m for m in range(remainder, TOPK_MAX_K + 1) if legal_topk_k_splits(m)),
+            None,
+        )
+        if legal_remainder is None:
+            raise Unsupported(
+                f"topk with k={k}: no chunk size in [{remainder}, {TOPK_MAX_K}] "
+                f"splits across {config.sencores} cores"
+            )
+        padded_k += legal_remainder
+
+    pad = 0
+    n = input.size(dim)
+    if padded_k != k or padded_k > TOPK_MAX_K:
+        if not isinstance(n, int):
+            raise Unsupported(f"topk along a dim of symbolic size {n}")
+        # Back-pad with -inf when the dim is shorter than padded_k. Among
+        # equal keys topk emits the lowest index first, so a pad (which has a
+        # higher index than every real element) comes out after any real
+        # element it ties with: the pads are always the last results, even
+        # when the input holds infinities, and real indices are unchanged.
+        pad = max(padded_k - n, 0)
+        if pad == 1:
+            # A single pad element is written at a constant stick coordinate,
+            # which the backend rejects. Add a second one: topk returns only
+            # padded_k results, so the extra pad is never among them.
+            pad = 2
+        if pad:
+            input = torch.constant_pad_nd(
+                input, [0, 0] * (input.dim() - 1 - dim) + [0, pad], float("-inf")
+            )
+    # topkindex's indices come back in the input dtype, and Spyre's fp16 holds
+    # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16 search dim
+    # (counted after padding) would return wrong indices.
+    if input.dtype == torch.float16 and n + pad > FP16_TOPK_MAX_DIM:
+        raise Unsupported(
+            f"topk with k={k} along a dim of size {n} (padded to {n + pad}) on a "
+            f"float16 input: the search dim may be at most {FP16_TOPK_MAX_DIM} "
+            "because the indices are held in float16; use float32"
+        )
+
+    # Peel in chunks of at most TOPK_MAX_K elements. After each chunk its
+    # elements are masked to -inf so the next chunk takes the next largest ones.
     # sorted=False is a no-op: our reduction always returns sorted output.
     # Index stays in the input dtype (not int64) all the way out; topkindex's
     # fake reports it so Dynamo traces it with no meta conflict.
-    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
-        input, k, dim
-    )
+    vals_list = []
+    idxs_list = []
+    curr_input = input
+    remaining_k = padded_k
+
+    # TODO: (#6261) Reconfigure this peeling to use a for_each_tile instead of looping like this
+    while remaining_k > 0:
+        chunk_k = min(remaining_k, TOPK_MAX_K)
+        v = torch.ops.spyre.topkvalue(curr_input, chunk_k, dim)
+        i = torch.ops.spyre.topkindex(curr_input, chunk_k, dim)
+        vals_list.append(v)
+        idxs_list.append(i)
+        remaining_k -= chunk_k
+        if remaining_k > 0:
+            curr_input = torch.ops.spyre.mask_by_index(curr_input, i, dim)
+
+    if len(vals_list) == 1:
+        values, indices = vals_list[0], idxs_list[0]
+    else:
+        values = torch.cat(vals_list, dim=dim)
+        indices = torch.cat(idxs_list, dim=dim)
+    if padded_k != k:
+        values = values.narrow(dim, 0, k)
+        indices = indices.narrow(dim, 0, k)
+    return values, indices
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.default, torch.ops.aten.sort.stable]
+)
+def spyre_sort(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sort`` as a full-length topk (k = size of ``dim``).
+
+    topk only returns the largest elements, so an ascending sort runs it on
+    ``-input`` and negates the values back. Among equal keys topk emits the
+    lowest index first, which is the stable order, so sort is always stable
+    and ``stable`` needs no extra work.
+    """
+    if input.numel() == 0:
+        # Nothing to reorder, and topk rejects zero-size tensors.
+        return input.clone(), torch.empty_like(input, dtype=torch.int64)
+    if input.dim() == 0:
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    dim = dim % input.dim()
+    n = input.size(dim)
+    if n == 1:
+        # A single-element sort is the identity; skip the reduction entirely.
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    if not isinstance(n, int):
+        # k = n must be a concrete topk size.
+        raise Unsupported(f"sort along a dim of symbolic size {n}")
+    orig_dtype = input.dtype
+    if not orig_dtype.is_floating_point:
+        # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools, so
+        # sort integers as fp32 and cast the values back.
+        input = input.to(torch.float32)
+    key = input if descending else -input
+    # spyre_topk pads an unsplittable n and rejects an fp16 dim over 512.
+    values, indices = spyre_topk(key, n, dim=dim, largest=True, sorted=True)
+    if not descending:
+        values = -values
+    if not orig_dtype.is_floating_point:
+        values = values.to(orig_dtype)
+    return values, indices.to(torch.int64)
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
