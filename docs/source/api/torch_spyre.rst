@@ -528,6 +528,7 @@ manipulation of device tensor layouts. See
           device_size=[4, 2, 64],
           stride_map=[128, 64, 1],
           device_dtype=DataFormats.SEN169_FP16,
+          valid_elements={(0,): 4, (1, 2): 128},  # host [4, 128]
       )
 
    The ``dim_order`` parameter controls which logical dimension is

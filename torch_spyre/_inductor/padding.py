@@ -1279,6 +1279,7 @@ def _pad_num_sticks(
             [new_num_sticks, *stl.device_size],
             [0, *stl.stride_map],
             stl.device_dtype,
+            prepend_dim_valid_elements(stl, 1),
             stl.element_arrangement,
         ),
     )
