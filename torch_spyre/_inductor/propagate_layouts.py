@@ -83,11 +83,13 @@ from .ir import (
     SpyreEmptyFallback,
 )
 from .pass_utils import (
+    collapse_valid_elements,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
+    forward_valid_elements,
     get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
@@ -100,6 +102,8 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     op_read_writes,
+    sparse_stl_from_host,
+    sparse_target_for_unservable_read,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -190,10 +194,17 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
             changed = True
     if not changed:
         return stl
+    # Cap each group's count at the product of its new extents.  A collapsed
+    # broadcast dim has size 1, so any key containing it is capped to 1.
+    new_ve = {
+        key: min(val, math.prod(device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
         device_size,
         stride_map,
         stl.device_dtype,
+        new_ve,
         stl.element_arrangement,
     )
 
@@ -536,7 +547,11 @@ def rescale_stl_for_dtype(
         # A stick holding one element (a size-1 or sparse stick dim) needs no more
         # sticks at any number of elements per stick.
         return SpyreTensorLayout(
-            out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+            out_device_size,
+            out_stride_map,
+            get_device_dtype(out_dtype),
+            forward_valid_elements(stl),
+            ea,
         )
 
     stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
@@ -589,8 +604,13 @@ def rescale_stl_for_dtype(
 
     out_device_size[num_sticks_dim] = out_sticks
     out_stride_map[num_sticks_dim] = stride_map_entry
+    # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
+    out_valid = {
+        key: min(val, math.prod(out_device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
-        out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+        out_device_size, out_stride_map, get_device_dtype(out_dtype), out_valid, ea
     )
 
 
@@ -785,16 +805,25 @@ def _reduction_layout_from_stl(
     )
     stick_size = get_elem_in_stick(out_dtype_for_layout)
 
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
+        # TODO(#5966): as in _default_pointwise_layout, try a dense relocation of
+        # the stick before returning the sparse output, and derive the output
+        # candidates below from the relocated layout.
+        if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
+            # As for a pointwise op below.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early; compute_restickify_needed does not check
+            # that its sparse target is stick_compatible with the output.
+            return [sparse_stl_from_host(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
     reduction_var = next(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
-
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
 
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -905,6 +934,7 @@ def _default_pointwise_layout(
                 stl.device_size,
                 stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(stl),
                 stl.element_arrangement,
             )
         ]
@@ -913,6 +943,20 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
+        # TODO(#5966): before returning the sparse output, try a dense
+        # relocation of the stick (see compute_restickify_needed) and derive the
+        # output candidates below from the relocated layout, as for any other
+        # input layout. The sparse output stays as the fallback for a read with
+        # no dim to move the stick to.
+        if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
+            # A read the input's layout cannot serve (flattening [8, 65] into
+            # [520] splits a stick): compute_restickify_needed moves the input to
+            # its sparse layout, and the output is sparse on its own host dims.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early. A rule that also offers a dense output for
+            # this read would get a sparse target that cannot feed it, because
+            # compute_restickify_needed does not check stick_compatible.
+            return [sparse_stl_from_host(output, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]
     stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
@@ -1282,7 +1326,12 @@ def _collapse_outer_stick_dims(
         del new_size[d]
         del new_stride[d]
         del new_coords[d]
-    return SpyreTensorLayout(new_size, new_stride, stl.device_dtype), new_coords, keep
+    new_ve = collapse_valid_elements(stl, outer_dims, keep)
+    return (
+        SpyreTensorLayout(new_size, new_stride, stl.device_dtype, new_ve),
+        new_coords,
+        keep,
+    )
 
 
 def _rebuild_stl_for_matmul(
@@ -2135,6 +2184,7 @@ def _multi_arg_pointwise_layouts(
                 template_stl.device_size,
                 template_stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(template_stl),
                 output_ea,
             )
         )
@@ -2205,6 +2255,7 @@ def _multi_arg_pointwise_layouts(
             src_stl.device_size,
             src_stl.stride_map,
             out_device_dtype,
+            forward_valid_elements(src_stl),
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
