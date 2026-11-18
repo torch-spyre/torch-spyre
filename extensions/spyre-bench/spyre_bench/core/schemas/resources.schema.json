@@ -4565,7 +4565,7 @@
          },
          "class": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_]*$",
+          "pattern": "^(x-)?[a-z][a-z0-9_-]*$",
           "description": "metric class of the metric-context vocabulary; default: matched by name"
          },
          "context": {
@@ -4576,14 +4576,14 @@
             "type": "array",
             "items": {
              "type": "string",
-             "pattern": "^[a-z0-9_|]+$"
+             "pattern": "^[a-z0-9_|-]+$"
             }
            },
            "optional": {
             "type": "array",
             "items": {
              "type": "string",
-             "pattern": "^[a-z0-9_]+$"
+             "pattern": "^[a-z0-9_-]+$"
             }
            }
           },

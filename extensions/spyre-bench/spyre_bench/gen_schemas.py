@@ -999,11 +999,14 @@ SPECS = {
                         "compare": {"enum": ["relative", "absolute", "exact"]},
                         "noise": obj({"min_repeats": integer(minimum=1), "cv_max": num(minimum=0)}),
                         "class": s(
-                            pattern=r"^[a-z][a-z0-9_]*$",
+                            pattern=r"^(x-)?[a-z][a-z0-9_-]*$",
                             description="metric class of the metric-context vocabulary; default: matched by name",
                         ),
                         "context": obj(
-                            {"required": arr(s(pattern=r"^[a-z0-9_|]+$")), "optional": arr(s(pattern=r"^[a-z0-9_]+$"))},
+                            {
+                                "required": arr(s(pattern=r"^[a-z0-9_|-]+$")),
+                                "optional": arr(s(pattern=r"^[a-z0-9_-]+$")),
+                            },
                             desc="facets numbers of this metric must carry; `required` replaces the class default",
                         ),
                         "otel": s(),

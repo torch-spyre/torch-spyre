@@ -56,7 +56,7 @@ def rec(metric="llm.output_throughput", **over):
 
 
 def test_vocabulary_size_and_lint():
-    assert len(V.facets) >= 60
+    assert (len(V.facets), len(V.classes)) == (92, 16)
     assert V.lint() == []
     assert {f["group"] for f in V.facets.values()} == {
         "workload",
@@ -122,8 +122,9 @@ def test_empty_slots_are_rendered_for_every_missing_required_facet():
 def test_fully_empty_context_shows_all_slots():
     bare = {"metric": "llm.output_throughput", "value": "<value>", "unit": "token/s", "ctx": {}}
     line = nc.context_line(bare, V)
-    for lab in ("cache", "load", "in", "KV", "dtype", "TP", "arch", "build", "clean"):
-        assert f"{lab} {E}" in line or f"{lab} " in line
+    for chip in (f"cache {E}", f"load {E}", f"in {E}/out {E}", f"KV {E}", f"dtype {E}", f"TP {E}", f"arch {E}",
+                 f"build {E}", f"clean {E}"):  # fmt: skip
+        assert chip in line.split(" \u00b7 "), chip
     assert f"load {E}" in line and f"KV {E}" in line and f"build {E}" in line
 
 
@@ -293,20 +294,143 @@ def test_required_facets_override_replaces_class_default():
     assert "token_basis" in nc.required_facets({"name": "llm.output_throughput", "class": "throughput"}, V)
 
 
-def test_lint_warns_on_undeclared_author_facets_and_accepts_declared():
+def test_lint_default_is_one_summary_line_and_detail_lists_facets():
     cat = _cat("kernel-demo")
     assert not cat.errors, cat.errors
-    warns = nc.lint_catalog(cat)
-    assert warns and all("needs facet timer" in w or "matches no metric class" in w for w in warns)
+    quiet = nc.lint_catalog(cat)
+    assert len(quiet) == 1 and "undeclared context facets; run validate --lint-context" in quiet[0]
+    detail = nc.lint_catalog(cat, detail=True)
+    assert detail and all("needs facet timer" in w or "matches no metric class" in w for w in detail)
     for b in cat.of("Benchmark"):
         b.spec["context"] = {"timer": "wall"}
-    assert nc.lint_catalog(cat) == []
+    assert nc.lint_catalog(cat) == [] and nc.lint_catalog(cat, detail=True) == []
 
 
 def test_lint_flags_unknown_context_key_and_validate_stays_exit_zero(capsys):
     cat = _cat("kernel-demo")
-    next(iter(cat.of("Benchmark"))).spec["context"] = {"not_a_facet": 1}
-    assert any("not_a_facet" in w for w in nc.lint_catalog(cat))
-    rc = validate.main([str(EX / "kernel-demo"), "--central", str(EX / "central"), "--json"])
+    next(iter(cat.of("Benchmark"))).spec["context"] = {"not_a_facet": 1, "x-mine": 2}
+    quiet = nc.lint_catalog(cat)
+    assert any("context.not_a_facet" in w for w in quiet) and not any("x-mine" in w for w in quiet)
+    argv = [str(EX / "kernel-demo"), "--central", str(EX / "central"), "--json"]
+    rc = validate.main(argv)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and len(out[0]["warnings"]) == 1
+    rc = validate.main(argv + ["--lint-context"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0 and any("needs facet timer" in w for w in out[0]["warnings"])
+
+
+def test_shipped_non_llm_metrics_do_not_inherit_llm_requirements():
+    reg = _cat("llm-demo").reg
+    for name in ("spyre.compiled_graphs",):
+        assert nc.metric_class(reg.metrics[name], V)["id"] == "diagnostic"
+        assert nc.required_facets(reg.metrics[name], V) == []
+    assert (
+        nc.metric_class({"name": "comms.latency", "class": "collective"}, V)["required"]
+        == V.class_by_id("collective")["required"]
+    )
+    assert "token_basis" not in V.class_by_id("collective")["required"]
+
+
+# ---- pack declarations drive the renderer
+GOODPUT = {"name": "llm.goodput_at_slo", "class": "throughput"}
+
+
+def _bound(*specs):
+    return V.bind({s["name"]: s for s in specs})
+
+
+def test_declared_class_drives_missing_chips_and_compare():
+    bare = {"metric": "llm.goodput_at_slo", "value": 1, "statistic": "value"}
+    assert nc.missing(bare, V) == ["metric class"]
+    B = _bound(GOODPUT)
+    assert "token_basis" in nc.missing(bare, B) and "metric class" not in nc.missing(bare, B)
+    assert any(txt.startswith("tokens") for _, txt, _ in nc.chips(bare, B))
+    a, b = rec("llm.goodput_at_slo"), rec("llm.goodput_at_slo", ctx={"build": "000000000a02"})
+    assert nc.compare(a, b, V)["status"] == "different_metric"
+    assert nc.compare(a, b, B)["status"] == "comparable"
+    assert nc.completeness(bare, B)[1] == len(V.class_by_id("throughput")["required"])
+
+
+def test_declared_context_required_replaces_class_default_everywhere():
+    spec = {**GOODPUT, "context": {"required": ["model", "dtype"], "optional": ["tp"]}}
+    B = _bound(spec)
+    r = rec("llm.goodput_at_slo", ctx={"dtype": None})
+    assert nc.missing(r, B) == ["dtype"]
+    assert [t for _, t, s in nc.chips(r, B) if s == "empty"] == [f"dtype {E}"]
+    flat = {f for g in nc.expanded_view(r, B).values() for f, _, _ in g}
+    assert flat == {"model", "dtype", "tp"}
+    a, b = rec("llm.goodput_at_slo", ctx={"input_len": 1}), rec("llm.goodput_at_slo", ctx={"input_len": 2})
+    assert nc.compare(a, b, B)["status"] == "comparable"  # input_len is no longer required
+    assert nc.compare(a, b, V.bind({}))["status"] == "different_metric"
+
+
+def test_custom_x_class_and_facets_carry_no_requirements():
+    B = _bound({"name": "x.m", "class": "x-mine"}, {"name": "x.n", "context": {"required": ["x-foo", "model"]}})
+    r = {"metric": "x.m", "value": 1, "ctx": {}}
+    assert nc.missing(r, B) == []
+    assert nc.missing({"metric": "x.n", "value": 1, "ctx": {}}, B) == ["model"]
+    assert nc.pack_errors([{"name": "x.m", "class": "x-mine", "context": {"required": ["x-foo"]}}], V) == []
+    assert nc.pack_errors([{"name": "x.m", "class": "mine"}], V)
+
+
+# ---- placeholders and malformed values
+def test_placeholder_values_are_missing():
+    for junk in ("\u2014", "-", "n/a", "N/A", "  ", "Unknown", "null", "?", "none", "None", "\u2013"):
+        assert "model" in nc.missing(rec(ctx={"model": junk}), V), junk
+    assert nc.missing(rec(ctx={"clean": "none"}), V) == []  # none is a legal clean value
+    assert nc.missing(rec(ctx={"model": "a\u2014b"}), V) == []
+
+
+def test_em_dash_inside_a_legal_value_is_not_an_empty_chip():
+    cs = nc.chips(rec(ctx={"model": "a\u2014b"}), V)
+    assert ("model a\u2014b", "known") in [(t, s) for _, t, s in cs]
+    assert all(s == "known" for _, _, s in cs)
+
+
+def test_half_known_in_out_chip_is_empty_by_state_not_by_text():
+    cs = {tuple(ids): s for ids, _, s in nc.chips(rec(ctx={"output_len": None}), V)}
+    assert cs[("input_len", "output_len")] == "empty"
+    assert cs[("kv_span",)] == "empty"
+
+
+JUNK = ["abc", "128", "", None, "\u2014", -1, 1e30, float("nan"), [], {}, "1-", "-", "a-b", "9" * 400, True]
+
+
+def test_junk_values_never_raise():
+    for fid in V.facets:
+        for junk in JUNK:
+            for metric in ("llm.output_throughput", "kernel.time.mean", "llm.itl.median", "nope"):
+                r = rec(metric, ctx={fid: junk})
+                nc.missing(r, V)
+                nc.render(r, V)
+                nc.expanded_view(r, V)
+                nc.length_drift(r)
+                nc.compare(r, rec(metric), V)
+                nc.compare(rec(metric), r, V, vary="build")
+    for k, v in (("kv_span", "abc"), ("kv_span", "128"), ("input_len", "abc")):
+        assert nc.render(rec(ctx={k: v}), V).startswith("<value>")
+
+
+# ---- compare details
+def test_vary_string_is_one_facet_not_characters():
+    a, b = rec(ctx={"build": "000000000a02"}), rec(ctx={"build": "000000000a03"})
+    assert nc.compare(a, b, V, vary="build")["status"] == "comparable"
+    assert nc.compare(rec(ctx={"arch": "x86_64"}), rec(ctx={"arch": "s390x"}), V, vary="arch")["status"] == "comparable"
+
+
+def test_numeric_facets_compare_as_numbers():
+    assert nc.compare(rec(ctx={"tp": "1"}), rec(ctx={"tp": 1.0}), V)["status"] == "comparable"
+    assert nc.compare(rec(ctx={"concurrency": 8}), rec(ctx={"concurrency": "8.0"}), V)["status"] == "comparable"
+    assert nc.compare(rec(ctx={"tp": 1}), rec(ctx={"tp": 2}), V)["status"] == "differs"
+
+
+def test_compare_both_sides_incomplete_lists_union():
+    out = nc.compare(rec(ctx={"dtype": None}), rec(ctx={"output_len": None}), V)
+    assert out["status"] == "incomplete"
+    assert {"dtype", "output_len", "kv_span"} <= set(out["unknown"])
+
+
+def test_unknown_backend_lists_conditional_facet_and_backend_missing():
+    m = nc.missing(rec(ctx={"backend": None, "kv_ladder": None}), V)
+    assert "backend" in m and "kv_ladder" in m

@@ -112,3 +112,5 @@ classes:
   - {id: roofline_pct, match: ["*roofline*"], required: ["cache_state", "op_shape", "dtype", "backend", "arch", "device_type", "device_count", "build", "clean", "roofline_basis", "timer", "statistic"], optional: ["mem_placement", "trust"]}
   - {id: ratio, match: ["ratio", "*_ratio", "*speedup*"], required: ["ratio_basis", "backend", "arch", "device_type", "build", "statistic"], optional: ["trust"]}
   - {id: design_parameter, match: ["param.*"], required: ["model", "phase", "backend", "device_type", "value_kind", "source"], optional: ["moe_experts", "moe_top_k", "chunk_tokens", "tile_tokens", "loop_bound_max", "expert_concurrency", "device_count", "tp", "dtype", "trust"]}
+  - {id: diagnostic, match: [], required: [], optional: [backend, arch, device_type, build]}
+  - {id: collective, match: ["comms.*"], required: [backend, arch, device_type, device_count, build, clean, statistic], optional: [dtype, tp, sample_n, spread, trust]}

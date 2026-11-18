@@ -26,13 +26,15 @@ from pathlib import Path
 import yaml
 
 VOCAB_PATH = Path(__file__).resolve().parent / "core" / "metric-context.yaml"
-MISSING = (None, "", "unknown")
+# Placeholder spellings that mean "not recorded". "none" is also one unless it is a legal value of the facet.
+PLACEHOLDERS = {"", "unknown", "unset", "null", "n/a", "na", "?", "-", "\u2014", "\u2013", "none"}
 
 
 class Vocab:
     def __init__(self, facets, classes):
         self.facets = {f["id"]: f for f in facets}
         self.classes = classes
+        self.specs = {}
 
     @classmethod
     def load(cls, path=None):
@@ -48,6 +50,35 @@ class Vocab:
 
     def class_by_id(self, cid):
         return next((c for c in self.classes if c["id"] == cid), None)
+
+    def bind(self, metrics):
+        """A copy that resolves classes and required facets through registered pack metric specs."""
+        v = Vocab(list(self.facets.values()), self.classes)
+        v.specs = dict(metrics)
+        return v
+
+    def cls_for(self, metric):
+        """The class dict that governs a metric: its pack declaration when bound, else the name-glob match.
+
+        A pack `context.required` / `context.optional` replaces the class lists; `x-` classes and facets carry no
+        requirements.
+        """
+        spec = self.specs.get(metric)
+        if spec is None:
+            return self.classify(metric)
+        cid = spec.get("class")
+        if cid and cid.startswith("x-"):
+            base = {"id": cid, "match": [], "required": [], "optional": []}
+        else:
+            base = self.class_by_id(cid) if cid else self.classify(metric)
+        ctx = spec.get("context") or {}
+        if base is None and "required" not in ctx:
+            return None
+        base = base or {"id": "custom", "match": [], "required": [], "optional": []}
+        req = ctx.get("required", base["required"])
+        opt = ctx.get("optional", base.get("optional", []))
+        keep = lambda fs: [f for f in fs if not any(a.startswith("x-") for a in f.split("|"))]  # noqa: E731
+        return {**base, "required": keep(req), "optional": keep(opt)}
 
     def lint(self):
         """Vocabulary self-check: every class facet exists."""
@@ -66,9 +97,21 @@ def default_vocab():
 
 
 # ---------------------------------------------------------------- resolving values
+def _unrecorded(fid, v, vocab):
+    """True for None and placeholder spellings; "none" counts as a value where the facet lists it as legal."""
+    if v is None:
+        return True
+    if not isinstance(v, str):
+        return False
+    s = v.strip().lower()
+    if s == "none":
+        return "none" not in [str(x).lower() for x in (vocab.facets.get(fid) or {}).get("values", [])]
+    return s in PLACEHOLDERS
+
+
 def resolve(rec, vocab):
     """Facet values after derivation: (values, derived_ids). Unknown values are dropped."""
-    vals = {k: v for k, v in (rec.get("ctx") or {}).items() if v not in MISSING}
+    vals = {k: v for k, v in (rec.get("ctx") or {}).items() if not _unrecorded(k, v, vocab)}
     derived = set()
     st = rec.get("statistic")
     if st and "statistic" not in vals:
@@ -78,8 +121,12 @@ def resolve(rec, vocab):
         vals["sample_n"] = rec["n"]
         derived.add("sample_n")
     if "kv_span" not in vals and "input_len" in vals and "output_len" in vals:
-        vals["kv_span"] = f"{int(vals['input_len'])}-{int(vals['input_len']) + int(vals['output_len'])}"
-        derived.add("kv_span")
+        try:
+            lo = int(float(vals["input_len"]))
+            vals["kv_span"] = f"{lo}-{lo + int(float(vals['output_len']))}"
+            derived.add("kv_span")
+        except (TypeError, ValueError, OverflowError):
+            pass
     if "cache_state" not in vals and "compile_cache" in vals and "shape_warmup" in vals:
         cc, sw = vals["compile_cache"], vals["shape_warmup"]
         vals["cache_state"] = (
@@ -89,13 +136,29 @@ def resolve(rec, vocab):
     return vals, derived
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _same(fid, vocab, x, y):
+    """Equality of two known values: numeric facets compare as numbers, others case-insensitively as text."""
+    if (vocab.facets.get(fid) or {}).get("type") in ("int", "float"):
+        a, b = _num(x), _num(y)
+        if a is not None and b is not None:
+            return a == b
+    return str(x).lower() == str(y).lower()
+
+
 def _alts(req):
     return req.split("|")
 
 
 def _applies(fid, vocab, vals):
     """A facet with `when: key=value` applies unless that key is known and differs."""
-    cond = vocab.facets[fid].get("when")
+    cond = vocab.facets.get(fid, {}).get("when")
     if not cond:
         return True
     k, _, v = cond.partition("=")
@@ -104,7 +167,7 @@ def _applies(fid, vocab, vals):
 
 def missing(rec, vocab):
     """Required facets with no known value. A "a|b" requirement is met by either alternative."""
-    cls = vocab.classify(rec["metric"])
+    cls = vocab.cls_for(rec["metric"])
     if cls is None:
         return ["metric class"]
     vals, _ = resolve(rec, vocab)
@@ -116,7 +179,7 @@ def missing(rec, vocab):
 
 
 def completeness(rec, vocab):
-    cls = vocab.classify(rec["metric"])
+    cls = vocab.cls_for(rec["metric"])
     if cls is None:
         return 0, 0
     total = len(cls["required"])
@@ -129,7 +192,10 @@ def is_complete(rec, vocab):
 
 # ---------------------------------------------------------------- chips
 def _k(n, approx=False):
-    n = int(n)
+    try:
+        n = int(float(n))
+    except (TypeError, ValueError, OverflowError):
+        return str(n)
     if n >= 1024 and n % 1024 == 0:
         return f"{n // 1024}k"
     if approx and n >= 1024:
@@ -246,16 +312,18 @@ IN_HEAD = {"statistic", "sample_n"}
 
 def _chip_value(fid, v, derived):
     if fid == "kv_span":
-        lo, _, hi = str(v).partition("-")
+        lo, sep, hi = str(v).partition("-")
+        if not sep:
+            return str(v)
         return f"{_k(lo)}\u2192{_k(hi)}"
     if fid == "build":
         return _short_build(v)
     if fid == "clean":
-        return CLEAN_CHIP.get(v, v)
+        return CLEAN_CHIP.get(str(v), str(v))
     if fid == "cpu_pinning":
         return "on" if v != "none" else "off"
     if fid in ("ttft_def", "itl_def"):
-        return DEF_SHORT.get(v, v)
+        return DEF_SHORT.get(str(v), str(v))
     return str(v)
 
 
@@ -314,7 +382,7 @@ def chips(rec, vocab, expanded=False):
     Every REQUIRED facet gets a chip: known ones show the value, missing ones show `<label> \u2014`.
     Expanded adds the known optional facets and judgement badges.
     """
-    cls = vocab.classify(rec["metric"])
+    cls = vocab.cls_for(rec["metric"])
     vals, derived = resolve(rec, vocab)
     req = set()
     miss = set()
@@ -333,9 +401,10 @@ def chips(rec, vocab, expanded=False):
         if not (in_req or in_opt) or any(g in IN_HEAD for g in group):
             continue
         text = _text(group, vals, derived)
-        if text is not None and not (group == ("input_len", "output_len") and EMPTY in text and not in_req):
-            state = "empty" if EMPTY in text else "known"
-            out.append((list(group), text, state))
+        text = None if text is None else str(text)
+        half = group == ("input_len", "output_len") and not ("input_len" in vals and "output_len" in vals)
+        if text is not None and not (half and not in_req):
+            out.append((list(group), text, "empty" if half else "known"))
         elif in_req:
             out.append((list(group), _empty_text(group), "empty"))
     if expanded and "trust" in vals:
@@ -373,7 +442,7 @@ def render(rec, vocab):
 
 def expanded_view(rec, vocab):
     """Group -> list of (facet, value, flag) for the expanded panel; flag in {'', 'derived', 'required, not recorded'}."""
-    cls = vocab.classify(rec["metric"])
+    cls = vocab.cls_for(rec["metric"])
     vals, derived = resolve(rec, vocab)
     rows = {g: [] for g in ("workload", "state", "build", "environment", "method", "judgement")}
     req = set()
@@ -390,7 +459,9 @@ def expanded_view(rec, vocab):
         show.extend(present if present else [r])
     show += [o for o in (cls.get("optional", []) if cls else []) if o in vals]
     for fid in show:
-        f = vocab.facets[_alts(fid)[0]]
+        f = vocab.facets.get(_alts(fid)[0])
+        if f is None:
+            continue
         if fid in vals:
             rows[f["group"]].append((fid, vals[fid], "derived" if fid in derived else ""))
         else:
@@ -403,7 +474,8 @@ def length_drift(rec, tol=0.1):
     vals, _ = resolve(rec, default_vocab())
     out = []
     for req, act in (("input_len", "actual_input_len"), ("output_len", "actual_output_len")):
-        if req in vals and act in vals and abs(float(vals[act]) - float(vals[req])) > tol * float(vals[req]):
+        a, b = _num(vals.get(act)), _num(vals.get(req))
+        if a is not None and b is not None and abs(a - b) > tol * b:
             out.append((act, vals[req], vals[act]))
     return out
 
@@ -425,7 +497,7 @@ def compare(a, b, vocab, vary=("build",)):
             'incomplete' (a side lacks required context), 'different_metric'.
     `vary` names the facets the comparison is ABOUT (default: the build); they may differ.
     """
-    ca, cb = vocab.classify(a["metric"]), vocab.classify(b["metric"])
+    ca, cb = vocab.cls_for(a["metric"]), vocab.cls_for(b["metric"])
     if ca is None or cb is None or ca["id"] != cb["id"] or a["metric"] != b["metric"]:
         return {"status": "different_metric", "differs": [], "unknown": [], "line": "different metric"}
     ma, mb = missing(a, vocab), missing(b, vocab)
@@ -439,14 +511,14 @@ def compare(a, b, vocab, vary=("build",)):
         }
     va, _ = resolve(a, vocab)
     vb, _ = resolve(b, vocab)
-    vary = set(vary)
+    vary = {vary} if isinstance(vary, str) else set(vary)
     differs = []
     for r in ca["required"]:
         for alt in _alts(r):
-            if alt in vary or vocab.facets[alt].get("compare") == "note" or not _applies(alt, vocab, va):
+            if alt in vary or vocab.facets.get(alt, {}).get("compare") == "note" or not _applies(alt, vocab, va):
                 continue
             x, y = va.get(alt), vb.get(alt)
-            if (x is None) != (y is None) or (x is not None and str(x).lower() != str(y).lower()):
+            if (x is None) != (y is None) or (x is not None and not _same(alt, vocab, x, y)):
                 differs.append((alt, x, y))
     also = []
     for fid in dict.fromkeys(
@@ -455,7 +527,7 @@ def compare(a, b, vocab, vary=("build",)):
         if fid in vary:
             continue
         x, y = va.get(fid), vb.get(fid)
-        if x is not None and y is not None and str(x).lower() != str(y).lower():
+        if x is not None and y is not None and not _same(fid, vocab, x, y):
             also.append((fid, x, y))
     if differs:
         txt = ", ".join(f"{_name(f)} {_fmt(f, x)} vs {_fmt(f, y)}" for f, x, y in differs)
@@ -493,46 +565,48 @@ def scan_rows(rows, vocab):
 
 # ---------------------------------------------------------------- pack declarations and the validate lint
 def metric_class(spec, vocab):
-    """The class of a registered pack metric: its declared `class`, else the name-glob match."""
-    cid = spec.get("class")
-    return vocab.class_by_id(cid) if cid else vocab.classify(spec["name"])
+    """The class that governs a pack metric spec (declared `class`/`context` first, else the name glob)."""
+    return vocab.bind({spec["name"]: spec}).cls_for(spec["name"])
 
 
 def required_facets(spec, vocab):
     """Facet requirements of a pack metric: its own `context.required`, else the class default."""
-    own = (spec.get("context") or {}).get("required")
-    if own is not None:
-        return list(own)
     cls = metric_class(spec, vocab)
     return list(cls["required"]) if cls else []
 
 
+def _custom(name):
+    return str(name).startswith("x-")
+
+
 def pack_errors(metrics, vocab):
-    """Errors for pack metric declarations: unknown class, unknown facet ids."""
+    """Errors for pack metric declarations. Classes and facets are closed except the `x-` namespace."""
     errs = []
     for m in metrics:
-        if m.get("class") and vocab.class_by_id(m["class"]) is None:
-            errs.append(f"metric {m['name']}: class {m['class']!r} is not a metric class")
+        cid = m.get("class")
+        if cid and not _custom(cid) and vocab.class_by_id(cid) is None:
+            errs.append(f"metric {m['name']}: class {cid!r} is not a metric class")
         ctx = m.get("context") or {}
         for fid in ctx.get("required", []) + ctx.get("optional", []):
             for alt in fid.split("|"):
-                if alt not in vocab.facets:
+                if not _custom(alt) and alt not in vocab.facets:
                     errs.append(f"metric {m['name']}: context facet {alt!r} is not in the vocabulary")
     return errs
 
 
-def lint_catalog(cat, vocab=None):
-    """Warnings for Benchmarks whose metrics need author-declared facets the Benchmark does not state.
+def lint_catalog(cat, vocab=None, detail=False):
+    """Warnings about metric context in a catalog. Never an error.
 
-    Only facets with `auto: declared` can be missing here; engine, probe, derive and ingest facets are captured.
-    A Benchmark states them in its `context:` block. Warn only: an incomplete number is still shown and stored.
+    Always reported: a Benchmark `context:` key that is not a facet. Author-only facets a Benchmark does not state, and
+    metrics without a class, are one summary line unless `detail`. Engine, probe, derive and ingest facets are captured
+    and not checked.
     """
-    vocab = vocab or default_vocab()
+    vocab = (vocab or default_vocab()).bind(cat.reg.metrics)
     benches = {b.name: b for b in cat.of("Benchmark")}
-    warns, seen = [], set()
+    warns, notes, seen, undeclared = [], [], set(), set()
     for b in benches.values():
         for k in b.spec.get("context") or {}:
-            if k not in vocab.facets:
+            if k not in vocab.facets and not _custom(k):
                 warns.append(f"Benchmark/{b.name}: context.{k} is not a facet in the metric-context vocabulary")
     for c in cat.cases:
         b = benches.get(c["benchmark"])
@@ -540,22 +614,27 @@ def lint_catalog(cat, vocab=None):
             continue
         stated = set(b.spec.get("context") or {})
         for name in cat.case_metrics(c)[0]:
-            if (b.name, name) in seen:
+            if (b.name, name) in seen or name not in cat.reg.metrics:
                 continue
             seen.add((b.name, name))
-            spec = cat.reg.metrics.get(name)
-            if spec is None:
-                continue
-            cls = metric_class(spec, vocab)
+            cls = vocab.cls_for(name)
             if cls is None:
-                warns.append(f"Benchmark/{b.name}: metric {name} matches no metric class")
+                undeclared.add(b.name)
+                notes.append(f"Benchmark/{b.name}: metric {name} matches no metric class")
                 continue
-            for req in required_facets(spec, vocab):
+            for req in cls["required"]:
                 alts = req.split("|")
                 if any(a in stated or vocab.facets[a].get("auto") != "declared" for a in alts if a in vocab.facets):
                     continue
-                warns.append(
+                undeclared.add(b.name)
+                notes.append(
                     f"Benchmark/{b.name}: metric {name} (class {cls['id']}) needs facet {req}; "
                     f"declare it under the Benchmark's context: block"
                 )
+    if detail:
+        return warns + notes
+    if undeclared:
+        warns.append(
+            f"{len(undeclared)} benchmarks have undeclared context facets; run validate --lint-context for details"
+        )
     return warns
