@@ -494,7 +494,15 @@ stay the same, otherwise `resize_` raises.
   integers, `min <= max`, and `max` is a multiple of `granularity`.
 - `min` must be at least `min_reserved_dim_size` (default 8), and
   `max / granularity` (the number of buckets) must not exceed `max_buckets`
-  (default 32). Both live in `torch_spyre/_inductor/config.py`.
+  (default 256, enough for a 32K context at 128 tokens per page with
+  granularity 1). Both live in `torch_spyre/_inductor/config.py` and are
+  process-wide: a consumer may set them through the `MIN_RESERVED_DIM_SIZE`
+  and `MAX_BUCKETS` environment variables, or on that module before its
+  first declaration. The floor protects a consumer whose compiled code
+  branches on a small row count, so lower it only for tensors that take no
+  such branch, page tables for example. The cap is the number of candidate
+  iterations of a loop over the declared dimension, one correction slot
+  each, and has no measured cost at the step up to 256.
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
