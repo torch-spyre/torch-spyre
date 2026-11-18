@@ -25,16 +25,24 @@ or the module-level caches below.
 """
 
 import os
+import threading
+from collections import OrderedDict
 from typing import Optional, Sequence
 
 import torch
 
 __all__ = ["fft", "ifft", "fft2", "ifft2", "fftn", "ifftn"]
 
-# Compiled real matmul (u @ W), one per device.
+# Compiled real matmul (u @ W), one per device; built once under a lock.
 _COMPILED: dict = {}
-# Interleaved DFT matrix on device, keyed by (device, length, inverse).
-_W_CACHE: dict = {}
+_COMPILED_LOCK = threading.Lock()
+
+# Interleaved DFT matrix on device, keyed by (device, length, inverse). An LRU
+# bounded by total bytes (TORCH_SPYRE_FFT_W_CACHE_BYTES); each entry is
+# 8*n**2 bytes. Build + insert run under the lock so two callers never build
+# the same multi-gigabyte matrix at once.
+_W_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+_W_CACHE_LOCK = threading.Lock()
 
 
 def _to_interleaved(x: torch.Tensor) -> torch.Tensor:
@@ -47,33 +55,98 @@ def _from_interleaved(v: torch.Tensor, n: int) -> torch.Tensor:
     return torch.view_as_complex(v.reshape(*v.shape[:-1], n, 2).contiguous())
 
 
-def _dft_matrix(n: int, inverse: bool) -> torch.Tensor:
-    """``(2n, 2n)`` real interleaved DFT matrix.
+# Rows of the (2n, 2n) matrix assembled per block (one complex DFT row = two
+# interleaved real rows), to keep the host working set at O(block*n).
+_DFT_MATRIX_ROW_BLOCK = 256
+
+
+def _build_device_dft_matrix(
+    n: int, inverse: bool, device: str, block: int = _DFT_MATRIX_ROW_BLOCK
+) -> torch.Tensor:
+    """``(2n, 2n)`` fp16 interleaved DFT matrix, assembled directly on ``device``.
 
     Complex ``W[j, k] = exp(-2pi i jk/n)`` (``conj/n`` for the inverse) expanded
     into real ``[[Re, Im], [-Im, Re]]`` blocks so a complex DFT runs as one real
     matmul on interleaved ``[re0, im0, ...]`` data.
+
+    Built a row block at a time from length-n ``cos``/``sin`` tables indexed by
+    the exact integer phase ``(j*k) % n``, so no ``(n, n)`` float64 outer
+    product (or float32 full matrix) is ever materialized -- host peak is
+    ``O(block*n)`` rather than ``O(n**2)``. Values match the dense construction
+    to fp16. The exact integer index also avoids the float rounding a large
+    ``j*k`` would suffer once it exceeds the mantissa.
     """
-    k = torch.arange(n, dtype=torch.float64)
-    theta = 2.0 * torch.pi * torch.outer(k, k) / n
-    ang = theta if inverse else -theta
-    re, im = torch.cos(ang), torch.sin(ang)
-    if inverse:
-        re, im = re / n, im / n
-    m = torch.empty(2 * n, 2 * n, dtype=torch.float32)
-    m[0::2, 0::2], m[0::2, 1::2] = re, im
-    m[1::2, 0::2], m[1::2, 1::2] = -im, re
-    return m
+    phase = (2.0 * torch.pi / n) * torch.arange(n, dtype=torch.float64)
+    cos_t, sin_t = torch.cos(phase), torch.sin(phase)
+    scale = 1.0 / n if inverse else 1.0
+    im_sign = 1.0 if inverse else -1.0  # exp(+) inverse, exp(-) forward
+    k = torch.arange(n, dtype=torch.int64)
+    out = torch.empty(2 * n, 2 * n, dtype=torch.float16, device=device)
+    for j0 in range(0, n, block):
+        j = torch.arange(j0, min(j0 + block, n), dtype=torch.int64).unsqueeze(1)
+        idx = (j * k) % n  # (rows, n) exact integer phase index
+        re = (cos_t[idx] * scale).to(torch.float16)
+        im = (im_sign * sin_t[idx] * scale).to(torch.float16)
+        rows = re.shape[0]
+        blk = torch.empty(2 * rows, 2 * n, dtype=torch.float16)
+        blk[0::2, 0::2], blk[0::2, 1::2] = re, im
+        blk[1::2, 0::2], blk[1::2, 1::2] = -im, re
+        out[2 * j0 : 2 * j0 + 2 * rows] = blk.to(device)
+    return out
+
+
+def _entry_bytes(key: tuple) -> int:
+    """HBM bytes held by a cached ``(device, n, inverse)`` matrix: ``8*n**2``."""
+    _, n, _ = key
+    return 8 * n * n  # (2n, 2n) fp16
+
+
+def _w_cache_budget_bytes() -> int:
+    """LRU byte budget; default holds forward+inverse at the direct ceiling."""
+    default = 2 * 8 * _DIRECT_MATMUL_MAX_DEFAULT**2
+    raw = os.environ.get("TORCH_SPYRE_FFT_W_CACHE_BYTES")
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _evict_w_cache_locked(keep: tuple) -> None:
+    """Evict least-recently-used entries until within budget (caller holds lock).
+
+    ``keep`` (the just-built entry) is never evicted, so a single matrix larger
+    than the whole budget is still returned -- just not retained across calls.
+    """
+    budget = _w_cache_budget_bytes()
+    total = sum(_entry_bytes(k) for k in _W_CACHE)
+    for k in list(_W_CACHE):  # OrderedDict iterates least-recently-used first
+        if total <= budget:
+            break
+        if k == keep:
+            continue
+        del _W_CACHE[k]
+        total -= _entry_bytes(k)
 
 
 def _device_dft_matrix(n: int, inverse: bool, device: str) -> torch.Tensor:
-    """fp16 DFT matrix on ``device``, built once per (device, n, inverse)."""
+    """fp16 DFT matrix on ``device``, built once per (device, n, inverse).
+
+    Returned from a byte-bounded LRU cache; build and insert run under a lock so
+    concurrent callers do not build the same matrix twice.
+    """
     key = (device, n, inverse)
-    w = _W_CACHE.get(key)
-    if w is None:
-        w = _dft_matrix(n, inverse).to(torch.float16).to(device)
+    with _W_CACHE_LOCK:
+        w = _W_CACHE.get(key)
+        if w is not None:
+            _W_CACHE.move_to_end(key)
+            return w
+        w = _build_device_dft_matrix(n, inverse, device)
         _W_CACHE[key] = w
-    return w
+        _evict_w_cache_locked(keep=key)
+        return w
 
 
 # Largest single-transform length run as one direct (2n, 2n) matmul. The
@@ -103,8 +176,11 @@ def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     u = _to_interleaved(x).to(torch.float16).to(device)  # pack + cast on host
     comp = _COMPILED.get(device)
     if comp is None:
-        comp = torch.compile(lambda a, b: a @ b, dynamic=False)
-        _COMPILED[device] = comp
+        with _COMPILED_LOCK:
+            comp = _COMPILED.get(device)
+            if comp is None:
+                comp = torch.compile(lambda a, b: a @ b, dynamic=False)
+                _COMPILED[device] = comp
     w = _device_dft_matrix(n, inverse, device)
     # fp16 -> fp32 on the host: a bitwidth cast on device reorders within the
     # stick and would corrupt element order.
