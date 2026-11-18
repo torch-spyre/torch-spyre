@@ -3359,15 +3359,25 @@ def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
-    def test_splice_while_loops_is_first_pass(self):
+    def test_splice_while_loops_runs_right_after_the_reserved_dims_contract(self):
         from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+        from torch_spyre._inductor.reserved_dims_contract import (
+            apply_reserved_dims_contract,
+        )
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
 
         pipeline = CustomPreSchedulingPasses()
 
-        self.assertIs(pipeline.passes[0], splice_while_loops)
+        # apply_reserved_dims_contract must run before splice_while_loops (and
+        # everything else): it writes each declared dim's (min, max) into the
+        # ShapeEnv, which splice_while_loops reads when it stamps a loop's
+        # trip count / max extent. Reversing the order would make
+        # splice_while_loops see Dynamo's loose default range instead of the
+        # declared one.
+        self.assertIs(pipeline.passes[0], apply_reserved_dims_contract)
+        self.assertIs(pipeline.passes[1], splice_while_loops)
 
 
 def test_tile_dim_marker_lowering_produces_distinct_operation():
