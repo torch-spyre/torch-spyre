@@ -1020,6 +1020,28 @@ def test_pad_of_staggered_inside_stick_pair_raises():
         torch.compile(fn)(a.to(DEVICE_NAME))
 
 
+@expects_raise
+def test_where_on_staggered_compare_with_standard_operands_raises():
+    """A STANDARD where reading a staggered compare in full cannot keep its order.
+
+    The mask may only be read through a broadcast stick, where the stagger is
+    unobservable. No layout reads it so here, so the program does not compile.
+    """
+    # TODO: positive once the mask's order is restored in front of the where
+    # (#6429).
+    x = _small_int_fp16((8, 256), 7)
+    x[:, 5] = 1000
+    ramp = torch.arange(256, dtype=torch.float32)
+
+    def fn(x, ramp):
+        up = x.float()
+        return torch.where(up == up.amax(dim=-1, keepdim=True), ramp, ramp + 256)
+
+    torch._dynamo.reset()
+    with pytest.raises(InductorError, match="no mechanism to resolve stick"):
+        torch.compile(fn, dynamic=False)(x.to(DEVICE_NAME), ramp.to(DEVICE_NAME))
+
+
 @pytest.mark.parametrize("tokens", [1, 64])
 @pytest.mark.parametrize(
     "fp16",

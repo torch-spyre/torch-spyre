@@ -70,6 +70,17 @@ class EdgeCostMap:
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
+        # Layout propagation may narrow a consumer's copy of the producer's
+        # candidates to those its output layout is valid for (the mixed element
+        # arrangement rule keeps only broadcast reads, for example). Such an edge
+        # accepts no other producer layout: the stick compatibility costed below
+        # cannot tell the candidates apart.
+        producer_layouts = getattr(V.graph.get_buffer(dep.name), "layouts", None)
+        self._narrowed = (
+            frozenset(in_layouts)
+            if producer_layouts is not None and set(in_layouts) < set(producer_layouts)
+            else None
+        )
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -99,6 +110,11 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
+        if self._narrowed is not None and in_stl not in self._narrowed:
+            # The consumer's layout was chosen for its narrowed candidates only.
+            self._cost[in_stl][target_stl] = INF
+            self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
+            return
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
