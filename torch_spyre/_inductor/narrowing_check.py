@@ -116,6 +116,9 @@ def check_declared_ranges(declared):
     mode = _mode()
     if mode == "off":
         return
+    # The guards come from the TracingContext of this compile. It is per thread, so
+    # this relies on the backend compile running on Dynamo's thread; if that ever
+    # changed, the check would find no guards.
     ctx = TracingContext.try_get()
     shape_env = getattr(getattr(ctx, "fake_mode", None), "shape_env", None)
     if shape_env is None:

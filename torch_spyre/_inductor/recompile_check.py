@@ -68,8 +68,10 @@ CALLBACK_FROM_STANCE_PARAMS = ("callback",)
 _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
 _SPYRE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
 
-# {"name (file:line)": {"compiles": int, "seconds": float}}
+# {"name (file:line)": {"compiles": int, "seconds": float}}, oldest first.
 _ledger: dict[str, dict[str, float]] = {}
+# The ledger keeps at most this many functions; the oldest row is dropped.
+LEDGER_MAX_ROWS = 1024
 
 # Unknown mode values already warned about, so each is logged once.
 _warned_modes: set[str] = set()
@@ -145,10 +147,13 @@ def _broken_promise(frame):
 
 def _reasons(entries, frame, callback):
     """The guards that failed, as PyTorch words them; [] if unavailable."""
-    from torch._dynamo.eval_frame import innermost_fn
-    from torch._dynamo.guards import get_and_maybe_log_recompilation_reasons
+    try:
+        from torch._dynamo.eval_frame import innermost_backend
+        from torch._dynamo.guards import get_and_maybe_log_recompilation_reasons
 
-    backend = innermost_fn(callback)
+        backend = innermost_backend(callback)
+    except Exception:  # noqa: BLE001  a private name moved: never fatal
+        return []
     for arg in (entries, entries[0]):  # a list on torch 2.13, one entry before
         try:
             return get_and_maybe_log_recompilation_reasons(
@@ -205,7 +210,11 @@ def _wrap(callback):
         try:
             return callback(frame, *args, **kwargs)
         finally:
-            row = _ledger.setdefault(name, {"compiles": 0, "seconds": 0.0})
+            row = _ledger.get(name)
+            if row is None:
+                if len(_ledger) >= LEDGER_MAX_ROWS:
+                    del _ledger[next(iter(_ledger))]
+                row = _ledger[name] = {"compiles": 0, "seconds": 0.0}
             row["compiles"] += 1
             row["seconds"] += time.perf_counter() - start
 

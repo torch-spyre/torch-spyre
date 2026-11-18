@@ -144,6 +144,27 @@ class TestRecompileCheckCPU(_Base):
         self.assertEqual(rows[0]["compiles"], 2)
         self.assertGreater(rows[0]["seconds"], 0.0)
 
+    def test_ledger_keeps_at_most_the_cap(self):
+        @torch.compile(backend="eager")
+        def first(x):
+            return x + 1
+
+        @torch.compile(backend="eager")
+        def second(x):
+            return x + 2
+
+        @torch.compile(backend="eager")
+        def third(x):
+            return x + 3
+
+        with mock.patch.object(recompile_check, "LEDGER_MAX_ROWS", 2):
+            for fn in (first, second, third):
+                fn(torch.randn(128, COLS))
+        names = list(compile_ledger())
+        self.assertEqual(len(names), 2)
+        self.assertFalse(any(n.startswith("first ") for n in names))
+        self.assertTrue(any(n.startswith("third ") for n in names))
+
     def test_unknown_mode_falls_back_to_warn(self):
         # A bad value must not fail a compile: it is logged, and warn is used.
         with (
@@ -239,6 +260,34 @@ class TestTheDynamoHooks(unittest.TestCase):
             "_debug_get_cache_entry_list is gone, so the recompile check is "
             "no longer installed; update recompile_check.py",
         )
+        from torch._dynamo import guards
+
+        for module, name in (
+            (ef, "innermost_backend"),
+            (guards, "get_and_maybe_log_recompilation_reasons"),
+        ):
+            self.assertTrue(
+                hasattr(module, name),
+                f"{name} is gone, so recompile warnings say 'Reason: unknown'; "
+                "update recompile_check._reasons",
+            )
+
+    def test_the_wrapper_leads_to_the_same_compiler(self):
+        from torch._dynamo.eval_frame import innermost_backend
+
+        def compiler(gm, example_inputs):
+            return gm
+
+        def callback(frame, *args, **kwargs):
+            return None
+
+        callback._torchdynamo_orig_backend = compiler
+        self.assertIs(innermost_backend(recompile_check._wrap(callback)), compiler)
+
+        def bare(frame, *args, **kwargs):
+            return None
+
+        self.assertIs(innermost_backend(recompile_check._wrap(bare)), bare)
 
     def _assert_left_alone(self, callback_from_stance, cache_entry_reader):
         """Install over the given names; Dynamo must be left as it was."""
