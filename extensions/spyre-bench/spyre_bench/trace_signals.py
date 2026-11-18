@@ -23,8 +23,9 @@ tuple) is accepted; str, bytes and mappings are not arrays.
 
 Result per role: NOT_CAPTURED (no string name declared, the name is not stored, or the stored value is not an array),
 or a Signal; an array-like that cannot be read (0-d, indexing that raises) is NOT_CAPTURED. An empty array is captured but empty (`Signal((), ())`). An entry is missing, and its position is listed
-in `missing_at`, when it is None or NaN or, for a nested array, when any leaf inside it is; a partial array is never
-passed off as complete.
+in `missing_at`, when it is None or NaN or, for a nested array, when it is empty, holds any missing leaf, contains
+itself, nests deeper than MAX_DEPTH, holds more than MAX_NODES items, or cannot be read; a partial array is never
+passed off as complete. Ordinary exceptions from duck-typed values are swallowed; BaseExceptions propagate.
 """
 
 import math
@@ -42,7 +43,8 @@ class _NotCaptured:
 
 
 NOT_CAPTURED = _NotCaptured()
-_MAX_DEPTH = 8
+MAX_DEPTH = 8  # deepest nesting inside one entry that is read
+MAX_NODES = 10_000  # nested items visited per entry
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,10 @@ class Signal:
 
 
 def _is_array(v):
-    return hasattr(v, "__len__") and hasattr(v, "__getitem__") and not isinstance(v, (str, bytes, dict))
+    try:
+        return hasattr(v, "__len__") and hasattr(v, "__getitem__") and not isinstance(v, (str, bytes, dict))
+    except Exception:  # noqa: BLE001 - hostile attribute access
+        return False
 
 
 def _items(arr):
@@ -74,15 +79,30 @@ def _leaf_absent(v):
         return False
     try:
         return math.isnan(float(v))  # also numpy scalars
-    except (TypeError, ValueError, OverflowError):
+    except Exception:  # noqa: BLE001
         return False
 
 
-def _absent(v, depth=0):
-    if _is_array(v):
-        items = _items(v)
-        return items is None or (depth < _MAX_DEPTH and any(_absent(x, depth + 1) for x in items))
-    return _leaf_absent(v)
+def _nested_absent(v, budget, path, depth):
+    """True when a nested array is empty, unreadable, cyclic, too deep or large, or holds a missing leaf."""
+    items = _items(v)
+    if not items or depth > MAX_DEPTH or id(v) in path:
+        return True
+    path.add(id(v))
+    try:
+        for x in items:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return True
+            if _nested_absent(x, budget, path, depth + 1) if _is_array(x) else _leaf_absent(x):
+                return True
+        return False
+    finally:
+        path.discard(id(v))
+
+
+def _absent(v):
+    return _nested_absent(v, [MAX_NODES], set(), 1) if _is_array(v) else _leaf_absent(v)
 
 
 def declared_roles(reg, family):
@@ -96,20 +116,23 @@ def _stored(measurements, name):
         return None
     try:
         return measurements[name]
-    except (KeyError, TypeError, IndexError):
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _prop(props, key):
+    try:
+        return props.get(key)
+    except Exception:  # noqa: BLE001
         return None
 
 
 def resolve_roles(reg, family, run_props, measurements):
     """{role: Signal or NOT_CAPTURED} for every registered role of the family. None props/measurements read as empty."""
-    props = run_props if hasattr(run_props, "get") else {}
     out = {}
     for role in declared_roles(reg, family):
-        arr = _stored(measurements, props.get(f"role.{family}.{role}"))
-        if not _is_array(arr):
-            out[role] = NOT_CAPTURED
-            continue
-        vals = _items(arr)
+        arr = _stored(measurements, _prop(run_props, f"role.{family}.{role}"))
+        vals = _items(arr) if _is_array(arr) else None
         if vals is None:
             out[role] = NOT_CAPTURED
             continue

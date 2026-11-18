@@ -86,8 +86,13 @@ def test_role_moe_attributes_registered_and_absent_signal_is_not_captured():
     assert set(got) == MOE_ROLES
 
 
+_REG = []
+
+
 def _roles(props, meas):
-    return trace_signals.resolve_roles(_cat().reg, "moe", props, meas)
+    if not _REG:
+        _REG.append(_cat().reg)
+    return trace_signals.resolve_roles(_REG[0], "moe", props, meas)
 
 
 def test_not_captured_is_a_distinct_falsy_sentinel():
@@ -198,3 +203,92 @@ def test_variants_state_their_own_flags():
         "expert_concurrency": 1,
     }
     assert flags["moe_loop_int32_index"] == {"experts": 128, "top_k": 8, "phase": "decode"}
+
+
+def _fast(fn, limit=1.0):
+    import time
+
+    t0 = time.monotonic()
+    out = fn()
+    assert time.monotonic() - t0 < limit
+    return out
+
+
+def _one(entry, role="e_sel"):
+    return _roles({f"role.moe.{role}": "s"}, {"s": [entry]})[role]
+
+
+def test_pathological_nested_entries_finish_fast_and_read_as_missing():
+    import yaml
+
+    cyc = [1, 2, 3, 4, 5, 6, 7]
+    cyc.append(cyc)
+    anchored = yaml.safe_load("a: &a [1, 2, *a]")["a"]
+    wide_deep = [[[[[[[[list(range(30))] * 30] * 30]] * 30] * 30]] * 30] * 30
+    for junk in (cyc, anchored, wide_deep):
+        got = _fast(lambda: _one(junk))
+        assert got.missing_at == (0,)
+    selfref = [None]
+    selfref[0] = selfref
+    assert _fast(lambda: _roles({"role.moe.e_sel": "s"}, {"s": selfref})["e_sel"]).missing_at == (0,)
+
+
+def test_depth_cap_node_budget_and_empty_nested_are_pinned():
+    def nest(levels, leaf=5):
+        v = leaf
+        for _ in range(levels):
+            v = [v]
+        return v
+
+    assert trace_signals.MAX_DEPTH == 8 and trace_signals.MAX_NODES == 10_000
+    assert _one(nest(8)).complete and _one(nest(9)).missing_at == (0,)
+    assert _one([5] * 10_000).complete and _one([5] * 10_001).missing_at == (0,)
+    assert _one([]).missing_at == (0,)  # an empty nested array is a missing entry
+    assert _one([[]]).missing_at == (0,)
+    assert _roles({"role.moe.e_sel": "s"}, {"s": []})["e_sel"].complete  # an empty top-level array is captured
+
+
+def test_hostile_values_never_escape_trace_signals():
+    class Hostile:
+        def __init__(self, exc, where):
+            self.exc, self.where = exc, where
+
+        def _go(self, name):
+            if name == self.where:
+                raise self.exc("boom")
+
+        def __float__(self):
+            self._go("float")
+            return 1.0
+
+        def __len__(self):
+            self._go("len")
+            return 1
+
+        def __getitem__(self, i):
+            self._go("getitem")
+            return 1
+
+        def __iter__(self):
+            self._go("iter")
+            return iter([1])
+
+        def __bool__(self):
+            self._go("bool")
+            return True
+
+    class Mapping:
+        def __getitem__(self, k):
+            raise RuntimeError("boom")
+
+    for exc in (RuntimeError, RecursionError, MemoryError, KeyError):
+        for where in ("float", "len", "getitem", "iter", "bool"):
+            h = Hostile(exc, where)
+            _roles({"role.moe.e_sel": "s"}, {"s": h})
+            _roles({"role.moe.e_sel": "s"}, {"s": [h]})
+            _roles({"role.moe.e_sel": h}, {"s": [1]})
+        _roles({"role.moe.e_sel": "s"}, Mapping())
+        _roles(Hostile(exc, "getitem"), {"s": [1]})
+    for exc in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(exc):
+            _roles({"role.moe.e_sel": "s"}, {"s": [Hostile(exc, "getitem")]})
