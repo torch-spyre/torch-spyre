@@ -15,9 +15,14 @@ numbers are compared only when their context agrees.
   must carry. `a|b` means either facet satisfies the requirement. A `when: key=value` facet applies unless that key is
   known and differs. A `compare: note` facet must be recorded but never blocks a comparison.
 - **Required means known**, not a particular value: a shared node (`clean=none`) is complete. Absent values and
-  placeholders (empty, blank, `unknown`, `unset`, `null`, `n/a`, `?`, `-`, an em dash) are missing; `none` is missing
-  except for facets that list it as legal.
-- **Conditional facets** (`when: backend=spyre`) apply unless the condition key is known and differs. With the backend
+  placeholders are missing: empty or blank text, `unknown`, `unset`, `null`, `n/a`, `?`, `-`, an em dash, NaN or
+  infinity (including numpy scalars), and empty containers. `clean=unknown` is missing, because the design reads
+  `unknown` as "not determined".
+- **`none`** is a value only for facets that list it in `values` (`clean`, `cpu_pinning`) or set `none_ok: true`
+  (`device_type`, `quant_scheme`, `baseline`, `mem_alloc_policy`). For every other facet, `model` included, `none` and
+  `n/a` are placeholders.
+- **Conditional facets** (`when: backend=spyre`) apply unless the condition key is known and differs. In `compare`, a conditional facet applies if it applies to either side, so the result does not depend on the order
+  of the two numbers. With the backend
   unknown, both the backend and the conditional facet are listed as missing.
 
 ## Declaring it in a pack
@@ -28,7 +33,8 @@ metrics:
   - {name: x.rate, class: throughput, context: {required: [model, dtype]}, unit: "{token}/s", ...}
 ```
 
-`class` picks the metric class; without it the class is matched from the metric name. `context.required` replaces the
+`class` picks the metric class; without it, a metric of the engine's own packs is matched from its name, and a metric
+of any other pack is `unclassified`: no requirements and no lint output. `context.required` replaces the
 class default for that metric, `context.optional` replaces the facets shown only in the expanded view. The renderer
 honors these when it is given the pack's metrics: `Vocab.bind(registry.metrics)` returns a vocabulary whose
 `missing`, `chips`, `expanded_view`, `completeness` and `compare` resolve through the declarations. A plain `Vocab` falls
@@ -52,7 +58,7 @@ spec:
 
 ## The lint
 
-`spyre-bench validate` never fails on metric context. By default it warns when `context:` names an unknown facet, and
+`spyre-bench validate` never fails on metric context. By default it warns when `context:` names an unknown facet or gives an enum facet a value outside its list, and
 prints one summary line when Benchmarks have undeclared author-only facets or metrics without a class. `--lint-context`
 lists every one. Facets the engine, probes, ingest or derivation supply are not checked.
 

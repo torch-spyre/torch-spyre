@@ -20,6 +20,7 @@ rendered as an empty chip and the number is never hidden, but it is excluded fro
 """
 
 import fnmatch
+import math
 import functools
 from pathlib import Path
 
@@ -35,6 +36,7 @@ class Vocab:
         self.facets = {f["id"]: f for f in facets}
         self.classes = classes
         self.specs = {}
+        self.builtin = None
 
     @classmethod
     def load(cls, path=None):
@@ -42,7 +44,7 @@ class Vocab:
         return cls(d["facets"], d["classes"])
 
     def classify(self, metric):
-        m = (metric or "").lower()
+        m = metric.lower() if isinstance(metric, str) else ""
         for c in self.classes:
             if any(fnmatch.fnmatchcase(m, g) for g in c["match"]):
                 return c
@@ -51,10 +53,15 @@ class Vocab:
     def class_by_id(self, cid):
         return next((c for c in self.classes if c["id"] == cid), None)
 
-    def bind(self, metrics):
-        """A copy that resolves classes and required facets through registered pack metric specs."""
+    def bind(self, metrics, builtin=None):
+        """A copy that resolves classes and required facets through registered pack metric specs.
+
+        `builtin` names the metrics of the engine's own packs (None: all). Only those are glob-classified when the
+        pack declares no `class`; any other metric without a class is "unclassified" and has no requirements.
+        """
         v = Vocab(list(self.facets.values()), self.classes)
         v.specs = dict(metrics)
+        v.builtin = None if builtin is None else set(builtin)
         return v
 
     def cls_for(self, metric):
@@ -63,6 +70,7 @@ class Vocab:
         A pack `context.required` / `context.optional` replaces the class lists; `x-` classes and facets carry no
         requirements.
         """
+        metric = metric if isinstance(metric, str) else ""
         spec = self.specs.get(metric)
         if spec is None:
             return self.classify(metric)
@@ -72,6 +80,8 @@ class Vocab:
         else:
             base = self.class_by_id(cid) if cid else self.classify(metric)
         ctx = spec.get("context") or {}
+        if not cid and self.builtin is not None and metric not in self.builtin:
+            base = {"id": "unclassified", "match": [], "required": [], "optional": []}
         if base is None and "required" not in ctx:
             return None
         base = base or {"id": "custom", "match": [], "required": [], "optional": []}
@@ -97,21 +107,56 @@ def default_vocab():
 
 
 # ---------------------------------------------------------------- resolving values
-def _unrecorded(fid, v, vocab):
-    """True for None and placeholder spellings; "none" counts as a value where the facet lists it as legal."""
-    if v is None:
-        return True
-    if not isinstance(v, str):
+def _norm(rec):
+    """A record of any shape as {metric: str, value, unit, statistic: str|None, n, ctx: dict}; never raises."""
+    if not isinstance(rec, dict):
+        rec = {}
+    st = rec.get("statistic")
+    ctx = rec.get("ctx")
+    return {
+        "metric": rec["metric"] if isinstance(rec.get("metric"), str) else "",
+        "value": rec.get("value", ""),
+        "unit": rec.get("unit") if isinstance(rec.get("unit"), str) else "",
+        "statistic": st if isinstance(st, str) and st else None,
+        "n": rec.get("n"),
+        "ctx": {k: v for k, v in ctx.items() if isinstance(k, str)} if isinstance(ctx, dict) else {},
+    }
+
+
+def _nonfinite(v):
+    """NaN or infinity, including numpy scalars (duck-typed: anything float() accepts that is not a str)."""
+    if isinstance(v, (str, bytes, bool)):
         return False
-    s = v.strip().lower()
-    if s == "none":
-        return "none" not in [str(x).lower() for x in (vocab.facets.get(fid) or {}).get("values", [])]
-    return s in PLACEHOLDERS
+    try:
+        return not math.isfinite(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _unrecorded(fid, v, vocab):
+    """True for None, placeholder spellings, NaN/inf and empty containers.
+
+    "none" is a value where the facet lists it in `values` or sets `none_ok`; everywhere else (model, ...) it is a
+    placeholder.
+    """
+    if v is None or _nonfinite(v):
+        return True
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s == "none":
+            f = vocab.facets.get(fid) or {}
+            return not (f.get("none_ok") or "none" in [str(x).lower() for x in f.get("values", [])])
+        return s in PLACEHOLDERS
+    try:
+        return hasattr(v, "__len__") and len(v) == 0
+    except TypeError:
+        return False
 
 
 def resolve(rec, vocab):
     """Facet values after derivation: (values, derived_ids). Unknown values are dropped."""
-    vals = {k: v for k, v in (rec.get("ctx") or {}).items() if not _unrecorded(k, v, vocab)}
+    rec = _norm(rec)
+    vals = {k: v for k, v in rec["ctx"].items() if not _unrecorded(k, v, vocab)}
     derived = set()
     st = rec.get("statistic")
     if st and "statistic" not in vals:
@@ -167,6 +212,7 @@ def _applies(fid, vocab, vals):
 
 def missing(rec, vocab):
     """Required facets with no known value. A "a|b" requirement is met by either alternative."""
+    rec = _norm(rec)
     cls = vocab.cls_for(rec["metric"])
     if cls is None:
         return ["metric class"]
@@ -179,6 +225,7 @@ def missing(rec, vocab):
 
 
 def completeness(rec, vocab):
+    rec = _norm(rec)
     cls = vocab.cls_for(rec["metric"])
     if cls is None:
         return 0, 0
@@ -210,7 +257,7 @@ def _short_build(b):
 
 
 EMPTY = "\u2014"  # em dash: "required, not recorded". Never a legal value of any facet.
-CLEAN_CHIP = {"enforced": "clean", "observed": "observed-clean", "none": "shared", "unknown": "clean?"}
+CLEAN_CHIP = {"enforced": "clean", "observed": "observed-clean", "none": "shared"}
 STAT_CHIP = {
     "value": "",
     "mean": "mean",
@@ -320,11 +367,23 @@ def _chip_value(fid, v, derived):
         return _short_build(v)
     if fid == "clean":
         return CLEAN_CHIP.get(str(v), str(v))
+    if isinstance(v, bool):
+        return "on" if v else "off"
     if fid == "cpu_pinning":
-        return "on" if v != "none" else "off"
+        return "off" if str(v).strip().lower() == "none" else "on"
     if fid in ("ttft_def", "itl_def"):
         return DEF_SHORT.get(str(v), str(v))
     return str(v)
+
+
+def _label(fid):
+    return LABEL.get(fid, fid.replace("_", "-"))
+
+
+def _order(vocab):
+    """The fixed chip order, then every other facet in vocabulary order, so a required facet always has a slot."""
+    known = {f for g in ORDER for f in g}
+    return ORDER + [(f,) for f in vocab.facets if f not in known]
 
 
 def _text(group, vals, derived):
@@ -344,7 +403,7 @@ def _text(group, vals, derived):
     if fid not in vals:
         return None
     v = _chip_value(fid, vals[fid], derived)
-    lab = LABEL[fid]
+    lab = _label(fid)
     if fid in ("cache_state", "dtype", "arch", "backend", "window") and fid != "window":
         return v
     if fid == "window":
@@ -373,7 +432,7 @@ def _empty_text(group):
         return f"load {EMPTY}"
     if group == ("input_len", "output_len"):
         return f"in {EMPTY}/out {EMPTY}"
-    return f"{LABEL[group[0]]} {EMPTY}"
+    return f"{_label(group[0])} {EMPTY}"
 
 
 def chips(rec, vocab, expanded=False):
@@ -382,6 +441,7 @@ def chips(rec, vocab, expanded=False):
     Every REQUIRED facet gets a chip: known ones show the value, missing ones show `<label> \u2014`.
     Expanded adds the known optional facets and judgement badges.
     """
+    rec = _norm(rec)
     cls = vocab.cls_for(rec["metric"])
     vals, derived = resolve(rec, vocab)
     req = set()
@@ -395,7 +455,7 @@ def chips(rec, vocab, expanded=False):
             miss.update(alts)
     opt = set(cls.get("optional", [])) if (cls and expanded) else set()
     out = []
-    for group in ORDER:
+    for group in _order(vocab):
         in_req = any(g in req for g in group)
         in_opt = any(g in opt and g in vals for g in group)
         if not (in_req or in_opt) or any(g in IN_HEAD for g in group):
@@ -417,9 +477,10 @@ def context_line(rec, vocab, expanded=False):
 
 
 def stat_label(rec):
-    st = rec.get("statistic", "value")
+    rec = _norm(rec)
+    st = rec["statistic"] or "value"
     s = STAT_CHIP.get(st, st)
-    n = rec.get("n")
+    n = rec["n"]
     parts = [p for p in (s, f"n={n}" if n else "") if p]
     return " ".join(parts)
 
@@ -428,7 +489,8 @@ def render(rec, vocab):
     """One display string: value unit (stat, n), the context line with empty slots, then the badge if incomplete.
 
     The number is ALWAYS shown. Exclusion from comparisons is a separate rule (see compare)."""
-    head = f"{rec['value']} {rec.get('unit', '')}".strip()
+    rec = _norm(rec)
+    head = f"{rec['value']} {rec['unit']}".strip()
     st = stat_label(rec)
     if st:
         head += f" ({st})"
@@ -442,6 +504,7 @@ def render(rec, vocab):
 
 def expanded_view(rec, vocab):
     """Group -> list of (facet, value, flag) for the expanded panel; flag in {'', 'derived', 'required, not recorded'}."""
+    rec = _norm(rec)
     cls = vocab.cls_for(rec["metric"])
     vals, derived = resolve(rec, vocab)
     rows = {g: [] for g in ("workload", "state", "build", "environment", "method", "judgement")}
@@ -497,6 +560,7 @@ def compare(a, b, vocab, vary=("build",)):
             'incomplete' (a side lacks required context), 'different_metric'.
     `vary` names the facets the comparison is ABOUT (default: the build); they may differ.
     """
+    a, b = _norm(a), _norm(b)
     ca, cb = vocab.cls_for(a["metric"]), vocab.cls_for(b["metric"])
     if ca is None or cb is None or ca["id"] != cb["id"] or a["metric"] != b["metric"]:
         return {"status": "different_metric", "differs": [], "unknown": [], "line": "different metric"}
@@ -515,7 +579,11 @@ def compare(a, b, vocab, vary=("build",)):
     differs = []
     for r in ca["required"]:
         for alt in _alts(r):
-            if alt in vary or vocab.facets.get(alt, {}).get("compare") == "note" or not _applies(alt, vocab, va):
+            if (
+                alt in vary
+                or vocab.facets.get(alt, {}).get("compare") == "note"
+                or not (_applies(alt, vocab, va) or _applies(alt, vocab, vb))
+            ):
                 continue
             x, y = va.get(alt), vb.get(alt)
             if (x is None) != (y is None) or (x is not None and not _same(alt, vocab, x, y)):
@@ -601,13 +669,18 @@ def lint_catalog(cat, vocab=None, detail=False):
     metrics without a class, are one summary line unless `detail`. Engine, probe, derive and ingest facets are captured
     and not checked.
     """
-    vocab = (vocab or default_vocab()).bind(cat.reg.metrics)
+    vocab = (vocab or default_vocab()).bind(cat.reg.metrics, cat.reg.builtin_metrics)
     benches = {b.name: b for b in cat.of("Benchmark")}
     warns, notes, seen, undeclared = [], [], set(), set()
     for b in benches.values():
         for k in b.spec.get("context") or {}:
             if k not in vocab.facets and not _custom(k):
                 warns.append(f"Benchmark/{b.name}: context.{k} is not a facet in the metric-context vocabulary")
+            elif k in vocab.facets:
+                f = vocab.facets[k]
+                legal = [str(x).lower() for x in f.get("values", [])]
+                if f.get("type") == "enum" and legal and str(b.spec["context"][k]).lower() not in legal:
+                    warns.append(f"Benchmark/{b.name}: context.{k}={b.spec['context'][k]!r} is not one of {legal}")
     for c in cat.cases:
         b = benches.get(c["benchmark"])
         if b is None:
@@ -618,6 +691,8 @@ def lint_catalog(cat, vocab=None, detail=False):
                 continue
             seen.add((b.name, name))
             cls = vocab.cls_for(name)
+            if cls is not None and cls["id"] == "unclassified":
+                continue
             if cls is None:
                 undeclared.add(b.name)
                 notes.append(f"Benchmark/{b.name}: metric {name} matches no metric class")

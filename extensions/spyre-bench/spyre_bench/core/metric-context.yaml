@@ -7,7 +7,7 @@ groups: ["workload", "state", "build", "environment", "method", "judgement"]
 facets:
   - {id: model, group: workload, type: str, key: system.model, ident: identity, auto: engine}
   - {id: dtype, group: workload, type: enum, values: ["fp32", "bf16", "fp16", "fp8", "fp4", "int8", "int4"], key: system.precision, ident: prop, auto: engine}
-  - {id: quant_scheme, group: workload, type: str, key: -, ident: prop, auto: declared}
+  - {id: quant_scheme, group: workload, type: str, key: -, ident: prop, auto: declared, none_ok: true}
   - {id: tp, group: workload, type: int, unit: "", key: system.tp, ident: identity, auto: engine}
   - {id: pp, group: workload, type: int, unit: "", key: system.pp, ident: prop, auto: engine}
   - {id: batch_size, group: workload, type: int, unit: "", key: -, ident: identity, auto: engine}
@@ -26,7 +26,7 @@ facets:
   - {id: block_size, group: workload, type: int, unit: token, key: -, ident: prop, auto: engine}
   - {id: max_model_len, group: workload, type: int, unit: token, key: -, ident: identity, auto: engine}
   - {id: max_num_seqs, group: workload, type: int, unit: "", key: -, ident: identity, auto: engine}
-  - {id: prefix_cache, group: workload, type: enum, values: [false, "on_cold", "on_warm"], key: -, ident: prop, auto: engine}
+  - {id: prefix_cache, group: workload, type: enum, values: ["off", "on_cold", "on_warm"], key: -, ident: prop, auto: engine}
   - {id: prefix_hit_ratio, group: workload, type: float, unit: ratio, key: -, ident: n/a, auto: ingest, compare: note}
   - {id: chunked_prefill, group: workload, type: enum, values: [true, false], key: -, ident: prop, auto: engine}
   - {id: kv_cache_dtype, group: workload, type: enum, values: ["auto", "fp16", "bf16", "fp8"], key: -, ident: prop, auto: engine}
@@ -51,15 +51,15 @@ facets:
   - {id: result_schema, group: build, type: enum, values: ["v1", "v2"], key: -, ident: n/a, auto: ingest}
   - {id: arch, group: environment, type: enum, values: ["x86_64", "ppc64le", "s390x", "aarch64"], key: cpu.arch, ident: prop, auto: ingest}
   - {id: host_class, group: environment, type: str, key: env.label.node.class, ident: label, auto: engine}
-  - {id: device_type, group: environment, type: str, key: -, ident: prop, auto: ingest}
+  - {id: device_type, group: environment, type: str, key: -, ident: prop, auto: ingest, none_ok: true}
   - {id: device_count, group: environment, type: int, unit: "", key: env.label.device.count, ident: label, auto: engine}
   - {id: firmware, group: environment, type: str, key: env.fp.device.firmware, ident: prop, auto: probe}
   - {id: driver, group: environment, type: str, key: env.fp.device.driver, ident: prop, auto: probe}
   - {id: cpu_pinning, group: environment, type: enum, values: ["none", "device_local", "per_device", "explicit"], key: run.exec.cpu_pinning, ident: label, auto: engine}
   - {id: numa_node, group: environment, type: str, key: env.fp.device.numa_node, ident: prop, auto: probe}
-  - {id: clean, group: environment, type: enum, values: ["enforced", "observed", "none", "unknown"], key: run.clean.exclusive, ident: prop, auto: engine}
+  - {id: clean, group: environment, type: enum, values: ["enforced", "observed", "none"], key: run.clean.exclusive, ident: prop, auto: engine}
   - {id: mem_placement, group: environment, type: str, key: mem.weight.<name>.region_id, ident: prop, auto: probe, compare: note}
-  - {id: mem_alloc_policy, group: environment, type: enum, values: ["default", "reordered", "pinned"], key: -, ident: prop, auto: declared}
+  - {id: mem_alloc_policy, group: environment, type: enum, values: ["default", "reordered", "pinned"], key: -, ident: prop, auto: declared, none_ok: true}
   - {id: governor, group: environment, type: str, key: env.fp.governor, ident: prop, auto: probe}
   - {id: env_id, group: environment, type: id, key: env.id, ident: prop, auto: engine}
   - {id: tool, group: method, type: str, key: -, ident: prop, auto: engine}
@@ -77,7 +77,7 @@ facets:
   - {id: trust, group: judgement, type: enum, values: ["ci", "lab", "external"], key: run.trust, ident: n/a, auto: ingest}
   - {id: validity, group: judgement, type: enum, values: ["valid", "shared_env", "unqualified_env", "suspect", "invalid", "external"], key: run.validity, ident: n/a, auto: ingest}
   - {id: purpose, group: judgement, type: enum, values: ["pr", "nightly", "weekly", "release", "reference", "qualification", "investigate"], key: run.purpose, ident: n/a, auto: engine}
-  - {id: baseline, group: judgement, type: str, key: -, ident: n/a, auto: derive}
+  - {id: baseline, group: judgement, type: str, key: -, ident: n/a, auto: derive, none_ok: true}
   - {id: verdict, group: judgement, type: enum, values: ["pass", "regressed", "improved", "suspected", "no_baseline"], key: -, ident: n/a, auto: derive}
   - {id: moe_experts, group: workload, type: int, unit: "", key: -, ident: identity, auto: derive, derive_from: ["model"]}
   - {id: moe_top_k, group: workload, type: int, unit: "", key: -, ident: identity, auto: derive, derive_from: ["model"]}

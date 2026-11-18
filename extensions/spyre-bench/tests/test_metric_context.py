@@ -434,3 +434,107 @@ def test_compare_both_sides_incomplete_lists_union():
 def test_unknown_backend_lists_conditional_facet_and_backend_missing():
     m = nc.missing(rec(ctx={"backend": None, "kv_ladder": None}), V)
     assert "backend" in m and "kv_ladder" in m
+
+
+# ---- review round 3
+def test_none_is_a_value_only_where_the_facet_allows_it():
+    for fid in ("device_type", "quant_scheme", "baseline", "clean", "cpu_pinning"):
+        assert nc.resolve(rec(ctx={fid: "none"}), V)[0].get(fid) == "none", fid
+    for junk in ("none", "None", "NA", "N/A"):
+        assert "model" not in nc.resolve(rec(ctx={"model": junk}), V)[0], junk
+
+
+def test_clean_unknown_is_missing_and_has_no_chip_mapping():
+    assert "clean" in nc.missing(rec(ctx={"clean": "unknown"}), V)
+    assert "unknown" not in nc.CLEAN_CHIP
+
+
+def test_nonfinite_and_empty_containers_are_unrecorded():
+    class FloatLike:  # stands in for a numpy scalar
+        def __init__(self, v):
+            self.v = v
+
+        def __float__(self):
+            return self.v
+
+    for junk in (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        [],
+        {},
+        (),
+        FloatLike(float("nan")),
+        FloatLike(float("inf")),
+    ):
+        assert "tp" in nc.missing(rec(ctx={"tp": junk}), V), repr(junk)
+        assert "TPnan" not in nc.context_line(rec(ctx={"tp": junk}), V)
+    assert "tp" not in nc.missing(rec(ctx={"tp": FloatLike(2.0)}), V)
+
+
+RECORD_SHAPES = [None, 5, "x", [], {}, {"metric": 7}, {"metric": ["a"]}, {"metric": {"a": 1}, "ctx": 3},
+                 {"metric": "llm.output_throughput", "ctx": [1], "statistic": ["p"], "n": {}, "value": None},
+                 {"metric": "llm.output_throughput", "ctx": {1: 2, None: 3}, "statistic": {"a"}, "unit": 4},
+                 {"metric": "llm.output_throughput", "statistic": 7, "n": float("nan")}]  # fmt: skip
+
+
+def test_every_public_function_is_total_over_record_shapes():
+    for r in RECORD_SHAPES:
+        nc.resolve(r, V)
+        nc.missing(r, V)
+        nc.completeness(r, V)
+        nc.is_complete(r, V)
+        nc.chips(r, V, expanded=True)
+        nc.context_line(r, V)
+        nc.stat_label(r)
+        nc.render(r, V)
+        nc.expanded_view(r, V)
+        nc.length_drift(r)
+        nc.page_header([r, rec()], V)
+        nc.scan_rows([r], V)
+        for s in RECORD_SHAPES:
+            nc.compare(r, s, V)
+
+
+def test_compare_is_symmetric_when_a_conditional_facet_toggles():
+    a = rec(ctx={"backend": "spyre", "kv_ladder": "L1"})
+    b = rec(ctx={"backend": "cpu", "kv_ladder": None})
+    ab, ba = nc.compare(a, b, V, vary=("backend",)), nc.compare(b, a, V, vary=("backend",))
+    assert ab["status"] == ba["status"] == "differs"
+    assert [(f, y, x) for f, x, y in ab["differs"]] == ba["differs"]
+
+
+def test_enum_and_bool_rendering():
+    assert nc._chip_value("cpu_pinning", "None", set()) == "off"
+    assert nc._chip_value("cpu_pinning", "explicit", set()) == "on"
+    assert "prefix-cache off" in nc.context_line(rec(ctx={"prefix_cache": False}), V)
+    assert "prefix-cache False" not in nc.context_line(rec(ctx={"prefix_cache": False}), V)
+
+
+def test_every_required_facet_of_every_class_gets_an_empty_chip_when_absent():
+    for cls in V.classes:
+        r = {"metric": "m", "value": 1, "ctx": {}}
+        B = V.bind({"m": {"name": "m", "class": cls["id"]}})
+        shown = {f for ids, _, state in nc.chips(r, B) if state == "empty" for f in ids}
+        for req in cls["required"]:
+            alts = req.split("|")
+            if all(a in ("statistic", "sample_n") for a in alts):
+                continue
+            assert any(a in shown for a in alts), (cls["id"], req)
+
+
+def test_lint_warns_on_illegal_enum_value_in_benchmark_context():
+    cat = _cat("kernel-demo")
+    next(iter(cat.of("Benchmark"))).spec["context"] = {"timer": "stopwatch", "sampling": "anything"}
+    w = nc.lint_catalog(cat)
+    assert any("context.timer='stopwatch'" in x for x in w) and not any("sampling" in x for x in w)
+
+
+def test_third_party_metrics_without_a_class_are_unclassified_and_quiet():
+    cat = engine.Catalog([str(EX / "postgres-demo")], [str(EX / "packs" / "postgres-example")], [str(EX / "central")])
+    assert not cat.errors, cat.errors
+    B = V.bind(cat.reg.metrics, cat.reg.builtin_metrics)
+    assert "pg.latency.mean" in cat.reg.metrics and "pg.latency.mean" not in cat.reg.builtin_metrics
+    assert B.cls_for("pg.latency.mean")["id"] == "unclassified"
+    assert nc.missing({"metric": "pg.latency.mean", "value": 1}, B) == []
+    assert not [w for w in nc.lint_catalog(cat, detail=True) if "pg." in w]
