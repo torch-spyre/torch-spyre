@@ -49,7 +49,6 @@ from torch_spyre._C import (  # noqa: E402
     get_device_dtype,
     get_elem_in_stick,
 )
-from torch_spyre._inductor.errors import Unsupported  # noqa: E402
 
 
 # The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
@@ -1826,7 +1825,7 @@ class _ScatterScenarios:
         sub-stick inner dims (32 < 64 elems/stick) before the scatter.  The
         merged dim produces an unrepresentable stick expression (Mod(d1, 32))
         against the allocation layout.  Regression for issue #4443: every
-        scatter-lowered write must fail with a clear Unsupported naming the
+        scatter-lowered write must fail with a clear InductorError naming the
         buffer, the stick expression and elems_per_stick.
         """
 
@@ -1860,10 +1859,10 @@ class _ScatterScenarios:
                 idx = torch.arange(4, dtype=idx_dtype).to("spyre")
                 src = torch.ones(4, 1024, dtype=torch.float16).to("spyre")
                 with pytest.raises(
-                    Unsupported,
+                    InductorError,
                     match=(
-                        "innermost allocation stride \\(32\\)"
-                        ".*elems_per_stick \\(64\\).*sub-stick"
+                        r"sub-stick.*innermost allocation stride \(32\)"
+                        r".*elems_per_stick \(64\)"
                     ),
                 ):
                     torch.compile(kernel, dynamic=False)(x, idx, src)
@@ -1884,10 +1883,10 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
+            InductorError,
             match=(
-                "innermost allocation stride \\(16\\)"
-                ".*elems_per_stick \\(32\\).*sub-stick"
+                r"sub-stick.*innermost allocation stride \(16\)"
+                r".*elems_per_stick \(32\)"
             ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
@@ -1904,8 +1903,11 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
-            match="innermost allocation stride \\(32\\).*sub-stick",
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
+            ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
 
@@ -1924,10 +1926,10 @@ class _ScatterScenarios:
                 idx = torch.arange(2, dtype=torch.int32).to("spyre")
                 src = torch.ones(2, 1024, dtype=torch.float16).to("spyre")
                 with pytest.raises(
-                    Unsupported,
+                    InductorError,
                     match=(
-                        "innermost allocation stride \\(32\\)"
-                        ".*elems_per_stick \\(64\\).*sub-stick"
+                        r"sub-stick.*innermost allocation stride \(32\)"
+                        r".*elems_per_stick \(64\)"
                     ),
                 ):
                     torch.compile(kernel, dynamic=False)(x, idx, src)
@@ -1944,10 +1946,10 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
+            InductorError,
             match=(
-                "innermost allocation stride \\(32\\)"
-                ".*elems_per_stick \\(64\\).*sub-stick"
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
             ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
@@ -1958,7 +1960,7 @@ class _ScatterScenarios:
 
         [4, 8, 8, 16] -> [4, 1024]: inner strides are 16 and 8 and 8 — all
         below elems_per_stick=64.  The merged write index produces an
-        unrepresentable stick expression and must raise Unsupported.
+        unrepresentable stick expression and must raise InductorError.
         """
         x = torch.zeros(4, 8, 8, 16, dtype=torch.float16).to("spyre")
         idx = torch.arange(2, dtype=torch.int32).to("spyre")
@@ -1969,10 +1971,10 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
+            InductorError,
             match=(
-                "innermost allocation stride \\(16\\)"
-                ".*elems_per_stick \\(64\\).*sub-stick"
+                r"sub-stick.*innermost allocation stride \(16\)"
+                r".*elems_per_stick \(64\)"
             ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
@@ -1994,8 +1996,11 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
-            match="innermost allocation stride \\(32\\).*sub-stick",
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
+            ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
 
@@ -2015,10 +2020,10 @@ class _ScatterScenarios:
             return x
 
         with pytest.raises(
-            Unsupported,
+            InductorError,
             match=(
-                "innermost allocation stride \\(64\\)"
-                ".*elems_per_stick \\(128\\).*sub-stick"
+                r"sub-stick.*innermost allocation stride \(64\)"
+                r".*elems_per_stick \(128\)"
             ),
         ):
             torch.compile(kernel, dynamic=False)(x, idx, src)
