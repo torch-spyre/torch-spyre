@@ -583,9 +583,10 @@ the ring distance between K-collaborators. With `clamshell`, slice
 `i` uses core `(i - n//2) % SENCORES_PHYSICAL`. It keeps adjacent
 K-collaborators adjacent, including the pair across the ring boundary.
 The sparse modes apply only when `1 < n < SENCORES_PHYSICAL` and `n`
-divides `SENCORES_PHYSICAL`; otherwise placement stays dense. The
-physical count defaults to 32 and is separate from `SENCORES`, the
-logical planning limit. Clamshell placement needs the deeptools
+divides `SENCORES_PHYSICAL`; otherwise placement stays dense. Non-unified
+sharded kernels also stay dense: core `c` owns shard `c`. The physical
+count defaults to 32 and is separate from `SENCORES`, the logical
+planning limit. Clamshell placement needs the deeptools
 `GatherBuffers.cpp` fix (commit `209ca4aa5a`) for wrapping windows
 with indirect access.
 

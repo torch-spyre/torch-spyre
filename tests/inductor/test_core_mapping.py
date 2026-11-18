@@ -1781,6 +1781,21 @@ class TestCorePlacementStrategies:
             f"want a permutation of 0..{num_cores - 1}"
         )
 
+    def test_clamshell_eight_slice_member_mapping(self):
+        owner_map, span, ids = self._placed(8)
+        assert span == 32
+        expr = owner_map[sympy.Symbol("out")]
+        assert {core: int(expr.subs(self.CORE_ID, core)) for core in ids} == {
+            0: 4,
+            1: 5,
+            2: 6,
+            3: 7,
+            28: 0,
+            29: 1,
+            30: 2,
+            31: 3,
+        }
+
     @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
     @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
     def test_non_members_stay_in_range(self, strategy, num_cores):

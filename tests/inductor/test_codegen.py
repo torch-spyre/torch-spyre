@@ -587,6 +587,58 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
 
 
+class TestShardedCorePlacement(InductorTestCase):
+    def test_non_unified_core_ids_stay_shard_local(self):
+        shard = sympy.Symbol("c0")
+        iteration_space = {shard: (sympy.Integer(64), 8)}
+        args = [
+            TensorArg(
+                is_input=is_input,
+                arg_index=index,
+                device_dtype=DataFormats.IEEE_FP16,
+                device_size=[1, 64, 1],
+                device_coordinates=[sympy.Integer(0), shard, sympy.Integer(0)],
+                allocation={"hbm": index},
+                non_unified_shard_bytes=16,
+            )
+            for is_input, index in ((True, 0), (False, 1))
+        ]
+        spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            args=args,
+            op_info={},
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+        )
+        for mode in ("dense", "stride", "clamshell"):
+            with (
+                self.subTest(mode=mode),
+                config.patch(
+                    sencores=8, sencores_physical=32, core_placement_mode=mode
+                ),
+            ):
+                sdsc, _ = parse_op_spec(spec)
+                self.assertEqual(sdsc.num_cores, 8)
+                payload, _, _, symbol_kinds = compile_op_spec(0, spec, [])
+                root = next(iter(payload.values()))
+                self.assertEqual(root["numCoresUsed_"], 8)
+                self.assertEqual(
+                    root["dscs_"][0]["add"]["coreIdsUsed_"], list(range(8))
+                )
+                self.assertEqual(
+                    [root["coreIdToWkSlice_"][str(core)]["out"] for core in range(8)],
+                    list(range(8)),
+                )
+                for tensor in sdsc.args:
+                    self.assertTrue(tensor.non_unified)
+                    self.assertEqual(tensor.active_core_ids, ())
+                self.assertEqual(
+                    [(kind.arg_index, kind.core_idx) for kind in symbol_kinds],
+                    [(index, core) for index in range(2) for core in range(8)],
+                )
+
+
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
     def test_restickify_preserves_negative_window_gap(self):
         """Restickify must not replace an unfold gap with a padding gap."""

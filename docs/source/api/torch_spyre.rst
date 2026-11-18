@@ -722,9 +722,10 @@ Environment Variables
        keeps consecutive IDs; ``stride`` spaces them evenly;
        ``clamshell`` wraps them across the ring boundary. The sparse modes
        apply when the slice count exceeds 1, is less than
-       ``SENCORES_PHYSICAL``, and divides that count. ``clamshell`` needs
-       the deeptools ``GatherBuffers.cpp`` fix (commit ``209ca4aa5a``) for
-       wrapping windows with indirect access.
+       ``SENCORES_PHYSICAL``, and divides that count. Non-unified sharded
+       kernels stay dense: core ``c`` must access shard ``c``. ``clamshell``
+       needs the deeptools ``GatherBuffers.cpp`` fix (commit ``209ca4aa5a``)
+       for wrapping windows with indirect access.
    * - ``DXP_LX_FRAC_AVAIL``
      - Fraction of LX scratchpad available to the planner (default ``0.2``)
    * - ``LX_PLANNING``

@@ -615,13 +615,9 @@ def placement_applies(num_cores: int, physical_cores: int) -> bool:
 def resolve_core_stride(num_cores: int, physical_cores: int) -> int:
     """Spread ``num_cores`` logical slices evenly over a wider physical span.
 
-    Returns the largest ``S`` with ``num_cores * S <= physical_cores`` and
-    ``physical_cores % num_cores == 0``, so slice ``i`` lands on physical core
-    ``i * S`` and every placement uses equally spaced ids. Returns 1 (no
-    spreading) when the placement does not apply (see ``placement_applies``),
-    when ``physical_cores`` is non-positive, or when there is only one slice
-    to place: with nothing to space out, widening the fold would only add
-    overhead.
+    Returns ``physical_cores // num_cores`` when ``placement_applies`` is
+    true, so slice ``i`` lands on physical core ``i * S``. Otherwise returns
+    1 and leaves the slices densely placed.
     """
     if num_cores <= 1 or physical_cores <= 0 or physical_cores % num_cores != 0:
         return 1
@@ -642,7 +638,7 @@ def apply_core_stride(
     core count; a stride of 1 returns ``core_map`` unchanged.
 
     Returns the rewritten map, the widened fold size (``num_cores * stride``),
-    and the dispatched physical ids.
+    and the dispatched physical ids; the fold includes non-dispatched positions.
     """
     stride = resolve_core_stride(num_cores, physical_cores)
     if stride == 1:
@@ -663,13 +659,13 @@ def apply_clamshell(
 
     Logical slice ``i`` dispatches physical core ``(i - num_cores // 2)
     % physical_cores``. The resulting set balances the two 16-core halves
-    of the card (low ids of the first half, high ids of the second) at
-    every active count, mirroring the validated [0, 31] two-core placement.
-    Returns the rewritten map, the fold size (``max(physical_cores,
-    num_cores)``), and the sorted dispatched physical ids. A no-op — the
-    original map, fold, and ``range(num_cores)`` ids — whenever
-    ``placement_applies`` is false (single slice, full card, or a slice
-    count that does not divide the physical core count).
+    of the card (low ids of the first half, high ids of the second)
+    at every applicable count, including the [0, 31] two-core placement.
+    Returns the rewritten map, the fold size ``physical_cores``, and the
+    sorted dispatched physical ids. A no-op — the original map, a fold of
+    ``num_cores``, and dense ids — whenever ``placement_applies`` is false
+    (single slice, full card, or a slice count that does not divide the
+    physical core count).
 
     Owner rewrite: each owner expression is rebuilt by substituting
     ``core_id`` with the operation-logical slice of the physical core,

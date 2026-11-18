@@ -260,16 +260,19 @@ def _strip_debug_handles(obj):
     return obj
 
 
-# Config values that compile_op_spec() reads (sencores,
-# disable_conv2d_spatial_split) or that select which parts compute_specs_hash()
-# hashes (bundle_symbolic_args). They change the key through the SDSC JSON, not
-# as fields of their own, so a stored key that skips that work must have them
-# in its fingerprint. Add a setting here when compile_op_spec() starts reading
-# one; the verify-mode shard (tests/inductor/test_kernel_key_verify.py) catches
-# a key that changed while its fingerprint did not.
+# Config values that compile_op_spec() reads (sencores, core_placement_mode,
+# sencores_physical, disable_conv2d_spatial_split) or that select which parts
+# compute_specs_hash() hashes (bundle_symbolic_args). They change the key
+# through the SDSC JSON, not as fields of their own, so a stored key that
+# skips that work must have them in its fingerprint. Add a setting here when
+# compile_op_spec() starts reading one; the verify-mode shard
+# (tests/inductor/test_kernel_key_verify.py) catches a key that changed
+# while its fingerprint did not.
 _SPEC_COMPILE_CONFIG = (
     "bundle_symbolic_args",
     "sencores",
+    "core_placement_mode",
+    "sencores_physical",
     "disable_conv2d_spatial_split",
 )
 

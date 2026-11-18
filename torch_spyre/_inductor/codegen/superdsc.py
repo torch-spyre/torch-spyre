@@ -2192,7 +2192,9 @@ def _select_placement(mode: str):
         return apply_clamshell
     if mode == "dense":
         return _apply_dense_placement
-    return apply_core_stride
+    if mode == "stride":
+        return apply_core_stride
+    raise ValueError(f"unknown core placement mode: {mode!r}")
 
 
 def _apply_dense_placement(
@@ -2231,8 +2233,10 @@ def _remap_producer_cores(
         )
     if mode == "dense":
         return completed_producer_cores
-    stride = resolve_core_stride(logical_cores, sencores)
-    return tuple(sorted(core * stride for core in completed_producer_cores))
+    if mode == "stride":
+        stride = resolve_core_stride(logical_cores, sencores)
+        return tuple(sorted(core * stride for core in completed_producer_cores))
+    raise ValueError(f"unknown core placement mode: {mode!r}")
 
 
 def _finalize_tensor_work_divisions(
@@ -2984,9 +2988,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 division.work_slices, owner_map, num_cores=physical_span
             )
         active_core_ids = tuple(sorted(active))
-    elif _spyre_config.core_placement_mode != "dense" and placement_applies(
-        num_cores, _spyre_config.sencores_physical
+    elif (
+        not any(arg.non_unified for arg in args)
+        and _spyre_config.core_placement_mode != "dense"
+        and placement_applies(num_cores, _spyre_config.sencores_physical)
     ):
+        # Non-unified storage binds shard c to core c; moving the kernel
+        # without remapping each shard's address would read another shard.
         # A non-relayout op only shifts when the placement actually moves
         # its slice count; dense and every no-op case keep the dense map.
         _place = _select_placement(_spyre_config.core_placement_mode)

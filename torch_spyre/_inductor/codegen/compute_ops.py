@@ -800,6 +800,18 @@ def generate_sdsc(
         }
         for c in range(sdsc_spec.num_cores)
     }
+    # The raw kernel base belongs to the lowest fold position owning slice 0
+    # on every split dimension, including sparse placements where that is not 0.
+    anchor_core = next(
+        (
+            c
+            for c in range(sdsc_spec.num_cores)
+            if not any(core_id_to_wk_slice[str(c)].values())
+        ),
+        None,
+    )
+    if anchor_core is None:
+        raise ValueError("No fold position owns the all-zero work slice")
     operation_work_division = TensorWorkDivision(
         {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
         {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
@@ -1005,20 +1017,8 @@ def generate_sdsc(
         # work slice 0 on every split dim — the position whose runtime address
         # the raw ``kernel``/``kernel_slice`` base symbol represents (it is
         # built from the tensor origin plus compile-time slice offsets only).
-        # Core 0 is that position under dense/stride placements, but a sparse
-        # placement can dispatch slice 0 elsewhere; anchoring on core 0 then
-        # hands every dispatched core a derived symbol for a base the backend
-        # expects shared, and the slice-0 owner an address offset that may
-        # point before the buffer. Pick the lowest fold position whose
-        # evaluated slice is all zeros, deterministically.
-        anchor_core = min(
-            (
-                c
-                for c in range(sdsc_spec.num_cores)
-                if not any(core_id_to_wk_slice[str(c)].values())
-            ),
-            default=0,
-        )
+        # Sparse placements can dispatch slice 0 away from core 0; use the
+        # shared anchor selected from the evaluated fold map above.
         anchor_addr = (
             tensor.start_address
             + core_idx_to_slice_offset(
@@ -1267,16 +1267,7 @@ def generate_sdsc(
                 if total_slice_offset > 0
                 else ("kernel", tensor.arg_index)
             )
-            # Same anchor selection as the per-tensor registration loop: the
-            # lowest fold position owning work slice 0 on every split dim.
-            anchor_core = min(
-                (
-                    c
-                    for c in range(sdsc_spec.num_cores)
-                    if not any(core_id_to_wk_slice[str(c)].values())
-                ),
-                default=0,
-            )
+            # Reuse the base-symbol owner's fold position from registration.
             anchor_addr_lookup = (
                 tensor.start_address
                 + core_idx_to_slice_offset(
