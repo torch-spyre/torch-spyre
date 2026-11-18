@@ -540,7 +540,11 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
-        element_arrangement=stl.element_arrangement,
+        element_arrangement=(
+            ElementArrangement.QFP8WT
+            if stl.element_arrangement == ElementArrangement.QFP8WT
+            else ElementArrangement.STANDARD
+        ),
     )
 
 
