@@ -340,14 +340,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="exp3du_x")
@@ -361,14 +353,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="exp4du_x")
@@ -516,7 +500,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -529,14 +512,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="imp3du_x")
@@ -549,14 +524,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="imp4du_x")

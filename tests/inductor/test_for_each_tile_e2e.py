@@ -1777,7 +1777,9 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         ]
         self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
-        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        # The advance is written in the loop's own induction variable (u<n>), which
+        # is an integer, so floor(64*u0) simplifies to 64*u0.
+        weight_step = re.fullmatch(r"(\d+)\*u\d+", weight_reads[0])
         self.assertIsNotNone(weight_step)
         # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
         # per stick is one H*F = 4096-element expert slab.
