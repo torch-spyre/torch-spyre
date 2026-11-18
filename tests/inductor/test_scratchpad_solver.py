@@ -1399,7 +1399,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         ).plan_layout_and_core_divisions(cost)
 
         self.assertEqual(result.chosen_division, 1)
-        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+        self.assertEqual(float(cost.xreplace(solved_bindings([result]))), 1000.0)
 
     def test_solve_runs_without_the_variable_shaving_subsolvers(self):
         from ortools.sat.python import cp_model
@@ -2129,7 +2129,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 self.assertIsInstance(approx, sympy.Piecewise)
                 for v in (1, 2, 5, 8, 16, 32):
                     self.assertAlmostEqual(
-                        float(approx.subs(split, v)), v**0.25, delta=0.045 * v**0.25
+                        float(approx.xreplace({split: v})),
+                        v**0.25,
+                        delta=0.045 * v**0.25,
                     )
         n = sympy.Symbol("n")
         self.assertEqual(printer._inv_log_sym(split**n), split**n)
@@ -2226,7 +2228,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver = cp_model.CpSolver()
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
-                expected = sum(expr.subs({x: a, y: b}) for expr in expressions)
+                expected = sum(expr.xreplace({x: a, y: b}) for expr in expressions)
                 self.assertAlmostEqual(solver.objective_value, float(expected))
 
     def test_repeated_constant_conditions_do_not_create_decisions(self):
@@ -2243,7 +2245,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver.parameters.num_search_workers = 1
         self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
         expected = min(
-            sum(expr.subs({x: 2, y: value}) for expr in expressions)
+            sum(expr.xreplace({x: 2, y: value}) for expr in expressions)
             for value in range(-2, 3)
         )
         self.assertAlmostEqual(solver.objective_value, float(expected))
@@ -2344,7 +2346,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
                 self.assertAlmostEqual(
-                    solver.objective_value, float(expression.subs({x: a, y: b}))
+                    solver.objective_value, float(expression.xreplace({x: a, y: b}))
                 )
 
     def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
@@ -2534,7 +2536,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 )
                 self.assertAlmostEqual(
                     solver.ObjectiveValue(),
-                    float(expression.subs({x: 4, enabled: flag})),
+                    float(expression.xreplace({x: 4, enabled: flag})),
                     places=6,
                 )
 
@@ -2723,7 +2725,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
             solver = cp_model.CpSolver()
             self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
             values = [
-                int(expr.subs(dict(zip(lits, bits))))
+                int(expr.xreplace(dict(zip(lits, bits))))
                 for bits in itertools.product((0, 1), repeat=len(lits))
             ]
             best = max(values) if maximize else min(values)
