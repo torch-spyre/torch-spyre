@@ -16,7 +16,7 @@ import decimal
 import math
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING
 import warnings
 
 from torch.utils._config_module import install_config_module
@@ -599,5 +599,14 @@ def _precomputed_kernel_key_from_env() -> str:
 # the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
 # (true and yes work too). Any other value warns and leaves it off.
 precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
+
+if TYPE_CHECKING:
+    # install_config_module below adds ``patch`` (and the rest of the config
+    # API) at runtime. Declare it for mypy, which pre-commit runs without torch
+    # installed, so torch.utils._config_typing cannot supply it.
+    def patch(
+        arg1: str | dict[str, Any] | None = None, arg2: Any = None, **kwargs: Any
+    ) -> Any: ...
+
 
 install_config_module(sys.modules[__name__])
