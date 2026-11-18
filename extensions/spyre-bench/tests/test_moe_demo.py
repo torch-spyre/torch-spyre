@@ -104,6 +104,28 @@ def test_partial_array_reports_missing_indices():
     assert got.missing_at == (1, 3) and not got.complete and got.values[0] == 1
 
 
+def test_array_likes_nested_nan_and_none_inputs():
+    class Arr:  # duck-typed array: no list base class
+        def __init__(self, *v):
+            self.v = v
+
+        def __len__(self):
+            return len(self.v)
+
+        def __getitem__(self, i):
+            return self.v[i]
+
+    props = {"role.moe.e_sel": "a", "role.moe.tokens": "n", "role.moe.cores": "t", "role.moe.start_us": "d"}
+    meas = {"a": Arr(1.0, float("nan")), "n": [[1, 2], [3, float("nan")], [4]], "t": (1, 2), "d": {"x": 1}}
+    got = _roles(props, meas)
+    assert got["e_sel"].missing_at == (1,)
+    assert got["tokens"].missing_at == (1,) and got["tokens"].values[0] == [1, 2]
+    assert got["cores"] == trace_signals.Signal((1, 2), ())
+    assert got["start_us"] is trace_signals.NOT_CAPTURED  # a mapping is not an array
+    assert all(v is trace_signals.NOT_CAPTURED for v in _roles(None, None).values())
+    assert all(v is trace_signals.NOT_CAPTURED for v in _roles({"role.moe.e_sel": "s"}, None).values())
+
+
 def test_malformed_property_values_do_not_raise():
     props = {"role.moe.e_sel": ["a"], "role.moe.tokens": {"x": 1}, "role.moe.cores": 7, "role.moe.start_us": "s"}
     got = _roles(props, {"s": 5, "a": [1]})

@@ -18,9 +18,13 @@ A run declares which stored signal plays which role through `role.<family>.<role
 knows are its registered `role.<family>.*` attributes. Unknown signals and roles are ignored, so an older reader keeps
 working on newer data, and a missing signal is never reported as zero.
 
+The stored contract is a JSON array (a list). Any other array-like with `__len__` and `__getitem__` (a numpy array, a
+tuple) is accepted; str, bytes and mappings are not arrays.
+
 Result per role: NOT_CAPTURED (no string name declared, the name is not stored, or the stored value is not an array),
-or a Signal. An empty array is captured but empty (`Signal([], ())`). Entries that are None or NaN stay in `values` and
-their positions are listed in `missing_at`, so a partial array is never passed off as complete.
+or a Signal. An empty array is captured but empty (`Signal((), ())`). An entry is missing, and its position is listed
+in `missing_at`, when it is None or NaN or, for a nested array, when any leaf inside it is; a partial array is never
+passed off as complete.
 """
 
 import math
@@ -38,6 +42,7 @@ class _NotCaptured:
 
 
 NOT_CAPTURED = _NotCaptured()
+_MAX_DEPTH = 8
 
 
 @dataclass(frozen=True)
@@ -50,8 +55,28 @@ class Signal:
         return not self.missing_at
 
 
-def _absent(v):
-    return v is None or (isinstance(v, float) and math.isnan(v))
+def _is_array(v):
+    return hasattr(v, "__len__") and hasattr(v, "__getitem__") and not isinstance(v, (str, bytes, dict))
+
+
+def _leaf_absent(v):
+    if v is None:
+        return True
+    if isinstance(v, (str, bytes, bool)):
+        return False
+    try:
+        return math.isnan(float(v))  # also numpy scalars
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _absent(v, depth=0):
+    if _is_array(v):
+        try:
+            return depth < _MAX_DEPTH and any(_absent(v[i], depth + 1) for i in range(len(v)))
+        except (TypeError, IndexError, KeyError):
+            return True
+    return _leaf_absent(v)
 
 
 def declared_roles(reg, family):
@@ -60,14 +85,24 @@ def declared_roles(reg, family):
     return sorted(k[len(prefix) :] for k in reg.attrs if k.startswith(prefix))
 
 
+def _stored(measurements, name):
+    if not isinstance(name, str) or measurements is None:
+        return None
+    try:
+        return measurements[name]
+    except (KeyError, TypeError, IndexError):
+        return None
+
+
 def resolve_roles(reg, family, run_props, measurements):
-    """{role: Signal or NOT_CAPTURED} for every registered role of the family."""
+    """{role: Signal or NOT_CAPTURED} for every registered role of the family. None props/measurements read as empty."""
+    props = run_props if hasattr(run_props, "get") else {}
     out = {}
     for role in declared_roles(reg, family):
-        name = run_props.get(f"role.{family}.{role}")
-        arr = measurements.get(name) if isinstance(name, str) else None
-        if not isinstance(arr, (list, tuple)):
+        arr = _stored(measurements, props.get(f"role.{family}.{role}"))
+        if not _is_array(arr):
             out[role] = NOT_CAPTURED
             continue
-        out[role] = Signal(tuple(arr), tuple(i for i, v in enumerate(arr) if _absent(v)))
+        vals = tuple(arr[i] for i in range(len(arr)))
+        out[role] = Signal(vals, tuple(i for i, v in enumerate(vals) if _absent(v)))
     return out
