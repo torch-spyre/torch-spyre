@@ -54,19 +54,6 @@ def _rejected(match, issue):
     return decorate
 
 
-# The fp32 value of an fp16 upcast is staggered over a pair of fp32 sticks, but a
-# last dim of 16 is given only one stick of the pair (#5361). The compiled kernel
-# then fails on the device with a compute CB hardware error that leaves the runtime
-# stream unusable, so every later test fails too: skip rather than xfail.
-# TODO: run these as positive tests once unaligned upcasts are padded (#5048).
-_UNALIGNED_UPCAST_FAULTS = pytest.mark.skip(
-    reason=(
-        "compute CB hardware error that leaves the runtime stream unusable: the "
-        "fp32 value of a 16-wide last dim gets one stick of its stick pair (#5361)"
-    )
-)
-
-
 class TestExplicitConversion(unittest.TestCase):
     """Bucket B: explicit .to(dtype), shortcut methods, non-contiguous layouts."""
 
@@ -177,7 +164,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
@@ -353,7 +339,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @_UNALIGNED_UPCAST_FAULTS
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="exp3du_x")
@@ -367,7 +352,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_UNALIGNED_UPCAST_FAULTS
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="exp4du_x")
@@ -515,7 +499,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -528,7 +511,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_UNALIGNED_UPCAST_FAULTS
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="imp3du_x")
@@ -541,7 +523,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_UNALIGNED_UPCAST_FAULTS
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="imp4du_x")

@@ -605,11 +605,15 @@ def test_mixed_dtypes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_dynamic_shapes_fail_at_compile():
+    """torch.compile(dynamic=True) is refused before lowering, so a sharded
+    operand never reaches the non-unified static-shape check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="need static shapes"):
+    with pytest.raises(
+        RuntimeError, match=r"does not support: torch\.compile\(dynamic=True\)"
+    ):
         torch.compile(lambda x, y: x + y, dynamic=True)(a, a)
 
 
@@ -648,9 +652,8 @@ def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
 def test_dtype_casting_copy_fails_closed():
     """Dtype-converting copies of sharded tensors are rejected, not truncated.
 
-    The D2H conversion path bounds its host output only through the
-    post-factory host_capacity_bytes write in spyre_stream.cpp (a flex-side
-    TODO), and converting shard copies are untested against it.
+    Converting shard copies are untested against the D2H conversion path,
+    which bounds its host output by the host_capacity the DMA factories set.
     """
     n = _num_shards()
     torch.manual_seed(0)
