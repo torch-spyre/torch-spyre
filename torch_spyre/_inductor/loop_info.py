@@ -343,6 +343,33 @@ class CoarseTileInfo:
 # Op-metadata helpers
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class LoopShim:
+    """TEMPORARY, deleted with ``loop_info.py`` at stage 9.
+
+    What the loop-tiling lowering (``wsr/loop_tiling_lowering.py``) stamps as an
+    op's ``loop_info`` instead of a ``CoarseTileInfo``, for the readers that have
+    not yet moved to the ``LoopNode``. It holds the plan's own content: which loop
+    the op is in, how many trips, and which dim is tiled at each level. It holds
+    NOTHING about advances: the four advance fields of ``CoarseTileInfo`` are
+    absent on purpose, so a reader that wants them either has a shim branch
+    (``loop_facts`` derives a shim op's advances from the op's own index) or fails
+    in a test instead of reading an empty list.
+    """
+
+    loop_group_id: tuple[int, ...]
+    loop_count: list[sympy.Expr]
+    loop_tiled_dims: list[list[int]]
+    loop_tiled_reduction_dims: list[list[int]]
+
+
+# What a reader tests ``loop_info`` against when it needs the loop's own facts (group
+# id, count, tiled dims) and nothing about advances. ``isinstance(x, CoarseTileInfo)``
+# alone reads as False for a ``LoopShim``; stage 9 deletes this with the shim.
+COUNTED_LOOP_INFO = (CoarseTileInfo, LoopShim)
+
+
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
