@@ -5907,9 +5907,8 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     #   "writer-advance check failed for 'coarse_tile_copy_buf1' -- level 0
     #    tiles output dims [1] but output_tiled_dims has no extents for that
     #    level, so its write pointer would not advance there."
-    # (The names below are the legacy transform's, deleted in stage 7a.6.)
-    # _insert_copy_op keyed the synthesized copy-out writer's per-level
-    # extents by RAW dim index, while _tiled_dims_for_dep matched those keys
+    # (Legacy transform, deleted in stage 7a.6.) Its copy-out writer keyed the
+    # per-level extents by RAW dim index, while the dep matcher matched those keys
     # against the SQUEEZED dN symbols of dep.index. This group's terminal
     # reduction has output [1, 20] -> divided [1, 4]; the leading unit dim is
     # squeezed away, so the raw key 1 matched no symbol, output_tiled_dims
@@ -7701,64 +7700,13 @@ class TestSpanOverflowMutationE2E(InductorTestCase):
         }
     )
     def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
-        """(History: the functions named here are the legacy transform's, deleted in
-        stage 7a.6; the lowering has no Case 2/"Case 3" branch.)
+        """``x + y`` with ``x`` a transposed (non-contiguous) view, tiled by automatic
+        span-overflow planning; the compiled result matches the CPU.
 
-        Originally a regression repro for the Case 2/"Case 3"
-        layout-reconciliation gap; now an xfail for a separate, deeper,
-        pre-existing bug this task's fix newly exposes on this exact op.
-
-        Task 2 (this task) deleted the direct-mutation Case 2/"Case 3"
-        branch in `_propagate_tiled_op` entirely, so every cross-loop-group
-        write -- including this test's -- now takes the `_insert_copy_op`
-        path unconditionally. That fix *is* correct and closes the gap this
-        test originally targeted: `TestCoarseTileBufferPropagation`'s
-        `test_case2_condition_now_produces_copy_op` unit test directly
-        confirms the old Case 2 branch's code no longer exists and the
-        copy-op path is taken instead. A control probe run without any
-        divergent input layout at all (plain contiguous `x`/`y`, same
-        shapes, same span-overflow trigger) confirms the external-input-
-        layout-mismatch scenario is no longer what's failing here.
-
-        What still fails: `_insert_copy_op`'s interaction with a
-        post-stickify, span-overflow-scaled `full_buf` has its own,
-        independent, pre-existing addressing bug in `superdsc.py`'s per-arg
-        `device_size`/`device_coordinates` handling -- confirmed present on
-        the *pre-Task-2* code too, via a second control probe that forces a
-        real inside-consumer (so the OLD Case 2/"Case 3" branch does not
-        apply and the OLD code already takes the Case 1 copy-op path) on
-        this same post-stickify span-overflow setup: it fails the same way
-        (~87% mismatch) with zero divergent input layouts. This is the same
-        general class of latent Case-1-copy-path bug flagged as "item 4,
-        out of scope" in task-1-report.md (there triggered by a 3-input
-        case); here it's shown to need neither 3 inputs nor a divergent
-        layout, only `_insert_copy_op` + post-stickify span-overflow with
-        `loop_count > 1`. It was never exercised end to end before because,
-        pre-Task-2, an op with no inside consumers and no loop-internal
-        input (this test's exact shape) always took Case 2 instead, and no
-        other post-stickify span-overflow e2e test in this file forces
-        Case 1 with `loop_count > 1`.
-
-        This bug is in `_insert_copy_op`/`superdsc.py` addressing, not in
-        the Case 2/"Case 3" deletion this task performs, and is out of this
-        task's scope (its fix would require changes to `superdsc.py`, not
-        listed in this task's file scope). Per this task's explicit
-        instructions, this test stays `@unittest.expectedFailure` -- do not
-        un-xfail a test that still fails, and do not reinstate any form of
-        the deleted Case 2/"Case 3" branch as a workaround.
-
-        Confirmed failure mode (current code, post-Task-2 fix): 15779/16384
-        elements (96.3%) mismatch at atol=0.01/rtol=0.01, max abs diff
-        ~6.74 -- still far outside fp16 rounding noise, but a different
-        mismatch count/magnitude than the pre-fix 12221/16384 (74.6%),
-        max abs diff ~5.89 recorded in task-1-report.md, consistent with a
-        different root cause now being hit.
-
-        MAX_SPAN_BYTES is patched down so a small tensor triggers automatic
-        span-overflow tiling without needing a multi-hundred-MB real
-        allocation (technique matches
-        test_span_overflow_hint_analysis.py's TestSpanOverflowNumericValidation
-        class).
+        MAX_SPAN_BYTES is patched down so a small tensor triggers span-overflow
+        tiling without a multi-hundred-MB allocation (the technique of
+        ``TestSpanOverflowNumericValidation``). The operand layouts differ, so the
+        copy-out of the tiled op has to reconcile them.
         """
         from unittest.mock import patch as patch2
 

@@ -134,7 +134,7 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
 
     Mirrors SpyreKernel._host_dim_to_index_symbol's own squeeze arithmetic
     (same source of truth, duplicated here because that method maps one
-    dim at a time and _tiled_dims_for_dep needs the whole table to build a
+    dim at a time and the callers need the whole table to build a
     dep_dims membership test): output dims are numbered densely over
     ir_node.data.ranges, skipping unit-size (==1) entries; reduction dims
     continue the same counter, offset by n_output_dims, over
@@ -247,7 +247,7 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     ``d0 + 2*u0`` for a 2-row-per-iteration write into a dim tiled to size 2
     -- so requiring sym to be the ONLY free symbol never matches that case;
     the coefficient test is what catches it. Callers that consume this
-    position (_tiled_dims_for_dep's _dim_is_read) already use the same
+    position (the stored-record builders' _dim_is_read) already use the same
     coefficient test to decide whether a dependency reads a dim, so this
     keeps the two symbol/pos mappings consistent for that case.
     """
@@ -352,8 +352,7 @@ def _hint_ranges_pos(
     # ``dep.index == 32*u0`` with no ``d{i}`` coordinates at all -- so
     # loop_var can appear in its index without ever being resolvable
     # through the marker map. That is not a gap: it is the shape
-    # _point_splice_advance_for_dep's caller (build_loop_tiling_plan)
-    # handles through squeezed_advance_per_read once this function returns
+    # for_each_tile handles through squeezed_advance_per_read once this function returns
     # (None, False) for it, by stashing hint.loop_var into
     # unattributed_loop_vars. Counting it here as "mentions loop_var"
     # would raise on every legitimate point-splice-advance read instead of
@@ -455,11 +454,8 @@ def _loop_var_hinted_ranges(op: ComputedBuffer) -> dict[int, Expr]:
     is a multiplier over a larger extent that is never materialized as a
     real dim anywhere -- never a divisor of op.data.ranges[pos]. Callers
     that would otherwise divide a tiled dim's range by the level's loop
-    count (_planned_tile_extents_per_level, _compute_per_tile_ranges_planned,
-    _divide_ranges) must check this first and skip the divide for any pos
-    present here, matching the resolution pattern _tiled_dims_for_dep
-    already uses (pos_to_loop_var, built the same way, for its own
-    coefficient-based dep.index test).
+    count (_planned_tile_extents_per_level, _divide_ranges) must check this first and skip the divide for any pos
+    present here, using the same coefficient-based dep.index test as the stored-record builders.
     """
     hints = getattr(op, "dim_hints", None) or ()
     if not hints:

@@ -141,10 +141,11 @@ def build_loop_tiling_plan(
 ) -> LoopTilingPlan:
     """Plan ``groups`` (``(ops, [(hint_id, trip_count)])``) without touching the IR.
 
-    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for:
-    a nested group (one loop level only), reduction tiling while ``config.enable_reduction_tiling`` is off, a mixed or
-    multi-dim reduction level, an op that reads a reduction before it is complete,
-    and a matmul tiled across a broadcast batch.
+    ``op_name`` in the plan is ``get_operation_name()``. Raises ``Unsupported`` for a
+    nested group (one loop level only), reduction tiling while
+    ``config.enable_reduction_tiling`` is off, a mixed or multi-dim reduction level,
+    an op that reads a reduction before it is complete, and a matmul tiled across a
+    broadcast batch.
     """
     reject_nested_loops(groups, "build_loop_tiling_plan")
     planned_groups: list[LoopTilingGroup] = []
@@ -275,10 +276,10 @@ def _taken_symbols(graph: Any, operations: Iterable[Any]) -> list[sympy.Basic]:
         if get_size is not None:
             taken.extend(get_size())
         try:
-            reads_writes = op.get_read_writes()
+            reads_writes = op_read_writes(op)
         except Exception as error:
             raise Unsupported(
-                f"span-overflow loop term: cannot read the reads and writes of "
+                f"loop tiling lowering: cannot read the reads and writes of "
                 f"{op.get_operation_name()} ({type(error).__name__}), so the names "
                 "already in use are not known."
             ) from error
@@ -378,36 +379,33 @@ def _plan_carries(
     ]
     if len(partials) != len(updates) or len(partials) + len(updates) != len(reductions):
         raise Unsupported(
-            f"span-overflow loop term: {len(partials)} partial reductions and "
+            f"loop tiling lowering: {len(partials)} partial reductions and "
             f"{len(updates)} combines among {len(reductions)} reduction-kind ops "
             "of one group."
         )
     # By buffer name (``get_name``), as the record, the allocator and
     # ``apply_loop_carries`` key it: an extern op's name is op1, its buffer's buf1.
     live = {op.get_name(): op for op in graph.operations}
-    touched = {
-        op.get_operation_name(): {
-            dep.name
-            for dep in (*op.get_read_writes().reads, *op.get_read_writes().writes)
-        }
-        for op in members
-    }
+    touched = {}
+    for op in members:
+        rw = op_read_writes(op)
+        touched[op.get_operation_name()] = {dep.name for dep in (*rw.reads, *rw.writes)}
     edits = []
     for update in updates:
         storage_name = update.layout.get_buffer().get_name()
         storage = live.get(storage_name)
         if storage is None:
             raise Unsupported(
-                f"span-overflow loop term: the accumulator {storage_name} of "
+                f"loop tiling lowering: the accumulator {storage_name} of "
                 f"{update.get_operation_name()} is not an operation of the graph."
             )
         if getattr(storage, "_loop_carry_record", None) is not None:
             raise Unsupported(
-                f"span-overflow loop term: {storage_name} already declares a carry."
+                f"loop tiling lowering: {storage_name} already declares a carry."
             )
         if counted_loop_path(storage):
             raise Unsupported(
-                f"span-overflow loop term: the accumulator {storage_name} is a "
+                f"loop tiling lowering: the accumulator {storage_name} is a "
                 "member of the loop."
             )
         others = [
@@ -417,7 +415,7 @@ def _plan_carries(
         ]
         if others:
             raise Unsupported(
-                f"span-overflow loop term: {others} also touch the accumulator "
+                f"loop tiling lowering: {others} also touch the accumulator "
                 f"{storage_name} inside the loop."
             )
         edits.append(
