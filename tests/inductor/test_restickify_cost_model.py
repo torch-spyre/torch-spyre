@@ -111,25 +111,31 @@ def test_a_feature_memo_derives_an_access_once_and_only_inside(monkeypatch):
     assert len(calls) == 3
 
 
-def test_reads_are_memoized_only_inside_a_feature_memo():
-    """The post-pass report extracts after every pass, and not every pass that
-    rewrites an op's loads drops the planner's memo of them; outside a scope
-    the reads are re-derived, so a stale memo never reaches the report."""
+def test_reads_follow_the_shared_memo_outside_a_feature_memo(monkeypatch):
+    """Feature extraction reads an op's dependencies through ``op_read_writes``
+    with or without a :func:`dcm.feature_memo` scope, the post-pass report
+    included. An in-place edit of an op's reads therefore reaches it only once
+    the edit calls ``invalidate_op_read_writes``, as the memo's contract says."""
+    from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
 
     class Op:
         def __init__(self):
-            self.reads = "first"
+            self.read = "first"
 
         def get_read_writes(self):
-            return self.reads
+            dep = SimpleNamespace(index=self.read)
+            return SimpleNamespace(reads=[dep], writes=[dep])
 
+    monkeypatch.setattr(dcm, "iteration_space_from_op", lambda op: {})
+    monkeypatch.setattr(
+        dcm, "_work_slices", lambda op, write, read, space, slices: {"read": read}
+    )
     op = Op()
-    with dcm.feature_memo():
-        assert dcm._read_writes(op) == "first"
-    op.reads = "rewritten"  # in place, without invalidate_op_read_writes
-    assert dcm._read_writes(op) == "rewritten"
-    with dcm.feature_memo():
-        assert dcm._read_writes(op) == "first"  # the planner's memo, by design
+    assert dcm._resolved_work_slices(op) == {"read": "first"}
+    op.read = "rewritten"
+    assert dcm._resolved_work_slices(op) == {"read": "first"}
+    invalidate_op_read_writes(op)
+    assert dcm._resolved_work_slices(op) == {"read": "rewritten"}
 
 
 def test_geometry_keeps_symbolic_splits_and_physical_gaps():
