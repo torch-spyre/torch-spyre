@@ -57,7 +57,7 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+from torch.utils._sympy.functions import FloorDiv
 from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
@@ -100,6 +100,8 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
+    convert_modular_indexing,
+    find_repeat_vars,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -2964,29 +2966,23 @@ def stick_var_from_dep(stl: SpyreTensorLayout, dep: MemoryDep) -> "sympy.Symbol 
     if stick_stride == 0:
         return None
     index = concretize_index(dep.index, set(dep.ranges))
+    index = convert_modular_indexing(index)
     for sym in index.free_symbols:
         if sym in dep.ranges and index.coeff(sym) == stick_stride:
             return sym
-    # Mod case: index contains ModularIndexing(sym, 1, N) or Mod(sym, N) where
-    # N matches the stick stride.  This covers repeat ops where dep.index has
-    # the form k*ModularIndexing(d0,1,M) + ModularIndexing(d1,1,eps).
+    # Repeat/mod case: use find_repeat_vars to classify Mod-based variables.
+    # Covers repeat ops where dep.index has the form k*Mod(d0,M) + Mod(d1,eps).
     eps = stl.elems_per_stick()
-    for mod_expr in index.atoms(ModularIndexing):
-        base, divisor, modulus = mod_expr.args
-        if int(divisor) != 1:
-            continue
-        if not isinstance(base, sympy.Symbol) or base not in dep.ranges:
-            continue
-        mod_int = int(modulus)
-        if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
-            return base
-    for mod_expr in index.atoms(sympy.Mod):
-        base, modulus = mod_expr.args
-        if not isinstance(base, sympy.Symbol) or base not in dep.ranges:
-            continue
-        mod_int = int(modulus)
-        if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
-            return base
+    index_vars = {s: dep.ranges[s] for s in dep.ranges if s in index.free_symbols}
+    repeat_info = find_repeat_vars([index], index_vars)
+    for var, info in repeat_info.items():
+        if info["kind"] == "mod":
+            mod_int = int(info["modulus"])
+            if mod_int == stick_stride or (stick_stride == 1 and mod_int == eps):
+                return var
+        elif info["kind"] == "mul_mod":
+            if int(info["coeff"]) == stick_stride:
+                return var
     return None
 
 
