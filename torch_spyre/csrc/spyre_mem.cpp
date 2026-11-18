@@ -1219,6 +1219,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     if (ea_boundary.needed) {
       if (host2device) {
+        // The main dcsi_ reads from the intermediate padded buffer (offset 0),
+        // not the real host buffer.  Move cpu_offset to the pre_expand step,
+        // which reads from the real host buffer.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_src_ -= cpu_offset;
+        ea_boundary.boundary_dcsi.offset_src_ = cpu_offset;
         // Zero-pad the real-width host tensor before the shuffle runs.
         dci.pre_expand_dcsi_ = {ea_boundary.boundary_dcsi};
         dci.pre_input_shape_ = cpu_sizes;  // real, unpadded
@@ -1227,6 +1232,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
         dci.input_shape_ = padded_cpu_sizes;
         dci.output_shape_ = device_sizes;
       } else {
+        // The main dcsi_ writes to the intermediate padded buffer (offset 0),
+        // not the real host buffer.  Move cpu_offset to the post_slice step,
+        // which writes to the real host buffer.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_dst_ -= cpu_offset;
+        ea_boundary.boundary_dcsi.offset_dst_ = cpu_offset;
         // Slice the padded, now-unstaggered intermediate down to the host's
         // real width.
         dci.post_slice_dcsi_ = {ea_boundary.boundary_dcsi};
