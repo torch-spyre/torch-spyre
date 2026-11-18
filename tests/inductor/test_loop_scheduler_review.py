@@ -36,6 +36,8 @@ Each compiles on the device with the flow-through on and off.
 import contextlib
 import copy
 import unittest
+
+import regex as re
 from types import SimpleNamespace
 from unittest import mock
 
@@ -612,12 +614,13 @@ def test_cumsum_reading_a_body_buffer_runs_on_device():
 
 
 def test_structured_and_span_overflow_loops_in_one_graph():
-    """span-overflow stamps flat loop ops (stage 1b is held), which
-    ``build_loop_scheduler_nodes`` still groups.  Its ``group_idx_offset``
-    is computed inside the pass loop, against the flat view, so it sees the
-    structured loop's body ops and starts above their group id: the flat
-    loop is group 1, the LoopSchedulerNode group 0, and both reach the
-    kernel as separate counted loops."""
+    """span-overflow stamps its group above the structured loop's group id (its
+    ``group_idx_offset`` is computed inside the pass loop, against the flat view,
+    so it sees the structured loop's body ops), and since stage 7a.2 the pass loop
+    wraps that group in a ``LoopNode`` too: the structured loop is group 0, the
+    span-overflow loop group 1, both reach the scheduler as LoopSchedulerNodes and
+    the kernel as separate counted loops.  With the flow-through scheduler off both
+    are flat counted loops again."""
     torch.manual_seed(0)
     X, Y = _matmul_inputs()
     big = torch.randn(1, 8195, 256, 64, dtype=torch.float16)
@@ -676,15 +679,27 @@ def test_structured_and_span_overflow_loops_in_one_graph():
     acc, out, code = run(True)
     assert seen[True] == [
         ("LoopSchedulerNode", [(0,)]),
-        ("CountedLoopSchedulerNode", [(1,)]),
+        ("LoopSchedulerNode", [(1,)]),
     ], seen[True]
     assert seen[False] == [
         ("CountedLoopSchedulerNode", [(0,)]),
         ("CountedLoopSchedulerNode", [(1,)]),
     ], seen[False]
-    assert _HBM_POOL.sub(r"\g<1>N", _mask(code)) == _HBM_POOL.sub(
-        r"\g<1>N", _mask(code_flat)
-    )
+
+    # One comment in the generated file differs: the fused kernel's list of fx
+    # placeholders names the full output buffer a span-overflow copy-out mutates
+    # (``empty_default``) for a flat loop and not for a LoopSchedulerNode, which
+    # orders itself after that allocation through a dependency of its own. No kernel
+    # code differs.
+    def same_code(text):
+        text = re.sub(
+            r"(?m)^#\s+%empty_default\w* : Tensor .*PlaceHolder\[target=empty_default\w*\]\n",
+            "",
+            text,
+        )
+        return _HBM_POOL.sub(r"\g<1>N", _mask(text))
+
+    assert same_code(code) == same_code(code_flat)
     torch.testing.assert_close(acc, acc_flat, atol=0, rtol=0)
     torch.testing.assert_close(out, out_flat, atol=0, rtol=0)
     torch.testing.assert_close(
