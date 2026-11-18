@@ -2921,6 +2921,92 @@ def restickify_device_size(
     return new_device_size
 
 
+def _ve_elems_for_dims(device_size: list, valid_elements: dict, dims: list[int]) -> int:
+    """Valid element count for the variable spanning ``dims``.
+
+    If ``dims`` matches a ``valid_elements`` key exactly, returns that value
+    (accounts for padding).  If ``dims`` are a subset of a key and the only
+    missing dims are the stick dim, returns the key's value (the variable
+    tiles across the group including the stick).  Otherwise falls back to
+    ``prod(device_size[d])``.  Returns 1 for an empty dim list.
+    """
+    if not dims:
+        return 1
+    key = tuple(sorted(dims))
+    if key in valid_elements:
+        return valid_elements[key]
+    stick_dim = len(device_size) - 1
+    dim_set = set(dims)
+    for ve_key, ve_val in valid_elements.items():
+        if dim_set.issubset(ve_key) and set(ve_key) - dim_set == {stick_dim}:
+            return ve_val
+    return math.prod(device_size[d] for d in dims)
+
+
+def _device_dims_for_var(var, idc: list) -> list[int]:
+    """Return all device dims whose ``idc`` entry contains ``var``."""
+    return [j for j in range(len(idc)) if var in idc[j].free_symbols]
+
+
+def _stick_var_dims(
+    old_var_outer_dims: list[int],
+    old_sd_outer_dim: int,
+    stl: "SpyreTensorLayout",
+    idc: list,
+) -> list[int]:
+    """Device dims for the old stick variable, for ``_ve_elems_for_dims``.
+
+    When the variable has outer dims in ``idc``, those plus the stick dim form
+    the dim list.  When it has no outer dims (stick-only), the answer depends
+    on whether ``old_sd_outer_dim`` is in the stick's ``valid_elements`` group:
+
+    - If yes, the variable tiles across that group — return the full group key.
+    - If no and ``device_size[old_sd_outer_dim] > 1``, the outer dim has its
+      own ve group describing the variable — return that ve key.
+    - If no and ``device_size[old_sd_outer_dim] == 1``, the outer dim is a
+      dummy slot — return the stick ve group key (the var's element count is
+      described by that group, e.g. ``(2, 4): 128`` for a staggered layout).
+    """
+    stick_dim = len(idc) - 1
+    if old_var_outer_dims:
+        return old_var_outer_dims + [stick_dim]
+    stick_key = next((k for k in stl.valid_elements if stick_dim in k), (stick_dim,))
+    if old_sd_outer_dim in stick_key:
+        return list(stick_key)
+    if stl.device_size[old_sd_outer_dim] > 1:
+        outer_key = next(
+            (k for k in stl.valid_elements if old_sd_outer_dim in k),
+            (old_sd_outer_dim,),
+        )
+        return list(outer_key)
+    return list(stick_key)
+
+
+def restickify_device_size_new(
+    old_device_size: list,
+    old_sd_outer_dim: int,
+    new_sd_outer_dim: int,
+    stick_size: int,
+    old_var_dims: list[int],
+    new_var_dims: list[int],
+    valid_elements: dict,
+) -> list:
+    """Computes the new device size after restickify, using only device geometry.
+
+    ``old_var_dims`` and ``new_var_dims`` are the device dims carrying the
+    old and new variable respectively.  Empty means constant (element count 1).
+    Element counts are looked up from ``valid_elements`` groups covering those
+    dims.  No host sizes needed.
+    """
+    old_var_elems = _ve_elems_for_dims(old_device_size, valid_elements, old_var_dims)
+    new_var_elems = _ve_elems_for_dims(old_device_size, valid_elements, new_var_dims)
+    new_device_size = list(old_device_size)
+    new_device_size[-1] = stick_size
+    new_device_size[old_sd_outer_dim] = (new_var_elems + stick_size - 1) // stick_size
+    new_device_size[new_sd_outer_dim] = old_var_elems
+    return new_device_size
+
+
 def restickify_stride_map(
     old_stride_map: list,
     old_sd_outer_dim: int,
@@ -3081,6 +3167,31 @@ def compute_restickify_target_layout(
         new_sd_host_size,
         stick_size,
     )
+    old_var_dims = (
+        _stick_var_dims(old_var_outer_dims, old_sd_outer_dim, stl, idc)
+        if old_var is not None
+        else []
+    )
+    new_var_dims = _device_dims_for_var(new_var, idc)
+    _new_device_size = restickify_device_size_new(
+        old_device_size,
+        old_sd_outer_dim,
+        new_sd_outer_dim,
+        stick_size,
+        old_var_dims,
+        new_var_dims,
+        stl.valid_elements,
+    )
+    assert list(device_size) == _new_device_size, (
+        f"restickify_device_size mismatch: old={list(device_size)} "
+        f"new={_new_device_size} "
+        f"old_device_size={old_device_size} old_sd={old_sd_outer_dim} "
+        f"new_sd={new_sd_outer_dim} "
+        f"old_var_dims={old_var_dims} new_var_dims={new_var_dims} "
+        f"valid_elements={stl.valid_elements} "
+        f"old_sd_host_size={old_sd_host_size} new_sd_host_size={new_sd_host_size} "
+        f"stick_size={stick_size}"
+    )
     stride_map = restickify_stride_map(
         old_stride_map,
         old_sd_outer_dim,
@@ -3172,6 +3283,26 @@ def compute_size1_restickify_layout(
         new_sd_outer_dim,
         1,
         stick_size,
+    )
+    old_var_dims_s1 = _stick_var_dims(old_var_outer_dims, old_sd_outer_dim, stl, idc)
+    new_var_dims_s1: list[int] = []
+    _new_device_size_s1 = restickify_device_size_new(
+        list(stl.device_size),
+        old_sd_outer_dim,
+        new_sd_outer_dim,
+        stick_size,
+        old_var_dims_s1,
+        new_var_dims_s1,
+        stl.valid_elements,
+    )
+    assert list(device_size) == _new_device_size_s1, (
+        f"restickify_device_size mismatch (size1): old={list(device_size)} "
+        f"new={_new_device_size_s1} "
+        f"old_device_size={list(stl.device_size)} old_sd={old_sd_outer_dim} "
+        f"new_sd={new_sd_outer_dim} "
+        f"old_var_dims={old_var_dims_s1} new_var_dims={new_var_dims_s1} "
+        f"valid_elements={stl.valid_elements} "
+        f"old_sd_host_size={old_sd_host_size} stick_size={stick_size}"
     )
     stride_map = restickify_stride_map(
         list(stl.stride_map),
