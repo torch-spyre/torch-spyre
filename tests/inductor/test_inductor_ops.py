@@ -2208,6 +2208,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w192": (192,),
             },
         },
+        ("test_topk_wide_dim", "test_topk_wide_dim_int64_indices"): {
+            "param_sets": {
+                "n2048_k16": (2048, 16),
+                "n8192_k64": (8192, 64),
+                "n128256_k4": (128256, 4),
+            },
+        },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
             "param_sets": {
                 "k16_rows256_row_split": (256, 16),
@@ -11388,6 +11395,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(
             values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
         )
+
+    def test_topk_wide_dim_int64_indices(self, n: int, k: int):
+        # float32 indices are exact to 2**24, so a float32 topk gives exact int64
+        # indices at any width up to a full vocabulary (#5847). Each row holds
+        # k, k-1, ..., 1 at random positions on a zero background.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack([torch.randperm(n, generator=g)[:k] for _ in range(4)])
+        want = torch.arange(k, 0, -1).float().expand(4, k).contiguous()
+        x.scatter_(1, positions, want)
+
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=-1)
+            return values, indices.to(torch.int64)
+
+        values, indices = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        assert indices.dtype == torch.int64
+        assert torch.equal(values.cpu(), want)
+        assert torch.equal(indices.cpu(), positions)
+
+    @expects_raise
+    def test_topk_fp16_wide_dim_rejected(self):
+        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
+        # dim must be rejected instead of returning wrong indices (#5847).
+        x = torch.randn(4, 2048).half()
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

@@ -299,6 +299,39 @@ class TestItSpaceSplits(TestCase):
         self.assertIsNone(op.op_it_space_splits)
         self.assertTrue(hasattr(op, "iteration_space_ownership"))
 
+    def test_scheduler_transport_carries_both_axes_without_collision(self):
+        """The lossless counterpart to test_scheduler_transport_raises_on_
+        collision: distinct write-index coefficients pass the representability
+        check, so finalize commits both axes intact instead of raising."""
+
+        class Op:
+            def __init__(self):
+                self.op_it_space_splits = None
+                write = MemoryDep("out", 64 * i0 + 8 * i1, (i0, i1), (64, 8))
+                self.read_writes = type(
+                    "ReadWrites", (), {"writes": [write], "reads": []}
+                )()
+                self.iteration_space_ownership = TensorWorkDivision(
+                    {i0: 2, i1: 4}, {i0: sympy.Integer(0), i1: sympy.Integer(0)}
+                )
+
+            def get_name(self):
+                return "no_collision"
+
+            def get_read_writes(self):
+                return self.read_writes
+
+        op = Op()
+        graph = type("Graph", (), {"operations": [op]})()
+        with patch(
+            "torch_spyre._inductor.pass_utils.iteration_space_from_op",
+            return_value={i0: 8, i1: 8},
+        ):
+            finalize_work_division_for_scheduler(graph)
+
+        self.assertEqual(op.op_it_space_splits, ({64: 2, 8: 4}, {}))
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
 
 if __name__ == "__main__":
     run_tests()
