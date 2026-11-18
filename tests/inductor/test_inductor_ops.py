@@ -1094,6 +1094,25 @@ _PATTERN_TOL = {
 }
 
 
+def _stick_splitting_read_param_sets():
+    """``{case: (view, x)}`` for reads that split a stick."""
+    reads = {
+        "flat_8x65": ((8, 65), lambda a: a.reshape(-1)),
+        "flat_2x3x65": ((2, 3, 65), lambda a: a.reshape(-1)),
+        "flat_4x100": ((4, 100), lambda a: a.reshape(-1)),
+        "split_1x4x800_to_1x4x5x160": ((1, 4, 800), lambda a: a.reshape(1, 4, 5, 160)),
+        "merge_1x4x5x160_to_1x4x800": ((1, 4, 5, 160), lambda a: a.reshape(1, 4, 800)),
+        "reshape_1x2x4x8x7_to_1x8x56": (
+            (1, 2, 4, 8, 7),
+            lambda a: a.reshape(1, 8, 56),
+        ),
+    }
+    return {
+        name: (view, cached_randn(shape, differentiation="ssr"))
+        for name, (shape, view) in reads.items()
+    }
+
+
 def _pattern_param_sets():
     out = {}
 
@@ -2235,6 +2254,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w128": (128,),
                 "w160": (160,),
                 "w192": (192,),
+            },
+        },
+        ("test_topk_wide_dim", "test_topk_wide_dim_int64_indices"): {
+            "param_sets": {
+                "n2048_k16": (2048, 16),
+                "n8192_k64": (8192, 64),
+                "n128256_k4": (128256, 4),
             },
         },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
@@ -4803,6 +4829,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
                 ),
+            },
+        },
+        # A cat piece that needs a restickify is written straight into a slice of
+        # the cat buffer; the padding pass cannot pad such a write in place.
+        # TODO: restickify into a fresh buffer and copy it into the slice (the
+        # TODO in padding._pad_restickify_output); then this becomes a positive
+        # case.
+        (
+            "test_cat_of_reshapes",
+            "test_cat_of_reshapes_cpu",
+        ): {
+            "param_sets": {
+                "split_32x25600_to_32x160x160_dim1": (
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                ),
+            },
+            "expect_raise": {
+                "split_32x25600_to_32x160x160_dim1": "restickify written into a slice",
             },
         },
         (
@@ -9489,6 +9534,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Reads whose row or slice boundary falls inside a stick (64 fp16
+        # elements): issues #5197, #5198, #5227, #5872. A row of 160 elements is
+        # 2.5 sticks, as in the (1, 64, 25600) <-> (1, 64, 160, 160) reshape of
+        # #5227; a smaller tensor with the same row length exercises the same
+        # split and merge.
+        (
+            "test_stick_splitting_read_pointwise",
+            "test_stick_splitting_read_pointwise_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        (
+            "test_stick_splitting_read_reduction",
+            "test_stick_splitting_read_reduction_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        # #2851: a dtype conversion that reads a strided slice (stick coordinate
+        # 2*Mod(d1, 32)).
+        (
+            "test_stick_splitting_read_strided_to_dtype",
+            "test_stick_splitting_read_strided_to_dtype_cpu",
+        ): {
+            "param_sets": {
+                "step2_8x128_float_half": (
+                    cached_randn((8, 128), differentiation="ssr_2851"),
+                ),
+            },
+        },
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
@@ -11385,6 +11455,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
         )
 
+    def test_topk_wide_dim_int64_indices(self, n: int, k: int):
+        # float32 indices are exact to 2**24, so a float32 topk gives exact int64
+        # indices at any width up to a full vocabulary (#5847). Each row holds
+        # k, k-1, ..., 1 at random positions on a zero background.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack([torch.randperm(n, generator=g)[:k] for _ in range(4)])
+        want = torch.arange(k, 0, -1).float().expand(4, k).contiguous()
+        x.scatter_(1, positions, want)
+
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=-1)
+            return values, indices.to(torch.int64)
+
+        values, indices = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        assert indices.dtype == torch.int64
+        assert torch.equal(values.cpu(), want)
+        assert torch.equal(indices.cpu(), positions)
+
+    @expects_raise
+    def test_topk_fp16_wide_dim_rejected(self):
+        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
+        # dim must be rejected instead of returning wrong indices (#5847).
+        x = torch.randn(4, 2048).half()
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -12160,6 +12257,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, *tensors)
 
+    def test_cat_of_reshapes_cpu(self, a, b):
+        """``cat(1)`` of two reshapes that cut the stick dim (issue #5227's
+        ``(1, N, 25600) -> (1, N, 160, 160)``)."""
+
+        def fn(a, b):
+            return torch.cat(
+                [a.reshape(1, 32, 160, 160), b.reshape(1, 32, 160, 160)], dim=1
+            )
+
+        self.compare_with_cpu(fn, a, b, run_eager=False)
+
     def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
         def fn(a, b):
             return torch.cat([a, b], dim=-1).sum(dim=-1)
@@ -12439,6 +12547,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q.contiguous(), k.contiguous()
 
         self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
+
+    def test_stick_splitting_read_pointwise_cpu(self, view, x):
+        """A read whose row or slice boundary falls inside a stick (issues #5197,
+        #5198, #5227, #5872), compiled and eager.
+
+        ``(view * 2).exp()``, not ``view * 1.0``: the latter already passed on main.
+        """
+        self.compare_with_cpu(lambda a: (view(a) * 2).exp(), x, atol=0.5, rtol=0.1)
+
+    def test_stick_splitting_read_reduction_cpu(self, view, x):
+        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, rtol=0.1)
+
+    def test_stick_splitting_read_strided_to_dtype_cpu(self, x):
+        """``t[:, ::2].float().half()`` (issue #2851), compiled only.
+
+        The eager result of ``.float()`` is not comparable with the CPU even for
+        a dense tensor (see the D2H element-arrangement TODO in ``eager.py``).
+        """
+        self.compare_with_cpu(lambda a: a[:, ::2].float().half(), x, run_eager=False)
 
     # --- Migrated from test_ops.py ---
 

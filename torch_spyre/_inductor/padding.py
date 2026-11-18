@@ -62,6 +62,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -79,6 +80,7 @@ from .pass_utils import (
     device_coordinates,
     find_reduction_var,
     find_fx_node,
+    forward_valid_elements,
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
@@ -86,6 +88,7 @@ from .pass_utils import (
     lower_pad_sequence,
     op_read_writes,
     patch_env,
+    prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -624,6 +627,48 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     return next(iter(syms))
 
 
+def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
+    """Raise ``Unsupported`` for a restickify written straight into a slice of
+    another buffer (the pieces of a ``torch.cat``).
+
+    ``is_restickify_op`` needs a ``FixedTiledLayout`` output, and a write into a
+    slice has a ``MutationLayoutSHOULDREMOVE`` one, so the padding pass would skip
+    it.  Codegen still sees a restickify (``is_restickify_coords``) and asserts in
+    ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
+    which it never did.
+
+    Only a restickify with exactly one elided operand counts: that is the case the
+    codegen assert covers (one operand's within-stick coordinate has no loop
+    symbol).  When both operands carry one, the restore is a no-op and the slice
+    write compiles correctly (``torch.cat([a, b], -1).sum(-1)`` on
+    ``(32, 8, 16, 1)``, or the copy-back into a mutated graph input).
+
+    TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
+    copy it into the slice (see the TODO in ``_pad_restickify_output``); then
+    this check goes away.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
+        return
+    layout = op.get_layout()
+    if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+        return
+    real = layout.real_layout()
+    in_dep, _in_buf, in_layout = _restickify_input(op, graph)
+    if in_dep is None or not isinstance(real, FixedTiledLayout):
+        return
+    write_dep = _write_dep(op)
+    in_coords = device_coordinates(in_layout.device_layout, in_dep)
+    out_coords = device_coordinates(real.device_layout, write_dep)
+    if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
+        return
+    if bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols):
+        raise Unsupported(
+            f"insert_restickify_padding: restickify written into a slice of "
+            f"another buffer on {op.get_name()} (for example torch.cat of "
+            f"tensors that need a restickify) cannot be padded in place"
+        )
+
+
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     """Return whether ``op`` is a restickify: a single-input pointwise copy
     between two FixedTiledLayouts that lands a *different* host dim within the
@@ -670,7 +715,11 @@ def _pad_device_dim(
     new_device_size = list(stl.device_size)
     new_device_size[device_dim] = new_dim_size
     padded_stl = SpyreTensorLayout(
-        new_device_size, list(stl.stride_map), stl.device_dtype, stl.element_arrangement
+        new_device_size,
+        list(stl.stride_map),
+        stl.device_dtype,
+        forward_valid_elements(stl),
+        stl.element_arrangement,
     )
     host_size = [concretize_expr(s) for s in layout.size]
     host_stride = [concretize_expr(s) for s in layout.stride]
@@ -702,6 +751,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
         [stick, *stl.device_size],
         [0, *stl.stride_map],
         stl.device_dtype,
+        prepend_dim_valid_elements(stl, 1),
         stl.element_arrangement,
     )
     host_size = [concretize_expr(s) for s in layout.size]
@@ -904,9 +954,11 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
             f"dense flattened input coordinate {coord} requires a re-base copy"
         )
 
-    max_slice_start = coord.subs(stick_sym, 0)
+    max_slice_start = coord.xreplace({stick_sym: sympy.Integer(0)})
     for sym in syms - {stick_sym}:
-        max_slice_start = max_slice_start.subs(sym, concretize_expr(ranges[sym]) - 1)
+        max_slice_start = max_slice_start.xreplace(
+            {sym: sympy.Integer(concretize_expr(ranges[sym]) - 1)}
+        )
     return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
 
 
@@ -1004,6 +1056,7 @@ def lower_identity_clone(
         list(orig_stl.device_size),
         list(orig_stl.stride_map),
         orig_stl.device_dtype,
+        forward_valid_elements(orig_stl),
         orig_stl.element_arrangement,
     )
     # insert_restickify_padding runs after propagate_spyre_tensor_layouts, so
@@ -1192,6 +1245,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     symbol, so swapping the pass order fails loudly rather than silently.
     """
     for op in list(graph.operations):
+        _raise_if_sliced_restickify(op, graph)
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
