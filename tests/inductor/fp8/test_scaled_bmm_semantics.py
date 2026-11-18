@@ -198,11 +198,7 @@ class TestScaledBmmScales:
     def test_scale_dtypes(
         self, fvt_id, scale_a_dtype, scale_b_dtype, sencores, request
     ):
-        """Scale dtype pairs with out_dtype left at its default (None).
-
-        Today every case fails on #6053 (out_dtype=None rejected by the schema), so
-        this test exercises only that bug, and one case runs.
-        """
+        """Scale dtype pairs with out_dtype left at its default (None), giving fp16."""
         with _expect_known_failure(request):
             out, ref, absum = _run_exact(
                 fvt_id,
@@ -275,31 +271,47 @@ class TestScaledBmmBoundary:
         _cases("test_quantize_subnormals", _params(["SBQK-03"], cores=CORES_SEMANTIC)),
     )
     def test_quantize_subnormals(self, fvt_id, sencores, request):
-        """quantize_fp8_with_scale(x, 1.0) returns FP8-exact subnormals unchanged.
+        """quantize_fp8_with_scale(x, 1.0) keeps FP8-exact values, subnormals included.
 
         The quantize half of the "tiny" boundary case, without the matmul, so the
         quantizer (#6084) has a signal of its own; test_dma_round_trip_subnormals
-        does the same for the matmul's decode (#6067).
+        does the same for the matmul's decode (#6067). The result is read back
+        through dequantize_fp8_with_scale on the device: a .cpu() copy of the QFP8CH
+        quantize output comes back reordered. The first half of the rows hold normal
+        values, a control that any other cause of wrong values fails on its own.
         """
         with _expect_known_failure(request):
             _, mat1, _, _ = _CASES[fvt_id]
             u = cached_randn(mat1, differentiation=(fvt_id, "qsub"), abs=True).float()
-            mag = FP8_MIN_SUBNORMAL + (FP8_MIN_NORMAL - FP8_MIN_SUBNORMAL) * (
-                u.clamp(max=3.0) / 3.0
+            u = u.clamp(max=3.0) / 3.0
+            normal = torch.zeros(mat1, dtype=torch.bool)
+            normal[..., : mat1[-2] // 2, :] = True
+            mag = torch.where(
+                normal,
+                FP8_MIN_NORMAL + (FP8_E4M3FN_MAX - FP8_MIN_NORMAL) * u,
+                FP8_MIN_SUBNORMAL + (FP8_MIN_NORMAL - FP8_MIN_SUBNORMAL) * u,
             )
             x = (mag * _sign(mat1, (fvt_id, "qsub"))).to(FP8).float()
             one = torch.tensor(1.0, dtype=torch.float16)
 
             def fn(t, s):
-                return torch.ops.spyre.quantize_fp8_with_scale(t, s)
+                q = torch.ops.spyre.quantize_fp8_with_scale(t, s)
+                return torch.ops.spyre.dequantize_fp8_with_scale(q, s)
 
             with _cores(sencores):
-                q = _compile_and_run(fn, (x.to(torch.float16), one), DEVICE)
-            changed = q.float() != x
-            assert not changed.any(), (
-                f"{changed.sum().item()} / {x.numel()} subnormal values changed by "
-                f"quantize_fp8_with_scale ({(q.float()[changed] == 0).sum().item()} "
-                "of them to zero)"
+                out = _compile_and_run(fn, (x.to(torch.float16), one), DEVICE).float()
+            changed = out != x
+            n_normal = changed[normal].sum().item()
+            assert n_normal == 0, (
+                f"{n_normal} / {normal.sum().item()} normal values changed"
+            )
+            sub = ~normal
+            to_other = (changed & sub & (out != 0)).sum().item()
+            assert to_other == 0, f"{to_other} subnormal values changed to other values"
+            zeroed = (changed & sub).sum().item()
+            assert zeroed == 0, (
+                f"{zeroed} / {sub.sum().item()} subnormal values flushed to zero by "
+                "quantize_fp8_with_scale"
             )
 
 

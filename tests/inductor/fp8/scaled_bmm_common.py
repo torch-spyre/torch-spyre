@@ -39,7 +39,6 @@ import regex as re
 
 import pytest
 import torch
-from torch._dynamo.exc import TorchRuntimeError
 from torch._inductor.exc import InductorError
 from utils_inductor import (
     DEVICE,
@@ -556,7 +555,6 @@ class _KnownFailure(NamedTuple):
 _DT_EXCEPTION = "newPds.stickDimOrder_.size() == newPds.stickSize_.size()"
 _NO_STICK_MECHANISM = "no mechanism to resolve stick incompatibility"
 _OUTSIDE_BOUND = "elements outside"
-_OUT_DTYPE_NONE = "Expected a value of type 'int' for argument 'out_dtype'"
 
 # Order matters: a case takes the first entry that matches it (first match wins),
 # both in _expect_known_failure and in _cases' pruning. Put narrower patterns
@@ -624,10 +622,10 @@ _KNOWN_FAILURES = [
     ),
     _KnownFailure(
         "test_scale_dtypes",
-        r".*",
-        TorchRuntimeError,
-        _OUT_DTYPE_NONE,
-        "#6053: [fp8] scaled_bmm: out_dtype=None is rejected by the op schema",
+        r".*torch\.float32.*",
+        AssertionError,
+        "default out_dtype gave torch.float32",
+        "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values",
     ),
     _KnownFailure(
         "test_boundary",
@@ -641,15 +639,8 @@ _KNOWN_FAILURES = [
         "test_quantize_subnormals",
         r".*",
         AssertionError,
-        "subnormal values changed by quantize_fp8_with_scale",
+        "subnormal values flushed to zero by quantize_fp8_with_scale",
         "#6084: [fp8] quantize_fp8_with_scale corrupts E4M3 subnormal values",
-    ),
-    _KnownFailure(
-        "test_out_dtype",
-        r".*-None-cores\d+",
-        TorchRuntimeError,
-        _OUT_DTYPE_NONE,
-        "#6053: [fp8] scaled_bmm: out_dtype=None is rejected by the op schema",
     ),
     _KnownFailure(
         "test_out_dtype_bfloat16",
