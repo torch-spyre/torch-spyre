@@ -2962,23 +2962,19 @@ def _stick_var_dims(
     """Device dims for the old stick variable, for ``_ve_elems_for_dims``.
 
     When the variable has outer dims in ``idc``, those plus the stick dim form
-    the dim list.  When it has no outer dims (stick-only), the answer depends
-    on whether ``old_sd_outer_dim`` is in the stick's ``valid_elements`` group:
-
-    - If yes, the variable tiles across that group — return the full group key.
-    - If no and ``device_size[old_sd_outer_dim] > 1``, the outer dim has its
-      own ve group describing the variable — return that ve key.
-    - If no and ``device_size[old_sd_outer_dim] == 1``, the outer dim is a
-      dummy slot — return the stick ve group key ONLY if all non-stick dims
-      in the group carry the same variable as the stick (staggered layout).
-      When the group mixes variables (factorized layout), return just the
-      stick dim so the caller falls back to the host element count.
+    the dim list.  When it has no outer dims (stick-only), we look for a
+    ``valid_elements`` group that covers the stick dim AND whose non-stick
+    dims all carry the same variable as the stick (verified via ``idc``).
+    When the group mixes variables or includes constant dims, return just
+    the stick dim so the caller falls back to the host element count.
     """
     stick_dim = len(idc) - 1
     if old_var_outer_dims:
         return old_var_outer_dims + [stick_dim]
+    old_var_syms = idc[stick_dim].free_symbols
     stick_key = next((k for k in stl.valid_elements if stick_dim in k), (stick_dim,))
-    if old_sd_outer_dim in stick_key:
+    non_stick = [d for d in stick_key if d != stick_dim]
+    if non_stick and all(idc[d].free_symbols & old_var_syms for d in non_stick):
         return list(stick_key)
     if stl.device_size[old_sd_outer_dim] > 1:
         outer_key = next(
@@ -2986,10 +2982,6 @@ def _stick_var_dims(
             (old_sd_outer_dim,),
         )
         return list(outer_key)
-    old_var_syms = idc[stick_dim].free_symbols
-    non_stick = [d for d in stick_key if d != stick_dim]
-    if non_stick and all(idc[d].free_symbols & old_var_syms for d in non_stick):
-        return list(stick_key)
     return [stick_dim]
 
 
