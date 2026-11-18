@@ -788,7 +788,8 @@ Environment Variables
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
    * - ``MAX_BUCKETS``
-     - Maximum number of work division buckets (default ``32``)
+     - Maximum number of buckets, ``max / granularity``, a declared dimension
+       may have (default ``256``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
