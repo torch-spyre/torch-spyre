@@ -77,14 +77,24 @@ def test_the_plan_types_are_frozen_and_hold_only_positions():
 @contextlib.contextmanager
 def _before_tile_groups(before):
     """Call ``before(operations, groups, group_idx_offset)`` at every call of
-    ``tile_groups`` (the graph is still undivided), then let the lowering run."""
+    ``tile_groups`` (the graph is still undivided), then let the lowering run.
+
+    The spy sits where the planner's tilings are applied, so the pass keeps
+    every group and each op takes the planner's tiling. Under CP-SAT the solve
+    would otherwise take some groups (``bmm_output_tiled``) and apply them
+    elsewhere."""
     original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         before(graph.operations, groups, group_idx_offset)
         return original(graph, groups, group_idx_offset)
 
-    with mock.patch.object(passes, "tile_groups", spy):
+    with (
+        mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(
+            passes, "solve_decides_span_overflow_tiling", lambda graph: False
+        ),
+    ):
         yield
 
 

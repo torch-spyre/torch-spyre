@@ -297,6 +297,7 @@ from torch._inductor.dependencies import MemoryDep  # noqa: E402
 from torch._inductor.ir import Pointwise  # noqa: E402
 
 from torch_spyre._inductor import config, passes  # noqa: E402
+from torch_spyre._inductor.scratchpad import coarse_tiling  # noqa: E402
 from torch_spyre._inductor.wsr import loop_tiling_lowering as slt  # noqa: E402
 
 from test_span_overflow_gate import (  # noqa: E402
@@ -341,7 +342,10 @@ class _Looped:
 
 def _recording(run):
     """Run ``run()`` (a compile) with a spy on the lowering. Returns
-    ``(result, [_Looped])``."""
+    ``(result, [_Looped])``.
+
+    The spy sits where the pass calls the lowering and where the solve's apply
+    does, since under CP-SAT the solve tiles the groups it can take."""
     seen: list[_Looped] = []
     original = passes.tile_groups
 
@@ -358,6 +362,7 @@ def _recording(run):
 
     patches = [
         mock.patch.object(passes, "tile_groups", spy),
+        mock.patch.object(coarse_tiling, "tile_groups", spy),
     ]
     with contextlib_exit_stack(patches):
         return run(), seen

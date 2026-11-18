@@ -875,7 +875,10 @@ scheduler/codegen lower the resulting nested `LoopNode`s as nested counted loops
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups` and `tile_groups` run.
+   `validate_coarse_tile_groups` and `tile_groups` run. Under CP-SAT, LX planning
+   calls the planner instead, and an op whose tiling the solve picks gets no
+   hints (see
+   [Span-overflow tiling in the solve](scratchpad_planning.md#span-overflow-tiling-in-the-solve)).
 
 From the lowering onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
 
