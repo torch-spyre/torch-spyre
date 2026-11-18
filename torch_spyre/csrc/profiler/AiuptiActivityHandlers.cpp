@@ -202,6 +202,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollBroadcast";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
       return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return "aiuCommsCollReduceScatter";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
       return "aiuCommsWorkSchedStart";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
@@ -374,8 +376,8 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
   }
 }
 
-// Runtime-record detail: transfer direction and conversion data formats. Newer than the other runtime fields, so detected rather than
-// assumed.
+// Runtime-record detail: transfer direction and conversion data formats. Newer
+// than the other runtime fields, so detected rather than assumed.
 template <class T, class = void>
 struct HasRuntimeDetailFields : std::false_type {};
 template <class T>
@@ -387,8 +389,7 @@ struct HasRuntimeDetailFields<
 // dtype_src / dtype_dst carry the deeptools DataFormats value + 1; 0 = none.
 inline std::string runtimeDtypeName(uint8_t dtype) {
   const int format = static_cast<int>(dtype) - 1;
-  if (format >= 0 &&
-      format < static_cast<int>(DataFormats::NUM_DATA_FORMATS)) {
+  if (format >= 0 && format < static_cast<int>(DataFormats::NUM_DATA_FORMATS)) {
     return EnumsConversion::dataFormatsToString(
         static_cast<DataFormats>(format));
   }
