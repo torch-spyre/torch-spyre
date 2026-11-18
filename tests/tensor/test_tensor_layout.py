@@ -641,10 +641,6 @@ class TestSpyreTensorLayout(TestCase):
         self, sizes, strides, device_size, stride_map, valid_elements
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
-        if valid_elements is None:
-            valid_elements = _valid_elements_from_host(
-                sizes, strides, device_size, stride_map
-            )
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,

@@ -30,7 +30,6 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -68,74 +67,17 @@ std::vector<int64_t> contiguous_device_strides(const SpyreTensorLayout& stl) {
   return strides;
 }
 
-// A dimension of the physical allocation behind a layout, recovered from its
-// stride_map: all device dims sharing one host stride form one allocation dim.
-struct AllocDim {
-  int64_t stride;  // host stride of the dim
-  int64_t size;    // device extent (max over dims sharing the stride)
-  // Host distance from one index of this dim to the next. For the stick dim
-  // this is the valid row width (valid_elements), not the device stick size,
-  // so a slice that spans a stick boundary is seen in host coordinates.
-  int64_t pitch;
-  // Host strides of the finer tiles inside this dim, ascending. A tile that
-  // starts at one of these strides is split across device dims.
-  std::vector<int64_t> tile_strides;
-};
-
-// Allocation dims of `stl`, coarsest stride first.
-std::vector<AllocDim> allocation_dims(const SpyreTensorLayout& stl) {
-  std::map<int64_t, int64_t, std::greater<int64_t>> size_of_stride;
-  for (size_t k = 0; k < stl.stride_map.size(); k++) {
-    const int64_t stride = stl.stride_map[k];
-    if (stride <= 0) continue;
-    auto [it, inserted] = size_of_stride.emplace(stride, stl.device_size[k]);
-    if (!inserted) it->second = std::max(it->second, stl.device_size[k]);
-  }
-
-  // Host row width of each stick pair {outer, inner}: its valid count. The
-  // pitch of the dim carrying the inner stride is that width, so a slice
-  // crossing a stick is judged in host coordinates. Other dims keep
-  // size * stride.
-  std::map<int64_t, int64_t> row_width_of_stride;
-  for (const auto& [dims, count] : stl.valid_elements) {
-    if (dims.size() != 2) continue;
-    const int64_t inner_stride = stl.stride_map[dims[1]];
-    if (inner_stride > 0) row_width_of_stride[inner_stride] = count;
-  }
-
-  std::vector<AllocDim> dims;
-  dims.reserve(size_of_stride.size());
-  for (const auto& [stride, size] : size_of_stride) {
-    const auto width = row_width_of_stride.find(stride);
-    const int64_t pitch =
-        width != row_width_of_stride.end() ? width->second : stride * size;
-    AllocDim dim{stride, size, pitch, {}};
-    for (const int64_t other : stl.stride_map) {
-      if (other >= stride && other < pitch) {
-        dim.tile_strides.push_back(other);
-      }
-    }
-    std::sort(dim.tile_strides.begin(), dim.tile_strides.end());
-    dim.tile_strides.erase(
-        std::unique(dim.tile_strides.begin(), dim.tile_strides.end()),
-        dim.tile_strides.end());
-    dims.push_back(std::move(dim));
-  }
-  return dims;
-}
-
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
  * The number of elements moved along each device dim comes from
  * stl.valid_elements:
- *   - singleton {j}: min(count, device_size[j]);
+ *   - singleton {j}: min(count, device_size[j]) when stride_map[j] > 0;
  *   - stick pair {outer, inner} holding V elements: inner moves
  *     min(V, inner_size) and outer moves V / inner_size full rows. When
  *     V % inner_size != 0 the last, partial row is a second descriptor.
- * Broadcast dims (stride_map == 0 matched by an expanded host dim) move their
- * full device extent; size-1 or sparse dims (stride_map == 0 otherwise) move
- * one element.
+ * A dim with stride_map == 0 (a broadcast) is not capped by its key and moves
+ * its full device extent.
  *
  * @param cpu_offset: storage offset of the CPU tensor
  * @param device_offset: storage offset of the dev tensor
@@ -146,87 +88,71 @@ std::vector<AllocDim> allocation_dims(const SpyreTensorLayout& stl) {
 auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
                              const SpyreTensorLayout& stl, bool host2device)
     -> std::vector<DataConversionStrideInfo> {
-  const int device_rank = static_cast<int>(stl.stride_map.size());
-  const std::vector<int64_t> device_strides = contiguous_device_strides(stl);
-
-  // Host stride of each device dim; dims without a host stride move 1 element.
-  std::vector<int64_t> host_strides(device_rank, 1);
-  std::vector<int64_t> sizes(device_rank, 1);
-  for (int i = 0; i < device_rank; i++) {
-    TORCH_CHECK(stl.device_size[i] >= 0, "Invalid device size ",
-                stl.device_size[i], " for device dimension ", i);
-    // Every stride is non-negative after construction. A zero stride is a
-    // broadcast or a size-1 dim; its host stride is kept, and a valid_elements
-    // key below sets its size.
-    host_strides[i] = stl.stride_map[i];
-    sizes[i] = stl.device_size[i];
+  for (const int64_t size : stl.device_size) {
+    TORCH_CHECK(size >= 0, "Invalid device size ", size);
   }
-
-  // The partial last stick row of a stick pair, if any: it covers one outer
-  // row and `leftover` inner elements, starting after the full rows.
-  struct Remainder {
-    int outer;
-    int inner;
-    int64_t leftover;        // valid elements in the partial row
-    int64_t full_row_count;  // rows before the partial one
-  };
-  std::optional<Remainder> remainder;
+  const std::vector<int64_t> device_strides = contiguous_device_strides(stl);
+  // Every stride is non-negative after construction. A zero stride is a
+  // broadcast or a size-1 dim.
+  const std::vector<int64_t>& host_strides = stl.stride_map;
+  std::vector<int64_t> sizes = stl.device_size;
 
   for (const auto& [dims, count] : stl.valid_elements) {
-    TORCH_CHECK(dims.size() == 1 || dims.size() == 2,
-                "valid_elements key with ", dims.size(),
-                " dims is not supported; only singleton {j} and stick-pair "
-                "{outer, inner} keys are valid");
-    if (dims.size() == 1) {
-      const int j = static_cast<int>(dims[0]);
-      if (stl.stride_map[j] > 0) sizes[j] = std::min(count, stl.device_size[j]);
-      continue;
-    }
-    const int outer = static_cast<int>(dims[0]);
-    const int inner = static_cast<int>(dims[1]);
-    const int64_t inner_size = stl.device_size[inner];
+    if (dims.size() != 1) continue;
+    const int64_t j = dims[0];
+    if (stl.stride_map[j] > 0) sizes[j] = std::min(count, stl.device_size[j]);
+  }
+
+  // The first stick pair with a partial last row, if any: that row covers one
+  // outer index and `count % inner_size` inner elements, after the full rows.
+  std::optional<StickPair> partial_pair;
+  for (const StickPair& pair : stick_pairs(stl)) {
+    const int64_t inner_size = stl.device_size[pair.inner];
     TORCH_CHECK(inner_size > 0, "Invalid device size ", inner_size,
-                " for device dimension ", inner);
-    sizes[inner] = std::min(count, inner_size);
-    sizes[outer] = count / inner_size;
-    if (count % inner_size != 0) {
-      TORCH_CHECK(!remainder.has_value(),
+                " for device dimension ", pair.inner);
+    sizes[pair.inner] = std::min(pair.count, inner_size);
+    sizes[pair.outer] = pair.count / inner_size;
+    if (pair.count % inner_size != 0) {
+      TORCH_CHECK(!partial_pair.has_value(),
                   "valid_elements has more than one partial stick row");
-      remainder = Remainder{outer, inner, count % inner_size, sizes[outer]};
+      partial_pair = pair;
     }
   }
 
-  DataConversionStrideInfo bulk;  // all the full rows
-  bulk.size_ = sizes;
-  bulk.stride_src_ = host2device ? host_strides : device_strides;
-  bulk.stride_dst_ = host2device ? device_strides : host_strides;
-  bulk.offset_src_ = host2device ? cpu_offset : device_offset;
-  bulk.offset_dst_ = host2device ? device_offset : cpu_offset;
-
-  std::vector<DataConversionStrideInfo> stride_infos;
-  // With no full row (valid count below one stick) only the remainder moves.
-  const bool has_full_rows = std::none_of(sizes.begin(), sizes.end(),
-                                          [](int64_t s) { return s == 0; });
-  if (has_full_rows) stride_infos.push_back(bulk);
-
-  if (remainder) {
-    DataConversionStrideInfo partial = bulk;
-    partial.size_[remainder->inner] = remainder->leftover;
-    partial.size_[remainder->outer] = 1;
-    const int64_t host_off =
-        remainder->full_row_count * host_strides[remainder->outer];
-    const int64_t dev_off =
-        remainder->full_row_count * device_strides[remainder->outer];
-    partial.offset_src_ += host2device ? host_off : dev_off;
-    partial.offset_dst_ += host2device ? dev_off : host_off;
-    stride_infos.push_back(std::move(partial));
-  }
-
-  // The descriptors list the innermost device dim first.
-  for (auto& info : stride_infos) {
+  // Builds one descriptor. The descriptors list the innermost device dim
+  // first, the reverse of PyTorch ordering.
+  const auto make_info = [&](std::vector<int64_t> info_sizes,
+                             int64_t host_offset, int64_t device_off) {
+    DataConversionStrideInfo info;
+    info.size_ = std::move(info_sizes);
+    info.stride_src_ = host2device ? host_strides : device_strides;
+    info.stride_dst_ = host2device ? device_strides : host_strides;
+    info.offset_src_ = host2device ? host_offset : device_off;
+    info.offset_dst_ = host2device ? device_off : host_offset;
     std::reverse(info.size_.begin(), info.size_.end());
     std::reverse(info.stride_src_.begin(), info.stride_src_.end());
     std::reverse(info.stride_dst_.begin(), info.stride_dst_.end());
+    return info;
+  };
+
+  std::vector<DataConversionStrideInfo> stride_infos;
+  // With no full row (valid count below one stick) only the partial row moves.
+  const bool has_full_rows = std::none_of(sizes.begin(), sizes.end(),
+                                          [](int64_t s) { return s == 0; });
+  if (has_full_rows) {
+    stride_infos.push_back(make_info(sizes, cpu_offset, device_offset));
+  }
+
+  if (partial_pair) {
+    const int64_t full_rows = sizes[partial_pair->outer];
+    std::vector<int64_t> partial_sizes = sizes;
+    partial_sizes[partial_pair->inner] =
+        partial_pair->count % stl.device_size[partial_pair->inner];
+    partial_sizes[partial_pair->outer] = 1;
+    stride_infos.push_back(make_info(
+        std::move(partial_sizes),
+        cpu_offset + full_rows * host_strides[partial_pair->outer],
+        device_offset + full_rows * device_strides[partial_pair->outer]));
   }
   return stride_infos;
 }
@@ -271,83 +197,106 @@ int64_t device_offset_for_storage_offset(const SpyreTensorLayout& stl,
   return device_offset;
 }
 
+// Device extent at each positive host stride of `stl`: the largest device_size
+// among the device dims sharing that stride.
+std::map<int64_t, int64_t> device_extent_by_stride(
+    const SpyreTensorLayout& stl) {
+  std::map<int64_t, int64_t> extent;
+  for (size_t k = 0; k < stl.stride_map.size(); k++) {
+    const int64_t stride = stl.stride_map[k];
+    if (stride <= 0) continue;
+    auto [it, inserted] = extent.emplace(stride, stl.device_size[k]);
+    if (!inserted) it->second = std::max(it->second, stl.device_size[k]);
+  }
+  return extent;
+}
+
+// What cap_valid_elements_to_view needs to know about a view.
+struct ViewStrides {
+  std::set<int64_t> used;  // positive strides of the view
+  // Layout stride -> view size. Equal strides keep the larger size, since
+  // unsqueeze(-1) repeats the inner stride on a size-1 dim.
+  std::map<int64_t, int64_t> size_at_stride;
+  int64_t numel = 1;
+};
+
+ViewStrides analyze_view_strides(
+    const std::map<int64_t, int64_t>& layout_extent,
+    const std::vector<int64_t>& view_sizes,
+    const std::vector<int64_t>& view_strides) {
+  ViewStrides view;
+  for (const int64_t size : view_sizes) view.numel *= size;
+  for (size_t i = 0; i < view_sizes.size(); i++) {
+    const int64_t stride = view_strides[i];
+    if (stride <= 0) continue;
+    view.used.insert(stride);
+    if (!layout_extent.contains(stride)) continue;
+    // A view dim above a stride the layout does not have (b.view(64, 8, 512)
+    // adds stride 4096 over layout stride 512) leaves the layout's count.
+    const bool foreign_dim_above =
+        std::ranges::any_of(view_strides, [&](int64_t other) {
+          return other > stride && !layout_extent.contains(other);
+        });
+    if (foreign_dim_above) continue;
+    auto [it, inserted] = view.size_at_stride.emplace(stride, view_sizes[i]);
+    if (!inserted) it->second = std::max(it->second, view_sizes[i]);
+  }
+  return view;
+}
+
+// True when the view holds every layout stride at its full device extent, so
+// it is the whole allocation and no valid element lies outside it.
+bool view_covers_layout(const std::map<int64_t, int64_t>& layout_extent,
+                        const std::vector<int64_t>& view_sizes,
+                        const std::vector<int64_t>& view_strides) {
+  return std::ranges::all_of(layout_extent, [&](const auto& stride_extent) {
+    for (size_t i = 0; i < view_sizes.size(); i++) {
+      if (view_strides[i] == stride_extent.first &&
+          view_sizes[i] == stride_extent.second) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+// The count a valid_elements key keeps in `view`. `finest` is the key's finest
+// positive stride_map value (for a stick pair, the host stick stride).
+int64_t capped_count(int64_t count, int64_t finest, const ViewStrides& view) {
+  if (view.used.contains(finest)) {
+    // The view has a dim at this stride: it limits the count to its size.
+    const auto size = view.size_at_stride.find(finest);
+    return size != view.size_at_stride.end() ? std::min(count, size->second)
+                                             : count;
+  }
+  // The view has no dim at this stride. A stick key (finest stride 1) is then
+  // indexed away. Any other key is still covered when the view holds the
+  // count * finest host elements it spans (a flattened view walks through the
+  // device dims below its innermost contiguous run); otherwise it is indexed
+  // away and one element (or row) remains.
+  if (finest == 1 || view.numel < count * finest) return 1;
+  return count;
+}
+
 // Caps each valid_elements count of `stl` to what the view (view_sizes,
 // view_strides) covers: a slice, or a view into a padded allocation, moves
-// fewer elements than the layout describes.
-//
-// A key is matched to a view dim through its finest positive stride_map value
-// (for a stick pair, the host stick stride). If no view dim has that stride the
-// view indexed it away, so one element (or row) remains. If the view has a
-// dim above it that is not an allocation dim (b.view(64, 8, 512) adds stride
-// 4096 over allocation stride 512), the key keeps the allocation's count.
+// fewer elements than the layout describes. A key is matched to a view dim
+// through its finest positive stride_map value.
 void cap_valid_elements_to_view(SpyreTensorLayout& stl,
                                 const std::vector<int64_t>& view_sizes,
                                 const std::vector<int64_t>& view_strides) {
-  const std::vector<AllocDim> alloc = allocation_dims(stl);
-  std::set<int64_t> alloc_strides;
-  for (const AllocDim& dim : alloc) {
-    alloc_strides.insert(dim.stride);
-  }
-  // A view that holds every allocation dim at full size is the whole
-  // allocation, so no valid element is outside it and nothing is capped.
-  const bool covers_allocation =
-      std::ranges::all_of(alloc, [&](const AllocDim& d) {
-        for (size_t i = 0; i < view_sizes.size(); i++) {
-          if (view_strides[i] == d.stride && view_sizes[i] == d.size)
-            return true;
-        }
-        return false;
-      });
-  if (covers_allocation) return;
-
-  const size_t view_rank = view_sizes.size();
-  std::set<int64_t> used_strides;
-  // Allocation stride -> view size. Equal strides keep the larger size, since
-  // unsqueeze(-1) repeats the inner stride on a size-1 dim.
-  std::map<int64_t, int64_t> size_at_stride;
-  for (size_t i = 0; i < view_rank; i++) {
-    const int64_t stride = view_strides[i];
-    if (stride <= 0) continue;
-    used_strides.insert(stride);
-    if (!alloc_strides.contains(stride)) continue;
-    const bool non_alloc_dim_above =
-        std::ranges::any_of(view_strides, [&](int64_t other) {
-          return other > stride && !alloc_strides.contains(other);
-        });
-    if (non_alloc_dim_above) continue;
-    auto [it, inserted] = size_at_stride.emplace(stride, view_sizes[i]);
-    if (!inserted) it->second = std::max(it->second, view_sizes[i]);
-  }
-
-  int64_t view_numel = 1;
-  for (int64_t size : view_sizes) view_numel *= size;
+  const std::map<int64_t, int64_t> layout_extent = device_extent_by_stride(stl);
+  if (view_covers_layout(layout_extent, view_sizes, view_strides)) return;
+  const ViewStrides view =
+      analyze_view_strides(layout_extent, view_sizes, view_strides);
 
   for (auto& [dims, count] : stl.valid_elements) {
-    int64_t finest = std::numeric_limits<int64_t>::max();
-    for (int64_t d : dims) {
-      if (stl.stride_map[d] > 0) finest = std::min(finest, stl.stride_map[d]);
+    std::optional<int64_t> finest;
+    for (const int64_t d : dims) {
+      const int64_t stride = stl.stride_map[d];
+      if (stride > 0 && (!finest || stride < *finest)) finest = stride;
     }
-    if (finest == std::numeric_limits<int64_t>::max()) continue;
-    // A key whose stride the view does not use is still covered when that
-    // stride lies inside the view's innermost contiguous run (the stride-1 dim,
-    // of length `run`): a flattened view walks through the device dims below
-    // its run. A stride at or past the run's end is indexed away.
-    if (!used_strides.contains(finest)) {
-      // A view with no stride-1 dim cannot reach any stick position, so a key
-      // holding the stick (finest stride 1) is indexed away entirely.
-      // Otherwise stride_map holds host strides, so the key spans count *
-      // finest host elements, and the view covers it when it holds at least
-      // that many.
-      const bool has_stride_one = used_strides.contains(1);
-      if (finest == 1 && !has_stride_one) {
-        count = 1;
-      } else if (view_numel < count * finest) {
-        count = 1;
-      }
-    } else if (auto it = size_at_stride.find(finest);
-               it != size_at_stride.end()) {
-      count = std::min(count, it->second);
-    }
+    if (finest) count = capped_count(count, *finest, view);
   }
 }
 
@@ -596,13 +545,15 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   // `stl` is this call's copy; the tensor's own layout is untouched.
   cap_valid_elements_to_view(stl, view_sizes, view_strides);
-  if (host2device && cpu_strides != view_strides) {
-    stl.stride_map =
-        stride_map_for_host_strides(stl, cpu_sizes, cpu_strides, view_strides);
-  } else if (!host2device && cpu_strides != view_strides) {
-    // D2H applies only the view-stride rebase: the staged buffer is the stored
-    // allocation, so the expand and slice rescaling is not needed.
-    rebase_view_strides(stl.stride_map, stl, cpu_strides, view_strides);
+  if (cpu_strides != view_strides) {
+    if (host2device) {
+      stl.stride_map = stride_map_for_host_strides(stl, cpu_sizes, cpu_strides,
+                                                   view_strides);
+    } else {
+      // D2H applies only the view-stride rebase: the staged buffer is the
+      // stored allocation, so the expand and slice rescaling is not needed.
+      rebase_view_strides(stl.stride_map, stl, cpu_strides, view_strides);
+    }
   }
 
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
@@ -1279,26 +1230,72 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
 
 namespace {
 
+// A dimension of the layout seen in host strides, for deciding whether a view
+// can be read in place. All device dims sharing one host stride form one
+// TileDim. For the [40, 60] tensor stored as device [8, 5, 64] with stride_map
+// [300, 60, 1] there are three: stride 300 (size 8), 60 (size 5) and 1 (size
+// 64, pitch 60: a row holds 60 valid elements).
+struct TileDim {
+  int64_t stride;  // host stride of the dim
+  int64_t size;    // device extent (max over dims sharing the stride)
+  // Host distance from one index of this dim to the next. For the stick dim
+  // this is the valid row width (valid_elements), not the device stick size,
+  // so a slice that spans a stick boundary is seen in host coordinates.
+  int64_t pitch;
+  // Host strides of the finer tiles inside this dim, ascending. A tile that
+  // starts at one of these strides is split across device dims.
+  std::vector<int64_t> tile_strides;
+};
+
+// Tile dims of `stl`, coarsest stride first.
+std::vector<TileDim> tile_dims(const SpyreTensorLayout& stl) {
+  const std::map<int64_t, int64_t> extent = device_extent_by_stride(stl);
+
+  // Host row width of each stick pair: its valid count. The pitch of the dim
+  // carrying the inner stride is that width. Other dims keep size * stride.
+  std::map<int64_t, int64_t> row_width_of_stride;
+  for (const StickPair& pair : stick_pairs(stl)) {
+    const int64_t inner_stride = stl.stride_map[pair.inner];
+    if (inner_stride > 0) row_width_of_stride[inner_stride] = pair.count;
+  }
+
+  std::vector<TileDim> dims;
+  dims.reserve(extent.size());
+  for (auto it = extent.rbegin(); it != extent.rend(); ++it) {
+    const auto [stride, size] = *it;
+    const auto width = row_width_of_stride.find(stride);
+    const int64_t pitch =
+        width != row_width_of_stride.end() ? width->second : stride * size;
+    TileDim dim{stride, size, pitch, {}};
+    for (const auto& stride_extent : extent) {
+      const int64_t other = stride_extent.first;
+      if (other >= stride && other < pitch) dim.tile_strides.push_back(other);
+    }
+    dims.push_back(std::move(dim));
+  }
+  return dims;
+}
+
 // True when a view with positive strides, smaller than its layout's stored
 // elements, cannot be read in place: it starts inside a tile of a tiled dim and
-// runs past the end of that tile, or it splits an allocation dim into dims that
+// runs past the end of that tile, or it splits a layout dim into dims that
 // do not cover all of it (a slice, or a view that drops part of the dim).
-bool view_needs_staging(const std::vector<AllocDim>& alloc_dims,
+bool view_needs_staging(const std::vector<TileDim>& dims,
                         c10::IntArrayRef sizes, c10::IntArrayRef strides,
                         int64_t storage_offset) {
-  // Per allocation dim: the product of the view sizes that land in it, and
+  // Per layout dim: the product of the view sizes that land in it, and
   // whether any of them is a plain split of the dim (not at a tile stride).
-  std::vector<int64_t> covered(alloc_dims.size(), 1);
-  std::vector<bool> split(alloc_dims.size(), false);
+  std::vector<int64_t> covered(dims.size(), 1);
+  std::vector<bool> split(dims.size(), false);
   for (size_t i = 0; i < sizes.size(); i++) {
     const int64_t stride = strides[i];
     const int64_t size = sizes[i];
     if (size == 1) continue;
-    for (size_t j = 0; j < alloc_dims.size(); j++) {
-      const int64_t pitch = alloc_dims[j].pitch;
-      if (stride < alloc_dims[j].stride || stride >= pitch) continue;
+    for (size_t j = 0; j < dims.size(); j++) {
+      const int64_t pitch = dims[j].pitch;
+      if (stride < dims[j].stride || stride >= pitch) continue;
       covered[j] *= size;
-      const auto& tiles = alloc_dims[j].tile_strides;
+      const auto& tiles = dims[j].tile_strides;
       const auto tile = std::ranges::find(tiles, stride);
       if (tile == tiles.end()) {
         split[j] = true;
@@ -1313,8 +1310,8 @@ bool view_needs_staging(const std::vector<AllocDim>& alloc_dims,
       break;
     }
   }
-  for (size_t j = 0; j < alloc_dims.size(); j++) {
-    if (split[j] && covered[j] != alloc_dims[j].size) return true;
+  for (size_t j = 0; j < dims.size(); j++) {
+    if (split[j] && covered[j] != dims[j].size) return true;
   }
   return false;
 }
@@ -1348,7 +1345,7 @@ bool needs_host_staging(const at::Tensor& self, const SpyreTensorLayout& stl) {
   // A view covering every stored element is a plain DMA.
   if (valid_element_count(stl) == self.numel()) return false;
   // Only this last check needs the allocation geometry.
-  return view_needs_staging(allocation_dims(stl), self.sizes(), self.strides(),
+  return view_needs_staging(tile_dims(stl), self.sizes(), self.strides(),
                             self.storage_offset());
 }
 
@@ -1359,15 +1356,29 @@ void copy_view_via_host_allocation(const at::Tensor& self,
                                    const at::Tensor& dst,
                                    const SpyreTensorLayout& stl,
                                    SpyreStream& stream) {
-  std::vector<int64_t> alloc_sizes;
-  std::vector<int64_t> alloc_strides;
-  for (const AllocDim& dim : allocation_dims(stl)) {
-    alloc_sizes.push_back(dim.size);
-    alloc_strides.push_back(dim.stride);
+  // The layout's strides are host storage strides, as are the view's, so a flat
+  // host buffer spanning the layout holds each element at its storage index and
+  // the view applies to it directly. Spanning is the furthest host element any
+  // device dim reaches, bounded by the storage.
+  int64_t extent = 1;
+  for (size_t j = 0; j < stl.stride_map.size(); j++) {
+    if (stl.stride_map[j] > 0) {
+      extent = std::max(extent, stl.device_size[j] * stl.stride_map[j]);
+    }
   }
+  extent =
+      std::min<int64_t>(extent, self.storage().nbytes() / self.element_size());
+  // The view must lie inside the staged span, or as_strided below reads past
+  // the host buffer.
+  int64_t reach = self.storage_offset() + 1;
+  for (int64_t i = 0; i < self.dim(); i++) {
+    reach += (self.size(i) - 1) * self.stride(i);
+  }
+  TORCH_CHECK(reach <= extent, "View reaches host element ", reach,
+              " outside the staged layout span of ", extent, " elements");
   const at::Tensor device_alloc =
-      at::as_strided(self, alloc_sizes, alloc_strides, /*storage_offset=*/0);
-  const at::Tensor host_alloc = at::empty(alloc_sizes, dst.options());
+      at::as_strided(self, {extent}, {1}, /*storage_offset=*/0);
+  const at::Tensor host_alloc = at::empty({extent}, dst.options());
 
   stream.copyAsync(device_alloc, host_alloc);
   stream.synchronize();

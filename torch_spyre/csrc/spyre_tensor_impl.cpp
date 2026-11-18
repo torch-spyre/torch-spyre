@@ -162,8 +162,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     groups[host_dim].push_back(static_cast<int64_t>(dev_idx));
   };
 
-  // Process each device dimension: update stride map and group by host dim.
-  // Trailing within-stick dimension first (finest granularity).
   update_stride(stick_dim, host_rank);
   update_valid_elements(stick_dim, host_rank);
 
@@ -213,7 +211,6 @@ std::string SpyreTensorLayout::toString() const {
       ss << dims[i];
       if (i + 1 < dims.size()) ss << ", ";
     }
-    // Single-element tuples need trailing comma in Python
     if (dims.size() == 1) ss << ",";
     ss << "): " << size;
   }
@@ -373,6 +370,18 @@ int64_t valid_element_count(const SpyreTensorLayout& stl) {
   int64_t count = 1;
   for (const auto& [dims, valid] : stl.valid_elements) count *= valid;
   return count;
+}
+
+std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl) {
+  std::vector<StickPair> pairs;
+  for (const auto& [dims, count] : stl.valid_elements) {
+    TORCH_CHECK(dims.size() == 1 || dims.size() == 2,
+                "valid_elements key with ", dims.size(),
+                " dims is not supported; only singleton {j} and stick-pair "
+                "{outer, inner} keys are valid");
+    if (dims.size() == 2) pairs.push_back({dims[0], dims[1], count});
+  }
+  return pairs;
 }
 
 void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,

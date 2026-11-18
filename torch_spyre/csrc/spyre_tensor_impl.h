@@ -440,6 +440,18 @@ std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
 // the valid_elements values (a stick-pair key counts once).
 int64_t valid_element_count(const SpyreTensorLayout& stl);
 
+// A two-dim valid_elements key {outer, inner}: the stick pair. `count` is the
+// number of valid elements across both dims together.
+struct StickPair {
+  int64_t outer;
+  int64_t inner;
+  int64_t count;
+};
+
+// The stick pairs of `stl`, in key order. Throws on a key that is neither a
+// singleton {j} nor a stick pair, which the host copy path cannot describe.
+std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl);
+
 // Records `real_size` as the valid extent of reserved host dim `dim` (the
 // layout was built from the padded shape). Only non-stick dims are supported.
 void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,

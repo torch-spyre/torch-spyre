@@ -358,8 +358,9 @@ their bytes cannot be interpreted as DL16. This storage check runs when a
 tensor is submitted, since compile-time plans contain scalar metadata only.
 Both eager and compiled collective plans include the device allocation's
 padding, including padding introduced by a producer operation before a
-compiled collective. The storage-extent guard compares `numel()` with the layout's valid element
-count, which counts logical elements, not the padded `device_size`. Ordinary allocated tensors therefore pass this guard even
+compiled collective. The storage-extent guard compares `numel()` with the
+layout's valid element count, which counts logical elements, not the padded
+`device_size`. Ordinary allocated tensors therefore pass this guard even
 when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
