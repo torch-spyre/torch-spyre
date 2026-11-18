@@ -30,6 +30,7 @@ These guides link to it instead of repeating it.
 | open the pull request | [10. Contribute](10-contribute.md) |
 | fix an error message | [11. Troubleshooting and FAQ](11-troubleshooting-and-faq.md) |
 | see the real `vllm bench` and `spyre-perf-suite` declared, with a nightly and a weekly run | [12. Worked example: nightly and weekly](12-worked-example-nightly-weekly.md) |
+| describe a design parameter, sweep it, and record the claim that an optimization helped | [13. Design parameters, sweeps, claims, experiment flow](13-design-parameters-sweeps-claims.md) |
 
 ## The shortest path
 
