@@ -1312,6 +1312,17 @@ class TestSpyre(TestCase):
             torch.tensor([data[1]] * 4, dtype=torch.float16),
         )
 
+    def test_eager_expand_broadcast_reduction(self):
+        """Eager dispatch compiles a standalone kernel over the already-
+        materialised expand() output, a distinct trigger from the compiled
+        path's fused expand+sum kernel, so it needs its own check."""
+        x_cpu = torch.randint(-3, 4, (70,), dtype=torch.int32).to(torch.float16)
+        x = x_cpu.to("spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1).cpu().float()
+        expected = x_cpu.float().expand(2, 32, 70).sum(dim=-1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
         logical values, not over-DMA the parent's full allocation."""
