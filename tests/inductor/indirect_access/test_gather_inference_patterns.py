@@ -40,11 +40,6 @@ _FP16_TO_FP32_EAGER = (
     "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
     r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_POINTWISE_NO_LAYOUT = rejection(
-    4713,
-    "compile topk-2 routing (4 rows): topk indices flatten -> int64 -> gather: aten.clamp.default has no supported output layout for any candidate input layout.",
-    r"aten\.clamp\.default\): no supported output layout found",
-)
 _GATHER_OUT_EAGER = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
@@ -90,10 +85,10 @@ _INDEX_PUT_IMPL_EAGER = rejection(
     "aten::_index_put_impl_ is not registered on Spyre.",
     r"Could not run 'aten::_index_put_impl_'",
 )
-_INDEX_PUT_NO_LAYOUT = rejection(
-    4636,
-    "compile index_put: no supported output layout for aten.index_put.default.",
-    r"aten\.index_put\.default\): no supported output layout found",
+_INDEX_PUT_DBO_OPT = (
+    4926,
+    "compile index_put_ on a [8, 1024] view: dbo-opt fails in sbf-ddc with 'Expect valid alloc users' (the diagnostic #4926 reports for scatter).",
+    r"SubprocException.*Expect valid alloc users",
 )
 
 
@@ -515,12 +510,7 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
-        _xfail_existing(
-            execution_mode,
-            eager=_CAST_STAGGERED_READ,
-            compiled=_POINTWISE_NO_LAYOUT,
-        )
+        _xfail_existing(execution_mode, eager=_CAST_STAGGERED_READ)
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 32, 64), differentiation="topk02", dtype=torch.float16
@@ -535,9 +525,7 @@ class TestGatherInferencePatternsEagerCompile:
             )
             return expert_w[ids]
 
-        compare_mode(
-            execution_mode, fn, expert_w, logits, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, expert_w, logits, atol=0, rtol=0)
 
     def test_topk_moe_weighted_routing(self, execution_mode):
         """MoE top-2 weighted: topk scores × gathered expert outputs → weighted sum."""
@@ -688,11 +676,11 @@ class TestGatherInferencePatternsEagerCompile:
     def test_index_put_view_n_32_32(self, execution_mode):
         """index_put_ on view [8, 32, 32] → [8, 1024]; compile Mod(d1, 32) (#4443)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/692
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4636
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4926
         _xfail_existing(
             execution_mode,
             eager=_INDEX_PUT_IMPL_EAGER,
-            compiled=_INDEX_PUT_NO_LAYOUT,
+            compiled=_INDEX_PUT_DBO_OPT,
         )
         x = torch.zeros(8, 32, 32, dtype=torch.float16)
         slots = torch.arange(4, dtype=torch.int32)

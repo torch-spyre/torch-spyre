@@ -50,10 +50,10 @@ _RESTICKIFY_3ARGS = rejection(
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
-_INCOMPATIBLE_HOST_SIZE = rejection(
-    3732,
-    "compile flat take_along_dim: Pointwise no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility",
+_TAKE_ALONG_DIM_FLAT_RESTICKIFY = rejection(
+    4327,
+    "compile flat take_along_dim: AssertionError restickify op_spec has 3 args.",
+    r"restickify op_spec has 3 args",
 )
 _REMAINDER_COMPILED = rejection(
     4416,
@@ -379,11 +379,11 @@ class TestGatherShapeRankAndIndexPatterns:
     def test_take_along_dim_none_flat(self, execution_mode):
         """take_along_dim(x_flat, idx, dim=0): flatten-then-gather (dim=None mode); API gap closure."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_INCOMPATIBLE_HOST_SIZE,
+            compiled=_TAKE_ALONG_DIM_FLAT_RESTICKIFY,
         )
         x = cached_randn((16, 32), differentiation="gfc_tad_none", dtype=torch.float16)
         flat_idx = torch.randint(0, 16 * 32, (64,), dtype=torch.int64)

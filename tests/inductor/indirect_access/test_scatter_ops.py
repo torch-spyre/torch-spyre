@@ -62,8 +62,8 @@ _PUT_EAGER = rejection(
 )
 _PUT_COMPILED = rejection(
     4636,
-    "compile put_: no supported output layout for aten.index_put.default.",
-    r"aten\.index_put\.default\): no supported output layout found",
+    "compile put_: AssertionError restickify op_spec has 3 args.",
+    r"restickify op_spec has 3 args",
 )
 _SR_TWO = rejection(
     4361,
@@ -444,8 +444,12 @@ class TestPutFlatIndexWriteEagerCompile:
         )
 
     def test_put_single_position(self, execution_mode):
-        """put_ with a single flat index; boundary case P=1."""
-        self._xfail_put(execution_mode)
+        """put_ with a single flat index; boundary case P=1.
+
+        Eager is missing aten::put_ (#4540). Compiled matches CPU.
+        """
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4540
+        _xfail_existing(execution_mode, eager=_PUT_EAGER)
         x = cached_randn((4, 8), differentiation="put_p1_01", dtype=torch.float16)
         idx = torch.tensor([7], dtype=torch.int64)
         vals = torch.tensor([-9.0], dtype=torch.float16)
@@ -611,12 +615,12 @@ class TestScatterValueStamp:
     def test_scatter_value_grouped_mm_offs(self, execution_mode):
         """scatter_(0, idx, 1.0) onto fp16 dest [128], T=192 — leftover extra (#4436 Python).
 
-        Eager is aten::scatter.value_out (#4473). Compiled this log was
-        ranges_from_index_vars (#4354 leftover string), not #4436 mismatch
-        and not #4472 Constant.
+        Eager is aten::scatter.value_out (#4473). Compiled fails in
+        insert_restickify_padding (#6163): the restickify is written into a
+        slice of another buffer, which cannot be padded in place.
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6163
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -625,9 +629,9 @@ class TestScatterValueStamp:
                 r"Could not run 'aten::scatter.value_out'",
             ),
             compiled=rejection(
-                4472,
-                "compile scatter_(value=) stores a rank-0 Constant.",
-                r"store value of unexpected type <class '[\w.]*Constant'>",
+                6163,
+                "compile scatter_(value=) on an fp16 dest [128]: insert_restickify_padding cannot pad a restickify written into a slice of another buffer.",
+                r"insert_restickify_padding: restickify written into a slice of another buffer",
             ),
         )
         G, T = 128, 192

@@ -93,10 +93,10 @@ _TAKE_EAGER = rejection(
     "aten::take is not registered on Spyre.",
     r"Could not run 'aten::take'",
 )
-_HOST_SIZE_DIM_ORDER = rejection(
-    3732,
-    "compile take / flatten-take: Pointwise no mechanism to resolve stick incompatibility.",
-    r"no mechanism to resolve stick incompatibility",
+_TAKE_FLAT_RESTICKIFY = rejection(
+    4327,
+    "compile take on a flattened 2-D source: AssertionError restickify op_spec has 3 args.",
+    r"restickify op_spec has 3 args",
 )
 _REMAINDER = rejection(
     4416,
@@ -871,9 +871,9 @@ class TestGatherBoundaryNumericsAndAPIForms:
     def test_take_float32(self, execution_mode):
         """torch.take flat-index on float32 source; selects 3 elements from 12-element flat view."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4307
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
-            execution_mode, eager=_TAKE_EAGER, compiled=_HOST_SIZE_DIM_ORDER
+            execution_mode, eager=_TAKE_EAGER, compiled=_TAKE_FLAT_RESTICKIFY
         )
         x = cached_randn((3, 4), differentiation="take_f32_01", dtype=torch.float32)
         idx = torch.tensor([0, 5, 11], dtype=torch.int64)
@@ -889,9 +889,9 @@ class TestGatherBoundaryNumericsAndAPIForms:
     def test_take_bfloat16(self, execution_mode):
         """torch.take flat-index on bfloat16 source; validates 2-byte word flat indexing."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4307
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
-            execution_mode, eager=_TAKE_EAGER, compiled=_HOST_SIZE_DIM_ORDER
+            execution_mode, eager=_TAKE_EAGER, compiled=_TAKE_FLAT_RESTICKIFY
         )
         x = cached_randn((3, 4), differentiation="take_bf16_01", dtype=torch.bfloat16)
         idx = torch.tensor([0, 5, 11], dtype=torch.int64)
@@ -907,9 +907,9 @@ class TestGatherBoundaryNumericsAndAPIForms:
     def test_take_duplicate_flat_index(self, execution_mode):
         """torch.take with duplicate flat indices; same flat position selected multiple times."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4307
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
-            execution_mode, eager=_TAKE_EAGER, compiled=_HOST_SIZE_DIM_ORDER
+            execution_mode, eager=_TAKE_EAGER, compiled=_TAKE_FLAT_RESTICKIFY
         )
         x = cached_randn((3, 4), differentiation="take_dup_01", dtype=torch.float16)
         idx = torch.tensor([0, 0, 5], dtype=torch.int64)
