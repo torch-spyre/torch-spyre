@@ -52,9 +52,8 @@ below should look like.
    difference for a kernel that computes. A fix above it (lowering, layout, fusion)
    changes the OpSpec itself, so capture the bad run again with the fix in place and
    compare that.
-7. **Then run every suite the change can reach**, not only the obvious subset. #6265's
-   first version fixed the cat and broke 58 storage-offset tests in `test_inductor_ops.py`
-   that `-k "cat or slice or pad or narrow"` never selected.
+7. **Then run every suite the change can reach**, not only the obvious subset: a `-k`
+   filter chosen for the bug can leave out the tests a fix breaks.
 
 ## Caveats
 
@@ -69,8 +68,7 @@ below should look like.
 
 ## On a model
 
-The same steps work on a whole model. The bug in the worked example was found this way
+The same steps work on a whole model: the bug in the worked example was found this way
 from spyre-inference's
-`tests/e2e/test_clip_embeddings.py::test_clip_image_embedding_matches_hf`: 47 kernels
-under vLLM, about five minutes per capture, the cat at launch 35. #6265's description
-walks through it.
+`tests/e2e/test_clip_embeddings.py::test_clip_image_embedding_matches_hf`, under vLLM.
+#6265's description walks through it.

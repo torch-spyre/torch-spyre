@@ -18,8 +18,9 @@
 in front of them, as a vision transformer's patch embedding does. With
 SPYRE_NDO_MATMUL_OUTPUT_REORDER=1 the matmul's output gets a layout that splits
 the grid, and the cat writes every token one row early, over the class token.
-"Comparing two runs" in the OpSpec Lab doc finds it. Once that is fixed, both
-runs print a small difference and the example has nothing left to find.
+"Comparing two runs" in the OpSpec Lab doc finds it. Once that is fixed (#6265,
+or its successor), both runs print a small difference and the example has
+nothing left to find.
 """
 
 import torch

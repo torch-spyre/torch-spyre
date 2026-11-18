@@ -203,8 +203,9 @@ whose outputs do not.
 `programs/05_cat_after_matmul.py` is one such program: a matmul over a 7x7 grid of
 tokens, then an eager cat that puts a class token in front of them. It is right as
 it is and wrong with `SPYRE_NDO_MATMUL_OUTPUT_REORDER=1`, until the bug it shows is
-fixed; after that the two runs agree and `compare.py` exits 0. The whole example
-takes about three minutes:
+fixed (#6265, or its successor); after that the two runs agree and `compare.py`
+exits 0. The whole example takes about three minutes. The numbers below are from
+main at `74721af8`:
 
 ```bash
 P=tests/op_specs/programs/05_cat_after_matmul.py
@@ -241,11 +242,12 @@ python replay/sdsc_fused_cat_0.py
 A replay prints `max|got - observed|` for every arg, here against the good outputs.
 The cat's output is 19.7 off, so the bad kernel is wrong on correct inputs, and
 the table in [4. Interpret](#4-interpret) applies with the good run as the expected
-answer. Diffing the two captures' scripts, and their SDSC (`--stage bundle` on
-each), shows what changed: with the flag the cat's input is laid out
-`[1, 7, 12, 7, 64]`, its output view becomes `[7, 7, 12, 64]` with the token row at
-`c0 + 1`, and the one-row offset that the good kernel carries (`backGap mb=1
-offsets out=0 mb=768`) is gone.
+answer. That 19.7 is absolute, while `compare.py`'s numbers are relative: it is the
+0.857 above times 23, the good output's largest value. Diffing the two captures'
+scripts, and their SDSC (`--stage bundle` on each), shows what changed: with the
+flag the cat's input is laid out `[1, 7, 12, 7, 64]`, its output view becomes
+`[7, 7, 12, 64]` with the token row at `c0 + 1`, and the one-row offset that the
+good kernel carries (`backGap mb=1 offsets out=0 mb=768`) is gone.
 
 When no kernel parts, `compare.py` exits 0 if every kernel pairs and agrees, and 4
 if it cannot show that they do. It then names the first kernel in the way: one
