@@ -478,7 +478,12 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        stl = td.layout.device_layout
+        elems_per_stick = stl.elems_per_stick()
+        if stl.element_arrangement == ElementArrangement.DL16_TO_FP32:
+            # A DL16_TO_FP32 tensor interleaves its elements across a stick pair,
+            # so the pair is the unit that cannot be split.
+            elems_per_stick *= 2
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 
@@ -534,13 +539,13 @@ def get_per_core_span(
         per_core_max = 0
         per_core_min = 0
         for v in coord.free_symbols:
-            term = coord.subs(dict.fromkeys(coord.free_symbols - {v}, 0))
+            term = coord.xreplace(dict.fromkeys(coord.free_symbols - {v}, Integer(0)))
             # Per-core span is a hardware-bound quantity that must be checked
             # against MAX_SPAN_BYTES. For symbolic dims we use ``max_size``
             # (the worst-case footprint, also the HBM allocation footprint).
             R = _effective_size(v, it_space_orig, symbol_meta) // splits.get(v, 1)
-            per_core_max += int(term.subs(v, R - 1))
-            per_core_min += int(term.subs(v, 0))
+            per_core_max += int(term.xreplace({v: R - 1}))
+            per_core_min += int(term.xreplace({v: 0}))
         per_core_size = per_core_max - per_core_min + 1
         if per_core_size > 1:
             stride_elems = math.prod(device_size[d + 1 :])
@@ -719,7 +724,7 @@ def must_split_vars(
             per_core_coord_size = (
                 max(
                     int(
-                        coord.subs(
+                        coord.xreplace(
                             {
                                 v: _effective_size(v, it_space_orig, symbol_meta)
                                 // accumulated_splits.get(v, 1)

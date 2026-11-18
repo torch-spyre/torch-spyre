@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import functools
 import math
 import threading
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function, sympify
+from sympy import Symbol, Expr, Function, Integer, sympify
+from sympy.core.parameters import global_parameters
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
@@ -44,6 +46,36 @@ class IndirectAccess(Function):
     @classmethod
     def eval(cls, name):  # noqa: ARG003
         return None  # keep unevaluated
+
+
+# Bounded so that a long-lived process compiling many shapes cannot grow it
+# without limit; a Granite 3.3 8B start parses about 105 distinct strings.
+@functools.lru_cache(maxsize=4096)
+def _cached_sympify(text: str, flags: tuple[bool, bool, bool]) -> Any:
+    # ``flags`` only keys the cache: sympify reads the same global parameters
+    # (evaluate, distribute, exp_is_pow), and each one changes its result.
+    return sympify(text)
+
+
+def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
+    """``sympify`` as imported by generated Spyre wrapper modules.
+
+    The wrapper emits ``sympify('<expr>')`` for every index expression, and each
+    load of a cached wrapper module re-parses those strings. A plain ``str``
+    argument is parsed once per process and the parsed expression is shared;
+    sympy expressions are immutable, so sharing them is safe. Anything else
+    goes straight to ``sympy.sympify``.
+    """
+    if not args and not kwargs and type(a) is str:
+        return _cached_sympify(
+            a,
+            (
+                global_parameters.evaluate,
+                global_parameters.distribute,
+                global_parameters.exp_is_pow,
+            ),
+        )
+    return sympify(a, *args, **kwargs)
 
 
 # --- Source-to-kernel provenance schema -------------------------------------
@@ -215,7 +247,7 @@ class TensorWorkDivision:
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                value = sympify(expression).subs(core_id, core)
+                value = sympify(expression).xreplace({core_id: Integer(core)})
                 if value.free_symbols or value.is_integer is not True:
                     raise ValueError(
                         f"core {core} owns non-integral {dim} slot {value}"
@@ -243,6 +275,9 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
+        stride_map: The ``stride_map`` of the SpyreTensorLayout the coordinates were
+                derived from: each device dim's host stride, 0 for a dim holding no
+                host elements.  ``None`` when the arg was not built from a layout.
         allocation: dict tagging where this Tensor's data lives. Mirrors
                 layout.allocation and carries exactly one of three
                 mutually-exclusive keys:
@@ -300,6 +335,7 @@ class TensorArg:
     kernel_local: bool = False
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
+    stride_map: list[int] | None = None
 
     @property
     def non_unified(self) -> bool:
