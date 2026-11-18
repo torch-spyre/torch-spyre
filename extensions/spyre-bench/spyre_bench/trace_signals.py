@@ -22,7 +22,7 @@ The stored contract is a JSON array (a list). Any other array-like with `__len__
 tuple) is accepted; str, bytes and mappings are not arrays.
 
 Result per role: NOT_CAPTURED (no string name declared, the name is not stored, or the stored value is not an array),
-or a Signal. An empty array is captured but empty (`Signal((), ())`). An entry is missing, and its position is listed
+or a Signal; an array-like that cannot be read (0-d, indexing that raises) is NOT_CAPTURED. An empty array is captured but empty (`Signal((), ())`). An entry is missing, and its position is listed
 in `missing_at`, when it is None or NaN or, for a nested array, when any leaf inside it is; a partial array is never
 passed off as complete.
 """
@@ -59,6 +59,14 @@ def _is_array(v):
     return hasattr(v, "__len__") and hasattr(v, "__getitem__") and not isinstance(v, (str, bytes, dict))
 
 
+def _items(arr):
+    """Tuple of the elements of an array-like, or None when it cannot be read (0-d, hostile or odd indexing)."""
+    try:
+        return tuple(arr[i] for i in range(len(arr)))
+    except Exception:  # noqa: BLE001 - duck-typed calls may raise anything; BaseException still propagates
+        return None
+
+
 def _leaf_absent(v):
     if v is None:
         return True
@@ -72,10 +80,8 @@ def _leaf_absent(v):
 
 def _absent(v, depth=0):
     if _is_array(v):
-        try:
-            return depth < _MAX_DEPTH and any(_absent(v[i], depth + 1) for i in range(len(v)))
-        except (TypeError, IndexError, KeyError):
-            return True
+        items = _items(v)
+        return items is None or (depth < _MAX_DEPTH and any(_absent(x, depth + 1) for x in items))
     return _leaf_absent(v)
 
 
@@ -103,6 +109,9 @@ def resolve_roles(reg, family, run_props, measurements):
         if not _is_array(arr):
             out[role] = NOT_CAPTURED
             continue
-        vals = tuple(arr[i] for i in range(len(arr)))
+        vals = _items(arr)
+        if vals is None:
+            out[role] = NOT_CAPTURED
+            continue
         out[role] = Signal(vals, tuple(i for i, v in enumerate(vals) if _absent(v)))
     return out

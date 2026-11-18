@@ -5,6 +5,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from spyre_bench import engine, trace_signals, validate
 
 EX = Path(__file__).resolve().parent.parent / "examples"
@@ -124,6 +126,51 @@ def test_array_likes_nested_nan_and_none_inputs():
     assert got["start_us"] is trace_signals.NOT_CAPTURED  # a mapping is not an array
     assert all(v is trace_signals.NOT_CAPTURED for v in _roles(None, None).values())
     assert all(v is trace_signals.NOT_CAPTURED for v in _roles({"role.moe.e_sel": "s"}, None).values())
+
+
+def test_unreadable_array_likes_are_not_captured():
+    class ZeroD:  # like np.array(5.0): has len and getitem, len() raises
+        def __len__(self):
+            raise TypeError("len() of unsized object")
+
+        def __getitem__(self, i):
+            raise IndexError
+
+    class KeyedByLabel:  # like a Series with a non-default index
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, i):
+            raise KeyError(i)
+
+    class Hostile:
+        def __len__(self):
+            raise RuntimeError("boom")
+
+        def __getitem__(self, i):
+            return 1
+
+    class Nested:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, i):
+            return ZeroD()
+
+    props = {"role.moe.e_sel": "z", "role.moe.tokens": "k", "role.moe.cores": "h", "role.moe.start_us": "n"}
+    got = _roles(props, {"z": ZeroD(), "k": KeyedByLabel(), "h": Hostile(), "n": [1, 2]})
+    assert got["e_sel"] is got["tokens"] is got["cores"] is trace_signals.NOT_CAPTURED
+    assert got["start_us"] == trace_signals.Signal((1, 2), ())
+    assert _roles({"role.moe.e_sel": "n"}, {"n": Nested()})["e_sel"].missing_at == (0,)
+
+
+def test_numpy_arrays_when_numpy_is_importable():
+    np = pytest.importorskip("numpy")
+    props = {"role.moe.e_sel": "a", "role.moe.tokens": "z", "role.moe.cores": "m"}
+    got = _roles(props, {"a": np.array([1.0, np.nan]), "z": np.array(5.0), "m": np.array([[1.0, 2.0], [np.nan, 1.0]])})
+    assert got["e_sel"].missing_at == (1,)
+    assert got["tokens"] is trace_signals.NOT_CAPTURED
+    assert got["cores"].missing_at == (1,)
 
 
 def test_malformed_property_values_do_not_raise():
