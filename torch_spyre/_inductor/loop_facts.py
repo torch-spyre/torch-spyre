@@ -205,10 +205,10 @@ def _per_level_advance(
             subs.update(
                 {sym: sympy.S.Zero for sym in dep.index.free_symbols if sym not in subs}
             )
-            term += dep.index.subs(subs)
+            term += dep.index.xreplace(subs)
         for host_stride, extent in squeezed:
             term += s * extent * host_stride
-        out.append(sympy.simplify(term.subs(s, 1) - term.subs(s, 0)))
+        out.append(sympy.simplify(term.xreplace({s: 1}) - term.xreplace({s: 0})))
     return tuple(out)
 
 
