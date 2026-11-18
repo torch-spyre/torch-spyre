@@ -1516,5 +1516,60 @@ class TestStickVarFromDep(TestCase):
         self.assertEqual(result, d1)
 
 
+class TestStickCompatibleWithoutCoords(TestCase):
+    """Tests for stick_compatible_v2 — stick_compatible taking (STL, MemoryDep) pairs."""
+
+    def test_two_tensors_same_stick_var(self):
+        """Two tensors with the same loop var on the stick — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible_v2
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        dep_a = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_b = MemoryDep("b", d0 * 64 + d1, (d0, d1), (4, 64))
+        self.assertTrue(stick_compatible_v2([(stl, dep_a), (stl, dep_b)]))
+
+    def test_broadcast_and_dense_compatible(self):
+        """One broadcast tensor + one dense tensor — compatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible_v2
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        dense_stl = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        bcast_stl = SpyreTensorLayout([4, 64], [0, 0], get_device_dtype(torch.float16))
+        dep_dense = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_bcast = MemoryDep("b", d0, (d0,), (4,))
+        self.assertTrue(
+            stick_compatible_v2([(dense_stl, dep_dense), (bcast_stl, dep_bcast)])
+        )
+
+    def test_different_stick_vars_incompatible(self):
+        """Two tensors with different loop vars on the stick — incompatible.
+
+        stl_a has stride_map[-1]=1, index d0*64+d1 → stick var is d1 (coeff 1).
+        stl_b has stride_map[-1]=1, index d1*4+d0 → stick var is d0 (coeff 1).
+        Different stick vars → incompatible.
+        """
+        from torch_spyre._inductor.pass_utils import stick_compatible_v2
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        stl_a = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        stl_b = SpyreTensorLayout([64, 4], [4, 1], get_device_dtype(torch.float16))
+        dep_a = MemoryDep("a", d0 * 64 + d1, (d0, d1), (4, 64))
+        dep_b = MemoryDep("b", d1 * 4 + d0, (d0, d1), (64, 4))
+        self.assertFalse(stick_compatible_v2([(stl_a, dep_a), (stl_b, dep_b)]))
+
+    def test_factorized_var_incompatible(self):
+        """Stick var range > elems_per_stick — factorized, incompatible."""
+        from torch_spyre._inductor.pass_utils import stick_compatible_v2
+
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # d1 ranges over 128 > 64 eps: factorized across stick and outer dim
+        stl = SpyreTensorLayout([2, 64], [64, 1], get_device_dtype(torch.float16))
+        dep = MemoryDep("a", d0 * 64 + d1, (d0, d1), (2, 128))
+        stl_out = SpyreTensorLayout([4, 64], [64, 1], get_device_dtype(torch.float16))
+        dep_out = MemoryDep("out", d0 * 64 + d1, (d0, d1), (4, 64))
+        self.assertFalse(stick_compatible_v2([(stl, dep), (stl_out, dep_out)]))
+
+
 if __name__ == "__main__":
     run_tests()
