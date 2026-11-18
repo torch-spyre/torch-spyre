@@ -22,6 +22,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -68,6 +69,16 @@ static std::vector<int64_t> compute_host_stride(
     stride *= host_size[i];
   }
   return host_stride;
+}
+
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
+    const std::vector<int64_t>& device_size) {
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
+  for (int64_t d = 0; d < static_cast<int64_t>(device_size.size()); ++d)
+    valid_elements[{d}] = device_size[d];
+
+  return valid_elements;
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -151,6 +162,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     groups[host_dim].push_back(static_cast<int64_t>(dev_idx));
   };
 
+  // Process each device dimension: update stride map and group by host dim.
+  // Trailing within-stick dimension first (finest granularity).
   update_stride(stick_dim, host_rank);
   update_valid_elements(stick_dim, host_rank);
 
@@ -200,6 +213,7 @@ std::string SpyreTensorLayout::toString() const {
       ss << dims[i];
       if (i + 1 < dims.size()) ss << ", ";
     }
+    // Single-element tuples need trailing comma in Python
     if (dims.size() == 1) ss << ",";
     ss << "): " << size;
   }
@@ -254,8 +268,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
-  impl->dma_sizes = this->dma_sizes;
-  impl->dma_strides = this->dma_strides;
   impl->reserved_dims = this->reserved_dims;
   copy_tensor_metadata(
       /*src_impl=*/this,
@@ -286,8 +298,6 @@ void SpyreTensorImpl::shallow_copy_from(
     const at::intrusive_ptr<at::TensorImpl>& impl) {
   auto spyre_impl = static_cast<SpyreTensorImpl*>(impl.get());
   at::TensorImpl::shallow_copy_from(impl);
-  this->dma_sizes = spyre_impl->dma_sizes;
-  this->dma_strides = spyre_impl->dma_strides;
   this->spyre_layout = spyre_impl->spyre_layout;
   this->reserved_dims = spyre_impl->reserved_dims;
 }
@@ -344,28 +354,60 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   }
 }
 
-std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_privateuseone());
-  SpyreTensorImpl* impl;
-  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_sizes;
-  }
-  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
+namespace {
+
+// Device dim that carries (the non-stick part of) host dim `host_dim` in a
+// layout built by SpyreTensorLayout::init with the generic stick dim order:
+// host dim 0 is the outermost device dim `host_rank - 1`; host dim h >= 1 is
+// device dim h - 1. The stick host dim (the last) also owns the stick-element
+// dim and is not covered here.
+int64_t host_dim_to_device_dim(int64_t host_rank, int64_t host_dim) {
+  TORCH_CHECK(host_dim >= 0 && host_dim < host_rank - 1, "host dim ", host_dim,
+              " must be a non-stick dim of a rank-", host_rank, " tensor");
+  return host_dim == 0 ? host_rank - 1 : host_dim - 1;
 }
 
-std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_privateuseone());
-  SpyreTensorImpl* impl;
-  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_strides;
-  }
-  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
+}  // namespace
+
+int64_t valid_element_count(const SpyreTensorLayout& stl) {
+  int64_t count = 1;
+  for (const auto& [dims, valid] : stl.valid_elements) count *= valid;
+  return count;
+}
+
+void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,
+                                 int64_t real_size) {
+  const int64_t host_rank = static_cast<int64_t>(stl.device_size.size()) - 1;
+  const int64_t dev_dim = host_dim_to_device_dim(host_rank, dim);
+  auto it = stl.valid_elements.find({dev_dim});
+  TORCH_CHECK(it != stl.valid_elements.end(), "reserved dim ", dim,
+              " (device dim ", dev_dim,
+              ") is not a singleton valid_elements key in ", stl.toString());
+  TORCH_CHECK(real_size <= stl.device_size[dev_dim], "reserved size ",
+              real_size, " exceeds the padded device extent ",
+              stl.device_size[dev_dim]);
+  it->second = real_size;
 }
 
 bool SpyreTensorImpl::has_intact_reservation() const {
-  return !reserved_dims.empty() && storage_offset() == 0 &&
-         sizes() == c10::IntArrayRef(dma_sizes) &&
-         strides() == c10::IntArrayRef(dma_strides);
+  if (reserved_dims.empty() || storage_offset() != 0) return false;
+  // The layout has one device dim per host dim plus the stick-element dim.
+  if (static_cast<int64_t>(spyre_layout.device_size.size()) != dim() + 1)
+    return false;
+  // Strides must still be the contiguous strides of sizes().
+  int64_t expected = 1;
+  for (int64_t d = dim() - 1; d >= 0; d--) {
+    if (sizes()[d] != 1 && strides()[d] != expected) return false;
+    expected *= std::max<int64_t>(sizes()[d], 1);
+  }
+  for (const auto& [rdim, info] : reserved_dims) {
+    if (rdim < 0 || rdim >= dim() - 1) return false;
+    const int64_t dev_dim = host_dim_to_device_dim(dim(), rdim);
+    auto it = spyre_layout.valid_elements.find({dev_dim});
+    if (it == spyre_layout.valid_elements.end() || it->second != info.max)
+      return false;
+  }
+  return true;
 }
 
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(

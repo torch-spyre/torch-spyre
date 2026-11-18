@@ -99,7 +99,7 @@ For the layout that lets the runtime actually walk one of those tensors, see [Te
 
 ### SpyreTensorImpl
 
-A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds three members: a `SpyreTensorLayout` (`spyre_layout`) plus two standalone vectors, `dma_sizes` and `dma_strides`. Together they capture everything the runtime needs.
+A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds a `SpyreTensorLayout` (`spyre_layout`). Its `valid_elements` records how many elements each device dimension moves, and its `stride_map` records the host stride of each device dimension. Together they capture everything the runtime needs.
 
 The `SpyreTensorLayout` holds:
 
@@ -108,7 +108,7 @@ The `SpyreTensorLayout` holds:
 - `device_dtype`: the on-device data format, for example `SEN169_FP16`.
 - `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 
-Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly, a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
+Alongside the layout, `SpyreTensorImpl` has no separate DMA fields. When a view is copied to or from the host, `generate_dci()` in `spyre_mem.cpp` derives the transfer descriptors from the layout's `valid_elements` and `stride_map`. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -117,7 +117,7 @@ Note that the handles returned to Python never carry a raw device pointer. That 
 :width: 80%
 :align: center
 
-What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` (device shape, `stride_map`, device dtype, and `element_arrangement`) plus the standalone `dma_sizes`/`dma_strides` DMA descriptor.
+What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` (device shape, `stride_map`, device dtype, `element_arrangement`, and `valid_elements`).
 :::
 
 ### SpyreAllocator
@@ -358,9 +358,8 @@ their bytes cannot be interpreted as DL16. This storage check runs when a
 tensor is submitted, since compile-time plans contain scalar metadata only.
 Both eager and compiled collective plans include the device allocation's
 padding, including padding introduced by a producer operation before a
-compiled collective. The storage-extent guard compares `numel()` with
-`dma_sizes`, which records the logical allocation shape, not the padded
-`device_size`. Ordinary allocated tensors therefore pass this guard even
+compiled collective. The storage-extent guard compares `numel()` with the layout's valid element
+count, which counts logical elements, not the padded `device_size`. Ordinary allocated tensors therefore pass this guard even
 when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
@@ -401,7 +400,7 @@ compiled broadcast, allgather, and allreduce materialize view inputs automatical
 Materialize other unsupported views before submission.
 
 Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
-A scalar has one logical element (`dma_sizes` is empty, whose product is
+A scalar has one logical element (its shape is empty, whose product is
 one), while its DL16 allocation occupies a full 64-element stick. Collective
 plans communicate that physical allocation, just as they do for padded
 multidimensional tensors; the host result remains a single scalar.

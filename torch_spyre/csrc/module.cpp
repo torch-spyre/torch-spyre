@@ -701,8 +701,6 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device_size"), py::arg("device_dtype"),
         "Return whole-stick storage bytes; reject undefined format geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
-  m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
-  m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
   m.def(
       "get_reserved_dims",
       [](const at::Tensor& tensor)

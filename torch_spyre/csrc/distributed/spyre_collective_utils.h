@@ -40,15 +40,16 @@ inline void check_collective_storage(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_contiguous(), "Collective tensor must be contiguous");
   TORCH_CHECK(tensor.storage_offset() == 0,
               "Collectives do not support nonzero storage offsets");
-  // A zero-offset prefix view may retain its base tensor's DMA descriptor.
-  // Borrowed composite addresses cover that descriptor, not just the view.
+  // A zero-offset prefix view may retain its base tensor's valid elements.
+  // Borrowed composite addresses cover those elements, not just the view.
+  const int64_t valid_numel =
+      valid_element_count(get_spyre_tensor_layout(tensor));
   TORCH_CHECK(
-      c10::multiply_integers(get_spyre_tensor_sizes(tensor)) == tensor.numel(),
+      valid_numel == tensor.numel(),
       "Collective tensor requires matching device storage extent: logical "
       "elements=",
-      tensor.numel(), ", descriptor elements=",
-      c10::multiply_integers(get_spyre_tensor_sizes(tensor)),
-      "; a view or allocation descriptor may cover a different logical shape");
+      tensor.numel(), ", valid elements=", valid_numel,
+      "; a view or allocation may cover a different logical shape");
 }
 
 }  // namespace spyre

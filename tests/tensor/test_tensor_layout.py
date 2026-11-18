@@ -43,17 +43,17 @@ def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.f
 
 
 def _valid_elements_from_host(sizes, strides, device_size, stride_map):
-    """Compute valid_elements by applying get_dim_map logic in Python.
+    """Compute valid_elements by mapping device dims to host dims in Python.
 
     Use this when the host-based constructor cannot reproduce the layout
     (e.g. multi-dim tiling, compiler-generated viewing/folding layouts) and
-    no dim_order is available.  Mirrors the C++ get_dim_map / get_tile_map
-    logic: maps each device dim to the host dim with the largest host stride
-    ≤ stride_map[j], then groups device dims by their host dim.
+    no dim_order is available.  Maps each device dim to the host dim with the
+    largest host stride <= stride_map[j], then groups device dims by their
+    host dim.
 
     The resulting valid_elements carries the host dimension's element count
-    for each device-dim group, which is what reconstruct_dma_geometry requires
-    to correctly reconstruct dma_sizes and dma_strides.
+    for each device-dim group, which is what the DCI generator needs to move
+    the right number of elements along each device dim.
     """
     host_rank = len(sizes)
     device_rank = len(stride_map)
@@ -434,20 +434,23 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map,dim_order",
+        "sizes,strides,device_size,stride_map,valid_elements",
         [
-            ([60], [1], [1, 512, 64], [60, 0, 1], [0]),
+            # Dim 1 is expanded (stride 0), so it has no valid key of its own:
+            # its full extent of 512 is a singleton key. The 60 valid elements
+            # are the stick pair (dim 0 = outer size-1 row, dim 2 = stick).
+            ([60], [1], [1, 512, 64], [60, 0, 1], {(1,): 1, (2,): 60}),
         ],
     )
     def test_to_spyre_layout_explicit_expanding(
-        self, sizes, strides, device_size, stride_map, dim_order
+        self, sizes, strides, device_size, stride_map, valid_elements
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
+            valid_elements,
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -516,53 +519,137 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,valid_elements",
         [
-            ([60], [1], [1, 2, 64], [30, 30, 1]),
-            ([60], [1], [2, 1, 2, 64], [15, 15, 30, 1]),
-            ([60], [1], [2, 1, 1, 2, 64], [15, 15, 15, 30, 1]),
-            ([60], [1], [1, 2, 1, 2, 64], [30, 15, 15, 30, 1]),
-            ([60], [1], [2, 2, 1, 1, 64], [30, 15, 15, 60, 1]),
-            ([60], [1], [2, 1, 1, 1, 2, 64], [15, 15, 15, 15, 30, 1]),
-            ([60], [1], [1, 2, 1, 1, 2, 64], [30, 15, 15, 15, 30, 1]),
-            ([60], [1], [1, 1, 2, 1, 2, 64], [30, 30, 15, 15, 30, 1]),
-            ([60], [1], [2, 2, 1, 1, 1, 64], [30, 15, 15, 15, 60, 1]),
-            ([60], [1], [2, 1, 2, 1, 1, 64], [30, 30, 15, 15, 60, 1]),
-            ([60], [1], [1, 2, 2, 1, 1, 64], [60, 30, 15, 15, 60, 1]),
+            ([60], [1], [1, 2, 64], [30, 30, 1], {(0,): 1, (1, 2): 60}),
+            ([60], [1], [2, 1, 2, 64], [15, 15, 30, 1], {(0,): 1, (1,): 1, (2, 3): 60}),
+            (
+                [60],
+                [1],
+                [2, 1, 1, 2, 64],
+                [15, 15, 15, 30, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3, 4): 60},
+            ),
+            (
+                [60],
+                [1],
+                [1, 2, 1, 2, 64],
+                [30, 15, 15, 30, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3, 4): 60},
+            ),
+            (
+                [60],
+                [1],
+                [2, 2, 1, 1, 64],
+                [30, 15, 15, 60, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3, 4): 60},
+            ),
+            (
+                [60],
+                [1],
+                [2, 1, 1, 1, 2, 64],
+                [15, 15, 15, 15, 30, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
+            (
+                [60],
+                [1],
+                [1, 2, 1, 1, 2, 64],
+                [30, 15, 15, 15, 30, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
+            (
+                [60],
+                [1],
+                [1, 1, 2, 1, 2, 64],
+                [30, 30, 15, 15, 30, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
+            (
+                [60],
+                [1],
+                [2, 2, 1, 1, 1, 64],
+                [30, 15, 15, 15, 60, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
+            (
+                [60],
+                [1],
+                [2, 1, 2, 1, 1, 64],
+                [30, 30, 15, 15, 60, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
+            (
+                [60],
+                [1],
+                [1, 2, 2, 1, 1, 64],
+                [60, 30, 15, 15, 60, 1],
+                {(0,): 1, (1,): 1, (2,): 1, (3,): 1, (4, 5): 60},
+            ),
         ],
     )
     def test_to_spyre_layout_explicit_viewing(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, valid_elements
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_from_host(sizes, strides, device_size, stride_map),
+            valid_elements,
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,valid_elements",
         [
-            ([4800], [1], [3, 2, 14, 64], [120, 64, 360, 1]),
-            ([40, 60], [60, 1], [24, 1, 2, 64], [60, 50, 1440, 1]),
-            ([40, 60], [60, 1], [2, 12, 1, 2, 64], [720, 60, 60, 1200, 1]),
-            ([40, 60], [60, 1], [2, 6, 2, 1, 2, 64], [720, 120, 60, 60, 1200, 1]),
-            ([40, 60], [60, 1], [3, 4, 3, 1, 2, 64], [600, 180, 60, 60, 1800, 1]),
+            # 4800 = 5 * 8 * 120: each (d0, d1) pair holds one 120-element row,
+            # and the stick pair (2, 3) holds the 120 valid elements of a row.
+            (
+                [4800],
+                [1],
+                [5, 8, 2, 64],
+                [960, 120, 64, 1],
+                {(0,): 5, (1,): 8, (2, 3): 120},
+            ),
+            # 40 rows of 60 elements = 8 * 5 rows. Each row is one stick with
+            # 60 valid elements; only the stick is a valid-element group.
+            # stride_map holds host strides: a row is 60 host elements, so the
+            # outer dims are 300 (5 rows) and 60 (1 row) apart.
+            ([40, 60], [60, 1], [8, 5, 64], [300, 60, 1], {(0,): 8, (1,): 5, (2,): 60}),
+            # 40 rows of 60: the outer dims are a row-major grid of rows
+            # (host stride 60 per row), and only the stick is a valid group.
+            (
+                [40, 60],
+                [60, 1],
+                [2, 20, 64],
+                [1200, 60, 1],
+                {(0,): 2, (1,): 20, (2,): 60},
+            ),
+            (
+                [40, 60],
+                [60, 1],
+                [4, 10, 64],
+                [600, 60, 1],
+                {(0,): 4, (1,): 10, (2,): 60},
+            ),
+            ([40, 60], [60, 1], [5, 8, 64], [480, 60, 1], {(0,): 5, (1,): 8, (2,): 60}),
         ],
     )
     def test_to_spyre_layout_explicit_tiling(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, valid_elements
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        if valid_elements is None:
+            valid_elements = _valid_elements_from_host(
+                sizes, strides, device_size, stride_map
+            )
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_from_host(sizes, strides, device_size, stride_map),
+            valid_elements,
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -670,7 +757,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_from_host(sizes, strides, device_size, stride_map),
+            {(0, 2): 60, (1,): 512},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -1881,15 +1968,16 @@ class TestComputeValidElements(TestCase):
         with self.assertRaisesRegex(RuntimeError, "exceeds the 256 positions"):
             SpyreTensorLayout(*args, ElementArrangement.STANDARD, {(0, 2): 257})
 
-    def test_valid_elements_defaults_to_empty(self):
-        # {} means the valid extents are unknown, not that all elements are valid.
+    def test_valid_elements_defaults_to_full_device(self):
+        # Without valid_elements, every device position is treated as valid
+        # (compute_valid_elements), so each singleton holds its full device size.
         stl = SpyreTensorLayout(
             [4, 512, 64],
             [64, 256, 1],
             get_device_dtype(torch.float16),
             ElementArrangement.STANDARD,
         )
-        self.assertEqual(stl.valid_elements, {})
+        self.assertEqual(stl.valid_elements, {(0,): 4, (1,): 512, (2,): 64})
 
 
 if __name__ == "__main__":

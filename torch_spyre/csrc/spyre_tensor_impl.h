@@ -35,6 +35,8 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
+    const std::vector<int64_t>& device_size);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -115,9 +117,14 @@ class SpyreTensorLayout {
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   /**
-   * Maps groups of device dimensions to their valid (non-padded) element
-   * count. This field maps disjoint ordered lists of device dimensions to
-   * sizes.
+   * Number of valid (non-padded) elements per group of device dimensions.
+   * Each key is either a singleton {j} (device dim j holds that many valid
+   * positions) or a stick pair {outer, inner} (the two device dims together
+   * hold that many valid elements of one host dimension, so a partial last
+   * stick is expressed as a count that is not a multiple of
+   * device_size[inner]). Keys are disjoint. Layouts built with the host
+   * constructor use stick pairs; compute_valid_elements() produces only
+   * singletons.
    */
   std::map<std::vector<int64_t>, int64_t> valid_elements;
 
@@ -154,10 +161,8 @@ class SpyreTensorLayout {
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
    *
-   * When valid_elements is omitted, it defaults to {}, meaning the valid
-   * extents are unknown. No consumer uses valid_elements for layout decisions
-   * yet, but one that does must not treat {} as "every device element is
-   * valid".
+   * When valid_elements is omitted it defaults to compute_valid_elements():
+   * every device position is treated as valid, padding included.
    *
    * @deprecated Use the overload that takes valid_elements as a required
    * parameter (before element_arrangement) to ensure accurate padding
@@ -176,7 +181,9 @@ class SpyreTensorLayout {
         stride_map(stride_map),
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
-        valid_elements(std::move(valid_elements)) {
+        valid_elements(valid_elements.empty()
+                           ? compute_valid_elements(device_size)
+                           : std::move(valid_elements)) {
     normalize_stride_map();
     validate_shape();
   }
@@ -227,8 +234,9 @@ class SpyreTensorLayout {
    * rescale_stl_for_dtype now rejects that upstream of the constructor, and
    * get_device_stride_infos checks every divisor before use.
    *
-   * stride_map entries are deliberately not range-checked here: -1 marks a
-   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
+   * stride_map entries are not range-checked here beyond the >= -1 check in
+   * normalize_stride_map: after construction every entry is >= 0, and 0 covers
+   * both a broadcast dimension and a size-1 or sparse dimension.
    * Consistency between stride_map and the host strides is only knowable at
    * use time and is checked in get_device_stride_infos.
    *
@@ -324,12 +332,13 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
-    // Include valid_elements (and update std::hash) after deprecated
-    // constructor call sites have migrated to the valid_elements overload.
-    return this->device_size == other.device_size &&
-           this->stride_map == other.stride_map &&
-           this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement;
+    if (this->device_size != other.device_size ||
+        this->stride_map != other.stride_map ||
+        this->device_dtype != other.device_dtype ||
+        this->element_arrangement != other.element_arrangement) {
+      return false;
+    }
+    return this->valid_elements == other.valid_elements;
   }
 };
 
@@ -343,8 +352,6 @@ class SpyreTensorImpl : public at::TensorImpl {
   ~SpyreTensorImpl() = default;
 
   SpyreTensorLayout spyre_layout;
-  std::vector<int64_t> dma_sizes;
-  std::vector<int64_t> dma_strides;
 
   /**
    * Maps each reserved dim to its [min, max, granularity]. An empty map
@@ -369,11 +376,13 @@ class SpyreTensorImpl : public at::TensorImpl {
   /**
    * True if this tensor has a reservation AND is still the tensor it was
    * allocated as. reserved_dims keys are absolute dim indices, so they only
-   * mean something while the axes are unchanged. dma_sizes/dma_strides are
-   * set at allocation and on every spyre_resize_, but in-place metadata ops
-   * (t_, transpose_, squeeze_, unsqueeze_, as_strided_) change
-   * sizes()/strides() without touching them. A mismatch therefore means the
-   * map is stale, and callers must not trust it.
+   * mean something while the axes are unchanged. The layout's valid_elements
+   * entry for each reserved dim is set to the real size at allocation and on
+   * every spyre_resize_, but in-place metadata ops (t_, transpose_, squeeze_,
+   * unsqueeze_, as_strided_) change sizes()/strides() without touching it. A
+   * mismatch with sizes(), non-contiguous strides, a rank change or a
+   * nonzero storage offset therefore means the map is stale, and callers
+   * must not trust it.
    */
   bool has_intact_reservation() const;
 
@@ -411,9 +420,6 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
-std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
-std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
-
 /**
  * Read back a tensor's reservation contract (see reserved_dims above),
  * or nullopt if the tensor has no reservation. Returns the typed struct
@@ -421,7 +427,7 @@ std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
  * field checking instead of string lookups; the pybind binding in
  * module.cpp does the dict-of-strings conversion for the Python side.
  *
- * Unlike the accessors above, this never throws: it returns nullopt for a
+ * This never throws: it returns nullopt for a
  * non-Spyre tensor instead of requiring the caller to check first. It has no
  * caller in the compiler yet. It is written to be safe to call from a pass
  * that visits every graph input of every compile, Spyre or not, where a throw
@@ -429,6 +435,15 @@ std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
  */
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
     const at::Tensor& tensor);
+
+// Number of valid (non-padded) elements the layout describes: the product of
+// the valid_elements values (a stick-pair key counts once).
+int64_t valid_element_count(const SpyreTensorLayout& stl);
+
+// Records `real_size` as the valid extent of reserved host dim `dim` (the
+// layout was built from the padded shape). Only non-stick dims are supported.
+void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,
+                                 int64_t real_size);
 
 }  // namespace spyre
 
@@ -446,6 +461,12 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
+    for (const auto& [dims, count] : layout.valid_elements) {
+      for (int64_t d : dims) {
+        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
+      }
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(count));
+    }
     return seed;
   }
 };

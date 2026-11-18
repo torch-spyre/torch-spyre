@@ -1224,6 +1224,17 @@ class TestSpyre(TestCase):
         assert torch.allclose(a.cpu(), b.cpu())
         assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
 
+    def test_h2d_broadcast_into_narrowed_destination_stays_in_view(self):
+        """Broadcasting a row into a slice of a larger device tensor must write
+        only the slice's rows, not the full device extent of the broadcast dim.
+        Rows outside the slice keep their values."""
+        dst = torch.full((64, 64), -1.0, dtype=torch.float16, device="spyre")
+        row = torch.arange(64, dtype=torch.float16, device="spyre").unsqueeze(0)
+        dst[:8].copy_(row.expand(8, 64))
+        expected = torch.full((64, 64), -1.0, dtype=torch.float16)
+        expected[:8] = torch.arange(64, dtype=torch.float16).unsqueeze(0).expand(8, 64)
+        self.assertEqual(dst.cpu(), expected)
+
     def test_d2h_copy_of_expanded_view(self):
         """D2H copy of a tensor with stride-0 (broadcast) dims must produce
         the broadcast values, not the underlying storage's contents."""
@@ -1267,9 +1278,10 @@ class TestSpyre(TestCase):
         ]
 
         # Slice then expand to original sizes: destination sizes == source sizes
-        # exercises the edge case where the device tensor sizes and dma_sizes
-        # have the same number of elements yet the sizes represent a expanded
-        # slice and the dma_sizes represent the original data.
+        # exercises the edge case where the device tensor sizes and the
+        # valid_elements counts have the same number of elements yet the sizes
+        # represent an expanded slice and the valid counts represent the
+        # original data.
         base = torch.tensor(data, dtype=torch.float16, device="spyre")
         sliced_expanded = base[1:2].expand(4, 20)
         self.assertEqual(sliced_expanded.storage_offset(), 20)
@@ -1298,7 +1310,7 @@ class TestSpyre(TestCase):
         """Transpose / column-major D2H must NOT be intercepted by the
         realize-on-CPU path; the existing DMA path handles those layouts
         correctly. Guards against re-broadening the trigger to
-        !is_contiguous(), which infinite-loops when dma_strides is
+        !is_contiguous(), which infinite-loops when the device strides are
         column-major (as produced by some Inductor-codegen outputs)."""
         m = torch.tensor(
             [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
