@@ -160,10 +160,10 @@ class TestScaledBmmScales:
         _cases("test_scales", _scale_params()),
     )
     def test_scales(self, fvt_id, scale_a, scale_b, scale_dtype, sencores, request):
-        _expect_known_failure(request)
-        _assert_within_bound(
-            *_run_exact(fvt_id, sencores, scale_a, scale_b, scale_dtype=scale_dtype)
-        )
+        with _expect_known_failure(request):
+            _assert_within_bound(
+                *_run_exact(fvt_id, sencores, scale_a, scale_b, scale_dtype=scale_dtype)
+            )
 
     @pytest.mark.parametrize(
         "fvt_id,scale_a,scale_b,sencores",
@@ -203,18 +203,18 @@ class TestScaledBmmScales:
         Today every case fails on #6053 (out_dtype=None rejected by the schema), so
         this test exercises only that bug, and one case runs.
         """
-        _expect_known_failure(request)
-        out, ref, absum = _run_exact(
-            fvt_id,
-            sencores,
-            2.0,
-            3.0,
-            scale_dtype=scale_a_dtype,
-            scale_b_dtype=scale_b_dtype,
-            out_dtype=None,
-        )
-        assert out.dtype == torch.float16, f"default out_dtype gave {out.dtype}"
-        _assert_within_bound(out, ref, absum)
+        with _expect_known_failure(request):
+            out, ref, absum = _run_exact(
+                fvt_id,
+                sencores,
+                2.0,
+                3.0,
+                scale_dtype=scale_a_dtype,
+                scale_b_dtype=scale_b_dtype,
+                out_dtype=None,
+            )
+            assert out.dtype == torch.float16, f"default out_dtype gave {out.dtype}"
+            _assert_within_bound(out, ref, absum)
 
 
 # The one section where quantization rounds or clamps: mat1 near, at, beyond or
@@ -243,32 +243,64 @@ class TestScaledBmmBoundary:
         _cases("test_boundary", _boundary_params()),
     )
     def test_boundary(self, fvt_id, mode, scale_a, scale_b, sencores, request):
-        _expect_known_failure(request)
-        _, mat1, mat2, _ = _CASES[fvt_id]
-        u = cached_randn(mat1, differentiation=(fvt_id, mode), abs=True).float()
-        u = u.clamp(max=3.0) / 3.0
-        if mode == "near_max":
-            mag = 440.0 + 8.0 * u
-        elif mode == "at_max":
-            mag = torch.full(mat1, FP8_E4M3FN_MAX)
-        elif mode == "saturate":
-            mag = 449.0 + 1551.0 * u
-        else:  # "tiny": uniform(2^-9, 2^-6), the E4M3 subnormal range
-            mag = FP8_MIN_SUBNORMAL + (FP8_MIN_NORMAL - FP8_MIN_SUBNORMAL) * u
-        a = (mag * _sign(mat1, (fvt_id, mode, "a")) * scale_a).to(torch.float16)
-        other = FP8_E4M3FN_MAX if mode == "tiny" else 0.125
-        rb = other * _sign(mat2, (fvt_id, mode, "b"))
-        b = (rb * scale_b).to(torch.float16)
-        sa = torch.tensor(scale_a, dtype=torch.float16)
-        sb = torch.tensor(scale_b, dtype=torch.float16)
-        with _cores(sencores):
-            out = _compile_and_run(_scaled_bmm_fn(), (a, b, sa, sb, sa, sb), DEVICE)
+        with _expect_known_failure(request):
+            _, mat1, mat2, _ = _CASES[fvt_id]
+            u = cached_randn(mat1, differentiation=(fvt_id, mode), abs=True).float()
+            u = u.clamp(max=3.0) / 3.0
+            if mode == "near_max":
+                mag = 440.0 + 8.0 * u
+            elif mode == "at_max":
+                mag = torch.full(mat1, FP8_E4M3FN_MAX)
+            elif mode == "saturate":
+                mag = 449.0 + 1551.0 * u
+            else:  # "tiny": uniform(2^-9, 2^-6), the E4M3 subnormal range
+                mag = FP8_MIN_SUBNORMAL + (FP8_MIN_NORMAL - FP8_MIN_SUBNORMAL) * u
+            a = (mag * _sign(mat1, (fvt_id, mode, "a")) * scale_a).to(torch.float16)
+            other = FP8_E4M3FN_MAX if mode == "tiny" else 0.125
+            rb = other * _sign(mat2, (fvt_id, mode, "b"))
+            b = (rb * scale_b).to(torch.float16)
+            sa = torch.tensor(scale_a, dtype=torch.float16)
+            sb = torch.tensor(scale_b, dtype=torch.float16)
+            with _cores(sencores):
+                out = _compile_and_run(_scaled_bmm_fn(), (a, b, sa, sb, sa, sb), DEVICE)
 
-        ra = (a.float() / scale_a).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX)
-        ra = ra.to(FP8).float()
-        s = scale_a * scale_b
-        assert torch.isfinite(out).all(), "non-finite output"
-        _assert_within_bound(out, (ra @ rb) * s, (ra.abs() @ rb.abs()) * s)
+            ra = (a.float() / scale_a).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX)
+            ra = ra.to(FP8).float()
+            s = scale_a * scale_b
+            assert torch.isfinite(out).all(), "non-finite output"
+            _assert_within_bound(out, (ra @ rb) * s, (ra.abs() @ rb.abs()) * s)
+
+    @pytest.mark.parametrize(
+        "fvt_id,sencores",
+        _cases("test_quantize_subnormals", _params(["SBQK-03"], cores=CORES_SEMANTIC)),
+    )
+    def test_quantize_subnormals(self, fvt_id, sencores, request):
+        """quantize_fp8_with_scale(x, 1.0) returns FP8-exact subnormals unchanged.
+
+        The quantize half of the "tiny" boundary case, without the matmul, so the
+        quantizer (#6084) has a signal of its own; test_dma_round_trip_subnormals
+        does the same for the matmul's decode (#6067).
+        """
+        with _expect_known_failure(request):
+            _, mat1, _, _ = _CASES[fvt_id]
+            u = cached_randn(mat1, differentiation=(fvt_id, "qsub"), abs=True).float()
+            mag = FP8_MIN_SUBNORMAL + (FP8_MIN_NORMAL - FP8_MIN_SUBNORMAL) * (
+                u.clamp(max=3.0) / 3.0
+            )
+            x = (mag * _sign(mat1, (fvt_id, "qsub"))).to(FP8).float()
+            one = torch.tensor(1.0, dtype=torch.float16)
+
+            def fn(t, s):
+                return torch.ops.spyre.quantize_fp8_with_scale(t, s)
+
+            with _cores(sencores):
+                q = _compile_and_run(fn, (x.to(torch.float16), one), DEVICE)
+            changed = q.float() != x
+            assert not changed.any(), (
+                f"{changed.sum().item()} / {x.numel()} subnormal values changed by "
+                f"quantize_fp8_with_scale ({(q.float()[changed] == 0).sum().item()} "
+                "of them to zero)"
+            )
 
 
 _OUT_DTYPE_GROUPS = [
@@ -301,11 +333,11 @@ class TestScaledBmmParameters:
     )
     def test_out_dtype(self, fvt_id, out_dtype, sencores, request):
         """out_dtype=None and out_dtype=torch.float16 both give fp16 (FRS 5.1)."""
-        _expect_known_failure(request)
-        expected = out_dtype or torch.float16
-        out, ref, absum = _run_exact(fvt_id, sencores, out_dtype=out_dtype)
-        assert out.dtype == expected, f"out_dtype={out_dtype} gave {out.dtype}"
-        _assert_within_bound(out, ref, absum, expected)
+        with _expect_known_failure(request):
+            expected = out_dtype or torch.float16
+            out, ref, absum = _run_exact(fvt_id, sencores, out_dtype=out_dtype)
+            assert out.dtype == expected, f"out_dtype={out_dtype} gave {out.dtype}"
+            _assert_within_bound(out, ref, absum, expected)
 
     @pytest.mark.parametrize(
         "fvt_id,sencores",
@@ -317,12 +349,12 @@ class TestScaledBmmParameters:
         Fails today on #6061: scaled_bmm_decomp multiplies the bf16 bmm_fp8 result
         by the 0-d fp16 scales, and that multiply is promoted to float32.
         """
-        _expect_known_failure(request)
-        out, ref, absum = _run_exact(fvt_id, sencores, out_dtype=torch.bfloat16)
-        assert out.dtype in (torch.float16, torch.bfloat16), (
-            f"out_dtype=torch.bfloat16 returned {out.dtype}"
-        )
-        _assert_within_bound(out, ref, absum, out.dtype)
+        with _expect_known_failure(request):
+            out, ref, absum = _run_exact(fvt_id, sencores, out_dtype=torch.bfloat16)
+            assert out.dtype in (torch.float16, torch.bfloat16), (
+                f"out_dtype=torch.bfloat16 returned {out.dtype}"
+            )
+            _assert_within_bound(out, ref, absum, out.dtype)
 
     @pytest.mark.parametrize(
         "fvt_id,use_fast_accum,sencores",
@@ -378,20 +410,34 @@ REJECTION_CASES = [
         torch.float16,
         "Expected FP8 input for mat2, got torch.float16",
     ),
-    ("rank2", (128, 128), (128, 128), FP8, FP8, "not supported"),
-    ("rank5", (1, 1, 32, 128, 128), (1, 1, 32, 128, 128), FP8, FP8, "not supported"),
-    ("rank_mismatch_4_3", _G4D, (32, 128, 128), FP8, FP8, "not supported"),
-    ("batch_mismatch", (2, 32, 128, 128), _G4D, FP8, FP8, "not supported"),
-    ("gqa_heads_unexpanded", _G4D, (1, 8, 128, 128), FP8, FP8, "not supported"),
-    ("broadcast_batch", (2, 32, 128, 128), (1, 1, 128, 128), FP8, FP8, "not supported"),
-    ("k_mismatch", _G4D, (1, 32, 256, 128), FP8, FP8, "not supported"),
+    ("rank2", (128, 128), (128, 128), FP8, FP8, "bmm_fp8 with shapes"),
+    (
+        "rank5",
+        (1, 1, 32, 128, 128),
+        (1, 1, 32, 128, 128),
+        FP8,
+        FP8,
+        "bmm_fp8 with shapes",
+    ),
+    ("rank_mismatch_4_3", _G4D, (32, 128, 128), FP8, FP8, "bmm_fp8 with shapes"),
+    ("batch_mismatch", (2, 32, 128, 128), _G4D, FP8, FP8, "bmm_fp8 with shapes"),
+    ("gqa_heads_unexpanded", _G4D, (1, 8, 128, 128), FP8, FP8, "bmm_fp8 with shapes"),
+    (
+        "broadcast_batch",
+        (2, 32, 128, 128),
+        (1, 1, 128, 128),
+        FP8,
+        FP8,
+        "bmm_fp8 with shapes",
+    ),
+    ("k_mismatch", _G4D, (1, 32, 256, 128), FP8, FP8, "bmm_fp8 with shapes"),
     (
         "gqa_unexpanded_global",
         (1, 16, 64, 512),
         (1, 2, 512, 2048),
         FP8,
         FP8,
-        "not supported",
+        "bmm_fp8 with shapes",
     ),
     (
         "gqa_unexpanded_sliding",
@@ -399,7 +445,7 @@ REJECTION_CASES = [
         (1, 8, 256, 1024),
         FP8,
         FP8,
-        "not supported",
+        "bmm_fp8 with shapes",
     ),
 ]
 
@@ -420,15 +466,15 @@ class TestScaledBmmRejections:
         ),
     )
     def test_rejections(self, key, mat1, mat2, dt1, dt2, fragment, sencores, request):
-        _expect_known_failure(request)
-        a = cached_randn(mat1, differentiation=(key, "mat1")).to(dt1)
-        b = cached_randn(mat2, differentiation=(key, "mat2")).to(dt2)
+        with _expect_known_failure(request):
+            a = cached_randn(mat1, differentiation=(key, "mat1")).to(dt1)
+            b = cached_randn(mat2, differentiation=(key, "mat2")).to(dt2)
 
-        def fn(a, b):
-            return torch.ops.spyre.scaled_bmm(a, b, out_dtype=torch.float16)
+            def fn(a, b):
+                return torch.ops.spyre.scaled_bmm(a, b, out_dtype=torch.float16)
 
-        with _cores(sencores), pytest.raises(InductorError, match=fragment):
-            _compile_and_run(fn, (a, b), DEVICE)
+            with _cores(sencores), pytest.raises(InductorError, match=fragment):
+                _compile_and_run(fn, (a, b), DEVICE)
 
     @expects_raise
     @pytest.mark.parametrize(
@@ -606,62 +652,62 @@ class TestScaledBmmForEachTile:
         Today every case fails on #5423 (batchmatmulfp8 layout planning inside
         for_each_tile), so this test exercises only that bug, and one case runs.
         """
-        _expect_known_failure(request)
-        pages = 4
-        moe = fvt_id == "SBFT-06"
-        if moe:  # map over experts, weight is [B, K, N]
-            x = _fet_act((b, m, d), (fvt_id, "x"))
-            w = _fp8_exact((b, n, d), (fvt_id, "w")).to(torch.float16)
-            tile = 2
+        with _expect_known_failure(request):
+            pages = 4
+            moe = fvt_id == "SBFT-06"
+            if moe:  # map over experts, weight is [B, K, N]
+                x = _fet_act((b, m, d), (fvt_id, "x"))
+                w = _fp8_exact((b, n, d), (fvt_id, "w")).to(torch.float16)
+                tile = 2
 
-            def expert(xt, wt):
-                return _fet_block(xt, wt.transpose(-2, -1).contiguous())
+                def expert(xt, wt):
+                    return _fet_block(xt, wt.transpose(-2, -1).contiguous())
 
-            def tiled(x, w):
-                def body(_carry, tiles):
-                    xt, wt = tiles
-                    return None, expert(xt, wt)
+                def tiled(x, w):
+                    def body(_carry, tiles):
+                        xt, wt = tiles
+                        return None, expert(xt, wt)
 
-                _, out = for_each_tile(
-                    body, (x, w), dims=(0, 0), tile_size=tile, out_dim=0
-                )
-                return out
+                    _, out = for_each_tile(
+                        body, (x, w), dims=(0, 0), tile_size=tile, out_dim=0
+                    )
+                    return out
 
-            args = (x, w)
-            tiles_t, pv = w, False
-        else:
-            act_s = n if fvt_id == "SBFT-03" else d
-            pv = fvt_id == "SBFT-03"
-            act = _fet_act((b, m, act_s), (fvt_id, "act"))
-            pg = _fp8_exact((pages, b, n, d), (fvt_id, "pg")).to(torch.float16)
-            acc0 = torch.zeros(b, m, n, dtype=torch.float16)
+                args = (x, w)
+                tiles_t, pv = w, False
+            else:
+                act_s = n if fvt_id == "SBFT-03" else d
+                pv = fvt_id == "SBFT-03"
+                act = _fet_act((b, m, act_s), (fvt_id, "act"))
+                pg = _fp8_exact((pages, b, n, d), (fvt_id, "pg")).to(torch.float16)
+                acc0 = torch.zeros(b, m, n, dtype=torch.float16)
 
-            def one_page(a, page):
-                w2d = page if pv else page.transpose(-2, -1).contiguous()
-                return _fet_block(a, w2d)
+                def one_page(a, page):
+                    w2d = page if pv else page.transpose(-2, -1).contiguous()
+                    return _fet_block(a, w2d)
 
-            def tiled(act, pg, acc0):
-                def body(carry, tiles):
-                    page, a, _ = tiles
-                    (acc,) = carry
-                    return (acc + one_page(a, page.squeeze(0)),), None
+                def tiled(act, pg, acc0):
+                    def body(carry, tiles):
+                        page, a, _ = tiles
+                        (acc,) = carry
+                        return (acc + one_page(a, page.squeeze(0)),), None
 
-                (out,), _ = for_each_tile(
-                    body,
-                    (pg, act, acc0),
-                    dims=(0, None, None),
-                    tile_size=1,
-                    init=(acc0,),
-                )
-                return out
+                    (out,), _ = for_each_tile(
+                        body,
+                        (pg, act, acc0),
+                        dims=(0, None, None),
+                        tile_size=1,
+                        init=(acc0,),
+                    )
+                    return out
 
-            args = (act, pg, acc0)
-            tiles_t = pg
+                args = (act, pg, acc0)
+                tiles_t = pg
 
-        with _cores(sencores):
-            out = _run_fullgraph(tiled, args)
-        ref, absum = _fet_ref(args[0], tiles_t, pv, moe)
-        _assert_within_bound(out, ref, absum)
+            with _cores(sencores):
+                out = _run_fullgraph(tiled, args)
+            ref, absum = _fet_ref(args[0], tiles_t, pv, moe)
+            _assert_within_bound(out, ref, absum)
 
 
 # Zero padding must not change the result; padded rows and columns must be zero.
@@ -722,54 +768,57 @@ class TestScaledBmmPadded:
     )
     def test_padded_inputs(self, fvt_id, key, source, axis, extent, sencores, request):
         """The live part matches the unpadded CPU result; the padding is zero."""
-        _expect_known_failure(request)
-        _, mat1, mat2, _ = _CASES[source]
-        ra = _fp8_exact(mat1, (source, "a"))
-        rb = _fp8_exact(mat2, (source, "b"))
-        m, k, n = mat1[-2], mat1[-1], mat2[-1]
+        with _expect_known_failure(request):
+            _, mat1, mat2, _ = _CASES[source]
+            ra = _fp8_exact(mat1, (source, "a"))
+            rb = _fp8_exact(mat2, (source, "b"))
+            m, k, n = mat1[-2], mat1[-1], mat2[-1]
 
-        pa, pb = ra, rb
-        if axis == "k":
-            pa = torch.nn.functional.pad(ra, (0, extent - k))
-            pb = torch.nn.functional.pad(rb, (0, 0, 0, extent - k))
-        elif axis == "n":
-            pb = torch.nn.functional.pad(rb, (0, extent - n))
-        else:
-            pa = torch.nn.functional.pad(ra, (0, 0, 0, extent - m))
+            pa, pb = ra, rb
+            if axis == "k":
+                pa = torch.nn.functional.pad(ra, (0, extent - k))
+                pb = torch.nn.functional.pad(rb, (0, 0, 0, extent - k))
+            elif axis == "n":
+                pb = torch.nn.functional.pad(rb, (0, extent - n))
+            else:
+                pa = torch.nn.functional.pad(ra, (0, 0, 0, extent - m))
 
-        one = torch.tensor(1.0, dtype=torch.float16)
-        args = (pa.to(torch.float16), pb.to(torch.float16), one, one, one, one)
-        with _cores(sencores):
-            out = _compile_and_run(_scaled_bmm_fn(), args, DEVICE)
+            one = torch.tensor(1.0, dtype=torch.float16)
+            args = (pa.to(torch.float16), pb.to(torch.float16), one, one, one, one)
+            with _cores(sencores):
+                out = _compile_and_run(_scaled_bmm_fn(), args, DEVICE)
 
-        ref = ra @ rb
-        absum = ra.abs() @ rb.abs()
-        live, pad = out, None
-        if axis == "n":
-            live, pad = out[..., :n], out[..., n:]
-        elif axis == "m":
-            live, pad = out[..., :m, :], out[..., m:, :]
-        _assert_within_bound(live, ref, absum)
-        if pad is not None:
-            assert torch.equal(pad.float(), torch.zeros_like(pad.float())), (
-                f"{(pad != 0).sum().item()} / {pad.numel()} padded elements "
-                f"are non-zero (max |value| {pad.abs().max().item()})"
-            )
+            ref = ra @ rb
+            absum = ra.abs() @ rb.abs()
+            live, pad = out, None
+            if axis == "n":
+                live, pad = out[..., :n], out[..., n:]
+            elif axis == "m":
+                live, pad = out[..., :m, :], out[..., m:, :]
+            _assert_within_bound(live, ref, absum)
+            if pad is not None:
+                assert torch.equal(pad.float(), torch.zeros_like(pad.float())), (
+                    f"{(pad != 0).sum().item()} / {pad.numel()} padded elements "
+                    f"are non-zero (max |value| {pad.abs().max().item()})"
+                )
 
 
 class TestScaledBmmKnownFailures:
-    """Every _KNOWN_FAILURES entry matches a case; a stale regex is silently a no-op."""
+    """Every _KNOWN_FAILURES entry matches a case and says what it expects."""
 
     @pytest.mark.parametrize(
-        "name,pattern",
-        [
-            pytest.param(name, pattern, id=f"{name}-{i}")
-            for i, (name, pattern, *_) in enumerate(_KNOWN_FAILURES)
-        ],
+        "entry",
+        [pytest.param(k, id=f"{k.test}-{i}") for i, k in enumerate(_KNOWN_FAILURES)],
     )
-    def test_entry_matches_a_case(self, name, pattern):
-        assert name in _ALL_CASES, f"no parametrized test named {name}"
-        ids = [p.id for p in _ALL_CASES[name]]
-        assert any(re.fullmatch(pattern, i) for i in ids), (
-            f"{name}: {pattern!r} matches none of its {len(ids)} cases"
+    def test_entry_matches_a_case(self, entry):
+        """A stale regex is silently a no-op; an empty fragment accepts any error."""
+        assert entry.test in _ALL_CASES, f"no parametrized test named {entry.test}"
+        ids = [p.id for p in _ALL_CASES[entry.test]]
+        assert any(re.fullmatch(entry.pattern, i) for i in ids), (
+            f"{entry.test}: {entry.pattern!r} matches none of its {len(ids)} cases"
+        )
+        assert entry.match, f"{entry.test}: {entry.pattern!r} has no message fragment"
+        assert re.search(r"#\d+", entry.reason), f"{entry.reason!r} cites no issue"
+        assert entry.strict == (not entry.reason.startswith("Unstable: ")), (
+            "a non-strict entry's reason starts with 'Unstable: ', and only its"
         )

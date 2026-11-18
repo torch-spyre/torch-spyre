@@ -37,5 +37,5 @@ class TestScaledBmmShapes:
 
     @pytest.mark.parametrize("fvt_id,sencores", SHAPE_PARAMS)
     def test_shapes(self, fvt_id, sencores, request):
-        _expect_known_failure(request)
-        _assert_within_bound(*_run_exact(fvt_id, sencores))
+        with _expect_known_failure(request):
+            _assert_within_bound(*_run_exact(fvt_id, sencores))

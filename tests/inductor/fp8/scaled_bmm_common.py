@@ -21,7 +21,8 @@ Sections 11 and 12 are in tests/inductor/test_fp8_operations.py and
 tests/inductor/test_fp8_prequantized_load.py. Shapes come from Granite-3.3/4.1-8B-FP8
 and Gemma-4-26B-A4B.
 
-Cases that fail today are listed in _KNOWN_FAILURES and run as strict xfails.
+Cases that fail today are listed in _KNOWN_FAILURES and run as strict xfails that
+also check a fragment of the error message.
 Outside test_shapes only the first case of each entry runs (see _cases); the
 others come back when the issue is fixed and its entry removed.
 
@@ -32,6 +33,7 @@ core count, so they run at CORES_SEMANTIC only.
 """
 
 import contextlib
+from typing import NamedTuple
 
 import regex as re
 
@@ -534,119 +536,197 @@ def _params(fvt_ids, *extra, cores=None):
     ]
 
 
-# (test name, case-id regex, exception raised today, reason citing the open issue).
+class _KnownFailure(NamedTuple):
+    """A case that fails today: run as an xfail tied to the open issue that records it.
+
+    ``match`` is a fragment of the error message today. A case that raises ``raises``
+    without it fails as StaleKnownFailure, so an entry whose case starts failing for
+    another reason fails the run instead of xfailing under the wrong issue.
+    ``strict=False`` is only for an outcome that varies between runs.
+    """
+
+    test: str
+    pattern: str  # case-id regex
+    raises: type
+    match: str
+    reason: str
+    strict: bool = True
+
+
+_DT_EXCEPTION = "newPds.stickDimOrder_.size() == newPds.stickSize_.size()"
+_NO_STICK_MECHANISM = "no mechanism to resolve stick incompatibility"
+_OUTSIDE_BOUND = "elements outside"
+_OUT_DTYPE_NONE = "Expected a value of type 'int' for argument 'out_dtype'"
+
 # Order matters: a case takes the first entry that matches it (first match wins),
 # both in _expect_known_failure and in _cases' pruning. Put narrower patterns
 # before broader ones for the same test.
 _KNOWN_FAILURES = [
-    (
+    _KnownFailure(
+        "test_shapes",
+        r"3d_qk_32x64x128x64-cores1",
+        AssertionError,
+        _OUTSIDE_BOUND,
+        "Unstable: #6436: [fp8] scaled_bmm: 3D QKᵀ at 1 core returns wrong values "
+        "(fails in most runs since #5048, passes in some)",
+        strict=False,
+    ),
+    _KnownFailure(
         "test_shapes",
         r"3d_moe_bmm_as_captured_(8|96)x2816x704x1-cores\d+",
         InductorError,
+        _NO_STICK_MECHANISM,
         "#6076: [fp8] scaled_bmm: N=1 MoE expert matmul fails layout planning "
         "when K is not a stick multiple",
     ),
-    (
+    _KnownFailure(
         "test_shapes",
         r"3d_moe_bmm_as_captured_96x1408x2816x1-cores1"
         r"|3d_moe_bmm_weight_as_mat2_96x1x(2816x1408|704x2816)-cores\d+",
         InductorError,
+        "per-core tensor span",
         "#6082: [fp8] scaled_bmm: per-core span limit rejects MoE shapes without "
         "splitting the batch dimension",
     ),
-    (
+    _KnownFailure(
         "test_shapes",
         r"3d_moe_bmm_as_captured_8x1408x2816x1-cores1"
         r"|3d_moe_bmm_as_captured_96x1408x2816x1-cores11",
         AssertionError,
-        "#5924: [fp8] batchmatmulfp8 returns wrong values when N is a multiple of"
-        " 64 but not of 128 (K aligned)",
+        _OUTSIDE_BOUND,
+        "#6438: [fp8] scaled_bmm: N=1 MoE expert matmul returns wrong values (inf) "
+        "at some core counts",
     ),
-    (
+    _KnownFailure(
         "test_shapes",
-        r"3d_moe_bmm_weight_as_mat2_8x1x704x2816-cores\d+",
+        r"(3d_moe_bmm_weight_as_mat2_8x1x704x2816"
+        r"|4d_decode_pv_(1|4)x32x1x64x128)-cores\d+",
         InductorError,
+        _DT_EXCEPTION,
         "#6079: [fp8] scaled_bmm: dbo-opt DtException when the contraction K is "
         "not a multiple of 128",
     ),
-    (
+    _KnownFailure(
         "test_shapes",
         r"(3d_pv_32x64x64x128|4d_prefill_pv_1x32x64x64x128"
-        r"|4d_decode_pv_(1|4)x32x1x64x128)-cores\d+",
+        r"|4d_global_prefill_pv_1x16x(12x12|24x24)x512)-cores\d+",
         InductorError,
-        '#6080: [fp8] scaled_bmm: P@V with K=64 rejected "cannot restickify any '
-        'input layout of x to carry x_var=d3"',
+        "StopIteration",
+        "#6437: [fp8] scaled_bmm: P@V with sub-stick K raises StopIteration in "
+        "_cost_model_matmul_planner (no QFP8WT input)",
     ),
-    (
-        "test_shapes",
-        r"4d_global_prefill_pv_1x16x(12x12|24x24)x512-cores\d+",
-        InductorError,
-        "#5524: [test_full_fp8_pipeline] 5 model-derived shapes with unaligned K "
-        "(2112) fail to compile",
-    ),
-    (
+    _KnownFailure(
         "test_scales",
         r"(?!.*-None-None-).*-torch\.float32-cores\d+",
         AssertionError,
+        _OUTSIDE_BOUND,
         "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values",
     ),
-    (
+    _KnownFailure(
         "test_scale_dtypes",
         r".*",
         TorchRuntimeError,
+        _OUT_DTYPE_NONE,
         "#6053: [fp8] scaled_bmm: out_dtype=None is rejected by the op schema",
     ),
-    (
+    _KnownFailure(
         "test_boundary",
         r".*-tiny-.*",
         AssertionError,
+        _OUTSIDE_BOUND,
         "#6067: [fp8] FP8 subnormals mis-decoded in the matmul; #6084: [fp8] "
         "quantize_fp8_with_scale corrupts E4M3 subnormal values",
     ),
-    (
+    _KnownFailure(
+        "test_quantize_subnormals",
+        r".*",
+        AssertionError,
+        "subnormal values changed by quantize_fp8_with_scale",
+        "#6084: [fp8] quantize_fp8_with_scale corrupts E4M3 subnormal values",
+    ),
+    _KnownFailure(
         "test_out_dtype",
         r".*-None-cores\d+",
         TorchRuntimeError,
+        _OUT_DTYPE_NONE,
         "#6053: [fp8] scaled_bmm: out_dtype=None is rejected by the op schema",
     ),
-    (
+    _KnownFailure(
         "test_out_dtype_bfloat16",
         r".*",
         AssertionError,
+        "out_dtype=torch.bfloat16 returned torch.float32",
         "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values"
         " (the bf16 result times the 0-d fp16 scale is promoted to float32)",
     ),
-    (
+    _KnownFailure(
         "test_rejections",
         r"mat[12]_fp16-cores\d+",
         AssertionError,
+        # pytest.raises' "Regex pattern did not match", quoting the layout error that
+        # reaches the user instead of the dtype guard.
+        _NO_STICK_MECHANISM,
         "#6203: [fp8] scaled_bmm: FP8 operand guard in lower_bmm_fp8 is bypassed "
         "when one operand is fp16",
     ),
-    (
+    _KnownFailure(
         "test_padded_inputs",
         r"pad_n_3d_moe_bmm_as_captured_8x2816x704x1-cores\d+",
         InductorError,
+        _DT_EXCEPTION,
         "#6079: [fp8] scaled_bmm: dbo-opt DtException when the contraction K is "
         "not a multiple of 128",
     ),
-    (
+    _KnownFailure(
         "test_for_each_tile",
         r".*",
         InductorError,
+        _NO_STICK_MECHANISM,
         "#5423: `batchmatmulfp8` fails layout planning inside `for_each_tile`: "
         '"no mechanism to resolve stick incompatibility"',
     ),
 ]
 
 
+class StaleKnownFailure(Exception):
+    """A _KNOWN_FAILURES case raised its exception type, but not its message."""
+
+
+@contextlib.contextmanager
 def _expect_known_failure(request):
-    """Strict xfail for a test listed in _KNOWN_FAILURES."""
+    """Run the body as an xfail if a _KNOWN_FAILURES entry matches this case.
+
+    The xfail is strict with ``raises=entry.raises``. An error of that type whose
+    message lacks ``entry.match`` is re-raised as StaleKnownFailure, which the xfail
+    does not accept, so the run fails and the stale entry gets noticed.
+    """
     test, case = request.node.originalname, request.node.callspec.id
-    for name, pattern, raises, reason in _KNOWN_FAILURES:
-        if name == test and re.fullmatch(pattern, case):
-            strict_xfail(request, raises=raises, reason=reason)
-            return
+    entry = next(
+        (
+            k
+            for k in _KNOWN_FAILURES
+            if k.test == test and re.fullmatch(k.pattern, case)
+        ),
+        None,
+    )
+    if entry is None:
+        yield
+        return
+    if entry.strict:
+        strict_xfail(request, raises=entry.raises, reason=entry.reason)
+    else:
+        request.applymarker(
+            pytest.mark.xfail(raises=entry.raises, strict=False, reason=entry.reason)
+        )
+    try:
+        yield
+    except entry.raises as e:
+        if entry.match not in str(e):
+            raise StaleKnownFailure(
+                f"{entry.reason}: expected {entry.match!r} in the error, got "
+                f"{type(e).__name__}: {str(e)[:500]}"
+            ) from e
+        raise
 
 
 # test name -> every case it defines, before _cases prunes repeated known failures.
@@ -671,8 +751,8 @@ def _cases(test, params):
         entry = next(
             (
                 i
-                for i, (name, pattern, *_) in enumerate(_KNOWN_FAILURES)
-                if name == test and re.fullmatch(pattern, p.id)
+                for i, k in enumerate(_KNOWN_FAILURES)
+                if k.test == test and re.fullmatch(k.pattern, p.id)
             ),
             None,
         )
