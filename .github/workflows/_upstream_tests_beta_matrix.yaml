@@ -227,6 +227,8 @@ jobs:
             config: inductor-test_cpu_select_algorithm_part4.yaml
           - name: Inductor test cpu select algorithm part 5
             config: inductor-test_cpu_select_algorithm_part5.yaml
+          - name: Scatter gather ops
+            config: test_scatter_gather_ops.yaml
           ####################
           - name: Inductor test custom op autotune
             config: inductor-test_custom_op_autotune.yaml

@@ -233,6 +233,120 @@ class TestSpyre(TestCase):
         self.assertTrue(d.cpu().eq(3.0).all())
 
     @parametrize(
+        "shape",
+        [
+            subtest((64, 64), name="aligned"),
+            subtest((3, 7), name="padded"),
+            subtest((2, 4, 16, 128), name="kv_page_shape"),
+        ],
+    )
+    def test_zero_float8(self, shape):
+        # The device fill has no fp8 value->pattern conversion; zero_ must still
+        # work (all-zero bytes) and must zero every element of a nonzero tensor.
+        ones = torch.ones(shape).to(torch.float8_e4m3fn)
+        d = ones.to("spyre")
+        d.zero_()
+        out = d.cpu()
+        self.assertEqual(out.dtype, torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(out.view(torch.uint8), torch.zeros(shape).to(torch.uint8))
+        )
+
+    @staticmethod
+    def _head_major_kv_layout(
+        num_rows, block_size, head_size, dtype, valid_elements=None
+    ):
+        # The layout spyre-inference uses for its paged KV cache
+        # (head_major_kv_layout): the folded (block, kv_head) row stays whole at
+        # device dim 0, and head_size is split into sticks.
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            get_device_dtype,
+            get_elem_in_stick,
+        )
+
+        eps = get_elem_in_stick(dtype)
+        sticks = (head_size + eps - 1) // eps
+        return SpyreTensorLayout(
+            device_size=[num_rows, block_size, sticks, eps],
+            stride_map=[block_size * head_size, head_size, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements=valid_elements or {},
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    @parametrize(
+        "head_size", [subtest(64, name="head64"), subtest(128, name="head128")]
+    )
+    @parametrize(
+        "with_valid_elements",
+        [subtest(False, name="unknown_valid"), subtest(True, name="valid_elements")],
+    )
+    def test_zero_kv_cache_device_layout(self, dtype, head_size, with_valid_elements):
+        # spyre-inference allocates its KV cache pages with
+        # torch.empty(..., device_layout=...) and zeroes them with zero_(). The
+        # cache is then read back whole, so every element must be zero.
+        num_blocks, kv_heads, block_size = 3, 2, 16
+        shape = (num_blocks, kv_heads, block_size, head_size)
+        rows = num_blocks * kv_heads
+        # Per device dim group, the unpadded extent: rows, block, and head_size
+        # across the (stick, element-in-stick) pair, which pads head_size up to
+        # whole sticks. The fill guard compares the product with numel().
+        valid = (
+            {(0,): rows, (1,): block_size, (2, 3): head_size}
+            if with_valid_elements
+            else None
+        )
+        layout = self._head_major_kv_layout(rows, block_size, head_size, dtype, valid)
+
+        # Allocation path used by allocate_pages: uninitialised, then zeroed.
+        page = torch.empty(
+            shape, dtype=dtype, device=torch.device("spyre"), device_layout=layout
+        )
+        self.assertIs(page.zero_(), page)
+        out = page.cpu()
+        self.assertEqual(out.shape, shape)
+        self.assertTrue(out.float().eq(0).all())
+
+        # Same layout, starting from nonzero data so the fill is observable
+        # (an empty tensor may already read as zero).
+        host = torch.ones(shape).to(dtype)
+        page = host.to("spyre", device_layout=layout)
+        self.assertTrue(page.cpu().float().eq(1).all())
+        page.zero_()
+        self.assertTrue(page.cpu().float().eq(0).all())
+
+    def test_zero_kv_cache_valid_elements_partial_rejected(self):
+        # Complement of the above: with valid_elements set, zero_ of a page
+        # slice of the cache is still a partial view and must be rejected.
+        shape = (3, 2, 16, 128)
+        layout = self._head_major_kv_layout(
+            6, 16, 128, torch.float8_e4m3fn, {(0,): 6, (1,): 16, (2, 3): 128}
+        )
+        page = (
+            torch.ones(shape).to(torch.float8_e4m3fn).to("spyre", device_layout=layout)
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            page[1].zero_()
+        self.assertTrue(page.cpu().float().eq(1).all())
+
+    def test_fill_float8_nonzero_rejected(self):
+        # Only zero is supported (no fp8 fill pattern); it must fail cleanly and
+        # leave the tensor untouched.
+        d = torch.ones(64, 64).to(torch.float8_e4m3fn).to("spyre")
+        with self.assertRaisesRegex(RuntimeError, "only supported with the value 0"):
+            d.fill_(1.0)
+        self.assertTrue(d.cpu().float().eq(1.0).all())
+
+    @parametrize(
         "view",
         [
             subtest(lambda t: t, name="base"),
@@ -1485,6 +1599,26 @@ class TestSpyre(TestCase):
                     torch.testing.assert_close(
                         restored.cpu(), expected, atol=atol, rtol=rtol
                     )
+
+    def test_unservable_view_in_compiled_fallback_uses_host_copy(self):
+        """Inside a compiled fallback the unservable view is copied through the
+        host and warns, instead of compiling a rebuild (no nested torch.compile)."""
+        from torch_spyre.ops.eager import (
+            _materialize_unservable_view,
+            _run_compiled_fallback,
+        )
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        base_cpu = torch.arange(8 * 65, dtype=torch.float16).reshape(8, 65)
+        base = base_cpu.to("spyre")
+        view = base.reshape(-1)  # [8, 65] flattened splits a stick: unservable
+        expected = base_cpu.reshape(-1)
+
+        with self.assertWarnsRegex(FallbackWarning, "unaligned view"):
+            copied = _run_compiled_fallback(_materialize_unservable_view, view)
+
+        self.assertEqual(copied.device.type, "spyre")
+        torch.testing.assert_close(copied.cpu(), expected)
 
     def test_unsupported_d2d_dtype_conversion_falls_back(self):
         """Unsupported native D2D pairs retain the CPU fallback behavior."""

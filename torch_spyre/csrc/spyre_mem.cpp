@@ -1116,11 +1116,10 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
-                                   c10::IntArrayRef stride,
-                                   c10::ScalarType dtype,
-                                   SpyreTensorLayout device_layout,
-                                   std::optional<c10::Device> device_opt) {
+at::Tensor spyre_empty_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, std::optional<c10::Device> device_opt,
+    std::optional<std::map<int64_t, ReservedDimInfo>> reserved_dims) {
   at::detail::check_size_nonnegative(size);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
@@ -1150,6 +1149,22 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
+  if (reserved_dims.has_value()) {
+    // The compiled wrapper passes a graph output's [min, max, granularity]
+    // here so that a later compile can read it back with get_reserved_dims.
+    // Unlike spyre_empty_reserved this does not pad the layout: the compiler
+    // has already sized device_layout for the declared max.
+    for (const auto& [rdim, info] : *reserved_dims) {
+      TORCH_CHECK(rdim >= 0 && rdim < static_cast<int64_t>(size.size()),
+                  "reserved dim ", rdim, " out of range for tensor of rank ",
+                  size.size());
+      TORCH_CHECK(info.granularity >= 1, "granularity must be >= 1, got ",
+                  info.granularity);
+      TORCH_CHECK(info.min <= info.max, "min=", info.min,
+                  " must be <= max=", info.max, " at dim ", rdim);
+    }
+    spyre_tensor_impl->reserved_dims = std::move(*reserved_dims);
+  }
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -1947,6 +1962,19 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
+
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
 
   // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
   // to the dtype-specific fill pattern; launchFillAsync submits it.

@@ -1043,6 +1043,28 @@ def abs_tiled_reference(A: torch.Tensor) -> torch.Tensor:
     return A.abs()
 
 
+def upcast_add_tiled_fn(
+    A: torch.Tensor, tile_size: int, downcast_in_body: bool
+) -> torch.Tensor:
+    """Map mode: fp16 -> fp32 conversion inside the body, then ``+ 1``.
+
+    The result returns to fp16 inside the body or, with ``downcast_in_body``
+    false, after the loop, so the loop also writes an fp32 output.
+    """
+
+    def body(_, ops):
+        (a_tile,) = ops
+        out = a_tile.float() + 1.0
+        return None, out.half() if downcast_in_body else out
+
+    _, out = for_each_tile(body, (A,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out.half()
+
+
+def upcast_add_tiled_reference(A: torch.Tensor) -> torch.Tensor:
+    return (A.float() + 1.0).half()
+
+
 def abs_add_mul_tiled_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, tile_size: int
 ) -> torch.Tensor:
@@ -1768,6 +1790,36 @@ def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
     with spyre_hint(work_div={"T": row_split}):
         final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
     return final
+
+
+def grouped_carry_group_sum_fn(
+    values: torch.Tensor,
+    group: int,
+    cores: int,
+    init: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """values[E, T, C].sum(0) through a grouped carry: ``group`` slabs per trip
+    add into a carry [G, T, C], and one sum over G follows the loop.
+
+    The loop and its carry use the core map {G: group, T: cores // group}; the
+    sum uses {T: cores}. Each core of the sum then reads its rows from all
+    ``group`` parts of the carry, which are on ``group`` cores. ``init``
+    is the carry's first value (zeros when None); a caller-owned one makes the
+    loop write a compiler-made copy of it.
+    """
+
+    def body(acc, ops):
+        (tile,) = ops
+        return acc + tile, None
+
+    if init is None:
+        init = values.new_zeros(group, *values.shape[1:])
+    with spyre_hint(
+        named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}
+    ):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=group, init=init)
+    with spyre_hint(named_dims=["T", "C"], work_div={"T": cores}):
+        return final.sum(0)
 
 
 def carried_routed_expert_sum_fn(
