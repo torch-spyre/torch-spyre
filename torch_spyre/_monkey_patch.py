@@ -241,6 +241,40 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     return dst
 
 
+def _transfer_reserved_with_layout(src, spec: _DynamicSpec, device_layout):
+    """``_transfer_reserved`` with the device layout given instead of derived.
+
+    Same sequence: allocate at the ceiling, copy the real rows in, mark the
+    dimension dynamic. The layout describes the buffer at ``max``, so the
+    reserved host dimension must occupy exactly one device dimension of it,
+    whole (the one whose stride-map entry is the host stride of the reserved
+    dimension), not the stick-elements dimension, with extent ``max``. The
+    native allocation checks that before anything is allocated and raises a
+    ``RuntimeError`` naming the rule it broke.
+    """
+    import torch
+
+    if not torch.spyre.is_initialized():
+        torch.spyre._impl._lazy_init()
+
+    from torch_spyre._C import copy_tensor, spyre_empty_reserved_with_layout
+
+    dst = spyre_empty_reserved_with_layout(
+        src.size(),
+        src.stride(),
+        src.dtype,
+        device_layout,
+        spec.dim,
+        spec.min,
+        spec.max,
+        spec.granularity,
+    )
+    copy_tensor(src, dst, non_blocking=False)
+    # Bare mark, for the same reasons as in _transfer_reserved.
+    torch._dynamo.mark_dynamic(dst, spec.dim)
+    return dst
+
+
 def _sharding_key(tensor) -> tuple | None:
     """Address-free sharding signature of a real Spyre tensor, else None.
 
@@ -314,16 +348,15 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
         if dynamic is not None:
-            if device_layout is not None:
-                raise ValueError(
-                    "dynamic= cannot be combined with device_layout=: a "
-                    "reserved tensor's layout is derived from its max size"
-                )
             dtype = _parse_dynamic_to_args(self, args, kwargs)
             spec = _parse_dynamic_spec(dynamic, self.size())
             # Convert on the host first: the reserved buffer is allocated
             # and filled at the dtype the caller asked for.
             src = self if dtype is None or dtype == self.dtype else orig_to(self, dtype)
+            if device_layout is not None:
+                # The caller's layout describes the buffer at the declared
+                # max; it is checked against the declaration, not derived.
+                return _transfer_reserved_with_layout(src, spec, device_layout)
             return _transfer_reserved(src, spec)
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
