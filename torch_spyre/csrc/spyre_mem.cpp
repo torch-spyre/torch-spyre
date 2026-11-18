@@ -1166,7 +1166,15 @@ at::Tensor spyre_empty_reserved_with_layout(
               dim, " (host stride ", host_stride,
               ") must occupy exactly one device dimension of the layout, "
               "found ",
-              carriers, " in ", device_layout.toString());
+              carriers, " in ", device_layout.toString(),
+              carriers > 1
+                  ? ". More than one device dimension walks that host "
+                    "stride (another host dimension with the same stride, "
+                    "or a layout that repeats it), so the reserved rows "
+                    "have no single device dimension to resize along: "
+                    "give the reserved dimension a device dimension of "
+                    "its own"
+                  : "");
   TORCH_CHECK(carrier != static_cast<int64_t>(device_size.size()) - 1,
               "device_layout with a reservation: the reserved host dimension ",
               dim,

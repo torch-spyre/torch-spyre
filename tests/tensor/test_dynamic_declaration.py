@@ -235,6 +235,25 @@ class TestDynamicDeclarationValidation(TestCase):
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
 
+    def test_device_layout_two_carriers_rejected(self) -> None:
+        # Two device dims walk host stride 1024 with an extent above one, so
+        # the reserved rows have no single device dim to resize along:
+        # "found 2", and the message names the case.
+        stl = SpyreTensorLayout(
+            [630, 2, 16, 64],
+            [1024, 1024, 64, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 630, (1,): 2, (2, 3): 1024},
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, r"found 2[\s\S]*device dimension of its own"
+        ):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
     def test_reserved_transfer_does_not_warn(self) -> None:
         # The transfer used to warn that compiled kernels were built for the
         # first compile's size (#5937). The compiler now builds a declared

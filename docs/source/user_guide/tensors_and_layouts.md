@@ -483,7 +483,7 @@ stay the same, otherwise `resize_` raises.
 reserved buffer, so it is the layout of the tensor at `max`, not at its current
 size:
 
-```
+```python
 from torch_spyre._C import get_device_dtype, SpyreTensorLayout
 
 # 12 rows of 32 page ids today, up to 16 rows over the tensor's life.
@@ -515,8 +515,8 @@ into another, splits it across the stick, or sizes it for anything but `max`
 is refused before anything is allocated, with a `RuntimeError` from the native
 allocation that names the rule. The layout's other dimensions are not checked
 against the host shape, the same contract as `device_layout=` without
-`dynamic=`: sizing them for the tensor is the caller's responsibility. The derived layout
-satisfies these rules by construction, so giving
+`dynamic=`: sizing them for the tensor is the caller's responsibility. The
+derived layout satisfies these rules by construction, so giving
 `SpyreTensorLayout(max_shape, dtype)` explicitly is the same as the call
 without `device_layout=`.
 
