@@ -242,7 +242,8 @@ _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 # Largest k topkvalue/topkindex accept.
 TOPK_MAX_K = 128
-# DLFloat16 has integer precision up to 1024, so above it indices come back wrong
+# topkindex counts in the input dtype, and fp16 holds integers exactly only up to
+# this many elements along the search dim (#5847).
 FP16_TOPK_MAX_DIM = 1024
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]

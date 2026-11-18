@@ -1892,14 +1892,14 @@ def spyre_topk(
             input = torch.constant_pad_nd(
                 input, [0, 0] * (input.dim() - 1 - dim) + [0, pad], float("-inf")
             )
-    # topkindex's indices come back in the input dtype, and Spyre's fp16 holds
-    # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16 search dim
-    # (counted after padding) would return wrong indices.
+    # The index is counted in the input dtype, so a longer fp16 search dim returns
+    # wrong indices without an error (#5847). The way around it is to search in
+    # float32, but the device float16 to float32 cast is not reliable yet (it
+    # permutes elements within a stick pair, #5856), so reject instead.
     if input.dtype == torch.float16 and n + pad > FP16_TOPK_MAX_DIM:
         raise Unsupported(
-            f"topk with k={k} along a dim of size {n} (padded to {n + pad}) on a "
-            f"float16 input: the search dim may be at most {FP16_TOPK_MAX_DIM} "
-            "because the indices are held in float16; use float32"
+            f"topk along a float16 dim of size {n + pad}: the indices are held in float16, "
+            f"which is exact only up to {FP16_TOPK_MAX_DIM}; use a float32 input"
         )
 
     # Peel in chunks of at most TOPK_MAX_K elements. After each chunk its

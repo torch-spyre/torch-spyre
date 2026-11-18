@@ -2682,6 +2682,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_k4_dim0": _STAGGERED_READBACK,
             },
         },
+        ("test_topk_wide_dim", "test_topk_wide_dim_int64_indices"): {
+            "param_sets": {
+                "n2048_k16": (2048, 16),
+                "n8192_k64": (8192, 64),
+                "n128256_k4": (128256, 4),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -11612,18 +11619,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @expects_raise
     def test_sort_fp16_index_range_rejected(self):
         # topkindex yields indices in the input dtype, and Spyre's fp16 holds
-        # integers exactly only up to 1024 (10 mantissa bits), so a longer fp16
+        # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16
         # sort dim must be rejected.
         x = unique_randn_along_dim((1025, 8), dim=0)
-        with pytest.raises(Exception, match="the search dim may be at most 1024"):
+        with pytest.raises(Exception, match="the indices are held in float16"):
             _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
 
     @expects_raise
-    def test_topk_fp16_index_range_rejected(self):
-        # The same limit applies to topk itself, even for a small k.
-        x = unique_randn_along_dim((1025, 8), dim=0)
-        with pytest.raises(Exception, match="the search dim may be at most 1024"):
-            _compile_and_run(lambda x: torch.topk(x, 4, dim=0)[0], [x], "spyre")
+    def test_topk_fp16_wide_dim_rejected(self):
+        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
+        # dim must be rejected instead of returning wrong indices (#5847).
+        x = torch.randn(4, 2048).half().to("spyre")
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
+
+    def test_topk_wide_dim_int64_indices(self, n: int, k: int):
+        # float32 indices are exact to 2**24, so a float32 topk gives exact int64
+        # indices at any width up to a full vocabulary (#5847). Each row holds
+        # k, k-1, ..., 1 at random positions on a zero background.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack([torch.randperm(n, generator=g)[:k] for _ in range(4)])
+        want = torch.arange(k, 0, -1).float().expand(4, k).contiguous()
+        x.scatter_(1, positions, want)
+
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=-1)
+            return values, indices.to(torch.int64)
+
+        values, indices = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        assert indices.dtype == torch.int64
+        assert torch.equal(values.cpu(), want)
+        assert torch.equal(indices.cpu(), positions)
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
