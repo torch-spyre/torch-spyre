@@ -1086,29 +1086,65 @@ def softmax_row_tiled_reference(X: torch.Tensor) -> torch.Tensor:
     return torch.softmax(X, dim=-1)
 
 
-def reshape_sum_tiled_fn(X: torch.Tensor, tile_size: int, group: int) -> torch.Tensor:
-    """Map mode: reshape each row-tile to (group, -1, cols) and reduce dim 0.
+def reshape_sum_tiled_fn(
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
+) -> torch.Tensor:
+    """Map mode: reshape each tile to (group, -1, cols) and reduce dim 0.
 
     The reduction axis exists only in the reshaped view of the tile, so its
     input stride is a multiple of the tile's own row stride -- the load
     shape whose reduce variable used to be dropped while inlining the tile
-    marker (issue #6407), making every reduce step read the same window.
+    marker (issue #6407). ``dim=1`` tiles columns: the tile then reads its
+    input at a row stride different from its own layout's, so the read is
+    only right if the reduce term is folded into the row dim.
     """
 
     def body(_, ops):
         (x_tile,) = ops
         return None, x_tile.reshape(group, -1, x_tile.shape[-1]).sum(dim=0)
 
-    _, out = for_each_tile(body, (X,), dims=(0,), tile_size=tile_size, out_dim=0)
+    _, out = for_each_tile(body, (X,), dims=(dim,), tile_size=tile_size, out_dim=dim)
     return out
 
 
 def reshape_sum_tiled_reference(
-    X: torch.Tensor, tile_size: int, group: int
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
 ) -> torch.Tensor:
     return torch.cat(
         [
-            tile.reshape(group, -1, X.shape[-1]).sum(dim=0)
+            tile.reshape(group, -1, tile.shape[-1]).sum(dim=0)
+            for tile in X.split(tile_size, dim=dim)
+        ],
+        dim=dim,
+    )
+
+
+def reshape_mul_sum_tiled_fn(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    """Map mode: reduce (row-tile * W) over a reshaped axis, W passed whole.
+
+    W's read keeps the reduce variable even where the tile's read loses it,
+    so issue #6407 did not crash here: it compiled and every reduce step read
+    the same window of the tile.
+    """
+
+    def body(_, ops):
+        x_tile, w = ops
+        shape = (group, -1, x_tile.shape[-1])
+        return None, (x_tile.reshape(shape) * w.reshape(shape)).sum(dim=0)
+
+    _, out = for_each_tile(body, (X, W), dims=(0, None), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def reshape_mul_sum_tiled_reference(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    shape = (group, -1, X.shape[-1])
+    return torch.cat(
+        [
+            (tile.reshape(shape) * W.reshape(shape)).sum(dim=0)
             for tile in X.split(tile_size, dim=0)
         ],
         dim=0,

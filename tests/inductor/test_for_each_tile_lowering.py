@@ -259,8 +259,8 @@ class TestDelinearizeIndex(unittest.TestCase):
     def test_symbol_at_multiple_of_dim_stride_is_folded_into_that_dim(self):
         """Core #6407 repro: a reduction symbol flattened through a contiguous
         reshape enters as 512*d2 where the marker's dim stride is 64; .coeff(64)
-        cannot see it, so it used to vanish from every coordinate -- silently
-        making every reduce step read the same window."""
+        cannot see it, so it used to vanish from every coordinate, dropping the
+        reduce axis from the composed read."""
         import sympy
 
         d0, d1, d2 = sympy.symbols("d0 d1 d2")
@@ -269,14 +269,27 @@ class TestDelinearizeIndex(unittest.TestCase):
         )
         self.assertEqual(coords, [8 * d2 + d0, d1])
 
-    def test_leftover_symbolic_terms_compose_into_same_dim(self):
+    def test_stride_multiple_folds_into_a_constant_coordinate(self):
+        """reshape(9, 8, 64)[:, 3, :].sum(0): the fold lands on a dim whose
+        coordinate came from the constant part of the index."""
         import sympy
 
-        i0, i1, i2 = sympy.symbols("i0 i1 i2")
+        d1, d2 = sympy.symbols("d1 d2")
         coords = self._delinearize(
-            8 * i0 + i1 + 24 * i2, size=[4, 8], stride=[8, 1], offset=0
+            512 * d2 + d1 + 192, size=[72, 64], stride=[64, 1], offset=0
         )
-        self.assertEqual(coords, [i0 + 3 * i2, i1])
+        self.assertEqual(coords, [8 * d2 + 3, d1])
+
+    def test_layout_without_foldable_dim_recovers_zero(self):
+        """A [1, 1] tile (tile_size=1 over an [N, 1] operand) or a broadcast
+        dim loads at index 0; with nothing left to fold, nothing must raise."""
+        import sympy
+
+        zero = sympy.Integer(0)
+        for size, stride in (([1, 1], [1, 1]), ([4], [0])):
+            with self.subTest(size=size, stride=stride):
+                coords = self._delinearize(zero, size=size, stride=stride, offset=0)
+                self.assertEqual(coords, [zero] * len(size))
 
     def test_leftover_term_indivisible_by_every_stride_raises(self):
         import sympy
