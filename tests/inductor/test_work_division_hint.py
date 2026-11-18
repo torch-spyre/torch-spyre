@@ -22,7 +22,7 @@ import math
 import regex as re
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch as mock_patch
+from unittest.mock import MagicMock, patch as mock_patch
 
 import pytest
 import sympy
@@ -37,6 +37,7 @@ from torch._dynamo.test_case import (
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._inductor.test_case import TestCase as InductorTestCase
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import NoneLayout
 from torch._inductor.utils import run_and_get_code, InputType
 
@@ -144,8 +145,17 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         )
 
     def _fake_op(self, loop_var_dims):
+        from torch._inductor.ir import Pointwise
+
+        ranges = {sym: 512 for sym in loop_var_dims}
+        data = MagicMock(spec=Pointwise)
+        data.ranges = ranges
         return SimpleNamespace(
+            data=data,
             get_name=lambda: "fake_op",
+            get_read_writes=lambda: SimpleNamespace(
+                writes=[SimpleNamespace(ranges=ranges)], reads=[]
+            ),
             work_div_loop_info=loop_var_dims,
         )
 
@@ -330,6 +340,51 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
                 allowed_splits={m: frozenset({1})},
             )
+
+    def test_apply_work_div_hint_rejects_unrepresentable_split(self):
+        from torch._inductor.ir import Pointwise
+
+        i0, i1 = Symbol("i0"), Symbol("i1")
+        op = self._fake_op({i0: ["H0"], i1: ["H1"]})
+        op.data = MagicMock(spec=Pointwise)
+        op.data.ranges = {i0: 8, i1: 8}
+        write = MemoryDep("fake_op", 8 * i0 + 8 * i1, (i0, i1), (8, 8))
+        op.get_read_writes = lambda: SimpleNamespace(writes=[write], reads=[])
+
+        with self.assertRaisesRegex(
+            _wd.Unsupported,
+            "work_division_hint: fake_op split .* cannot be represented by the "
+            "scheduler's coefficient-keyed transport",
+        ):
+            _wd._apply_user_hint(
+                op,
+                {i0: 2},
+                {i0: 8, i1: 8},
+                self._fake_output_td([i0, i1]),
+                max_cores=32,
+            )
+
+    def test_apply_work_div_hint_propagates_attribute_error(self):
+        from torch._inductor.ir import Pointwise
+
+        h = Symbol("H")
+        op = self._fake_op({h: ["H"]})
+        op.data = MagicMock(spec=Pointwise)
+        op.data.ranges = {h: 64}
+        write = MemoryDep("fake_op", h, (h,), (64,))
+        op.get_read_writes = lambda: SimpleNamespace(writes=[write], reads=[])
+        with mock_patch(
+            "torch_spyre._inductor.work_division.work_division_transport_indexes",
+            side_effect=AttributeError("broken operation guard"),
+        ):
+            with self.assertRaisesRegex(AttributeError, "broken operation guard"):
+                _wd._apply_user_hint(
+                    op,
+                    {h: 2},
+                    {h: 64},
+                    self._fake_output_td([h]),
+                    max_cores=32,
+                )
 
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
@@ -873,7 +928,7 @@ def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
                 return []
             candidate = overrides["source"]
             owners = [
-                int(candidate.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+                int(candidate.core_id_to_work_slice[kv].xreplace({_CORE_ID: core}))
                 for core in range(32)
             ]
             return [object()] if owners == [core % 8 for core in range(32)] else []
@@ -928,7 +983,7 @@ def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
         assert committed is original
         return
     assert [
-        int(committed.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+        int(committed.core_id_to_work_slice[kv].xreplace({_CORE_ID: core}))
         for core in range(32)
     ] == [core % 8 for core in range(32)]
 
@@ -1171,7 +1226,7 @@ def test_q_rope_ownership_keeps_the_whole_pair_in_its_slice(pair_extent, offset)
         assert division.physical_core_count == 32
         for core in range(32):
             owners = {
-                loop: int(owner.subs(_CORE_ID, core))
+                loop: int(owner.xreplace({_CORE_ID: core}))
                 for loop, owner in division.core_id_to_work_slice.items()
             }
             assert owners == {row: core % 8, head: core // 8}
@@ -1474,7 +1529,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         remapped.work_division, {old: ((inner, 2), (outer, 8))}
     )
     core_three = {
-        dim: int(slot.subs(_CORE_ID, 3))
+        dim: int(slot.xreplace({_CORE_ID: 3}))
         for dim, slot in remapped.work_division.core_id_to_work_slice.items()
     }
     assert core_three == {inner: 1, outer: 1}
@@ -1820,7 +1875,11 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     partners = {}
     for core in range(config.sencores):
         owner = tuple(
-            int(bmm_specs[0].core_id_to_work_slice[dim].subs(Symbol("core_id"), core))
+            int(
+                bmm_specs[0]
+                .core_id_to_work_slice[dim]
+                .xreplace({Symbol("core_id"): core})
+            )
             for dim in output_dims
         )
         partners.setdefault(owner, []).append(core)
@@ -2701,12 +2760,14 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
     if source_cores <= destination_cores:
         core = Symbol("physical_core", integer=True)
         assert (
-            sympy.simplify(Mod(owner.subs(_CORE_ID, core) - core, parsed.num_cores))
+            sympy.simplify(
+                Mod(owner.xreplace({_CORE_ID: core}) - core, parsed.num_cores)
+            )
             == 0
         ), "equal/expanded operation frame was repeated"
-    assert [int(owner.subs(_CORE_ID, core)) for core in range(parsed.num_cores)] == [
-        core % destination_cores for core in range(parsed.num_cores)
-    ]
+    assert [
+        int(owner.xreplace({_CORE_ID: core})) for core in range(parsed.num_cores)
+    ] == [core % destination_cores for core in range(parsed.num_cores)]
     for argument, physical_count, expected in zip(
         parsed.args, [source_cores, destination_cores], [source_owner, _CORE_ID]
     ):
@@ -2717,8 +2778,10 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         ]
         formula = argument.work_division.core_id_to_work_slice[dimension]
         assert [
-            int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
-        ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]
+            int(formula.xreplace({_CORE_ID: core})) for core in range(physical_count)
+        ] == [
+            int(expected.xreplace({_CORE_ID: core})) for core in range(physical_count)
+        ]
 
 
 @pytest.mark.parametrize("enabled", [False, True])

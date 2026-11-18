@@ -86,7 +86,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     """Inclusive min/max source indexes for one invocation, in elements."""
     expr = sympy.expand(dep.index)
     zero_subs = {var: sympy.Integer(0) for var in dep.var_names}
-    constant = sympy.expand(expr.subs(zero_subs))
+    constant = sympy.expand(expr.xreplace(zero_subs))
     lo = _static_int(constant)
     if lo is None:
         return None
@@ -158,8 +158,8 @@ def _loop_advance_bound(
                 return None
             level_subs = dict(zero_subs)
             level_subs[symbol] = sympy.Integer(extent)
-            step_expr += sympy.expand(dep.index.subs(level_subs))
-            step_expr -= sympy.expand(dep.index.subs(zero_subs))
+            step_expr += sympy.expand(dep.index.xreplace(level_subs))
+            step_expr -= sympy.expand(dep.index.xreplace(zero_subs))
         pairs = squeezed[level_idx] if level_idx < len(squeezed) else []
         step = 0
         for stride_expr, extent_expr in pairs:
@@ -587,6 +587,8 @@ def project_transport_read_copies(graph, division_splits, *, relayout_sources=()
             continue
         direct_op = None
         for splits in candidates:
+            # `candidates` comes from the solver menu, filtered by
+            # WorkDivisionContext.is_legal including transport representability.
             candidate = copy.copy(consumer)
             commit_iteration_space_ownership(candidate, splits)
             direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)

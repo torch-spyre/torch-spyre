@@ -46,7 +46,13 @@
 
 namespace spyre {
 
-enum class CollectiveKind { Broadcast, AllGather, AllReduce, AllToAll };
+enum class CollectiveKind {
+  Broadcast,
+  AllGather,
+  AllReduce,
+  ReduceScatter,
+  AllToAll
+};
 
 // Structure to hold pending async work
 struct PendingWork {
@@ -96,7 +102,13 @@ static void check_collective_errors(spyre_comms::WorkSchedule& work) {
 }
 
 // Compile-time plan cache.
-enum class PlanKind { Broadcast, AllReduce, AllGather, AllToAll };
+enum class PlanKind {
+  Broadcast,
+  AllReduce,
+  AllGather,
+  ReduceScatter,
+  AllToAll
+};
 
 struct CachedPlan {
   PlanKind kind;
@@ -108,6 +120,8 @@ struct CachedPlan {
   // tensor_info MUST outlive wsi — spyre_comms stores a non-owning reference
   // to it inside the WorkScheduleInfo's sentinel envelope.
   std::unique_ptr<spyre_comms::TensorInfo> tensor_info;
+  std::unique_ptr<spyre_comms::TensorInfo>
+      output_tensor_info;  // reduce_scatter
   std::unique_ptr<spyre_comms::WorkScheduleInfo> wsi;
   int64_t num_elems = 0;
   int64_t group_size = 0;  // allgather/alltoall only
@@ -188,7 +202,7 @@ spyre_comms::SpyreReductionOpType parse_reduce_op(
   if (reduce_op == "sum") {
     return spyre_comms::SpyreReductionOpType::SUM;
   }
-  TORCH_CHECK(false, "Unsupported reduce_op for spyre allreduce: ", reduce_op,
+  TORCH_CHECK(false, "Unsupported reduce_op for spyre collective: ", reduce_op,
               ". Only 'sum' is currently supported.");
 }
 
@@ -249,709 +263,877 @@ void ensure_wsi(CachedPlan& plan, int64_t num_elems,
           plan.dtype, spyre_comms::TensorShape({out_elems}));
       plan.wsi = context->alltoallw(*plan.output_tensor_info, *plan.tensor_info,
                                     plan.output_splits, plan.input_splits);
-      break;
+      case PlanKind::ReduceScatter: {
+        int64_t out_elems = num_elems / plan.group_size;
+        spyre_comms::TensorShape out_shape({out_elems});
+        plan.output_tensor_info =
+            std::make_unique<spyre_comms::TensorInfo>(plan.dtype, out_shape);
+        plan.wsi = context->reduce_scatter(
+            *plan.tensor_info, *plan.output_tensor_info, plan.reduce_op);
+        break;
+      }
     }
+      TORCH_CHECK(plan.wsi != nullptr, "Failed to create WSI");
   }
-  TORCH_CHECK(plan.wsi != nullptr, "Failed to create WSI");
-}
 
-int64_t spyre_broadcast_plan_impl(int64_t num_elems, int64_t dtype_code,
-                                  int64_t src_rank,
-                                  const std::string& group_name) {
-  SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
-                        << ", dtype=" << dtype_code
-                        << ", src_rank=" << src_rank;
+  int64_t spyre_broadcast_plan_impl(int64_t num_elems, int64_t dtype_code,
+                                    int64_t src_rank,
+                                    const std::string& group_name) {
+    SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
+                          << ", dtype=" << dtype_code
+                          << ", src_rank=" << src_rank;
 
-  auto context = ensure_context();
+    auto context = ensure_context();
 
-  TORCH_CHECK(
-      src_rank >= 0 && src_rank < static_cast<int64_t>(context->getSize()),
-      "src_rank out of range: ", src_rank, " (world size is ",
-      context->getSize(), ")");
+    TORCH_CHECK(
+        src_rank >= 0 && src_rank < static_cast<int64_t>(context->getSize()),
+        "src_rank out of range: ", src_rank, " (world size is ",
+        context->getSize(), ")");
 
-  auto dtype =
-      torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
+    auto dtype =
+        torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
 
-  std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
-  int64_t handle = cache_lookup(PlanKind::Broadcast, dtype, num_elems, src_rank,
-                                spyre_comms::SpyreReductionOpType::SUM, 0);
-  if (handle >= 0) {
-    SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+    std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
+    int64_t handle =
+        cache_lookup(PlanKind::Broadcast, dtype, num_elems, src_rank,
+                     spyre_comms::SpyreReductionOpType::SUM, 0);
+    if (handle >= 0) {
+      SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+      return handle;
+    }
+
+    handle = static_cast<int64_t>(wsi_cache_.size());
+    wsi_cache_.push_back(CachedPlan{PlanKind::Broadcast, dtype, src_rank,
+                                    spyre_comms::SpyreReductionOpType::SUM,
+                                    nullptr, nullptr, nullptr, 0, 0});
+    auto& plan = wsi_cache_.back();
+    ensure_wsi(plan, num_elems, context);
+
+    SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
     return handle;
   }
 
-  handle = static_cast<int64_t>(wsi_cache_.size());
-  wsi_cache_.push_back(CachedPlan{PlanKind::Broadcast, dtype, src_rank,
-                                  spyre_comms::SpyreReductionOpType::SUM,
-                                  nullptr, nullptr, 0, 0});
-  auto& plan = wsi_cache_.back();
-  ensure_wsi(plan, num_elems, context);
+  int64_t spyre_allreduce_plan_impl(int64_t num_elems, int64_t dtype_code,
+                                    const std::string& reduce_op,
+                                    const std::string& group_name) {
+    SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
+                          << ", dtype=" << dtype_code
+                          << ", reduce_op=" << reduce_op;
 
-  SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
-  return handle;
-}
+    auto context = ensure_context();
+    auto op_type = parse_reduce_op(reduce_op);
+    auto dtype =
+        torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
 
-int64_t spyre_allreduce_plan_impl(int64_t num_elems, int64_t dtype_code,
-                                  const std::string& reduce_op,
-                                  const std::string& group_name) {
-  SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
-                        << ", dtype=" << dtype_code
-                        << ", reduce_op=" << reduce_op;
+    std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
+    int64_t handle =
+        cache_lookup(PlanKind::AllReduce, dtype, num_elems, 0, op_type, 0);
+    if (handle >= 0) {
+      SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+      return handle;
+    }
 
-  auto context = ensure_context();
-  auto op_type = parse_reduce_op(reduce_op);
-  auto dtype =
-      torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
+    handle = static_cast<int64_t>(wsi_cache_.size());
+    wsi_cache_.push_back(CachedPlan{PlanKind::AllReduce, dtype, 0, op_type,
+                                    nullptr, nullptr, nullptr, 0, 0});
+    auto& plan = wsi_cache_.back();
+    ensure_wsi(plan, num_elems, context);
 
-  std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
-  int64_t handle =
-      cache_lookup(PlanKind::AllReduce, dtype, num_elems, 0, op_type, 0);
-  if (handle >= 0) {
-    SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+    SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
     return handle;
   }
 
-  handle = static_cast<int64_t>(wsi_cache_.size());
-  wsi_cache_.push_back(CachedPlan{PlanKind::AllReduce, dtype, 0, op_type,
-                                  nullptr, nullptr, 0, 0});
-  auto& plan = wsi_cache_.back();
-  ensure_wsi(plan, num_elems, context);
+  int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
+                                    int64_t group_size,
+                                    const std::string& group_name) {
+    SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
+                          << ", dtype=" << dtype_code
+                          << ", group_size=" << group_size;
 
-  SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
-  return handle;
-}
+    auto context = ensure_context();
 
-int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
-                                  int64_t group_size,
-                                  const std::string& group_name) {
-  SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
-                        << ", dtype=" << dtype_code
-                        << ", group_size=" << group_size;
+    TORCH_CHECK(group_size > 0 &&
+                    group_size == static_cast<int64_t>(context->getSize()),
+                "group_size must equal world size: got ", group_size,
+                " (world size is ", context->getSize(), ")");
 
-  auto context = ensure_context();
+    auto dtype =
+        torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
 
-  TORCH_CHECK(
-      group_size > 0 && group_size == static_cast<int64_t>(context->getSize()),
-      "group_size must equal world size: got ", group_size, " (world size is ",
-      context->getSize(), ")");
+    std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
+    int64_t handle =
+        cache_lookup(PlanKind::AllGather, dtype, num_elems, 0,
+                     spyre_comms::SpyreReductionOpType::SUM, group_size);
+    if (handle >= 0) {
+      SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+      return handle;
+    }
 
-  auto dtype =
-      torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
+    handle = static_cast<int64_t>(wsi_cache_.size());
+    wsi_cache_.push_back(CachedPlan{PlanKind::AllGather, dtype, 0,
+                                    spyre_comms::SpyreReductionOpType::SUM,
+                                    nullptr, nullptr, nullptr, 0, group_size});
+    auto& plan = wsi_cache_.back();
+    ensure_wsi(plan, num_elems, context);
 
-  std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
-  int64_t handle =
-      cache_lookup(PlanKind::AllGather, dtype, num_elems, 0,
-                   spyre_comms::SpyreReductionOpType::SUM, group_size);
-  if (handle >= 0) {
-    SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+    SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
     return handle;
   }
 
-  handle = static_cast<int64_t>(wsi_cache_.size());
-  wsi_cache_.push_back(CachedPlan{PlanKind::AllGather, dtype, 0,
-                                  spyre_comms::SpyreReductionOpType::SUM,
-                                  nullptr, nullptr, 0, group_size});
-  auto& plan = wsi_cache_.back();
-  ensure_wsi(plan, num_elems, context);
+  int64_t spyre_reducescatter_plan_impl(
+      int64_t num_elems, int64_t dtype_code, int64_t group_size,
+      const std::string& reduce_op, const std::string& group_name) {
+    SPYRE_RUNTIME_DEBUG() << "called with num_elems=" << num_elems
+                          << ", dtype=" << dtype_code
+                          << ", group_size=" << group_size
+                          << ", reduce_op=" << reduce_op;
 
-  SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
-  return handle;
-}
+    auto context = ensure_context();
+    auto op_type = parse_reduce_op(reduce_op);
 
-// Convert split sizes to the int vector spyre-comms alltoallw expects,
-// checking each is non-negative and fits in an int.
-static std::vector<int> to_alltoall_splits(c10::IntArrayRef splits,
-                                           const char* which) {
-  std::vector<int> out;
-  out.reserve(splits.size());
-  for (int64_t s : splits) {
-    TORCH_CHECK(s >= 0 && s <= std::numeric_limits<int>::max(),
-                "alltoall: ", which, " split size out of range: ", s);
-    // spyre-comms alltoallw accepts a zero split when the plan is built but
-    // segfaults in Collective::Convert when tensors are applied.
-    // TODO(flaviabeo): allow zero splits once spyre-comms alltoallw handles
-    // them.
-    TORCH_CHECK(s > 0, "alltoall: zero-size ", which,
-                " splits are not supported yet (spyre-comms alltoallw crashes "
-                "on them); got ",
-                splits);
-    out.push_back(static_cast<int>(s));
-  }
-  return out;
-}
+    TORCH_CHECK(group_size > 0 &&
+                    group_size == static_cast<int64_t>(context->getSize()),
+                "group_size must equal world size: got ", group_size,
+                " (world size is ", context->getSize(), ")");
+    // num_elems counts padded device elements of the staged input, whose
+    // group dim is outermost (see reducescatter_run). Each rank's slab must be
+    // a whole number of 128-byte sticks: spyre-comms has no algorithm for a
+    // smaller split and terminates the process instead of raising.
+    const auto scalar_type = static_cast<c10::ScalarType>(dtype_code);
+    const int64_t stick_elems = 128 / c10::elementSize(scalar_type);
+    TORCH_CHECK(num_elems % (group_size * stick_elems) == 0,
+                "reduce_scatter: device elements (", num_elems,
+                ") must split into group_size (", group_size,
+                ") slabs of whole sticks (", stick_elems, " elements)");
 
-// Gather every rank's split sizes over the c10d group `group_name` and return
-// them as one vector, [r0 input..., r0 output..., r1 input..., ...].  This is
-// a CPU allgather, so it runs on the group's CPU backend (e.g. gloo in
-// "cpu:gloo,spyre:spyreccl").  Every rank must call it, in the same order.
-static std::vector<int64_t> gather_alltoall_pattern(
-    const std::string& group_name, int64_t group_size,
-    const std::vector<int>& input_splits,
-    const std::vector<int>& output_splits) {
-  auto pg = c10d::resolve_process_group(group_name);
-  TORCH_CHECK(pg != nullptr, "alltoall: no process group named '", group_name,
-              "'");
-  TORCH_CHECK(pg->getSize() == group_size, "alltoall: process group '",
-              group_name, "' has ", pg->getSize(), " ranks but ", group_size,
-              " splits were given");
+    auto dtype = torch_dtype_to_spyre_comms(scalar_type);
 
-  auto mine = at::empty({2 * group_size}, at::kLong);
-  auto* p = mine.data_ptr<int64_t>();
-  for (int64_t j = 0; j < group_size; j++) {
-    p[j] = input_splits[j];
-    p[group_size + j] = output_splits[j];
-  }
-  std::vector<std::vector<at::Tensor>> gathered(1);
-  for (int64_t r = 0; r < group_size; r++) {
-    gathered[0].push_back(at::empty_like(mine));
-  }
-  std::vector<at::Tensor> inputs{mine};
-  {
-    // Release the GIL while the allgather runs, as c10d's own Python bindings
-    // do.  Under torch.compile Inductor enables the Python dispatcher
-    // process-wide, so gloo's worker thread needs the GIL just to run
-    // aten::view in flattenDenseTensors; holding it here deadlocks both ranks.
-    // This op is called from Python (the compiled wrapper's header), but may
-    // also be called without the GIL, so only release it if we hold it.
-    std::optional<pybind11::gil_scoped_release> no_gil;
-    if (Py_IsInitialized() && PyGILState_Check()) no_gil.emplace();
-    pg->allgather(gathered, inputs)->wait();
-  }
-
-  std::vector<int64_t> pattern;
-  pattern.reserve(static_cast<size_t>(2 * group_size * group_size));
-  for (const auto& t : gathered[0]) {
-    const int64_t* q = t.data_ptr<int64_t>();
-    pattern.insert(pattern.end(), q, q + 2 * group_size);
-  }
-
-  // Every rank sees the whole pattern, so every rank reaches the same verdict
-  // here: what src sends to dst must be what dst expects from src.
-  // spyre-comms checks this too, but only when a plan is built.
-  for (int64_t src = 0; src < group_size; src++) {
-    for (int64_t dst = 0; dst < group_size; dst++) {
-      const int64_t sent = pattern[src * 2 * group_size + dst];
-      const int64_t expected = pattern[dst * 2 * group_size + group_size + src];
-      TORCH_CHECK(sent == expected, "alltoall: rank ", src, " sends ", sent,
-                  " elements to rank ", dst, " but rank ", dst, " expects ",
-                  expected);
+    std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
+    int64_t handle = cache_lookup(PlanKind::ReduceScatter, dtype, num_elems, 0,
+                                  op_type, group_size);
+    if (handle >= 0) {
+      SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << handle;
+      return handle;
     }
+
+    handle = static_cast<int64_t>(wsi_cache_.size());
+    wsi_cache_.push_back(CachedPlan{PlanKind::ReduceScatter, dtype, 0, op_type,
+                                    nullptr, nullptr, nullptr, 0, group_size});
+    auto& plan = wsi_cache_.back();
+    ensure_wsi(plan, num_elems, context);
+
+    SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
+    return handle;
   }
-  return pattern;
-}
 
-// Split sizes are in device elements of the flat device buffer (the same
-// units as the num_elems the other plan ops take): input_split_elems[j] is
-// what this rank sends to rank j, output_split_elems[j] what it receives from
-// rank j.  Splits may be uneven; spyre-comms checks across ranks that every
-// send matches the receiver's expectation.
-int64_t spyre_alltoall_plan_impl(c10::IntArrayRef output_split_elems,
-                                 c10::IntArrayRef input_split_elems,
-                                 int64_t dtype_code,
-                                 const std::string& group_name) {
-  SPYRE_RUNTIME_DEBUG() << "called with output_split_elems="
-                        << output_split_elems
-                        << ", input_split_elems=" << input_split_elems
-                        << ", dtype=" << dtype_code;
-
-  auto context = ensure_context();
-
-  const int64_t group_size = static_cast<int64_t>(input_split_elems.size());
-  TORCH_CHECK(
-      group_size > 0 && group_size == static_cast<int64_t>(context->getSize()),
-      "alltoall: number of splits must equal world size: got ", group_size,
-      " (world size is ", context->getSize(), ")");
-  TORCH_CHECK(
-      static_cast<int64_t>(output_split_elems.size()) == group_size,
-      "alltoall: output_split_elems and input_split_elems must have the same "
-      "length, got ",
-      output_split_elems.size(), " and ", group_size);
-
-  auto output_splits = to_alltoall_splits(output_split_elems, "output");
-  auto input_splits = to_alltoall_splits(input_split_elems, "input");
-  int64_t num_elems = 0;
-  for (int s : input_splits) num_elems += s;
-  int64_t out_elems = 0;
-  for (int s : output_splits) out_elems += s;
-  TORCH_CHECK(num_elems > 0 && out_elems > 0,
-              "alltoall: total input and output sizes must be non-zero");
-
-  auto dtype =
-      torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
-
-  // Building the WSI is collective (alltoallw exchanges every rank's splits),
-  // so every rank must agree on whether this is a cache hit.  This rank's own
-  // splits are not enough: with uneven splits a peer's can change while ours
-  // stay the same, and if we then reused a cached plan the peer would wait in
-  // alltoallw forever.  Key the cache on the whole exchange pattern, which is
-  // the same on every rank.  Gather it before taking the cache lock, so no
-  // collective runs while the lock is held.
-  auto pattern = gather_alltoall_pattern(group_name, group_size, input_splits,
-                                         output_splits);
-
-  std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
-  // The shared cache_lookup does not compare split patterns; search here.
-  for (size_t i = 0; i < wsi_cache_.size(); i++) {
-    const auto& entry = wsi_cache_[i];
-    if (entry.kind == PlanKind::AllToAll && entry.dtype == dtype &&
-        entry.split_pattern == pattern) {
-      SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << i;
-      return static_cast<int64_t>(i);
+  // Convert split sizes to the int vector spyre-comms alltoallw expects,
+  // checking each is non-negative and fits in an int.
+  static std::vector<int> to_alltoall_splits(c10::IntArrayRef splits,
+                                             const char* which) {
+    std::vector<int> out;
+    out.reserve(splits.size());
+    for (int64_t s : splits) {
+      TORCH_CHECK(s >= 0 && s <= std::numeric_limits<int>::max(),
+                  "alltoall: ", which, " split size out of range: ", s);
+      // spyre-comms alltoallw accepts a zero split when the plan is built but
+      // segfaults in Collective::Convert when tensors are applied.
+      // TODO(flaviabeo): allow zero splits once spyre-comms alltoallw handles
+      // them.
+      TORCH_CHECK(
+          s > 0, "alltoall: zero-size ", which,
+          " splits are not supported yet (spyre-comms alltoallw crashes "
+          "on them); got ",
+          splits);
+      out.push_back(static_cast<int>(s));
     }
+    return out;
   }
 
-  int64_t handle = static_cast<int64_t>(wsi_cache_.size());
-  wsi_cache_.push_back(CachedPlan{
-      PlanKind::AllToAll, dtype, 0, spyre_comms::SpyreReductionOpType::SUM,
-      nullptr, nullptr, 0, group_size, nullptr, std::move(input_splits),
-      std::move(output_splits), 0, std::move(pattern)});
-  auto& plan = wsi_cache_.back();
-  ensure_wsi(plan, num_elems, context);
+  // Gather every rank's split sizes over the c10d group `group_name` and return
+  // them as one vector, [r0 input..., r0 output..., r1 input..., ...].  This is
+  // a CPU allgather, so it runs on the group's CPU backend (e.g. gloo in
+  // "cpu:gloo,spyre:spyreccl").  Every rank must call it, in the same order.
+  static std::vector<int64_t> gather_alltoall_pattern(
+      const std::string& group_name, int64_t group_size,
+      const std::vector<int>& input_splits,
+      const std::vector<int>& output_splits) {
+    auto pg = c10d::resolve_process_group(group_name);
+    TORCH_CHECK(pg != nullptr, "alltoall: no process group named '", group_name,
+                "'");
+    TORCH_CHECK(pg->getSize() == group_size, "alltoall: process group '",
+                group_name, "' has ", pg->getSize(), " ranks but ", group_size,
+                " splits were given");
 
-  SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
-  return handle;
-}
+    auto mine = at::empty({2 * group_size}, at::kLong);
+    auto* p = mine.data_ptr<int64_t>();
+    for (int64_t j = 0; j < group_size; j++) {
+      p[j] = input_splits[j];
+      p[group_size + j] = output_splits[j];
+    }
+    std::vector<std::vector<at::Tensor>> gathered(1);
+    for (int64_t r = 0; r < group_size; r++) {
+      gathered[0].push_back(at::empty_like(mine));
+    }
+    std::vector<at::Tensor> inputs{mine};
+    {
+      // Release the GIL while the allgather runs, as c10d's own Python bindings
+      // do.  Under torch.compile Inductor enables the Python dispatcher
+      // process-wide, so gloo's worker thread needs the GIL just to run
+      // aten::view in flattenDenseTensors; holding it here deadlocks both
+      // ranks. This op is called from Python (the compiled wrapper's header),
+      // but may also be called without the GIL, so only release it if we hold
+      // it.
+      std::optional<pybind11::gil_scoped_release> no_gil;
+      if (Py_IsInitialized() && PyGILState_Check()) no_gil.emplace();
+      pg->allgather(gathered, inputs)->wait();
+    }
 
-// ============================================================================
-// Runtime run ops
-// ============================================================================
+    std::vector<int64_t> pattern;
+    pattern.reserve(static_cast<size_t>(2 * group_size * group_size));
+    for (const auto& t : gathered[0]) {
+      const int64_t* q = t.data_ptr<int64_t>();
+      pattern.insert(pattern.end(), q, q + 2 * group_size);
+    }
 
-at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
-                                    int64_t plan_handle, int64_t src_rank) {
-  SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
-                        << ", src_rank=" << src_rank;
-
-  // Plans have only scalar metadata; validate actual storage at run time.
-  check_collective_storage(input);
-
-  auto context = ensure_context();
-
-  std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
-  TORCH_CHECK(
-      plan_handle >= 0 && plan_handle < static_cast<int64_t>(wsi_cache_.size()),
-      "broadcast_run: invalid plan_handle=", plan_handle);
-  auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
-
-  // Create output tensor
-  // A compiled producer can pad beyond the default stick layout. The plan
-  // covers that entire device allocation, so preserve it in the receive buffer.
-  at::Tensor output = spyre_empty_with_layout(
-      input.sizes(), input.strides(), input.scalar_type(),
-      get_spyre_tensor_layout(input), input.device());
-  TORCH_CHECK(output.nbytes() > 0,
-              "Tensor must have non-zero size for broadcast");
-
-  // Copy input to output if we're the source rank
-  int current_rank = context->getRank();
-  if (current_rank == src_rank) {
-    output.copy_(input);
+    // Every rank sees the whole pattern, so every rank reaches the same verdict
+    // here: what src sends to dst must be what dst expects from src.
+    // spyre-comms checks this too, but only when a plan is built.
+    for (int64_t src = 0; src < group_size; src++) {
+      for (int64_t dst = 0; dst < group_size; dst++) {
+        const int64_t sent = pattern[src * 2 * group_size + dst];
+        const int64_t expected =
+            pattern[dst * 2 * group_size + group_size + src];
+        TORCH_CHECK(sent == expected, "alltoall: rank ", src, " sends ", sent,
+                    " elements to rank ", dst, " but rank ", dst, " expects ",
+                    expected);
+      }
+    }
+    return pattern;
   }
 
-  // Get SharedOwnerCtx for map key
-  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
-      output.storage().data_ptr().get_context());
-  TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for output tensor");
+  // Split sizes are in device elements of the flat device buffer (the same
+  // units as the num_elems the other plan ops take): input_split_elems[j] is
+  // what this rank sends to rank j, output_split_elems[j] what it receives from
+  // rank j.  Splits may be uneven; spyre-comms checks across ranks that every
+  // send matches the receiver's expectation.
+  int64_t spyre_alltoall_plan_impl(
+      c10::IntArrayRef output_split_elems, c10::IntArrayRef input_split_elems,
+      int64_t dtype_code, const std::string& group_name) {
+    SPYRE_RUNTIME_DEBUG() << "called with output_split_elems="
+                          << output_split_elems
+                          << ", input_split_elems=" << input_split_elems
+                          << ", dtype=" << dtype_code;
 
-  // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
-  spyre_comms::Tensor buffer_tensor(*plan.tensor_info);
-  buffer_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
+    auto context = ensure_context();
 
-  auto work_schedule = context->broadcast_applyTensor(*plan.wsi, buffer_tensor);
-  TORCH_CHECK(work_schedule != nullptr,
-              "broadcast_applyTensor operation failed to create WorkSchedule");
+    const int64_t group_size = static_cast<int64_t>(input_split_elems.size());
+    TORCH_CHECK(group_size > 0 &&
+                    group_size == static_cast<int64_t>(context->getSize()),
+                "alltoall: number of splits must equal world size: got ",
+                group_size, " (world size is ", context->getSize(), ")");
+    TORCH_CHECK(
+        static_cast<int64_t>(output_split_elems.size()) == group_size,
+        "alltoall: output_split_elems and input_split_elems must have the same "
+        "length, got ",
+        output_split_elems.size(), " and ", group_size);
 
-  work_schedule->start();
+    auto output_splits = to_alltoall_splits(output_split_elems, "output");
+    auto input_splits = to_alltoall_splits(input_split_elems, "input");
+    int64_t num_elems = 0;
+    for (int s : input_splits) num_elems += s;
+    int64_t out_elems = 0;
+    for (int s : output_splits) out_elems += s;
+    TORCH_CHECK(num_elems > 0 && out_elems > 0,
+                "alltoall: total input and output sizes must be non-zero");
 
-  // Build keep_alive to hold the output tensor storage for the duration of
-  // the WorkSchedule.  broadcast borrows the buffer address of `output`.
-  auto ka = make_tensor_keep_alive({output});
+    auto dtype =
+        torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
 
-  // Store pending work
-  {
-    std::lock_guard<std::mutex> lock(work_map_mutex_);
-    TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
-                "broadcast_run called twice on the same allocation without "
-                "intervening wait_work");
-    pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::Broadcast,
-                                               std::move(work_schedule),
-                                               {output},
-                                               0,
-                                               {output},
-                                               std::move(ka)});
+    // Building the WSI is collective (alltoallw exchanges every rank's splits),
+    // so every rank must agree on whether this is a cache hit.  This rank's own
+    // splits are not enough: with uneven splits a peer's can change while ours
+    // stay the same, and if we then reused a cached plan the peer would wait in
+    // alltoallw forever.  Key the cache on the whole exchange pattern, which is
+    // the same on every rank.  Gather it before taking the cache lock, so no
+    // collective runs while the lock is held.
+    auto pattern = gather_alltoall_pattern(group_name, group_size, input_splits,
+                                           output_splits);
+
+    std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
+    // The shared cache_lookup does not compare split patterns; search here.
+    for (size_t i = 0; i < wsi_cache_.size(); i++) {
+      const auto& entry = wsi_cache_[i];
+      if (entry.kind == PlanKind::AllToAll && entry.dtype == dtype &&
+          entry.split_pattern == pattern) {
+        SPYRE_RUNTIME_DEBUG() << "cache hit at handle=" << i;
+        return static_cast<int64_t>(i);
+      }
+    }
+
+    int64_t handle = static_cast<int64_t>(wsi_cache_.size());
+    wsi_cache_.push_back(CachedPlan{
+        PlanKind::AllToAll, dtype, 0, spyre_comms::SpyreReductionOpType::SUM,
+        nullptr, nullptr, 0, group_size, nullptr, std::move(input_splits),
+        std::move(output_splits), 0, std::move(pattern)});
+    auto& plan = wsi_cache_.back();
+    ensure_wsi(plan, num_elems, context);
+
+    SPYRE_RUNTIME_DEBUG() << "created WSI at handle=" << handle;
+    return handle;
   }
 
-  return output;
-}
+  // ============================================================================
+  // Runtime run ops
+  // ============================================================================
 
-at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
-                                    int64_t plan_handle) {
-  SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle;
+  at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
+                                      int64_t plan_handle, int64_t src_rank) {
+    SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
+                          << ", src_rank=" << src_rank;
 
-  check_collective_storage(input);
+    // Plans have only scalar metadata; validate actual storage at run time.
+    check_collective_storage(input);
 
-  auto context = ensure_context();
+    auto context = ensure_context();
 
-  std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
-  TORCH_CHECK(
-      plan_handle >= 0 && plan_handle < static_cast<int64_t>(wsi_cache_.size()),
-      "allreduce_run: invalid plan_handle=", plan_handle);
-  auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
+    std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
+    TORCH_CHECK(plan_handle >= 0 &&
+                    plan_handle < static_cast<int64_t>(wsi_cache_.size()),
+                "broadcast_run: invalid plan_handle=", plan_handle);
+    auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
 
-  TORCH_CHECK(input.is_privateuseone(),
-              "Tensor must be on Spyre device for all_reduce");
-  TORCH_CHECK(input.is_contiguous(),
-              "Tensor must be contiguous for all_reduce");
-  TORCH_CHECK(input.nbytes() > 0,
-              "Tensor must have non-zero size for all_reduce");
-
-  // Get SharedOwnerCtx
-  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
-      input.storage().data_ptr().get_context());
-  TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for input tensor");
-
-  // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
-  spyre_comms::Tensor inout_tensor(*plan.tensor_info,
-                                   input.storage().data_ptr().get());
-  inout_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
-
-  auto work_schedule = context->allreduce_applyTensor(*plan.wsi, inout_tensor);
-  TORCH_CHECK(work_schedule != nullptr,
-              "allreduce_applyTensor operation failed to create WorkSchedule");
-
-  work_schedule->start();
-
-  // Build keep_alive to hold the input tensor storage for the duration of
-  // the WorkSchedule.  allreduce borrows the buffer address of `input`.
-  auto ka = make_tensor_keep_alive({input});
-
-  // Store pending work
-  {
-    std::lock_guard<std::mutex> lock(work_map_mutex_);
-    TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
-                "allreduce_run called twice on the same allocation without "
-                "intervening wait_work");
-    pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::AllReduce,
-                                               std::move(work_schedule),
-                                               {input},
-                                               0,
-                                               {input},
-                                               std::move(ka)});
-  }
-
-  return input;
-}
-
-at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
-                                    int64_t plan_handle, int64_t group_size) {
-  SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
-                        << ", group_size=" << group_size;
-
-  check_collective_storage(input);
-
-  auto context = ensure_context();
-
-  std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
-  TORCH_CHECK(
-      plan_handle >= 0 && plan_handle < static_cast<int64_t>(wsi_cache_.size()),
-      "allgather_run: invalid plan_handle=", plan_handle);
-  auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
-
-  TORCH_CHECK(input.is_privateuseone(),
-              "Tensor must be on Spyre device for allgather");
-  TORCH_CHECK(input.is_contiguous(), "Tensor must be contiguous for allgather");
-  TORCH_CHECK(input.nbytes() > 0,
-              "Tensor must have non-zero size for allgather");
-
-  spyre_comms::Tensor input_tensor(*plan.tensor_info,
-                                   input.storage().data_ptr().get());
-  input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
-
-  // Allocate per-rank output tensors (same shape/layout as input)
-  std::vector<at::Tensor> rank_outputs;
-  rank_outputs.reserve(group_size);
-  for (int64_t i = 0; i < group_size; i++) {
-    rank_outputs.push_back(spyre_empty_with_layout(
-        input.sizes(), input.strides(), input.scalar_type(),
-        get_spyre_tensor_layout(input), input.device()));
-  }
-
-  // Build spyre_comms::Tensor vector for per-rank outputs
-  std::vector<spyre_comms::Tensor> output_tensors;
-  output_tensors.reserve(group_size);
-  for (int64_t i = 0; i < group_size; i++) {
-    spyre_comms::Tensor out_tensor(*plan.tensor_info,
-                                   rank_outputs[i].storage().data_ptr().get());
-    out_tensor.SetSpyreDeviceAddressBorrowed(
-        get_composite_address(rank_outputs[i]));
-    output_tensors.push_back(std::move(out_tensor));
-  }
-
-  auto work_schedule =
-      context->allgather_applyTensors(*plan.wsi, output_tensors, input_tensor);
-  TORCH_CHECK(work_schedule != nullptr,
-              "allgather_applyTensors operation failed to create WorkSchedule");
-
-  work_schedule->start();
-
-  // Allocate final concatenated output
-  auto output_sizes = input.sizes().vec();
-  output_sizes[0] *= group_size;
-  at::Tensor output = at::empty(output_sizes, input.options());
-
-  auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
-      output.storage().data_ptr().get_context());
-  TORCH_CHECK(output_ctx != nullptr,
-              "SharedOwnerCtx is null for output tensor");
-
-  // allgather borrows both the input and the per-rank outputs. Generated code
-  // may release its input immediately after allgather_run, before wait_work.
-  auto borrowed_tensors = rank_outputs;
-  borrowed_tensors.push_back(input);
-  auto ka = make_tensor_keep_alive(std::move(borrowed_tensors));
-
-  // Store pending work with rank_outputs for assembly in wait_work
-  {
-    std::lock_guard<std::mutex> lock(work_map_mutex_);
-    TORCH_CHECK(pending_work_map_.find(output_ctx) == pending_work_map_.end(),
-                "allgather_run called twice on the same allocation without "
-                "intervening wait_work");
-    pending_work_map_.emplace(output_ctx, PendingWork{CollectiveKind::AllGather,
-                                                      std::move(work_schedule),
-                                                      std::move(rank_outputs),
-                                                      input.size(0),
-                                                      {output},
-                                                      std::move(ka)});
-  }
-
-  return output;
-}
-
-// Device elements (in scalar-type units, as the plan counts them) covered by a
-// tensor's device allocation.
-static int64_t device_num_elems(const at::Tensor& t) {
-  return static_cast<int64_t>(
-             get_device_size_in_bytes(get_spyre_tensor_layout(t))) /
-         static_cast<int64_t>(t.element_size());
-}
-
-at::Tensor spyre_alltoall_run_impl(const at::Tensor& input, int64_t plan_handle,
-                                   int64_t output_dim0) {
-  SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
-                        << ", output_dim0=" << output_dim0;
-
-  check_collective_storage(input);
-
-  auto context = ensure_context();
-
-  std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
-  TORCH_CHECK(
-      plan_handle >= 0 && plan_handle < static_cast<int64_t>(wsi_cache_.size()),
-      "alltoall_run: invalid plan_handle=", plan_handle);
-  auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
-  TORCH_CHECK(plan.kind == PlanKind::AllToAll,
-              "alltoall_run: plan_handle=", plan_handle,
-              " is not an alltoall plan");
-
-  TORCH_CHECK(input.dim() > 0, "alltoall: input must have at least 1 dim");
-  TORCH_CHECK(output_dim0 > 0, "alltoall: output_dim0 must be positive, got ",
-              output_dim0);
-  TORCH_CHECK(device_num_elems(input) == plan.num_elems,
-              "alltoall_run: input covers ", device_num_elems(input),
-              " device elements but the plan expects ", plan.num_elems);
-
-  // alltoall does not modify its input; results land in a fresh tensor whose
-  // dim 0 is sum(output_split_sizes) (equal to the input's for even splits).
-  at::Tensor output;
-  if (output_dim0 == input.size(0)) {
-    output = spyre_empty_with_layout(
+    // Create output tensor
+    // A compiled producer can pad beyond the default stick layout. The plan
+    // covers that entire device allocation, so preserve it in the receive
+    // buffer.
+    at::Tensor output = spyre_empty_with_layout(
         input.sizes(), input.strides(), input.scalar_type(),
         get_spyre_tensor_layout(input), input.device());
-  } else {
-    auto out_sizes = input.sizes().vec();
-    out_sizes[0] = output_dim0;
-    output = at::empty(out_sizes, input.options());
-  }
-  TORCH_CHECK(device_num_elems(output) == plan.output_num_elems,
-              "alltoall_run: output covers ", device_num_elems(output),
-              " device elements but the plan expects ", plan.output_num_elems,
-              "; the output's default device layout does not match the plan");
+    TORCH_CHECK(output.nbytes() > 0,
+                "Tensor must have non-zero size for broadcast");
 
-  auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
-      output.storage().data_ptr().get_context());
-  TORCH_CHECK(output_ctx != nullptr,
-              "SharedOwnerCtx is null for output tensor");
-
-  spyre_comms::Tensor input_tensor(*plan.tensor_info,
-                                   input.storage().data_ptr().get());
-  input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
-  spyre_comms::Tensor output_tensor(*plan.output_tensor_info,
-                                    output.storage().data_ptr().get());
-  output_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
-
-  // Note: alltoallw_applyTensors takes (output, input).
-  auto work_schedule =
-      context->alltoallw_applyTensors(*plan.wsi, output_tensor, input_tensor);
-  TORCH_CHECK(work_schedule != nullptr,
-              "alltoall_applyTensors operation failed to create WorkSchedule");
-
-  work_schedule->start();
-
-  // alltoall borrows the buffer addresses of both input and output.
-  auto ka = make_tensor_keep_alive({input, output});
-
-  {
-    std::lock_guard<std::mutex> lock(work_map_mutex_);
-    TORCH_CHECK(pending_work_map_.find(output_ctx) == pending_work_map_.end(),
-                "alltoall_run called twice on the same allocation without "
-                "intervening wait_work");
-    pending_work_map_.emplace(output_ctx, PendingWork{CollectiveKind::AllToAll,
-                                                      std::move(work_schedule),
-                                                      {output},
-                                                      0,
-                                                      {input, output},
-                                                      std::move(ka)});
-  }
-
-  return output;
-}
-
-// Wait for async operation to complete
-at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
-  SPYRE_RUNTIME_DEBUG() << "called";
-
-  // Get SharedOwnerCtx for map lookup
-  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
-      tensor.storage().data_ptr().get_context());
-  TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for tensor");
-
-  PendingWork pending;
-  {
-    std::lock_guard<std::mutex> lock(work_map_mutex_);
-    auto it = pending_work_map_.find(ctx);
-    TORCH_CHECK(it != pending_work_map_.end(),
-                "No pending async work found for tensor. "
-                "wait_work must be called on a tensor returned from "
-                "broadcast_run, allgather_run, allreduce_run, or "
-                "alltoall_run.");
-
-    pending = std::move(it->second);
-    pending_work_map_.erase(it);
-    SPYRE_RUNTIME_DEBUG() << "Extracted and erased PendingWork, map size="
-                          << pending_work_map_.size();
-  }
-
-  // Lock released — concurrent wait_work and run ops can now proceed.
-  // The wait is enforced only when opted in with
-  // TORCH_SPYRE_DIST_ENFORCE_WAIT=1 and the current stream is the default Flex
-  // stream that Spyre Comms uses (see ensure_context()).  Other streams are not
-  // ordered with it.
-  static const bool enforce_wait = []() {
-    const char* env = std::getenv("TORCH_SPYRE_DIST_ENFORCE_WAIT");
-    return env && std::string(env) == "1";
-  }();
-
-  if (pending.work) {
-    const c10::Device device = tensor.device();
-    const bool skip_wait =
-        !enforce_wait && spyre::getCurrentStream(device).id() ==
-                             spyre::getDefaultStream(device).id();
-    if (!skip_wait) {
-      pending.work->wait();
-      check_collective_errors(*pending.work);
-      SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
-    } else {
-      // If we are skipping the wait, relinquish ownership to spyre-comms so
-      // the WorkSchedule stays alive until finalize_library() drains it.
-      // This prevents ~WorkSchedule() from firing inline here and forcing an
-      // unwanted synchronous wait().  Pass the keep_alive bundle so that the
-      // borrowed tensor buffers remain valid until spyre-comms retires the
-      // schedule.
-      check_collective_errors(*pending.work);
-      spyre_comms::relinquish_work_schedule(std::move(pending.work),
-                                            std::move(pending.keep_alive));
-      SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
+    // Copy input to output if we're the source rank
+    int current_rank = context->getRank();
+    if (current_rank == src_rank) {
+      output.copy_(input);
     }
-  }
 
-  if (pending.kind == CollectiveKind::AllGather) {
-    // _c10d_functional.all_gather_into_tensor concatenates along dim 0 by
-    // contract (see torch/distributed/_functional_collectives.py). Verify
-    // the output was sized accordingly.
-    int64_t world = static_cast<int64_t>(pending.rank_outputs.size());
-    TORCH_CHECK(tensor.size(0) == world * pending.chunk_size,
-                "wait_work: output dim 0 (", tensor.size(0),
-                ") != world_size * chunk_size (", world, " * ",
-                pending.chunk_size,
-                "). all_gather_into_tensor must concatenate along dim 0.");
+    // Get SharedOwnerCtx for map key
+    auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+        output.storage().data_ptr().get_context());
+    TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for output tensor");
 
-    for (size_t i = 0; i < pending.rank_outputs.size(); i++) {
-      tensor
-          .narrow(0, static_cast<int64_t>(i) * pending.chunk_size,
-                  pending.chunk_size)
-          .copy_(pending.rank_outputs[i]);
+    // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
+    spyre_comms::Tensor buffer_tensor(*plan.tensor_info);
+    buffer_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
+
+    auto work_schedule =
+        context->broadcast_applyTensor(*plan.wsi, buffer_tensor);
+    TORCH_CHECK(
+        work_schedule != nullptr,
+        "broadcast_applyTensor operation failed to create WorkSchedule");
+
+    work_schedule->start();
+
+    // Build keep_alive to hold the output tensor storage for the duration of
+    // the WorkSchedule.  broadcast borrows the buffer address of `output`.
+    auto ka = make_tensor_keep_alive({output});
+
+    // Store pending work
+    {
+      std::lock_guard<std::mutex> lock(work_map_mutex_);
+      TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
+                  "broadcast_run called twice on the same allocation without "
+                  "intervening wait_work");
+      pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::Broadcast,
+                                                 std::move(work_schedule),
+                                                 {output},
+                                                 0,
+                                                 {output},
+                                                 std::move(ka)});
     }
-    SPYRE_RUNTIME_DEBUG() << "Assembled allgather output from "
-                          << pending.rank_outputs.size() << " rank buffers";
+
+    return output;
   }
-  // For Broadcast/AllReduce/Reduce/AllToAll the output data is already in
-  // tensor — no further data manipulation is needed.
 
-  // Return the tensor with completed collective data (broadcast or allreduce)
-  return tensor;
-}
+  at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
+                                      int64_t plan_handle) {
+    SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle;
 
-}  // namespace spyre
+    check_collective_storage(input);
 
-// Define the spyre namespace and operations
-TORCH_LIBRARY(spyre, m) {
-  m.def(
-      "broadcast_async(Tensor input, int src_rank, str group_name) -> Tensor");
-  m.def(
-      "all_gather_async(Tensor input, SymInt group_size=1, "
-      "str group_name=\"default\") -> Tensor");
-  m.def(
-      "all_reduce_async(Tensor(a!) input, str reduce_op=\"sum\", "
-      "str group_name=\"default\") -> Tensor(a)");
-  m.def("wait_work(Tensor(a!) tensor) -> Tensor(a)");
+    auto context = ensure_context();
 
-  // Compile-time plan ops — scalar-only, registered with impl directly
-  // so they dispatch via CompositeImplicitAutograd (no tensor to key off).
-  m.def(
-      "broadcast_plan(int num_elems, int dtype, int src_rank, "
-      "str group_name) -> int",
-      &spyre::spyre_broadcast_plan_impl);
-  m.def(
-      "allreduce_plan(int num_elems, int dtype, str reduce_op, "
-      "str group_name) -> int",
-      &spyre::spyre_allreduce_plan_impl);
-  m.def(
-      "allgather_plan(int num_elems, int dtype, int group_size, "
-      "str group_name) -> int",
-      &spyre::spyre_allgather_plan_impl);
-  m.def(
-      "alltoall_plan(int[] output_split_elems, int[] input_split_elems, "
-      "int dtype, str group_name) -> int",
-      &spyre::spyre_alltoall_plan_impl);
+    std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
+    TORCH_CHECK(plan_handle >= 0 &&
+                    plan_handle < static_cast<int64_t>(wsi_cache_.size()),
+                "allreduce_run: invalid plan_handle=", plan_handle);
+    auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
 
-  // Runtime run ops — bind cached WSI to a tensor and execute
-  m.def(
-      "broadcast_run(Tensor input, int plan_handle, int src_rank) "
-      "-> Tensor");
-  m.def("allreduce_run(Tensor(a!) input, int plan_handle) -> Tensor(a)");
-  m.def(
-      "allgather_run(Tensor input, int plan_handle, int group_size) "
-      "-> Tensor");
-  m.def(
-      "alltoall_run(Tensor input, int plan_handle, int output_dim0) "
-      "-> Tensor");
-}
+    TORCH_CHECK(input.is_privateuseone(),
+                "Tensor must be on Spyre device for all_reduce");
+    TORCH_CHECK(input.is_contiguous(),
+                "Tensor must be contiguous for all_reduce");
+    TORCH_CHECK(input.nbytes() > 0,
+                "Tensor must have non-zero size for all_reduce");
 
-// Register the implementations with PyTorch's dispatcher
-TORCH_LIBRARY_IMPL(spyre, PrivateUse1, m) {
-  m.impl("wait_work", &spyre::spyre_wait_work_impl);
+    // Get SharedOwnerCtx
+    auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+        input.storage().data_ptr().get_context());
+    TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for input tensor");
 
-  m.impl("broadcast_run", &spyre::spyre_broadcast_run_impl);
-  m.impl("allreduce_run", &spyre::spyre_allreduce_run_impl);
-  m.impl("allgather_run", &spyre::spyre_allgather_run_impl);
-  m.impl("alltoall_run", &spyre::spyre_alltoall_run_impl);
-}
+    // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
+    spyre_comms::Tensor inout_tensor(*plan.tensor_info,
+                                     input.storage().data_ptr().get());
+    inout_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
+
+    auto work_schedule =
+        context->allreduce_applyTensor(*plan.wsi, inout_tensor);
+    TORCH_CHECK(
+        work_schedule != nullptr,
+        "allreduce_applyTensor operation failed to create WorkSchedule");
+
+    work_schedule->start();
+
+    // Build keep_alive to hold the input tensor storage for the duration of
+    // the WorkSchedule.  allreduce borrows the buffer address of `input`.
+    auto ka = make_tensor_keep_alive({input});
+
+    // Store pending work
+    {
+      std::lock_guard<std::mutex> lock(work_map_mutex_);
+      TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
+                  "allreduce_run called twice on the same allocation without "
+                  "intervening wait_work");
+      pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::AllReduce,
+                                                 std::move(work_schedule),
+                                                 {input},
+                                                 0,
+                                                 {input},
+                                                 std::move(ka)});
+    }
+
+    return input;
+  }
+
+  at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
+                                      int64_t plan_handle, int64_t group_size) {
+    SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
+                          << ", group_size=" << group_size;
+
+    check_collective_storage(input);
+
+    auto context = ensure_context();
+
+    std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
+    TORCH_CHECK(plan_handle >= 0 &&
+                    plan_handle < static_cast<int64_t>(wsi_cache_.size()),
+                "allgather_run: invalid plan_handle=", plan_handle);
+    auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
+
+    TORCH_CHECK(input.is_privateuseone(),
+                "Tensor must be on Spyre device for allgather");
+    TORCH_CHECK(input.is_contiguous(),
+                "Tensor must be contiguous for allgather");
+    TORCH_CHECK(input.nbytes() > 0,
+                "Tensor must have non-zero size for allgather");
+
+    spyre_comms::Tensor input_tensor(*plan.tensor_info,
+                                     input.storage().data_ptr().get());
+    input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
+
+    // Allocate per-rank output tensors (same shape/layout as input)
+    std::vector<at::Tensor> rank_outputs;
+    rank_outputs.reserve(group_size);
+    for (int64_t i = 0; i < group_size; i++) {
+      rank_outputs.push_back(spyre_empty_with_layout(
+          input.sizes(), input.strides(), input.scalar_type(),
+          get_spyre_tensor_layout(input), input.device()));
+    }
+
+    // Build spyre_comms::Tensor vector for per-rank outputs
+    std::vector<spyre_comms::Tensor> output_tensors;
+    output_tensors.reserve(group_size);
+    for (int64_t i = 0; i < group_size; i++) {
+      spyre_comms::Tensor out_tensor(
+          *plan.tensor_info, rank_outputs[i].storage().data_ptr().get());
+      out_tensor.SetSpyreDeviceAddressBorrowed(
+          get_composite_address(rank_outputs[i]));
+      output_tensors.push_back(std::move(out_tensor));
+    }
+
+    auto work_schedule = context->allgather_applyTensors(
+        *plan.wsi, output_tensors, input_tensor);
+    TORCH_CHECK(
+        work_schedule != nullptr,
+        "allgather_applyTensors operation failed to create WorkSchedule");
+
+    work_schedule->start();
+
+    // Allocate final concatenated output
+    auto output_sizes = input.sizes().vec();
+    output_sizes[0] *= group_size;
+    at::Tensor output = at::empty(output_sizes, input.options());
+
+    auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
+        output.storage().data_ptr().get_context());
+    TORCH_CHECK(output_ctx != nullptr,
+                "SharedOwnerCtx is null for output tensor");
+
+    // allgather borrows both the input and the per-rank outputs. Generated code
+    // may release its input immediately after allgather_run, before wait_work.
+    auto borrowed_tensors = rank_outputs;
+    borrowed_tensors.push_back(input);
+    auto ka = make_tensor_keep_alive(std::move(borrowed_tensors));
+
+    // Store pending work with rank_outputs for assembly in wait_work
+    {
+      std::lock_guard<std::mutex> lock(work_map_mutex_);
+      TORCH_CHECK(pending_work_map_.find(output_ctx) == pending_work_map_.end(),
+                  "allgather_run called twice on the same allocation without "
+                  "intervening wait_work");
+      pending_work_map_.emplace(output_ctx,
+                                PendingWork{CollectiveKind::AllGather,
+                                            std::move(work_schedule),
+                                            std::move(rank_outputs),
+                                            input.size(0),
+                                            {output},
+                                            std::move(ka)});
+    }
+
+    return output;
+  }
+
+  at::Tensor spyre_reducescatter_run_impl(
+      const at::Tensor& input, int64_t plan_handle, int64_t group_size) {
+    SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
+                          << ", group_size=" << group_size;
+
+    check_collective_storage(input);
+
+    auto context = ensure_context();
+
+    std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
+    TORCH_CHECK(plan_handle >= 0 &&
+                    plan_handle < static_cast<int64_t>(wsi_cache_.size()),
+                "reducescatter_run: invalid plan_handle=", plan_handle);
+    auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
+
+    TORCH_CHECK(input.nbytes() > 0,
+                "Tensor must have non-zero size for reduce_scatter");
+
+    spyre_comms::Tensor input_tensor(*plan.tensor_info,
+                                     input.storage().data_ptr().get());
+    input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
+
+    // spyre-comms hands rank r the r-th contiguous 1/group_size of the device
+    // buffer. The compiler stages the input as (A, group_size, B) so that,
+    // under the default stick layout, the device layout is [group_size,
+    // ceil(B/stick), A, stick] and each slab is exactly the default device
+    // image of an (A, B) tensor. Reject anything else: a different layout
+    // scatters the wrong elements without any error from spyre-comms.
+    // Same condition as ReduceScatterKernel.codegen (_inductor/ir.py); keep the
+    // two in sync.
+    TORCH_CHECK(
+        input.dim() == 3 && input.size(1) == group_size,
+        "reduce_scatter: expected a staged (A, group_size, B) input, got "
+        "sizes ",
+        input.sizes(), " for group_size ", group_size);
+    const auto input_stl = get_spyre_tensor_layout(input);
+    const SpyreTensorLayout staged_stl(input.sizes().vec(),
+                                       input.scalar_type());
+    TORCH_CHECK(
+        input_stl == staged_stl && staged_stl.device_size[0] == group_size,
+        "reduce_scatter: staged input must use the default device layout "
+        "with the group dim outermost (",
+        staged_stl.toString(), "), got ", input_stl.toString());
+    at::Tensor output =
+        at::empty({input.size(0), input.size(2)}, input.options());
+    TORCH_CHECK(get_device_size_in_bytes(get_spyre_tensor_layout(output)) *
+                        group_size ==
+                    get_device_size_in_bytes(input_stl),
+                "reduce_scatter: per-rank output device size does not tile the "
+                "staged input");
+
+    auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
+        output.storage().data_ptr().get_context());
+    TORCH_CHECK(output_ctx != nullptr,
+                "SharedOwnerCtx is null for output tensor");
+    check_collective_device(output);
+
+    spyre_comms::Tensor output_tensor(*plan.output_tensor_info,
+                                      output.storage().data_ptr().get());
+    output_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
+
+    auto work_schedule = context->reduce_scatter_applyTensors(
+        *plan.wsi, input_tensor, output_tensor);
+    TORCH_CHECK(
+        work_schedule != nullptr,
+        "reduce_scatter_applyTensors operation failed to create WorkSchedule");
+
+    work_schedule->start();
+
+    // reduce_scatter borrows the buffer addresses of both input and output.
+    auto ka = make_tensor_keep_alive({input, output});
+
+    // Store pending work
+    {
+      std::lock_guard<std::mutex> lock(work_map_mutex_);
+      TORCH_CHECK(
+          pending_work_map_.find(output_ctx) == pending_work_map_.end(),
+          "reducescatter_run called twice on the same allocation without "
+          "intervening wait_work");
+      pending_work_map_.emplace(output_ctx,
+                                PendingWork{CollectiveKind::ReduceScatter,
+                                            std::move(work_schedule),
+                                            {},
+                                            0,
+                                            {output, input},
+                                            std::move(ka)});
+    }
+
+    // Device elements (in scalar-type units, as the plan counts them) covered
+    // by a
+    // tensor's device allocation.
+    static int64_t device_num_elems(const at::Tensor& t) {
+      return static_cast<int64_t>(
+                 get_device_size_in_bytes(get_spyre_tensor_layout(t))) /
+             static_cast<int64_t>(t.element_size());
+    }
+
+    at::Tensor spyre_alltoall_run_impl(
+        const at::Tensor& input, int64_t plan_handle, int64_t output_dim0) {
+      SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
+                            << ", output_dim0=" << output_dim0;
+
+      check_collective_storage(input);
+
+      auto context = ensure_context();
+
+      std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
+      TORCH_CHECK(plan_handle >= 0 &&
+                      plan_handle < static_cast<int64_t>(wsi_cache_.size()),
+                  "alltoall_run: invalid plan_handle=", plan_handle);
+      auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
+      TORCH_CHECK(plan.kind == PlanKind::AllToAll,
+                  "alltoall_run: plan_handle=", plan_handle,
+                  " is not an alltoall plan");
+
+      TORCH_CHECK(input.dim() > 0, "alltoall: input must have at least 1 dim");
+      TORCH_CHECK(output_dim0 > 0,
+                  "alltoall: output_dim0 must be positive, got ", output_dim0);
+      TORCH_CHECK(device_num_elems(input) == plan.num_elems,
+                  "alltoall_run: input covers ", device_num_elems(input),
+                  " device elements but the plan expects ", plan.num_elems);
+
+      // alltoall does not modify its input; results land in a fresh tensor
+      // whose dim 0 is sum(output_split_sizes) (equal to the input's for even
+      // splits).
+      at::Tensor output;
+      if (output_dim0 == input.size(0)) {
+        output = spyre_empty_with_layout(
+            input.sizes(), input.strides(), input.scalar_type(),
+            get_spyre_tensor_layout(input), input.device());
+      } else {
+        auto out_sizes = input.sizes().vec();
+        out_sizes[0] = output_dim0;
+        output = at::empty(out_sizes, input.options());
+      }
+      TORCH_CHECK(
+          device_num_elems(output) == plan.output_num_elems,
+          "alltoall_run: output covers ", device_num_elems(output),
+          " device elements but the plan expects ", plan.output_num_elems,
+          "; the output's default device layout does not match the plan");
+
+      auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
+          output.storage().data_ptr().get_context());
+      TORCH_CHECK(output_ctx != nullptr,
+                  "SharedOwnerCtx is null for output tensor");
+
+      spyre_comms::Tensor input_tensor(*plan.tensor_info,
+                                       input.storage().data_ptr().get());
+      input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
+      spyre_comms::Tensor output_tensor(*plan.output_tensor_info,
+                                        output.storage().data_ptr().get());
+      output_tensor.SetSpyreDeviceAddressBorrowed(
+          get_composite_address(output));
+
+      // Note: alltoallw_applyTensors takes (output, input).
+      auto work_schedule = context->alltoallw_applyTensors(
+          *plan.wsi, output_tensor, input_tensor);
+      TORCH_CHECK(
+          work_schedule != nullptr,
+          "alltoall_applyTensors operation failed to create WorkSchedule");
+
+      work_schedule->start();
+
+      // alltoall borrows the buffer addresses of both input and output.
+      auto ka = make_tensor_keep_alive({input, output});
+
+      {
+        std::lock_guard<std::mutex> lock(work_map_mutex_);
+        TORCH_CHECK(
+            pending_work_map_.find(output_ctx) == pending_work_map_.end(),
+            "alltoall_run called twice on the same allocation without "
+            "intervening wait_work");
+        pending_work_map_.emplace(output_ctx,
+                                  PendingWork{CollectiveKind::AllToAll,
+                                              std::move(work_schedule),
+                                              {output},
+                                              0,
+                                              {input, output},
+                                              std::move(ka)});
+      }
+
+      return output;
+    }
+
+    // Wait for async operation to complete
+    at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
+      SPYRE_RUNTIME_DEBUG() << "called";
+
+      // Get SharedOwnerCtx for map lookup
+      auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+          tensor.storage().data_ptr().get_context());
+      TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null for tensor");
+
+      PendingWork pending;
+      {
+        std::lock_guard<std::mutex> lock(work_map_mutex_);
+        auto it = pending_work_map_.find(ctx);
+        TORCH_CHECK(it != pending_work_map_.end(),
+                    "No pending async work found for tensor. "
+                    "wait_work must be called on a tensor returned from "
+                    "broadcast_run, allgather_run, allreduce_run, "
+                    "reducescatter_run, or alltoall_run.");
+
+        pending = std::move(it->second);
+        pending_work_map_.erase(it);
+        SPYRE_RUNTIME_DEBUG() << "Extracted and erased PendingWork, map size="
+                              << pending_work_map_.size();
+      }
+
+      // Lock released — concurrent wait_work and run ops can now proceed.
+      // The wait is enforced only when opted in with
+      // TORCH_SPYRE_DIST_ENFORCE_WAIT=1 and the current stream is the default
+      // Flex stream that Spyre Comms uses (see ensure_context()).  Other
+      // streams are not ordered with it.
+      static const bool enforce_wait = []() {
+        const char* env = std::getenv("TORCH_SPYRE_DIST_ENFORCE_WAIT");
+        return env && std::string(env) == "1";
+      }();
+
+      if (pending.work) {
+        const c10::Device device = tensor.device();
+        const bool skip_wait =
+            !enforce_wait && spyre::getCurrentStream(device).id() ==
+                                 spyre::getDefaultStream(device).id();
+        if (!skip_wait) {
+          pending.work->wait();
+          check_collective_errors(*pending.work);
+          SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
+        } else {
+          // If we are skipping the wait, relinquish ownership to spyre-comms so
+          // the WorkSchedule stays alive until finalize_library() drains it.
+          // This prevents ~WorkSchedule() from firing inline here and forcing
+          // an unwanted synchronous wait().  Pass the keep_alive bundle so that
+          // the borrowed tensor buffers remain valid until spyre-comms retires
+          // the schedule.
+          check_collective_errors(*pending.work);
+          spyre_comms::relinquish_work_schedule(std::move(pending.work),
+                                                std::move(pending.keep_alive));
+          SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
+        }
+      }
+
+      if (pending.kind == CollectiveKind::AllGather) {
+        // _c10d_functional.all_gather_into_tensor concatenates along dim 0 by
+        // contract (see torch/distributed/_functional_collectives.py). Verify
+        // the output was sized accordingly.
+        int64_t world = static_cast<int64_t>(pending.rank_outputs.size());
+        TORCH_CHECK(tensor.size(0) == world * pending.chunk_size,
+                    "wait_work: output dim 0 (", tensor.size(0),
+                    ") != world_size * chunk_size (", world, " * ",
+                    pending.chunk_size,
+                    "). all_gather_into_tensor must concatenate along dim 0.");
+
+        for (size_t i = 0; i < pending.rank_outputs.size(); i++) {
+          tensor
+              .narrow(0, static_cast<int64_t>(i) * pending.chunk_size,
+                      pending.chunk_size)
+              .copy_(pending.rank_outputs[i]);
+        }
+        SPYRE_RUNTIME_DEBUG() << "Assembled allgather output from "
+                              << pending.rank_outputs.size() << " rank buffers";
+      }
+      // For Broadcast/AllReduce/Reduce/AllToAll the output data is already in
+      // tensor — no further data manipulation is needed.
+
+      // Return the tensor with completed collective data (broadcast or
+      // allreduce)
+      return tensor;
+    }
+  }  // namespace spyre
+
+  // Define the spyre namespace and operations
+  TORCH_LIBRARY(spyre, m) {
+    m.def(
+        "broadcast_async(Tensor input, int src_rank, str group_name) -> "
+        "Tensor");
+    m.def(
+        "all_gather_async(Tensor input, SymInt group_size=1, "
+        "str group_name=\"default\") -> Tensor");
+    m.def(
+        "all_reduce_async(Tensor(a!) input, str reduce_op=\"sum\", "
+        "str group_name=\"default\") -> Tensor(a)");
+    m.def("wait_work(Tensor(a!) tensor) -> Tensor(a)");
+
+    // Compile-time plan ops — scalar-only, registered with impl directly
+    // so they dispatch via CompositeImplicitAutograd (no tensor to key off).
+    m.def(
+        "broadcast_plan(int num_elems, int dtype, int src_rank, "
+        "str group_name) -> int",
+        &spyre::spyre_broadcast_plan_impl);
+    m.def(
+        "allreduce_plan(int num_elems, int dtype, str reduce_op, "
+        "str group_name) -> int",
+        &spyre::spyre_allreduce_plan_impl);
+    m.def(
+        "allgather_plan(int num_elems, int dtype, int group_size, "
+        "str group_name) -> int",
+        &spyre::spyre_allgather_plan_impl);
+    m.def(
+        "alltoall_plan(int[] output_split_elems, int[] input_split_elems, "
+        "int dtype, str group_name) -> int",
+        &spyre::spyre_alltoall_plan_impl);
+    m.def(
+        "reducescatter_plan(int num_elems, int dtype, int group_size, "
+        "str reduce_op, str group_name) -> int",
+        &spyre::spyre_reducescatter_plan_impl);
+
+    // Runtime run ops — bind cached WSI to a tensor and execute
+    m.def(
+        "broadcast_run(Tensor input, int plan_handle, int src_rank) "
+        "-> Tensor");
+    m.def("allreduce_run(Tensor(a!) input, int plan_handle) -> Tensor(a)");
+    m.def(
+        "allgather_run(Tensor input, int plan_handle, int group_size) "
+        "-> Tensor");
+    m.def(
+        "alltoall_run(Tensor input, int plan_handle, int output_dim0) "
+        "-> Tensor");
+    m.def(
+        "reducescatter_run(Tensor input, int plan_handle, int group_size) "
+        "-> Tensor");
+  }
+
+  // Register the implementations with PyTorch's dispatcher
+  TORCH_LIBRARY_IMPL(spyre, PrivateUse1, m) {
+    m.impl("wait_work", &spyre::spyre_wait_work_impl);
+
+    m.impl("broadcast_run", &spyre::spyre_broadcast_run_impl);
+    m.impl("allreduce_run", &spyre::spyre_allreduce_run_impl);
+    m.impl("allgather_run", &spyre::spyre_allgather_run_impl);
+    m.impl("alltoall_run", &spyre::spyre_alltoall_run_impl);
+    m.impl("reducescatter_run", &spyre::spyre_reducescatter_run_impl);
+  }

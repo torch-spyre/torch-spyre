@@ -231,7 +231,7 @@ def test_selected_dim_varies_first(contiguous_dim):
 def _mapping_coordinates(mapping, dims, num_cores):
     core_id = sympy.Symbol("core_id")
     return [
-        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
+        tuple(int(mapping[dim].xreplace({core_id: core})) for dim in dims)
         for core in range(num_cores)
     ]
 
@@ -354,7 +354,7 @@ def test_fused_decomposition_is_exact_and_bounded(
         return
     assert result is not None and result[0] == accepted
     assert [
-        tuple(int(slot.subs(_CORE_ID, c)) for _, slot in result[1])
+        tuple(int(slot.xreplace({_CORE_ID: c})) for _, slot in result[1])
         for c in range(split)
     ] == [owner(c) for c in range(split)]
 
@@ -378,7 +378,7 @@ def test_index_regions_match_exact_points(coords, extent, split, sizes):
     width = extent // split
     for part in range(split):
         points = {
-            tuple(c.subs(_FUSED, p) for c in coords)
+            tuple(c.xreplace({_FUSED: p}) for c in coords)
             for p in range(part * width, (part + 1) * width)
         }
         region = tuple(zip(map(min, zip(*points)), map(max, zip(*points))))
@@ -910,7 +910,7 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
             sympy.Mod(flat, 64),
         ),
         device_size=[2, 1, 1, 1, 4, 16, 64],
-        stride_map=[256, -1, -1, -1, 64, 512, 1],
+        stride_map=[256, 0, 0, 0, 64, 512, 1],
         device_stride_to_dim={256: 0, 64: 4, 512: 5, 1: 6},
         stick_host_stride=1,
         num_stick_dim=4,
@@ -974,7 +974,7 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
     physical_splits = dict(view.work_slice_dims)
     physical_slots = dict(view.core_to_slot)
     for c in range(split):
-        logical_slot = int(owner.subs(core, c))
+        logical_slot = int(owner.xreplace({core: c}))
         expected = set(
             range(
                 logical_slot * (extent // split), (logical_slot + 1) * (extent // split)
@@ -984,9 +984,9 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
             point
             for point in range(extent)
             if all(
-                int(coordinates[axis].subs(flat, point))
+                int(coordinates[axis].xreplace({flat: point}))
                 // (device_size[axis] // factor)
-                == int(physical_slots[axis].subs(core, c))
+                == int(physical_slots[axis].xreplace({core: c}))
                 for axis, factor in physical_splits.items()
             )
         }
@@ -1005,7 +1005,7 @@ def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
             sympy.S.Zero,
         ),
         device_size=[4, 8, 1],
-        stride_map=[-1, -1, 1],
+        stride_map=[0, 0, 1],
         device_stride_to_dim={},
         elems_per_stick=1,
     )
@@ -1075,7 +1075,7 @@ def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned
         dep_coeff={dim: index.coeff(dim) for dim in space},
         dep_device_coordinates=tuple(coords),
         device_size=sizes,
-        stride_map=[-1, -1, 1, 1] if feature_owned else [-1, -1],
+        stride_map=[0, 0, 1, 1] if feature_owned else [0, 0],
         device_stride_to_dim={1: 2} if feature_owned else {},
         is_matmul=True,
         **kwargs,
@@ -1109,7 +1109,7 @@ def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
     _ds = [1, 1, 8, 16, 64]
     device_layout = pass_utils_module.SpyreTensorLayout(
         [1, 1, 8, 16, 64],
-        [-1, -1, 64, 512, 1],
+        [0, 0, 64, 512, 1],
         DataFormats.SEN169_FP16,
         {(0,): 1, (1,): 1, (2, 4): 512, (3,): 16},
         ElementArrangement.STANDARD,
@@ -1270,8 +1270,8 @@ def test_attention_repack_maps_only_complete_head_shards(
         assert dict(view.work_slice_dims) == {0: 4, 1: 8}
         owners = dict(view.core_to_slot)
         for core in range(32):
-            assert int(owners[0].subs(_CORE_ID, core)) == core // 8
-            assert int(owners[1].subs(_CORE_ID, core)) == core % 8
+            assert int(owners[0].xreplace({_CORE_ID: core})) == core // 8
+            assert int(owners[1].xreplace({_CORE_ID: core})) == core % 8
 
 
 @pytest.mark.parametrize("relayout_enabled", [False, True])
@@ -1706,11 +1706,11 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
             assert division.physical_core_count == 32
             for core in range(32):
                 assert (
-                    int(division.core_id_to_work_slice[head].subs(_CORE_ID, core))
+                    int(division.core_id_to_work_slice[head].xreplace({_CORE_ID: core}))
                     == core // 8
                 )
                 assert (
-                    int(division.core_id_to_work_slice[row].subs(_CORE_ID, core))
+                    int(division.core_id_to_work_slice[row].xreplace({_CORE_ID: core}))
                     == core % 8
                 )
     assert prep.dep_device_coordinates == coordinates
