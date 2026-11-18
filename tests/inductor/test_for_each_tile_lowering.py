@@ -3359,15 +3359,25 @@ def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
-    def test_splice_while_loops_is_first_pass(self):
+    def test_splice_while_loops_runs_right_after_the_reserved_dims_contract(self):
         from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+        from torch_spyre._inductor.reserved_dims_contract import (
+            apply_reserved_dims_contract,
+        )
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
 
         pipeline = CustomPreSchedulingPasses()
 
-        self.assertIs(pipeline.passes[0], splice_while_loops)
+        # apply_reserved_dims_contract must run before splice_while_loops (and
+        # everything else): it writes each declared dim's (min, max) into the
+        # ShapeEnv, which splice_while_loops reads when it stamps a loop's
+        # trip count / max extent. Reversing the order would make
+        # splice_while_loops see Dynamo's loose default range instead of the
+        # declared one.
+        self.assertIs(pipeline.passes[0], apply_reserved_dims_contract)
+        self.assertIs(pipeline.passes[1], splice_while_loops)
 
 
 def test_tile_dim_marker_lowering_produces_distinct_operation():
@@ -5890,6 +5900,62 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)
+
+    def test_split_input_clone_has_representable_scheduler_transport(self):
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.pass_utils import (
+            PerCoreView,
+            apply_splits_from_index_coeff,
+            finalize_work_division_for_scheduler,
+            iteration_space_from_op,
+            op_read_writes,
+            select_work_division_transport_indexes,
+        )
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_group_path,
+            get_buffer_users,
+        )
+
+        graph = self._spliced_graph()
+        with V.set_graph_handler(graph):
+            users = get_buffer_users(graph)
+            name = next(
+                name
+                for name in graph.graph_input_names
+                if users.get(name) and counted_loop_group_path(users[name][0])
+            )
+            box = self._tile_input(graph, name)
+            core_id = sympy.Symbol("core_id")
+            clone = GraphEditor(graph).push_allocation_with_clone(
+                box,
+                users[name],
+                input=True,
+                lx_view=PerCoreView(
+                    ((1, 2),), ((1, sympy.Mod(core_id, 2)),), num_cores=2
+                ),
+            )
+            expected_splits = dict(clone.iteration_space_ownership.work_slices)
+            self.assertEqual(clone.iteration_space_ownership.physical_core_count, 2)
+            self.assertEqual(sorted(expected_splits.values()), [1, 2])
+            clone_space = iteration_space_from_op(clone)
+            clone_writes = [
+                dep
+                for dep in op_read_writes(clone).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(len(clone_writes), 1)
+
+            finalize_work_division_for_scheduler(graph)
+            write_index, read_index = select_work_division_transport_indexes(
+                clone, op_read_writes(clone), clone_space
+            )
+            decoded = apply_splits_from_index_coeff(
+                clone.op_it_space_splits, write_index, read_index, clone_space
+            )
+            self.assertEqual(decoded, expected_splits)
 
 
 class TestRepointRefsToBuffer(unittest.TestCase):
