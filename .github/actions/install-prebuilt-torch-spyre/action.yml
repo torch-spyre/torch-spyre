@@ -41,6 +41,13 @@ runs:
         # fleet requests it concurrently. Bumping setup-uv moves this version forward.
         version: latest-known
 
+    # Restores UV_CACHE_DIR from /storage-1 instead of PyPI; its post step saves it back at job end.
+    - name: uv cache (NFS)
+      uses: torch-spyre/spyre-inference/.github/actions/uv-nfs-cache@e353b30d6311b5872ab1176c4a0b47a2e8d571ab
+      with:
+        storage-root: /storage-1/torch-spyre/.cache/uv
+        key-files: ${{ inputs.torch_spyre_dir }}/uv.lock
+
     - name: Download prebuilt wheel
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
@@ -48,6 +55,81 @@ runs:
         path: ${{ github.workspace }}/prebuilt-wheel
         run-id: ${{ inputs.run_id }}
         github-token: ${{ inputs.github_token }}
+
+    # download-artifact can leave a TRUNCATED wheel and still report
+    # outcome=success, so uv is blamed instead (issue #5732). Test the zip and
+    # re-fetch, as #5370's ingest fetch does. `gh` is absent from the ARC runner
+    # images, so install it on demand (pattern: recover-threaded-run-id).
+    - name: Check for the GitHub CLI
+      id: gh
+      shell: bash
+      run: echo "present=$(command -v gh >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup the GitHub CLI
+      if: steps.gh.outputs.present != 'true'
+      uses: ./.github/actions/setup-gh-cli
+
+    - name: Verify the wheel, re-fetching a truncated download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token || github.token }}
+        ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        ARTIFACT_RUN_ID: ${{ inputs.run_id || github.run_id }}
+      run: |
+        set -uo pipefail
+        DEST="$GITHUB_WORKSPACE/prebuilt-wheel"
+
+        # Detects an incomplete transfer, not wheel validity. testzip() RETURNS
+        # the bad member and raises nothing, so it must be compared against None:
+        # bare `testzip()` exits 0 on CRC corruption. Stderr dropped (noisy trace).
+        good() {
+          local w
+          w="$(ls -1 "$DEST"/*.whl 2>/dev/null | head -1)"
+          [[ -n "$w" ]] || return 1
+          # One line: an unindented heredoc would end this YAML block scalar.
+          python3 -c "import sys, zipfile; \
+            zipfile.ZipFile(sys.argv[1]).testzip() is None \
+            or sys.exit('corrupt zip member')" "$w" 2>/dev/null
+        }
+
+        ATTEMPTS=3
+        for attempt in $(seq 1 "$ATTEMPTS"); do
+          if good; then
+            # Same `ls -1 | head -1` as the install step: same wheel.
+            ls -l "$(ls -1 "$DEST"/*.whl | head -1)"
+            exit 0
+          fi
+          # Nothing left to verify after the last attempt: don't sleep or re-fetch.
+          [[ "$attempt" -eq "$ATTEMPTS" ]] && break
+          echo "::warning::Prebuilt wheel is missing or not a readable zip" \
+            "(truncated download), attempt ${attempt}/${ATTEMPTS}; re-fetching" \
+            "'${ARTIFACT_NAME}' from run ${ARTIFACT_RUN_ID}."
+          sleep $((attempt * 5))
+          # No `set -e`: an unguarded mkdir failure would get blamed on the upload.
+          rm -rf "$DEST"
+          if ! mkdir -p "$DEST"; then
+            echo "::error::Cannot create the wheel download directory ${DEST}." >&2
+            exit 1
+          fi
+          # `?name=` filters server-side: a run uploads ~200 artifacts and the
+          # wheel is not on page 1. A failed fetch is not fatal; `good` re-checks.
+          aid="$(gh api \
+                   "/repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}/artifacts?name=${ARTIFACT_NAME}" \
+                   --jq '[.artifacts[] | select(.expired == false)] | last | .id // empty')" || aid=""
+          if [[ -n "$aid" ]]; then
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${aid}/zip" \
+                > "${DEST}/artifact.zip" \
+              && unzip -o -q "${DEST}/artifact.zip" -d "$DEST" || true
+            rm -f "${DEST}/artifact.zip"
+          else
+            echo "::warning::Could not resolve artifact id for '${ARTIFACT_NAME}'" \
+              "in run ${ARTIFACT_RUN_ID}."
+          fi
+        done
+
+        echo "::error::Prebuilt wheel '${ARTIFACT_NAME}' did not transfer" \
+          "completely after 3 attempts; the uploaded artifact may itself be bad." >&2
+        exit 1
 
     - name: Install prebuilt wheel
       shell: bash

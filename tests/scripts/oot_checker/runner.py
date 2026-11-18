@@ -14,10 +14,11 @@ from .checks import (
     check_missing,
     check_dead_patterns,
     check_missing_labels,
+    check_invalid_platforms,
 )
 from .discovery import find_test_files
 from .display import bold, green, red, yellow, heuristic_base_names, warn
-from .loader import load_all_patterns, load_labels
+from .loader import load_all_patterns, load_labels, load_excluded_platforms
 from .parser import parse_test_file
 
 
@@ -52,6 +53,11 @@ def run(
     """
     print(bold("CHECK 0: Labels"))
     total_hard_problems = check_missing_labels(load_labels(config_files))
+
+    print(bold("CHECK 0b: Platforms"))
+    total_hard_problems += check_invalid_platforms(
+        load_excluded_platforms(config_files)
+    )
 
     all_patterns = load_all_patterns(config_files)
 

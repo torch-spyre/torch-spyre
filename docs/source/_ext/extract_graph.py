@@ -257,6 +257,37 @@ def extract_decompositions(filepath):
                                 "relationship": "decomposed_by",
                             }
                         )
+                    # Capture the ops this decomposition expands into by
+                    # walking its body for explicit op calls. Best-effort:
+                    # torch.ops.spyre.* / torch.ops.aten.* and bare torch.*
+                    # functional calls are named here; Python operators
+                    # (*, +, @) and tensor methods (.transpose) cannot be
+                    # resolved statically and are omitted.
+                    seen_targets = set()
+                    for call in ast.walk(node):
+                        if not isinstance(call, ast.Call):
+                            continue
+                        target = _normalize_op_name(_resolve_attr(call.func))
+                        if not target:
+                            continue
+                        if target.startswith("torch.") and not target.startswith(
+                            ("torch.ops.", "torch._ops.")
+                        ):
+                            target = "aten." + target[len("torch.") :]
+                        if not target.startswith(("spyre.", "aten.")):
+                            continue
+                        if target in seen_targets:
+                            continue
+                        seen_targets.add(target)
+                        target_id = f"op::{target}"
+                        nodes.append({"id": target_id, "label": target, "type": "op"})
+                        edges.append(
+                            {
+                                "source": decomp_id,
+                                "target": target_id,
+                                "relationship": "decomposes_into",
+                            }
+                        )
     return nodes, edges
 
 
@@ -756,7 +787,7 @@ def extract_modules(torch_spyre_root, repo_root):
         rel_path = str(filepath.relative_to(repo_root))
         mod_name = _module_from_path(filepath, repo_root)
 
-        if mod_name == "torch_spyre.version":
+        if mod_name == "torch_spyre._version":
             continue
 
         mod_id = f"module::{mod_name}"

@@ -33,6 +33,14 @@ struct CompositeChunkInfo {
   uint64_t offset;
   size_t size;
   uint32_t domain_id;
+
+  bool operator==(const CompositeChunkInfo& o) const {
+    return region_id == o.region_id && offset == o.offset && size == o.size &&
+           domain_id == o.domain_id;
+  }
+  bool operator!=(const CompositeChunkInfo& o) const {
+    return !(*this == o);
+  }
 };
 
 // An opaque, read-only handle over the flex::CompositeAddress that backs a

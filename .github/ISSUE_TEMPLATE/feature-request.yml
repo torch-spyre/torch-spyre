@@ -1,7 +1,7 @@
 name: Feature request
 description: New feature request in Torch Spyre
 labels:
-  - type/feature
+  - enhancement
 body:
   - type: markdown
     attributes:

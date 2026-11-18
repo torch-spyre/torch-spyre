@@ -373,14 +373,12 @@ class TestUnifiedLoggingPatterns(LoggingIsolationMixin):
         assert len(captured.output) == 3
 
 
-class TestLegacyCompatibility(LoggingIsolationMixin):
-    """Tests for the legacy-to-unified logging compatibility layer."""
+class TestEnvVarCompatibility(LoggingIsolationMixin):
+    """Tests for deprecated environment variable handling."""
 
-    def test_legacy_environment_variables_map_to_unified_config(self) -> None:
-        """Verify legacy env vars map into unified config with warnings."""
+    def test_torch_spyre_debug_maps_to_unified_config(self) -> None:
+        """Verify TORCH_SPYRE_DEBUG maps into unified config with warning."""
         os.environ.pop("TORCH_LOGS", None)
-        os.environ["SPYRE_INDUCTOR_LOG"] = "1"
-        os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
         os.environ["TORCH_SPYRE_DEBUG"] = "1"
 
         with warnings.catch_warnings(record=True) as caught:
@@ -388,32 +386,21 @@ class TestLegacyCompatibility(LoggingIsolationMixin):
             logging_config, logging_utils = self._reload_logging_modules()
 
         messages = [str(w.message) for w in caught]
-        assert logging_config.get_effective_config()["spyre.inductor"] == "DEBUG"
-        assert (
-            logging_config.get_config_source("spyre.inductor")
-            == "legacy:SPYRE_INDUCTOR_LOG"
-        )
         assert logging_config.get_effective_config()["spyre.runtime"] == "DEBUG"
         assert (
-            logging_config.get_config_source("spyre.runtime")
-            == "legacy:TORCH_SPYRE_DEBUG"
-        )
-        assert any(
-            "SPYRE_INDUCTOR_LOG is deprecated" in message for message in messages
+            logging_config.get_config_source("spyre.runtime") == "env:TORCH_SPYRE_DEBUG"
         )
         assert any("TORCH_SPYRE_DEBUG is deprecated" in message for message in messages)
 
-        legacy_logger = logging_utils.get_logger("legacy_test")
-        with capture_logs("spyre.inductor.legacy_test", level="DEBUG") as captured:
-            legacy_logger.debug(
-                "DEBUG message (enabled via SPYRE_INDUCTOR_LOG_LEVEL=DEBUG)"
-            )
-            legacy_logger.info("INFO message")
-            legacy_logger.warning("WARNING message")
+        debug_logger = logging_utils.get_logger("debug_test")
+        with capture_logs("spyre.inductor.debug_test", level="DEBUG") as captured:
+            debug_logger.debug("DEBUG message")
+            debug_logger.info("INFO message")
+            debug_logger.warning("WARNING message")
 
         assert len(captured.output) == 3
 
-    def test_legacy_log_file_env_var_maps_to_unified_config(self) -> None:
+    def test_log_file_env_var_maps_to_unified_config(self) -> None:
         """Verify SPYRE_LOG_FILE maps into unified output config with warning."""
         os.environ["SPYRE_LOG_FILE"] = "/tmp/spyre-legacy.log"
 
@@ -423,7 +410,7 @@ class TestLegacyCompatibility(LoggingIsolationMixin):
 
         output_config = logging_config.get_output_config()
         assert output_config["log_file"] == "/tmp/spyre-legacy.log"
-        assert output_config["log_file_source"] == "legacy:SPYRE_LOG_FILE"
+        assert output_config["log_file_source"] == "env:SPYRE_LOG_FILE"
         messages = [str(w.message) for w in caught]
         assert any("SPYRE_LOG_FILE is deprecated" in message for message in messages)
 
@@ -491,6 +478,59 @@ class TestTorchSpyreNamespaceNormalization(LoggingIsolationMixin):
         )
 
 
+class TestWsrNamespace(LoggingIsolationMixin):
+    """Tests for the spyre.inductor.wsr namespace covering torch_spyre._inductor.wsr."""
+
+    def test_plus_torch_spyre_inductor_wsr_enables_wsr_and_children(self) -> None:
+        """+torch_spyre.inductor.wsr must raise spyre.inductor.wsr (and its
+        dynamic children) to DEBUG, without touching sibling components."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor.wsr"
+        logging_config, logging_utils = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr")
+            == logging_config.LogLevel.DEBUG
+        )
+        assert logging_config.get_config_source("spyre.inductor.wsr") == "TORCH_LOGS"
+
+        coarse_tile_logger = logging_utils.get_logger("wsr.coarse_tile")
+        assert coarse_tile_logger.name == "spyre.inductor.wsr.coarse_tile"
+        assert coarse_tile_logger.level == int(logging_config.LogLevel.DEBUG)
+
+        # A sibling component outside wsr must stay at its default.
+        assert (
+            logging_config.get_log_level("spyre.inductor.lowering")
+            == logging_config.LogLevel.WARNING
+        )
+
+        with capture_logs("spyre.inductor.wsr.coarse_tile", level="DEBUG") as captured:
+            coarse_tile_logger.debug("coarse tile decision")
+        assert any("coarse tile decision" in line for line in captured.output)
+
+    def test_minus_torch_spyre_inductor_wsr_overrides_enabled_parent(self) -> None:
+        """-torch_spyre.inductor.wsr silences wsr even when inductor is enabled."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor,-torch_spyre.inductor.wsr"
+        logging_config, _ = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor")
+            == logging_config.LogLevel.DEBUG
+        )
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr")
+            == logging_config.LogLevel.ERROR
+        )
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr.coarse_tile")
+            == logging_config.LogLevel.ERROR
+        )
+        # Siblings still inherit the enabled parent.
+        assert (
+            logging_config.get_log_level("spyre.inductor.lowering")
+            == logging_config.LogLevel.DEBUG
+        )
+
+
 class TestCompleteIntegration(LoggingIsolationMixin):
     """End-to-end tests for integrated logging configuration behavior."""
 
@@ -504,7 +544,7 @@ class TestCompleteIntegration(LoggingIsolationMixin):
             log_path = os.path.join(tmpdir, "spyre.log")
             logging_config, logging_utils = self._reload_logging_modules()
 
-            assert "legacy:" not in logging_config.get_config_source("spyre.inductor")
+            assert "env:" not in logging_config.get_config_source("spyre.inductor")
             components = logging_config.list_components()
             assert "spyre.inductor" in components
             assert "spyre.execution" in components

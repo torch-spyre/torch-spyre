@@ -214,9 +214,10 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    `spyre::layer_norm`, `spyre::gelu`).
 3. **Decompositions** — FX rewrites that turn an ATen op into a
    sequence of native or custom ops (e.g. `aten.addmm` →
-   `matmul + scale + add`).
+   `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
+   plus a Taylor polynomial).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `sin`, `cos`, `tril`, `triu`, ...). Transparent, but
+   `arange`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
@@ -231,8 +232,8 @@ to enable a new one.
 
 The compiled path runs the standard PyTorch pipeline (FX capture,
 AOTAutograd, Inductor scheduler) and inserts three Spyre-specific
-passes: layout propagation, work division (`span_reduction` followed
-by `work_distribution`), and scratchpad / LX planning. The output is
+passes: layout propagation, work division (`cost_model_matmul_division`
+and `work_distribution`), and scratchpad / LX planning. The output is
 a SuperDSC JSON artifact that the Deeptools backend (a proprietary
 compiler) turns into a device binary.
 
@@ -272,14 +273,20 @@ Each box is a distinct IR. The pass between two boxes is named above the arrow: 
   consumes. SpyreCode is the runtime interface that turns a compiled
   kernel IR into device execution. See [Runtime](../runtime/index.md).
 
-### Named dimensions and tiling hints
+### Tiling loops and named dimensions
 
-Working set reduction is driven by **named dimensions**. User code
-declares dimension names with `declare_tensor_dim`, attaches them to
-input tensors with `name_tensor_dims`, and tiles them inside a
-`with spyre_hint(tiles={...}):` scope. Hints are lexically scoped, can
-be nested, and compose by intersection of the op's iteration dimensions
-with each enclosing hint's tile dict. Full details and examples are in
+Working set reduction is expressed with `for_each_tile`: one explicit,
+co-indexed tiling loop whose body sees one tile of each operand per trip.
+A loop that only maps (each trip writes its own slice of the result)
+and a loop that carries a value (a split-K accumulation, an online softmax)
+use the same call, and two calls compose into a nested loop. `for_each_tile`
+needs the enclosing function compiled with `fullgraph=True`.
+
+Named dimensions are separate and optional. User code declares dimension
+names with `declare_tensor_dim` and attaches them to input tensors with
+`name_tensor_dims` so that a `with spyre_hint(work_div={...}):` scope can
+control how an operation's iteration space is divided across cores.
+Full details and examples are in
 [Working Set Reduction](../compiler/working_set_reduction.md).
 
 For the full pipeline reference, see

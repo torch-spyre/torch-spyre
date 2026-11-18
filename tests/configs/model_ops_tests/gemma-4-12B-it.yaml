@@ -18,7 +18,10 @@ test_suite_config:
       - name: bfloat16
         precision:
           atol: 0.005
-          rtol: 0.005
+          # rtol 0.008 (> 2^-7 = 0.0078125, the max relative size of one bf16 step):
+          # device results, computed via DLFloat16, can differ from the CPU reference
+          # by one bf16 step.
+          rtol: 0.008
       - name: int8
         precision:
           atol: 0.005
@@ -1639,21 +1642,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -2628,21 +2631,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 24, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 24, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -4108,21 +4111,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -4998,21 +5001,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 2048, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 2048, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0

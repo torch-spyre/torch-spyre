@@ -83,7 +83,9 @@ void SpyreGuardImpl::setDevice(c10::Device d) const {
   tls_idx = d.index();
 }
 
-void SpyreGuardImpl::uncheckedSetDevice(c10::Device) const noexcept {}
+void SpyreGuardImpl::uncheckedSetDevice(c10::Device d) const noexcept {
+  tls_idx = d.index();
+}
 
 c10::DeviceIndex SpyreGuardImpl::deviceCount() const noexcept {
   return c10::DeviceIndex(getVisibleDeviceCount());

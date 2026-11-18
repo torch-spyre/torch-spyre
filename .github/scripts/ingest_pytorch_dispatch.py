@@ -23,7 +23,7 @@ import os
 import sys
 from pathlib import Path
 
-import clickhouse_connect
+from spyre_clickhouse_ingest.client import get_client
 
 # ---------------------------------------------------------------------------
 # ClickHouse DDL
@@ -77,17 +77,6 @@ ORDER BY (delivery_id, job_name)
 # ---------------------------------------------------------------------------
 # ClickHouse connection client
 # ---------------------------------------------------------------------------
-
-
-def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-    )
 
 
 # ---------------------------------------------------------------------------

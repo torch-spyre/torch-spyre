@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 300" font-family="'Source Sans 3', Calibri, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555555"/>
+    </marker>
+  </defs>
+
+  <!-- top lane: -inf mask poisons the reduction -->
+  <text x="20" y="60" font-size="16" font-weight="600" fill="#1a1a1a">mask = -inf</text>
+  <g>
+    <rect x="20" y="72" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="47" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">a</text>
+    <rect x="74" y="72" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="101" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">b</text>
+    <rect x="128" y="72" width="68" height="46" fill="#ececec" stroke="#333333" stroke-width="1.5"/><text x="162" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">-inf</text>
+  </g>
+  <line x1="206" y1="95" x2="270" y2="95" stroke="#555555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="238" y="86" font-size="13" fill="#666666" text-anchor="middle">encode</text>
+  <g>
+    <rect x="278" y="72" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="305" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">a</text>
+    <rect x="332" y="72" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="359" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">b</text>
+    <rect x="386" y="72" width="68" height="46" fill="#d9d9d9" stroke="#333333" stroke-width="1.5"/><text x="420" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">NaN</text>
+  </g>
+  <line x1="464" y1="95" x2="528" y2="95" stroke="#555555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="496" y="86" font-size="13" fill="#666666" text-anchor="middle">reduce</text>
+  <rect x="536" y="72" width="150" height="46" fill="#d9d9d9" stroke="#333333" stroke-width="1.5"/>
+  <text x="611" y="101" font-size="15" fill="#1a1a1a" text-anchor="middle">NaN</text>
+  <text x="700" y="92" font-size="14" fill="#1a1a1a">whole output,</text>
+  <text x="700" y="110" font-size="14" fill="#1a1a1a">every position</text>
+
+  <!-- divider -->
+  <line x1="20" y1="150" x2="920" y2="150" stroke="#e2e2e2" stroke-width="1"/>
+
+  <!-- bottom lane: -1e4 mask is correct -->
+  <text x="20" y="196" font-size="16" font-weight="600" fill="#1a1a1a">mask = -1e4</text>
+  <g>
+    <rect x="20" y="208" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="47" y="237" font-size="15" fill="#1a1a1a" text-anchor="middle">a</text>
+    <rect x="74" y="208" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="101" y="237" font-size="15" fill="#1a1a1a" text-anchor="middle">b</text>
+    <rect x="128" y="208" width="68" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="162" y="237" font-size="14" fill="#1a1a1a" text-anchor="middle">-1e4</text>
+  </g>
+  <line x1="206" y1="231" x2="270" y2="231" stroke="#555555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="238" y="222" font-size="13" fill="#666666" text-anchor="middle">encode</text>
+  <g>
+    <rect x="278" y="208" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="305" y="237" font-size="15" fill="#1a1a1a" text-anchor="middle">a</text>
+    <rect x="332" y="208" width="54" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="359" y="237" font-size="15" fill="#1a1a1a" text-anchor="middle">b</text>
+    <rect x="386" y="208" width="68" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/><text x="420" y="237" font-size="14" fill="#1a1a1a" text-anchor="middle">-1e4</text>
+  </g>
+  <line x1="464" y1="231" x2="528" y2="231" stroke="#555555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="496" y="222" font-size="13" fill="#666666" text-anchor="middle">reduce</text>
+  <rect x="536" y="208" width="150" height="46" fill="#ffffff" stroke="#333333" stroke-width="1.5"/>
+  <text x="611" y="237" font-size="15" fill="#1a1a1a" text-anchor="middle">finite</text>
+  <text x="700" y="228" font-size="14" fill="#1a1a1a">masked positions</text>
+  <text x="700" y="246" font-size="14" fill="#1a1a1a">contribute nothing</text>
+</svg>

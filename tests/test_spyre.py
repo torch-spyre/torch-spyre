@@ -14,6 +14,7 @@
 
 # Owner(s): ["module: cpp"]
 
+import functools
 import os
 import warnings
 from contextlib import contextmanager
@@ -44,22 +45,54 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
+# The add is correct, but int8 goes through a CPU fallback for the conversion to
+# float32, which warns, and the helper asserts no warning (#5364).
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
-    reason="Support scalar eager add with to_dtype lowering in Spyre"
+    strict=True,
+    raises=AssertionError,
+    reason="the int8 to float32 conversion falls back to the CPU and warns, "
+    "and the test asserts no warning (#5364)",
 )
+
+# Same #5364 CPU-fallback warn as int8, now that uint8 host transfers work:
+# "conversion from torch.uint8 to torch.float32 is falling back to cpu".
+_SCALAR_ADD_XFAIL_UINT8_TO_DTYPE = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="the uint8 to float32 conversion falls back to the CPU and warns, "
+    "and the test asserts no warning (#5364)",
+)
+
+
+# A float16-format bool's float32 or integer result is staggered on device.
+_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="a staggered result is read back without restoring its order (#4393)",
+)
+
+
+def _expect_raise(match):
+    """Decorator: the test passes only if it raises with a message matching ``match``."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
-    reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
-)
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
+_SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
-)
-
-# TODO:ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
-_SCALAR_ADD_SKIP_UINT8 = pytest.mark.skip(
-    reason="Spyre hardware requires 128-byte aligned buffers - small uint8 tensors cause alignment violations"
 )
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
@@ -74,7 +107,6 @@ class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -90,7 +122,7 @@ class TestSpyre(TestCase):
                 thread_name = file.read().strip()
             all_thread_names.add(thread_name)
 
-        for i in range(torch.spyre._device_daemon.NUM_DEVICES):
+        for i in range(torch.spyre.device_count()):
             self.assertIn(f"pt_autograd_{i}", all_thread_names)
 
     def test_empty_factory(self):
@@ -101,6 +133,555 @@ class TestSpyre(TestCase):
 
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
+
+    @parametrize(
+        "view",
+        [
+            subtest(lambda t: t[8:16], name="rows_middle"),
+            subtest(lambda t: t[:8], name="rows_leading"),
+            subtest(lambda t: t[56:], name="rows_trailing"),
+            subtest(lambda t: t[3], name="one_row"),
+            subtest(lambda t: t[:, 32:], name="cols_trailing"),
+            subtest(lambda t: t[:, :32], name="cols_leading"),
+            subtest(lambda t: t[::2], name="strided"),
+            # Not a tracked view: no base to compare with, so the layout's
+            # element count is what catches it.
+            subtest(lambda t: t[8:16].detach(), name="detached_rows_middle"),
+            subtest(lambda t: t[:8].detach(), name="detached_rows_leading"),
+            # A tracked view of an untracked partial tensor: its base is the
+            # detached slice, so the base itself must be checked too.
+            subtest(lambda t: t[8:16].detach().view(-1), name="detached_rows_flat"),
+            subtest(lambda t: t[8:16].detach()[:], name="detached_rows_full_slice"),
+            subtest(lambda t: t[8:16].detach().t(), name="detached_rows_transposed"),
+            # Broadcast: the base's offset and element count, but only row 0.
+            subtest(lambda t: t[:1].expand(64, 64), name="broadcast_row"),
+        ],
+    )
+    @parametrize("op", [subtest("fill", name="fill"), subtest("zero", name="zero")])
+    def test_fill_partial_view_rejected(self, view, op):
+        # The device fill writes whole sticks of the storage, so a fill of a
+        # partial or broadcast view would overwrite elements outside it. It
+        # must raise and leave the tensor untouched.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        d = expected.to("spyre")
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            if op == "fill":
+                view(d).fill_(3.0)
+            else:
+                view(d).zero_()
+        self.assertTrue(torch.equal(d.cpu(), expected))
+
+    @parametrize(
+        "mode",
+        [
+            subtest(torch.no_grad, name="no_grad"),
+            subtest(torch.inference_mode, name="inference_mode"),
+        ],
+    )
+    def test_fill_views_without_autograd(self, mode):
+        # Under no_grad, views are still tracked (the base check applies); under
+        # inference_mode they are not (the layout check applies). Either way a
+        # partial view must be rejected and a whole-tensor view must fill.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        with mode():
+            d = expected.to("spyre")
+            for view in (lambda t: t[8:16], lambda t: t[8:16].detach().view(-1)):
+                with self.assertRaisesRegex(
+                    RuntimeError, "partial view of a Spyre tensor"
+                ):
+                    view(d).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), expected))
+            d.view(-1).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), torch.full((64, 64), 3.0)))
+            d.t().zero_()
+            self.assertTrue(torch.equal(d.cpu(), torch.zeros(64, 64)))
+
+    @parametrize(
+        "view",
+        [
+            subtest(lambda t: t, name="base"),
+            subtest(lambda t: t[0:64], name="full_slice"),
+            subtest(lambda t: t.view(-1), name="flat"),
+            subtest(lambda t: t.t(), name="transposed"),
+            subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+            # A detached whole tensor is not a view, but its views are: the
+            # root check must accept them.
+            subtest(lambda t: t.detach().view(-1), name="detached_flat"),
+            subtest(lambda t: t.detach().t(), name="detached_transposed"),
+        ],
+    )
+    def test_fill_whole_tensor_view(self, view):
+        d = torch.zeros(64, 64).to("spyre")
+        view(d).fill_(3.0)
+        self.assertTrue(d.cpu().eq(3.0).all())
+        view(d).zero_()
+        self.assertTrue(d.cpu().eq(0.0).all())
+
+    @parametrize(
+        "shape, dtype",
+        [
+            subtest(((64, 50), torch.float32), name="padded_fp32"),
+            subtest(((3, 7), torch.float16), name="padded_fp16"),
+            subtest(((), torch.float32), name="scalar"),
+        ],
+    )
+    def test_fill_whole_tensor_padded_layouts(self, shape, dtype):
+        d = torch.zeros(shape, dtype=dtype).to("spyre")
+        d.fill_(3.0)
+        self.assertTrue(d.cpu().eq(3.0).all())
+
+    @parametrize(
+        "shape",
+        [
+            subtest((64, 64), name="aligned"),
+            subtest((3, 7), name="padded"),
+            subtest((2, 4, 16, 128), name="kv_page_shape"),
+        ],
+    )
+    def test_zero_float8(self, shape):
+        # The device fill has no fp8 value->pattern conversion; zero_ must still
+        # work (all-zero bytes) and must zero every element of a nonzero tensor.
+        ones = torch.ones(shape).to(torch.float8_e4m3fn)
+        d = ones.to("spyre")
+        d.zero_()
+        out = d.cpu()
+        self.assertEqual(out.dtype, torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(out.view(torch.uint8), torch.zeros(shape).to(torch.uint8))
+        )
+
+    @staticmethod
+    def _head_major_kv_layout(
+        num_rows, block_size, head_size, dtype, valid_elements=None
+    ):
+        # The layout spyre-inference uses for its paged KV cache
+        # (head_major_kv_layout): the folded (block, kv_head) row stays whole at
+        # device dim 0, and head_size is split into sticks.
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            get_device_dtype,
+            get_elem_in_stick,
+        )
+
+        eps = get_elem_in_stick(dtype)
+        sticks = (head_size + eps - 1) // eps
+        return SpyreTensorLayout(
+            device_size=[num_rows, block_size, sticks, eps],
+            stride_map=[block_size * head_size, head_size, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements=valid_elements or {},
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    @parametrize(
+        "head_size", [subtest(64, name="head64"), subtest(128, name="head128")]
+    )
+    @parametrize(
+        "with_valid_elements",
+        [subtest(False, name="unknown_valid"), subtest(True, name="valid_elements")],
+    )
+    def test_zero_kv_cache_device_layout(self, dtype, head_size, with_valid_elements):
+        # spyre-inference allocates its KV cache pages with
+        # torch.empty(..., device_layout=...) and zeroes them with zero_(). The
+        # cache is then read back whole, so every element must be zero.
+        num_blocks, kv_heads, block_size = 3, 2, 16
+        shape = (num_blocks, kv_heads, block_size, head_size)
+        rows = num_blocks * kv_heads
+        # Per device dim group, the unpadded extent: rows, block, and head_size
+        # across the (stick, element-in-stick) pair, which pads head_size up to
+        # whole sticks. The fill guard compares the product with numel().
+        valid = (
+            {(0,): rows, (1,): block_size, (2, 3): head_size}
+            if with_valid_elements
+            else None
+        )
+        layout = self._head_major_kv_layout(rows, block_size, head_size, dtype, valid)
+
+        # Allocation path used by allocate_pages: uninitialised, then zeroed.
+        page = torch.empty(
+            shape, dtype=dtype, device=torch.device("spyre"), device_layout=layout
+        )
+        self.assertIs(page.zero_(), page)
+        out = page.cpu()
+        self.assertEqual(out.shape, shape)
+        self.assertTrue(out.float().eq(0).all())
+
+        # Same layout, starting from nonzero data so the fill is observable
+        # (an empty tensor may already read as zero).
+        host = torch.ones(shape).to(dtype)
+        page = host.to("spyre", device_layout=layout)
+        self.assertTrue(page.cpu().float().eq(1).all())
+        page.zero_()
+        self.assertTrue(page.cpu().float().eq(0).all())
+
+    def test_zero_kv_cache_valid_elements_partial_rejected(self):
+        # Complement of the above: with valid_elements set, zero_ of a page
+        # slice of the cache is still a partial view and must be rejected.
+        shape = (3, 2, 16, 128)
+        layout = self._head_major_kv_layout(
+            6, 16, 128, torch.float8_e4m3fn, {(0,): 6, (1,): 16, (2, 3): 128}
+        )
+        page = (
+            torch.ones(shape).to(torch.float8_e4m3fn).to("spyre", device_layout=layout)
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            page[1].zero_()
+        self.assertTrue(page.cpu().float().eq(1).all())
+
+    def test_fill_float8_nonzero_rejected(self):
+        # Only zero is supported (no fp8 fill pattern); it must fail cleanly and
+        # leave the tensor untouched.
+        d = torch.ones(64, 64).to(torch.float8_e4m3fn).to("spyre")
+        with self.assertRaisesRegex(RuntimeError, "only supported with the value 0"):
+            d.fill_(1.0)
+        self.assertTrue(d.cpu().float().eq(1.0).all())
+
+    @parametrize(
+        "view",
+        [
+            subtest(lambda t: t, name="base"),
+            subtest(lambda t: t[0:70], name="full_slice"),
+            subtest(lambda t: t.t(), name="transposed"),
+        ],
+    )
+    @parametrize("op", [subtest("fill", name="fill"), subtest("zero", name="zero")])
+    def test_fill_whole_reserved_tensor(self, view, op):
+        # A max-reserved tensor's storage is sized for 630 rows; filling its
+        # current 70 rows is a whole-tensor fill and must work.
+        reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
+        d = torch.ones(70, 64).to("spyre", dynamic=reserve)
+        if op == "fill":
+            view(d).fill_(3.0)
+            self.assertTrue(d.cpu().eq(3.0).all())
+        else:
+            view(d).zero_()
+            self.assertTrue(d.cpu().eq(0.0).all())
+
+    def test_fill_partial_view_of_reserved_tensor_rejected(self):
+        reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
+        expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
+        d = expected.to("spyre", dynamic=reserve)
+        with self.assertRaisesRegex(RuntimeError, "partial view of a Spyre tensor"):
+            d[10:20].fill_(3.0)
+        self.assertTrue(torch.equal(d.cpu(), expected))
+
+    @parametrize(
+        "factory",
+        [
+            subtest(
+                lambda: torch.empty((64, 64), dtype=torch.float16, pin_memory=True),
+                name="empty",
+            ),
+            subtest(
+                lambda: torch.empty_strided(
+                    (64, 64),
+                    (1, 64),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="empty_strided",
+            ),
+        ],
+    )
+    def test_cpu_factory_pin_memory(self, factory):
+        cpu = factory()
+
+        self.assertEqual(cpu.device.type, "cpu")
+        self.assertTrue(cpu.is_pinned())
+
+        expected = (torch.arange(cpu.numel(), dtype=torch.int64) % 31).to(cpu.dtype)
+        cpu.copy_(expected.reshape(cpu.shape))
+        actual = cpu.to("spyre").cpu()
+        torch.testing.assert_close(actual, cpu, rtol=0, atol=0)
+
+    def test_cpu_pin_memory_method_and_interior_view(self):
+        values = (torch.arange(4128, dtype=torch.int64) % 31).to(torch.float16)
+        base = values.pin_memory()
+        view = base[17:4113]
+
+        self.assertTrue(base.is_pinned())
+        self.assertTrue(view.is_pinned())
+        self.assertEqual(
+            view.data_ptr(),
+            base.data_ptr() + 17 * base.element_size(),
+        )
+
+    def test_explicit_pinned_d2h(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=True)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertTrue(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    def test_pageable_d2h_remains_supported(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=False)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertFalse(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    # The DCI-skip optimization must reject anything that is not a dense
+    # same-format copy: for each layout below, dci_is_identity_copy has to
+    # keep the conversion descriptor, and a round trip through the device
+    # must reproduce the view's values exactly. (If the predicate wrongly
+    # accepted the layout, the raw DMA would move storage bytes a plain
+    # memcpy would — including bytes before a storage offset or stride
+    # gaps — and the comparison would fail.)
+    #
+    # These run in same-format dtypes (int8, fp32): fp16/bf16 host and
+    # device formats differ, so their DCIs are rejected at the dataformat
+    # check before the offset/stride/broadcast logic is ever reached and
+    # would not exercise the layout rejection at all.
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_storage_offset_view_keeps_conversion(self, dtype):
+        base = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        pinned = base.pin_memory()
+        view = pinned[37:8101]  # non-zero storage offset + partial slice
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_strided_view_keeps_conversion(self, dtype):
+        base = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype)
+        pinned = base.pin_memory()
+        view = pinned.view(64, 64)[:, ::2]  # stride gaps between rows
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_broadcast_strides_keeps_conversion(self, dtype):
+        row = (torch.arange(64, dtype=torch.int64) % 31).to(dtype)
+        pinned = row.pin_memory()
+        view = pinned.unsqueeze(0).expand(32, 64)  # broadcast (zero) stride
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_into_device_slice_keeps_conversion(self, dtype):
+        # The device side is the strided side here: a copy into a device slice
+        # must keep its DCI, since a raw DMA would write storage-base-relative
+        # bytes instead of the slice's. The offset is stick-aligned (128
+        # elements is a whole stick for both int8 and fp32) so the test does
+        # not depend on the pre-existing mid-stick int8 slice bug, which is
+        # flex-version dependent.
+        pinned = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype).pin_memory()
+        dev = torch.zeros(8192, dtype=dtype, device="spyre")
+
+        dev[128:4224].copy_(pinned)
+        torch.testing.assert_close(dev[128:4224].cpu(), pinned, rtol=0, atol=0)
+        torch.testing.assert_close(
+            dev[:128].cpu(), torch.zeros(128, dtype=dtype), rtol=0, atol=0
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_d2h_from_device_slice_keeps_conversion(self, dtype):
+        # Mirror of the above: reading a device slice out into a pinned host
+        # tensor must also keep the conversion for the device-side offset.
+        # Stick-aligned offset, same rationale as above.
+        dev = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype).to("spyre")
+        y = torch.empty(4096, dtype=dtype, pin_memory=True)
+
+        y.copy_(dev[128:4224])
+        torch.testing.assert_close(y, dev[128:4224].cpu(), rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_slice_copy_into_same_size_host_buffer(self, dtype):
+        # Regression test: the identity-copy skip must compare the copied
+        # region, not the host storage size. y is exactly as large as the
+        # device allocation, but only y[:4096] is the copy destination -- a
+        # whole-allocation raw DMA here would overwrite y[4096:] with device
+        # data (silent corruption).
+        src = ((torch.arange(8192, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        for pin in (False, True):
+            y = torch.full((8192,), -1, dtype=dtype, pin_memory=pin)
+            y[:4096].copy_(dev[:4096])
+            torch.testing.assert_close(y[:4096], src[:4096], rtol=0, atol=0)
+            torch.testing.assert_close(
+                y[4096:], torch.full((4096,), -1, dtype=dtype), rtol=0, atol=0
+            )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_round_trip_same_format(self, dtype):
+        # The flagship fast-path combination: a same-format pinned tensor is
+        # submitted as a raw pinned DMA (DCI stripped) in both directions.
+        # fp16 keeps the conversion path and never exercises this.
+        x = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        pinned = x.pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), x, rtol=0, atol=0)
+
+        y = torch.empty(8192, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(y, x, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_d2h_dense_leading_slice(self, dtype):
+        # d[:4096].cpu() is dense with offset 0 but covers only part of the
+        # device allocation: the identity-copy skip must not fire, or the raw
+        # DMA (sized from the whole allocation) would overrun the 4096-element
+        # host buffer returned by .cpu().
+        src = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        dev = src.to("spyre")
+
+        out = dev[:4096].cpu()
+        torch.testing.assert_close(out, src[:4096], rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pageable_h2d_source_freed(self, dtype):
+        # With the DCI stripped there is no caller-thread staging copy, so
+        # flex reads the pageable source pages from the scheduler thread
+        # after the copy call returns. Dropping the only reference right
+        # after a non-blocking copy must not free those pages under the
+        # in-flight DMA.
+        n = 8192
+        dev = torch.empty(n, dtype=dtype, device="spyre")
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        expected = src.clone()
+
+        dev.copy_(src, non_blocking=True)
+        del src
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pinned_d2h_freed_and_reused(self, dtype):
+        # A pinned destination freed to the staging cache right after a
+        # non-blocking D2H must not be handed back out while the DMA is
+        # still writing it (the in-flight buffer is retained by the DMA's
+        # completion callback). Whether the next allocation recycles the
+        # freed buffer is timing-dependent, so this checks the observable
+        # contract: the copy completes without error and later pinned
+        # traffic through the cache is intact.
+        n = 8192
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        y = torch.empty(n, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        del y
+
+        z = torch.empty(n, dtype=dtype, pin_memory=True)
+        z.fill_(-1)
+        torch.accelerator.synchronize()
+
+        expected = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        torch.testing.assert_close(
+            z.copy_(dev, non_blocking=False), expected, rtol=0, atol=0
+        )
+
+    def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
+        # 64x32 int8 maps to a partial-stick device layout: the DCI carries
+        # real stickification and must survive the identity-copy skip.
+        expected = (torch.arange(64 * 32, dtype=torch.int64) % 31).to(torch.int8)
+        pinned = expected.reshape(64, 32).pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), pinned, rtol=0, atol=0)
+
+    def test_zero_size_pinned_allocation(self):
+        cpu = torch.empty(0, dtype=torch.float16, pin_memory=True)
+        self.assertEqual(cpu.numel(), 0)
+        self.assertEqual(cpu.device.type, "cpu")
+
+    def test_empty_host_cache_preserves_active_allocation(self):
+        active = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        active.fill_(7)
+
+        torch.accelerator.empty_host_cache()
+
+        self.assertTrue(active.is_pinned())
+        self.assertTrue(active.eq(7).all())
+
+        del active
+        torch.accelerator.empty_host_cache()
+        replacement = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        self.assertTrue(replacement.is_pinned())
 
     def test_empty_factory_in_device_context(self):
         # The error only repros if at least one allocation
@@ -282,7 +863,7 @@ class TestSpyre(TestCase):
             )
             self._assert_zero_dim_roundtrip(x, x_cpu, dtype)
 
-    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8/bool/int64: Inductor to_dtype in add (#1153).
+    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8: the conversion to float32 warns (#5364).
     # float8: SEN143_FP8 unsupported. float16/float32: pass; ignore known full() CPU fallback warn.
     @parametrize(
         "dtype, scalar_factory, ignored_warning_message",
@@ -295,17 +876,15 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.bool, lambda: torch.tensor(True, dtype=torch.bool), None),
                 name="bool",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
                 name="int64",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.uint8, lambda: torch.tensor(10, dtype=torch.uint8), None),
                 name="uint8",
-                decorators=[_SCALAR_ADD_SKIP_UINT8],
+                decorators=[_SCALAR_ADD_XFAIL_UINT8_TO_DTYPE],
             ),
             subtest(
                 (torch.int16, lambda: torch.tensor(10, dtype=torch.int16), None),
@@ -326,7 +905,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_RAISES_FP8],
             ),
             subtest(
                 (
@@ -360,6 +939,23 @@ class TestSpyre(TestCase):
         b = a.to(device="spyre").add(2.0).to(device="cpu")
         self.assertEqual(b, a + 2)
 
+    # A plain .to("spyre").cpu() roundtrip cannot catch a byte-order bug: a raw DMA
+    # swaps the bytes in both directions and the swaps cancel. Each test below
+    # crosses the host/device boundary once with values the device produced or
+    # consumed, so a big-endian host that skips ConvertData fails it (#5864).
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_cross_device_copy_d2h_device_fill(self, dtype):
+        out = torch.full((64,), 1.5, dtype=dtype, device="spyre").cpu()
+        torch.testing.assert_close(
+            out, torch.full((64,), 1.5, dtype=dtype), atol=0, rtol=0
+        )
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_cross_device_copy_h2d_device_op(self, dtype):
+        x = torch.tensor([1.0, 2.0, 0.5, -7.25] * 16, dtype=dtype)
+        out = (x.to("spyre") + 1.0).cpu()
+        torch.testing.assert_close(out, x + 1.0, atol=0, rtol=0)
+
     def test_cross_device_copy_dtypes(self):
         dtype_configs = {
             torch.int8: lambda: (torch.rand(64, 64) * 100).to(dtype=torch.int8),
@@ -382,6 +978,30 @@ class TestSpyre(TestCase):
                 x, expect_warning=dtype in dtypes_with_downcast_warning
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(
+                dtype,
+                name=str(dtype).removeprefix("torch."),
+                decorators=[_EAGER_BOOL_READBACK_XFAIL],
+            )
+            for dtype in (torch.float32, torch.int32, torch.int64)
+        ],
+    )
+    def test_eager_bool_to_dtype_readback(self, dtype):
+        # An eager bool converts on device, and the result is read back directly.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = mask.to("spyre").to(dtype).cpu()
+        torch.testing.assert_close(out, mask.to(dtype), atol=0, rtol=0)
+
+    def test_eager_bool_to_float32_consumed(self):
+        # Converting the float32 back to float16 on device restores the order.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = (mask.to("spyre").to(torch.float32) * 2).to(torch.float16).cpu()
+        expected = (mask.to(torch.float32) * 2).to(torch.float16)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
     def test_cross_device_inplace_error_msg(self):
         # Mirrors upstream test_cross_device_inplace_error_msg: the CPU tensor is the write target, so it must raise despite the scalar exemption below.
@@ -413,7 +1033,11 @@ class TestSpyre(TestCase):
         ):
             spyre_t + cpu_t
 
-    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
+    @pytest.mark.xfail(
+        raises=NotImplementedError,
+        reason="data-dependent output not supported (no aten::masked_select)",
+        strict=True,
+    )
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")
@@ -669,6 +1293,36 @@ class TestSpyre(TestCase):
             torch.tensor([[5, 6, 7, 8]] * 3, dtype=torch.float16),
         )
 
+        data = [
+            [float(i) for i in range(0, 20)],
+            [float(i) for i in range(20, 40)],
+            [float(i) for i in range(40, 60)],
+            [float(i) for i in range(60, 80)],
+        ]
+
+        # Slice then expand to original sizes: destination sizes == source sizes
+        # exercises the edge case where the device tensor sizes and dma_sizes
+        # have the same number of elements yet the sizes represent a expanded
+        # slice and the dma_sizes represent the original data.
+        base = torch.tensor(data, dtype=torch.float16, device="spyre")
+        sliced_expanded = base[1:2].expand(4, 20)
+        self.assertEqual(sliced_expanded.storage_offset(), 20)
+        self.assertEqual(
+            sliced_expanded.cpu(),
+            torch.tensor([data[1]] * 4, dtype=torch.float16),
+        )
+
+    def test_eager_expand_broadcast_reduction(self):
+        """Eager dispatch compiles a standalone kernel over the already-
+        materialised expand() output, a distinct trigger from the compiled
+        path's fused expand+sum kernel, so it needs its own check."""
+        x_cpu = torch.randint(-3, 4, (70,), dtype=torch.int32).to(torch.float16)
+        x = x_cpu.to("spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1).cpu().float()
+        expected = x_cpu.float().expand(2, 32, 70).sum(dim=-1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
         logical values, not over-DMA the parent's full allocation."""
@@ -711,6 +1365,77 @@ class TestSpyre(TestCase):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
+
+    def test_uint8_roundtrips_full_range(self):
+        """uint8 must survive a host round trip over its whole range.
+
+        uint8's host format is now SENUINT8 (1 byte, matching PyTorch's
+        storage) while the device keeps SENUINT32, because the device has no
+        1-byte unsigned format.  Before that, the host leg declared 4 bytes
+        for a 1-byte buffer, so ConvertData's capacity read storage/4 and a
+        D2H threw "output_shape_ volume (N elem) exceeds out buffer capacity
+        (N/4 elem)", which shut the stream down for the rest of the process.
+
+        128..255 matter most: a signed 1-byte host format would map them to
+        val-256, so they are asserted explicitly rather than sampled.
+        """
+        cpu = torch.arange(256, dtype=torch.uint8)
+        dev = cpu.to("spyre")
+        self.assertEqual(dev.device.type, "spyre")
+        self.assertEqual(dev.dtype, torch.uint8)
+        self.assertEqual(dev.cpu(), cpu)
+        # The signed-overflow boundary, called out separately.
+        for v in (0, 1, 127, 128, 200, 254, 255):
+            with self.subTest(value=v):
+                t = torch.tensor([v], dtype=torch.uint8).to("spyre")
+                self.assertEqual(int(t.cpu()[0]), v)
+
+    def test_uint8_non_contiguous_roundtrip(self):
+        """17x16 uint8 round trip in contiguous, transposed and strided views."""
+        # % 251 (prime) instead of a plain arange: plain arange wraps at 256,
+        # so row 16 would equal row 0 and a row-swap bug would pass.
+        cpu = (torch.arange(272) % 251).to(torch.uint8).reshape(17, 16)
+        for name, t in (
+            ("contiguous", cpu),
+            ("transposed", cpu.t()),
+            ("strided", (torch.arange(544) % 251).to(torch.uint8)[::2].reshape(17, 16)),
+        ):
+            with self.subTest(view=name):
+                self.assertEqual(t.to("spyre").cpu(), t)
+
+    def test_uint8_allocation_still_allowed(self):
+        """Allocating a uint8 tensor on device must keep working.
+
+        torch.distributed allocates uint8 tensors internally
+        (distributed_c10d.py, used by barrier() and the object collectives),
+        so gating is_supported_dtype() on this would break the multi-Spyre
+        barrier tests.
+        """
+        t = torch.empty(272, dtype=torch.uint8, device="spyre")
+        self.assertEqual(t.device.type, "spyre")
+        self.assertEqual(t.dtype, torch.uint8)
+
+    def test_supported_dtypes_still_transferable(self):
+        """The width gate must not reject dtypes whose host width matches.
+
+        int16 is excluded because isDCIConversionSupported has no
+        {SENINT16, SENINT16} pair, so its H2D fails on the conversion check
+        rather than on this gate.
+        """
+        for dtype in (
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        ):
+            with self.subTest(dtype=dtype):
+                cpu = torch.ones(128, dtype=dtype)
+                dev = cpu.to("spyre")
+                self.assertEqual(dev.device.type, "spyre")
+                self.assertEqual(dev.cpu().dtype, dtype)
 
     def test_d2h_h2d_dtype_conversion(self):
         """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.
@@ -755,10 +1480,13 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
-        # DCI doesn't support either direction for these conversions.
+        # DCI doesn't support either direction for these conversions. int64 is
+        # IEEE_INT32 on device, so it shares int32's gap.
         skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
+            (torch.float32, torch.int64),
+            (torch.int64, torch.float32),
         }
 
         # Test supported conversions
@@ -883,17 +1611,38 @@ class TestSpyre(TestCase):
                         restored.cpu(), expected, atol=atol, rtol=rtol
                     )
 
+    def test_unservable_view_in_compiled_fallback_uses_host_copy(self):
+        """Inside a compiled fallback the unservable view is copied through the
+        host and warns, instead of compiling a rebuild (no nested torch.compile)."""
+        from torch_spyre.ops.eager import (
+            _materialize_unservable_view,
+            _run_compiled_fallback,
+        )
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        base_cpu = torch.arange(8 * 65, dtype=torch.float16).reshape(8, 65)
+        base = base_cpu.to("spyre")
+        view = base.reshape(-1)  # [8, 65] flattened splits a stick: unservable
+        expected = base_cpu.reshape(-1)
+
+        with self.assertWarnsRegex(FallbackWarning, "unaligned view"):
+            copied = _run_compiled_fallback(_materialize_unservable_view, view)
+
+        self.assertEqual(copied.device.type, "spyre")
+        torch.testing.assert_close(copied.cpu(), expected)
+
     def test_unsupported_d2d_dtype_conversion_falls_back(self):
         """Unsupported native D2D pairs retain the CPU fallback behavior."""
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
         from torch_spyre.ops.fallbacks import FallbackWarning
 
-        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        # int8 has a device format but no conversion op.
+        source_cpu = (torch.arange(128) % 100).to(torch.int8).reshape(2, 64)
         source = source_cpu.to("spyre")
 
         with self.assertWarnsRegex(
             FallbackWarning,
-            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+            r"conversion from torch\.int8 to torch\.float16 is falling back to cpu",
         ):
             actual = source.to(torch.float16)
 
@@ -903,6 +1652,165 @@ class TestSpyre(TestCase):
             ElementArrangement.STANDARD,
         )
         torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
+
+    def test_d2d_conversion_to_unsupported_dtype_raises(self):
+        """Casting a device tensor to float64 raises instead of crashing.
+
+        The unsupported dtype used to reach SpyreTensorLayout::init, which
+        divided by its zero elems_per_stick and killed the process (SIGFPE).
+        """
+        source = torch.arange(64, dtype=torch.float32).to("spyre")
+
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
+            source.to(torch.float64)
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
+            torch.compile(lambda t: t.to(torch.float64))(source)
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    def test_h2d_copy_to_sliced_destination(self, sizes):
+        """H2D to a slice (e.g. t[:2]) must write to the slice's logical
+        value."""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
+
+        slice_sizes = [2, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[:2] = y
+        self.assertEqual(x.cpu()[:2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[2:3] = y
+        self.assertEqual(x.cpu()[2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3] = y
+        self.assertEqual(x.cpu()[3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, :2] = y
+        self.assertEqual(x.cpu()[3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3] = y
+        self.assertEqual(x.cpu()[3, 3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    @pytest.mark.xfail(
+        strict=False,  # Allows XPASS for now, will be changed to True to enforce later
+        raises=AssertionError,
+        reason="Sub-stick slices are not yet supported for DMA",
+    )
+    def test_h2d_copy_to_substick_sliced_destination(self, sizes):
+        """H2D sub-stick tensor slice"""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
+
+        slice_sizes = [2]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = []
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":

@@ -63,8 +63,7 @@ def _poison_device_hbm():
     some other test happens to leave nonzero data behind first. Poisoning
     once here means every test -- including one run alone -- sees non-zero
     garbage instead, making such bugs fail deterministically. See issue
-    #3613 and test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct in
-    test_coarse_tile_e2e.py for the specific bug class this guards against.
+    #3613 for the specific bug class this guards against.
     """
     poison_tensors = [
         torch.full((nbytes // 2,), _POISON_VALUE, dtype=torch.float16, device="spyre")

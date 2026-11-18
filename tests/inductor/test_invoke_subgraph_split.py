@@ -29,7 +29,7 @@ AND the subgraph-local ``mul`` node. ``split_multi_ops`` picked
 ``next(iter(op.origins))``, which could return the parent's invoke_subgraph
 node; that node is not in the subgraph's ``gl.graph``, so
 ``gl.graph.inserting_before(orig_node)`` asserted. The fix
-(``split_multi_ops._origin_in_graph``) selects the origin whose ``.graph is
+(``pass_utils.origin_in_graph``) selects the origin whose ``.graph is
 gl.graph``.
 """
 
@@ -115,6 +115,95 @@ class TestInvokeSubgraphSplit(unittest.TestCase):
             "expected repeated invoke_subgraph calls, got "
             f"{[n.name for n in seen_hops[0]]}",
         )
+
+    def test_region_transposed_intermediate_layout(self):
+        """A transposed intermediate passed into a reused region must keep its
+        device layout, not one rebuilt from its host strides.
+
+        x.t() * 1.0 produces a buffer with strides [1, 128] -- the stick
+        dimension is dim 0, not the default dim 1.  Before the fix,
+        propagate_spyre_tensor_layouts fell through to the host-stride fallback
+        for invoke_subgraph inputs (hasattr(op, "operands") was always True but
+        op.operands was None), and the rebuilt layout placed the stick on the
+        wrong dimension, giving ~81% wrong values with no error raised.
+        """
+
+        @nested_compile_region
+        def r(h):
+            return h + 1.0
+
+        def outer(x):
+            # Two calls: a single call is inlined and no invoke_subgraph remains.
+            return r(r(x.t() * 1.0))
+
+        seen_hops = []
+
+        def backend(gm, example_inputs):
+            seen_hops.append(
+                [
+                    n
+                    for n in gm.graph.nodes
+                    if "invoke_subgraph" in str(getattr(n, "target", ""))
+                ]
+            )
+            from torch._inductor.compile_fx import compile_fx
+
+            return compile_fx(gm, example_inputs)
+
+        x = torch.randn(64, 128, dtype=torch.float16, device=DEVICE_NAME)
+        compiled = torch.compile(outer, backend=backend, dynamic=False, fullgraph=True)
+        out = compiled(x)
+
+        self.assertGreaterEqual(
+            len(seen_hops[0]),
+            2,
+            f"expected two invoke_subgraph calls, got {[n.name for n in seen_hops[0]]}",
+        )
+        torch.testing.assert_close(out.cpu(), outer(x.cpu()), atol=0.1, rtol=0.1)
+
+    def test_region_dtype_conversion(self):
+        """An fp16 <-> fp32 conversion inside a reused region keeps its layout rule.
+
+        The region's buffers inherit the parent graph's ``invoke_subgraph`` node
+        as their first origin; layout propagation must pick the conversion's
+        own node, or the upcast output loses its DL16_TO_FP32 arrangement and
+        later ops read it in the wrong order.
+        """
+
+        @nested_compile_region
+        def r(h):
+            return (h.float() * 2.0 + 1.0).half()
+
+        def outer(x):
+            # Several calls: a single call is inlined and no invoke_subgraph remains.
+            return r(r(r(x)))
+
+        seen_hops = []
+
+        def backend(gm, example_inputs):
+            seen_hops.append(
+                [
+                    n
+                    for n in gm.graph.nodes
+                    if "invoke_subgraph" in str(getattr(n, "target", ""))
+                ]
+            )
+            from torch._inductor.compile_fx import compile_fx
+
+            return compile_fx(gm, example_inputs)
+
+        # Multiples of 1/64 in [-1, 1): every step stays exact in fp16 and fp32,
+        # so an element read from the wrong lane cannot hide in a tolerance.
+        x = ((torch.arange(128 * 128) * 7 % 129 - 64) / 64).reshape(128, 128).half()
+        compiled = torch.compile(outer, backend=backend, dynamic=False, fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME))
+
+        self.assertGreaterEqual(
+            len(seen_hops[0]),
+            2,
+            f"expected repeated invoke_subgraph calls, got {[n.name for n in seen_hops[0]]}",
+        )
+        torch.testing.assert_close(out.cpu(), outer(x), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -38,13 +38,17 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
     MutationLayoutSHOULDREMOVE,
+    _CollectiveKernel,
 )
 from torch._inductor.lowering import clone as clone_lowering
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
-from torch_spyre._inductor.pass_utils import copy_op_metadata
+from torch_spyre._inductor.pass_utils import (
+    copy_op_metadata,
+    register_operation_after_graph_edit,
+)
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
@@ -147,6 +151,11 @@ def _select_bracket_targets(
     for fk_idx, op in enumerate(graph.operations):
         if not isinstance(op, FallbackKernel):
             continue
+        if isinstance(op, _CollectiveKernel):
+            # Collectives and waits run in spyre-comms and never launch a
+            # nested compile.  Bracketing them would add a dump and a restore
+            # around every all_reduce on the TP decode path.
+            continue
         outputs = getattr(op, "outputs", None)
         if outputs is None or len(outputs) > 1:
             # Dedupe by op kind (op_overload when available, else the
@@ -211,14 +220,8 @@ def _dump_buffers(
 
         layout = buf.layout
         assert isinstance(layout, FixedTiledLayout)
-        dump_layout = FixedTiledLayout(
-            layout.device,
-            layout.dtype,
-            list(layout.size),
-            list(layout.stride),
-            layout.device_layout,
-            offset=layout.offset,
-        )  # allocation dict starts empty: invisible to LX planning (already
+        dump_layout = layout.unallocated_copy()
+        # allocation dict starts empty: invisible to LX planning (already
         # run by this point) and picked up later by ordinary HBM/hbm_pool
         # buffer addressing, same as any other un-pinned intermediate.
         clone_tb = clone_lowering(buf)
@@ -233,7 +236,7 @@ def _dump_buffers(
         copy_op_metadata(buf, dump_buf)  # keep it in buf's coarse-tile/loop-group
         dump_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         dump_buf.name = graph.register_buffer(dump_buf)
-        graph.register_operation(dump_buf)
+        register_operation_after_graph_edit(graph, dump_buf)
 
         # Reposition into graph.operations right before target_op
         # (remove()+insert(), same pattern GraphEditor.push_allocation_with_clone
@@ -302,7 +305,7 @@ def _restore_buffers(
         # clones around a buffer that no longer resides on LX at all).
         restore_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         restore_buf.name = graph.register_buffer(restore_buf)
-        graph.register_operation(restore_buf)
+        register_operation_after_graph_edit(graph, restore_buf)
 
         graph.operations.remove(restore_buf)
         graph.operations.insert(graph.operations.index(target_op) + 1, restore_buf)

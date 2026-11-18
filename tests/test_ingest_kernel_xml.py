@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel-XML tests for .github/scripts/ingest_xml.py.
+"""Kernel-XML tests for spyre_clickhouse_ingest.results.
 
 The script is not importable as a module (it lives outside the package and pulls
 in clickhouse_connect at import time), so it is loaded by path with the driver
@@ -20,7 +20,7 @@ stubbed out. No ClickHouse required: the client is a fake that records what the
 script asked for.
 """
 
-import importlib.util
+import importlib
 import sys
 import types
 from datetime import UTC, datetime
@@ -29,9 +29,11 @@ from xml.etree import ElementTree
 
 import pytest
 
-INGEST_PATH = (
-    Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
-)
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
 
 KERNEL_CLASSNAME = "spyre_perf_suite.kernel_benchmark"
 OP_CLASSNAME = "spyre_perf_suite.benchmark"
@@ -45,10 +47,7 @@ def ingest():
     had = "clickhouse_connect" in sys.modules
     sys.modules.setdefault("clickhouse_connect", types.ModuleType("clickhouse_connect"))
     try:
-        spec = importlib.util.spec_from_file_location("ingest_xml", INGEST_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        yield module
+        yield importlib.import_module("spyre_clickhouse_ingest.results")
     finally:
         if not had:
             sys.modules.pop("clickhouse_connect", None)
@@ -62,9 +61,11 @@ class _Result:
 class FakeClient:
     """Answers system.columns / system.tables from a declared schema."""
 
-    def __init__(self, tables=None, already_ingested=0):
+    def __init__(self, tables=None, already_ingested=0, database="spyre"):
         # {table: [column, ...]}
         self.tables = tables if tables is not None else {}
+        # _table_exists reads client.database when no explicit db is passed.
+        self.database = database
         self.already_ingested = already_ingested
         self.inserts = []
         self.commands = []
@@ -82,7 +83,7 @@ class FakeClient:
     def command(self, sql):
         self.commands.append(sql)
 
-    def insert(self, table, rows, column_names=None):
+    def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))
 
 

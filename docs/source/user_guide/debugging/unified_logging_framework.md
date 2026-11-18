@@ -6,9 +6,10 @@
 
 - [Spyre Unified Logging Framework (ULF) Guide](#spyre-unified-logging-framework-ulf-guide)
   - [Table of Contents](#table-of-contents)
+  - [What unified logging is](#what-unified-logging-is)
   - [Quick Start](#quick-start)
   - [1. Overview](#1-overview)
-    - [Migrating from Legacy Variables](#migrating-from-legacy-variables)
+    - [Deprecated Environment Variables](#deprecated-environment-variables)
   - [2. TORCH\_LOGS Syntax for Spyre Components](#2-torch_logs-syntax-for-spyre-components)
     - [Syntax Forms](#syntax-forms)
     - [Namespace Normalization](#namespace-normalization)
@@ -34,7 +35,6 @@
     - [Using the Macros](#using-the-macros)
     - [The Logger Class](#the-logger-class)
     - [Performance: Level-Gated Logging](#performance-level-gated-logging)
-    - [Legacy DEBUGINFO](#legacy-debuginfo)
     - [Log Format (C++)](#log-format-c)
     - [File Output (C++)](#file-output-c)
   - [7. Python–C++ Synchronization](#7-pythonc-synchronization)
@@ -57,6 +57,26 @@
     - [Thread Safety](#thread-safety)
   - [Appendix C: C++ LogLevel Enum Reference](#appendix-c-c-loglevel-enum-reference)
   - [Appendix D: Design Rationale — Naming](#appendix-d-design-rationale--naming)
+
+---
+
+## What unified logging is
+
+torch-spyre writes log output from two places: the Python compiler passes and
+the C++ device runtime. That output used to be controlled by several separate
+environment variables, with the Python and C++ sides configured independently.
+The Unified Logging Framework replaces those with one control.
+
+You name a subsystem, for example the Inductor compiler or the device runtime,
+and set how much it logs. The same setting applies to both the Python and C++
+code for that subsystem. A single environment variable, `TORCH_LOGS`, drives
+all of it, through the same mechanism PyTorch already uses for its own logs.
+Subsystems form a hierarchy, so one setting on a parent reaches all of its
+children.
+
+The rest of this guide is how to use it. Section 1 describes the component
+model and how it replaces the legacy variables, and the later sections cover
+the Python API, the C++ macros, and how the two stay in sync.
 
 ---
 
@@ -87,10 +107,10 @@ See [Common Recipes](#common-recipes) for more configuration patterns.
 
 The **Unified Logging Framework (ULF)** consolidates all torch-spyre logging
 (Python and C++) behind a hierarchical component system configured via the
-`TORCH_LOGS` environment variable. ULF replaces the legacy
-`SPYRE_INDUCTOR_LOG`, `SPYRE_INDUCTOR_LOG_LEVEL`, and `TORCH_SPYRE_DEBUG`
-variables with a single, per-component configuration that is consistent
-across Python and C++ code paths.
+`TORCH_LOGS` environment variable, replacing the deprecated
+`TORCH_SPYRE_DEBUG` and `SPYRE_LOG_FILE` variables with a single,
+per-component configuration that is consistent across Python and C++ code
+paths.
 
 A **component** is a dot-separated identifier (e.g.,
 `spyre.inductor.lowering`) that names a logical subsystem within
@@ -106,19 +126,17 @@ logging system; `torch_spyre.*` entries are intercepted, normalized to
 Configuration priority (highest wins):
 
 1. `TORCH_LOGS` environment variable (primary, recommended)
-2. Legacy env vars (deprecated, emit warnings)
+2. Deprecated env vars (`TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE` — emit warnings)
 3. Programmatic API (`logging_config.set_log_level(...)`)
 4. Defaults (all components at WARNING)
 
-### Migrating from Legacy Variables
+### Deprecated Environment Variables
 
-The following legacy environment variables are deprecated and emit warnings
+The following environment variables are deprecated and emit warnings
 on use. Migrate to their `TORCH_LOGS` equivalents:
 
-| Old variable | New equivalent |
+| Deprecated variable | Replacement |
 | --- | --- |
-| `SPYRE_INDUCTOR_LOG=1` | `TORCH_LOGS="torch_spyre.inductor"` (INFO) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | `TORCH_LOGS="+torch_spyre.inductor"` (DEBUG) |
 | `TORCH_SPYRE_DEBUG=1` | `TORCH_LOGS="+torch_spyre"` (DEBUG) |
 | `SPYRE_LOG_FILE=/path` | `logging_config.set_log_file("/path")` |
 
@@ -299,6 +317,7 @@ These components are defined in `DEFAULT_LOG_LEVELS` in
 | `spyre.inductor.sdsc` | SuperDSC bundle generation | `_inductor/codegen/bundle.py` |
 | `spyre.inductor.stickify` | Tensor stickification passes | `_inductor/insert_restickify.py` |
 | `spyre.inductor.passes` | General compiler passes | `_inductor/passes.py` |
+| `spyre.inductor.wsr` | Working-set-reduction / coarse-tiling package (parent) | `_inductor/wsr/` |
 | `spyre.runtime` | C++ runtime (allocator, streams, distributed) | `torch_spyre/csrc/` |
 | `spyre.execution` | (reserved) | — |
 | `spyre.device` | (reserved) | — |
@@ -358,15 +377,31 @@ The full list of dynamic loggers in the codebase:
 | `"scratchpad.allocator"` | `spyre.inductor.scratchpad.allocator` | `_inductor/scratchpad/allocator.py` |
 | `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
 | `"scratchpad.greedy_solver"` | `spyre.inductor.scratchpad.greedy_solver` | `_inductor/scratchpad/greedy_solver.py` |
-| `"assign_dim_hints"` | `spyre.inductor.assign_dim_hints` | `_inductor/wsr/coarse_tile_hints.py` |
-| `"coarse_tile"` | `spyre.inductor.coarse_tile` | `_inductor/wsr/coarse_tile.py` |
-| `"propagate_named_dims"` | `spyre.inductor.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
-| `"span_overflow_hint_analysis"` | `spyre.inductor.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |
+| `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/propagate_named_dims.py` |
+| `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile.py`, `_inductor/wsr/coarse_tile_span_overflow.py` |
+| `"wsr.propagate_named_dims"` | `spyre.inductor.wsr.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
+| `"wsr.span_overflow_hint_analysis"` | `spyre.inductor.wsr.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |
+| `"wsr.while_loop_bridge"` | `spyre.inductor.wsr.while_loop_bridge` | `_inductor/wsr/while_loop_bridge.py` |
+| `"wsr.enumerate_tilings"` | `spyre.inductor.wsr.enumerate_tilings` | `_inductor/wsr/enumerate_tilings.py` |
+| `"wsr.for_each_tile_lowering"` | `spyre.inductor.wsr.for_each_tile_lowering` | `_inductor/wsr/for_each_tile_lowering.py` |
 | `"propagate_layouts"` | `spyre.inductor.propagate_layouts` | `_inductor/propagate_layouts.py` |
 | `"spyre_kernel"` | `spyre.inductor.spyre_kernel` | `_inductor/spyre_kernel.py` |
 | `"work_division"` | `spyre.inductor.work_division` | `_inductor/work_division.py` |
 
 All of these respond to `TORCH_LOGS="+torch_spyre.inductor"` (parent inheritance).
+
+All `wsr.*` loggers additionally nest under the real `spyre.inductor.wsr`
+namespace (registered in `DEFAULT_LOG_LEVELS`, unlike the other dynamic
+loggers above), so the whole `torch_spyre._inductor.wsr` package can be
+controlled as one group without touching sibling components:
+
+```bash
+# Everything in the wsr package (coarse-tiling / working-set reduction) at DEBUG
+export TORCH_LOGS="+torch_spyre.inductor.wsr"
+
+# Everything else in inductor at DEBUG, but silence wsr specifically
+export TORCH_LOGS="+torch_spyre.inductor,-torch_spyre.inductor.wsr"
+```
 
 ---
 
@@ -448,7 +483,6 @@ three layers:
 | --- | --- |
 | `logging_config.h` / `.cpp` | `LoggingConfig` singleton, `Logger` class, convenience macros |
 | `logging_bindings.h` / `.cpp` | pybind11 bindings exposing C++ logging to Python |
-| `logging_legacy.h` | `DEBUGINFO(...)` compatibility shim |
 | `logging.h` / `.cpp` | Umbrella header re-exporting the public interface |
 
 All C++ logging state lives in the `torch_spyre::logging` namespace.
@@ -464,11 +498,10 @@ For most C++ code in `torch_spyre/csrc/`, include the umbrella header:
 This gives you access to:
 
 - All `SPYRE_LOG` / `SPYRE_RUNTIME_*` macros
-- The `DEBUGINFO(...)` legacy macro
 - The `Logger`, `LoggingConfig`, and `LogLevel` types
 
-If you only need the new logging system (no legacy `DEBUGINFO`), you can
-include `logging_config.h` directly.
+`logging.h` re-exports the public interface from `logging_config.h`, so
+for most code either header works.
 
 ### Available Macros
 
@@ -481,12 +514,15 @@ include `logging_config.h` directly.
 | `SPYRE_RUNTIME_CRITICAL()` | `spyre.runtime` | CRITICAL |
 | `SPYRE_LOG(component, LEVEL)` | any | any |
 | `SPYRE_LOG_ENABLED(component, level)` | any | any (returns bool) |
-| `DEBUGINFO(...)` | `spyre.runtime` | DEBUG (legacy) |
 
 The `SPYRE_LOG` macro is **zero-cost when disabled**: it checks
 `SPYRE_LOG_ENABLED` first (a thread-local cache hit) and short-circuits
 the entire `Logger` construction and stream operations when the level is
 not enabled.
+
+Every `SPYRE_LOG` and `SPYRE_RUNTIME_*` record is automatically prefixed
+with the calling function name (`__func__`), so the C++ log format shows
+`function_name: message` without any manual annotation.
 
 ### Adding Logging to New C++ Code
 
@@ -587,23 +623,6 @@ if (SPYRE_LOG_ENABLED("spyre.runtime", torch_spyre::logging::LogLevel::DEBUG)) {
 }
 ```
 
-### Legacy DEBUGINFO
-
-```cpp
-#include "logging.h"
-
-DEBUGINFO("Allocating ", nbytes, " bytes on Spyre", device);
-// Equivalent to: SPYRE_RUNTIME_DEBUG() << __func__ << ": Allocating " << ...
-```
-
-`DEBUGINFO` maps to component `spyre.runtime` at DEBUG level. It
-automatically prepends the calling function name (`__func__`).
-
-The `DEBUGINFO` macro is defined in `logging_legacy.h` and delegates to
-the new `Logger` class internally — it is not a separate logging system.
-It exists solely for backward compatibility with existing C++ code. New
-code should use `SPYRE_LOG` or `SPYRE_RUNTIME_*` macros instead.
-
 ### Log Format (C++)
 
 ```text
@@ -642,7 +661,7 @@ itself. Instead, Python drives all configuration:
 ```text
 torch_spyre import
     → logging_config.py module executes initialize()
-        → _resolve_config() parses TORCH_LOGS + legacy vars
+        → _resolve_config() parses TORCH_LOGS + deprecated env vars
         → configure_python_logging() sets up Python loggers
     → _lazy_init() (first device op or explicit init)
         → imports torch_spyre._C (loads the pybind11 extension)
@@ -727,9 +746,9 @@ no locking, no memory allocation.
   an exception at import time. Use the parent component or the
   programmatic API instead.
 
-**Legacy env var deprecation warnings:**
+**Deprecated env var warnings:**
 
-- See [Migrating from Legacy Variables](#migrating-from-legacy-variables) in
+- See [Deprecated Environment Variables](#deprecated-environment-variables) in
   section 1 for the equivalent `TORCH_LOGS` settings.
 
 **File output not working:**
@@ -810,7 +829,7 @@ logging_config.get_effective_config()
 
 # Get source of a component's config
 logging_config.get_config_source("spyre.inductor")
-# → "TORCH_LOGS" | "legacy:SPYRE_INDUCTOR_LOG" | "legacy:TORCH_SPYRE_DEBUG" | "programmatic" | "default"
+# → "TORCH_LOGS" | "env:TORCH_SPYRE_DEBUG" | "env:SPYRE_LOG_FILE" | "programmatic" | "default"
 
 # List all predefined components
 logging_config.list_components()

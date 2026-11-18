@@ -19,6 +19,9 @@ export TORCH_LOGS="+torch_spyre.inductor"
 # Inductor at INFO, but silence its passes sub-component
 export TORCH_LOGS="torch_spyre.inductor,-torch_spyre.inductor.passes"
 
+# Just the wsr (coarse-tiling / working-set reduction) package, at DEBUG
+export TORCH_LOGS="+torch_spyre.inductor.wsr"
+
 # Runtime (C++: allocator/streams/distributed) at DEBUG
 export TORCH_LOGS="+torch_spyre.runtime"
 
@@ -59,9 +62,8 @@ export TORCH_LOGS="+torch_spyre,+inductor"
   `_lazy_init()` (first device op). If you only `import torch_spyre` without
   running anything on-device, call
   `torch_spyre.logging_config._sync_cpp_config()` explicitly.
-- Legacy vars (`SPYRE_INDUCTOR_LOG`, `SPYRE_INDUCTOR_LOG_LEVEL`,
-  `TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE`) still work but emit deprecation
-  warnings — see the migration table in the full reference doc for their
+- Deprecated vars (`TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE`) still work but
+  emit deprecation warnings — see the full reference doc for their
   `TORCH_LOGS` equivalents.
 
 ## Finer control than TORCH_LOGS allows (WARNING/CRITICAL, log-to-file)
@@ -89,11 +91,17 @@ logging_config.get_effective_config()           # introspect current levels
 | `spyre.inductor.codegen` | code generation |
 | `spyre.inductor.stickify` | stickification passes |
 | `spyre.inductor.passes` | general compiler passes |
+| `spyre.inductor.wsr` | working-set-reduction / coarse-tiling package (`_inductor/wsr/`) |
 | `spyre.runtime` | C++ runtime: allocator, streams, distributed |
 
 Everything else under `spyre.inductor.*` (e.g. `scheduler`, `padding`,
 `work_division`, `dedup_constants`) is a dynamic logger reachable only via
-the `spyre.inductor` parent or the programmatic API — see above.
+the `spyre.inductor` parent or the programmatic API — see above. Loggers
+under `_inductor/wsr/` are the one exception: they are named
+`wsr.<name>` (e.g. `get_inductor_logger("wsr.coarse_tile")` ->
+`spyre.inductor.wsr.coarse_tile`), so the whole package can be targeted
+directly as `+torch_spyre.inductor.wsr` / `-torch_spyre.inductor.wsr`
+without going through the `spyre.inductor` parent.
 
 ## Adding logging to new code
 

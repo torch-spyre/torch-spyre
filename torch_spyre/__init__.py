@@ -138,10 +138,14 @@ class _SpyreImpl:
         return default_generator.initial_seed()
 
     def is_available(self) -> bool:
+        # A process that doesn't own the card (forked, or started with
+        # IS_INDUCTOR_SPAWNED_SUBPROCESS=1) never starts the runtime, so it has
+        # no usable device. Reporting one makes torch.accelerator callers (e.g.
+        # Dynamo's stream tracking on every compile) reach stream code that
+        # needs the runtime, and the process aborts even for CPU-only code.
         if self._is_in_bad_fork():
-            return True
-        else:
-            return self.device_count() > 0
+            return False
+        return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()
@@ -189,10 +193,20 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = lambda: impl.device_count()
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
+    from torch_spyre._sharded_api import is_sharded, sharding_info, to_sharded
+
+    mod.to_sharded = to_sharded
+    mod.is_sharded = is_sharded
+    mod.sharding_info = sharding_info
     mod._is_compiled = lambda: True
     mod.memory = memory
     # Public profiler API (eagerly imported above); avoid private _ffdc import.
     mod.get_diagnostic_report = profiler.get_diagnostic_report
+
+    # WARNING: does not make sense until upstream issue #203190
+    # Once that issue is resolved, ensure the names match
+    # and revert the rest of the monkey patch logic in PR: 5887
+    mod._fake_avoid_device_init = lambda: True
 
     import torch  # noqa: E402
 
@@ -305,9 +319,21 @@ def _autoload_impl():
     # cache guards. It must be available before any .to("spyre") /
     # .to(device_layout=...) call -- including when that call is the very first
     # mention of the device (e.g. moving model weights onto Spyre).
-    from ._monkey_patch import _patch_tensor_for_spyre
+    from ._monkey_patch import _patch_fake_tensor_device_init, _patch_tensor_for_spyre
 
     _patch_tensor_for_spyre()
+
+    # FakeTensorMode device-init opt-out for the Spyre backend: keeps
+    # torch.tensor(..., device="spyre") under FakeTensorMode from
+    # materializing real device storage (78 one-stick DMAs + memsets per
+    # cold compile from Inductor's SDPA pattern init). See
+    # _monkey_patch._patch_fake_tensor_device_init.
+    try:
+        _patch_fake_tensor_device_init()
+    except Exception as e:  # pragma: no cover - defensive during torch import
+        import warnings
+
+        warnings.warn(f"Failed to install FakeTensorMode device-init patch: {e}")
 
     # Inductor backend registration (scheduler / codegen / op-overrides).
     from torch_spyre._inductor import _autoload as ts_inductor_autoload
@@ -319,6 +345,17 @@ def _autoload_impl():
     # Customops must be imported here because decompositions.py references
     # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
     import torch_spyre._inductor.customops  # noqa: F401
+
+    # lowering.py is normally imported lazily, only when enable_spyre_context()
+    # actually runs (i.e. only for compiles Inductor detects as Spyre-bound).
+    # tile_dim_marker's lowering is registered directly into the real global
+    # torch._inductor.lowering.lowerings dict (not the CM-scoped
+    # spyre_lowerings dict most Spyre lowerings use) precisely so it is always
+    # present -- including for device-agnostic compiles that never enter Spyre
+    # context, e.g. for_each_tile exercised directly on CPU tensors. That
+    # registration only takes effect once this module has actually executed,
+    # so import it eagerly here rather than leaving it to the lazy path.
+    import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.decompositions import (
         _register_spyre_dispatchkey_kernels_permanently,
     )
@@ -355,11 +392,7 @@ def _autoload_impl():
         _orig_init = torch.profiler.profile.__init__
 
         def _init_with_spyre_profiler(self, *args, **kwargs):
-            # For first call, need to ensure torch_spyre._C is loaded so that SpyreProfiler is registered
-            if not torch.spyre.is_initialized():
-                torch.spyre._impl._lazy_init()
             try:
-                # This will automatically register the profiler
                 import torch_spyre._C  # noqa: F401
             except ImportError:
                 pass
@@ -377,6 +410,10 @@ def _autoload_impl():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+    # A second, independent cap that dynamo checks before the per-op limit
+    # above, so at its default of 256 it caps the cache whatever
+    # cache_size_limit says.
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
 
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 

@@ -1,0 +1,6 @@
+# v1 model-ops: delete once the dashboard reads v2 capabilities
+test_suite_config:
+  labels: [unit, regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_model_ops_v1_parity.py
+      unlisted_test_mode: mandatory_success

@@ -31,8 +31,14 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
+from .loop_info import ReadCopyElisionRecord
 from .errors import Unsupported
-from .pass_utils import replace_computed_buffer_body
+from .pass_utils import (
+    replace_computed_buffer_body,
+    origin_in_graph,
+    patch_env,
+    find_fx_node,
+)
 from .constants import is_ea_compatible
 from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
@@ -366,6 +372,11 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
     return tuple(args), clean_kw, out_dtype
 
 
+def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
+    """The index symbols _trace_inner_fn passes to a traced inner_fn."""
+    return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
+
+
 def _trace_inner_fn(op):
     """Trace the inner_fn of an operation to extract its structure.
 
@@ -378,7 +389,7 @@ def _trace_inner_fn(op):
         List of traced operations or None if tracing failed
     """
     ranges = op.data.ranges
-    syms = tuple(sympy.Symbol(f"_i{k}") for k in range(len(ranges)))
+    syms = _index_syms(len(ranges))
     tracer = _TracingHandler(V.ops)
     try:
         with tracer:
@@ -439,33 +450,15 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
-def _find_fx_node(name, gl):
-    """Find an FX node by buffer name in the graph.
-
-    Searches both gl.env and placeholder nodes
-
-    Args:
-        name: Buffer name to search for
-        gl: GraphLowering instance
-
-    Returns:
-        FX Node corresponding to the buffer name
-
-    Raises:
-        KeyError: If no FX node is found for the given name
-    """
-    for n, tb in gl.env.items():
-        if isinstance(n, fx.Node) and tb is not None:
-            if tb.get_name() == name:
-                return n
-    for n in gl.graph.nodes:
-        if n.op == "placeholder" and n.name == name:
-            return n
-    raise KeyError(f"No FX node for {name}")
-
-
 def _lower_fx_node(node, gl, ops, idx):
     """Lower an FX node to a buffer and insert it into operations list.
+
+    A lowering may register more than one operation: a host fallback registers
+    a FallbackKernel and then the MultiOutput that reads it, and a lowering can
+    realize helper buffers before its result. register_operation appends them
+    all at the end of gl.operations, after the consumer being split, so all of
+    them are moved to ``idx`` in registration order to keep the list in
+    topological order.
 
     Args:
         node: FX node to lower
@@ -474,14 +467,22 @@ def _lower_fx_node(node, gl, ops, idx):
         idx: Index position for insertion
 
     Returns:
-        The created buffer
+        The created buffer and the number of operations inserted at ``idx``
     """
+    start = len(gl.operations)
     tb = gl.run_node(node)
+    gl.env[node] = tb  # run_node does not record it in the env
+    # buf is the lowering's result, not every operation it registered: for a
+    # host fallback it is the MultiOutput, registered after its FallbackKernel.
+    # new_ops below holds all of them, so the whole group moves together.
     buf = tb.data.data
-    gl.operations.remove(buf)
-    ops.insert(idx, buf)
+    new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
+    for new_op in new_ops:
+        gl.operations.remove(new_op)
+    for offset, new_op in enumerate(new_ops):
+        ops.insert(idx + offset, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
-    return buf
+    return buf, len(new_ops)
 
 
 def _make_intermediate_bufs(
@@ -560,6 +561,7 @@ def _make_intermediate_bufs(
             # For ExternKernel like SpyreConstantFallback, extract the raw buffer
             # only for positioning — don't replace it with raw buffer in operations.
             tb = gl.run_node(new_node)
+            gl.env[new_node] = tb  # run_node does not record it in the env
             # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
             # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
@@ -582,7 +584,12 @@ def _make_intermediate_bufs(
             insert_idx += 1
             continue
 
-        input_nodes = [_find_fx_node(vid_to_bufname[v], gl) for v in inputs]
+        def assert_fx_node(v):
+            if (_node := find_fx_node(vid_to_bufname[v], gl)) is not None:
+                return _node
+            raise KeyError(f"No FX node for {vid_to_bufname[v]}")
+
+        input_nodes = [assert_fx_node(v) for v in inputs]
         target = _resolve_fx_target(op_name)
         if target is None:
             raise RuntimeError(f"Cannot resolve target for '{op_name}'")
@@ -602,7 +609,7 @@ def _make_intermediate_bufs(
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
-        new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
+        new_buf, num_new_ops = _lower_fx_node(new_node, gl, operations, insert_idx)
         # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
@@ -620,7 +627,7 @@ def _make_intermediate_bufs(
         if op_name not in op_queues:
             op_queues[op_name] = collections.deque()
         op_queues[op_name].append(buf_name)
-        insert_idx += 1
+        insert_idx += num_new_ops
 
     return constant_map, op_queues
 
@@ -664,6 +671,7 @@ def _patch_original_buf(
         name_map[orig_load_names[v_in]] = new_buf
 
     orig_inner = op.data.inner_fn
+    read_copy_record = getattr(op, "_read_copy_elision_record", None)
     _cm = constant_map or {}
     _oq_snapshot = {k: collections.deque(v) for k, v in (op_queues or {}).items()}
 
@@ -674,6 +682,19 @@ def _patch_original_buf(
         inner = _SplitOpsHandler(V.ops, _nm, _cm)
         with V.set_ops_handler(_IntermediateOpHandler(inner, fresh_queues)):
             return _orig(*args)
+
+    direct_inner_fn = None
+    if isinstance(read_copy_record, ReadCopyElisionRecord):
+
+        def direct_inner_fn(
+            *args,
+            _nm=name_map,
+            _orig=read_copy_record.direct_inner_fn,
+        ):
+            fresh_queues = {k: collections.deque(v) for k, v in _oq_snapshot.items()}
+            inner = _SplitOpsHandler(V.ops, _nm, _cm)
+            with V.set_ops_handler(_IntermediateOpHandler(inner, fresh_queues)):
+                return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
     # Preserve origins from the original data object (dataclasses.replace creates
@@ -686,25 +707,12 @@ def _patch_original_buf(
         pass_name="split_multi_ops",
         reason="rewrite original buffer body",
     )
+    if isinstance(read_copy_record, ReadCopyElisionRecord):
+        new_op._read_copy_elision_record = dataclasses.replace(  # type: ignore[attr-defined]
+            read_copy_record,
+            direct_inner_fn=direct_inner_fn,
+        )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
-
-
-def _origin_in_graph(origins, g: "fx.Graph") -> "fx.Node | None":
-    """Pick the origin fx.Node that belongs to graph ``g``.
-
-    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
-    ``nested_compile_region`` block reused across layers) inherits origins that
-    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
-    nodes) AND the subgraph's own compute nodes. FX insertion
-    (``inserting_before``) requires an anchor in the *current* lowering graph,
-    and ``next(iter(origins))`` may return a foreign parent-graph node — whose
-    ``.graph is not g`` — which asserts. Filter to the graph being lowered.
-    Returns ``None`` if no origin lives in ``g``.
-    """
-    return next(
-        (n for n in origins if isinstance(n, fx.Node) and n.graph is g),
-        None,
-    )
 
 
 def _get_op_name(op) -> str:
@@ -720,7 +728,7 @@ def _get_op_name(op) -> str:
     gl = V.graph
     origin_node = None
     if hasattr(gl, "graph"):
-        origin_node = _origin_in_graph(op.data.origins, gl.graph)
+        origin_node = origin_in_graph(op.data.origins, gl.graph)
     if origin_node is None:
         origin_node = next(iter(op.data.origins))
 
@@ -798,6 +806,53 @@ def validate_ops(graph: GraphLowering) -> None:
             )
 
 
+def _validate_split_supported(op, trace, intermediate_ops) -> None:
+    """Refuse to split ``op`` when an intermediate would combine view loads.
+
+    An intermediate is materialized as an FX op over the base buffers, which
+    reproduces a load only at its buffer's canonical position: the buffer's
+    strides on the trailing output index symbols, aligned as for broadcasting.
+    A load at an offset or through a view (e.g. one select() row) is elsewhere.
+    A single such operand is still reloaded at its own index on replay, but two
+    tensor operands are combined over the base buffers and pair the wrong
+    elements.
+    """
+    # A reduction's loads also index the reduction symbols, which the canonical
+    # position does not model, so only pointwise bodies are checked.
+    if not isinstance(op.data, Pointwise):
+        return
+    syms = _index_syms(len(op.data.ranges))
+    tensors: set[int] = set()  # values derived from any load
+    from_view: set[int] = set()  # values derived from a view load
+    for name, vid, inputs, kwargs in trace:
+        if name == "load":
+            tensors.add(vid)
+            layout = V.graph.get_buffer(kwargs["_name"]).get_layout()
+            lead = len(syms) - len(layout.size)
+            # A buffer of higher rank than the output is read through a view.
+            is_view = lead < 0
+            if not is_view:
+                canonical = layout.offset + sum(
+                    st * syms[lead + k]
+                    for k, (sz, st) in enumerate(zip(layout.size, layout.stride))
+                    if sz != 1
+                )
+                is_view = sympy.expand(kwargs["_index"] - canonical) != 0
+            if is_view:
+                from_view.add(vid)
+        elif any(v in tensors for v in inputs):
+            tensors.add(vid)
+            if any(v in from_view for v in inputs):
+                from_view.add(vid)
+    for name, _, inputs, _ in intermediate_ops:
+        operands = [v for v in inputs if v in tensors]
+        if len(operands) > 1 and any(v in from_view for v in operands):
+            raise Unsupported(
+                f"split_multi_ops: {op.get_name()}: intermediate '{name}' combines "
+                "loads through a view, which split_multi_ops does not support"
+            )
+
+
 def split_multi_ops(graph: GraphLowering):
     """Split multi-ops in a single loop body into separate buffers.
 
@@ -828,18 +883,7 @@ def split_multi_ops(graph: GraphLowering):
     if not (hasattr(gl, "graph") and hasattr(gl, "run_node")):
         return
 
-    # Build environment mapping FX nodes to TensorBox for node lookup. Prefer
-    # the origin in the current lowering graph so subgraph buffers key on their
-    # subgraph-local node rather than a foreign parent-graph invoke_subgraph node.
-    env = {}
-    for tbs in gl.name_to_users.values():
-        for tb in tbs:
-            if tb.data.origins:
-                fx_node = _origin_in_graph(tb.data.origins, gl.graph)
-                if fx_node is None:
-                    fx_node = next(iter(tb.data.origins))
-                env[fx_node] = tb
-    gl.env.update(env)
+    patch_env(gl)
 
     operations = graph.operations
     for op in list(operations):
@@ -872,14 +916,28 @@ def split_multi_ops(graph: GraphLowering):
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
         # lowered inside an invoke_subgraph HOP carries origins from both the
         # parent graph and the subgraph; only the subgraph-local origin is a
-        # valid inserting_before anchor here. _origin_in_graph already enforces
+        # valid inserting_before anchor here. origin_in_graph already enforces
         # node-ness and current-graph membership.
-        orig_node = _origin_in_graph(op.origins, gl.graph)
+        orig_node = origin_in_graph(op.origins, gl.graph)
         if orig_node is None:
             continue
 
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
+
+        # An intermediate in a multi-op body that combines a view load with
+        # another tensor operand is refused; replaying it over the base buffers
+        # would pair the wrong elements.
+        # TODO: support views. A view load needs a buffer of its own, which can
+        # come from two places:
+        # - here, by rebuilding the intermediate from traced index expressions.
+        #   That reconstructs inner_fn, against the rule that a pass wraps inner_fn
+        #   and never reconstructs it (#2797), so it means revisiting that rule.
+        # - in the lowering that builds the body, by realizing the viewed operand
+        #   before it is inlined into another op and giving it an FX origin with
+        #   _ensure_synthetic_origin. It costs a kernel per operand and covers
+        #   only operands a lowering builds itself.
+        _validate_split_supported(op, trace, intermediate_ops)
 
         if _is_reduction_with_to_dtype(op, compute_ops):
             intermediate_ops = compute_ops

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 """
 Reads the JSON produced by parse_model_ops_logs.py and batch-inserts the
 rows into two ClickHouse tables:
@@ -39,7 +40,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import clickhouse_connect
+from spyre_clickhouse_ingest.client import get_client as _get_client
 
 # ---------------------------------------------------------------------------
 # ClickHouse DDL
@@ -146,15 +147,9 @@ SETTINGS index_granularity = 8192
 
 
 def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-        verify=False,
-    )
+    """This endpoint's certificate does not validate, hence verify=False -- the only reason this
+    wrapper exists rather than importing the shared factory directly."""
+    return _get_client(verify=False)
 
 
 def _parse_ts(ts_str: str) -> datetime:
@@ -552,17 +547,12 @@ def main() -> None:
         client.insert("model_ops_variants", all_variant_rows, column_names=VARIANT_COLS)
         print(f"[info]   model_ops_variants  — {len(all_variant_rows)} rows inserted")
 
-    # ── Verify counts ─────────────────────────────────────────────────────────
     n_s = client.query("SELECT count() FROM model_ops_suites").result_rows[0][0]
     n_v = client.query("SELECT count() FROM model_ops_variants").result_rows[0][0]
-
-    print("\n[info] ── Ingest complete ──────────────────────────────────────────")
+    print("\n[info] ── v1 ingest complete ───────────────────────────────────")
     print(f"[info]   model_ops_suites   : {n_s} rows")
     print(f"[info]   model_ops_variants : {n_v} rows")
     print(f"[info]   gha_run_id         : {gha_run_id}")
-    print(f"[info]   workflow           : {args.workflow}")
-    print(f"[info]   branch             : {args.branch}")
-    print(f"[info]   sha                : {args.sha[:12]}")
 
 
 if __name__ == "__main__":

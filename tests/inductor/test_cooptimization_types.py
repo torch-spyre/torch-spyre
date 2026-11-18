@@ -42,7 +42,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
-from tests.inductor.cooptimization_capture_loader import (
+from cooptimization_capture_loader import (
+    DEFAULT_CAPTURE_PATH,
     LARGE_CAPTURE_PATH,
     SEED_DIVISION_INDEX,
     load_captures,
@@ -63,6 +64,30 @@ def _all_captures():
 class _NoOpSolver(CoreDivisionLayoutSolver):
     """Minimal concrete engine: seeds every buffer, spills everything."""
 
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def generates_divisions(cls) -> bool:
+        return False
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return False
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
+
     def plan_layout(self, log_lx_usage=False):
         return list(self.buffers)
 
@@ -70,7 +95,7 @@ class _NoOpSolver(CoreDivisionLayoutSolver):
         for b in self.buffers:
             b.chosen_division = SEED_DIVISION_INDEX
             b.address = None  # spilled
-            self.spill_reasons[b.name] = "no-op solver spills everything"
+            b.spill_reason = "no-op solver spills everything"
         return list(self.buffers)
 
 
@@ -161,10 +186,7 @@ class CaptureAssumptionsTest(TestCase):
         """
         import json
 
-        for path in (
-            "tests/inductor/cooptimization_captures.json",
-            "tests/inductor/cooptimization_captures_large.json",
-        ):
+        for path in (DEFAULT_CAPTURE_PATH, LARGE_CAPTURE_PATH):
             with open(path) as f:
                 raw = json.load(f)
             for case, graphs in raw.items():
@@ -257,7 +279,7 @@ class EngineBindingTest(TestCase):
             self.assertIsNotNone(b.chosen_division)
             self.assertTrue(0 <= b.chosen_division < len(b.core_divisions))
             if b.address is None:
-                self.assertIn(b.name, solver.spill_reasons)
+                self.assertIsNotNone(b.spill_reason)
 
     def test_placement_only_path_is_refused(self):
         """Joint-only engine: ``plan_layout`` is a loud stub, not a silent no-op."""
@@ -298,14 +320,13 @@ class NoOpSolverABCTest(TestCase):
         solver = _NoOpSolver(graph.buffers, size=4096, alignment=128)
         self.assertEqual(solver.limit, 4096)
         self.assertEqual(solver.alignment, 128)
-        self.assertEqual(solver.spill_reasons, {})
 
         out = solver.plan_layout_and_core_divisions()
         self.assertEqual(len(out), len(graph.buffers))
         for b in out:
             self.assertEqual(b.chosen_division, SEED_DIVISION_INDEX)
             self.assertIsNone(b.address)
-            self.assertIn(b.name, solver.spill_reasons)
+            self.assertIsNotNone(b.spill_reason)
 
 
 class SpillCostTest(TestCase):

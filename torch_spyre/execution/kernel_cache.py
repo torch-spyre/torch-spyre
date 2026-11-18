@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -20,19 +22,23 @@ from collections.abc import Sequence
 from functools import lru_cache
 from typing import Optional
 
+import sympy
 import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
 logger = get_inductor_logger("kernel_cache")
 
-# All artifacts that dxp_standalone must produce for a valid compiled kernel.
+# All artifacts that dbo-opt must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
+_SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
     "bundle.mlir",
+    _SYMBOL_KINDS_FILE,
     os.path.join("spyreCodeDir", "init_binary.bin"),
     os.path.join("spyreCodeDir", "spyrecode.json"),
 ]
@@ -97,6 +103,31 @@ class _KernelHashRegistry:
             if kernel_name and kernel_name not in entry["kernel_names"]:
                 entry["kernel_names"].append(kernel_name)
 
+    def register_precomputed(
+        self,
+        cache_key: str,
+        kernel_name: str,
+        ops: list[str],
+        loop_counts: list[str],
+    ) -> None:
+        """Record a key taken from a generated wrapper (precomputed_key).
+
+        No SDSC JSON is generated on this path, so the pool/slice offsets that
+        compute_specs_hash() would record are unknown. An existing entry
+        (e.g. registered by compute_specs_hash() earlier in this process) only
+        gains the kernel name; a new one is marked ``precomputed`` and has no
+        pool_offsets. hit/miss counting is the same as for a computed key.
+        """
+        entry = self._registry.get(cache_key)
+        if entry is None:
+            self.register(cache_key, kernel_name, ops, loop_counts, [])
+            self._registry[cache_key]["precomputed"] = True
+            return
+        if kernel_name:
+            entry["kernel_name"] = kernel_name
+            if kernel_name not in entry["kernel_names"]:
+                entry["kernel_names"].append(kernel_name)
+
     def record_hit(self, cache_key: str) -> None:
         if cache_key in self._registry:
             self._registry[cache_key]["hit_count"] += 1
@@ -142,7 +173,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
 
 
 @lru_cache(maxsize=1)
-def _get_dxp_version() -> str:
+def _get_backend_compiler_version() -> str:
     """Return a combined deeptools+flex version string from the Spyre components file.
 
     Reads the path given by the ``LIB_VERSION_FILE`` environment variable
@@ -194,8 +225,14 @@ def _get_dxp_version() -> str:
 @lru_cache(maxsize=1)
 def _get_torch_spyre_version() -> str:
     """Return the torch_spyre package version string."""
-    from torch_spyre.version import __version__
-
+    try:
+        from torch_spyre._version import __version__
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch_spyre._version is missing; cannot determine the torch_spyre "
+            "version for the cache key. The wheel was built without "
+            "setuptools_scm. Set SPYRE_KERNEL_CACHE=0 to run without caching."
+        ) from exc
     return __version__
 
 
@@ -212,7 +249,7 @@ def _strip_debug_handles(obj):
     debug_handle_ carries Inductor-assigned buffer names and source file paths
     that are process/run-specific. Including them in the cache key causes false
     misses (identical graphs with different buffer names hash differently) and
-    does not affect compilation correctness — dxp_standalone ignores the field.
+    does not affect compilation correctness — the backend ignores the field.
     """
     if isinstance(obj, dict):
         return {
@@ -223,16 +260,95 @@ def _strip_debug_handles(obj):
     return obj
 
 
+# Config values that compile_op_spec() reads (sencores,
+# disable_conv2d_spatial_split) or that select which parts compute_specs_hash()
+# hashes (bundle_symbolic_args). They change the key through the SDSC JSON, not
+# as fields of their own, so a stored key that skips that work must have them
+# in its fingerprint. Add a setting here when compile_op_spec() starts reading
+# one; the verify-mode shard (tests/inductor/test_kernel_key_verify.py) catches
+# a key that changed while its fingerprint did not.
+_SPEC_COMPILE_CONFIG = (
+    "bundle_symbolic_args",
+    "sencores",
+    "disable_conv2d_spatial_split",
+)
+
+
+def _key_context(
+    pool_size: int, backend_loop_unroll: bool, ktir_device_mlir: str
+) -> tuple[list[str], list[str]]:
+    """The inputs of the kernel-cache key other than the specs.
+
+    Returns ``(fields, versions)``: compute_specs_hash() appends ``fields`` to
+    the hashed content and passes ``versions`` to code_hash() as ``extra``.
+    kernel_key_fingerprint() hashes the same two lists, so an input added here
+    is part of both the key and the fingerprint of a stored key.
+    """
+    from torch_spyre._inductor import config as _spyre_config
+
+    fields = [
+        # Emitted as sdscbundle.device_mem_allocate <pool_size> bytes in
+        # bundle.mlir.
+        f"pool_size:{pool_size}",
+        # frontend_pool_allocation changes both the bundle signature (adds a
+        # pool base-address parameter as the first MLIR input) and the .run()
+        # argument ABI (tensor_id indices are offset by 1 when the pool param
+        # is present). A cached kernel compiled without it must never be
+        # reused when the flag is on, and vice-versa.
+        f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}",
+        f"loop_unroll:{int(backend_loop_unroll)}",
+        f"ktir_device_mlir:{ktir_device_mlir}",
+    ]
+    versions = [
+        torch.__version__,
+        _get_torch_spyre_version(),
+        _get_backend_compiler_version(),
+        # Bundles are compiled by dbo-opt, not dxp_standalone.
+        # _get_backend_compiler_version() reports the deeptools package
+        # version, which ships both binaries and so does not change when
+        # the backend does.
+        # Without this tag, entries produced by dxp_standalone stay
+        # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
+        # and would be served as hits, so dbo-opt would never run.
+        "backend=dbo-opt",
+    ]
+    return fields, versions
+
+
+def _normalized_expr_str(expr) -> str:
+    """``str(expr)`` in the spelling the reload path will produce.
+
+    Hashing a raw ``str`` makes the cache key depend on which side of a reload
+    the expression was last on. Normalising means both sides agree. Falls back
+    to the raw string if the expression does not survive a parse, which keeps a
+    key computable rather than failing a compile over a hash input.
+    """
+    raw = str(expr)
+    try:
+        return str(sympy.sympify(raw))
+    except (sympy.SympifyError, SyntaxError, TypeError):
+        # A spelling sympify cannot parse is still a usable key. Anything else
+        # is a real bug and propagates.
+        return raw
+
+
 def compute_specs_hash(
-    specs: Sequence, kernel_name: str = "", pool_size: int = 0
+    specs: Sequence,
+    kernel_name: str = "",
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
+    register: bool = True,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
 
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
     (op structure, iteration space, tiling, shapes, dtypes), the trip count of
     every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, and the versions of torch, torch_spyre,
-    dxp_standalone, and the active compile config.
+    the total pool allocation size, the versions of torch, torch_spyre and
+    the deeptools/flex toolchain, the backend compiler in use, and the active
+    compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -241,11 +357,21 @@ def compute_specs_hash(
                      ``sdscbundle.device_mem_allocate`` in bundle.mlir.
                      Must be included so that kernels that differ only in
                      their pool size get different cache keys.
+        backend_loop_unroll: Resolved setting passed to the backend compiler.
+                             Defaults to the active Spyre config.
+        ktir_device_mlir: Resolved device override passed to the backend compiler.
+                          Defaults to the active Spyre config.
+        register:    Record the key in the process-global registry (codegen
+                     precomputation passes False: no kernel is loaded there).
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor import config as _spyre_config
 
+    if backend_loop_unroll is None:
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -267,10 +393,49 @@ def compute_specs_hash(
                 # Include the trip count so loops with different iteration
                 # counts never collide, even when their body OpSpecs produce
                 # identical SDSC JSON.
-                loop_count_str = str(entry.count)
+                # Normalised through one sympify, because str() is NOT stable
+                # across the reload. The serializer writes sympify('<str>') and
+                # str(FloorDiv(s0, 64)) is "(s0//64)", which re-parses as
+                # floor(s0/64) and prints as "floor(s0/64)". Hashing the raw
+                # string would give a reloaded kernel a different key from the
+                # one that produced it, so it misses its own entry and
+                # recompiles, in the one feature whose point is not recompiling.
+                # The round trip is idempotent: both spellings normalise to the
+                # same string, and a concrete count is unaffected.
+                loop_count_str = _normalized_expr_str(entry.count)
                 content_parts.append(f"loop_count:{loop_count_str}".encode())
                 _debug_loop_counts.append(loop_count_str)
                 logger.debug("  [hash] LoopSpec  count=%s", loop_count_str)
+                # The per-symbol max and tile size are NOT recoverable from the
+                # count string: two kernels can share "FloorDiv(s0, 64)" while
+                # declaring different maxima, and the max reaches the bundle's
+                # input_arg rather than the SDSC JSON hashed below. Without this
+                # they collide and the second is served a binary built for the
+                # first one's range.
+                if entry.count_symbol_bounds:
+                    bounds = json.dumps(
+                        {
+                            name: list(bound)
+                            for name, bound in entry.count_symbol_bounds.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_bounds:{bounds}".encode())
+                    logger.debug("  [hash] LoopSpec  bounds=%s", bounds)
+                # Which argument and dim the runtime reads each symbol from is
+                # baked into the bundle's parameter list, so two otherwise
+                # identical kernels reading the same dimension off different
+                # arguments are different binaries.
+                if entry.count_symbol_sources:
+                    sources = json.dumps(
+                        {
+                            name: list(source)
+                            for name, source in entry.count_symbol_sources.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_sources:{sources}".encode())
+                    logger.debug("  [hash] LoopSpec  sources=%s", sources)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
@@ -360,21 +525,16 @@ def compute_specs_hash(
 
     _collect(specs_list)
 
-    # Include the total pool allocation: it is emitted as
-    # sdscbundle.device_mem_allocate <pool_size> bytes in bundle.mlir.
-    content_parts.append(f"pool_size:{pool_size}".encode())
-
+    fields, versions = _key_context(pool_size, backend_loop_unroll, ktir_device_mlir)
+    content_parts.extend(field.encode() for field in fields)
     content = b"||".join(content_parts)
-    extra = "||".join(
-        [
-            torch.__version__,
-            _get_torch_spyre_version(),
-            _get_dxp_version(),
-        ]
-    )
+    extra = "||".join(versions)
 
     cache_key = code_hash(content, extra=extra)
-    logger.info(
+    # Codegen precomputation (register=False) logs at DEBUG: sdsc() logs the
+    # same kernel again when it computes or uses the key.
+    _log = logger.info if register else logger.debug
+    _log(
         "Hash inputs summary  kernel=%s  sdsc_count=%d  content_parts=%d  "
         "content_bytes=%d  use_symbols=%s",
         kernel_name or "<unknown>",
@@ -385,15 +545,16 @@ def compute_specs_hash(
     )
 
     # Register ingredients in the process-global registry for hit/miss logging.
-    _registry.register(
-        cache_key,
-        kernel_name,
-        _debug_ops,
-        _debug_loop_counts,
-        _debug_pool_offsets,
-    )
+    if register:
+        _registry.register(
+            cache_key,
+            kernel_name,
+            _debug_ops,
+            _debug_loop_counts,
+            _debug_pool_offsets,
+        )
 
-    logger.info(
+    _log(
         "Computed specs hash  kernel=%s  ops=[%s]  loops=[%s]  pool=[%s]  key=%s",
         kernel_name or "<unknown>",
         ",".join(_debug_ops),
@@ -402,6 +563,290 @@ def compute_specs_hash(
         cache_key,
     )
     return cache_key
+
+
+# ---------------------------------------------------------------------------
+# Precomputed kernel-cache keys (config.precomputed_kernel_key,
+# TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY).
+#
+# Codegen evaluates the OpSpec source text it is about to emit, exactly as the
+# generated wrapper module will, runs compute_specs_hash() on it and emits
+# ``precomputed_key="<key>|<fingerprint>"`` into the async_compile.sdsc(...)
+# call. The fingerprint covers every input of compute_specs_hash() other than
+# the specs themselves (the specs are fixed by the wrapper source the key is
+# stored in). At runtime, with the switch on, a matching fingerprint lets
+# sdsc() use <key> without regenerating any SDSC JSON.
+# ---------------------------------------------------------------------------
+
+_PRECOMPUTED_KEY_SEP = "|"
+
+
+class PrecomputedKernelKeyMismatch(RuntimeError):
+    """Raised in TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=verify mode when the key
+    stored in the generated wrapper differs from compute_specs_hash()."""
+
+
+@lru_cache(maxsize=1)
+def _get_key_source_digest() -> str:
+    """SHA-256 over the torch_spyre sources a cache key is derived with.
+
+    compute_specs_hash() runs the code in torch_spyre._inductor (OpSpec
+    classes, compile_op_spec, generate_sdsc, ...) plus this module, and its key
+    changes when that code changes the SDSC JSON -- but the torch_spyre version
+    string does not change with local edits. A precomputed key is therefore
+    only trusted by a process running byte-identical sources.
+
+    It covers all of torch_spyre._inductor (passes, distributed/, scratchpad/,
+    ...), much more than the key path needs. That is the safe choice: any edit
+    under _inductor invalidates every stored key, so a process with local edits
+    computes its keys again (slower, never wrong).
+    """
+    import torch_spyre._inductor as _inductor_pkg
+
+    root = os.path.dirname(os.path.abspath(_inductor_pkg.__file__))
+    return _digest_sources(root, [os.path.abspath(__file__)])
+
+
+def _digest_sources(root: str, extra_paths: Sequence[str]) -> str:
+    """SHA-256 over ``extra_paths`` and every ``.py`` file under ``root``.
+
+    Only regular files count: os.walk also lists symlinks and other entries
+    whose names end in ``.py``, such as editor lock files (``.#foo.py``).
+    """
+    paths = list(extra_paths)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        paths.extend(os.path.join(dirpath, f) for f in filenames if f.endswith(".py"))
+    paths = [p for p in paths if os.path.isfile(p)]
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(os.path.relpath(path, root).encode())
+        digest.update(b"\0")
+        with open(path, "rb") as f:
+            digest.update(f.read())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _get_native_extension_digest() -> str:
+    """SHA-256 of the loaded torch_spyre/_C extension file.
+
+    compute_specs_hash() depends on native code (DataFormats enum values,
+    encode_constant in codegen/compute_ops.py, get_device_dtype in
+    dtype_ops.py), which the version string does not track. Hashed by content
+    rather than size + st_mtime_ns: read once per process (0.06 s for the
+    86 MB _C.so we measured), and a byte-identical copy of _C.so keeps its keys
+    valid.
+    """
+    import torch_spyre._C as _C
+
+    digest = hashlib.sha256()
+    with open(os.path.abspath(_C.__file__), "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def kernel_key_fingerprint(
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
+) -> str:
+    """Fingerprint of everything compute_specs_hash() depends on besides specs.
+
+    That is: the fields and versions of _key_context(), the same lists the key
+    is built from; the config values in _SPEC_COMPILE_CONFIG; the source digest
+    above; the digest of the native extension; and the sympy version (the
+    specs are sympy expressions). Raises like compute_specs_hash() when a
+    version cannot be determined.
+    """
+    import sympy
+
+    from torch_spyre._inductor import config as _spyre_config
+
+    if backend_loop_unroll is None:
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
+    fields, versions = _key_context(
+        int(pool_size), bool(backend_loop_unroll), ktir_device_mlir
+    )
+    parts = [
+        *versions,
+        *fields,
+        *(f"{name}:{getattr(_spyre_config, name)}" for name in _SPEC_COMPILE_CONFIG),
+        f"src:{_get_key_source_digest()}",
+        f"native:{_get_native_extension_digest()}",
+        f"sympy:{sympy.__version__}",
+    ]
+    return hashlib.sha256("||".join(parts).encode()).hexdigest()[:32]
+
+
+# Set by the first fingerprint that cannot be computed in this process.
+_fingerprint_failure: Optional[str] = None
+
+
+def _current_fingerprint(
+    pool_size: int,
+    *,
+    backend_loop_unroll: bool | None,
+    ktir_device_mlir: str | None,
+) -> Optional[str]:
+    """kernel_key_fingerprint(), or None when it cannot be computed.
+
+    Never raises: an input that cannot be read (an unreadable source file, a
+    version that cannot be determined) must send the caller down the
+    computed-key path, not fail it. The first failure is logged as a warning
+    and remembered, so the process does not walk the sources again for every
+    kernel.
+    """
+    global _fingerprint_failure
+    if _fingerprint_failure is not None:
+        return None
+    try:
+        return kernel_key_fingerprint(
+            pool_size,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
+        )
+    except Exception as e:  # noqa: BLE001 - any failure means "do not trust"
+        _fingerprint_failure = repr(e)
+        logger.warning(
+            "Precomputed kernel keys are not used in this process: the key "
+            "fingerprint could not be computed (%r). Kernel-cache keys are "
+            "computed instead.",
+            e,
+        )
+        return None
+
+
+def precompute_kernel_key(
+    src_code: str,
+    kernel_name: str = "",
+    pool_size: int = 0,
+) -> Optional[str]:
+    """Codegen side: the ``precomputed_key`` value for an sdsc(...) call.
+
+    ``src_code`` is the OpSpec list source the wrapper passes as ``specs`` and
+    ``pool_size`` the value it passes (0 when the kwarg is omitted). The source
+    is evaluated with the wrapper module's imports, so the key is computed from
+    the same objects the runtime would hash, and with V.graph unset, as when a
+    cached wrapper is reloaded. Returns None (the runtime then computes the
+    key) when the kernel cache is off or the key cannot be computed. Never
+    raises.
+    """
+    from torch._inductor.virtualized import NullHandler, V
+    from torch_spyre._inductor import config as _spyre_config
+    from torch_spyre._inductor.logging_utils import warn_once
+    from torch_spyre._inductor.op_spec import find_unimplemented
+    from torch_spyre._inductor.wrapper import spec_eval_namespace
+
+    if not _spyre_config.spyre_kernel_cache:
+        return None
+    backend_loop_unroll = _spyre_config.backend_loop_unroll
+    ktir_device_mlir = _spyre_config.ktir_device_mlir
+    fingerprint = _current_fingerprint(
+        pool_size,
+        backend_loop_unroll=backend_loop_unroll,
+        ktir_device_mlir=ktir_device_mlir,
+    )
+    if fingerprint is None:
+        return None
+    try:
+        specs = eval(src_code, spec_eval_namespace())  # noqa: S307
+        if find_unimplemented(list(specs)) is not None:
+            return None  # sdsc() returns before hashing
+        with V.set_graph_handler(NullHandler()):  # type: ignore[arg-type]
+            cache_key = compute_specs_hash(
+                specs,
+                kernel_name=kernel_name,
+                pool_size=pool_size,
+                backend_loop_unroll=backend_loop_unroll,
+                ktir_device_mlir=ktir_device_mlir,
+                register=False,
+            )
+    except Exception as e:  # noqa: BLE001 - the runtime falls back to hashing
+        # The first failure is a warning: if every kernel fails the same way
+        # (for example a name missing from SPYRE_WRAPPER_IMPORTS), the switch
+        # silently stops saving time.
+        warn_once(
+            logger,
+            "precompute_kernel_key",
+            "No precomputed kernel key for %s: %r. Its key is computed at load "
+            "time instead; later failures are logged at DEBUG.",
+            kernel_name,
+            e,
+        )
+        logger.debug("No precomputed kernel key for %s: %r", kernel_name, e)
+        return None
+    return f"{cache_key}{_PRECOMPUTED_KEY_SEP}{fingerprint}"
+
+
+def resolve_precomputed_key(
+    precomputed_key: Optional[str],
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
+) -> Optional[str]:
+    """Runtime side: the stored key if its fingerprint matches this process.
+
+    Returns None when there is no stored key, it is malformed, any
+    fingerprint input differs, or the fingerprint cannot be computed (the
+    caller then runs compute_specs_hash()). Never raises.
+    """
+    if not precomputed_key:
+        return None
+    cache_key, sep, fingerprint = precomputed_key.rpartition(_PRECOMPUTED_KEY_SEP)
+    if not sep or not cache_key or not fingerprint:
+        return None
+    current = _current_fingerprint(
+        pool_size,
+        backend_loop_unroll=backend_loop_unroll,
+        ktir_device_mlir=ktir_device_mlir,
+    )
+    if current is None:
+        return None
+    if fingerprint != current:
+        logger.debug(
+            "Precomputed kernel key %s not used: fingerprint %s != %s",
+            cache_key,
+            fingerprint,
+            current,
+        )
+        return None
+    return cache_key
+
+
+def register_precomputed_key(cache_key: str, kernel_name: str, specs: Sequence) -> None:
+    """Register a trusted precomputed key in the process-global registry.
+
+    Collects the cheap debug metadata (op names, loop counts) by walking the
+    spec tree; see _KernelHashRegistry.register_precomputed.
+    """
+    from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+
+    ops: list[str] = []
+    loop_counts: list[str] = []
+
+    def _walk(entries):
+        for entry in entries:
+            if isinstance(entry, LoopSpec):
+                loop_counts.append(str(entry.count))
+                _walk(entry.body)
+            elif isinstance(entry, OpSpec):
+                ops.append(entry.op)
+
+    _walk(specs)
+    _registry.register_precomputed(cache_key, kernel_name, ops, loop_counts)
+    logger.info(
+        "Using precomputed specs hash  kernel=%s  ops=[%s]  key=%s",
+        kernel_name or "<unknown>",
+        ",".join(ops),
+        cache_key,
+    )
 
 
 def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
@@ -447,15 +892,62 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     return cached_dir
 
 
-def allocate_compile_dir(cache_key: str) -> str:
+def save_symbol_kinds(compile_dir: str, symbol_kinds: list[SymbolKind]) -> None:
+    with open(os.path.join(compile_dir, _SYMBOL_KINDS_FILE), "w") as f:
+        json.dump([dataclasses.asdict(kind) for kind in symbol_kinds], f)
+
+
+def load_symbol_kinds(cached_dir: str) -> list[SymbolKind]:
+    with open(os.path.join(cached_dir, _SYMBOL_KINDS_FILE)) as f:
+        return [SymbolKind(**kind) for kind in json.load(f)]
+
+
+# Cache dirs are named by hash alone; this records which kernels map to one.
+_KERNEL_NAME_FILE = "kernel_name.txt"
+
+
+def record_kernel_name(kernel_dir: str, kernel_name: str) -> None:
+    """Append kernel_name to <kernel_dir>/kernel_name.txt unless already listed.
+
+    Never raises: failing to record a name must not fail a compile.
+
+    The read-check-append is not atomic across processes, so two processes
+    recording the same name concurrently can each append it and produce a
+    duplicate line. This is harmless — the file is a debugging aid, not part
+    of the cache key — so no locking is used.
+    """
+    if not kernel_name:
+        return
+    # A newline would corrupt the one-name-per-line format.
+    name = kernel_name.strip()
+    if not name or "\n" in name or "\r" in name:
+        return
+    marker = os.path.join(kernel_dir, _KERNEL_NAME_FILE)
+    try:
+        try:
+            with open(marker) as f:
+                if name in f.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(marker, "a") as f:
+            f.write(f"{name}\n")
+    except OSError as e:
+        logger.debug("Could not record kernel name %s in %s: %s", name, kernel_dir, e)
+
+
+def allocate_compile_dir(cache_key: str, *, kernel_name: str = "") -> str:
     """Reserve a unique temp directory inside the cache root for compilation.
 
     Placing it inside the cache root (not /tmp) ensures the subsequent rename
     in commit_compile_dir is atomic on POSIX.
+
+    ``kernel_name``, when given, is recorded in kernel_name.txt.
     """
     cache_root = get_cache_root_dir()
     tmp_dir = os.path.join(cache_root, f"{cache_key}.tmp.{uuid.uuid4().hex}")
     os.makedirs(tmp_dir, exist_ok=True)
+    record_kernel_name(tmp_dir, kernel_name)
     return tmp_dir
 
 
@@ -469,7 +961,10 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     cached_dir = os.path.join(cache_root, cache_key)
 
     if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy.
+        # Another process/thread won the race — discard our copy, but first
+        # merge our recorded kernel names into the winner's file so no name
+        # is lost.
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
         return cached_dir
@@ -478,18 +973,35 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
     except OSError:
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
 
     return cached_dir
 
 
+def _merge_kernel_names(tmp_dir: str, cached_dir: str) -> None:
+    """Record the names listed in tmp_dir's marker into cached_dir's marker.
+
+    Called when a race loser discards tmp_dir, so a name only that process
+    recorded is not lost. Never raises.
+    """
+    try:
+        with open(os.path.join(tmp_dir, _KERNEL_NAME_FILE)) as f:
+            names = f.read().splitlines()
+    except OSError:
+        return
+    for name in names:
+        record_kernel_name(cached_dir, name)
+
+
 def _move_to_failed_dir(compile_dir: str) -> None:
     """Move a failed compile dir into a ``failed/`` subdirectory of the cache root.
 
     Keeps the cache root clean while still retaining failed artifacts for
-    manual debugging (``dxp_standalone -d <path>``).  If the rename itself
-    fails (e.g. cross-device move), the original path is kept and logged.
+    manual debugging (re-run dbo-opt over the dir's ``bundle.mlir``).  If the
+    rename itself fails (e.g. cross-device move), the original path is kept and
+    logged.
     """
     cache_root = get_cache_root_dir()
     failed_root = os.path.join(cache_root, "failed")

@@ -31,7 +31,7 @@ The loader reads the checkpoint's config, picks the adapter for that model
 family, and patches one live HF model instance. Everything Spyre executes
 natively stays as it is in `transformers`. Only the operations Spyre cannot
 run natively are swapped: RoPE becomes a precomputed rotation matmul because
-Spyre has no `sin`/`cos`, RMSNorm is patched to compute in the model's device
+Spyre has no native `sin`/`cos` instruction, RMSNorm is patched to compute in the model's device
 dtype rather than the float32 upcast stock HF uses, the LM head is padded to a
 stick-aligned vocab so work division fits the 256 MB per-core span limit, the
 decoder blocks become compiled `block_forward` functions with raw-tensor KV
@@ -52,6 +52,29 @@ vision tower and the text decoder for Spyre, so it accepts image input;
 vision tower, for text-only inference on the same checkpoint. The canonical
 per-adapter list of verified checkpoints is in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints).
+
+## Weight loading and on-device layout
+
+Importing `torch_spyre` installs a wrapper around `safetensors.safe_open`
+(and the `get_tensor`/`get_tensors` accessors it returns). When a checkpoint
+is opened with `device="spyre"`, the wrapper assigns each weight a
+Spyre-aware on-device layout as it is read, rather than materializing a
+default-layout tensor on the host and restickifying it later. The layout is
+selected from the tensor's role, which the wrapper infers from its
+checkpoint key and shape:
+
+- Two-dimensional embedding weights whose hidden dimension is a multiple of
+  the dtype's stick width receive a gather-optimal layout for indirect access.
+  Tables that are not stick-aligned instead receive the default Spyre layout.
+- Two-dimensional Linear weights receive a matmul-optimal layout with
+  `dim_order=[1, 0]`.
+- Every other tensor receives the default Spyre layout.
+
+Weights load in `torch.float16` by default, which the host-to-device
+transfer requires. Pass an explicit `target_dtype` to override it. Because
+this path is on by default, a stock `transformers` or hf-adapters loader that
+opens a safetensors checkpoint with `device="spyre"` gets these layouts with
+no further configuration.
 
 ## Install
 
@@ -79,7 +102,9 @@ uv sync --group test
 
 Load a causal-LM with `AutoSpyreModelForCausalLM`. It reads the checkpoint's
 config, selects the matching adapter, prepares the model for Spyre, and moves
-it to the device. The tokenizer is the stock HF one.
+it to the device. The tokenizer is the stock HF one. See the
+[HuggingFace model example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/hf_model.py) for a runnable version of
+the script below.
 
 ```python
 from hf_adapters import AutoSpyreModelForCausalLM

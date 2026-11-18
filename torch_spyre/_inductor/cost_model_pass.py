@@ -24,6 +24,13 @@ The report is a *value*, not just a printout, so another pass or an external too
 compare two candidate plans without compiling and running either. That is the point:
 ``report_a.total_us`` vs ``report_b.total_us`` is a cheap plan comparison.
 
+This reporting pass has no candidate menu. It therefore omits the menu-dependent
+loop-delivery estimate, so looped-matmul totals can differ from the allocator's
+objective. It does not reconstruct candidate divisions from the committed plan.
+The DMA requests of a looped matmul's operand reads need no menu; with the delivery
+estimate omitted, the report charges their whole excess over the byte time, where
+the allocator charges only the part beyond that estimate.
+
 NOT related to ``work_division.cost_model_matmul_division``, which is a separate model
 used to choose a matmul work division. This module is the analytical whole-program
 runtime model documented in ``docs/source/compiler/cost_model.md``.
@@ -62,8 +69,10 @@ from torch._inductor.ir import ComputedBuffer
 from . import config
 from .constants import DEVICE_NAME
 from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
-from .dump_cost_model import extract_op_features
+from .cost_features import extract_op_features
 from .logging_utils import get_inductor_logger
+from .loop_facts import counted_loop_path
+from .loop_node import all_ops
 
 logger = get_inductor_logger("cost_model_pass")
 
@@ -280,11 +289,11 @@ def _traffic(o: "OpCost", width: int = 12) -> str:
 
 
 def _loop_group_id(op) -> tuple[int, ...] | None:
-    gid = getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-    try:
-        return tuple(gid) if gid else None
-    except TypeError:  # a malformed id (e.g. a bare int) must not sink the report
-        return None
+    # A malformed id (e.g. a bare int) reads as "no loop" and must not sink the report.
+    # ``include_extern=True`` keeps this reader's old behaviour of not special-casing
+    # an ExternKernel.  Here ``op`` is an IR op from the report's operation list, and
+    # the extractor skips ops it cannot model, so the flag changes nothing today.
+    return counted_loop_path(op, include_extern=True) or None
 
 
 def _per_iteration(f) -> dict:
@@ -392,6 +401,10 @@ def build_report(operations: list, params: CostParams | None = None) -> CostRepo
     """Price ``operations`` kernel by kernel, mirroring how the backend fuses.
 
     Split out from the pass so it can be unit-tested without a GraphLowering.
+
+    ``operations`` may hold LoopNodes (they reach the scheduler as one node
+    each). Their body ops are priced in program order exactly as the flat
+    list was, so the report does not depend on whether the loops are nodes.
     """
     params = params or CostParams()
 
@@ -404,7 +417,7 @@ def build_report(operations: list, params: CostParams | None = None) -> CostRepo
     # (fusion.py returns the node list untouched), so every op is its own kernel.
     fuses = bool(getattr(config, "bundle_symbolic_args", True))
 
-    for op in operations:
+    for op in all_ops(operations):
         feats = None
         if _is_modellable(op):
             try:

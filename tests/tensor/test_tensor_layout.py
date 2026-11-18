@@ -15,18 +15,112 @@
 # Owner(s): ["module: cpp"]
 
 import copy
+import json
 import pickle
-import unittest
 
+import sympy
 import torch
 from torch.testing._internal.common_utils import (
     TestCase,
+    TemporaryFileName,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
+
+
+def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.float16):
+    """Return valid_elements that init() produces for these host sizes/strides/dim_order.
+
+    Constructs a canonical SpyreTensorLayout via the host-based constructor
+    and extracts its valid_elements.  This gives the correct device-dim grouping
+    for whatever dim_order the explicit layout was designed with.
+    """
+    canonical = SpyreTensorLayout(sizes, strides, dtype, dim_order)
+    return canonical.valid_elements
+
+
+def _valid_elements_from_host(sizes, strides, device_size, stride_map):
+    """Compute valid_elements by applying get_dim_map logic in Python.
+
+    Use this when the host-based constructor cannot reproduce the layout
+    (e.g. multi-dim tiling, compiler-generated viewing/folding layouts) and
+    no dim_order is available.  Mirrors the C++ get_dim_map / get_tile_map
+    logic: maps each device dim to the host dim with the largest host stride
+    ≤ stride_map[j], then groups device dims by their host dim.
+
+    The resulting valid_elements carries the host dimension's element count
+    for each device-dim group, which is what reconstruct_dma_geometry requires
+    to correctly reconstruct dma_sizes and dma_strides.
+    """
+    host_rank = len(sizes)
+    device_rank = len(stride_map)
+    stick_dim_index = max(0, device_rank - 3)
+
+    max_stride_le = [0] * device_rank
+    dim_map = [-1] * device_rank
+
+    for i in range(host_rank):
+        if sizes[i] == 1:
+            continue
+        hst = strides[i]
+        if hst == 0:
+            continue
+        for j in range(device_rank):
+            if device_size[j] == 1:
+                continue
+            dst = stride_map[j]
+            if hst > max_stride_le[j] and hst <= dst:
+                max_stride_le[j] = hst
+                dim_map[j] = i
+
+    if dim_map[stick_dim_index] != -1:
+        dim_map[stick_dim_index] = dim_map[device_rank - 1]
+
+    groups: dict[int, list[int]] = {}
+    for j in range(device_rank):
+        h = dim_map[j]
+        if h == -1:
+            continue
+        groups.setdefault(h, []).append(j)
+
+    return {tuple(sorted(dims)): sizes[h] for h, dims in groups.items()}
+
+
+def _contiguous(host_size):
+    """Row-major host strides for ``host_size``."""
+    stride, acc = [], 1
+    for size in reversed(host_size):
+        stride.insert(0, acc)
+        acc *= size
+    return stride
+
+
+def _host_layout(dtype, host_size):
+    """A contiguous host ``FixedLayout`` on the spyre device."""
+    from torch._inductor.ir import FixedLayout
+
+    return FixedLayout(
+        torch.device("spyre"), dtype, list(host_size), _contiguous(host_size)
+    )
+
+
+def _dep(name, host_size):
+    """The ``MemoryDep`` a pointwise op over a contiguous ``host_size`` records.
+
+    Inductor drops a size-1 dim's loop variable, so only the other dims index.
+    """
+    from torch._inductor.dependencies import MemoryDep
+
+    stride = _contiguous(host_size)
+    live = [i for i, size in enumerate(host_size) if size != 1]
+    var_names = tuple(
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(len(live))
+    )
+    index = sum((stride[i] * v for i, v in zip(live, var_names)), sympy.Integer(0))
+    return MemoryDep(name, index, var_names, tuple(host_size[i] for i in live))
 
 
 @instantiate_parametrized_tests
@@ -57,7 +151,10 @@ class TestSpyreTensorLayout(TestCase):
             # Both normal and shortened/sparse trailing extents occupy full
             # sticks. Empty outer geometry remains empty after FP8 rescaling.
             for outer, inner in [(3, eps), (3, 1), (0, eps)]:
-                stl = SpyreTensorLayout([outer, inner], [eps, 1], df, ea)
+                _ds = [outer, inner]
+                stl = SpyreTensorLayout(
+                    _ds, [eps, 1], df, {(i,): _ds[i] for i in range(len(_ds))}, ea
+                )
                 expected = outer * eps * bits // 8
                 self.assertEqual(get_device_size_in_bytes(stl), expected)
                 self.assertEqual(
@@ -85,7 +182,8 @@ class TestSpyreTensorLayout(TestCase):
         # Explicit transfer encodings differ from default compute storage.
         x = torch.arange(64, dtype=dtype)
         eps = df.elems_per_stick()
-        stl = SpyreTensorLayout([64 // eps, eps], [eps, 1], df)
+        _ds = [64 // eps, eps]
+        stl = SpyreTensorLayout(_ds, [eps, 1], df, {(0, 1): 64})
         y = x.to("spyre", device_layout=stl)
         self.assertEqual(y.device_tensor_layout().device_dtype, df)
         self.assertEqual(y.cpu(), x)
@@ -93,7 +191,7 @@ class TestSpyreTensorLayout(TestCase):
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)
         self.assertEqual(stl.device_size, [1, 64])
-        self.assertEqual(stl.stride_map, [-1, -1])
+        self.assertEqual(stl.stride_map, [0, 0])
 
         stl = SpyreTensorLayout([120], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
@@ -126,7 +224,7 @@ class TestSpyreTensorLayout(TestCase):
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [0, 2, 1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(stl.stride_map, [1, 16384, 2048, 256])
+        self.assertEqual(stl.stride_map, [1, 2048, 2048, 256])
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [1, 0, 2])
         self.assertEqual(stl.device_size, [512, 4, 8, 64])
@@ -138,7 +236,7 @@ class TestSpyreTensorLayout(TestCase):
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [2, 0, 1])
         self.assertEqual(stl.device_size, [512, 1, 256, 64])
-        self.assertEqual(stl.stride_map, [2048, 16384, 1, 256])
+        self.assertEqual(stl.stride_map, [2048, 2048, 1, 256])
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [2, 1, 0])
         self.assertEqual(stl.device_size, [8, 8, 256, 64])
@@ -147,7 +245,10 @@ class TestSpyreTensorLayout(TestCase):
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
         stl_y = SpyreTensorLayout(
-            [4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16)
+            [4, 512, 64],
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            {(0, 2): 256, (1,): 512},
         )
         self.assertEqual(stl_x.stride_map, stl_y.stride_map)
         self.assertEqual(stl_x.device_size, stl_y.device_size)
@@ -155,13 +256,13 @@ class TestSpyreTensorLayout(TestCase):
     def test_sparse_dim_order(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1, -1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(stl.stride_map, [1, 0, 256, 0])
 
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16)",
+            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={(0, 2): 256, (1,): 512})",
         )
 
     def test_device_alloc(self):
@@ -196,12 +297,26 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(len(s), 2)
 
     def test_stl_pickleable(self):
-        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
-        self.assertEqual(stl, pickle.loads(pickle.dumps(stl)))
+        stl = SpyreTensorLayout(
+            [512, 256],
+            [256, 1],
+            torch.float16,
+            [1, 0],
+        )
+        loaded = pickle.loads(pickle.dumps(stl))
+        self.assertEqual(stl, loaded)
+        self.assertEqual(stl.valid_elements, loaded.valid_elements)
 
     def test_stl_copyable(self):
-        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
-        self.assertEqual(stl, copy.deepcopy(stl))
+        stl = SpyreTensorLayout(
+            [512, 256],
+            [256, 1],
+            torch.float16,
+            [1, 0],
+        )
+        copied = copy.deepcopy(stl)
+        self.assertEqual(stl, copied)
+        self.assertEqual(stl.valid_elements, copied.valid_elements)
 
     def test_to_spyre_layout(self):
         x = torch.rand([512, 256], dtype=torch.float16)
@@ -216,7 +331,10 @@ class TestSpyreTensorLayout(TestCase):
 
         y = torch.rand([512, 512], dtype=torch.float16)
         y_stl = SpyreTensorLayout(
-            [8, 512, 64], [64, 512, 1], get_device_dtype(torch.float16)
+            [8, 512, 64],
+            [64, 512, 1],
+            get_device_dtype(torch.float16),
+            {(0, 2): 512, (1,): 512},
         )
         y_dev = y.to(device_layout=y_stl)
         self.assertEqual(y, y_dev.cpu(), atol=1e-3, rtol=1e-3)
@@ -250,75 +368,86 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(w_slice, w_dev.cpu(), atol=1e-3, rtol=1e-3)
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([60], [1], [1, 64], [64, 1]),
-            ([64], [1], [1, 64], [64, 1]),
-            ([120], [1], [2, 64], [64, 1]),
-            ([128], [1], [2, 64], [64, 1]),
-            ([240], [1], [4, 64], [64, 1]),
-            ([256], [1], [4, 64], [64, 1]),
-            ([40, 60], [60, 1], [1, 60, 64], [3840, 1, 60]),
-            ([40, 60], [60, 1], [1, 40, 64], [64, 60, 1]),
-            ([40, 64], [64, 1], [1, 64, 64], [4096, 1, 64]),
-            ([40, 64], [64, 1], [1, 40, 64], [64, 64, 1]),
-            ([40, 120], [120, 1], [1, 120, 64], [7680, 1, 120]),
-            ([40, 120], [120, 1], [2, 40, 64], [64, 120, 1]),
-            ([40, 128], [128, 1], [1, 128, 64], [8192, 1, 128]),
-            ([40, 128], [128, 1], [2, 40, 64], [64, 128, 1]),
-            ([40, 240], [240, 1], [1, 240, 64], [15360, 1, 240]),
-            ([40, 240], [240, 1], [4, 40, 64], [64, 240, 1]),
-            ([40, 256], [256, 1], [1, 256, 64], [16384, 1, 256]),
-            ([40, 256], [256, 1], [4, 40, 64], [64, 256, 1]),
+            ([60], [1], [1, 64], [60, 1], [0]),
+            ([64], [1], [1, 64], [64, 1], [0]),
+            ([120], [1], [2, 64], [64, 1], [0]),
+            ([128], [1], [2, 64], [64, 1], [0]),
+            ([240], [1], [4, 64], [64, 1], [0]),
+            ([256], [1], [4, 64], [64, 1], [0]),
+            ([40, 60], [60, 1], [1, 60, 64], [60 * 60, 1, 60], [1, 0]),
+            ([40, 60], [60, 1], [1, 40, 64], [60, 60, 1], [0, 1]),
+            ([40, 64], [64, 1], [1, 64, 64], [60 * 64, 1, 64], [1, 0]),
+            ([40, 64], [64, 1], [1, 40, 64], [64, 64, 1], [0, 1]),
+            ([40, 120], [120, 1], [1, 120, 64], [120 * 64, 1, 120], [1, 0]),
+            ([40, 120], [120, 1], [2, 40, 64], [64, 120, 1], [0, 1]),
+            ([40, 128], [128, 1], [1, 128, 64], [128 * 40, 1, 128], [1, 0]),
+            ([40, 128], [128, 1], [2, 40, 64], [64, 128, 1], [0, 1]),
+            ([40, 240], [240, 1], [1, 240, 64], [240 * 40, 1, 240], [1, 0]),
+            ([40, 240], [240, 1], [4, 40, 64], [64, 240, 1], [0, 1]),
+            ([40, 256], [256, 1], [1, 256, 64], [256 * 40, 1, 256], [1, 0]),
+            ([40, 256], [256, 1], [4, 40, 64], [64, 256, 1], [0, 1]),
         ],
     )
-    def test_to_spyre_layout_explicit(self, sizes, strides, device_size, stride_map):
+    def test_to_spyre_layout_explicit(
+        self, sizes, strides, device_size, stride_map, dim_order
+    ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([40, 60], [60, 1], [1, 512, 64], [3840, 1, 60]),
-            ([40, 60], [60, 1], [1, 512, 64], [64, 60, 1]),
-            ([40, 64], [64, 1], [1, 512, 64], [4096, 1, 64]),
-            ([40, 64], [64, 1], [1, 512, 64], [64, 64, 1]),
-            ([40, 120], [120, 1], [1, 512, 64], [7680, 1, 120]),
-            ([40, 120], [120, 1], [2, 512, 64], [64, 120, 1]),
-            ([40, 128], [128, 1], [1, 512, 64], [8192, 1, 128]),
-            ([40, 128], [128, 1], [2, 512, 64], [64, 128, 1]),
-            ([40, 240], [240, 1], [1, 512, 64], [15360, 1, 240]),
-            ([40, 240], [240, 1], [4, 512, 64], [64, 240, 1]),
-            ([40, 256], [256, 1], [1, 512, 64], [16384, 1, 256]),
-            ([40, 256], [256, 1], [4, 512, 64], [64, 256, 1]),
+            ([40, 60], [60, 1], [1, 512, 64], [60 * 60, 1, 60], [1, 0]),
+            ([40, 60], [60, 1], [1, 512, 64], [60, 60, 1], [0, 1]),
+            ([40, 64], [64, 1], [1, 512, 64], [64 * 40, 1, 64], [1, 0]),
+            ([40, 64], [64, 1], [1, 512, 64], [64, 64, 1], [0, 1]),
+            ([40, 120], [120, 1], [1, 512, 64], [120 * 40, 1, 120], [1, 0]),
+            ([40, 120], [120, 1], [2, 512, 64], [64, 120, 1], [0, 1]),
+            ([40, 128], [128, 1], [1, 512, 64], [128 * 40, 1, 128], [1, 0]),
+            ([40, 128], [128, 1], [2, 512, 64], [64, 128, 1], [0, 1]),
+            ([40, 240], [240, 1], [1, 512, 64], [240 * 40, 1, 240], [1, 0]),
+            ([40, 240], [240, 1], [4, 512, 64], [64, 240, 1], [0, 1]),
+            ([40, 256], [256, 1], [1, 512, 64], [256 * 40, 1, 256], [1, 0]),
+            ([40, 256], [256, 1], [4, 512, 64], [64, 256, 1], [0, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_padding(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, dim_order
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([60], [1], [1, 512, 64], [64, 0, 1]),
+            ([60], [1], [1, 512, 64], [60, 0, 1], [0]),
         ],
     )
     def test_to_spyre_layout_explicit_expanding(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, dim_order
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -334,7 +463,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(0, 1): sizes[0] * sizes[1]},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -342,10 +474,10 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([60], [1], [1, 1, 64], [64, 60, 1]),
-            ([60], [1], [1, 1, 1, 64], [60, 64, 60, 1]),
-            ([60], [1], [1, 1, 1, 1, 64], [60, 60, 64, 60, 1]),
-            ([60], [1], [1, 1, 1, 1, 1, 64], [60, 60, 60, 64, 60, 1]),
+            ([60], [1], [1, 1, 64], [60, 60, 1]),
+            ([60], [1], [1, 1, 1, 64], [60, 60, 60, 1]),
+            ([60], [1], [1, 1, 1, 1, 64], [60, 60, 60, 60, 1]),
+            ([60], [1], [1, 1, 1, 1, 1, 64], [60, 60, 60, 60, 60, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_leading_ones(
@@ -353,7 +485,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -361,10 +496,10 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([60], [1], [1, 60, 64], [64, 1, 1]),
-            ([60], [1], [1, 1, 60, 64], [1, 64, 1, 1]),
-            ([60], [1], [1, 1, 1, 60, 64], [1, 1, 64, 1, 1]),
-            ([60], [1], [1, 1, 1, 1, 60, 64], [1, 1, 1, 64, 1, 1]),
+            ([60], [1], [1, 60, 64], [0, 1, 0]),
+            ([60], [1], [1, 1, 60, 64], [1, 0, 1, 0]),
+            ([60], [1], [1, 1, 1, 60, 64], [1, 1, 0, 1, 0]),
+            ([60], [1], [1, 1, 1, 1, 60, 64], [1, 1, 1, 0, 1, 0]),
         ],
     )
     def test_to_spyre_layout_explicit_trailing_ones(
@@ -372,7 +507,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -380,17 +518,17 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([60], [1], [1, 2, 64], [64, 30, 1]),
-            ([60], [1], [2, 1, 2, 64], [15, 64, 30, 1]),
-            ([60], [1], [2, 1, 1, 2, 64], [15, 15, 64, 30, 1]),
-            ([60], [1], [1, 2, 1, 2, 64], [30, 15, 64, 30, 1]),
-            ([60], [1], [2, 2, 1, 1, 64], [30, 15, 64, 60, 1]),
-            ([60], [1], [2, 1, 1, 1, 2, 64], [15, 15, 15, 64, 30, 1]),
-            ([60], [1], [1, 2, 1, 1, 2, 64], [30, 15, 15, 64, 30, 1]),
-            ([60], [1], [1, 1, 2, 1, 2, 64], [30, 30, 15, 64, 30, 1]),
-            ([60], [1], [2, 2, 1, 1, 1, 64], [30, 15, 15, 64, 60, 1]),
-            ([60], [1], [2, 1, 2, 1, 1, 64], [30, 30, 15, 64, 60, 1]),
-            ([60], [1], [1, 2, 2, 1, 1, 64], [60, 30, 15, 64, 60, 1]),
+            ([60], [1], [1, 2, 64], [30, 30, 1]),
+            ([60], [1], [2, 1, 2, 64], [15, 15, 30, 1]),
+            ([60], [1], [2, 1, 1, 2, 64], [15, 15, 15, 30, 1]),
+            ([60], [1], [1, 2, 1, 2, 64], [30, 15, 15, 30, 1]),
+            ([60], [1], [2, 2, 1, 1, 64], [30, 15, 15, 60, 1]),
+            ([60], [1], [2, 1, 1, 1, 2, 64], [15, 15, 15, 15, 30, 1]),
+            ([60], [1], [1, 2, 1, 1, 2, 64], [30, 15, 15, 15, 30, 1]),
+            ([60], [1], [1, 1, 2, 1, 2, 64], [30, 30, 15, 15, 30, 1]),
+            ([60], [1], [2, 2, 1, 1, 1, 64], [30, 15, 15, 15, 60, 1]),
+            ([60], [1], [2, 1, 2, 1, 1, 64], [30, 30, 15, 15, 60, 1]),
+            ([60], [1], [1, 2, 2, 1, 1, 64], [60, 30, 15, 15, 60, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_viewing(
@@ -398,7 +536,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -407,10 +548,10 @@ class TestSpyreTensorLayout(TestCase):
         "sizes,strides,device_size,stride_map",
         [
             ([4800], [1], [3, 2, 14, 64], [120, 64, 360, 1]),
-            ([40, 60], [60, 1], [24, 1, 2, 64], [60, 64, 1440, 1]),
-            ([40, 60], [60, 1], [2, 12, 1, 2, 64], [720, 60, 64, 1200, 1]),
-            ([40, 60], [60, 1], [2, 6, 2, 1, 2, 64], [720, 120, 60, 64, 1200, 1]),
-            ([40, 60], [60, 1], [3, 4, 3, 1, 2, 64], [600, 180, 60, 64, 1800, 1]),
+            ([40, 60], [60, 1], [24, 1, 2, 64], [60, 50, 1440, 1]),
+            ([40, 60], [60, 1], [2, 12, 1, 2, 64], [720, 60, 60, 1200, 1]),
+            ([40, 60], [60, 1], [2, 6, 2, 1, 2, 64], [720, 120, 60, 60, 1200, 1]),
+            ([40, 60], [60, 1], [3, 4, 3, 1, 2, 64], [600, 180, 60, 60, 1800, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_tiling(
@@ -418,7 +559,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -427,8 +571,8 @@ class TestSpyreTensorLayout(TestCase):
         "sizes,strides,device_size,stride_map",
         [
             # Permuted [60, 40] to [40, 60]
-            ([40, 60], [1, 40], [1, 40, 64], [2560, 1, 40]),
-            ([40, 60], [1, 40], [1, 60, 64], [64, 40, 1]),
+            ([40, 60], [1, 40], [1, 40, 64], [40 * 60, 1, 40]),
+            ([40, 60], [1, 40], [1, 60, 64], [40, 40, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_permuted(
@@ -436,7 +580,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -444,7 +591,7 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([120], [1], [1, 64], [64, 1]),
+            ([120], [1], [1, 64], [60, 1]),
             ([128], [1], [1, 64], [64, 1]),
             ([240], [1], [2, 64], [64, 1]),
             ([256], [1], [2, 64], [64, 1]),
@@ -457,8 +604,15 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[sizes[0] // 2 :]
+        sliced_sizes = list(x_sliced.shape)
+        sliced_strides = list(x_sliced.stride())
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(
+                sliced_sizes, sliced_strides, device_size, stride_map
+            ),
         )
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())
@@ -474,20 +628,38 @@ class TestSpyreTensorLayout(TestCase):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[:, sizes[1] // 2 :]
         x_dev = x_sliced.to("spyre")
-        # Sliced tensors (that are not sliced along the batch dimension) are
-        # non-dense but produce dense tensors when transferred across devices.
-        # This requires an update the the stride_map after the device transfer
-        # for all non-dense dimensions.
-        # Once this is implemented, this test should pass.
         self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
 
-    @unittest.skip(
-        "Skip until device transfers are updated to account for overlapping tensors"
+    @parametrize(
+        "sizes,strides",
+        [
+            ([40, 128], [1, 40]),
+            ([128, 40], [1, 128]),
+        ],
     )
+    def test_to_spyre_permuted_sliced_batch(self, sizes, strides):
+        x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        x_sliced = x[(sizes[0] // 2) :, :]
+        x_dev = x_sliced.to("spyre")
+        self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
+
+    @parametrize(
+        "sizes,strides",
+        [
+            ([40, 128], [1, 40]),
+            ([128, 40], [1, 128]),
+        ],
+    )
+    def test_to_spyre_permuted_sliced_other(self, sizes, strides):
+        x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        x_sliced = x[:, (sizes[1] // 2) :]
+        x_dev = x_sliced.to("spyre")
+        self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
+
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([1, 60], [60, 1], [1, 512, 64], [64, 0, 1]),
+            ([1, 60], [60, 1], [1, 512, 64], [60, 0, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_expanded(
@@ -495,7 +667,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -511,6 +686,179 @@ class TestSpyreTensorLayout(TestCase):
         # Once this is implemented, this test should pass.
         self.assertEqual(x_expanded.contiguous(), x_dev.cpu())
 
+    def _assert_d2h_bytes(self, prof, expected):
+        with TemporaryFileName(mode="w+") as trace_path:
+            prof.export_chrome_trace(trace_path)
+            with open(trace_path) as trace:
+                copies = [
+                    event
+                    for event in json.load(trace)["traceEvents"]
+                    if event.get("cat") == "gpu_memcpy" and "DtoH" in event["name"]
+                ]
+        self.assertTrue(copies, "The profiler must record the actual device transfer")
+        self.assertEqual(
+            sum(event.get("args", {}).get("bytes", 0) for event in copies), expected
+        )
+
+    @parametrize(
+        "dtype,device_format",
+        [
+            (torch.float16, DataFormats.SEN169_FP16),
+            (torch.bfloat16, DataFormats.SEN169_FP16),
+            (torch.int64, DataFormats.IEEE_INT32),
+            (torch.float32, DataFormats.IEEE_FP32),
+        ],
+    )
+    @parametrize("width", [128, 130])
+    @parametrize("row", [0, 3, 7])
+    def test_d2h_row_view_transfers_only_covered_sticks(
+        self, dtype, device_format, width, row
+    ):
+        rows = 8
+        # A period coprime to the row widths makes wrong-row reads observable.
+        host = (
+            ((torch.arange(rows * width) % 251) - 125).to(dtype).reshape(1, rows, width)
+        )
+        eps = device_format.elems_per_stick()
+        sticks = (width + eps - 1) // eps
+        # The row-major physical layout produced by the compiled LM head.
+        layout = SpyreTensorLayout(
+            [rows, sticks, 1, eps],
+            [width, eps, -1, 1],
+            device_format,
+            {(0,): rows, (1, 3): width, (2,): 1},
+        )
+        device = host.to("spyre", device_layout=layout)
+        view = device[:, row, :]
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = view.cpu()
+        torch.testing.assert_close(actual, host[:, row, :], rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, sticks * 128)
+
+    @parametrize(
+        "dtype,device_format",
+        [
+            (torch.float16, DataFormats.SEN169_FP16),
+            (torch.float32, DataFormats.IEEE_FP32),
+        ],
+    )
+    @parametrize("start,stop", [(5, 31), (64, 128), (5, 67), (65, 130)])
+    @parametrize("row", [0, 3, 7])
+    def test_d2h_partial_stick_view_transfer(
+        self, dtype, device_format, start, stop, row
+    ):
+        rows, width = 8, 130
+        host = ((torch.arange(rows * width) % 251) - 125).to(dtype).reshape(rows, width)
+        eps = device_format.elems_per_stick()
+        layout = SpyreTensorLayout(
+            [rows, (width + eps - 1) // eps, eps],
+            [width, eps, 1],
+            device_format,
+            {(0,): rows, (1, 2): width},
+        )
+        device = host.to("spyre", device_layout=layout)
+        # Offsets within one stick and aligned multi-stick slices can use DCI
+        # directly. Crossing a tile from an unaligned start uses the existing
+        # full-allocation CPU staging fallback in spyre_copy_from.
+        # A slice within one stick must transfer just that stick and preserve
+        # the source displacement within it during data conversion.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[row, start:stop].cpu()
+        torch.testing.assert_close(actual, host[row, start:stop], rtol=0, atol=0)
+        if start % eps and start % eps + stop - start > eps:
+            expected_bytes = rows * ((width + eps - 1) // eps) * 128
+        else:
+            expected_bytes = ((stop + eps - 1) // eps - start // eps) * 128
+        self._assert_d2h_bytes(prof, expected_bytes)
+
+    def test_d2h_strided_batch_slice_and_destination_dtype(self):
+        host = (
+            ((torch.arange(2 * 8 * 128) % 251) - 125)
+            .to(torch.float16)
+            .reshape(2, 8, 128)
+        )
+        layout = SpyreTensorLayout(
+            [2, 8, 2, 1, 64],
+            [1024, 128, 64, 0, 1],
+            DataFormats.SEN169_FP16,
+            {(0,): 2, (1,): 8, (2, 4): 128, (3,): 1},
+        )
+        device = host.to("spyre", device_layout=layout)
+        # The bounded descriptor must preserve source strides when rebasing.
+        # Flex then compacts the two selected rows, omitting the gap and using
+        # the device item size even though the CPU destination is float32.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[:, 3, :].to(device="cpu", dtype=torch.float32)
+        torch.testing.assert_close(actual, host[:, 3, :].float(), rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, 2 * 128 * 2)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_d2h_slice_to_larger_host_dtype(self, dtype):
+        host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
+        layout = SpyreTensorLayout(
+            [8, 2, 64], [128, 64, 1], DataFormats.SEN169_FP16, {(0,): 8, (1, 2): 128}
+        )
+        device = host.to("spyre", device_layout=layout)
+        # The 512-byte destination needs more capacity than the 256-byte DMA.
+        # Flex must receive the CPU storage capacity, not the staging buffer size.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[3].to(device="cpu", dtype=torch.float32)
+        torch.testing.assert_close(actual, host[3].float(), rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, 256)
+
+    @parametrize(
+        "dtype,device_format",
+        [(torch.float32, DataFormats.BFLOAT16), (torch.int32, DataFormats.IEEE_INT64)],
+    )
+    def test_d2h_other_storage_formats_use_flex_slice_transfer(
+        self, dtype, device_format
+    ):
+        host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
+        eps = device_format.elems_per_stick()
+        layout = SpyreTensorLayout(
+            [8, 128 // eps, eps],
+            [128, eps, 1],
+            device_format,
+            {(0,): 8, (1, 2): 128},
+        )
+        device = host.to("spyre", device_layout=layout)
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[3].cpu()
+        torch.testing.assert_close(actual, host[3], rtol=0, atol=0)
+        # torch-spyre leaves these allocation descriptors unchanged. Flex still
+        # transfers just the selected row, using its explicit device encoding.
+        self._assert_d2h_bytes(prof, (128 // eps) * 128)
+
     def test_to_layout_patched(self):
         x = torch.rand([512, 256], dtype=torch.float16)
         x_stl = SpyreTensorLayout([512, 256], torch.float16)
@@ -519,6 +867,27 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x_dev, x_dev.cpu())
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
+
+    def test_to_same_layout_honors_a_different_explicit_device(self):
+        """A matching layout must not bypass an explicit cross-device copy."""
+        if torch.spyre.device_count() < 2:
+            self.skipTest("requires at least two Spyre devices")
+
+        previous = torch.spyre.current_device()
+        target = torch.device("spyre", (previous + 1) % torch.spyre.device_count())
+        x = torch.rand([128, 256], dtype=torch.float16)
+        layout = SpyreTensorLayout(list(x.shape), x.dtype)
+        source = x.to(torch.device("spyre", previous), device_layout=layout)
+
+        result = source.to(target, device_layout=layout)
+
+        self.assertIsNot(result, source)
+        self.assertEqual(source.device, torch.device("spyre", previous))
+        self.assertEqual(result.device, target)
+        self.assertEqual(result.device_tensor_layout(), layout)
+        round_trip = result.to(source.device, device_layout=layout, copy=True)
+        torch.testing.assert_close(round_trip.cpu(), x, rtol=2e-3, atol=1e-4)
+        self.assertEqual(torch.spyre.current_device(), previous)
 
     def test_empty_layout_patched(self):
         x_stl = SpyreTensorLayout(
@@ -540,7 +909,7 @@ class TestSpyreTensorLayout(TestCase):
         # without being loose enough to mask a genuine regression.
         self.assertEqual(x, x_dev.cpu(), atol=1e-3, rtol=1e-3)
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(x_stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(x_stl.stride_map, [1, 0, 256, 0])
 
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
@@ -623,10 +992,12 @@ class TestSpyreTensorLayout(TestCase):
         def project(x, weight, residual):
             return torch.nn.functional.linear(x, weight) + residual
 
+        _fact_ds = [L, D // 64, H, 64]
         factorized_layout = SpyreTensorLayout(
-            [L, D // 64, H, 64],
+            _fact_ds,
             [hidden, 64, D, 1],
             get_device_dtype(torch.float16),
+            {(0,): L, (1, 3): D, (2,): H},
         )
         flattened = x.to(device_layout=factorized_layout)
         self.assertEqual(flattened.device_tensor_layout(), factorized_layout)
@@ -674,6 +1045,917 @@ class TestSpyreTensorLayout(TestCase):
             weight.to("spyre"),
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
+    def test_rescale_for_dtype_rounds_the_num_sticks_dim_up(self):
+        """A num-sticks dim that does not hold a whole number of output sticks
+        rounds up, so that padded and unpadded inputs describing the same live
+        elements yield the same layout: three fp32 sticks and four both hold 96
+        live elements and both describe two fp16 sticks.
+        ``insert_staggered_ea_padding`` sizes the wide side's padding from this
+        layout (issue #3999).
+
+        Rounding up also keeps a single input stick from flooring to a size-0
+        dim, which described no tensor and reached ``get_device_stride_infos`` to
+        divide by it and kill the process with SIGFPE (issue #3604). Needs no
+        device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp32 = get_device_dtype(torch.float32)
+
+        def rescaled(num_sticks, extent):
+            stl = SpyreTensorLayout(
+                [num_sticks, 4, 32],
+                [32, extent, 1],
+                fp32,
+                {(0, 2): extent, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+            host_size = [4, extent]
+            return rescale_stl_for_dtype(
+                stl,
+                torch.float16,
+                ElementArrangement.STANDARD,
+                _host_layout(torch.float32, host_size),
+                _dep("buf", host_size),
+            )
+
+        # One fp32 stick: a whole fp16 stick, never a size-0 dim.
+        self.assertEqual(list(rescaled(1, 32).device_size), [1, 4, 64])
+        # Three fp32 sticks (96 elements) span two fp16 sticks; flooring to one
+        # would drop 32 elements.
+        self.assertEqual(list(rescaled(3, 96).device_size), [2, 4, 64])
+        # Four, the padded form of the same 96 live elements, agrees.
+        self.assertEqual(list(rescaled(4, 96).device_size), [2, 4, 64])
+        # An exact ratio rescales the dim and its stride.
+        self.assertEqual(list(rescaled(4, 128).device_size), [2, 4, 64])
+        self.assertEqual(list(rescaled(4, 128).stride_map), [64, 128, 1])
+
+    def test_rescale_for_dtype_leaves_a_sub_stick_dim_alone(self):
+        """A num-sticks stride below the input's elements per stick marks a stick
+        dim shorter than one stick: the entry is the host extent, not a stick
+        step, and the dim already counts the single stick that extent occupies.
+        Rescaling it would claim stepping the host tensor does not have, which
+        the layout validator rejects, so only the elements per stick change. The
+        extra capacity a widening conversion needs is added by
+        ``insert_staggered_ea_padding``, which pads the one buffer that needs it
+        rather than sending a grown dim into every downstream consumer.
+
+        A sentinel num-sticks slot (0, a dim that is extent 1 by construction
+        and never stepped) is left alone for the same reason. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+        # Host extent 5 at fp16: the num-sticks stride is the extent, not 64.
+        sub_stick = SpyreTensorLayout(
+            [3, 1, 2, 64],
+            [5, 5, 15, 1],
+            fp16,
+            {(0,): 3, (1, 3): 5, (2,): 2},
+            ElementArrangement.STANDARD,
+        )
+        out = rescale_stl_for_dtype(
+            sub_stick,
+            torch.float32,
+            ElementArrangement.STANDARD,
+            _host_layout(torch.float16, [2, 3, 5]),
+            _dep("buf", [2, 3, 5]),
+        )
+        self.assertEqual(list(out.device_size), [3, 1, 2, 32])
+        self.assertEqual(list(out.stride_map), [5, 5, 15, 1])
+
+        scalar = SpyreTensorLayout(
+            [1, 64], [0, 0], fp16, {(0, 1): 1}, ElementArrangement.STANDARD
+        )
+        scalar_out = rescale_stl_for_dtype(
+            scalar,
+            torch.float32,
+            ElementArrangement.STANDARD,
+            _host_layout(torch.float16, [1]),
+            _dep("buf", [1]),
+        )
+        self.assertEqual(list(scalar_out.device_size), [1, 32])
+        self.assertEqual(list(scalar_out.stride_map), [0, 0])
+
+    def test_rescale_for_dtype_rejects_a_stick_with_no_dim_counting_its_sticks(self):
+        """A layout with no device dim to count its sticks has none to resize. 16
+        tokens on the stick of a ``[16, 4096]`` hidden state read at ``[d1, d0]``.
+        Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout(
+            [4096, 64],
+            [1, 4096],
+            fp16,
+            {(0,): 4096, (1,): 16},
+            ElementArrangement.STANDARD,
+        )
+        host_size = [16, 4096]
+        with self.assertRaises(Unsupported):
+            rescale_stl_for_dtype(
+                stl,
+                torch.float32,
+                ElementArrangement.DL16_TO_FP32,
+                _host_layout(torch.float16, host_size),
+                _dep("buf", host_size),
+            )
+
+    def test_typecast_of_a_bool_takes_its_backing_format_arrangement(self):
+        """A bool cast takes the element arrangement of its backing format. An
+        fp32-backed bool cast to fp16 converts as fp32 -> fp16, so its output is
+        FP32_TO_DL16; a bool backed by a format with no logical equivalent is
+        unsupported. Needs no device.
+        """
+        from torch_spyre._C import DataFormats, ElementArrangement
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.propagate_layouts import _typecast_layouts
+
+        host_size = [4, 64]
+        in_layout = _host_layout(torch.bool, host_size)
+        output = _host_layout(torch.float16, host_size)
+        dep, output_dep = _dep("buf", host_size), _dep("out", host_size)
+
+        def bool_backed_by(device_dtype):
+            return SpyreTensorLayout(
+                [2, 4, 32],
+                [32, 64, 1],
+                device_dtype,
+                {(0, 2): 64, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+
+        layouts = _typecast_layouts(
+            output, output_dep, dep, in_layout, bool_backed_by(DataFormats.IEEE_FP32)
+        )
+        self.assertTrue(layouts)
+        self.assertEqual(
+            {stl.element_arrangement for stl in layouts},
+            {ElementArrangement.FP32_TO_DL16},
+        )
+        with self.assertRaises(Unsupported):
+            _typecast_layouts(
+                output,
+                output_dep,
+                dep,
+                in_layout,
+                bool_backed_by(DataFormats.IEEE_INT32),
+            )
+
+    def test_convert_of_a_stick_with_no_dim_counting_its_sticks_reads_as_a_slice(
+        self,
+    ):
+        """A layout with no device dim to count its sticks reads as a slice; the
+        same tokens with a size-1 dim to count them read whole. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _can_rescale_input_stl
+
+        fp16 = get_device_dtype(torch.float16)
+        host_size = [16, 4096]
+        in_layout = _host_layout(torch.float16, host_size)
+        output = _host_layout(torch.float32, host_size)
+        dep, output_dep = _dep("buf", host_size), _dep("out", host_size)
+        uncounted = SpyreTensorLayout(
+            [4096, 64],
+            [1, 4096],
+            fp16,
+            {(0,): 4096, (1,): 16},
+            ElementArrangement.STANDARD,
+        )
+        counted = SpyreTensorLayout(
+            [1, 4096, 64],
+            [65536, 1, 4096],
+            fp16,
+            {(0, 2): 16, (1,): 4096},
+            ElementArrangement.STANDARD,
+        )
+        self.assertFalse(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, uncounted)
+        )
+        self.assertTrue(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, counted)
+        )
+
+    def test_rescale_for_dtype_rejects_a_folded_num_sticks_dim(self):
+        """A num-sticks dim that also steps other host dims is not bounded by the
+        stick dim's host size. q read as ``[1, 2, 128]`` heads from qkv's
+        ``[1, 768]`` layout lays the heads end to end on one device dim, at
+        ``2*head + floor(elem/64)``; sizing it from head_dim would convert one
+        head. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+        qkv_stl = SpyreTensorLayout(
+            [12, 1, 64],
+            [64, 0, 1],
+            fp16,
+            {(0, 2): 768, (1,): 1},
+            ElementArrangement.STANDARD,
+        )
+        host_size = [1, 2, 128]
+        with self.assertRaises(AssertionError):
+            rescale_stl_for_dtype(
+                qkv_stl,
+                torch.float32,
+                ElementArrangement.STANDARD,
+                _host_layout(torch.float16, host_size),
+                _dep("buf", host_size),
+            )
+
+    def test_convert_of_a_folded_heads_view_reads_as_a_slice(self):
+        """A heads view keeping qkv's layout reads as a slice, though its host
+        size and index match the output's; the heads view's own layout reads
+        whole. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import (
+            _can_rescale_input_stl,
+        )
+
+        fp16 = get_device_dtype(torch.float16)
+        host_size = [1, 2, 128]
+        in_layout = _host_layout(torch.float16, host_size)
+        output = _host_layout(torch.float32, host_size)
+        dep, output_dep = _dep("buf", host_size), _dep("out", host_size)
+        qkv_stl = SpyreTensorLayout(
+            [12, 1, 64],
+            [64, 0, 1],
+            fp16,
+            {(0, 2): 768, (1,): 1},
+            ElementArrangement.STANDARD,
+        )
+        heads_stl = SpyreTensorLayout(
+            [1, 2, 2, 64],
+            [0, 64, 128, 1],
+            fp16,
+            {(0,): 1, (1, 3): 128, (2,): 2},
+            ElementArrangement.STANDARD,
+        )
+        self.assertFalse(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, qkv_stl)
+        )
+        self.assertTrue(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, heads_stl)
+        )
+
+    def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
+        """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:
+        one fp16 stick becomes one (half-filled) 128-element fp8 stick, never a
+        size-0 dim."""
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+
+        def to_qfp8ch(num_sticks):
+            extent = 64 * num_sticks
+            stl = SpyreTensorLayout(
+                [num_sticks, 4, 64],
+                [64, extent, 1],
+                fp16,
+                {(0, 2): extent, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+            return rescale_stl_for_dtype(
+                stl,
+                torch.float8_e4m3fn,
+                ElementArrangement.QFP8CH,
+                _host_layout(torch.float16, [4, extent]),
+                _dep("buf", [4, extent]),
+            )
+
+        out = to_qfp8ch(1)
+        self.assertEqual(list(out.device_size), [1, 4, 128])
+        # The half-filled stick steps no host stick, so it keeps the host extent.
+        self.assertEqual(list(out.stride_map), [64, 64, 1])
+        self.assertEqual(out.element_arrangement, ElementArrangement.QFP8CH)
+        self.assertEqual(list(to_qfp8ch(3).device_size), [2, 4, 128])
+        self.assertEqual(list(to_qfp8ch(2).device_size), [1, 4, 128])
+
+    def test_fp8_to_fp16_layout_counts_the_live_sticks(self):
+        """The fp8 -> fp16 conversion after qfp8ch lays its output out by the
+        sticks the live elements reach: 192 elements take 3 fp16 sticks. The
+        fourth that the conversion writes is added by insert_staggered_ea_padding
+        (test_pad_fp8_to_fp16_output_to_whole_fp8_sticks). Needs no device."""
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import (
+            _typecast_layouts,
+            rescale_stl_for_dtype,
+        )
+
+        fp16 = get_device_dtype(torch.float16)
+
+        def dequantized_sticks(extent):
+            num_sticks = extent // 64
+            fp16_stl = SpyreTensorLayout(
+                [num_sticks, 4, 64],
+                [64, extent, 1],
+                fp16,
+                {(0, 2): extent, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+            fp8_stl = rescale_stl_for_dtype(
+                fp16_stl,
+                torch.float8_e4m3fn,
+                ElementArrangement.QFP8CH,
+                _host_layout(torch.float16, [4, extent]),
+                _dep("x", [4, extent]),
+            )
+            [out] = _typecast_layouts(
+                _host_layout(torch.float16, [4, extent]),
+                _dep("y", [4, extent]),
+                _dep("x", [4, extent]),
+                _host_layout(torch.float8_e4m3fn, [4, extent]),
+                fp8_stl,
+            )
+            self.assertEqual(list(out.stride_map), [64, extent, 1])
+            return out.device_size[0]
+
+        self.assertEqual(
+            [dequantized_sticks(e) for e in [64, 128, 192, 256, 320]], [1, 2, 3, 4, 5]
+        )
+
+    def test_offset_stick_conversion_writes_from_a_restickified_input(self):
+        """An upcast reading ``x[:, 32:96]`` of an fp16 ``[64, 128]`` starts its
+        input stick mid-stick, which the whole-stick conversion cannot read. Its
+        only layout is the one written from the input restickified onto the
+        rows, so the output's stick walks the row variable. Needs no device."""
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _typecast_layouts
+
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout(
+            [2, 64, 64],
+            [64, 128, 1],
+            fp16,
+            {(0, 2): 128, (1,): 64},
+            ElementArrangement.STANDARD,
+        )
+        d0, d1 = (sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in (0, 1))
+        sliced_read = MemoryDep("x", 128 * d0 + d1 + 32, (d0, d1), (64, 64))
+        [out] = _typecast_layouts(
+            _host_layout(torch.float32, [64, 64]),
+            _dep("y", [64, 64]),
+            sliced_read,
+            _host_layout(torch.float16, [64, 128]),
+            stl,
+        )
+        self.assertEqual(list(out.device_size), [2, 64, 32])
+        self.assertEqual(list(out.stride_map), [2048, 1, 64])
+        self.assertEqual(out.element_arrangement, ElementArrangement.DL16_TO_FP32)
+
+    def test_qfp8ch_layout_rescales_the_stick_count_dim_not_a_row_dim(self):
+        """A sequence-rows dim with the stick stride, placed first, must not be
+        taken for the stick-count dim: for a head_dim of 64 the only count dim is
+        the size-1 one, and the rows keep their size and stride. Needs no
+        device."""
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+        host_size = [2, 8, 64, 64]
+        stl = SpyreTensorLayout(
+            [8, 64, 1, 2, 64],
+            [4096, 64, 64, 32768, 1],
+            fp16,
+            {(0,): 8, (1,): 64, (2, 4): 64, (3,): 2},
+            ElementArrangement.STANDARD,
+        )
+        out = rescale_stl_for_dtype(
+            stl,
+            torch.float8_e4m3fn,
+            ElementArrangement.QFP8CH,
+            _host_layout(torch.float16, host_size),
+            _dep("buf", host_size),
+        )
+        self.assertEqual(list(out.device_size), [8, 64, 1, 2, 128])
+        self.assertEqual(list(out.stride_map[:2]), [4096, 64])
+
+    def test_qfp8wt_layout_puts_k_next_to_the_stick(self):
+        """qfp8wt's QFP8WT output pairs K with N in a 2D stick, but the device
+        layout records only a 1D stick of N. The layout places K directly
+        outside the stick, so K is device dim -2 at every rank and readers can
+        take it from there. Rank 2 keeps its existing layout."""
+        from torch._inductor.ir import FixedLayout
+
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _qfp8wt_stl
+
+        def contiguous(size):
+            stride, acc = [], 1
+            for s in reversed(size):
+                stride.insert(0, acc)
+                acc *= s
+            return stride
+
+        cases = {
+            # host [..., K, N]: (expected device_size, expected stride_map)
+            (128, 256): ([2, 128, 128], [128, 256, 1]),
+            (4, 128, 64): ([4, 1, 128, 128], [8192, 64, 64, 1]),
+            (2, 12, 128, 128): ([2, 12, 1, 128, 128], [196608, 16384, 128, 128, 1]),
+            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [0, 98304, 128, 384, 1]),
+        }
+        cpu = torch.device("cpu")
+        for size, (device_size, stride_map) in cases.items():
+            with self.subTest(size=size):
+                size = list(size)
+                out = _qfp8wt_stl(
+                    FixedLayout(cpu, torch.float8_e4m3fn, size, contiguous(size)),
+                    FixedLayout(cpu, torch.float16, size, contiguous(size)),
+                )
+                self.assertEqual(out.element_arrangement, ElementArrangement.QFP8WT)
+                self.assertEqual(list(out.device_size), device_size)
+                self.assertEqual(list(out.stride_map), stride_map)
+                # K: device dim -2, with K's host stride.
+                self.assertEqual(out.device_size[-2], size[-2])
+                self.assertEqual(out.stride_map[-2], contiguous(size)[-2])
+
+    def test_explicit_layout_rejects_malformed_device_size(self):
+        """The explicit (device_size, stride_map) constructor validates the one
+        invariant every consumer assumes: non-negative device dims, one
+        stride_map entry each. A negative dim is rejected at construction
+        instead of crashing the process later. A size-0 dim is how an empty
+        tensor is laid out and stays legal; the degenerate size-0 dim behind
+        issue #3604 cannot arise, because rescale_stl_for_dtype rounds its
+        num-sticks dim up."""
+        from torch_spyre._C import ElementArrangement
+
+        fp16 = get_device_dtype(torch.float16)
+        with self.assertRaisesRegex(
+            RuntimeError, "device dimension 0 has negative size -1"
+        ):
+            SpyreTensorLayout(
+                [-1, 4, 64],
+                [64, 32, 1],
+                fp16,
+                {(0, 2): -1, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+        empty = SpyreTensorLayout(
+            [0, 4, 64],
+            [64, 32, 1],
+            fp16,
+            {(0, 2): 0, (1,): 4},
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(list(empty.device_size), [0, 4, 64])
+        self.assertEqual(get_device_size_in_bytes(empty), 0)
+        with self.assertRaisesRegex(RuntimeError, "stride_map has 2 entries for 3"):
+            SpyreTensorLayout(
+                [1, 4, 64],
+                [64, 1],
+                fp16,
+                {(0, 2): 64, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+        # -1 (legacy broadcast marker) is normalized to 0; values below -1 are
+        # rejected.
+        ok = SpyreTensorLayout(
+            [1, 4, 64],
+            [-1, 0, 1],
+            fp16,
+            {(0, 2): 64, (1,): 4},
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(list(ok.device_size), [1, 4, 64])
+        self.assertEqual(list(ok.stride_map), [0, 0, 1])
+        with self.assertRaisesRegex(RuntimeError, "not a valid stride"):
+            SpyreTensorLayout(
+                [1, 4, 64],
+                [-2, 0, 1],
+                fp16,
+                {(0, 2): 64, (1,): 4},
+                ElementArrangement.STANDARD,
+            )
+
+    def test_explicit_stl_minus_one_normalized_to_zero(self):
+        """stride_map -1 (legacy broadcast marker) is normalized to 0 in the
+        explicit (device_size, stride_map) constructor."""
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, -1, 1], fp16, {(0, 2): 64, (1,): 1})
+        self.assertEqual(list(stl.stride_map), [32, 0, 1])
+        self.assertEqual(list(stl.device_size), [2, 1, 32])
+
+    def test_stl_v3_pickle_minus_one_loads_as_zero(self):
+        """A v3 pickle written before the -1 -> 0 switch still loads, with 0."""
+        fp16_df = get_device_dtype(torch.float16)
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (3, [2, 1, 32], [32, -1, 1], fp16_df, ElementArrangement.STANDARD)
+        )
+        self.assertEqual(list(restored.stride_map), [32, 0, 1])
+
+    def test_stl_v4_pickle_minus_one_loads_as_zero(self):
+        """A v4 pickle written before the -1 -> 0 switch still loads, with 0."""
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df, {(0, 2): 64, (1,): 1})
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (
+                4,
+                [2, 1, 32],
+                [32, -1, 1],
+                fp16_df,
+                stl.element_arrangement,
+                dict(stl.valid_elements),
+            )
+        )
+        self.assertEqual(list(restored.stride_map), [32, 0, 1])
+
+    def test_stl_pickle_writes_v5(self):
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df, {(0, 2): 64, (1,): 1})
+        state = stl.__getstate__()
+        self.assertEqual(state[0], 5)
+        self.assertEqual(len(state), 6)
+
+    def test_fp32_to_dl16_output_partial_stick(self):
+        """FP32_TO_DL16: 3 fp32 sticks -> 2 fp16 sticks (issue #3999).
+
+        The output rounds up to whole fp16 sticks: 3*32=96 elements ->
+        ceil(96/64)=2 fp16 sticks.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp32 = get_device_dtype(torch.float32)
+        three_sticks = SpyreTensorLayout(
+            [3, 2, 32],
+            [32, 96, 1],
+            fp32,
+            {(0, 2): 96, (1,): 2},
+            ElementArrangement.STANDARD,
+        )
+        out = rescale_stl_for_dtype(
+            three_sticks,
+            torch.float16,
+            ElementArrangement.FP32_TO_DL16,
+            _host_layout(torch.float32, [2, 96]),
+            _dep("buf", [2, 96]),
+        )
+
+        # Output: 2 DL16 sticks of 64 elements.
+        self.assertEqual(list(out.device_size), [2, 2, 64])
+        self.assertEqual(list(out.stride_map), [64, 96, 1])
+        self.assertEqual(out.element_arrangement, ElementArrangement.FP32_TO_DL16)
+
+    def _conversion_op(self, in_dtype, in_stl, out_dtype, out_stl, host_size):
+        """A mock unary conversion ComputedBuffer and a graph holding its input.
+
+        Returns ``(op, in_buf, graph)``; a pass that pads the input replaces
+        ``in_buf.layout``, one that pads the output replaces ``op.layout``.
+        """
+        import unittest.mock as mock
+        import torch._inductor.ir as _ir
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        stride = _contiguous(host_size)
+        in_layout = FixedTiledLayout(
+            torch.device("spyre"), in_dtype, list(host_size), stride, in_stl
+        )
+        in_buf = mock.MagicMock()
+        in_buf.__class__ = _ir.ComputedBuffer
+        in_buf.get_layout.return_value = in_layout
+        in_buf.layout = in_layout
+
+        out_layout = FixedTiledLayout(
+            torch.device("spyre"), out_dtype, list(host_size), stride, out_stl
+        )
+        rw = mock.MagicMock()
+        rw.reads = [_dep("buf_in", host_size)]
+        rw.writes = [_dep("buf_out", host_size)]
+        op = mock.MagicMock()
+        op.__class__ = _ir.ComputedBuffer
+        op.get_layout.return_value = out_layout
+        op.layout = out_layout
+        op.get_read_writes.return_value = rw
+        op.get_name.return_value = "buf_out"
+        op.data = _ir.Pointwise.__new__(_ir.Pointwise)
+
+        graph = mock.MagicMock()
+        graph.get_buffer.return_value = in_buf
+        graph.operations = [op]
+        return op, in_buf, graph
+
+    def test_pad_downcast_input_fp32_partial_stick(self):
+        """_pad_downcast_input: 3-stick fp32 input expanded to 4 sticks (issue #3999).
+
+        After finalize_layouts, the fp32 input has device_size=[3,2,32] but the
+        FP32_TO_DL16 output requires 2*64/32=4 fp32 sticks of physical capacity.
+        _pad_downcast_input must grow device_size[0] from 3 to 4.
+
+        The stride_map values are the ones a real [2, 96] tensor carries: the row
+        dim steps a whole host row, 96, not the stick width. Giving it 32 would
+        make it share dim 0's step, which spyre_mem.cpp rejects.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.padding import insert_staggered_ea_padding
+
+        op, in_buf, graph = self._conversion_op(
+            torch.float32,
+            SpyreTensorLayout(
+                [3, 2, 32],
+                [32, 96, 1],
+                get_device_dtype(torch.float32),
+                {(0, 2): 96, (1,): 2},
+                ElementArrangement.STANDARD,
+            ),
+            torch.float16,
+            SpyreTensorLayout(
+                [2, 2, 64],
+                [64, 96, 1],
+                get_device_dtype(torch.float16),
+                {(0, 2): 96, (1,): 2},
+                ElementArrangement.FP32_TO_DL16,
+            ),
+            [2, 96],
+        )
+        insert_staggered_ea_padding(graph)
+
+        # After padding, input device_size[0] must be 4 (= 2*64/32).
+        padded_layout = in_buf.layout
+        self.assertIsInstance(padded_layout, FixedTiledLayout)
+        self.assertEqual(list(padded_layout.device_layout.device_size), [4, 2, 32])
+        # stride_map and stick dim are unchanged.
+        self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 96, 1])
+
+    def test_pad_downcast_input_fp16_to_fp8(self):
+        """qfp8ch's fp16 input spans every fp16 stick of the fp8 sticks it fills.
+
+        192 elements fill 2 fp8 sticks, which the conversion reads as 4 fp16
+        sticks, one more than the host extent needs. The pass reaches it through
+        the QFP8CH arrangement on the output.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.padding import insert_staggered_ea_padding
+
+        op, in_buf, graph = self._conversion_op(
+            torch.float16,
+            SpyreTensorLayout(
+                [3, 4, 64],
+                [64, 192, 1],
+                get_device_dtype(torch.float16),
+                {(0, 2): 192, (1,): 4},
+                ElementArrangement.STANDARD,
+            ),
+            torch.float8_e4m3fn,
+            SpyreTensorLayout(
+                [2, 4, 128],
+                [128, 192, 1],
+                get_device_dtype(torch.float8_e4m3fn),
+                {(0, 2): 192, (1,): 4},
+                ElementArrangement.QFP8CH,
+            ),
+            [4, 192],
+        )
+        insert_staggered_ea_padding(graph)
+
+        self.assertEqual(list(in_buf.layout.device_layout.device_size), [4, 4, 64])
+        self.assertEqual(list(in_buf.layout.device_layout.stride_map), [64, 192, 1])
+        # The fp8 output already holds whole fp8 sticks.
+        self.assertEqual(list(op.layout.device_layout.device_size), [2, 4, 128])
+
+    def test_pad_fp8_to_fp16_output_to_whole_fp8_sticks(self):
+        """The fp8 -> fp16 output spans both fp16 sticks of every fp8 stick.
+
+        The conversion writes each fp8 stick as two fp16 sticks, so 192 elements
+        (2 fp8 sticks) take 4 fp16 sticks although the live elements reach 3. The
+        output is STANDARD, so the pass reaches it by the elements per stick on
+        either side rather than by an arrangement.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.padding import insert_staggered_ea_padding
+
+        def padded_sticks(num_fp8_sticks, num_fp16_sticks, extent):
+            op, in_buf, graph = self._conversion_op(
+                torch.float8_e4m3fn,
+                SpyreTensorLayout(
+                    [num_fp8_sticks, 4, 128],
+                    [128, extent, 1],
+                    get_device_dtype(torch.float8_e4m3fn),
+                    {(0, 2): extent, (1,): 4},
+                    ElementArrangement.QFP8CH,
+                ),
+                torch.float16,
+                SpyreTensorLayout(
+                    [num_fp16_sticks, 4, 64],
+                    [64, extent, 1],
+                    get_device_dtype(torch.float16),
+                    {(0, 2): extent, (1,): 4},
+                    ElementArrangement.STANDARD,
+                ),
+                [4, extent],
+            )
+            insert_staggered_ea_padding(graph)
+            # The input is left alone.
+            self.assertEqual(in_buf.layout.device_layout.device_size[0], num_fp8_sticks)
+            self.assertEqual(list(op.layout.device_layout.stride_map), [64, extent, 1])
+            return op.layout.device_layout.device_size[0]
+
+        self.assertEqual(
+            [padded_sticks(*a) for a in [(1, 2, 128), (2, 3, 192), (3, 5, 320)]],
+            [2, 4, 6],
+        )
+
+    def _staggered_fp32_op(self, device_size, stride_map, host_size, valid_elements):
+        """A mock ComputedBuffer with a DL16_TO_FP32 output."""
+        import unittest.mock as mock
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        stl = SpyreTensorLayout(
+            list(device_size),
+            list(stride_map),
+            get_device_dtype(torch.float32),
+            valid_elements,
+            ElementArrangement.DL16_TO_FP32,
+        )
+        layout = FixedTiledLayout(
+            torch.device("spyre"),
+            torch.float32,
+            list(host_size),
+            _contiguous(host_size),
+            stl,
+        )
+        op = mock.MagicMock()
+        rw = mock.MagicMock()
+        rw.writes = [_dep("buf_staggered", host_size)]
+        op.get_read_writes.return_value = rw
+        op.__class__ = ComputedBuffer
+        op.get_layout.return_value = layout
+        op.layout = layout
+        op.get_name.return_value = "buf_staggered"
+        return op
+
+    def test_pad_upcast_output_grows_a_sub_stick_dim_to_the_pair(self):
+        """A sub-stick DL16_TO_FP32 output still spans both FP32 sticks of its pair.
+
+        ``rescale_stl_for_dtype`` reports the one stick the live elements occupy, so
+        the second half of the pair is capacity this pass adds, as an outermost gap
+        dim since a single stick has no count dim to grow.
+        """
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.padding import _pad_upcast_output
+
+        op = self._staggered_fp32_op(
+            [1, 1, 32], [5, 0, 1], [1, 5], {(0, 2): 5, (1,): 1}
+        )
+        _pad_upcast_output(op, op.layout, 64)
+
+        padded = op.layout
+        self.assertIsInstance(padded, FixedTiledLayout)
+        self.assertEqual(list(padded.device_layout.device_size), [2, 1, 1, 32])
+        # The added stick holds no host element, so the gap dim steps nothing.
+        self.assertEqual(list(padded.device_layout.stride_map), [0, 5, 0, 1])
+
+    def test_pad_upcast_output_rounds_a_partial_pair_up(self):
+        """A stick-stepped dim ending inside a stick pair grows to the whole pair."""
+        from torch_spyre._inductor.padding import _pad_upcast_output
+
+        op = self._staggered_fp32_op(
+            [3, 1, 32], [32, 0, 1], [1, 96], {(0, 2): 96, (1,): 1}
+        )
+        _pad_upcast_output(op, op.layout, 64)
+
+        self.assertEqual(list(op.layout.device_layout.device_size), [4, 1, 32])
+        # A dim that already steps sticks keeps its step.
+        self.assertEqual(list(op.layout.device_layout.stride_map), [32, 0, 1])
+
+    def test_pad_upcast_output_leaves_whole_pairs_alone(self):
+        """A stick-stepped dim already covering whole pairs needs no padding."""
+        from torch_spyre._inductor.padding import _pad_upcast_output
+
+        op = self._staggered_fp32_op(
+            [4, 1, 32], [32, 0, 1], [1, 96], {(0, 2): 96, (1,): 1}
+        )
+        before = list(op.layout.device_layout.device_size)
+        _pad_upcast_output(op, op.layout, 64)
+
+        self.assertEqual(list(op.layout.device_layout.device_size), before)
+
+
+@instantiate_parametrized_tests
+class TestComputeValidElements(TestCase):
+    @parametrize(
+        "host_size,host_strides,expected",
+        [
+            ([1], [1], {(0, 1): 1}),
+            ([64], [1], {(0, 1): 64}),
+            ([42], [1], {(0, 1): 42}),
+            ([100], [1], {(0, 1): 100}),
+            ([7, 100], [100, 1], {(0, 2): 100, (1,): 7}),
+            ([7, 100], [101, 1], {(0, 2): 100, (1,): 7}),
+            ([7, 100], [200, 1], {(0, 2): 100, (1,): 7}),
+            ([8, 16, 64], [1024, 64, 1], {(2,): 8, (0,): 16, (1, 3): 64}),
+            ([5, 10, 42], [420, 42, 1], {(2,): 5, (0,): 10, (1, 3): 42}),
+            ([5, 10, 42], [500, 50, 1], {(2,): 5, (0,): 10, (1, 3): 42}),
+            ([10, 1, 64], [64, 64, 1], {(2,): 10, (1, 3): 64, (0,): 1}),
+            ([1, 64], [64, 1], {(1,): 1, (0, 2): 64}),
+            ([64, 1], [1, 1], {(1,): 64, (0, 2): 1}),
+            ([1, 7, 64], [448, 64, 1], {(2,): 1, (0,): 7, (1, 3): 64}),
+            ([7, 1, 64], [64, 64, 1], {(2,): 7, (0,): 1, (1, 3): 64}),
+            ([7, 64, 1], [64, 1, 1], {(2,): 7, (0,): 64, (1, 3): 1}),
+            ([1, 1, 64], [64, 64, 1], {(0,): 1, (2,): 1, (1, 3): 64}),
+            ([1, 1, 1], [1, 1, 1], {(1, 3): 1, (0,): 1, (2,): 1}),
+            ([7, 100], [0, 1], {(0, 2): 100, (1,): 7}),
+            ([16, 256], [256, 1], {(1,): 16, (0, 2): 256}),
+            ([6, 8, 64], [512, 64, 1], {(1, 3): 64, (0,): 8, (2,): 6}),
+            (
+                [8, 16, 32, 64],
+                [32768, 2048, 64, 1],
+                {(2, 4): 64, (0,): 16, (1,): 32, (3,): 8},
+            ),
+            ([10, 12, 42], [504, 42, 1], {(1, 3): 42, (0,): 12, (2,): 10}),
+            ([10, 12, 42], [600, 50, 1], {(1, 3): 42, (0,): 12, (2,): 10}),
+            ([8, 64], [64, 1], {(1,): 8, (0, 2): 64}),
+            ([4, 8, 64], [512, 64, 1], {(2,): 4, (0,): 8, (1, 3): 64}),
+            ([3, 5, 128], [640, 128, 1], {(1, 3): 128, (0,): 5, (2,): 3}),
+            (
+                [2, 4, 8, 64],
+                [2048, 512, 64, 1],
+                {(3,): 2, (0,): 4, (1,): 8, (2, 4): 64},
+            ),
+        ],
+    )
+    def test_compute_valid_elements(self, host_size, host_strides, expected):
+        stl = SpyreTensorLayout(
+            host_size, host_strides, torch.float16, list(range(len(host_size)))
+        )
+        self.assertEqual(stl.valid_elements, expected)
+
+    @parametrize(
+        "device_size, valid_elements",
+        [
+            # {} (valid extents unknown) stays accepted: the v1-v3 pickles load with it.
+            ([4, 512, 64], {}),
+            ([4, 512, 64], {(0, 2): 256, (1,): 512}),
+            ([4, 512, 64], {(0, 2): 200, (1,): 7}),
+            ([4, 512, 64], {(0, 2): 0, (1,): 0}),
+            ([4, 0, 64], {(0, 2): 256, (1,): 0}),
+            ([2**62, 4, 64], {(0, 1): 1}),
+            ([2**62, 4, 64], {(0, 1): 2**63 - 1}),
+        ],
+    )
+    def test_valid_elements_accepted(self, device_size, valid_elements):
+        stl = SpyreTensorLayout(
+            device_size,
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            valid_elements,
+        )
+        self.assertEqual(stl.valid_elements, valid_elements)
+
+    @parametrize(
+        "device_size, valid_elements, message",
+        [
+            ([4, 512, 64], {(): 0}, "empty device dimension tuple"),
+            ([4, 512, 64], {(2, 0): 256, (1,): 512}, "not strictly increasing"),
+            ([4, 512, 64], {(0, 0, 2): 256, (1,): 512}, "not strictly increasing"),
+            ([4, 512, 64], {(-1,): 1}, "nonnegative integers, but encountered -1"),
+            ([4, 512, 64], {(3,): 1}, r"less than len\(device_size\)"),
+            ([4, 512, 64], {(0, 2): 256, (0, 1): 4}, "multiple keys"),
+            ([4, 512, 64], {(0, 2): 256, (1,): -1}, "values must be nonnegative"),
+            ([4, 512, 64], {(0, 2): 257, (1,): 512}, "exceeds the 256 positions"),
+            ([4, 0, 64], {(1,): 1}, "exceeds the 0 positions"),
+            ([2**62, 4, 0], {(0, 1, 2): 1}, "exceeds the 0 positions"),
+        ],
+    )
+    def test_valid_elements_rejected(self, device_size, valid_elements, message):
+        with self.assertRaisesRegex(RuntimeError, message):
+            SpyreTensorLayout(
+                device_size,
+                [64, 256, 1],
+                get_device_dtype(torch.float16),
+                valid_elements,
+            )
+
+    def test_valid_elements_before_element_arrangement(self):
+        args = ([4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16))
+        valid_elements = {(0, 2): 256, (1,): 512}
+        stl = SpyreTensorLayout(*args, valid_elements, ElementArrangement.STANDARD)
+        self.assertEqual(stl.valid_elements, valid_elements)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 256 positions"):
+            SpyreTensorLayout(*args, {(0, 2): 257}, ElementArrangement.STANDARD)
+
+    def test_valid_elements_is_required(self):
+        # The constructor without valid_elements was removed.
+        args = ([4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16))
+        with self.assertRaises(TypeError):
+            SpyreTensorLayout(*args)
+        with self.assertRaises(TypeError):
+            SpyreTensorLayout(*args, ElementArrangement.STANDARD)
 
 
 if __name__ == "__main__":

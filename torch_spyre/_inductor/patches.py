@@ -12,19 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import contextmanager
 from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    TensorBox,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from . import pass_counters
+from .constants import DEVICE_NAME
+from .errors import Unsupported
+from .logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("patches")
+
+_DYNAMIC_TRUE_MESSAGE = (
+    "torch.compile(dynamic=True). To enable dynamism, declare the varying "
+    "dimension on the tensor and compile with the default dynamic=None:\n"
+    '    x = x.to("spyre", dynamic={0: dict(min=32, max=576, granularity=32)})\n'
+    "    compiled = torch.compile(model, dynamic=None)"
+)
+
+
+def _refuse_dynamic_true() -> None:
+    """Refuse a Spyre compile requested with ``torch.compile(dynamic=True)``.
+
+    ``dynamic=True`` makes every dimension of every input symbolic, with no
+    declared range. Spyre resolves such a symbol to the size of the call being
+    compiled, so the result is a fixed-size binary and a recompile for every new
+    shape: it never provides dynamism, only the appearance of it.
+
+    ``torch.compile(dynamic=True)`` is the only thing that clears
+    ``assume_static_by_default`` for the compile. The default ``dynamic=None``
+    keeps it set, and a dimension marked per tensor (``mark_dynamic``, or
+    ``.to("spyre", dynamic=...)``) never touches it, so neither is refused.
+    """
+    if not torch._dynamo.config.assume_static_by_default:
+        raise Unsupported(_DYNAMIC_TRUE_MESSAGE)
+
 
 @contextmanager
 def spyre_data_types():
+    """Keep elementwise computation at the input width for the whole compile.
+
+    Upstream ``_computation_dtype_map`` sends fp16 / bf16 / complex32 to a wider
+    computation dtype, so aten refs upcast to fp32 before computing.  Spyre
+    lowers these widths natively and does not want that implicit upcast, so the
+    map is replaced with identity entries for the duration of the compile:
+    inside this CM ``get_computation_dtype(torch.float16)`` is fp16, not fp32.
+
+    Action at a distance worth knowing before you touch this: a decomposition
+    that genuinely needs a wider evaluation width can no longer get it from
+    ``elementwise_dtypes(...)[0]`` here, and must spell it with an explicit
+    ``.to(...)``.  ``_taylor_dtypes`` in ``decompositions.py`` (cos / sin) does
+    exactly that and documents why -- its Cody-Waite range reduction resolves
+    the argument against pi and loses ~0.75 absolute at a 10-bit mantissa.
+    """
     saved = torch._prims_common._computation_dtype_map
     torch._prims_common._computation_dtype_map = {
         torch.bfloat16: torch.bfloat16,
@@ -38,9 +90,231 @@ def spyre_data_types():
 
 
 @contextmanager
-def enable_spyre_context(example_inputs: list[InputType]):
+def _preserve_spyre_input_storage_offsets():
+    """Attach graph-input offsets before lowering creates dependent views.
+
+    Upstream ``GraphLowering.placeholder`` records ``storage_offset`` beside
+    the graph input, but initializes the input's ``FixedLayout`` with offset
+    zero.  Spyre repairs that layout during pre-scheduling layout propagation;
+    by then, however, a view lowered from the input has already copied the
+    zero offset into its own ``FixedLayout``.  Put the recorded offset on the
+    input immediately so every subsequently constructed view inherits it.
+    """
+    old_placeholder = GraphLowering.placeholder
+
+    def _spyre_placeholder(self: GraphLowering, target, args, kwargs):
+        result = old_placeholder(self, target, args, kwargs)
+        if not isinstance(result, TensorBox):
+            return result
+
+        input_buffer = result.data.data
+        layout = input_buffer.layout
+        if not isinstance(layout, FixedLayout) or layout.device.type != DEVICE_NAME:
+            return result
+
+        name = self.graph_input_names[-1]
+        input_buffer.layout = FixedLayout(
+            layout.device,
+            layout.dtype,
+            layout.size,
+            layout.stride,
+            self.graph_input_storage_offsets[name],
+        )
+        return result
+
+    GraphLowering.placeholder = _spyre_placeholder  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.placeholder = old_placeholder  # type: ignore[method-assign]
+
+
+@contextmanager
+def _unique_operation_names():
+    """Name every operation as ``register_operation_after_graph_edit`` does.
+
+    Upstream ``GraphLowering.register_operation`` names an op
+    ``op{len(graph.operations)}``.  Pre-scheduling passes that lower new nodes
+    (``insert_restickify``, ``insert_bmm_padding``, ``coarse_tile``) register
+    them after earlier passes have shortened the list, so the name can already
+    belong to a live op and ``name_to_op`` is overwritten.  Anything that then
+    looks the op up by name gets the newcomer.  While lowering only appends, the
+    first free name is the upstream one.
+
+    Additionally, ``dedup_and_promote_constants`` pops merged constants from
+    ``name_to_op`` entirely, freeing their name slots.  Checking ``name_to_op``
+    alone would allow those freed names to be reissued.  This wrapper stamps
+    ``_spyre_issued_op_names`` on the graph at first registration; that set
+    accumulates every name ever handed out and is never pruned by graph passes.
+    """
+    from torch_spyre._inductor.pass_utils import register_operation_after_graph_edit
+
+    old_register_operation = GraphLowering.register_operation
+
+    def _register(graph, op):
+        if not hasattr(graph, "_spyre_issued_op_names"):
+            graph._spyre_issued_op_names = set(graph.name_to_op.keys())
+        return register_operation_after_graph_edit(graph, op)
+
+    GraphLowering.register_operation = _register  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
+
+
+# The upstream report for the gap _resolve_scan_shapes_by_expression patches,
+# and the signature the patch was written against.
+RESOLVE_SHAPE_ISSUE = "https://github.com/pytorch/pytorch/issues/203212"
+RESOLVE_SHAPE_PARAMS = ("shape", "bound_symbols")
+
+
+@contextmanager
+def _resolve_scan_shapes_by_expression():
+    """Let upstream rebuild a scan output shape whose extent is an expression.
+
+    ``decompose_scan_to_while_loop`` rebuilds the scan output's shape through
+    ``resolve_shape_to_proxy``, against an env keyed ``{arg.node.expr: arg}``
+    over the scan's SymInt args plus the scan length. ``sympy_interp`` only
+    consults that env for a bare ``sympy.Symbol`` leaf, so an expression key
+    such as ``FloorDiv(s97, 64)`` sits in the dict unread: it recurses into
+    ``s97`` and raises ``KeyError(s97)``.
+
+    That fires exactly when the body is fully static and only the trip count is
+    derived from a dynamic dim, which is the shape a symbolic loop bound has.
+    The proxy for the whole expression is already in the dict as the scan
+    length, so matching the expression before upstream's symbol walk covers
+    every for_each_tile loop: it moves the tiled dim to 0, trims to whole tiles
+    and scans along dim 0, whichever operand dim it tiles. A size that contains
+    the bare base symbol, such as the extent ``s//(s//64)`` of a ``scan`` called
+    directly along dim 1 on an untrimmed unflatten, still goes to upstream and
+    raises: the base symbol is never bound, the root cause the upstream issue
+    tracks.
+
+    An upstream gap, not a Spyre one, tracked as RESOLVE_SHAPE_ISSUE. Remove it
+    once that is fixed. Everything else takes the original path, one element at
+    a time so upstream keeps its own type checking and error messages.
+
+    The module attribute is the only hook, so the wrapper is in place for the
+    whole Spyre compile and main's map decomposition reaches it too. It answers
+    differently from upstream only where upstream would raise ``KeyError``.
+    Wherever upstream resolves a size, the result is the same value.
+
+    The wrapper is installed only over the signature it was written against.
+    A PyTorch upgrade that changes or removes the function leaves upstream in
+    place and warns, rather than wrapping something it no longer matches.
+    """
+    from torch._inductor.fx_passes import post_grad as _post_grad
+
+    original = getattr(_post_grad, "resolve_shape_to_proxy", None)
+    if original is None:
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy is absent, so its expression-key "
+            "gap (%s) is not patched. Upstream may have fixed it or moved it. "
+            "A symbolic trip count may fail in the scan decomposition with "
+            "KeyError until this patch is updated or removed",
+            RESOLVE_SHAPE_ISSUE,
+        )
+        yield
+        return
+    try:
+        params = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        params = None
+    if params != RESOLVE_SHAPE_PARAMS:
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy has parameters %s, the patch for "
+            "its expression-key gap (%s) was written for %s, so it is not "
+            "installed. A symbolic trip count may fail in the scan "
+            "decomposition with KeyError until this patch is updated or removed",
+            params,
+            RESOLVE_SHAPE_ISSUE,
+            RESOLVE_SHAPE_PARAMS,
+        )
+        yield
+        return
+
+    @wraps(original)
+    def resolve_shape_to_proxy(shape, bound_symbols):
+        resolved = []
+        for size in shape:
+            expr = getattr(getattr(size, "node", None), "expr", None)
+            # A dict lookup on sympy structural equality, the same equality
+            # upstream's own env keys use. An equal value built another way
+            # (FloorDiv(s97, 64) against a simplified form) misses and goes to
+            # upstream, which raises KeyError exactly as it would unpatched.
+            if expr is not None and expr in bound_symbols:
+                resolved.append(bound_symbols[expr])
+            else:
+                resolved.append(original([size], bound_symbols)[0])
+        return resolved
+
+    _post_grad.resolve_shape_to_proxy = resolve_shape_to_proxy
+    try:
+        yield
+    finally:
+        _post_grad.resolve_shape_to_proxy = original
+
+
+def _contiguous_stride_first(sizes, strides, false_if_dde=False):
+    """torch's check_contiguous_sizes_strides, but compares the stride before
+    asking size == 1, so a correct stride installs no Ne(size, 1) guard (#6018).
+    Remove if upstream does the same (pytorch/pytorch#203781).
+    tests/inductor/test_contiguity_patch.py checks it against upstream."""
+    from torch.fx.experimental.symbolic_shapes import (
+        guard_or_false,
+        guard_or_true,
+        is_nested_int,
+        statically_known_true,
+    )
+
+    maybe_false = guard_or_false if false_if_dde else bool
+    maybe_true = guard_or_true if false_if_dde else bool
+    expected, expected_max = 1, 1
+    for x, y in reversed(tuple(zip(sizes, strides))):
+        if statically_known_true(y == expected) or statically_known_true(
+            y == expected_max
+        ):
+            pass
+        elif maybe_false(x == 1):
+            continue
+        elif maybe_true(y != expected) and maybe_true(y != expected_max):
+            return False
+        expected_max *= x if is_nested_int(x) else torch.sym_max(x, 1)
+        expected *= x
+    return True
+
+
+@contextmanager
+def _contiguity_stride_first():
+    # Replaces the module attribute, so it reaches only callers that look it up
+    # at call time: the callers inside torch._prims_common do. A caller that
+    # imported the name earlier keeps upstream's version, and torch's C++
+    # contiguity path never calls it.
+    import torch._prims_common as prims_common
+
+    original = prims_common.check_contiguous_sizes_strides
+    prims_common.check_contiguous_sizes_strides = _contiguous_stride_first
+    try:
+        yield
+    finally:
+        prims_common.check_contiguous_sizes_strides = original
+
+
+@contextmanager
+def enable_spyre_context(
+    example_inputs: list[InputType],
+    declared_dims: "dict[str, tuple[int, int, int]] | None" = None,
+):
     """
     Context manager that sets up the complete Spyre compilation environment.
+
+    ``declared_dims`` maps the ShapeEnv symbol name of every graph input
+    dimension declared with ``tensor.to("spyre", dynamic=...)`` to its
+    ``(min, max, granularity)``. It is made the compile's declared set for the
+    whole block (``pass_utils.declared_dims``), so ``concretize_expr`` builds a
+    declared dimension's geometry at its declared maximum from the first
+    lowering call on.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
       - Enabling Spyre-specific data type handling
@@ -60,6 +334,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
             set real inputs in the virtualized context for shape inference and
             optimization decisions.
     """
+    _refuse_dynamic_true()
 
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
@@ -74,6 +349,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPreFusionPasses,
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
+    )
+    from torch_spyre._inductor import timing_recorder
+    from torch_spyre._inductor.loop_scheduler import (
+        loop_scheduler_patches_for_compile,
     )
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
@@ -93,6 +372,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
         "reorder_for_locality": False,  # Prevents unhinted ops from being moved into hinted regions.
+        # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
+        # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
+        "fallback_random": True,
     }
 
     from torch._inductor.ir import Loops
@@ -126,7 +408,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
                 recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
-        old_update_scheduler(self)
+        # Upstream scheduler construction, which the pre-scheduling pipeline runs
+        # immediately before. Timed separately so the two are not conflated.
+        with timing_recorder.stage("stage:GraphLowering:update_scheduler"):
+            old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
@@ -159,9 +444,30 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # A LoopNode reaching the scheduler becomes one LoopSchedulerNode
+    # (loop_scheduler.py).  On a torch release the patch does not support,
+    # entering does NOT raise: a compile with no loop must keep working on any
+    # release, so only a LoopNode handed to the scheduler is refused there
+    # (CustomPreSchedulingPasses refuses one earlier, naming the release).
+    # On a graph with no LoopNode each patched method takes its original path.
+    # Local import: pass_utils pulls in the lowering machinery, which this module
+    # is imported ahead of.
+    from .pass_utils import declared_dims as _declared_dims_for_compile
+
     with (
+        # First in the header: the same ``with`` closes it however the body, or
+        # the entry of a later manager, exits.
+        loop_scheduler_patches_for_compile(),
+        _declared_dims_for_compile(declared_dims),
         spyre_data_types(),
+        _preserve_spyre_input_storage_offsets(),
+        _unique_operation_names(),
+        _resolve_scan_shapes_by_expression(),
+        _contiguity_stride_first(),
         enable_spyre_lowerings(),
+        # Analysis-call counters ride the timing gate: they exist to annotate
+        # timing records, and a second knob would let the two disagree.
+        pass_counters.counting(install=timing_recorder.is_enabled()),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),

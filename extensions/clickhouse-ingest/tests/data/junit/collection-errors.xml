@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="all_tests" errors="3" failures="0" skipped="0" tests="5" time="12.0" timestamp="2026-10-10T20:10:43">
+<testcase classname="junit-test-quality-shard-0" name="" time="0.000"><error message="collection failure">ImportError while importing test module '/root/.cache/vllm-upstream-tests/worktree-v0.28.0/tests/models/multimodal/processing/test_common.py'.
+Hint: make sure your test modules/packages have valid Python names.</error></testcase>
+<testcase classname="junit-test-quality-shard-1" name="" time="0.000"><error message="collection failure">ImportError while importing test module '/root/.cache/vllm-upstream-tests/worktree-v0.28.0/tests/models/multimodal/processing/test_common.py'.
+Hint: make sure your test modules/packages have valid Python names.</error></testcase>
+<testcase classname="junit-test-upstream-distributed" name="" time="0.000"><error message="collection failure">ImportError while importing test module '/root/.cache/vllm-upstream-tests/worktree-v0.28.0/tests/models/multimodal/processing/test_common.py'.
+Hint: make sure your test modules/packages have valid Python names.</error></testcase>
+<testcase classname="tests.models.test_llama" name="test_generate" time="1.500"/>
+<testcase classname="tests.models.test_llama" name="test_logprobs" time="2.500"/>
+</testsuite></testsuites>

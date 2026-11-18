@@ -99,8 +99,9 @@ CustomPreSchedulingPasses:
 ... Inductor scheduler construction ...
 
 CustomPostFusionPasses:
-  demote_incoherent_lx_buffers         # LX fixups (phase 2)
+  sink_collective_waits                # Schedule each collective wait as late as consumers allow (gated by SPYRE_SINK_COLLECTIVE_WAITS)
   spyre_fuse_nodes                     # Determine bundle boundaries
+  prepare_spyre_kernels                # Prepare each bundle's kernel once; demote LX on failure
   hbm_pool_planning                    # Per-bundle HBM pool allocation (this pass)
 ```
 
@@ -108,8 +109,10 @@ By the time this pass runs, `nodes` is the final, post-fusion top-level list.
 Each entry in `nodes` is exactly one bundle:
 
 - A `FusedSchedulerNode` wrapping multiple fused operations.
-- A `CountedLoopSchedulerNode` (which is a `FusedSchedulerNode` subclass)
-  wrapping a loop and its body operations.
+- A `CountedLoopSchedulerNode` (a `FusedSchedulerNode` subclass) wrapping a
+  loop and its body operations. A loop lowered from `for_each_tile` arrives as
+  a `LoopSchedulerNode`, the `CountedLoopSchedulerNode` subclass that carries a
+  single `LoopNode`.
 - A standalone `SchedulerNode` or other node type that fusion left untouched
   because it had no fusible neighbors.
 

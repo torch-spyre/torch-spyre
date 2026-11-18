@@ -10,12 +10,10 @@ inputs:
       When 'true', also dumps sorted env, AIU env vars, and a directory
       listing of the pre-cloned repo. Defaults to 'false' for a terse log.
     required: false
-    type: string
     default: 'false'
   torch_spyre_dir:
     description: Path to the pre-cloned torch-spyre directory
     required: false
-    type: string
     default: torch-spyre
   runner_labels:
     description: |
@@ -26,7 +24,6 @@ inputs:
       run. Optional: when empty, only the resolved runner identity is
       printed.
     required: false
-    type: string
     default: ''
 
 runs:

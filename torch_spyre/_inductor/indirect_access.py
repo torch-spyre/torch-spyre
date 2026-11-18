@@ -98,7 +98,7 @@ def get_indirect_dim_symbols(
     for i in range(len(index_arg.device_coordinates) - 2, -1, -1):
         coord = index_arg.device_coordinates[i]
         if hasattr(coord, "free_symbols"):
-            expr = coord.subs(symbol_mapping)
+            expr = coord.xreplace(symbol_mapping)
             for sym in expr.free_symbols:
                 if sym not in seen:
                     seen.add(sym)
@@ -143,7 +143,7 @@ def _get_index_active_dims_for_value(
     for coord in index_arg.device_coordinates:
         if not hasattr(coord, "free_symbols"):
             continue
-        for sym in coord.subs(symbol_mapping).free_symbols:
+        for sym in coord.xreplace(symbol_mapping).free_symbols:
             if sym not in seen:
                 seen.add(sym)
                 active.append(sym)
@@ -193,6 +193,11 @@ def compute_indirect_max_dim_sizes(
             return -1
         active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
         if len(active_dims) > 1 and dim != active_dims[-1]:
+            # A tiled index-table row can retain the full table's physical
+            # extent. A singleton role still accesses only one row per trip.
+            for symbol, (extent, _) in op_spec.iteration_space.items():
+                if symbol_mapping.get(symbol, symbol) == dim and extent == 1:
+                    return 1
             return idx_size
         return 1
 

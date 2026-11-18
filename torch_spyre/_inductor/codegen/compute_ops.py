@@ -22,8 +22,12 @@ from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
+    DLFLOAT16_MAX,
+    FP8_2D_STICK_OPS,
+    POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -32,7 +36,7 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
-    Five variants (constructed via class methods):
+    Six variants (constructed via class methods):
       - ``kernel(arg_index)``:               raw HBM base address of a kernel tensor arg;
                                              emitted as a ``!sdscbundle.input_arg`` param
                                              named ``%arg_{arg_index}``.  Value =
@@ -91,6 +95,10 @@ class SymbolKind:
                                              ``dimToSymbolMapping_`` entry.  Registered
                                              before address symbols so their negative IDs
                                              never collide with address symbol IDs.
+      - ``loop_dimension(...)``:             a bundle loop bound, read from a launch
+                                             tensor's shape.  Never reaches an SDSC.
+                                             Distinct from ``dimension`` on purpose, see
+                                             its own docstring.
     """
 
     kind: str
@@ -103,6 +111,9 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Only meaningful for the loop_dimension variant: which dim of which launch
+    # tensor the runtime reads this symbol's value from.
+    dim_index: int = -1
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -149,6 +160,26 @@ class SymbolKind:
         )
 
     @classmethod
+    def shard_kernel(
+        cls, arg_index: int, core_idx: int, num_shards: int, shard_bytes: int
+    ) -> "SymbolKind":
+        """Start address of core ``core_idx``'s own shard of a sharded tensor.
+
+        Non-unified kernels give every core an independent start address
+        (``nonUnifiedAllocInHBM_``); the runtime resolves this one to the
+        chunk holding shard ``core_idx`` of kernel arg ``arg_index``, after
+        checking the tensor has ``num_shards`` (``split_count``) shards of
+        ``shard_bytes`` (``offset``) device bytes.
+        """
+        return cls(
+            kind="shard_kernel",
+            arg_index=arg_index,
+            core_idx=core_idx,
+            split_count=num_shards,
+            offset=shard_bytes,
+        )
+
+    @classmethod
     def pool(cls) -> "SymbolKind":
         return cls(kind="pool")
 
@@ -163,6 +194,40 @@ class SymbolKind:
             pytorch_sym=pytorch_sym,
         )
 
+    @classmethod
+    def loop_dimension(
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        arg_index: int,
+        dim_index: int,
+    ) -> "SymbolKind":
+        """A bundle-level loop bound, read from a launch tensor's shape.
+
+        Deliberately a different variant from ``dimension``. That one lives in an
+        SDSC's ``dimToSymbolMapping_``, the symbolic-SDSC route where the symbol
+        stays inside one op's iteration space. This one never reaches an SDSC at
+        all: the loop is explicit, the body is a static tile, and the dimension
+        exists only as a bundle parameter whose value the runtime reads from
+        ``inputs_outputs[arg_index].size(dim_index)`` on every launch, via
+        ``SymbolicArgKind::kDimension``.
+
+        ``is_dimension`` stays False for this variant on purpose. The guard in
+        ``execution/async_compile`` refuses SDSC dimension symbols because that
+        route's runtime payload was never built, and a bundle carrying one would
+        reach the backend with a mismatched ``inputSym_`` slot count. That guard
+        should keep refusing the old route, and should not refuse this one.
+        """
+        return cls(
+            kind="loop_dimension",
+            granularity=granularity,
+            max_value=max_value,
+            pytorch_sym=pytorch_sym,
+            arg_index=arg_index,
+            dim_index=dim_index,
+        )
+
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
@@ -172,12 +237,22 @@ class SymbolKind:
         return self.kind == "kernel_derived_symbolic"
 
     @property
+    def is_shard_kernel(self) -> bool:
+        return self.kind == "shard_kernel"
+
+    @property
     def is_pool(self) -> bool:
         return self.kind == "pool"
 
     @property
     def is_dimension(self) -> bool:
+        # The old symbolic-SDSC route only. See loop_dimension for why this must
+        # not also answer True for a loop bound.
         return self.kind == "dimension"
+
+    @property
+    def is_loop_dimension(self) -> bool:
+        return self.kind == "loop_dimension"
 
 
 def core_idx_to_slice_offset(
@@ -225,7 +300,14 @@ def generate_constant_info(
     constant_info: dict[str, Any] = {}
     for name, value in constants.items():
         try:
-            encoded_value = encode_constant(value, data_format)
+            # The host converter saturates DLFloat16 constants at 2**32.
+            # Preserve the exact finite limits used for missing clip bounds.
+            if data_format == DataFormats.SEN169_FP16 and value == DLFLOAT16_MAX:
+                encoded_value = 0x7FFE
+            elif data_format == DataFormats.SEN169_FP16 and value == -DLFLOAT16_MAX:
+                encoded_value = 0xFFFE
+            else:
+                encoded_value = encode_constant(value, data_format)
         except (ValueError, TypeError) as e:
             raise ValueError(
                 f"Cannot encode constant '{name}' with value {value} "
@@ -242,7 +324,7 @@ def generate_constant_info(
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encoded_value]},
+                "data_": {"[0, 0, 0]": [str(encoded_value)]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -267,27 +349,57 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
-def _compute_fp8_coord_params(tensor, dim, sdsc_spec):
-    """Compute FP8 2D stick coordinate parameters for a dimension.
+# FP8 has 128 elements per stick. A QFP8WT tensor with 2D stick [2, 64]
+# is flattened back to [128] after device-size flattening. Matching this
+# sentinel identifies tensors that need their 2D-stick metadata restored.
+_FP8_FLAT_STICK_SIZE = [128]  # == 2 * 64
 
-    Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
+# Index of the QFP8WT-layout tensor within each op in FP8_2D_STICK_OPS.
+# Both ops store it at argument index 1 in op_spec.args (inputs then outputs):
+#   batchmatmulfp8: arg 0 = INPUT activation,  arg 1 = INPUT KERNEL weight (QFP8WT)
+#   qfp8wt:         arg 0 = INPUT fp16 weight,  arg 1 = OUTPUT fp8 weight (QFP8WT)
+# In hardware terminology both are "KERNEL layout" tensors — qfp8wt's OUTPUT is
+# the weight that batchmatmulfp8 will subsequently consume as its KERNEL input.
+_FP8_2D_STICK_TENSOR_IDX = 1
+
+
+def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Return layout metadata to emit for a tensor.
+
+    For individually compiled FP8 ops in FP8_2D_STICK_OPS, the upstream
+    flattening needed to satisfy the SDSC dimension limit can erase the
+    semantic 2D-stick metadata on the KERNEL tensor. Restore that metadata
+    here so the emitted SDSC matches the combined-compilation shape contract.
+
+    Covers both ``batchmatmulfp8`` (consumer) and ``qfp8wt`` (producer) so
+    that individually compiled kernels for either op emit the correct 2D-stick
+    layout, mirroring the flattening guard in superdsc._create_sdsc_tensors.
     """
-    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
-    stick_dim_order = sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
-
-    is_fp8_stick = (
-        tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
-    )
-
-    if dim in stick_dim_order and len(stick_size_list) > 1:
-        stick_idx = stick_dim_order.index(dim)
-        other_idx = 1 - stick_idx
-        other_stick_size = stick_size_list[other_idx]
-    else:
-        stick_idx = -1
-        other_stick_size = 1
-
-    return is_fp8_stick, other_stick_size, stick_idx
+    layout_info = sdsc_spec.layouts[tensor.layout]
+    if (
+        sdsc_spec.opfunc in FP8_2D_STICK_OPS
+        and tensor_idx == _FP8_2D_STICK_TENSOR_IDX
+        and tensor.data_format == DataFormats.SEN143_FP8
+        and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
+    ):
+        # After device-size flattening a rank-4+ tensor produces a 3-element
+        # dim_order (one collapsed leading dim + the two trailing stick dims).
+        # The [-2:] slice always selects the two stick dims regardless of how
+        # many leading dims were collapsed, because flattening only touches
+        # leading dims and the trailing stick dims are preserved as-is by
+        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
+        dim_order = layout_info["dim_order"]
+        if len(dim_order) < 2:
+            raise ValueError(
+                f"FP8 {sdsc_spec.opfunc} kernel tensor expected at least 2D "
+                f"dim_order, got {len(dim_order)}D: {dim_order}"
+            )
+        return {
+            **layout_info,
+            "stick_dim_order": list(dim_order),
+            "stick_size": [2, 64],
+        }
+    return layout_info
 
 
 def gen_coord_info_value(
@@ -298,8 +410,6 @@ def gen_coord_info_value(
     is_stick_reduction: bool = False,
     conv_params=None,
     padding: str = "nopad",
-    is_fp8_stick: bool = False,
-    stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
     core_stride: int | None = None,
@@ -363,31 +473,6 @@ def gen_coord_info_value(
                         "factor_": elem_arr_factor,
                         "label_": "elem_arr_0",
                     },
-                ],
-            },
-        }
-    elif is_stick_dim and is_fp8_stick and not (stick_idx == 0):
-        return {
-            "spatial": 3,
-            "temporal": 0,
-            "elemArr": 3,
-            "padding": "nopad",
-            "folds": {
-                "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": (size // 8), "beta_": 0}},
-                    {"Affine": {"alpha_": 8, "beta_": 0}},
-                    {"Affine": {"alpha_": 1, "beta_": 0}},
-                ],
-                "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": 64, "label_": "elem_arr_2"},
-                    {"factor_": 2, "label_": "elem_arr_1"},
-                    {"factor_": 1, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -710,7 +795,7 @@ def generate_sdsc(
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
-            str(dim): int(expr.subs({Symbol("core_id"): c}))
+            str(dim): int(expr.xreplace({Symbol("core_id"): c}))
             for dim, expr in sdsc_spec.core_id_to_work_slice.items()
         }
         for c in range(sdsc_spec.num_cores)
@@ -796,6 +881,8 @@ def generate_sdsc(
             key = ("kernel", kind.arg_index)
         elif kind.kind == "kernel_slice":
             key = ("kernel_slice", kind.arg_index, kind.offset)
+        elif kind.is_shard_kernel:
+            key = ("shard_kernel", kind.arg_index, kind.core_idx)
         elif kind.is_derived_symbolic:
             # Per-core symbolic address: key by (tensor, core) so every
             # (arg_index, core_idx) is a distinct registration and never
@@ -859,7 +946,37 @@ def generate_sdsc(
     # the symbols at that level that advance tensor i.  Empty list of dicts
     # (i.e. [{}] * n_levels or []) for non-tiled tensors.
     affine_strides: list[list[dict]] = []
+    non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
+    if non_unified_args:
+        if len(non_unified_args) != len(sdsc_spec.args):
+            raise Unsupported("non-unified kernels need every tensor argument sharded")
+        verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
+        if tensor.non_unified:
+            # Sharded storage: core c owns chunk c, addressed from its own
+            # start (no base + per-core offset).
+            if tensor.arg_index < 0 or any(
+                _tensor_tiled_by_symbol(tensor, s)
+                for level_syms in tiled_symbols
+                for s in level_syms
+            ):
+                raise Unsupported(
+                    "non-unified kernels support untiled HBM kernel arguments "
+                    f"only (arg {tensor.arg_index}, allocation {tensor.allocation})"
+                )
+            shard_bytes = tensor.non_unified_shard_bytes
+            for c in range(sdsc_spec.num_cores):
+                offset_as_symbol(
+                    tensor.arg_index,
+                    SymbolKind.shard_kernel(
+                        arg_index=tensor.arg_index,
+                        core_idx=c,
+                        num_shards=sdsc_spec.num_cores,
+                        shard_bytes=shard_bytes,
+                    ),
+                )
+            affine_strides.append([{} for _ in tiled_symbols])
+            continue
         if "lx" in tensor.allocation:
             # LX addresses are never registered as symbols in the SDSC JSON
             # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
@@ -1098,6 +1215,13 @@ def generate_sdsc(
     def _start_addr_data(tensor):
         # All per-core addresses were already registered by the per-tensor loop
         # above. Look them up using the same key scheme as offset_as_symbol.
+        if tensor.non_unified:
+            return {
+                f"[{c}, 0, 0]": str(
+                    local_symbols[("shard_kernel", tensor.arg_index, c)]
+                )
+                for c in range(sdsc_spec.num_cores)
+            }
         if "lx" in tensor.allocation:
             return {
                 f"[{c}, 0, 0]": str(tensor.start_address)
@@ -1192,7 +1316,6 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
-            is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
             conv_params = (
                 get_conv_params(
                     tensor_idx,
@@ -1212,8 +1335,6 @@ def generate_sdsc(
                 elems_per_stick=tensor.data_format.elems_per_stick(),
                 is_stick_dim=(dim in stick_dim_order),
                 is_stick_reduction=(scale == -2),
-                is_fp8_stick=is_fp8,
-                stick_idx=st_idx,
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
@@ -1287,16 +1408,36 @@ def generate_sdsc(
         each core.  Dividing the *total* padded input span by the core count
         instead (the plain path) undercounts for an overlapping window
         (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
-        has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
-        its non-overlapping stride==kernel windows the two coincide anyway).
+        has nothing to distribute.
+
+        Applies to every windowed op -- conv2d and the pools alike.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             stride = int(ps.get("stride_", 1))
             dilation = int(ps.get("dilation_", 1))
             k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
-            return (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            span = (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            # The window span is what each core READS, and it equals the axis
+            # extent only when the windows tile it exactly.  When stride > kernel
+            # the span UNDERRUNS the declared extent (k=4 s=6 on 8: span 4 of 8),
+            # and on an unsplit axis the coordinate fold must still expose the
+            # whole extent -- elem_arr_0 factor 8, not 4, alongside totalSize_ 8.
+            # Exposing only the span there reads a short extent and returns
+            # elements from the wrong window.  Only widen when unsplit: with
+            # nsplits > 1 the span is deliberately the per-core read (see
+            # _coord_core_stride).
+            # elem_arr_0 must expose the extent this stage addresses, which is
+            # the window span PLUS any declared slack -- for a split strided pool
+            # (e.g. 1x64x16x16 k4 s5, i split 3 ways) that is elem_arr_0 factor
+            # 6 = span 4 + unneededPad_ 2, not the bare span.  Exposing only the
+            # span reads a short extent per core and returns elements from the
+            # wrong window.
+            declared = int(ps.get("totalSize_", span))
+            if nsplits == 1:
+                return max(span, declared)
+            return max(span, span + int(ps.get("unneededPad_", 0)))
         return (
             _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
         )
@@ -1305,14 +1446,19 @@ def generate_sdsc(
         """Core-fold stride (advance per core) for a windowed input spatial dim.
 
         Returns ``out_per_core * stride`` -- how far the input window origin moves
-        between adjacent cores -- so overlapping windows (conv stride < kernel)
-        step correctly while each core still reads the full window span
-        (_coord_per_core_size).  Returns None for non-windowed dims (and for
-        avgpool), where gen_coord_info_value defaults the core stride to the
-        per-core size -- so avgpool's original behavior is unchanged.
+        between adjacent cores -- so overlapping windows (stride < kernel) step
+        correctly while each core still reads the full window span
+        (_coord_per_core_size).  Returns None for non-windowed dims, where
+        gen_coord_info_value defaults the core stride to the per-core size.
+
+        Must stay in lockstep with _coord_per_core_size: that helper widens each
+        core's read to the window span, which for an overlapping window is wider
+        than the stride between cores.  Defaulting the stride to the (now wider)
+        per-core size would over-advance and skip input rows, so both helpers
+        cover the same ops -- conv2d and the pools.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             return out_per_core * int(ps.get("stride_", 1))
         return None
@@ -1340,12 +1486,15 @@ def generate_sdsc(
             extra["allocateNode_"] = alloc_node
         return extra
 
+    active_core_ids = sdsc_spec.completed_producer_cores or tuple(
+        range(sdsc_spec.num_cores)
+    )
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
                 # Source-to-kernel provenance. JSON key uses the SDSC
                 # trailing-underscore convention; the Python field stays
-                # `debug_handle`. dxp_standalone ignores unknown keys.
+                # `debug_handle`. The backend ignores unknown keys.
                 "debug_handle_": (
                     sdsc_spec.debug_handle.to_dict()
                     if sdsc_spec.debug_handle is not None
@@ -1359,25 +1508,37 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": sdsc_spec.num_cores,
-                "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
+                "numCoresUsed_": len(active_core_ids),
+                "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
                 # allocation coordinates below.
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
+                    if sdsc_spec.opfunc not in POOL_OPS
+                    or str(dim) not in sdsc_spec.window_dims
                 },
-                "coreIdToWkSlice_": core_id_to_wk_slice,
+                # Window dims (ki/kj) are not real dims of any tensor for pool
+                # operations and hence should not be emitted
+                "coreIdToWkSlice_": {
+                    core: {
+                        dim: slc
+                        for dim, slc in slices.items()
+                        if sdsc_spec.opfunc not in POOL_OPS
+                        or dim not in sdsc_spec.window_dims
+                    }
+                    for core, slices in core_id_to_wk_slice.items()
+                },
                 "coreIdToDscSchedule": {
-                    str(c): [[-1, 0, 0, 0]] for c in range(sdsc_spec.num_cores)
+                    str(c): [[-1, 0, 0, 0]] for c in active_core_ids
                 },
                 "dscs_": [
                     {
                         sdsc_spec.opfunc: {
-                            "numCoresUsed_": sdsc_spec.num_cores,
+                            "numCoresUsed_": len(active_core_ids),
                             "numCoreletsUsed_": 1,
-                            "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
+                            "coreIdsUsed_": list(active_core_ids),
                             "N_": {
                                 "name_": "n",
                                 **{
@@ -1455,26 +1616,37 @@ def generate_sdsc(
                                     },
                                 }
                             },
+                            # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
+                            # receives the originating tensor and tensor_idx, allowing it to apply
+                            # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
                             "primaryDsInfo_": {
-                                label: {
-                                    "layoutDimOrder_": [
-                                        str(dim)
-                                        for dim in _filter_window_dims(
-                                            layout_info["dim_order"], label
-                                        )
-                                    ],
-                                    "stickDimOrder_": [
-                                        str(dim)
-                                        for dim in layout_info["stick_dim_order"]
-                                    ],
-                                    "stickSize_": layout_info["stick_size"],
-                                    **(
-                                        {"stickRepl_": [1]}
-                                        if sdsc_spec.stick_replication
-                                        else {}
-                                    ),
-                                }
-                                for label, layout_info in sdsc_spec.layouts.items()
+                                tensor.layout: (
+                                    lambda layout_info, label=tensor.layout: {
+                                        "layoutDimOrder_": [
+                                            str(dim)
+                                            for dim in _filter_window_dims(
+                                                layout_info["dim_order"], label
+                                            )
+                                        ],
+                                        "stickDimOrder_": [
+                                            str(dim)
+                                            for dim in layout_info["stick_dim_order"]
+                                        ],
+                                        "stickSize_": layout_info["stick_size"],
+                                        **(
+                                            {"stickRepl_": [1]}
+                                            if sdsc_spec.stick_replication
+                                            else {}
+                                        ),
+                                    }
+                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                # Keyed by tensor.layout (the layout-role label assigned by
+                                # _get_layout_label). Two tensors share a label only when their
+                                # dim_order, stick_dim_order, and stick_size are all identical —
+                                # in that case the values are equal too, so the overwrite is
+                                # harmless. If the same label could map to distinct layouts in
+                                # the future, key by (i, tensor.layout) instead.
+                                for i, tensor in enumerate(sdsc_spec.args)
                             },
                             **(
                                 {"pdsRelation_": {"isPdsReuse": 1}}
@@ -1503,6 +1675,11 @@ def generate_sdsc(
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if "lx" not in tensor.allocation
+                                        else {}
+                                    ),
+                                    **(
+                                        {"nonUnifiedAllocInHBM_": True}
+                                        if tensor.non_unified
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
@@ -1577,10 +1754,16 @@ def generate_sdsc(
                                             sdsc_spec.opfunc, tensor, i
                                         ),
                                         "coreIdToWkSlice_": (
-                                            tensor.work_division.to_core_slices(
-                                                tensor.work_division.num_cores
-                                                or sdsc_spec.num_cores
-                                            )
+                                            {
+                                                core: slices
+                                                for core, slices in tensor.work_division.to_core_slices(
+                                                    tensor.work_division.num_cores
+                                                    or sdsc_spec.num_cores
+                                                ).items()
+                                                if i != 0
+                                                or not sdsc_spec.completed_producer_cores
+                                                or int(core) in active_core_ids
+                                            }
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None
                                             else {}

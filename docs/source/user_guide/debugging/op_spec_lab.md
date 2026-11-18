@@ -53,8 +53,9 @@ emitted file is one kernel, not one operation. The softmax above is six.
 | Option | Use it when |
 |---|---|
 | `--kernel NAME` | Only emit kernels whose name contains `NAME` |
-| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Without it, integer args replay as zeros |
+| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones, with what each kernel's first launch changed, for [comparing two runs](#comparing-two-runs). Without it, integer args replay as zeros |
 | `--no-execute` | Stub the backend compile and launch, so no device is needed |
+| `--emitter ktir` | Target the KTIR emitter instead of SuperDSC. See [Capturing for KTIR](#capturing-for-ktir) |
 | `--no-explain-header` | Omit the decoded explanation from each emitted file |
 
 The stale-`fxgraph`-cache trap is handled for you: `capture.py` patches
@@ -84,6 +85,7 @@ torch-spyre installed. This is the header of
 # Source program:  <your checkout>/tests/op_specs/programs/01_add.py
 # Kernel:          1 of 1 compiled from that program
 # Environment:     torch 2.13.0+cpu, SENCORES=32, bundle_symbolic_args=True
+# Emitter:         sdsc (generate_bundle)
 # Kernel args:     3 in the spec, 3 observed at .run()
 #
 # Run it:
@@ -136,12 +138,52 @@ python captured/sdsc_fused__softmax_0.py --stage bundle  # artifacts only
 ```
 
 `--stage bundle` writes `sdsc_N.json` and `bundle.mlir` and stops. It needs no
-device and no `dxp_standalone`, so it is the stage to use when the question is
+device and no backend compiler, so it is the stage to use when the question is
 *"what did my OpSpec turn into?"* rather than *"what does it compute?"*.
 
 Then edit a field and re-run. That is the whole point of the file being
 standalone: change a `device_size`, a work division or a coordinate expression,
 diff the resulting `bundle.mlir`, and you are probing the backend directly.
+
+### Capturing for KTIR
+
+`--stage ktir` is the same stage for the other emitter: it writes
+`<kernel>.ktir` — the [KTDP-dialect MLIR](../../compiler/ktir.md) that
+`generate_ktir` produces from the same OpSpec list — and stops. It needs no
+device and no `dbo-opt`, only the `mlir_ktdp` bindings, which are a from-source
+build rather than a declared dependency: install them with
+`tools/install-ktir.sh`.
+
+A script captured on the default path cannot use it. The buffer names
+`generate_ktir` keys its register threading on are populated by
+`create_tensor_arg` only under `config.ktir_emitter`, so an SDSC capture carries
+`name=None` everywhere and emission refuses it. Capture with `--emitter ktir`
+instead, which turns that config on for the run:
+
+```bash
+python tests/op_specs/capture.py my_repro.py --emitter ktir --no-execute --out captured/
+python captured/ktir_fused_add_0.py --stage ktir
+```
+
+The header names which emitter compiled each kernel, and the emitted script pins
+it: a KTIR capture's `--stage run` goes through `async_compile.ktir`, never
+`sdsc`. That is not a preference. Under the KTIR emitter a spec's HBM addresses
+may be baked absolute rather than symbolic, and `generate_bundle` rejects those
+outright rather than miscompile them — so the emitter that built a spec is the
+one certain to accept it, and the header offers that stage alone. Both stages
+stay on the CLI for the cases where the other emitter does accept the spec.
+
+Two things follow from `--emitter ktir` being a *capture-time* choice:
+
+- **It works with no device and no backend compiler at all.** Canonical KTIR
+  spells base addresses as func arguments and never reads `allocation["hbm"]`, so
+  `BUNDLE_SYMBOLIC_ARGS=1` — the default — is fine. With `--no-execute` the whole
+  loop runs on a laptop.
+- **Expect refusals.** The emitter is narrower than SuperDSC today: LX and
+  HBM-pool intermediates are either threaded as SSA values or refused, and one
+  kernel whose ops disagree about work division cannot share a grid. Those arrive
+  as `Unimplemented` with a label naming the capability, which is the emitter
+  telling you what it does not build yet — not a broken capture.
 
 ### 4. Interpret
 
@@ -149,6 +191,96 @@ diff the resulting `bundle.mlir`, and you are probing the backend directly.
 |---|---|
 | Also wrong | The **back-end** mis-executes a spec that faithfully describes the intent. You now have a minimal reproducer with no model or graph in it. |
 | Correct | The bug is **upstream** — in lowering, fusion, stickification or layout. The spec is not what you meant. |
+
+### Comparing two runs
+
+When a program is right one way and wrong another (a config flag, a commit, an
+environment variable), capture it both ways with `--save-inputs`. Each kernel's
+`.inputs.pt` then also holds what its first launch changed, which args it reads
+and when it ran, and `compare.py` finds the first kernel whose inputs agree but
+whose outputs do not.
+
+`programs/05_cat_after_matmul.py` is one such program: a matmul over a 7x7 grid of
+tokens, then an eager cat that puts a class token in front of them. It is right as
+it is and wrong with `SPYRE_NDO_MATMUL_OUTPUT_REORDER=1`, until the bug it shows is
+fixed (#6265, or its successor); after that the two runs agree and `compare.py`
+exits 0. The whole example takes about three minutes. The numbers below are from
+main at `74721af8`:
+
+```bash
+P=tests/op_specs/programs/05_cat_after_matmul.py
+python $P                                      # max|got - expected| = 0.078125
+SPYRE_NDO_MATMUL_OUTPUT_REORDER=1 python $P    # max|got - expected| = 19.6875
+python tests/op_specs/capture.py $P --save-inputs --out good
+SPYRE_NDO_MATMUL_OUTPUT_REORDER=1 python tests/op_specs/capture.py $P --save-inputs --out bad
+python tests/op_specs/compare.py good bad
+```
+
+Kernels pair by name and argument shapes, and the table runs in launch order. A
+kernel's `inputs` are the args it reads, as they were going in, and its `outputs`
+the args its launch changed in either run. Each number is the largest elementwise
+difference between the runs, relative to the largest magnitude in the good run's
+tensor; a NaN or an infinity in one run where the other differs counts as
+infinite:
+
+```
+launch     inputs    outputs  kernel
+     0          0          0  sdsc_fused_0
+     1          0      0.857  sdsc_fused_cat_0  <-- parts here
+```
+
+The matmul agrees; the cat gets the same inputs in both runs and writes something
+else. `compare.py` exits 3 and prints how to replay the bad capture's script on
+the good capture's inputs:
+
+```bash
+mkdir -p replay && cp bad/sdsc_fused_cat_0.py replay/
+cp good/sdsc_fused_cat_0.inputs.pt replay/sdsc_fused_cat_0.inputs.pt
+python replay/sdsc_fused_cat_0.py
+```
+
+A replay prints `max|got - observed|` for every arg, here against the good outputs.
+The cat's output is 19.7 off, so the bad kernel is wrong on correct inputs, and
+the table in [4. Interpret](#4-interpret) applies with the good run as the expected
+answer. That 19.7 is absolute, while `compare.py`'s numbers are relative: it is the
+0.857 above times 23, the good output's largest value. Diffing the two captures'
+scripts, and their SDSC (`--stage bundle` on each), shows what changed: with the
+flag the cat's input is laid out `[1, 7, 12, 7, 64]`, its output view becomes
+`[7, 7, 12, 64]` with the token row at `c0 + 1`, and the one-row offset that the
+good kernel carries (`backGap mb=1 offsets out=0 mb=768`) is gone.
+
+When no kernel parts, `compare.py` exits 0 if every kernel pairs and agrees, and 4
+if it cannot show that they do. It then names the first kernel in the way: one
+only one run launched (listed as `unpaired:`, as when the runs fuse differently),
+a pair it could not compare, or a pair whose inputs already differ, which means
+the difference came from outside the paired kernels, such as the program's own
+inputs or a copy to the device. A launch that raised in one run only is where the
+runs part.
+
+The same steps work on a model. #6265 found this bug from spyre-inference's CLIP
+embedding test, 47 kernels under vLLM, the same way.
+
+Keep in mind:
+
+- Values are compared as host tensors, so the runs may lay a tensor out differently
+  on the device, as long as the copy to the host reads both faithfully. It does not
+  for every element arrangement (#4393), so a kernel whose args differ in
+  arrangement between the runs is reported as not comparable.
+- The difference is relative to the largest value, so one wrong small element among
+  large ones can stay under `--tol` (default `1e-2`).
+- A capture copies every arg to the host before and after each kernel's first
+  launch, so first launches run one at a time. A bug that depends on timing between
+  kernels may not show while capturing. Only the first launch is recorded.
+- `--save-inputs` holds a host copy of every kernel's args, and of whatever its
+  first launch changed, until the program ends. On a model that is its weights
+  again. `compare.py` maps the files rather than reading them in.
+
+A program that runs only under pytest needs a script for `capture.py` to run,
+one that ends in `sys.exit(pytest.main([...]))`. If the program hands its work
+to subprocesses, keep it in one process: for vLLM, set
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`, and point `VLLM_CACHE_ROOT` at an empty
+directory, or vLLM's compile cache can skip the compile and leave the capture
+empty.
 
 ---
 
@@ -213,15 +345,17 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 ### `LoopSpec`
 
 Wraps a body of specs in a `count` trip count. Only coarse tiling produces
-these, and only via `spyre_hint(num_tiles_per_dim=...)` — see
+these: a `for_each_tile` loop, or the automatic span-overflow tiling — see
 [Coarse Tiling Loops](../../compiler/coarse_tiling_loops.md).
 
 ## Walkthrough: four worked examples
 
-Four programs live in
+Programs `01` to `04` live in
 [`tests/op_specs/programs/`](https://github.com/torch-spyre/torch-spyre/tree/main/tests/op_specs/programs).
 Each is about fifteen lines, and each produces an OpSpec shape the others do not.
 Work down them in order and you will have met every field in the reference above.
+The fifth, `05_cat_after_matmul.py`, is the example in
+[Comparing two runs](#comparing-two-runs).
 
 Every one is the same four beats:
 
@@ -565,8 +699,8 @@ capture would undo. Attach a capture to a *ticket*, not to the repo.
 Re-capture after a compiler change and diff against what you had. Every block above
 is real codegen from a real device run, so patching a number by inference is how they
 go stale: an `origin` line moves whenever its program does, and the op indices move
-whenever fusion does. Re-run the four programs and paste, rather than adjusting a
-digit that looks wrong.
+whenever fusion does. Re-run the programs and paste, rather than adjusting a digit
+that looks wrong.
 
 ---
 

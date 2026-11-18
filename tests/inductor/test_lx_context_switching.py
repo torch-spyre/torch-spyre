@@ -34,6 +34,7 @@ need no compile or device.
 """
 
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import torch
@@ -131,10 +132,13 @@ class TestLxContextSwitching(unittest.TestCase):
         # test_scratchpad_use.py's BaseTestScratchpadUsage.setUp.
         self._caches_disabled = t_inductor_config.patch("force_disable_caches", True)
         self._caches_disabled.__enter__()
+        self._coopt_off = ts_inductor_config.patch({"co_optimizing_lx_planning": False})
+        self._coopt_off.__enter__()
 
     def tearDown(self):
         global _launch
         _launch = False
+        self._coopt_off.__exit__(None, None, None)
         self._caches_disabled.__exit__(None, None, None)
         torch.compiler.reset()
 
@@ -259,10 +263,87 @@ class TestMarkLxSafe(unittest.TestCase):
             op._spyre_lx_safe = False
 
 
+class TestCollectivesAreNotBracketed(unittest.TestCase):
+    """Collectives and waits are never bracketed, even with LX-resident buffers
+    live across them.
+
+    They are ``_CollectiveKernel``s, so ``FallbackKernel``s, but their bodies run
+    in spyre-comms and never launch a nested compile.  Bracketing them dumps and
+    restores every straddling buffer around each all_reduce, which costs a TP
+    decode step two extra kernels per collective.  Built with the upstream
+    factories, as the lowerings build them; no compile or device needed.
+    """
+
+    def setUp(self):
+        from contextlib import ExitStack
+
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        gm = fx.symbolic_trace(lambda: None)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(V.set_fake_mode(FakeTensorMode()))
+        stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        # process_kernel reads the FX node being lowered (newer torch checks
+        # its target); a lowering always has one, so provide the graph's own.
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
+
+    def test_collectives_are_skipped(self):
+        from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.ir import (
+            AllGatherKernel,
+            AllReduceKernel,
+            WaitKernel,
+        )
+        from torch_spyre._inductor.scratchpad import lx_context_switching as lcs
+
+        def operand(name):
+            buf = InputBuffer(
+                name=name,
+                layout=FixedLayout(torch.device("cpu"), DTYPE, [8, 64], [64, 1]),
+            )
+            V.graph.name_to_buffer[name] = buf
+            V.graph.graph_inputs[name] = buf
+            return TensorBox(StorageBox(buf))
+
+        c10d = torch.ops._c10d_functional
+        x = operand("x")
+        AllReduceKernel.create_inplace(c10d.all_reduce_.default, x, "sum", "group0")
+        WaitKernel.create_wait(c10d.wait_tensor.default, x)
+        gathered = AllGatherKernel.create_out_of_place(
+            c10d.all_gather_into_tensor.default, operand("y"), 2, "group0"
+        )
+        WaitKernel.create_wait(c10d.wait_tensor.default, TensorBox.create(gathered))
+        kinds = {type(op) for op in V.graph.operations}
+        self.assertTrue(
+            {AllReduceKernel, AllGatherKernel, WaitKernel} <= kinds, "fixture drifted"
+        )
+
+        # Every op would otherwise be bracketed: one LX buffer straddles them all.
+        at_risk = [mock.sentinel.lx_resident]
+        with (
+            patch.object(lcs, "calculate_liveness", return_value={}),
+            patch.object(lcs, "_at_risk_buffers", return_value=at_risk),
+        ):
+            self.assertEqual(lcs._select_bracket_targets(V.graph), [])
+
+
 class TestIsCpuOnlyFallback(unittest.TestCase):
     def test_matches_registered_fallback_ops(self):
-        self.assertIn(torch.ops.aten.sin.default, fallback_ops)
-        self.assertTrue(_is_cpu_only_fallback(torch.ops.aten.sin.default))
+        # Sampled from the registry instead of naming an op: entries graduate
+        # out of fallback_ops as device support lands -- aten.sin / aten.cos
+        # did, which is what broke the aten.sin.default this used to assert --
+        # and any hardcoded name makes that a failure here rather than in the
+        # suite that owns the op.  What is worth pinning is the wiring: this
+        # helper reads the same list ops/fallbacks.py fills.
+        self.assertTrue(fallback_ops, "ops/fallbacks.py registered no fallbacks")
+        for op in fallback_ops:
+            self.assertTrue(_is_cpu_only_fallback(op), f"{op} not seen as fallback")
 
     def test_rejects_non_fallback_ops(self):
         self.assertNotIn(torch.ops.aten.mm.default, fallback_ops)

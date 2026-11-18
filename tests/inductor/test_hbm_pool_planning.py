@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from unittest.mock import patch as mock_patch
 
+import pytest
 import regex as re
 import torch
 from sympy import Integer
@@ -24,12 +25,16 @@ from torch import fx
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
-from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    ExternKernelSchedulerNode,
+    FusedSchedulerNode,
+    SchedulerNode,
+)
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-import pytest
+from utils_inductor import mock_backend_compiler
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -163,7 +168,7 @@ def _make_ftl_buffer_aliased(name, alias_of, host_size=(64,), dim_order=(0,)):
     return buf
 
 
-def _make_snode_with_rw(name, writes, reads):
+def _make_snode_with_rw(name, writes, reads, node_type=SchedulerNode):
     """MagicMock SchedulerNode with real MemoryDep read_writes for the
     given buffer names, and get_nodes()/get_name() wired for
     _iter_all_nodes / bundle-name lookup.
@@ -177,7 +182,7 @@ def _make_snode_with_rw(name, writes, reads):
     tests build bundles directly (bypassing the Scheduler), fill them in
     with the same empty/zero defaults BaseSchedulerNode.__init__ uses.
     """
-    snode = MagicMock(spec=SchedulerNode)
+    snode = MagicMock(spec=node_type)
     snode.get_name.return_value = name
     snode.get_nodes.return_value = [snode]
     snode.ancestors = OrderedSet()
@@ -533,6 +538,37 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         self.assertNotIn("hbm_pool", target_buf.get_layout().allocation)
         self.assertNotIn("hbm_pool", alias_buf.get_layout().allocation)
 
+    def test_alias_of_fallback_input_is_not_pool_eligible(self):
+        """An alias cannot pool storage needed as a Python fallback input.
+
+        for_each_tile rewires its body output to the initializer's storage.
+        The rewritten output and initializer have different names but share
+        one allocation dict. If the rewritten name is pooled while the
+        initializer is passed directly to an ExternKernel (such as compiled
+        all-reduce), wrapper code references an initializer tensor that was
+        never allocated.
+        """
+        target = _make_ftl_buffer("target")
+        _make_ftl_buffer_aliased("alias", alias_of=target)
+
+        write_target = _make_snode_with_rw("write_target", writes=["target"], reads=[])
+        write_alias = _make_snode_with_rw("write_alias", writes=["alias"], reads=[])
+        read_alias = _make_snode_with_rw("read_alias", writes=[], reads=["alias"])
+
+        fallback = _make_snode_with_rw(
+            "fallback",
+            writes=[],
+            reads=["target"],
+            node_type=ExternKernelSchedulerNode,
+        )
+
+        bundle = FusedSchedulerNode(
+            MagicMock(), [write_target, write_alias, read_alias, fallback]
+        )
+        hbm_pool_planning([bundle])
+
+        self.assertNotIn("hbm_pool", target.get_layout().allocation)
+
     def test_aliased_buffer_within_same_bundle_shares_one_merged_live_range(self):
         """Regression test for issue #3980: two buffer *names* that share
         the exact same FixedTiledLayout.allocation dict object -- as
@@ -690,8 +726,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
     @config.patch({"lx_planning": False})
     def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
-        """codegen_node must look up this bundle's own pool_size from
-        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+        """codegen_node must bind this bundle's own pool_size from
+        V.graph.hbm_pool_sizes before printing its kernel, not a stale
+        graph-global scalar. Pooling runs after the kernel is prepared, so
+        the value is observed at the binding point.
 
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
@@ -704,11 +742,11 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         from torch_spyre._inductor.spyre_kernel import SpyreKernel
 
         seen_pool_sizes = []
-        orig_init = SpyreKernel.__init__
+        orig_codegen_kernel = SpyreKernel.codegen_kernel
 
-        def _recording_init(self, pool_size=0, **kwargs):
-            seen_pool_sizes.append(pool_size)
-            orig_init(self, pool_size=pool_size, **kwargs)
+        def _recording_codegen_kernel(self):
+            seen_pool_sizes.append(self.pool_size)
+            return orig_codegen_kernel(self)
 
         def fn(x, y):
             a = x + y
@@ -719,10 +757,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
         with (
-            mock_patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch.object(SpyreKernel, "codegen_kernel", _recording_codegen_kernel),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             torch.compile(fn)(x, y)
 
@@ -733,10 +771,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"{seen_pool_sizes}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
-        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        """A CPU-fallback op (torch.tril) splits the graph into multiple
         bundles. With frontend_pool_allocation at its default (False), each
         bundle's pool (if any) is allocated inside that bundle's own
         generated MLIR via sdscbundle.device_mem_allocate -- there is no
@@ -746,7 +784,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
-            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            b = torch.tril(a)  # fallback op -- forces a bundle boundary
             c = torch.exp(b) * 2  # compiled bundle 2
             return c
 
@@ -760,15 +798,15 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         real_get_output_dir = async_compile_mod.get_output_dir
         output_dirs_by_kernel = {}
 
-        def _recording_get_output_dir(kernel_name):
-            output_dir = real_get_output_dir(kernel_name)
+        def _recording_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+            output_dir = real_get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
             output_dirs_by_kernel[kernel_name] = output_dir
             return output_dir
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch.object(
                 async_compile_mod, "get_output_dir", _recording_get_output_dir
             ),
@@ -816,7 +854,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"kernels were {kernel_names}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
         """With frontend_pool_allocation at its default (False), no bundle
@@ -825,7 +863,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2
-            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            b = torch.tril(a)  # fallback op -- forces a bundle boundary
             c = torch.exp(b) * 2
             return c
 
@@ -834,7 +872,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
@@ -877,7 +915,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
@@ -887,8 +925,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         # positive one -- pool_size=0 must never be emitted explicitly.
         self.assertNotIn("pool_size=0", src)
 
-    @config.patch({"lx_planning": True})
-    def test_pool_size_kwarg_omitted_when_no_pool(self):
+    def _check_pool_size_kwarg_omitted(self) -> None:
         """A kernel with no pool usage gets no pool_size kwarg at all.
 
         With lx_planning enabled, the `a = x + y` intermediate is claimed by
@@ -909,13 +946,22 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
 
         self.assertIn("async_compile.sdsc(", src)
         self.assertNotIn("pool_size", src)
+
+    @config.patch({"lx_planning": True})
+    def test_pool_size_kwarg_omitted_when_no_pool(self):
+        self._check_pool_size_kwarg_omitted()
+
+    @config.patch({"lx_planning": True, "layout_solver": "simulated_annealing"})
+    def test_pool_size_kwarg_omitted_when_no_pool_sa(self):
+        """As above, with the simulated annealing solver placing `a` in LX."""
+        self._check_pool_size_kwarg_omitted()
 
     @config.patch({"lx_planning": False})
     def test_alias_read_in_another_bundle_blocks_pool_eligibility(self):
@@ -956,7 +1002,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             # Without the alias-read guard this raises InductorError from
             # generate_bundle's pool_size assertion.

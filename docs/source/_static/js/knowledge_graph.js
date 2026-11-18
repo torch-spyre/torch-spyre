@@ -25,6 +25,7 @@
       ],
       relationships: [
         "decomposed_by",
+        "decomposes_into",
         "lowered_by",
         "falls_back_to",
         "eager_via",
@@ -212,6 +213,14 @@
           "line-style": "dashed",
           "line-color": "#e74c3c",
           "target-arrow-color": "#e74c3c",
+        },
+      },
+      {
+        selector: "edge[relationship = 'decomposes_into']",
+        style: {
+          "line-color": "#2ecc71",
+          "target-arrow-color": "#2ecc71",
+          width: 1.5,
         },
       },
       {

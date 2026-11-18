@@ -30,6 +30,7 @@ import torch
 
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.ktir import dialect_available, generate_ktir
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
 
@@ -100,7 +101,40 @@ def bundle_op_specs(name: str, ops: list, out_dir: str, pool_size=0) -> list:
     return sorted(os.listdir(out_dir))
 
 
-def run_op_specs(name: str, ops: list, tensors: list, layouts=None, pool_size=0):
+def ktir_op_specs(name: str, ops: list, out_dir: str) -> list:
+    """Write ``<name>.ktir`` for ``ops`` into ``out_dir``.
+
+    The KTIR counterpart of ``bundle_op_specs``: needs no device and no
+    ``dbo-opt``, but does need the ``mlir_ktdp`` bindings.
+
+    Whether to bake addresses is not a choice here.  The baked form reads a byte
+    address out of ``allocation["hbm"]``, which only holds one when the spec was
+    built with ``bundle_symbolic_args=False``, so it follows the pinned flag
+    exactly as ``async_compile.ktir`` does.
+    """
+    if not dialect_available():
+        raise SystemExit(
+            "--stage ktir needs the mlir_ktdp bindings, which are not importable"
+            " here. Install them with `tools/install-ktir.sh`; nothing else in"
+            " this script needs them."
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    text = generate_ktir(
+        name, list(ops), bake_addresses=not spyre_config.bundle_symbolic_args
+    )
+    with open(os.path.join(out_dir, f"{name}.ktir"), "w") as fh:
+        fh.write(text)
+    return sorted(os.listdir(out_dir))
+
+
+def run_op_specs(
+    name: str,
+    ops: list,
+    tensors: list,
+    layouts=None,
+    pool_size=0,
+    ktir_emitter=False,
+):
     """Compile ``ops`` and run them on the device against ``tensors``.
 
     ``tensors[i]`` is the host tensor for the TensorArg with ``arg_index=i``,
@@ -109,10 +143,25 @@ def run_op_specs(name: str, ops: list, tensors: list, layouts=None, pool_size=0)
     valid slice.  Every tensor is a kernel arg: the HBM pool, when there is one,
     is allocated inside the bundle rather than passed at launch, so ``pool_size``
     only has to reach ``sdsc``.  Returns the artifact directory.
+
+    ``ktir_emitter`` picks the backend, and has to match the capture rather than
+    the ambient config: a spec built under the KTIR emitter carries baked
+    addresses, which ``generate_bundle`` refuses outright, so compiling it
+    through ``sdsc`` cannot work whatever the environment says.  It takes no
+    ``pool_size``: that emitter refuses an ``hbm_pool`` buffer outright, so a
+    kernel with a pool never reaches it.
     """
     dev_tensors = to_device(tensors, layouts)
 
-    runner = SpyreAsyncCompile().sdsc(name, list(ops), pool_size=pool_size)
+    async_compile = SpyreAsyncCompile()
+    if ktir_emitter:
+        scope = {"runner": async_compile.ktir(name, list(ops))}
+    else:
+        scope = {"runner": async_compile.sdsc(name, list(ops), pool_size=pool_size)}
+    # sdsc hands back a future once DXP compiles in parallel; ktir returns the
+    # runner directly, and wait() leaves a non-future untouched.
+    async_compile.wait(scope)
+    runner = scope["runner"]
     code_dir = getattr(runner, "code_dir", None)
     print(f"artifacts: {code_dir}")
 
@@ -130,28 +179,37 @@ def main(
     layouts=None,
     pool_size=0,
     bundle_symbolic_args=None,
+    ktir_emitter=False,
     argv=None,
+    observed=None,
 ):
     """Tiny CLI shared by this module and every captured script.
 
-    ``--stage bundle`` stops after writing the SDSC/MLIR artifacts, which needs
-    no hardware; ``--stage run`` (the default) goes all the way to a launch.
+    ``--stage bundle`` and ``--stage ktir`` stop after writing one emitter's
+    artifacts, which needs no hardware; ``--stage run`` (the default) goes all
+    the way to a launch, through whichever emitter the capture used.
+
+    ``observed`` is what each arg held after the captured launch; a launch here
+    is compared against it, which tells a kernel that misbehaves on its own
+    from one that only misbehaves inside its program.
     """
     pin_bundle_symbolic_args(bundle_symbolic_args)
     parser = argparse.ArgumentParser(description=f"Run OpSpec kernel {name!r}.")
     parser.add_argument(
         "--stage",
-        choices=("bundle", "run"),
+        choices=("bundle", "ktir", "run"),
         default="run",
         help=(
             "bundle: write sdsc_N.json + bundle.mlir and stop (no device or"
-            " dxp_standalone needed). run: compile and launch. Default: run."
+            " backend compiler needed). ktir: write <name>.ktir and stop (no"
+            " device or dbo-opt needed, but mlir_ktdp must be installed). run:"
+            " compile and launch. Default: run."
         ),
     )
     parser.add_argument(
         "--out-dir",
         default=None,
-        help="Directory for --stage bundle. Default: ./op_spec_out/<name>.",
+        help="Directory for --stage bundle/ktir. Default: ./op_spec_out/<name>.",
     )
     parser.add_argument(
         "--explain",
@@ -185,17 +243,31 @@ def main(
                 )
             )
 
-    if args.stage == "bundle":
+    if args.stage in ("bundle", "ktir"):
         out_dir = args.out_dir or os.path.join("op_spec_out", name)
-        listing = bundle_op_specs(name, ops, out_dir, pool_size=pool_size)
+        if args.stage == "bundle":
+            listing = bundle_op_specs(name, ops, out_dir, pool_size=pool_size)
+        else:
+            listing = ktir_op_specs(name, ops, out_dir)
         print(f"artifacts: {os.path.abspath(out_dir)}")
         print(f"contents: {listing}")
         return out_dir
 
-    code_dir = run_op_specs(name, ops, tensors, layouts=layouts, pool_size=pool_size)
+    code_dir = run_op_specs(
+        name,
+        ops,
+        tensors,
+        layouts=layouts,
+        pool_size=pool_size,
+        ktir_emitter=ktir_emitter,
+    )
     # Only after a launch: before one these are still the inputs.
     for i, t in enumerate(tensors):
-        print(f"arg{i} {tuple(t.shape)} {t.dtype}: {t.flatten()[:6].tolist()}")
+        line = f"arg{i} {tuple(t.shape)} {t.dtype}: {t.flatten()[:6].tolist()}"
+        if observed is not None and observed[i] is not None:
+            diff = (t.float() - observed[i].float()).abs().max().item()
+            line += f"  max|got - observed| = {diff:.6g}"
+        print(line)
     return code_dir
 
 
@@ -214,6 +286,7 @@ import torch
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.ktir import dialect_available, generate_ktir
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 """
 
@@ -222,6 +295,7 @@ _TEMPLATE_FUNCS = (
     pin_bundle_symbolic_args,
     to_device,
     bundle_op_specs,
+    ktir_op_specs,
     run_op_specs,
     main,
 )

@@ -16,6 +16,12 @@ from pathlib import Path
 
 
 def _launch(path, tensors):
+    """Launch the bundle and return the runner.
+
+    The returned runner MUST be kept alive until the outputs have been read
+    back. Dropping it frees the JobPlan, and with it the device allocation and
+    pinned buffers that the still in-flight launch is reading.
+    """
     # delayed import, for easy testing
     from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
@@ -23,6 +29,7 @@ def _launch(path, tensors):
     # should have already compiled at this point
     runner = SpyreSDSCKernelRunner("spyre-cli", str(path))
     runner.run(*tensors)
+    return runner
 
 
 dtype_mapping = {
@@ -94,16 +101,24 @@ def launch_from_cli(path, inputs, outputs):
         )
         tensors.append(tensor)
 
-    _launch(path, tensors)
+    runner = _launch(path, tensors)
 
     # TODO: deal with the cases when we have multiple outputs
     # which ops would those be?
     if len(outputs) > 1:
         print("WARNING: multiple outputs found, but only last one printed!")
 
-    print(tensors[-1])
+    print(tensors[-1].cpu())
+    del runner
 
 
 def launch(*tensors, path="."):
+    """Launch a bundle; returns the runner, which the caller MUST keep alive.
+
+    Bind the result (``runner = launch(a, b, c)``) and keep it in scope until
+    the outputs have been read back. Calling this as a bare statement frees the
+    JobPlan while the launch is still in flight, and the device then faults
+    with what looks like a hardware error.
+    """
     path = Path(path)
-    _launch(path, tensors)
+    return _launch(path, tensors)

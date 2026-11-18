@@ -19,8 +19,11 @@ per-kernel report). Both are gated by ``config.cost_model``; this module only de
 WHERE the text goes -- stderr, or the file named by ``SPYRE_DUMP_COST_FILE``.
 """
 
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def emit(text: str) -> None:
@@ -34,6 +37,45 @@ def emit(text: str) -> None:
         sys.stderr.write(text)
         sys.stderr.write("\n")
         sys.stderr.flush()
+
+
+def emit_json_line(path: str, record: dict) -> None:
+    """Append ``record`` as one JSON line to ``path`` (JSON Lines, one record per
+    dump). Instrumentation only: never raises.
+
+    Broad on purpose. ``OSError`` covers the file, but ``default=str`` reaches
+    an arbitrary ``__str__`` -- a sympy object mid-construction, say -- and a
+    dump that cannot be written must not be the reason a compile fails."""
+    import json
+
+    try:
+        line = json.dumps(record, separators=(",", ":"), default=str)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.debug("cost dump to %s skipped", path, exc_info=True)
+
+
+def origin_op_name(op) -> str:
+    """The Inductor ORIGIN node name for an operation (``index_put_3``,
+    ``amax_1``), falling back to the reduction type and then to the positional
+    operation name (``op7``).
+
+    Shared so the two dumps key ops the same way: the numeric cost dump and the
+    cost-expression dump are joined on this name, and ``get_operation_name``
+    alone would give the positional id, which the numeric dump never uses.
+    """
+    data = getattr(op, "data", None)
+    node = getattr(data, "origin_node", None)
+    if node is not None:
+        return getattr(node, "name", None) or str(getattr(node, "target", node))
+    rtype = getattr(data, "reduction_type", None)
+    if rtype:
+        return str(rtype)
+    if data is not None:
+        return type(data).__name__
+    return op.get_operation_name()
 
 
 def banner(title: str) -> str:

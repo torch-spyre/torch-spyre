@@ -1,7 +1,19 @@
 # Spyre Inductor Operation Cookbook
 
-This document describe the common patterns used to define operations
+This document describes the common patterns used to define operations
 in the front-end compiler.
+
+:::{figure} ../_static/images/op-cookbook-patterns.svg
+:alt: Decision flow over the five operation-definition patterns: direct mapping to a SpyreOpFuncs method, Spyre decomposition, Spyre lowering, custom op, and custom op as a CPU fallback, each with its file and decorator.
+:width: 100%
+:align: center
+
+The operation-definition patterns, as a guide to which one to reach for. Each
+leaf names the file and the decorator or method it uses. The sections below
+describe each pattern in full. The cookbook also covers related conventions,
+such as modifying existing kernels and preserving provenance, that are not
+operation-definition patterns and are not shown here.
+:::
 
 ## Direct mapping from ATen to OpFunc
 
@@ -26,6 +38,10 @@ that are performed before the graph is lowered to loop level IR.
 
 We define Spyre-specific lowerings from ATen operations to Inductor's
 loop level IR in [lowering.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/lowering.py) using the `@register_spyre_lowering` decorator.
+
+See the [custom op example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/custom_op.py) for a
+runnable script that defines a custom op and registers a Spyre lowering with
+`register_spyre_lowering`.
 
 ## Spyre-specific OpFuncs
 
@@ -107,7 +123,7 @@ canonicalization and test equivalent independently constructed values.
 
 When a compiler pass needs to alter how an existing `ComputedBuffer` computes
 its values, always wrap the original `inner_fn` using a `WrapperHandler`
-subclass — never attempt to rebuild `inner_fn` from scratch.
+subclass, never rebuild `inner_fn` from scratch.
 
 **Why:** `inner_fn` index expressions are symbolic; they are bound to the
 specific `sympy` objects created during lowering. Rebuilding the function from
