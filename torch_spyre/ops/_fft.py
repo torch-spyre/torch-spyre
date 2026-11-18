@@ -26,6 +26,7 @@ or the module-level caches below.
 
 import os
 import threading
+import warnings
 from collections import OrderedDict
 from typing import Optional, Sequence
 
@@ -168,8 +169,20 @@ def _direct_matmul_max() -> int:
     try:
         v = int(raw)
     except ValueError:
+        warnings.warn(
+            f"TORCH_SPYRE_FFT_DIRECT_MAX={raw!r} is not an integer; using the "
+            f"default {_DIRECT_MATMUL_MAX_DEFAULT}.",
+            stacklevel=2,
+        )
         return _DIRECT_MATMUL_MAX_DEFAULT
-    return v if v > 0 else _DIRECT_MATMUL_MAX_DEFAULT
+    if v <= 0:
+        warnings.warn(
+            f"TORCH_SPYRE_FFT_DIRECT_MAX={v} must be positive; using the "
+            f"default {_DIRECT_MATMUL_MAX_DEFAULT}.",
+            stacklevel=2,
+        )
+        return _DIRECT_MATMUL_MAX_DEFAULT
+    return v
 
 
 def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
@@ -185,7 +198,13 @@ def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     n = x.shape[-1]
     s = x.abs().amax()
     xs = x / s if s > 0 else x
-    u = _to_interleaved(xs).to(torch.float16).to(device)  # pack + cast on host
+    u = _to_interleaved(xs).to(torch.float16)  # (*batch, 2n), pack + cast on host
+    # Flatten every leading dim into one so the matmul always sees a 2D
+    # (B, 2n) @ (2n, 2n); otherwise each distinct batch rank/shape recompiles
+    # the dynamic=False callable (fftn over several axes + four-step sub-DFTs
+    # would hit Dynamo's recompile limit quickly).
+    batch = u.shape[:-1]
+    u = u.reshape(-1, u.shape[-1]).to(device)
     comp = _COMPILED.get(device)
     if comp is None:
         with _COMPILED_LOCK:
@@ -202,9 +221,9 @@ def _direct(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     # permutation. The result returns to the host anyway, and casting after the
     # fp16 D2H copy moves half the bytes of an on-device upcast. A device-side
     # upcast (torch-spyre #5495 insert_ea_shuffle) could revisit this.
-    v = _from_interleaved(comp(u, w).cpu().float(), n)
+    v = _from_interleaved(comp(u, w).cpu().float(), n)  # (B, n) complex
     post = (s / n) if inverse else s
-    return v * post
+    return v.reshape(*batch, n) * post
 
 
 def _factor(n: int) -> tuple[int, int]:
@@ -213,6 +232,16 @@ def _factor(n: int) -> tuple[int, int]:
         if n % a == 0:
             return a, n // a
     return 1, n
+
+
+def _largest_prime_factor(n: int) -> int:
+    """Largest prime factor of ``n`` (``n`` itself when prime)."""
+    largest, m, d = 1, n, 2
+    while d * d <= m:
+        while m % d == 0:
+            largest, m = d, m // d
+        d += 1
+    return max(largest, m)
 
 
 def _twiddle(n1: int, n2: int, inverse: bool) -> torch.Tensor:
@@ -245,11 +274,20 @@ def _run_1d(x: torch.Tensor, inverse: bool, device: str) -> torch.Tensor:
     n = x.shape[-1]
     threshold = _direct_matmul_max()
     if n > threshold:
-        if _factor(n)[0] == 1:
+        # Validate the full factorization of the requested length up front. The
+        # four-step split only helps if every prime factor is <= threshold; a
+        # length like 2*65537 would otherwise fail deep in the recursion naming
+        # the sub-length (65537), not the length the caller asked for. Because
+        # this runs before recursing, the top-level call names the original n,
+        # and sub-DFTs (factors of an already-validated n) never re-raise.
+        pf = _largest_prime_factor(n)
+        if pf > threshold:
             raise NotImplementedError(
-                f"FFT length {n} has a prime factor larger than {threshold}; "
-                "not supported (it would need an O(n^2) "
-                f"{2 * n}x{2 * n} matrix). Use a composite length."
+                f"FFT length {n} has prime factor {pf} larger than the direct "
+                f"ceiling {threshold}; the four-step factorization cannot reduce "
+                f"it below a single O(n^2) matmul. Use a length whose prime "
+                f"factors are all <= {threshold}, or raise "
+                f"TORCH_SPYRE_FFT_DIRECT_MAX."
             )
         return _four_step(x, inverse, device)
     return _direct(x, inverse, device)
