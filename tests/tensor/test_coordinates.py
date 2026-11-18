@@ -209,7 +209,7 @@ class TestCoordinates(TestCase):
                 for t in range(count):
                     for c in (0, 63, 64, 255):
                         actual = sum(
-                            coord.subs({p0: t, p1: c}) * stride
+                            coord.xreplace({p0: t, p1: c}) * stride
                             for coord, stride in zip(coords, (512, 128, 64, 1))
                         )
                         batch, row = divmod(3 * t, rows)
@@ -754,8 +754,8 @@ class TestAlignTensorsStridedTerm(TestCase):
                             for column in range(width):
                                 substitutions = {**synthetic, c: column}
                                 self.assertEqual(
-                                    sympy.expand(address.subs(substitutions)),
-                                    sympy.expand(expected.subs(substitutions)),
+                                    sympy.expand(address.xreplace(substitutions)),
+                                    sympy.expand(expected.xreplace(substitutions)),
                                 )
                         self.assertLess(
                             (start + step * (count - 1)) * width + width - 1,
@@ -1240,7 +1240,7 @@ class TestNormalizeCoordinatesFusion(TestCase):
         # ... and the fused dim addresses exactly what the two dims did.
         addr = self._addr(terms)
         for val in range(2048):
-            self.assertEqual(int(addr.subs({k: val})), val)
+            self.assertEqual(int(addr.xreplace({k: val})), val)
 
     def test_fusion_declined_when_outer_term_has_offset(self):
         """An offset on the outer term counts in units of that term's ``den``.
@@ -1263,7 +1263,7 @@ class TestNormalizeCoordinatesFusion(TestCase):
         self.assertEqual([int(t.dim_size) for t in terms], [16, 2, 64])
         addr = self._addr(terms)
         for val in (0, 1, 63, 64, 127, 128, 1023):
-            self.assertEqual(int(addr.subs({k: val})), 512 + val)
+            self.assertEqual(int(addr.xreplace({k: val})), 512 + val)
 
     def test_fusion_declined_when_pair_is_not_dense(self):
         """A gap between the two dims (3*64 < 256) makes the fusion inexact."""
