@@ -2960,13 +2960,14 @@ def stick_var_from_dep(
     return None
 
 
-def stick_compatible_v2(
+def stick_compatible(
     pairs: "list[tuple[SpyreTensorLayout, MemoryDep]]",
 ) -> bool:
     """Return True if all tensors are stick-compatible.
 
-    Equivalent to stick_compatible() but takes (STL, MemoryDep) pairs
-    instead of pre-computed device_coordinates results.
+    Compatible means: the union of stick variables across all tensors has at
+    most one element, and is disjoint from the union of non-stick variables
+    (all other loop variables in each tensor's index).
     """
     stick_vars: set[sympy.Symbol] = set()
     nonstick_vars: set[sympy.Symbol] = set()
@@ -2980,26 +2981,6 @@ def stick_compatible_v2(
         }
         nonstick = all_vars - ({sv} if sv else set())
         nonstick_vars |= nonstick
-    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
-
-
-def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
-    """Return True if all tensors are stick-compatible.
-
-    coords: list of device_coordinates() results, one per tensor.
-
-    Compatible means: the union of stick variables (free symbols in the last
-    device coordinate) across all tensors has at most one element, and is
-    disjoint from the union of nonstick variables (free symbols in all other
-    device coordinates, excluding each tensor's own stick variable).
-    """
-    stick_vars: set[sympy.Symbol] = set()
-    nonstick_vars: set[sympy.Symbol] = set()
-    for dc in coords:
-        tensor_stick_vars = dc[-1].free_symbols
-        stick_vars |= tensor_stick_vars
-        for coord in dc[:-1]:
-            nonstick_vars |= coord.free_symbols - tensor_stick_vars
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
@@ -3071,25 +3052,6 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
-def _dual_stick_compatible(
-    in_stl: SpyreTensorLayout,
-    in_dep: MemoryDep,
-    out_stl: SpyreTensorLayout,
-    out_dep: MemoryDep,
-    idc: "list[sympy.Expr]",
-    out_idc: "list[sympy.Expr]",
-) -> bool:
-    """Temporary: run both old and new stick_compatible, assert they agree."""
-    old = stick_compatible([idc, out_idc])
-    new = stick_compatible_v2([(in_stl, in_dep), (out_stl, out_dep)])
-    assert old == new, (
-        f"stick_compatible mismatch: old={old} new={new}\n"
-        f"  in_stl={in_stl} in_dep.index={in_dep.index}\n"
-        f"  out_stl={out_stl} out_dep.index={out_dep.index}"
-    )
-    return old
-
-
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3154,7 +3116,7 @@ def compute_restickify_needed(
     if (
         not factorized_layout_mismatch
         and in_stick_offset_free
-        and _dual_stick_compatible(in_stl, in_dep, out_stl, out_dep, idc, out_idc)
+        and stick_compatible([(in_stl, in_dep), (out_stl, out_dep)])
     ):
         return False, None
 
