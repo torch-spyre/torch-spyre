@@ -357,8 +357,6 @@ def lower_scaled_mm(
     mat2,
     out_dtype=None,
 ):
-    mat1.realize()
-    mat2.realize()
     mat1_loader = mat1.make_loader()
     mat2_loader = mat2.make_loader()
 
@@ -421,8 +419,6 @@ def lower_bmm_fp8(
 ):
     # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
     # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
-    mat1.realize()
-    mat2.realize()
     mat1_loader = mat1.make_loader()
     mat2_loader = mat2.make_loader()
 
@@ -500,8 +496,6 @@ def lower_bmm_fp8(
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
-    x.realize()
-    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -554,7 +548,7 @@ def lower_mm(x, y):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
             f"mm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}, "
-            f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
+            f"out_layout={result_buf.get_layout()}"
         )
 
     return result
@@ -563,8 +557,6 @@ def lower_mm(x, y):
 @register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    x.realize()
-    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
