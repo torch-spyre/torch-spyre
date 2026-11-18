@@ -502,7 +502,9 @@ stay the same, otherwise `resize_` raises.
   branches on a small row count, so lower it only for tensors that take no
   such branch, page tables for example. The cap is the number of candidate
   iterations of a loop over the declared dimension, one correction slot
-  each, and has no measured cost at the step up to 256.
+  each, and has no measured cost at the step up to 256. The compiled
+  program carries one slot per bucket, so compile work grows with the
+  count. Runs at 128 and 256 buckets compiled and ran (#6432).
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop

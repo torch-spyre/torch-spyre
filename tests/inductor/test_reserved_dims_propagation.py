@@ -30,6 +30,7 @@ from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor import pass_utils
 from torch_spyre._inductor import reserved_dims_contract as contract
 from torch_spyre._inductor.errors import Unsupported
@@ -241,11 +242,13 @@ class TestOutputReservedDims(unittest.TestCase):
         # input size shifts by 16, a multiple of 16), so both ends of the
         # derived triple divide evenly by construction: min=144 (144 % 16 ==
         # 0), max=528 (528 % 16 == 0). What construction does not guarantee is
-        # the bucket count: 528 / 16 = 33, one over the default cap of 32.
-        # Nothing before this stamp step checks that, so without this
-        # refusal the next kernel over the output would build 33 buckets.
-        with self.assertRaisesRegex(Unsupported, "buckets"):
-            contract.output_reserved_dims(self.graph(), (s0 + 16, COLS))
+        # the bucket count: 528 / 16 = 33, one over a cap of 32 (pinned here,
+        # the default is 256 since #6432). Nothing before this stamp step
+        # checks that, so without this refusal the next kernel over the
+        # output would build 33 buckets.
+        with config.patch(max_buckets=32):
+            with self.assertRaisesRegex(Unsupported, "buckets"):
+                contract.output_reserved_dims(self.graph(), (s0 + 16, COLS))
 
 
 if __name__ == "__main__":
