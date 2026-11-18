@@ -455,6 +455,27 @@ inline void addDmaSectionMetadata(trace_activity_type& trace_activity,
   }
 }
 
+// Collective a host span did work for (e.g. the artifact load an allreduce
+// triggered). Not a correlation ID, so it never links host and device records.
+// Newer than the other runtime fields, so detected rather than assumed.
+template <class T, class = void>
+struct HasRuntimeCollIdField : std::false_type {};
+template <class T>
+struct HasRuntimeCollIdField<
+    T, std::void_t<decltype(std::declval<T&>().coll_id),
+                   decltype(std::declval<T&>().has_coll_id)>> : std::true_type {
+};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addRuntimeCollIdMetadata(trace_activity_type& trace_activity,
+                                     const aiupti_activity_type* activity) {
+  if constexpr (HasRuntimeCollIdField<aiupti_activity_type>::value) {
+    if (activity->has_coll_id != 0) {
+      trace_activity->addMetadata("coll_id", activity->coll_id);
+    }
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -518,6 +539,7 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
   addRuntimeDetailMetadata(runtime_activity, activity);
+  addRuntimeCollIdMetadata(runtime_activity, activity);
 
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
       !calibration && linked && linked->deviceId() == activity->process_id &&
@@ -594,6 +616,26 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
 
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
+    // spyre-comms WorkScheduleInfo: joins a collective's setup and
+    // bundle-generation spans to each of its _applyTensor spans.
+    case AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER_SETUP:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      runtime_activity->addMetadata("wsi_id", activity->data);
       break;
 
     default:

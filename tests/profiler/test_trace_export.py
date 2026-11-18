@@ -161,6 +161,13 @@ def test_runtime_data_metadata(native_traces):
     assert roundtrip["args"]["cb_idx"] == 2
     assert unicast["name"] == "aiuP2PRdmaSend"
     assert unicast["args"]["bytes"] == 1024
+    for correlation in (45, 46, 47):
+        assert spans[correlation]["args"]["wsi_id"] == 7
+    tagged, untagged = spans[48], spans[49]
+    assert tagged["name"] == "aiuCommsArtifactLoad"
+    assert tagged["args"]["coll_id"] == 0
+    assert tagged["args"]["bytes"] == 4096
+    assert "coll_id" not in untagged["args"]
 
 
 @pytest.mark.parametrize("prefix", ["reused", "scheduled-reused"])
@@ -205,6 +212,9 @@ def _capture_native_traces(output):
     runtime = Path(os.environ["RUNTIME_INSTALL_DIR"])
     aiupti = Path(os.environ.get("LIBAIUPTI_INSTALL_DIR") or runtime)
     external = Path(os.environ.get("SHARED_DEPS_DIR", csrc / "external"))
+    # AiuptiActivityHandlers.cpp names dtypes through deeptools' sendefs.h; the
+    # symbols resolve through libflex's own deeptools dependency, as in setup.py.
+    deeptools = Path(os.environ.get("DEEPTOOLS_INSTALL_DIR") or runtime)
     fixture = load(
         name="spyre_native_trace_fixture",
         sources=[
@@ -224,6 +234,7 @@ def _capture_native_traces(output):
             str(csrc / "profiler"),
             str(runtime / "include"),
             str(aiupti / "include"),
+            str(deeptools / "include"),
             str(external / "nlohmann/include"),
             str(Path(torch.__file__).parent / "include/kineto"),
         ],

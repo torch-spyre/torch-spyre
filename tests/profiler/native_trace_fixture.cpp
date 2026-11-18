@@ -304,6 +304,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA, 42, 4096);
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP, 43, 2);
     emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND, 44, 1024);
+    // spyre-comms WorkScheduleInfo ID, shown as wsi_id.
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE, 45, 7);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP, 46, 7);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE, 47, 7);
+    // An artifact load tagged with the collective that triggered it (0 is a
+    // valid ID), and one that is not.
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE, 48, 4096);
+    syntheticApi.runtime.back().has_coll_id = 1;
+    syntheticApi.runtime.back().coll_id = 0;
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE, 49, 4096);
   });
   module.def("emit_capture_window", [](int window) {
     at::RecordFunction origin(at::RecordScope::FUNCTION);
