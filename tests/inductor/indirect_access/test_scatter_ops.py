@@ -31,11 +31,12 @@ from conftest import (
     rejection,
 )
 
-# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
-# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
-# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
+# fp16 compute after a gather (unary, binary, small reductions).  The largest error
+# measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
+# so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
-# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
+# fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
+# (layer norm).
 _ATOL_F32 = 1e-5
 
 

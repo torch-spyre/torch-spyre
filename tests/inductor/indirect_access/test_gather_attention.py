@@ -23,11 +23,13 @@ import torch.nn.functional as F
 from utils_inductor import cached_randn
 from conftest import _xfail_existing, compare_mode, rejection
 
-# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
-# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
+# largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
+# error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
 _ATOL_BF16 = 2e-2
 # fp16/bf16 scaled_dot_product_attention over gathered K/V (matmul + softmax + matmul).
-# Measured against an fp32 reference, 3 data seeds: worst 5.8e-3, fp16 floor 4e-4.
+# The largest error measured against an fp32 reference is 6.5e-3 (fp16's own error:
+# 1.8e-3), so 2e-2 leaves about 3x margin.
 _ATOL_SDPA = 2e-2
 
 

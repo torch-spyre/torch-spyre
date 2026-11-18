@@ -22,20 +22,22 @@ import torch
 from utils_inductor import DEVICE, cached_randint, cached_randn
 from conftest import _xfail_existing, compare_mode
 
-# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
-# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
-# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
+# fp16 compute after a gather (unary, binary, small reductions).  The largest error
+# measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
+# so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
 # fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
 # bit fewer than fp16), so the error grows with the number of rows and depends on
 # which rows are drawn.  Measured over 1500 random index draws against an fp32
-# reference: worst 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps ~25%
-# above that worst case and stays 10x below an error of one whole row (~1).
+# reference the largest error was 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps
+# ~25% above that and stays 30x below the error of one wrong row (~1).
 _ATOL_F16_SUM = 3e-2
-# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); measured
-# worst 3.9e-3 against an fp32 reference, bf16's own compute floor up to 2.8e-3.
+# bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
+# largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
+# error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
 _ATOL_BF16 = 2e-2
-# fp32 compute.  Measured worst 4.3e-7 against an fp32 CPU reference (layer norm).
+# fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
+# (layer norm).
 _ATOL_F32 = 1e-5
 
 _NUMERICAL_MISMATCH = (

@@ -81,15 +81,15 @@ except ImportError:
 
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
-# fp16 compute after a gather (unary, binary, small reductions).  Measured against an
-# fp32 reference over every such test, 3 data seeds: worst 4.5e-3, fp16's own
-# compute floor up to 1.7e-3.  Pure data movement uses atol=0 instead.
+# fp16 compute after a gather (unary, binary, small reductions).  The largest error
+# measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
+# so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
 _ATOL_F16 = 1e-2
 # fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
 # bit fewer than fp16), so the error grows with the number of rows and depends on
 # which rows are drawn.  Measured over 1500 random index draws against an fp32
-# reference: worst 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps ~25%
-# above that worst case and stays 10x below an error of one whole row (~1).
+# reference the largest error was 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps
+# ~25% above that and stays 30x below the error of one wrong row (~1).
 _ATOL_F16_SUM = 3e-2
 
 # ---------------------------------------------------------------------------
