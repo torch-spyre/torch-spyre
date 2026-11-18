@@ -38,7 +38,6 @@ from torch_spyre._inductor.pass_utils import (
     _repoint_mutation_targets,
     compute_granularity,
     compute_max_size,
-    compute_symbolic_bounds,
 )
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -334,55 +333,6 @@ class TestPassUtils(unittest.TestCase):
                 granularity = compute_granularity(expr, max_size=1024)
         assert granularity == 32
         assert any("came from optimization_hint" in str(x.message) for x in w)
-
-    def test_compute_symbolic_bounds_concrete_int_returns_none(self):
-        with patch("torch_spyre._inductor.pass_utils.V", self._mock_v()):
-            assert compute_symbolic_bounds(128) is None
-
-    def test_compute_symbolic_bounds_concrete_sympy_integer_returns_none(self):
-        with patch("torch_spyre._inductor.pass_utils.V", self._mock_v()):
-            assert compute_symbolic_bounds(sympy.Integer(512)) is None
-
-    def test_compute_symbolic_bounds_shape_env_none_returns_none(self):
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        sizevars = SimpleNamespace(shape_env=None)
-        mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            assert compute_symbolic_bounds(s0) is None
-
-    def test_compute_symbolic_bounds_finite_bounds(self):
-        # lower=64 is a valid mark_dynamic(min=...): it divides max=1024
-        # and stays within max_buckets, so compute_granularity honours it
-        # as-is and the result coincides with the raw ShapeEnv lower bound.
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        mock_v = self._mock_v(
-            lower=sympy.Integer(64),
-            upper=sympy.Integer(1024),
-            optimization_hint=512,
-        )
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            result = compute_symbolic_bounds(s0)
-        assert result == (1024, 64)
-
-    def test_compute_symbolic_bounds_infinite_upper_falls_back_to_hint(self):
-        # dynamic=True without mark_dynamic(max=...) gives upper=oo.
-        # max_size must fall back to optimization_hint, not oo. lower=2 is
-        # ShapeEnv's default (no mark_dynamic(min=...) given), so
-        # granularity comes from compute_granularity's default-divisor
-        # branch: smallest divisor of 256 >= min_default_granularity(4)
-        # with 256/d <= max_buckets(32) is 8.
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        mock_v = self._mock_v(
-            lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=256
-        )
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            with warnings.catch_warnings(record=True):
-                warnings.simplefilter("always")
-                result = compute_symbolic_bounds(s0)
-        assert result is not None
-        max_size, granularity = result
-        assert max_size == 256
-        assert granularity == 8
 
 
 class TestRepointMutationTargets(unittest.TestCase):

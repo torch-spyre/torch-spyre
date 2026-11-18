@@ -13,33 +13,64 @@
 # limitations under the License.
 
 # Dynamic shape version of mean.py
-# Right now this is a work in progress — setting dynamic=True lets Dynamo
-# trace with symbolic shapes, but the SDSC we generate still ends up fully
-# concrete. Getting symbolic shapes all the way into the SDSC is tracked
-# in issues #220, #1371, #1372, #1373.
+# Dim 0 is declared on the tensor with x.to("spyre", dynamic={0: SPEC}) and the
+# function is compiled with the default dynamic=None. mean runs inside a
+# for_each_tile loop, one TILE-row tile per step, so one compiled program
+# serves every row count in [min, max]. The mean is over dim 1, so every row
+# is independent. A mean over the declared dim 0 would divide by the symbolic
+# row count, which does not compile yet.
+# torch.compile(dynamic=True) is refused on Spyre: it gives every dim a symbol
+# with no declared range.
 
 import torch
+from torch._dynamo.utils import counters
+
+from torch_spyre._inductor.wsr import for_each_tile
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+TILE = 64  # 64 fp16 values fill one 128-byte stick
+COLS = 64
+# The minimum is two tiles: a one-tile call recompiles until #6060 lands (#6018).
+SPEC = {"min": 2 * TILE, "max": 512, "granularity": TILE}
+# The compile size first, then the minimum, the maximum and sizes between.
+SIZES = [256, 128, 512, 448, 192]
+
 
 def mean_fn(a):
-    return torch.mean(a, dim=0)
+    # Restate the declared range inside the trace.
+    rows = a.shape[0]
+    torch._check(rows >= SPEC["min"])
+    torch._check(rows <= SPEC["max"])
+    torch._check(rows % TILE == 0)
+
+    def body(_carry, tiles):
+        (tile,) = tiles
+        return None, torch.mean(tile, dim=1)
+
+    _carry, out = for_each_tile(body, (a,), dims=(0,), tile_size=TILE, out_dim=0)
+    return out
 
 
-# Compile with dynamic=True
-compiled_fn = torch.compile(mean_fn, dynamic=True)
+compiled_fn = torch.compile(mean_fn, fullgraph=True)
 
-x = torch.rand(128, 64, dtype=torch.float16)
+x = torch.rand(SPEC["max"], COLS, dtype=torch.float16)
+# Reserves the device buffer at max rows, so resize_ within the range keeps
+# the device layout and does not recompile.
+x_device = x.to(DEVICE, dynamic={0: SPEC})
 
-cpu_result = mean_fn(x)
+counters.clear()
+for rows in SIZES:
+    x_device.resize_((rows, COLS))
+    compiled_result = compiled_fn(x_device).cpu().float()
+    cpu_result = torch.mean(x[:rows].float(), dim=1)
 
-x_device = x.to(DEVICE)
-compiled_result = compiled_fn(x_device).cpu()
+    # Compare results
+    cpu_delta = torch.abs(compiled_result - cpu_result).max()
+    print(f"rows={rows}: Max delta Compiled Spyre vs. CPU: {cpu_delta}")
+    torch.testing.assert_close(compiled_result, cpu_result, atol=1e-2, rtol=1e-2)
 
-# Compare results
-print(f"CPU result\n{cpu_result}")
-print(f"Spyre Compiled result\n{compiled_result}")
-cpu_delta = torch.abs(compiled_result - cpu_result).max()
-print(f"Max delta Compiled Spyre vs. CPU: {cpu_delta}")
+graphs = counters["stats"]["unique_graphs"]
+print(f"Compiled graphs: {graphs}")
+assert graphs == 1, "a size in the declared range caused a recompile"

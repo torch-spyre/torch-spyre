@@ -1115,8 +1115,8 @@ def overlapping_coordinate_extents(
 def _moves_coordinate(coordinate: Expr, var: Symbol, extent: int) -> bool:
     """Whether ``var`` changes ``coordinate`` (``floor(c/64)`` with ``c < 64`` does not)."""
     others = {v: 0 for v in coordinate.free_symbols if v != var}
-    base = coordinate.subs(others)
-    return extent > 1 and base.subs(var, 0) != base.subs(var, extent - 1)
+    base = coordinate.xreplace(others)
+    return extent > 1 and base.xreplace({var: 0}) != base.xreplace({var: extent - 1})
 
 
 def overlapping_window_split_domains(
