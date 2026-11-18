@@ -459,6 +459,10 @@ dimension, so `torch.compile` treats it as symbolic from the first trace. The
 `min`/`max` range itself is not passed to Dynamo; it is enforced when the tensor
 is resized.
 
+The reserved dimension is placed outermost in the derived device layout, so the
+first rows of the buffer are one contiguous block and a transfer of fewer than
+`max` rows goes over in a single DMA transfer.
+
 #### Resizing
 
 A reserved tensor is resized in place with `resize_`:
