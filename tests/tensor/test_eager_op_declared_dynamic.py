@@ -107,9 +107,7 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
         for rows in SIZES:
             with self.subTest(rows=rows):
                 cpu, x = _declared(rows)
-                torch.testing.assert_close(
-                    (x + 1).cpu(), cpu + 1, rtol=1e-3, atol=1e-3
-                )
+                torch.testing.assert_close((x + 1).cpu(), cpu + 1, rtol=1e-3, atol=1e-3)
                 self.assertIn(0, x._dynamo_dynamic_indices)
 
     def test_inplace_op_returns_the_callers_tensor(self) -> None:
@@ -176,4 +174,3 @@ class TestUserCompileStaysStrict(TestCase):
 
 if __name__ == "__main__":
     run_tests()
-
