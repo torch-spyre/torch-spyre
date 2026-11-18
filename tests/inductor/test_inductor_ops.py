@@ -817,19 +817,6 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
-# torch.sort returns int64 indices, and the cast of topk's fp16 indices to
-# int64 runs on the device through a staggered fp32 value. The sort
-# values stay exact; the indices come back wrong, deterministically:
-# - permuted when the stick dim fills whole stick pairs (#4393);
-# - wrong numbers, some out of range, when it does not (#3999).
-_SORT_PERMUTED = (
-    "readback of the staggered int64 index cast is permuted, so the indices come "
-    "back reordered (#4393)"
-)
-_SORT_UNALIGNED = (
-    "the staggered fp32 value of the int64 index cast does not fill whole stick "
-    "pairs, so the indices come back wrong (#3999)"
-)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
@@ -1356,10 +1343,10 @@ def _sort_inf_input(dim, dtype=torch.float16):
     return x
 
 
-# torch.sort cases as (make_input(dtype), dim, descending). The same
-# cases run in fp32 (test_sort: values and indices, both exact) and in fp16
-# (test_sort_values: values only, because fp16 indices come back wrong, see
-# _SORT_PERMUTED). A few fp16 cases stay in test_sort as strict xfails.
+# torch.sort cases as (make_input(dtype), dim, descending). The same cases
+# run in fp32 (test_sort: values and indices, both exact) and in fp16
+# (test_sort_values: values only, because topkindex returns indices in the
+# input dtype and the int64 cast via staggered fp32 comes back wrong, #4393).
 _SORT_CASES = {
     # Random columns, so each column's indices differ and a permuted readback
     # is caught.
@@ -1393,15 +1380,6 @@ _SORT_CASES = {
     ),
 }
 
-# fp16 cases that test_sort keeps, with the reason their indices are wrong.
-_SORT_FP16_INDEX_XFAIL = {
-    "2d_dim0_asc": _SORT_PERMUTED,
-    "3d_ties_dim1": _SORT_PERMUTED,
-    "2d_ties_last_dim_w60": _SORT_UNALIGNED,
-    "2d_ties_peeling_n165_dim0_desc": _SORT_PERMUTED,
-}
-
-
 def _sort_params(dtype, names=None):
     suffix = {torch.float16: "fp16", torch.float32: "fp32"}[dtype]
     return {
@@ -1411,15 +1389,15 @@ def _sort_params(dtype, names=None):
     }
 
 
-# Sort-dim sizes 256, 512, 999 and 1024 in 1D and 2D, as (input, dim, descending).
-# Sorting along dim 0, 1D sort, and sort along dim=1 for n=256 and n=999 all
-# work. fp32 runs in test_sort, which checks the indices. fp16 stops at 512
-# (FP16_TOPK_MAX_DIM) because the indices are held in fp16, so the fp16 sizes are
-# 256 and 512 only, and run in test_sort_values.
+# Sort-dim sizes 256, 999 and 1024 in 1D and 2D, as (input, dim, descending).
+# fp32 runs in test_sort, which checks the indices. fp16 runs in test_sort_values
+# (values only, since the int64 index cast fails). fp16 and fp32 use the same
+# sizes: DLFloat16 has integer precision up to FP16_TOPK_MAX_DIM (1024), so all
+# three sizes are within range.
 _SORT_SIZES = (256, 999, 1024)
 _SORT_SIZES_FP16 = {
     f"2d_dim0_n{n}_fp16": (_sort_ties((n, 32), 11, torch.float16), 0, False)
-    for n in (256, 512)
+    for n in _SORT_SIZES
 }
 _SORT_SIZES_FP32 = {
     **{
@@ -2633,13 +2611,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_sort", "test_sort_cpu"): {
-            # fp32 checks values and indices. The fp16 cases are strict xfails
-            # that track the wrong fp16 indices: the int64 index cast runs on
-            # the device through fp32, so the indices come back wrong on every
-            # run. TODO: remove each entry when its issue is fixed.
+            # fp32: checks both values and indices. fp16 runs in test_sort_values.
             "param_sets": {
                 **_sort_params(torch.float32),
-                **_sort_params(torch.float16, _SORT_FP16_INDEX_XFAIL),
                 **_SORT_INT_CASES,
                 **_SORT_SIZES_FP32,
                 # The pad for an unsplittable sort dim is -inf in topk's key
@@ -2656,22 +2630,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     False,
                 ),
-                # Sort along the stick dim: the values are exact, the int64
-                # index cast fails (see _SORT_UNALIGNED).
-                "2d_ties_dim1_desc_fp16": (
-                    _sort_ties((8, 64), 5, torch.float16),
-                    1,
-                    True,
-                ),
-                "1d_ties_fp16": (_sort_ties((64,), 4, torch.float16), 0, False),
-            },
-            "expect_fail": {
-                **{f"{n}_fp16": r for n, r in _SORT_FP16_INDEX_XFAIL.items()},
-                "2d_ties_dim1_desc_fp16": _SORT_UNALIGNED,
-                "1d_ties_fp16": _SORT_UNALIGNED,
             },
         },
-        # fp16, values only: the fp16 indices are wrong (see _SORT_PERMUTED).
+        # fp16, values only: topkindex returns indices in the input dtype and
+        # the int64 cast via staggered fp32 comes back wrong (#4393).
         ("test_sort_values", "test_sort_values_cpu"): {
             "param_sets": {
                 **_sort_params(torch.float16),
@@ -2687,6 +2649,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # The same inf inputs in fp16, values only (fp32 is in test_sort).
                 "unsplittable_with_inf_dim0": (_sort_inf_input(0), 0, False),
                 "unsplittable_with_inf_dim1": (_sort_inf_input(1), 1, False),
+                # Sort along the stick dim: values are exact, indices are not.
+                "2d_ties_dim1_desc_fp16": (
+                    _sort_ties((8, 64), 5, torch.float16),
+                    1,
+                    True,
+                ),
+                "1d_ties_fp16": (_sort_ties((64,), 4, torch.float16), 0, False),
             },
         },
         ("test_topk_indices", "test_topk_indices_cpu"): {
@@ -2711,19 +2680,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # the indices is not.
             "expect_fail": {
                 "2d_k4_dim0": _STAGGERED_READBACK,
-            },
-            # The cast's fp32 value lacks the second stick of a stick pair, so it
-            # reads memory that was never written: the result is wrong on most runs
-            # and right on some, and a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "2d_batch1_k4_dim1_lt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on most runs"
-                ),
-                "2d_batch1_k4_dim1_gt64": (
-                    "the cast's fp32 value lacks the second stick of a stick pair "
-                    "(#3999), so the indices come back wrong on some runs"
-                ),
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -11656,17 +11612,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @expects_raise
     def test_sort_fp16_index_range_rejected(self):
         # topkindex yields indices in the input dtype, and Spyre's fp16 holds
-        # integers exactly only up to 512 (9 mantissa bits), so a longer fp16
+        # integers exactly only up to 1024 (10 mantissa bits), so a longer fp16
         # sort dim must be rejected.
-        x = unique_randn_along_dim((513, 8), dim=0)
-        with pytest.raises(Exception, match="the search dim may be at most 512"):
+        x = unique_randn_along_dim((1025, 8), dim=0)
+        with pytest.raises(Exception, match="the search dim may be at most 1024"):
             _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
 
     @expects_raise
     def test_topk_fp16_index_range_rejected(self):
         # The same limit applies to topk itself, even for a small k.
-        x = unique_randn_along_dim((513, 8), dim=0)
-        with pytest.raises(Exception, match="the search dim may be at most 512"):
+        x = unique_randn_along_dim((1025, 8), dim=0)
+        with pytest.raises(Exception, match="the search dim may be at most 1024"):
             _compile_and_run(lambda x: torch.topk(x, 4, dim=0)[0], [x], "spyre")
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):

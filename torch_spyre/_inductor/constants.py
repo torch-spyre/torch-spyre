@@ -242,8 +242,8 @@ _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 # Largest k topkvalue/topkindex accept.
 TOPK_MAX_K = 128
-# DLFloat16 has integer precision up to 512, so above it indices come back wrong
-FP16_TOPK_MAX_DIM = 512
+# DLFloat16 has integer precision up to 1024, so above it indices come back wrong
+FP16_TOPK_MAX_DIM = 1024
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
