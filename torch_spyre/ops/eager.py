@@ -98,6 +98,10 @@ def _guard_reentry(op):
 # Attributes dynamo reads off a tensor to decide that a dim must be symbolic
 # (``mark_dynamic``, ``maybe_mark_dynamic``, ``mark_unbacked``, and
 # ``_dynamo_dynamic_range`` which carries the bounds for ``mark_dynamic``).
+# These are private torch names: ``test_mark_attributes_are_all_known`` fails
+# if a torch upgrade adds or renames one. ``detach()`` drops every Python
+# attribute of a tensor, not only these, so the twin is unmarked whatever the
+# list holds; the list only decides which tensors get a twin.
 _DYNAMO_DYNAMIC_MARKS = (
     "_dynamo_dynamic_indices",
     "_dynamo_dynamic_range",
@@ -116,22 +120,27 @@ def _strip_dynamo_marks(args, kwargs):
 
     The marks are plain Python attributes on one tensor object, and ``detach()``
     returns a new object that shares storage and layout but not those
-    attributes. Returns ``(args, kwargs, lookup)`` where ``lookup`` maps
-    ``id(twin) -> original``, the shape ``_remap_result`` below expects, so an op
-    that returns one of its arguments hands back the caller's own tensor. The
-    twins stay alive in the returned args until the result has been remapped,
-    so their ids cannot be reused in the meantime.
+    attributes. Returns ``(args, kwargs, pairs)`` where ``pairs`` is a list of
+    ``(twin, original)``. ``_static_shape_call`` turns it into the
+    ``id(twin) -> original`` map ``_remap_result`` expects, so an op that
+    returns one of its arguments hands back the caller's own tensor. ``pairs``
+    keeps the twins alive until the result has been remapped, so their ids
+    cannot be reused in the meantime.
     """
-    lookup = {}
+    pairs = []
 
     def strip(a):
         if isinstance(a, torch.Tensor) and _has_dynamo_marks(a):
             twin = a.detach()
-            lookup[id(twin)] = a
+            pairs.append((twin, a))
             return twin
         return a
 
-    return pytree.tree_map(strip, args), pytree.tree_map(strip, kwargs), lookup
+    return pytree.tree_map(strip, args), pytree.tree_map(strip, kwargs), pairs
+
+
+def _metadata(t):
+    return (tuple(t.shape), tuple(t.stride()), t.storage_offset())
 
 
 def _static_shape_call(compiled):
@@ -149,14 +158,34 @@ def _static_shape_call(compiled):
     (``allow_ignore_mark_dynamic``), is deliberate: that knob only silences the
     error, and a kernel that does not itself specialise the marked dim (``add``,
     ``gelu``) would still see a symbolic dim the Spyre lowering rejects.
+
+    The twin shares storage, so a write to the data reaches the caller's tensor.
+    A change to its metadata (size, strides, offset, e.g. an ``out=`` that the
+    kernel resizes) would not, so that case raises instead of silently leaving
+    the caller's tensor stale.
     """
 
     @functools.wraps(compiled)
     def call(*args, **kwargs):
-        args, kwargs, lookup = _strip_dynamo_marks(args, kwargs)
-        if not lookup:  # nothing was marked: leave the result untouched
+        # Common case, nothing marked: one flat scan, no rebuild of the args.
+        if not any(
+            isinstance(a, torch.Tensor) and _has_dynamo_marks(a)
+            for a in pytree.tree_leaves((args, kwargs))
+        ):
             return compiled(*args, **kwargs)
-        return _remap_result(compiled(*args, **kwargs), lookup)
+        args, kwargs, pairs = _strip_dynamo_marks(args, kwargs)
+        result = compiled(*args, **kwargs)
+        for twin, original in pairs:
+            before, after = _metadata(original), _metadata(twin)
+            if before != after:
+                raise RuntimeError(
+                    "A Spyre eager kernel changed the size, strides or offset of a "
+                    "tensor declared with .to('spyre', dynamic=...) "
+                    f"(size, strides, offset: {before} -> {after}). The change "
+                    "cannot be applied to the declared tensor; resize it with "
+                    "resize_() first."
+                )
+        return _remap_result(result, {id(t): o for t, o in pairs})
 
     return call
 

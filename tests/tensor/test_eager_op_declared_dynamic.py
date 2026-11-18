@@ -30,6 +30,11 @@ from torch.fx.experimental.symbolic_shapes import ConstraintViolationError
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
+from torch_spyre.ops.eager import (
+    _DYNAMO_DYNAMIC_MARKS,
+    _has_dynamo_marks,
+    _static_shape_call,
+)
 
 DEVICE = torch.device("spyre")
 DECLARATION = {0: {"min": 8, "max": 128, "granularity": 8}}
@@ -140,6 +145,17 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
                     result.cpu(), cpu.slice_scatter(src_cpu, 0, 0, rows)
                 )
 
+    def test_list_argument_op_matches_cpu(self) -> None:
+        # cat takes a list of tensors, so the marked tensors sit inside a list.
+        for rows in SIZES:
+            with self.subTest(rows=rows):
+                a_cpu, a = _declared(rows)
+                b_cpu, b = _declared(rows)
+                torch.testing.assert_close(
+                    torch.cat([a, b]).cpu(), torch.cat([a_cpu, b_cpu])
+                )
+                self.assertIn(0, a._dynamo_dynamic_indices)
+
     def test_decomposed_op_matches_cpu(self) -> None:
         # gelu has a Spyre decomposition, so eager gelu goes through _OPWrapper
         # and not through compile_once.
@@ -153,11 +169,11 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
 
 
 class TestUserCompileStaysStrict(TestCase):
-    """The marks are stripped only for the internal eager kernels. A user ``torch.compile``
-    that specialises a declared dim must keep raising, so an unintended
-    specialisation stays loud instead of silently recompiling per size. This
-    holds with or without the fix; it guards against widening the fix to the
-    declaration itself (e.g. ``maybe_mark_dynamic``).
+    """The marks are stripped only for the internal eager kernels. A user
+    ``torch.compile`` that specialises a declared dim must keep raising, so an
+    unintended specialisation stays loud instead of silently recompiling per
+    size. This holds with or without the fix; it guards against widening the
+    fix to the declaration itself (e.g. ``maybe_mark_dynamic``).
     """
 
     def test_specialising_body_still_raises(self) -> None:
@@ -170,6 +186,66 @@ class TestUserCompileStaysStrict(TestCase):
         compiled = torch.compile(specialises, backend="eager")
         with self.assertRaisesRegex(ConstraintViolationError, "specialized"):
             compiled(x)
+
+
+class TestStaticShapeCall(TestCase):
+    """The stripping helper on CPU tensors, with a stand-in for the kernel."""
+
+    def test_mark_attributes_are_all_known(self) -> None:
+        # Drift guard: the mark names are private torch API. If an upgrade adds
+        # or renames one, fail here and not by a silent return of #6030.
+        decorators = torch._dynamo.decorators
+        # Set next to the marks (torch >= 2.14) as an optional size hint for a
+        # marked dim. It does not make a dim symbolic, so it is no mark.
+        companions = {"_dynamo_hint_overrides"}
+        markers = {
+            "mark_dynamic": lambda t: torch._dynamo.mark_dynamic(t, 0, min=2, max=8),
+            "maybe_mark_dynamic": lambda t: torch._dynamo.maybe_mark_dynamic(t, 0),
+            "mark_unbacked": lambda t: decorators.mark_unbacked(t, 0),
+            "mark_unbacked(strict)": lambda t: decorators.mark_unbacked(
+                t, 0, strict=True
+            ),
+        }
+        for name, mark in markers.items():
+            with self.subTest(marker=name):
+                t = torch.zeros(4, 3)
+                mark(t)
+                added = {n for n in vars(t) if n.startswith("_dynamo")}
+                self.assertTrue(added)
+                self.assertLessEqual(added - companions, set(_DYNAMO_DYNAMIC_MARKS))
+                self.assertTrue(_has_dynamo_marks(t))
+                self.assertFalse(_has_dynamo_marks(t.detach()))
+
+    def test_list_arguments_and_results(self) -> None:
+        # Tensors inside a list argument are found, and the caller's own tensor
+        # comes back from inside a list result.
+        marked, plain = torch.zeros(4, 3), torch.zeros(4, 3)
+        torch._dynamo.mark_dynamic(marked, 0)
+
+        def kernel(tensors, other):
+            self.assertFalse(any(_has_dynamo_marks(t) for t in (*tensors, other)))
+            tensors[0].add_(1)
+            return [tensors[0], other, (tensors[1],)]
+
+        result = _static_shape_call(kernel)([marked, plain], other=marked)
+        self.assertIs(result[0], marked)
+        self.assertIs(result[1], marked)
+        self.assertIs(result[2][0], plain)
+        self.assertEqual(marked.sum().item(), 12)  # the write reached the caller
+        self.assertTrue(_has_dynamo_marks(marked))
+
+        # Nothing marked: the kernel gets the caller's own objects back untouched.
+        seen = []
+        _static_shape_call(lambda *a: seen.extend(a))(plain, [plain])
+        self.assertIs(seen[0], plain)
+        self.assertIs(seen[1][0], plain)
+
+    def test_metadata_change_on_the_twin_raises(self) -> None:
+        # A resize on the twin would not reach the caller's tensor.
+        marked = torch.zeros(4, 3)
+        torch._dynamo.mark_dynamic(marked, 0)
+        with self.assertRaisesRegex(RuntimeError, "changed the size"):
+            _static_shape_call(lambda t: t.resize_(2, 3))(marked)
 
 
 if __name__ == "__main__":
