@@ -72,6 +72,7 @@ from .constants import (
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
     MATMUL_REDUCTION_OPS,
+    QFP8WT_STICK_N,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -84,6 +85,7 @@ from .ir import (
 )
 from .pass_utils import (
     collapse_valid_elements,
+    qfp8wt_layout,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
@@ -95,6 +97,7 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
+    stick_dims,
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
@@ -423,13 +426,17 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
                 # aborting — another candidate for this input may be valid.
                 continue
             representable += 1
-            stick_expr = coords[-1]
-            if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
-                raise Unsupported(
-                    f"{op_label}: input arg{i} has stick expression with offset "
-                    f"{stick_expr!r} (likely from slicing the stick dimension); "
-                    f"this op requires a fixed input layout and double-restickify is not yet supported"
-                )
+            # Each stick dim is checked against its own size: a QFP8WT stick is
+            # [N/64, K/2, 64, 2] (see qfp8wt_layout), so its stick coordinates are
+            # Mod(n, 64) and Mod(k, 2), not one Mod(var, elems_per_stick).
+            for d in stick_dims(stl):
+                stick_expr = coords[d]
+                if not is_stick_expr_offset_free(stick_expr, stl.device_size[d]):
+                    raise Unsupported(
+                        f"{op_label}: input arg{i} has stick expression with offset "
+                        f"{stick_expr!r} (likely from slicing the stick dimension); "
+                        f"this op requires a fixed input layout and double-restickify is not yet supported"
+                    )
         if arg.layouts and representable == 0:
             # Every candidate layout for this input was unrepresentable. This
             # is not fatal here, but the downstream layout selection will fail
@@ -730,40 +737,50 @@ def _typecast_layouts(
     return layouts
 
 
-def qfp8wt_dim_order(rank: int) -> list[int]:
-    """Default host dim order for a QFP8WT tensor [..., K, N]: [K, L0, .., N].
+def _qfp8wt_candidates(
+    output: FixedLayout,
+    in_layout: FixedLayout,
+) -> list[SpyreTensorLayout]:
+    """QFP8WT output layouts, one per possible K host dim.
 
-    The 2D stick pairs K with N, but the device layout records only a 1D stick
-    of N, so readers (codegen, work division) take K from device coordinate -2.
-    This default places host dim -2 there, giving the device order
-    [L0, .., N-tile, K, stick]; it assumes the tensor is [..., K, N]. When a
-    matmul reads the tensor, nonstick_dim_order takes K from the matmul's
-    reduction variable instead and reorders this layout if they disagree.
-    Rank 2 stays [0, 1].
+    K is the matmul's reduction dim, which the producer cannot see. The default
+    (host dim -2) comes first; the other even host dims follow, so a consumer
+    matmul can pick the candidate whose 2-wide stick carries its K. Dims that do
+    not hold an even K are skipped.
     """
-    if rank < 2:
-        return list(range(rank))
-    return [rank - 2, *range(rank - 2), rank - 1]
+    rank = len(output.size)
+    default = rank - 2
+    order = [default] + [d for d in range(rank - 1) if d != default]
+    candidates = []
+    for k_dim in order:
+        try:
+            candidates.append(_qfp8wt_stl(output, in_layout, k_dim))
+        except Unsupported:
+            continue
+    if not candidates:
+        raise Unsupported(
+            f"QFP8WT output of size {list(output.size)} has no host dim that "
+            "holds an even K for its [2, 64] stick"
+        )
+    return candidates
 
 
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
+    k_dim: int | None = None,
 ) -> SpyreTensorLayout:
-    """Propagate special FP8 tensor with 2D stick [2, 64]
+    """Propagate the QFP8WT output layout with its 2D [2, 64] stick.
 
-    The QFP8WT weight (KERNEL) tensor requires stick dimensions of [2, 64].  This
-    function propagates the output layout for both aligned and unaligned input tensors.
-
-    Outer dimensions and strides are preserved from output layout, with the innermost
-    stride always set to 1. For unaligned inputs where input stick size is not a
-    multiple of input stick size, the last dimension is padded to the stick size.  For
-    aligned inputs, it retains the concrete output size. The device order puts K
-    directly outside the stick (see ``qfp8wt_dim_order``).
+    Outer dimensions and strides are preserved from the output layout, and the
+    innermost stride is set to 1. For unaligned inputs the last dimension is
+    padded to the stick size; for aligned inputs it keeps the concrete output
+    size. See ``qfp8wt_layout`` for the device shape.
 
     Args:
         output: Inductor ``FixedLayout`` for the op's output tensor.
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
+        k_dim: Host dim holding K; defaults to -2.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
     stick_dim_size = concretize_expr(in_layout.size[-1])
@@ -771,14 +788,11 @@ def _qfp8wt_stl(
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
     last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
-    c_size = outer_sizes + [last_dim]
-    c_stride = outer_strides + [1]
-    return SpyreTensorLayout(
-        c_size,
-        c_stride,
+    return qfp8wt_layout(
+        outer_sizes + [last_dim],
+        outer_strides + [1],
         output.dtype,
-        qfp8wt_dim_order(len(c_size)),
-        ElementArrangement.QFP8WT,
+        k_dim,
     )
 
 
@@ -1043,7 +1057,7 @@ def _single_arg_op_layout(
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
-            return [_qfp8wt_stl(output, in_layout)]
+            return _qfp8wt_candidates(output, in_layout)
 
     return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
 
@@ -1074,7 +1088,27 @@ def _clone_layout(
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
     in_device_coords = device_coordinates(in_stl, in_dep, None)
-    stick_expr = in_device_coords[-1]
+    in_stick_dims = stick_dims(in_stl)
+    multi_dim_stick = len(in_stick_dims) > 1
+    if multi_dim_stick:
+        # A QFP8WT input's stick is two device dims. The stick that carries the
+        # innermost host element (the variable with stride 1 in the read index)
+        # is the one the clone's element order depends on; its extent is its own
+        # device size, not the whole fp8 stick.
+        inner_vars = [
+            v for v in in_dep.index.free_symbols if in_dep.index.coeff(v) == 1
+        ]
+        stick_dim = next(
+            (
+                d
+                for d in in_stick_dims
+                if inner_vars and inner_vars[0] in in_device_coords[d].free_symbols
+            ),
+            in_stick_dims[-1],
+        )
+        stick_expr = in_device_coords[stick_dim]
+    else:
+        stick_expr = in_device_coords[-1]
 
     # Clone preserves physical format, so a bool output must match its
     # input's -- substitute the equivalent logical dtype since
@@ -1084,12 +1118,19 @@ def _clone_layout(
     else:
         dtype_for_layout = output.dtype
     stick_size = get_elem_in_stick(dtype_for_layout)
+    if multi_dim_stick:
+        stick_size = int(in_stl.device_size[stick_dim])
 
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    out_stl = SpyreTensorLayout(
-        c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
-    )
+    if in_stl.element_arrangement == ElementArrangement.QFP8WT:
+        # Clone preserves the physical format: a QFP8WT input yields a QFP8WT
+        # output for the (contiguous) output shape, not a standard layout.
+        out_stl = qfp8wt_layout(c_size, c_stride, dtype_for_layout)
+    else:
+        out_stl = SpyreTensorLayout(
+            c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
+        )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
         # Case 1: No restickify insertion needed.
@@ -1484,10 +1525,25 @@ def _parseable_candidates(
     ]
 
 
+def _carries_n_stick_var(
+    stl: "SpyreTensorLayout", dev_coords: list, stick_var: sympy.Symbol
+) -> bool:
+    """True if stick_var indexes the 64-wide (N) stick dim of a QFP8WT weight.
+
+    The 2-wide stick dim is K, so N must sit on the 64-wide dim. A candidate
+    with N on the 2-wide dim is rejected here, and layout selection fails.
+    """
+    return any(
+        stl.device_size[d] == QFP8WT_STICK_N and stick_var in dev_coords[d].free_symbols
+        for d in stick_dims(stl)
+    )
+
+
 def _find_quantized_candidate(
     candidates: "list[tuple[SpyreTensorLayout, list]]",
     stick_var: sympy.Symbol,
     reduction_type: str,
+    k_var: sympy.Symbol | None = None,
 ) -> "SpyreTensorLayout | None":
     """Return the first non-STANDARD candidate that is usable, or None.
 
@@ -1503,12 +1559,31 @@ def _find_quantized_candidate(
         ea = stl.element_arrangement
         if ea == ElementArrangement.STANDARD:
             continue
-        if (
+        if reduction_type == BATCH_MATMUL_FP8_OP and ea == ElementArrangement.QFP8WT:
+            # The fp8 weight's N must be on its 64-wide stick dim, and its K (the
+            # matmul's reduction var) on the 2-wide one.
+            if not _carries_n_stick_var(stl, dev_coords, stick_var):
+                continue
+            k_coord = dev_coords[stick_dims(stl)[-1]]
+            if k_var is not None and k_var not in k_coord.free_symbols:
+                continue
+        elif (
             reduction_type == BATCH_MATMUL_FP8_OP or ea in STAGGERED_EAS
-        ) and stick_var not in dev_coords[-1].free_symbols:
+        ) and not _carries_stick_var(stl, dev_coords, stick_var):
             continue
         return stl
     return None
+
+
+def _carries_stick_var(
+    stl: "SpyreTensorLayout", dev_coords: list, stick_var: sympy.Symbol
+) -> bool:
+    """True if stick_var indexes any stick dim of the layout.
+
+    A stick can span several device dims (QFP8WT's [N/64, K/2, 64, 2]), so the
+    variable may sit on any of them, not only the last.
+    """
+    return any(stick_var in dev_coords[d].free_symbols for d in stick_dims(stl))
 
 
 def _prepare_for_restickify(
@@ -1557,7 +1632,7 @@ def _find_existing_candidate(
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
             continue
-        if stick_var not in dev_coords[-1].free_symbols:
+        if not _carries_stick_var(stl, dev_coords, stick_var):
             continue
         if reduction_type == BATCH_MATMUL_OP and _violates_matmul_outer_dim_constraints(
             dev_coords, stick_var, nosplit_var
@@ -1641,7 +1716,9 @@ def generate_stl_with_required_stick(
     """
     candidates = _parseable_candidates(arg)
 
-    stl = _find_quantized_candidate(candidates, stick_var, reduction_type)
+    stl = _find_quantized_candidate(
+        candidates, stick_var, reduction_type, k_var=nosplit_var
+    )
     if stl is not None:
         return stl
 
@@ -1657,6 +1734,16 @@ def generate_stl_with_required_stick(
     if stl is not None:
         return stl
 
+    if reduction_type == BATCH_MATMUL_FP8_OP and nosplit_var is not None:
+        # A QFP8WT weight's layout is fixed where it is a graph input, so no
+        # candidate can move its K.
+        if arg.dep.name in V.graph.graph_input_names:
+            raise Unsupported(
+                f"{reduction_type}: QFP8WT weight {arg.dep.name} is a graph input "
+                f"with K ({nosplit_var}) away from its 2-wide stick dim; its "
+                "layout cannot be rebuilt here. Produce it with K at the "
+                "matmul's reduction dim."
+            )
     raise Unsupported(
         f"{reduction_type}: cannot restickify any input layout of {label} "
         f"to carry {label}_var={stick_var}"
@@ -3089,8 +3176,18 @@ def _find_alt_target_stl(
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size) and not (
+    write_coords = device_coordinates(target_stl, output_dep, None)
+    write_stick = write_coords[-1]
+    if target_stl.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT stick is two device dims, [N/64, K/2, 64, 2]. Each stick dim is
+        # offset-free against its own size; the last coordinate is only K's 2-wide
+        # dim, so it cannot stand for the stick (see _check_supported_input_sticks).
+        if all(
+            is_stick_expr_offset_free(write_coords[d], int(target_stl.device_size[d]))
+            for d in stick_dims(target_stl)
+        ):
+            return None
+    elif is_stick_expr_offset_free(write_stick, stick_size) and not (
         _is_substick_write(write_stick, target_layout, output_dep, stick_size)
     ):
         return None
@@ -3728,6 +3825,17 @@ def propagate_spyre_tensor_layouts(
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
                 op.layouts = [target_stl]
+                if (
+                    args
+                    and args[0].layouts
+                    and len(stick_dims(next(iter(args[0].layouts)))) > 1
+                ):
+                    # A copy from a multi-dim-stick input (QFP8WT's [K/2, 64]) cannot
+                    # restickify that input, and AllSameNode would demand the input
+                    # match the target's stick. The copy's data conversion repacks
+                    # the elements, so no edge is needed.
+                    op.restick_cost_fn = AnyInNode.from_args()
+                    continue
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )

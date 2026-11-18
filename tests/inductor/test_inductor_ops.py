@@ -14954,7 +14954,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         The matmul needs N on the weight's stick, and a QFP8WT tensor cannot be
         restickified, so layout propagation rejects it instead of computing with
         the wrong pairing. (nonstick_dim_order's own stick check is a second
-        guard; test_qfp8wt_k_constraint.py covers its message.)
+        guard.)
         TODO: supporting it needs a restickify of the QFP8WT tensor.
         """
         q, k, scale_a, scale_b = SCALED_BMM_QK_TESTS["qk_1x32x128x128"]

@@ -70,6 +70,7 @@ from .pass_utils import (
     indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
+    stick_dims,
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
@@ -275,7 +276,13 @@ def direct_read_source_stick_split_domains(
     if not coordinates or eps <= 0:
         return ConstraintResult()
 
-    stick_coord = sympy.expand(coordinates[-1])
+    # Only a single-dim stick has the canonical Mod(v, eps) coordinate; a multi-dim
+    # stick (QFP8WT's [64, 2]) splits across several coordinates and is left to
+    # adjust_it_space_for_sticks, which keeps each stick variable whole.
+    sticks = stick_dims(source_layout.device_layout)
+    if len(sticks) != 1:
+        return ConstraintResult()
+    stick_coord = sympy.expand(coordinates[sticks[0]])
     allowed_splits: dict[Symbol, frozenset[int]] = {}
     for symbol, extent_expr in ctx.it_space.items():
         if sympy.simplify(stick_coord - sympy.Mod(symbol, eps)) != 0:
@@ -721,13 +728,16 @@ def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
     and read by batchmatmulfp8 in 4, only the first head of each read slice is
     correct, while the same graph on one core is exact.
 
+    For a rank-2 weight only the second stick dim is pinned, as before. The
+    stick dims come from the layout, not from a fixed position.
+
     TODO: this pin is a workaround. The fix is to adjust the strides to reflect
     the 2D stick layout, which is not currently represented in the tensor's
     device_size; that would make the per-core addressing correct and let the
     pin be dropped.
     """
     if len(td.layout.size) <= 2:
-        return [td.device_coords[-2]]
+        return [td.device_coords[stick_dims(td.layout.device_layout)[-1]]]
     return list(td.device_coords)
 
 

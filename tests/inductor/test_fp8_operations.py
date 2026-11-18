@@ -347,18 +347,9 @@ class TestFP8Operations:
         """Regression test for FP8 batchmatmulfp8 SDSC crash under separate compilation.
 
         Pre-quantizing the weight in one torch.compile call and running _scaled_mm
-        in a second torch.compile call crosses the compile boundary: the QFP8WT
-        kernel tensor arrives at the batchmatmulfp8 SDSC codegen with a
-        flat stick_size=[128] (instead of the canonical [2, 64]) because the
-        SpyreTensorLayout crossing the compile boundary loses the 2D-stick structure.
-        Without _layout_info_for_tensor restoring it, batchmatmulfp8 codegen
-        produced:
-
-            loc("bmm.ddl":22:24): error: Fixed layout with too many dimensions
-            DtException: Impossible to match for sdsc0_batchmatmulfp8
-
-        The fix lives in _layout_info_for_tensor (compute_ops.py): it detects the
-        flat stick_size=[128] at the compile boundary and restores stick_size=[2, 64].
+        in a second torch.compile call crosses the compile boundary. The QFP8WT
+        kernel tensor must keep its 2D [2, 64] stick across that boundary.
+        The layout carries its 2D stick, so no restore is needed at codegen.
         """
         M, K, N = 128, 128, 128
         mat_a = cached_randn((M, K), dtype=torch.float16, scale=1.0)
@@ -381,8 +372,8 @@ class TestFP8Operations:
         q_a = quantize_a(mat_a_d, scale_a_d)
         q_b = quantize_b(mat_b_d, scale_b_d)
 
-        # Run _scaled_mm in a third separate compiled call — this is the case
-        # that triggered the "Fixed layout with too many dimensions" crash.
+        # Run _scaled_mm in a third separate compiled call, the case that crosses
+        # the compile boundary.
         scaled_mm = torch.compile(
             lambda a, b: torch.ops.aten._scaled_mm(
                 a,

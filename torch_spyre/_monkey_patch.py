@@ -477,6 +477,44 @@ def _patch_tensor_for_spyre():
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
+
+    # Clone preserves the physical format. A QFP8WT Spyre tensor is cloned into
+    # a QFP8WT destination (the contiguous shape's qfp8wt layout); PyTorch's
+    # default clone would allocate a standard layout instead, which the FP8
+    # kernels cannot read.
+    orig_clone = torch.Tensor.clone
+
+    def spyre_clone(self, *, memory_format=torch.preserve_format):
+        # Under tracing the tensor is a FakeTensor/FunctionalTensor with no device
+        # layout to read; dynamo traces the original clone, so leave it alone.
+        if torch.compiler.is_compiling():
+            return orig_clone(self, memory_format=memory_format)
+        if self.device.type == DEVICE_NAME and not isinstance(
+            self, torch._subclasses.FakeTensor
+        ):
+            from torch_spyre._C import ElementArrangement, spyre_empty_with_layout
+            from torch_spyre._inductor.propagate_layouts import qfp8wt_layout
+
+            src_layout = device_tensor_layout(self)
+            if (
+                src_layout is not None
+                and src_layout.element_arrangement == ElementArrangement.QFP8WT
+            ):
+                size = list(self.size())
+                stride = [1] * len(size)
+                for d in range(len(size) - 2, -1, -1):
+                    stride[d] = stride[d + 1] * size[d + 1]
+                dst = spyre_empty_with_layout(
+                    self.size(),
+                    stride,
+                    self.dtype,
+                    qfp8wt_layout(size, stride, self.dtype),
+                )
+                dst.copy_(self)
+                return dst
+        return orig_clone(self, memory_format=memory_format)
+
+    torch.Tensor.clone = spyre_clone
     # Dynamo cannot trace INTO the Python ``spyre_to``: it inlines the wrapper,
     # hits the C++ ``orig_to`` call, and graph-breaks — forcing the whole region
     # to run eager, where D2D dtype casts (e.g. fp16<->bf16) are wrong. Mark

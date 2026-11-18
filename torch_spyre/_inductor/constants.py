@@ -226,11 +226,6 @@ SPYRE_FP8_OPS = {
     "qfp8wt",  # FP8 quantization (output: FP8)
 }
 
-# Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
-# Used consistently in both compute_ops._layout_info_for_tensor and
-# superdsc._create_sdsc_tensors to gate device-size flattening and
-# 2D-stick metadata restoration.
-FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
@@ -324,3 +319,8 @@ POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
 # for free, so the mapping stays aligned with the surviving iteration-space
 # dims.
 CONV_DIM_LABELS = ["mb", "i", "j", "out", "in", "ki", "kj"]
+
+# The QFP8WT 2D stick: 64 N elements by 2 K elements (128 bytes at fp8). The
+# device shape is [..., N/64, K/2, 64, 2]; see pass_utils.qfp8wt_layout.
+QFP8WT_STICK_N = 64
+QFP8WT_STICK_K = 2

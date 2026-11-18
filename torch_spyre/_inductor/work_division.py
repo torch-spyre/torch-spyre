@@ -59,6 +59,7 @@ from .pass_utils import (
     PerCoreView,
     SchedNodeArg,
     compute_granularity,
+    stick_dims,
     compute_max_size,
     concretize_expr,
     device_coordinates,
@@ -392,16 +393,6 @@ def multi_dim_iteration_space_split(
     return splits
 
 
-def _qfp8wt_stick_coords(td: TensorDep) -> list[Expr]:
-    """Coordinates spanned by a QFP8WT tensor's 2D stick: its K and N dims.
-
-    K sits directly outside the stick (placed by nonstick_dim_order for a
-    matmul weight, by ``propagate_layouts.qfp8wt_dim_order`` otherwise), so
-    these are the last two device coordinates for every rank.
-    """
-    return td.device_coords[-2:]
-
-
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
@@ -438,25 +429,18 @@ def adjust_it_space_for_sticks(
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
-        # Handle QFP8WT multi-dim stick
-        if (
-            hasattr(td.layout.device_layout, "element_arrangement")
-            and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
-        ):
-            # For QFP8WT, the 2D stick [2, 64] spans the weight's K and N dims.
-            # Both need to be treated as atomic 128-byte units
-            stick_vars = []
-            for coord in _qfp8wt_stick_coords(td):
+        # A stick can span several device dims (QFP8WT's [2, 64]): each stick
+        # dim's variable is atomic at the full stick size.
+        stick_coords = [
+            td.device_coords[d] for d in stick_dims(td.layout.device_layout)
+        ]
+        if len(stick_coords) > 1:
+            for coord in stick_coords:
                 if len(coord.free_symbols) == 1:
-                    var = next(iter(coord.free_symbols))
-                    if var in adjusted_space:
-                        stick_vars.append(var)
-
-            for stick_var in stick_vars:
-                # QFP8WT stick size is always 128 bytes (64 elements at fp8)
-                fp8_stick_elems = td.layout.device_layout.elems_per_stick()
-                if stick_var not in max_elems or fp8_stick_elems > max_elems[stick_var]:
-                    max_elems[stick_var] = fp8_stick_elems
+                    stick_var = next(iter(coord.free_symbols))
+                    if stick_var in adjusted_space:
+                        elems = td.layout.device_layout.elems_per_stick()
+                        max_elems[stick_var] = max(max_elems.get(stick_var, 0), elems)
             continue
 
         stick_expr = td.device_coords[-1]

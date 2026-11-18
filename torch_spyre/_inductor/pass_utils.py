@@ -23,6 +23,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Literal,
     Mapping,
     NamedTuple,
     Optional,
@@ -65,6 +66,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
+    get_device_dtype,
     get_elem_in_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -80,6 +82,8 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
+    QFP8WT_STICK_K,
+    QFP8WT_STICK_N,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
 )
@@ -100,6 +104,7 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
+    stick_dims_from_size,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -2016,16 +2021,96 @@ def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> 
     )
 
 
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
-    offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
-    has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
+def _check_stick_expr_supported(stick_expr: sympy.Expr, modulus: int) -> None:
+    """Raise Unsupported for stick expressions may be valid but are not yet supported.
+
+    ``modulus`` is the size of the stick dimension the expression indexes.
+    """
+    offset_free = is_stick_expr_offset_free(stick_expr, modulus)
+    has_offset = _is_stick_expr_with_offset(stick_expr, modulus)
     if not (offset_free or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+            f"Mod(var, {modulus}), a bare variable, 0, or any of those "
             f"with a constant offset"
         )
+
+
+def qfp8wt_layout(
+    host_size: list[int],
+    host_strides: list[int],
+    dtype: torch.dtype,
+    k_dim: int | None = None,
+) -> SpyreTensorLayout:
+    """Device layout of a QFP8WT tensor with its 2D [2, 64] stick.
+
+    ``k_dim`` is the host dim holding K, the matmul's reduction dim; it defaults
+    to host dim -2. N is always the last host dim and must be contiguous. The
+    device shape is ``[outer..., N/64, K/2, 64, 2]``: the other host dims in
+    host order, then the N tile and K tile, then the stick (64 wide N, 2 wide K).
+    ``stick_dims`` returns the last two device dims, and the stick's 2-wide dim
+    always carries K's host stride. This is the layout the generic host/device
+    copy in ``spyre_mem.cpp`` walks, from the ``stride_map``. K and N must be
+    multiples of ``QFP8WT_STICK_K`` and ``QFP8WT_STICK_N``.
+
+    Args:
+        host_size: Host sizes, K and N included.
+        host_strides: Host strides matching ``host_size``.
+        dtype: FP8 dtype of the tensor.
+        k_dim: Host dim of K; negative values count from the end.
+    """
+    rank = len(host_size)
+    if rank < 2:
+        raise Unsupported(f"QFP8WT needs a host tensor of rank >= 2, got {rank}")
+    k_dim = rank - 2 if k_dim is None else k_dim % rank
+    if k_dim == rank - 1:
+        raise ValueError("QFP8WT K and N cannot be the same host dim")
+    outer_dims = [i for i in range(rank - 1) if i != k_dim]
+    k, n = host_size[k_dim], host_size[-1]
+    s_k, s_n = host_strides[k_dim], host_strides[-1]
+    if s_n != 1:
+        raise Unsupported(f"QFP8WT needs contiguous N, got stride {s_n}")
+    if k % QFP8WT_STICK_K != 0 or n % QFP8WT_STICK_N != 0:
+        # k // 2 and n // 64 below would truncate and drop elements silently.
+        raise Unsupported(
+            f"QFP8WT tensor [K={k}, N={n}]: K must be a multiple of "
+            f"{QFP8WT_STICK_K} and N a multiple of {QFP8WT_STICK_N} for the 2D "
+            f"[{QFP8WT_STICK_K}, {QFP8WT_STICK_N}] stick"
+        )
+    outer = [host_size[i] for i in outer_dims]
+    outer_strides = [host_strides[i] for i in outer_dims]
+    device_size = [
+        *outer,
+        n // QFP8WT_STICK_N,
+        k // QFP8WT_STICK_K,
+        QFP8WT_STICK_N,
+        QFP8WT_STICK_K,
+    ]
+    stride_map = [*outer_strides, QFP8WT_STICK_N, QFP8WT_STICK_K * s_k, s_n, s_k]
+    valid_elements: dict[tuple[int, ...], int] = {
+        (len(outer), len(outer) + 2): n,
+        (len(outer) + 1, len(outer) + 3): k,
+    }
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        get_device_dtype(dtype),
+        ElementArrangement.QFP8WT,
+        valid_elements,
+    )
+
+
+def stick_dims(stl: SpyreTensorLayout) -> list[int]:
+    """Indices of the stick device dimensions of ``stl``, outermost first.
+
+    A layout such as QFP8WT ``[N/64, K/2, 64, 2]`` has two stick dimensions,
+    ``[2, 64]`` in its trailing dims. Returns an empty list when no dimension is
+    below the stick size. See ``views.stick_dims_from_size`` for the definition.
+
+    Raises:
+        Unsupported: the stick dimensions do not hold exactly one stick.
+    """
+    return stick_dims_from_size(stl.device_size, stl.elems_per_stick(), strict=True)
 
 
 def device_coordinates(
@@ -2044,12 +2129,15 @@ def device_coordinates(
         indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
             None for structural callers (stick-compatibility checks, layout
             matching) where indirect coordinates are irrelevant.
+        check_stick_expr: when True, check that each stick dimension's coordinate
+            is a supported stick expression (see ``stick_dims``). Raises
+            ``Unsupported`` if the layout has no stick dimension.
         op: when given, splice trip counters in the dep index are pinned to trip
             zero (``per_trip_index``), matching codegen's base coordinates.
 
     Returns:
-        One coordinate expression per device dimension; the last element is
-        the stick expression.
+        One coordinate expression per device dimension. The entries at the
+        indices from ``stick_dims(stl)`` are the stick coordinates.
     """
     if COUNTERS.enabled:
         # Defined as constructions, not asks: a reader treats the count as the
@@ -2061,7 +2149,15 @@ def device_coordinates(
     index = per_trip_index(op, dep.index) if op is not None else dep.index
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
     if check_stick_expr:
-        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+        dims = stick_dims(stl)
+        if not dims:
+            raise Unsupported(
+                f"device layout has no stick dimension: "
+                f"device_size={list(stl.device_size)} "
+                f"stride_map={list(stl.stride_map)}"
+            )
+        for d in dims:
+            _check_stick_expr_supported(coords[d], stl.device_size[d])
     return coords
 
 
@@ -2133,6 +2229,7 @@ def build_operation_alignment_inputs(
     tensors = [
         {
             "size": list(access.device_layout.device_size),
+            "elems_per_stick": access.device_layout.elems_per_stick(),
             "coordinates": alignment_coordinates(
                 access.device_layout,
                 access.index,
@@ -3163,8 +3260,8 @@ def compute_size1_restickify_layout(
         ),
         old_sd_outer_dim,
     )
-    # A size-1 dim has one element and maps to no host stride, as in
-    # dim_map_to_stride_map in spyre_tensor_impl.cpp.
+    # A size-1 dim has one element and maps to no host stride; the device
+    # layout keeps it as a size-1 dim.
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
@@ -3206,24 +3303,79 @@ def compute_size1_restickify_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype, new_ve)
 
 
-def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
-    """Return True if all tensors are stick-compatible.
+def _stick_terms_and_residue(
+    dc: "list[sympy.Expr]", stl: SpyreTensorLayout
+) -> "tuple[set[sympy.Symbol], set[sympy.Symbol]]":
+    """Return a tensor's (stick terms, residue) variable sets.
+
+    The stick terms are the variables of its stick-dim coordinates. A constant
+    stick coordinate has no variables, so it contributes no stick term. The
+    residue is the variables of the non-stick coordinates, minus the tensor's own
+    stick terms.
+    """
+    stick_set = set(stick_dims(stl))
+    terms: set[sympy.Symbol] = set()
+    residue: set[sympy.Symbol] = set()
+    for d, coord in enumerate(dc):
+        if d in stick_set:
+            terms |= coord.free_symbols
+        else:
+            residue |= coord.free_symbols
+    return terms, residue - terms
+
+
+def stick_compatible(
+    coords: "list[list[sympy.Expr]]",
+    stls: "list[SpyreTensorLayout]",
+    rule: "Literal['pointwise', 'bmm'] | None" = None,
+) -> bool:
+    """Return True if all tensors are stick-compatible under ``rule``.
 
     coords: list of device_coordinates() results, one per tensor.
+    stls: the layout of each tensor, in the same order, used to find its stick
+        dims. A stick can span several device dims, so each tensor may
+        contribute several stick variables.
+    rule: the op's stick rule, or None for the count check alone. The caller
+        picks the rule (see ``_stick_rule``).
 
-    Compatible means: the union of stick variables (free symbols in the last
-    device coordinate) across all tensors has at most one element, and is
-    disjoint from the union of nonstick variables (free symbols in all other
-    device coordinates, excluding each tensor's own stick variable).
+    Count check (always): the stick variables of all tensors, taken together,
+    number at most the largest stick-dim count of any tensor (at least one).
+
+    ``"pointwise"``: the non-empty stick terms are identical across tensors, and
+    a stick variable does not occur in the residue of a tensor with no stick
+    term.
+
+    ``"bmm"``: non-empty stick terms are nested (one contains the other), and
+    each tensor's stick variables do not occur in another tensor's residue.
+    This forbids the arg_0 stick in out and the arg_1 stick in arg_0.
     """
-    stick_vars: set[sympy.Symbol] = set()
-    nonstick_vars: set[sympy.Symbol] = set()
-    for dc in coords:
-        tensor_stick_vars = dc[-1].free_symbols
-        stick_vars |= tensor_stick_vars
-        for coord in dc[:-1]:
-            nonstick_vars |= coord.free_symbols - tensor_stick_vars
-    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+    terms: list[set[sympy.Symbol]] = []
+    residues: list[set[sympy.Symbol]] = []
+    for dc, stl in zip(coords, stls):
+        tensor_terms, tensor_residue = _stick_terms_and_residue(dc, stl)
+        terms.append(tensor_terms)
+        residues.append(tensor_residue)
+    stick_vars = set().union(*terms)
+    max_stick_dims = max(len(stick_dims(stl)) for stl in stls)
+    if len(stick_vars) > max(max_stick_dims, 1):
+        return False
+    if rule is None:
+        return True
+    if rule == "pointwise":
+        nonempty = {frozenset(t) for t in terms if t}
+        if len(nonempty) > 1:
+            return False
+        return all(
+            not (stick_vars & residue) for t, residue in zip(terms, residues) if not t
+        )
+    # rule == "bmm"
+    for i, j in itertools.permutations(range(len(terms)), 2):
+        both_sticked = bool(terms[i]) and bool(terms[j])
+        if both_sticked and not (terms[i] <= terms[j] or terms[j] <= terms[i]):
+            return False
+        if terms[j] & residues[i]:
+            return False
+    return True
 
 
 def is_sparse_stl(stl) -> bool:
@@ -3294,6 +3446,51 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
         return True, out_stl
 
     return False, out_stl
+
+
+def _stick_rule(
+    op: "Operation | None",
+    in_stl: SpyreTensorLayout,
+    out_stl: SpyreTensorLayout,
+) -> "Literal['pointwise', 'bmm'] | None":
+    """Return the ``stick_compatible`` rule for an op, or None for the count check.
+
+    The op's doc rules (pointwise, bmm) assume each tensor has one stick
+    variable. A QFP8WT tensor's stick is [N, K] with two variables, which those
+    rules do not model (see the multi-dimension stick TODO in the device tensor
+    docs), so any QFP8WT input or output gets the count check alone.
+    """
+    if op is None:
+        return None
+    quantized = ElementArrangement.QFP8WT
+    if quantized in (in_stl.element_arrangement, out_stl.element_arrangement):
+        return None
+    return "bmm" if _is_matmul_op(op) else "pointwise"
+
+
+def _qfp8wt_producer_input_is_n(
+    idc: "list[sympy.Expr]",
+    out_idc: "list[sympy.Expr]",
+    in_stl: SpyreTensorLayout,
+    out_stl: SpyreTensorLayout,
+) -> "bool | None":
+    """Whether a QFP8WT producer's input stick carries the output's N.
+
+    A QFP8WT output's stick is the last two dims of ``qfp8wt_layout``: the outer
+    one is N (64 wide), the inner one is K (2 wide). A non-matmul producer
+    writes N, so the input's stick (its innermost stick dim) must carry N. The
+    union rule of ``stick_compatible`` alone also accepts the input's K.
+
+    Returns None when the input's stick is constant: a size-1 dim carries no N,
+    and restickifying it would restore a size-1 loop dim the backend rejects, so
+    no restickify is feasible.
+    """
+    out_n_dim = stick_dims(out_stl)[0]
+    in_stick = stick_dims(in_stl)[-1]
+    in_n = idc[in_stick].free_symbols
+    if not in_n:
+        return None
+    return in_n <= out_idc[out_n_dim].free_symbols
 
 
 def sparse_stl_from_host(
@@ -3469,14 +3666,20 @@ def compute_restickify_needed(
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
-    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
+    in_stick_offset_free = all(
+        is_stick_expr_offset_free(idc[d], in_stl.device_size[d])
+        for d in stick_dims(in_stl)
+    )
     # A factorized layout places the stick variable on outer axes as well as the
     # stick; the backend would see two contraction dimensions and produce wrong output.
     # Such a layout is not truly compatible with any target that has a clean stick,
     # so skip the stick_compatible short-circuit when the layouts differ.
-    stick_syms = idc[-1].free_symbols
+    in_sticks = set(stick_dims(in_stl))
+    stick_syms = set().union(*(idc[d].free_symbols for d in in_sticks))
     outer_axes_with_stick_var = [
-        c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
+        c
+        for d, c in enumerate(idc)
+        if d not in in_sticks and c.free_symbols & stick_syms
     ]
     is_factorized = (
         _is_matmul_op(op)
@@ -3486,11 +3689,19 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    if (
-        not factorized_layout_mismatch
-        and in_stick_offset_free
-        and stick_compatible([idc, out_idc])
-    ):
+    qfp8wt_producer = (
+        op is not None
+        and not _is_matmul_op(op)
+        and out_stl.element_arrangement == ElementArrangement.QFP8WT
+    )
+    rule = _stick_rule(op, in_stl, out_stl)
+    compatible = stick_compatible([idc, out_idc], [in_stl, out_stl], rule)
+    if compatible and qfp8wt_producer:
+        n_compatible = _qfp8wt_producer_input_is_n(idc, out_idc, in_stl, out_stl)
+        if n_compatible is None:
+            return True, None
+        compatible = n_compatible
+    if not factorized_layout_mismatch and in_stick_offset_free and compatible:
         return False, None
 
     # ReStickifyOpHBM supports the DL16 format (FP16/BF16 both map to
@@ -3521,7 +3732,18 @@ def compute_restickify_needed(
         # queries this function with that canonical result.
         return True, out_stl
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    target_stick = out_idc[-1]
+    # The target stick is the innermost stick dim's coordinate. A sparse output
+    # has no stick dim, and its stick is the constant zero, as before.
+    out_sticks = stick_dims(out_stl)
+    target_dim: int | None
+    if out_sticks and out_stl.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT stick is [64, 2]: the input's stick is N, the 64-wide dim
+        # (the innermost dim is K, the 2-wide one).
+        # The 64-wide N dim is larger than the 2-wide K dim.
+        target_dim = max(out_sticks, key=lambda d: out_stl.device_size[d])
+    else:
+        target_dim = out_sticks[-1] if out_sticks else None
+    target_stick = out_idc[target_dim] if target_dim is not None else sympy.S.Zero
 
     if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
         # The output stick is 0 (sparse) and the input is clean-dense.  For
@@ -4558,7 +4780,7 @@ def _per_core_view_from_prep(
     # Step 3: place each split on a device dim via stride lookup.
     #
     # stride_map[i] is a device-dim → host-stride mapping. The stickified
-    # host dim decomposes into two device dims (per dim_map_to_stride_map in C++):
+    # host dim decomposes into two device dims:
     #   - within-stick dim: always at position n-1, with
     #     stride_map[-1] = host_stride[stick_dim] and dev_size = elems_per_stick.
     #   - outer-stick (num_stick) dim: stride = stride_map[-1] * elems_per_stick,

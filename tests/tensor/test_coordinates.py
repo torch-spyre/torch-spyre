@@ -307,7 +307,7 @@ class TestCoordinates(TestCase):
 
             iteration_space, tensors, remap = align_tensors(
                 {lq: (64, 1), hd: (4096, 1)},
-                [{"size": [1, 32, 64, 128], "coordinates": cx}],
+                [{"elems_per_stick": 64, "size": [1, 32, 64, 128], "coordinates": cx}],
                 repeat_info=repeat_info,
             )
             self.assertEqual(iteration_space[hd][0], 128)
@@ -324,6 +324,7 @@ class TestCoordinates(TestCase):
         indirect = sympy.Symbol("indirect", integer=True, nonnegative=True)
         tensors = [
             {
+                "elems_per_stick": 64,
                 "size": [2, 32],
                 "coordinates": [
                     sympy.floor(entry / 32),
@@ -331,6 +332,7 @@ class TestCoordinates(TestCase):
                 ],
             },
             {
+                "elems_per_stick": 64,
                 "size": [128, 8, 4, 1, 64],
                 "coordinates": [
                     head + 8 * sympy.Mod(entry, 16),
@@ -341,6 +343,7 @@ class TestCoordinates(TestCase):
                 ],
             },
             {
+                "elems_per_stick": 64,
                 "size": [128, 8, 4, 1, 64],
                 "coordinates": [
                     indirect,
@@ -369,6 +372,7 @@ class TestCoordinates(TestCase):
         )
         tensors = [
             {
+                "elems_per_stick": 64,
                 "size": [3, 32],
                 "coordinates": [
                     sympy.floor(entry / 32),
@@ -376,6 +380,7 @@ class TestCoordinates(TestCase):
                 ],
             },
             {
+                "elems_per_stick": 64,
                 "size": [384, 2, 4, 1, 64],
                 "coordinates": [
                     head + 8 * sympy.Mod(entry, 48),
@@ -403,6 +408,7 @@ class TestCoordinates(TestCase):
             {entry: (4, 2)},
             [
                 {
+                    "elems_per_stick": 64,
                     "size": [2, 64],
                     "coordinates": [sympy.floor(entry / 2), entry],
                 }
@@ -418,6 +424,7 @@ class TestCoordinates(TestCase):
         )
         tensors = [
             {
+                "elems_per_stick": 64,
                 "size": [2, 32],
                 "coordinates": [
                     sympy.floor(entry / 32),
@@ -425,6 +432,7 @@ class TestCoordinates(TestCase):
                 ],
             },
             {
+                "elems_per_stick": 64,
                 "size": [64, 8, 4, 1, 64],
                 "coordinates": [
                     entry,
@@ -449,6 +457,7 @@ class TestCoordinates(TestCase):
             {entry: (7, 1)},
             [
                 {
+                    "elems_per_stick": 64,
                     "size": [1, 32],
                     "coordinates": [
                         sympy.floor(entry / 32),
@@ -456,6 +465,7 @@ class TestCoordinates(TestCase):
                     ],
                 },
                 {
+                    "elems_per_stick": 64,
                     "size": [7, 64],
                     "coordinates": [entry, sympy.S.Zero],
                 },
@@ -716,8 +726,16 @@ class TestAlignTensorsStridedTerm(TestCase):
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         it_space = {d0: (sympy.Integer(8), 1), d1: (sympy.Integer(4), 1), d2: (64, 1)}
         zero = sympy.S.Zero
-        inp = {"size": [8, 8, 1, 64], "coordinates": [d0, stick_coord(d1), zero, d2]}
-        out = {"size": [4, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        inp = {
+            "elems_per_stick": 64,
+            "size": [8, 8, 1, 64],
+            "coordinates": [d0, stick_coord(d1), zero, d2],
+        }
+        out = {
+            "elems_per_stick": 64,
+            "size": [4, 1, 1, 8, 64],
+            "coordinates": [d1, zero, zero, d0, d2],
+        }
         return (d0, d1, d2), it_space, inp, out
 
     def test_stride_realized_as_gap_keeps_footprint(self):
@@ -778,10 +796,15 @@ class TestAlignTensorsStridedTerm(TestCase):
                     ):
                         count = len(range(start, rows, step))
                         inp = {
+                            "elems_per_stick": width,
                             "size": [rows, width],
                             "coordinates": [step * r + start, c],
                         }
-                        out = {"size": [count, width], "coordinates": [r, c]}
+                        out = {
+                            "elems_per_stick": width,
+                            "size": [count, width],
+                            "coordinates": [r, c],
+                        }
                         if leading_unit:
                             inp["size"].insert(0, 1)
                             inp["coordinates"].insert(0, sympy.S.Zero)
@@ -820,8 +843,16 @@ class TestAlignTensorsStridedTerm(TestCase):
                     align_tensors(
                         {r: (count, 1), c: (64, 1)},
                         [
-                            {"size": [97, 64], "coordinates": [3 * r + start, c]},
-                            {"size": [count, 64], "coordinates": [r, c]},
+                            {
+                                "elems_per_stick": 64,
+                                "size": [97, 64],
+                                "coordinates": [3 * r + start, c],
+                            },
+                            {
+                                "elems_per_stick": 64,
+                                "size": [count, 64],
+                                "coordinates": [r, c],
+                            },
                         ],
                     )
 
@@ -829,8 +860,16 @@ class TestAlignTensorsStridedTerm(TestCase):
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         it_space = {d0: (8, 1), d1: (3, 1), d2: (64, 1)}
         zero = sympy.S.Zero
-        inp = {"size": [8, 7, 1, 64], "coordinates": [d0, 2 * d1, zero, d2]}
-        out = {"size": [3, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        inp = {
+            "elems_per_stick": 64,
+            "size": [8, 7, 1, 64],
+            "coordinates": [d0, 2 * d1, zero, d2],
+        }
+        out = {
+            "elems_per_stick": 64,
+            "size": [3, 1, 1, 8, 64],
+            "coordinates": [d1, zero, zero, d0, d2],
+        }
         with self.assertRaisesRegex(Unsupported, "does not divide"):
             align_tensors(it_space, [inp, out])
 

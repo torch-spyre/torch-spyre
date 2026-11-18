@@ -42,6 +42,8 @@ from typing import NoReturn
 import sympy
 
 from . import config, constants
+from torch_spyre._C import ElementArrangement
+from .views import stick_dims_from_size
 from .core_mapping import owner_slots, transfer_edges
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
@@ -617,10 +619,28 @@ def _arg_free_syms(arg: TensorArg) -> set[sympy.Symbol]:
     return syms
 
 
+def _max_stick_dims(op_spec: OpSpec) -> int:
+    """Most stick dims any arg of the op has (2 for a QFP8WT stick, else 1)."""
+    counts = [
+        len(stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick()))
+        for arg in op_spec.args
+        if arg.device_coordinates
+    ]
+    return max(counts, default=1)
+
+
 def _arg_stick_syms(arg: TensorArg) -> set[sympy.Symbol]:
+    """Stick variables of an arg: the variables of every stick dim.
+
+    A QFP8WT stick spans two device dims, so the variables of all of them count.
+    """
     if not arg.device_coordinates:
         return set()
-    return arg.device_coordinates[-1].free_symbols
+    dims = stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick())
+    if len(dims) <= 1:
+        # Single-stick args keep the original contract: the last coordinate.
+        return arg.device_coordinates[-1].free_symbols
+    return set().union(*(arg.device_coordinates[d].free_symbols for d in dims))
 
 
 def _indirect_index_tensor_names(op_spec: OpSpec) -> set[str]:
@@ -657,6 +677,8 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_norm(op_spec, stage)
     elif op in TOPK_OPS:
         _check_stick_topk(op_spec, stage)
+    elif op == constants.FP8TODL16_OP:
+        _check_fp8todl16_input(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
     elif op in constants.CONV_OPS:
@@ -673,6 +695,23 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_all_same(op_spec, stage)
 
 
+def _check_fp8todl16_input(op_spec: OpSpec, stage: str) -> None:
+    """Reject a QFP8WT input to fp8todl16 (the FP8 -> FP16 dequantize).
+
+    fp8todl16 converts a standard FP8 stick; it does not accept a QFP8WT tensor's
+    2D [K/2, 64] stick, and the backend cannot compile that read.
+    """
+    for arg in op_spec.args:
+        if arg.is_input and arg.element_arrangement == ElementArrangement.QFP8WT:
+            raise OpSpecValidationError(
+                op_spec,
+                "QFP8WT input to fp8todl16",
+                "fp8todl16 does not accept a QFP8WT input; dequantize the weight "
+                "with a matmul consumer",
+                stage,
+            )
+
+
 def _check_stick_all_same(op_spec: OpSpec, stage: str) -> None:
     """All non-index-tensor args must share the same stick symbol.
 
@@ -687,9 +726,9 @@ def _check_stick_all_same(op_spec: OpSpec, stage: str) -> None:
             continue
         syms = _arg_stick_syms(arg)
         if syms:
-            stick_vars.add(min(syms, key=str))
+            stick_vars |= syms
 
-    if len(stick_vars) > 1:
+    if len(stick_vars) > max(_max_stick_dims(op_spec), 1):
         coords_str = ", ".join(
             str(arg.device_coordinates[-1])
             for arg in op_spec.args
@@ -872,6 +911,24 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     if not reduction_syms:
         return
     reduction_sym = min(reduction_syms, key=str)
+
+    # A QFP8WT Input1 keeps its K on the 2-wide stick dim (the last one). A
+    # reduction variable on its 64-wide dim means the activation was quantized
+    # in the weight's layout (swapped quantize ops), which the matmul cannot read.
+    if x_arg.element_arrangement == ElementArrangement.QFP8WT:
+        stick_dims = stick_dims_from_size(
+            x_arg.device_size, x_arg.device_dtype.elems_per_stick()
+        )
+        k_dim = stick_dims[-1]
+        if reduction_sym not in x_arg.device_coordinates[k_dim].free_symbols:
+            raise OpSpecValidationError(
+                op_spec,
+                "QFP8WT Input1 must reduce over its 2-wide stick dim",
+                f"reduction_sym={reduction_sym!r} is not on the 2-wide stick dim "
+                f"{k_dim}; Input1 device coordinates "
+                f"{[str(c) for c in x_arg.device_coordinates]}",
+                stage,
+            )
 
     out_stick: set[sympy.Symbol] = set()
     for arg in outputs:

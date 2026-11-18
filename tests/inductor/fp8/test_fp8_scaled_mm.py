@@ -1381,7 +1381,7 @@ class TestFP8Negative:
 
         fn_c = _compile(_swapped_ops_fn)
         with pytest.raises(
-            InductorError, match="the matmul reduces over its stick dim"
+            InductorError, match="QFP8WT Input1 must reduce over its 2-wide stick dim"
         ):
             fn_c(a, w, sa, sw)
 

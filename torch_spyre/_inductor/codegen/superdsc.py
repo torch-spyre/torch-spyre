@@ -34,7 +34,6 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
-    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -73,6 +72,7 @@ from torch_spyre._inductor.op_spec import (
     is_lx_relayout_identity,
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
+from torch_spyre._inductor.views import stick_dims_from_size
 
 from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
@@ -381,10 +381,14 @@ def _unambiguous_physical_axis(
     Dimensions factorized across multiple non-lane coordinates return
     ``None`` here and keep the established positional handling.
     """
+    stick_dim_ids = set(
+        stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick())
+    ) | {len(arg.device_coordinates) - 1}
     positions = [
         index
-        for index, coordinate in enumerate(arg.device_coordinates[:-1])
-        if dim in coordinate.xreplace(symbol_mapping).free_symbols
+        for index, coordinate in enumerate(arg.device_coordinates)
+        if index not in stick_dim_ids
+        and dim in coordinate.xreplace(symbol_mapping).free_symbols
     ]
     return positions[0] if len(positions) == 1 else None
 
@@ -409,6 +413,39 @@ def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> boo
     return tensor_position == 1
 
 
+def _sym_only_in_size_one_dims(op_spec, symbol_mapping: dict, sym: Symbol) -> bool:
+    """True if no argument indexes a device dim of size > 1 with ``sym``.
+
+    A synthetic size-1 iteration variable that is a real tile of some tensor
+    (indexing a device dim of size > 1) must stay a layout dim.
+    """
+    for arg in op_spec.args:
+        for d, coord in enumerate(arg.device_coordinates):
+            if str(sym) not in {
+                str(x) for x in coord.subs(symbol_mapping).free_symbols
+            }:
+                continue
+            if _concretize_for_sdsc(arg.device_size[d]) != 1:
+                return False
+    return True
+
+
+def _iteration_extent_is_one(op_spec, symbol_mapping: dict, sym: Symbol) -> bool:
+    """True if every iteration variable mapped to ``sym`` has extent 1.
+
+    Several original variables can map to one ``sym``; if any of them has an
+    extent other than 1, the dim is a real iteration dim and must stay one.
+    """
+    # Compare structurally: a symbolic extent is never known to be 1, so it is
+    # not resolved through a graph hint (which can differ at runtime).
+    extents = [
+        op_spec.iteration_space[orig][0]
+        for orig, mapped in symbol_mapping.items()
+        if str(mapped) == str(sym) and orig in op_spec.iteration_space
+    ]
+    return bool(extents) and all(e == 1 for e in extents)
+
+
 def _get_device_dim_order(
     arg: TensorArg,
     symbol_mapping: dict,
@@ -427,7 +464,15 @@ def _get_device_dim_order(
     stick_dim = free[0] if free else None
 
     dim_order: list[Symbol] = []
-    for i in range(len(arg.device_coordinates) - 2, -1, -1):
+    stick_dim_ids = stick_dims_from_size(
+        arg.device_size, arg.device_dtype.elems_per_stick()
+    )
+    if len(stick_dim_ids) > 1:
+        for d in reversed(stick_dim_ids):
+            syms = arg.device_coordinates[d].subs(symbol_mapping).free_symbols
+            if len(syms) == 1 and next(iter(syms)) not in dim_order:
+                dim_order.append(next(iter(syms)))
+    for i in range(len(arg.device_coordinates) - (len(stick_dim_ids) + 1), -1, -1):
         coord = arg.device_coordinates[i]
         # Handle coordinates containing IndirectAccess — extract symbols from index tensor.
         if hasattr(coord, "has") and coord.has(IndirectAccess):
@@ -469,6 +514,18 @@ def _get_device_dim_order(
                     if sym_size == 1:
                         # Skip this synthetic placeholder
                         skip_sym = True
+
+            # A size-1 iteration dim (e.g. a batch of 1 kept on a restickify or
+            # clip buffer) has nothing to tile; the backend needs a positive
+            # extent for every primary dim, so it is not a layout dim.
+            if (
+                not skip_sym
+                and op_spec is not None
+                and sym != stick_dim
+                and _iteration_extent_is_one(op_spec, symbol_mapping, sym)
+                and _sym_only_in_size_one_dims(op_spec, symbol_mapping, sym)
+            ):
+                skip_sym = True
 
             if not skip_sym and sym not in dim_order:
                 dim_order.append(sym)
@@ -543,12 +600,12 @@ def _get_padded_iteration_space(
         for dim in dim_order:
             if dim not in stick_dim_order:
                 continue
-            effective_stick_size = (
-                stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
-            )
-            unaligned = sdsc_iteration_space[dim] % effective_stick_size
+            # Each stick dim rounds up to its own size: a 2D stick's dims are
+            # [2, 64] (K, N), not one 128-element stick.
+            stick_dim_size = stick_size[stick_dim_order.index(dim)]
+            unaligned = sdsc_iteration_space[dim] % stick_dim_size
             if unaligned > 0:
-                sdsc_iteration_space[dim] += effective_stick_size - unaligned
+                sdsc_iteration_space[dim] += stick_dim_size - unaligned
                 padding[dim] = sdsc_iteration_space[dim] - unpadded_extent[dim]
     return padding
 
@@ -657,8 +714,8 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
 def _arg_stick_symbol(arg) -> Symbol | None:
     """The iteration symbol on ``arg``'s stick (innermost) device coordinate.
 
-    Spyre lays the stick dim last, so ``device_coordinates[-1]`` is the stick
-    lane (e.g. ``Mod(c3, 64)``).  Returns its single free symbol, or ``None``
+    ``device_coordinates[-1]`` is the innermost stick lane (e.g. ``Mod(c3, 64)``;
+    for a QFP8WT weight, whose stick spans its last two dims, the 2-wide K lane).  Returns its single free symbol, or ``None``
     when the arg has no coordinates or the stick coordinate is not driven by
     exactly one symbol (so callers can bail to a positional mapping).  Mirrors
     the stick-var read in ``spyre_kernel.create_op_spec``.
@@ -1329,31 +1386,38 @@ _QFP8WT_ROWS_PER_STICK = 2
 
 def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
     """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
-    return (
-        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
-    )
+    # The arrangement alone marks the 2D stick; the op-name gate was removed
+    # with FP8_2D_STICK_OPS, since a QFP8WT tensor only reaches batchmatmulfp8
+    # and qfp8wt (other ops reject it in OpSpec validation).
+    return arg.element_arrangement == ElementArrangement.QFP8WT
 
 
 def _check_qfp8wt_offset(arg: TensorArg) -> None:
     """Reject a QFP8WT offset that cannot be addressed.
 
-    An odd K start falls inside a stick, and offsets on other axes (column
-    slices) are not modelled; either would read the wrong data.
+    The device layout is ``[outer..., N/64, K/2, 64, 2]`` (``qfp8wt_layout``).
+    The N tile and K tile dims (``len-4``, ``len-3``) hold whole sticks, so an
+    origin there is a whole-stick start and is addressed. The stick dims
+    (``len-2``, ``len-1``) cannot start inside a stick, and outer dims are not
+    modelled, so those must start at 0.
     """
-    origin = [
-        c.xreplace({s: Integer(0) for s in c.free_symbols})
-        for c in arg.device_coordinates
-    ]
-    k_axis = len(origin) - 2
-    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+    origin = [c.subs({s: 0 for s in c.free_symbols}) for c in arg.device_coordinates]
+    tile_axes = {len(origin) - 4, len(origin) - 3}
+    for axis, o in enumerate(origin):
+        if o == 0 or axis in tile_axes:
+            continue
+        if axis == len(origin) - 1:
+            raise Unsupported(
+                f"a slice starting at an odd row of a QFP8WT weight (device origin "
+                f"{origin}); a row slice must start on a multiple of "
+                f"{_QFP8WT_ROWS_PER_STICK} rows"
+            )
+        if axis == len(origin) - 2:
+            raise Unsupported(
+                f"an offset inside a QFP8WT 64-column stick (device origin {origin})"
+            )
         raise Unsupported(
-            f"a column offset into a QFP8WT weight (device origin {origin}); "
-            "only a row slice of a QFP8WT weight is supported"
-        )
-    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
-        raise Unsupported(
-            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
-            f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
+            f"an offset on an outer dim of a QFP8WT weight (device origin {origin})"
         )
 
 
@@ -1586,7 +1650,13 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim == stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            # A QFP8WT stick dim (the matmul's K) has its own K tile axis, which is
+            # not the positional -2 of the old layout: keep that physical axis.
+            if (
+                dim == stick_dim
+                and physical_axis not in gap_factor_by_inner_axis
+                and not (is_qfp8wt_2d_stick and physical_axis is not None)
+            ):
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
@@ -1660,9 +1730,28 @@ def _create_sdsc_tensors(
                 # extent, which skips the padding corrections below.
                 size_idx = -stride_idx - 2
                 if physical_axis is not None:
-                    dev_dim_size = arg.device_size[
-                        physical_axis
-                    ] * gap_factor_by_inner_axis.get(physical_axis, 1)
+                    # A dim that also rides a multi-dim stick (QFP8WT's N, on
+                    # the 64-wide dim) covers its stick dims' extent too.
+                    stick_dim_ids_here = stick_dims_from_size(
+                        arg.device_size, arg.device_dtype.elems_per_stick()
+                    )
+                    own_stick_extent = 1
+                    # The stick dim's own stick extent is applied by the stick branch
+                    # below, so only a non-stick dim riding the stick counts it here.
+                    if len(stick_dim_ids_here) > 1 and dim != stick_dim:
+                        for d in stick_dim_ids_here:
+                            if (
+                                dim
+                                in arg.device_coordinates[d]
+                                .subs(symbol_mapping)
+                                .free_symbols
+                            ):
+                                own_stick_extent *= int(arg.device_size[d])
+                    dev_dim_size = (
+                        arg.device_size[physical_axis]
+                        * gap_factor_by_inner_axis.get(physical_axis, 1)
+                        * own_stick_extent
+                    )
                 elif -size_idx > len(arg.device_size):
                     dev_dim_size = iteration_space[dim]
                 else:
@@ -1670,6 +1759,20 @@ def _create_sdsc_tensors(
                 it_dim_size = iteration_space[dim]
                 if dim == stick_dim:
                     stick_size = arg.device_dtype.elems_per_stick()
+                    # A multi-dim stick (QFP8WT's [K/2, 64]) is shared by several
+                    # variables: this dim owns only the stick dims that carry it,
+                    # so its element count is their product, not the whole stick.
+                    stick_dim_ids = stick_dims_from_size(
+                        arg.device_size, arg.device_dtype.elems_per_stick()
+                    )
+                    own = [
+                        d
+                        for d in stick_dim_ids
+                        if dim
+                        in arg.device_coordinates[d].subs(symbol_mapping).free_symbols
+                    ]
+                    if len(stick_dim_ids) > 1 and own:
+                        stick_size = math.prod(int(arg.device_size[d]) for d in own)
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
@@ -1826,39 +1929,38 @@ def _create_sdsc_tensors(
         effective_stick = [real_stick]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for QFP8WT KERNEL tensors.
-        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
-        # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
-        # tensor as input but uses a 1D flat FP8 input.
-        dtype_stick_size = arg.device_dtype.elems_per_stick()
-        layout_stick_size = [dtype_stick_size]
-        if arg.element_arrangement == ElementArrangement.QFP8WT and op_spec.op in (
-            "batchmatmulfp8",
-            "qfp8wt",
-        ):
-            # FP8 KERNEL needs 2D stick: [2, stick_size/2]
-            layout_stick_size = [2, dtype_stick_size // 2]
-            # The 2D stick packs 2 values of the weight's K dim against 64 of
-            # its N (stick) dim, so stickDimOrder_ is [K, N] with the real
-            # stick dim last. K sits directly outside the stick, at device
-            # coordinate -2, for every rank and every reader, including
-            # through a view: nonstick_dim_order puts it there for a matmul
-            # weight (from the matmul's reduction variable), and
-            # qfp8wt_dim_order does by default otherwise.
-            companion = None
-            k_syms = arg.device_coordinates[-2].xreplace(symbol_mapping).free_symbols
-            if len(k_syms) == 1:
-                companion = next(iter(k_syms))
-            if (
-                companion is not None
-                and companion in dim_order
-                and companion != real_stick
+        # A stick can span several device dims (QFP8WT's [2, 64] stick). Its dims
+        # are the trailing device dims whose sizes multiply to elems_per_stick,
+        # the same rule pass_utils.stick_dims applies to the layout.
+        stick_sizes = [
+            arg.device_size[d]
+            for d in stick_dims_from_size(
+                arg.device_size, arg.device_dtype.elems_per_stick()
+            )
+        ]
+        if len(stick_sizes) > 1:
+            # A multi-dim stick: each stick dim's label is its own coordinate's
+            # variable, paired with that dim's size, ordered 2-wide then 64-wide.
+            stick_dims_here = stick_dims_from_size(
+                arg.device_size, arg.device_dtype.elems_per_stick()
+            )
+            pairs = []
+            for d in stick_dims_here:
+                syms = arg.device_coordinates[d].xreplace(symbol_mapping).free_symbols
+                label = next(iter(syms)) if len(syms) == 1 else None
+                pairs.append((label, arg.device_size[d]))
+            if None in [label for label, _ in pairs] or any(
+                label not in dim_order for label, _ in pairs
             ):
-                effective_stick = [companion, real_stick]
-            else:
-                # K not identifiable (e.g. a rank-1 weight): keep the
-                # positional behaviour.
-                effective_stick = dim_order[-2:]
+                pairs = list(
+                    zip(reversed(dim_order[-len(stick_sizes) :]), reversed(stick_sizes))
+                )
+            # The backend takes the 2-wide K dim first, then the 64-wide N dim.
+            pairs.sort(key=lambda pair: int(pair[1]))
+            effective_stick = [label for label, _ in pairs]
+            layout_stick_size = [int(size) for _, size in pairs]
+        else:
+            layout_stick_size = [arg.device_dtype.elems_per_stick()]
 
         if has_indirect_access:
             label = get_indirect_layout_label(
@@ -2083,6 +2185,21 @@ def _extend_matmul_k_to_padded(
     )
 
 
+def _qfp8wt_n_stick(
+    y_arg: TensorArg, symbol_mapping: dict, out_arg: TensorArg
+) -> Symbol | None:
+    """The QFP8WT weight's N stick variable: the stick dim the output also carries."""
+    out_coords = out_arg.device_coordinates
+    out_syms = set().union(*(c.subs(symbol_mapping).free_symbols for c in out_coords))
+    for d in stick_dims_from_size(
+        y_arg.device_size, y_arg.device_dtype.elems_per_stick()
+    ):
+        syms = y_arg.device_coordinates[d].subs(symbol_mapping).free_symbols
+        if len(syms) == 1 and next(iter(syms)) in out_syms:
+            return next(iter(syms))
+    return None
+
+
 def _matmul_reuse_dims(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -2106,6 +2223,13 @@ def _matmul_reuse_dims(
     out_dim_order, out_stick = _get_device_dim_order(out_arg, symbol_mapping)
     if y_stick is None:
         return []
+    if y_arg.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT weight's stick is [K, N]: its innermost dim is K, the
+        # contraction, not N. N is the other stick dim, the one the output
+        # carries, so take N as y's stick for the reuse test.
+        y_stick = _qfp8wt_n_stick(y_arg, symbol_mapping, out_arg)
+        if y_stick is None:
+            return []
     if y_stick in set(x_dim_order):
         # M=1: N leaked into x's dim_order; N is x's reuse dim.
         return [y_stick]

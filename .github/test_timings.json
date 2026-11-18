@@ -694,12 +694,6 @@
    "runs": 3378,
    "cases": 41
   },
-  "inductor/test_qfp8wt_k_constraint_config.yaml": {
-   "p50_min": 0.1,
-   "p90_min": 0.102,
-   "runs": 613,
-   "cases": 5
-  },
   "inductor/test_restickify_config.yaml": {
    "p50_min": 3.739,
    "p90_min": 6.874,

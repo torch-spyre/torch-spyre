@@ -53,6 +53,7 @@ from torch_spyre._inductor.pass_utils import (
     trip_count_estimate,
 )
 from torch_spyre._C import get_device_size_in_bytes
+from torch_spyre._inductor.views import stick_dims_from_size
 from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     ResidencyEdge,
@@ -2575,7 +2576,10 @@ def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
             continue
         if s not in stride_to_size or device_size[i] != 1:
             stride_to_size[s] = device_size[i]
-    if stride_map[-1] > 0:  # stickified dim -> bound by the outer-stick count
+    # A single-dim stick is bound by its outer-stick count. A multi-dim stick
+    # (QFP8WT's [2, 64]) keeps each stick dim's own device size instead.
+    single_dim_stick = len(stick_dims_from_size(device_size, elems_per_stick)) == 1
+    if stride_map[-1] > 0 and single_dim_stick:
         stride_to_size[stride_map[-1]] = stride_to_size.get(
             stride_map[-1] * elems_per_stick, 1
         )

@@ -90,7 +90,7 @@ from .pass_utils import (
     loop_var_ranges_from_dim_hints,
     per_trip_index,
 )
-from .views import align_tensors, tiling_expr_to_device_expr
+from .views import align_tensors, stick_dims_from_size, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .loop_checker import LoopAdvanceMismatch
 from .loop_info import LoopShim
@@ -2271,6 +2271,8 @@ def _restickify_restore_elided_dim(op_spec) -> None:
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]
 
     def _stick_sym(arg):
+        # Restickify only takes STANDARD layouts (compute_restickify_needed
+        # rejects the rest), so the stick is the last device dim.
         syms = tuple(arg.device_coordinates[-1].free_symbols)
         assert len(syms) <= 1, f"expected 0 or 1 free symbols, got {len(syms)}"
         return syms[0] if syms else None
@@ -2386,19 +2388,39 @@ def _has_staggered_ea(op_spec: OpSpec) -> bool:
     """
     if not op_spec.args:
         return False
+    if any(
+        arg.element_arrangement == ElementArrangement.QFP8WT for arg in op_spec.args
+    ):
+        # A QFP8WT conversion is a quantization with its own 2D stick, not a
+        # stagger: its last device dim is K's 2, so the eps comparison below would
+        # invent a typecast for quantize and dequantize.
+        return False
     in_arg, out_arg = op_spec.args[0], op_spec.args[-1]
-    in_eps = in_arg.device_size[-1]
-    out_eps = out_arg.device_size[-1]
+    in_eps = _arg_eps(in_arg)
+    out_eps = _arg_eps(out_arg)
     is_typecast = (
         not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps != out_eps
     )
     return is_typecast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
 
 
+def _arg_eps(arg: TensorArg) -> int:
+    """Elements per stick of ``arg``'s layout.
+
+    A multi-dim stick (QFP8WT's [K/2, 64]) spans several device dims, so its
+    element count is their product, not the last device dim (K's 2).  A
+    single-dim stick is its last device dim.
+    """
+    dims = stick_dims_from_size(arg.device_size, arg.device_dtype.elems_per_stick())
+    if len(dims) > 1:
+        return math.prod(int(arg.device_size[d]) for d in dims)
+    return int(arg.device_size[-1])
+
+
 def _holds_stick_pair(arg: TensorArg, max_eps: int) -> bool:
     """Whether ``arg`` keeps a stick pair on the gap dim ``_pad_num_sticks`` prepends."""
     return (
-        arg.device_size[-1] < max_eps
+        _arg_eps(arg) < max_eps
         and arg.stride_map is not None
         and arg.stride_map[0] == 0
         and arg.device_size[0] > 1
@@ -2425,7 +2447,7 @@ def _add_size1_stick_var(op_spec: OpSpec, max_eps: int) -> None:
     is_typecast = (
         not op_spec.is_reduction
         and len(op_spec.args) == 2
-        and len({arg.device_size[-1] for arg in op_spec.args}) == 2
+        and len({_arg_eps(arg) for arg in op_spec.args}) == 2
     )
     targets = op_spec.args if is_typecast else pair_args
     stick_var = next(
@@ -2455,7 +2477,7 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
     prepares the kernels again.
     """
     # A typecast converts whole sticks of its side with more elements per stick.
-    max_eps = max(arg.device_size[-1] for arg in op_spec.args)
+    max_eps = max(_arg_eps(arg) for arg in op_spec.args)
     if any(
         arg.element_arrangement == ElementArrangement.DL16_TO_FP32
         for arg in op_spec.args
@@ -2485,7 +2507,7 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
             )
             rounded_stick_vars.add(stick_var)
 
-        eps = arg.device_size[-1]
+        eps = _arg_eps(arg)
         if eps == max_eps:
             # The rounded stick var spans exactly one of the operand's sticks.
             continue
@@ -2571,7 +2593,11 @@ def simplify_op_spec(
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
         [
-            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+                "elems_per_stick": arg.device_dtype.elems_per_stick(),
+            }
             for arg in op_spec.args
         ],
         indirect_sizes,

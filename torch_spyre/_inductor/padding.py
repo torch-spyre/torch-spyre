@@ -786,6 +786,11 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     out_layout = op.get_layout()
     write_dep = _write_dep(op)
     stl = out_layout.device_layout
+    if stl.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT layout's 2D stick is already a whole [2, 64] stick, so no
+        # device dim needs padding to a stick multiple. Padding picks the
+        # innermost dim (K/2 here), which is not a stick multiple to grow.
+        return
 
     if old_sym is None:
         _pad_elided_dim(op)
@@ -1145,6 +1150,10 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     assert isinstance(op, ComputedBuffer)
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
+    if in_layout.device_layout.element_arrangement == ElementArrangement.QFP8WT:
+        # A QFP8WT input's 2D stick is whole already; growing its N-tile dim
+        # (size N/64) by the stick size would multiply it by 64.
+        return
 
     # --- Gates: decide whether (and how) to pad BEFORE mutating the graph. ---
     out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))
@@ -1459,6 +1468,14 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
             continue
         in_layout = in_buf.get_layout()
         if not isinstance(in_layout, FixedTiledLayout):
+            continue
+        if ElementArrangement.QFP8WT in (
+            in_layout.device_layout.element_arrangement,
+            out_stl.element_arrangement,
+        ):
+            # A QFP8WT conversion is a quantization with its own 2D [K/2, 64] stick,
+            # not a stagger: its device_size[-1] is K's 2, not an elements-per-stick
+            # count, so comparing it here invents a typecast.
             continue
         in_eps = in_layout.device_layout.device_size[-1]
         out_eps = out_stl.device_size[-1]

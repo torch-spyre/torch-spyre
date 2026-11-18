@@ -497,6 +497,29 @@ class TestScaledMmPrequantizedRowSlice:
     blocks.
     """
 
+    def test_column_slice_matches_standalone_slab(self):
+        """A column slice (whole 64-column sticks) matches the same columns loaded
+        as their own weight (#5764). The N tile is addressed correctly."""
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        torch.manual_seed(0)
+        codes = (torch.randn(512, 256) * 50).clamp(-448.0, 448.0)
+        codes = codes.to(torch.float8_e4m3fn)
+        w_full = _dma_to_spyre_fp8_kernel(codes)
+        w_slab = _dma_to_spyre_fp8_kernel(codes[:, 128:256].contiguous())
+        act = torch.randn(4, 512, dtype=torch.float16).to(DEVICE)
+        scale = torch.full((1,), 1.0, dtype=torch.float16).to(DEVICE)
+
+        torch._dynamo.reset()
+        expected = torch.compile(_row_slice_spyre_fn, dynamic=False)(
+            act, w_slab, scale, scale
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(_row_slice_spyre_fn, dynamic=False)(
+            act, w_full[:, 128:256], scale, scale
+        )
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         "kb, path",
         [(1, "eager_view"), (1, "in_graph_slice"), (3, "eager_view")],
@@ -543,16 +566,15 @@ class TestScaledMmPrequantizedRowSlice:
     @pytest.mark.parametrize(
         "act_k, take_slice, match",
         [
-            (128, lambda w: w[1:129], "multiple of 2 rows"),
-            (512, lambda w: w[:, 128:256], "column offset"),
+            (128, lambda w: w[1:129], "stick expression with offset"),
         ],
-        ids=["odd_row_start", "column_start"],
+        ids=["odd_row_start"],
     )
     def test_unsupported_qfp8wt_slice_raises(self, act_k, take_slice, match):
         """A QFP8WT slice that cannot be addressed is rejected (#5764).
 
-        odd_row_start begins inside a 2-row stick; column_start has a column
-        offset, which is not modelled. Either would read the wrong data.
+        odd_row_start begins inside a 2-row stick, which propagate_layouts rejects
+        as an offset stick expression. Such a slice would read the wrong data.
         """
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
