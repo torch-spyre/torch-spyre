@@ -82,6 +82,19 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
   library_ref_held_.store(true);
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
+    // The destructor will not run for a constructor that throws, so release
+    // the library reference here to avoid leaking the initialization.
+    try {
+      shutdown();
+    }
+    catch (const std::exception& e) {
+      SPYRE_RUNTIME_WARNING()
+          << "# [Spyre CCL]: shutdown failed in constructor: " << e.what();
+    }
+    catch (...) {
+      SPYRE_RUNTIME_WARNING()
+          << "# [Spyre CCL]: shutdown failed in constructor: unknown error";
+    }
     std::string _err_msg =
         "[" + getBackendName() + "]: Failed to capture the world context";
     throw std::runtime_error(_err_msg);
@@ -94,11 +107,11 @@ SpyreCCLBackend::~SpyreCCLBackend() {
     shutdown();
   }
   catch (const std::exception& e) {
-    SPYRE_RUNTIME_DEBUG() << "# [Spyre CCL]: shutdown failed in destructor: "
-                          << e.what();
+    SPYRE_RUNTIME_WARNING()
+        << "# [Spyre CCL]: shutdown failed in destructor: " << e.what();
   }
   catch (...) {
-    SPYRE_RUNTIME_DEBUG()
+    SPYRE_RUNTIME_WARNING()
         << "# [Spyre CCL]: shutdown failed in destructor: unknown error";
   }
 }
