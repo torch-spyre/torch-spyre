@@ -605,32 +605,36 @@ def test_projection_declines_without_a_universal_proof(
     divisions = {"consumer": splits}
     relayout_sources = ()
     proof = rce._prove_matmul_direct_read
-    if failure == "one_candidate":
+    overrides = {"read_copy_elision": False} if failure == "disabled" else {}
+    with config.patch(**overrides):
+        if failure == "one_candidate":
 
-        def prove(op, *args):
-            if op.iteration_space_ownership.work_slices[x] == 2:
-                return None, "unsupported candidate"
-            return proof(op, *args)
+            def prove(op, *args):
+                if op.iteration_space_ownership.work_slices[x] == 2:
+                    return None, "unsupported candidate"
+                return proof(op, *args)
 
-        monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-    elif failure == "validation":
-        monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
-    elif failure == "disabled":
-        monkeypatch.setattr(config, "read_copy_elision", False)
-    elif failure == "source_placement":
-        divisions["input"] = [{}]
-    elif failure == "relayout":
-        relayout_sources = ("stage",)
-    elif failure == "graph_output":
-        graph.graph_outputs = [stage]
-    else:
-        monkeypatch.setattr(rce, "_copy_readers", lambda *args: [consumer, consumer])
-    assert rce.project_transport_read_copies(
-        graph, divisions, relayout_sources=relayout_sources
-    ) == [
-        stage,
-        consumer,
-    ]
+            monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
+        elif failure == "validation":
+            monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
+        elif failure == "disabled":
+            pass  # read_copy_elision=False, patched above
+        elif failure == "source_placement":
+            divisions["input"] = [{}]
+        elif failure == "relayout":
+            relayout_sources = ("stage",)
+        elif failure == "graph_output":
+            graph.graph_outputs = [stage]
+        else:
+            monkeypatch.setattr(
+                rce, "_copy_readers", lambda *args: [consumer, consumer]
+            )
+        assert rce.project_transport_read_copies(
+            graph, divisions, relayout_sources=relayout_sources
+        ) == [
+            stage,
+            consumer,
+        ]
 
 
 def test_real_allocator_keeps_proven_priced_direct_read_candidates(
@@ -706,82 +710,91 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
     commit_iteration_space_ownership(consumer, {b: 8, x: 2, n: 1})
-    if failure in ("disabled_pricing", "core_budget"):
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
-        )
+    overrides = {
+        "core_budget": {"sencores": 8},
+        "disabled_elision": {"read_copy_elision": False},
+        "hint": {"ignore_work_division_hints": False},
+    }.get(failure, {})
+    with config.patch(**overrides):
+        if failure in ("disabled_pricing", "core_budget"):
+            monkeypatch.setattr(
+                am,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
+            )
+        elif failure == "unsupported_core_count":
+            rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
+            del rates[2]
+            monkeypatch.setattr(
+                am,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
+            )
+        elif failure == "unknown_geometry":
+            monkeypatch.setattr(
+                dcm, "_transport_read_geometry", lambda *args: (None, None)
+            )
+        elif failure == "one_candidate":
+            proof = rce._prove_matmul_direct_read
+
+            def prove(op, *args):
+                if op.iteration_space_ownership.work_slices.get(b, 1) == 2:
+                    return None, "unsupported candidate"
+                return proof(op, *args)
+
+            monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
+        elif failure == "graph_output":
+            graph.graph_outputs = [stage]
+        elif failure == "shared_reader":
+            other = ComputedBuffer(
+                name="other", layout=consumer.layout, data=consumer.data
+            )
+            other.operation_name = "other"
+            other.loop_info = consumer.loop_info
+            commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
+            graph.operations.append(other)
+            graph.name_to_buffer[other.name] = other
+        elif failure == "disabled_elision":
+            pass  # read_copy_elision=False, patched above
+        elif failure == "hint":
+            monkeypatch.setattr(
+                am, "has_resolved_work_div_hint", lambda op: op is consumer
+            )
+        allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
+        if failure in ("source_clone", "relayout"):
+            from torch_spyre._inductor.scratchpad.plan_solver import (
+                CoreDivision,
+                CoreDivisionBuffer,
+                RelayoutCopyBuffer,
+            )
+
+            build = allocator._build_cd_bound_buffers
+
+            def with_allocation_choice(*args):
+                buffers = build(*args)
+                # Inject only the allocation-dependent choice, not divisions or
+                # the proof. Preparation must use the same context as pricing.
+                if failure == "source_clone":
+                    extra = CoreDivisionBuffer(
+                        "input", 128, [0, 1], core_divisions=[CoreDivision()]
+                    )
+                else:
+                    extra = RelayoutCopyBuffer(
+                        "shuffle",
+                        128,
+                        [0, 1],
+                        core_divisions=[CoreDivision()],
+                        relayout_parent=stage.name,
+                    )
+                return [*buffers, extra]
+
+            monkeypatch.setattr(
+                allocator, "_build_cd_bound_buffers", with_allocation_choice
+            )
         if failure == "core_budget":
-            monkeypatch.setattr(config, "sencores", 8)
-    elif failure == "unsupported_core_count":
-        rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
-        del rates[2]
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
-        )
-    elif failure == "unknown_geometry":
-        monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *args: (None, None))
-    elif failure == "one_candidate":
-        proof = rce._prove_matmul_direct_read
-
-        def prove(op, *args):
-            if op.iteration_space_ownership.work_slices.get(b, 1) == 2:
-                return None, "unsupported candidate"
-            return proof(op, *args)
-
-        monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-    elif failure == "graph_output":
-        graph.graph_outputs = [stage]
-    elif failure == "shared_reader":
-        other = ComputedBuffer(name="other", layout=consumer.layout, data=consumer.data)
-        other.operation_name = "other"
-        other.loop_info = consumer.loop_info
-        commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
-        graph.operations.append(other)
-        graph.name_to_buffer[other.name] = other
-    elif failure == "disabled_elision":
-        monkeypatch.setattr(config, "read_copy_elision", False)
-    elif failure == "hint":
-        monkeypatch.setattr(config, "ignore_work_division_hints", False)
-        monkeypatch.setattr(am, "has_resolved_work_div_hint", lambda op: op is consumer)
-    allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    if failure in ("source_clone", "relayout"):
-        from torch_spyre._inductor.scratchpad.plan_solver import (
-            CoreDivision,
-            CoreDivisionBuffer,
-            RelayoutCopyBuffer,
-        )
-
-        build = allocator._build_cd_bound_buffers
-
-        def with_allocation_choice(*args):
-            buffers = build(*args)
-            # Inject only the allocation-dependent choice, not divisions or
-            # the proof. Preparation must use the same context as pricing.
-            if failure == "source_clone":
-                extra = CoreDivisionBuffer(
-                    "input", 128, [0, 1], core_divisions=[CoreDivision()]
-                )
-            else:
-                extra = RelayoutCopyBuffer(
-                    "shuffle",
-                    128,
-                    [0, 1],
-                    core_divisions=[CoreDivision()],
-                    relayout_parent=stage.name,
-                )
-            return [*buffers, extra]
-
-        monkeypatch.setattr(
-            allocator, "_build_cd_bound_buffers", with_allocation_choice
-        )
-    if failure == "core_budget":
-        with pytest.raises(AssertionError, match="fixed direct-read division over"):
-            allocator._prepare_buffers(graph)
-        return
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == [am._fixed_core_division(consumer)]
+            with pytest.raises(AssertionError, match="fixed direct-read division over"):
+                allocator._prepare_buffers(graph)
+            return
+        buffers = allocator._prepare_buffers(graph)
+        actual = next(buf for buf in buffers if buf.name == consumer.name)
+        assert actual.core_divisions == [am._fixed_core_division(consumer)]

@@ -16,7 +16,7 @@ import decimal
 import math
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING
 import warnings
 
 from torch.utils._config_module import install_config_module
@@ -337,6 +337,24 @@ ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
+
+# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
+# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
+# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
+# the CoarseTileInfo transform is deleted.
+def _choose_loop_tiling_lowering(value: str) -> str:
+    if value not in ("legacy", "plan"):
+        raise ValueError(
+            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
+            "'plan'"
+        )
+    return value
+
+
+loop_tiling_lowering: str = _choose_loop_tiling_lowering(
+    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
+)
+
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
 # hardware limitation that can't support it) makes planning treat any op
@@ -581,5 +599,14 @@ def _precomputed_kernel_key_from_env() -> str:
 # the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
 # (true and yes work too). Any other value warns and leaves it off.
 precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
+
+if TYPE_CHECKING:
+    # install_config_module below adds ``patch`` (and the rest of the config
+    # API) at runtime. Declare it for mypy, which pre-commit runs without torch
+    # installed, so torch.utils._config_typing cannot supply it.
+    def patch(
+        arg1: str | dict[str, Any] | None = None, arg2: Any = None, **kwargs: Any
+    ) -> Any: ...
+
 
 install_config_module(sys.modules[__name__])

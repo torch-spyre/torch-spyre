@@ -720,7 +720,8 @@ in proof-of-concept form. See [Scratchpad planning](../compiler/scratchpad_plann
 **Distributed inference.** The `spyreccl` torch.distributed backend is implemented under
 `csrc/distributed/`. Synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`,
 `reduce`, and `allreduce` work today. The remaining work is async support and the missing
-collectives (`scatter`, `reduce_scatter`, `alltoall`). See
+collectives (`scatter`, `reduce_scatter`, `alltoall`) in the eager process group;
+compiled graphs already lower `reduce_scatter_tensor` to spyre-comms. See
 [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
 **Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
