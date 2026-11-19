@@ -850,7 +850,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node
         if getattr(ir_node, "loop_info", None) is None:
             return None
-        read_idx = None
         if is_input:
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
@@ -865,7 +864,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             consumed = self._tile_advance_seen.get(name, 0)
             if consumed >= len(matches):
                 return None
-            read_idx = matches[consumed][0]
             self._tile_advance_seen[name] = consumed + 1
         indexed = self._index_tile_advance(tensor, is_input, name)
         if indexed is None:
@@ -877,56 +875,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     f"{'read' if is_input else 'write'} of {name} has no advance in "
                     "the index: the op lists no loop variable for its levels"
                 )
-            self._check_against_stored_record(ir_node, is_input, read_idx, None, name)
             return None
         from_index, _ = indexed
-        self._check_against_stored_record(ir_node, is_input, read_idx, from_index, name)
         # "No advance" is None, not a zero: consumers test ``is not None``.
         return None if from_index == 0 else from_index
-
-    @staticmethod
-    def _check_against_stored_record(ir_node, is_input, read_idx, from_index, name):
-        """TEMPORARY (stage 7.4 part A; deleted with the lists in part B).
-
-        The stored per-read / output advance lists are no longer read, but they are
-        still written. Until they are deleted, the hardware CI suite compares them with
-        the index on every access, so a disagreement the local corpus did not show
-        fails loudly instead of changing a kernel silently. Two cases are newly
-        exposed by reading the index: an op that lists no loop variable (the record
-        decided before) and a record that says an access advances while the index
-        gives none (or the reverse).
-        """
-        li = getattr(ir_node, "loop_info", None)
-        if (
-            li is None
-            or isinstance(li, LoopShim)
-            or not hasattr(li, "tiled_dims_per_read")
-        ):
-            return
-        if is_input:
-            tiled = li.tiled_dims_per_read
-            squeezed = li.squeezed_advance_per_read
-            entry_t = (
-                tiled[read_idx]
-                if read_idx is not None and read_idx < len(tiled)
-                else []
-            )
-            entry_s = (
-                squeezed[read_idx]
-                if read_idx is not None and read_idx < len(squeezed)
-                else []
-            )
-        else:
-            entry_t, entry_s = li.output_tiled_dims, li.squeezed_advance_output
-        recorded = any(entry_t) or any(entry_s)
-        indexed = from_index is not None and from_index != 0
-        if recorded != indexed:
-            raise RuntimeError(
-                f"stage 7.4 check: {ir_node.get_operation_name()} "
-                f"{'reads' if is_input else 'writes'} {name}: the stored record says "
-                f"{'advance' if recorded else 'no advance'} and the index says "
-                f"{'advance' if indexed else 'no advance'}"
-            )
 
     def create_tensor_arg(
         self,
