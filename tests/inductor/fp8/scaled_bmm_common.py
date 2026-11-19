@@ -629,16 +629,6 @@ _KNOWN_FAILURES = [
         "#6084: [fp8] quantize_fp8_with_scale corrupts E4M3 subnormal values",
     ),
     _KnownFailure(
-        "test_rejections",
-        r"mat[12]_fp16-cores\d+",
-        AssertionError,
-        # pytest.raises' "Regex pattern did not match", quoting the layout error that
-        # reaches the user instead of the dtype guard.
-        _NO_STICK_MECHANISM,
-        "#6203: [fp8] scaled_bmm: FP8 operand guard in lower_bmm_fp8 is bypassed "
-        "when one operand is fp16",
-    ),
-    _KnownFailure(
         "test_padded_inputs",
         r"pad_n_3d_moe_bmm_as_captured_8x2816x704x1-cores\d+",
         InductorError,
