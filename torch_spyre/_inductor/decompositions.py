@@ -4188,6 +4188,86 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
+@register_spyre_decompositions([torch.ops.aten.index_fill.int_Tensor])
+def spyre_index_fill(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """`index_fill.int_Tensor` as an overwrite-scatter of a materialized block.
+
+    The upstream reference broadcasts the 0-d `value` with `expand` and
+    scatters it via `index_copy`, so the store reads a stride-0 view that has
+    no dimension advancing with the indexed rows. Adding `value` to a real
+    block gives the scatter a source buffer, the shape `index_copy` already
+    handles.
+
+    The scalar overload (`int_Scalar`) is not registered here: upstream builds
+    it from `scalar_tensor(value).expand(...)`, which the
+    `materialize_scalar_fill` post-grad pass rewrites to a `full`. That pass
+    does not match a tensor `value`, which is why this overload still needs
+    its own decomposition.
+    """
+    torch._check(
+        index.dim() <= 1,
+        lambda: f"Index should have dimension 1 or 0 (got {index.dim()})",
+    )
+    torch._check(
+        value.dim() == 0,
+        lambda: "Only supports 0-dimensional value tensor. "
+        f"Got a tensor with {value.dim()} dimensions.",
+    )
+    # Treat a 0-d self as shape [1], as the upstream reference does.
+    y = self.unsqueeze(0) if self.dim() == 0 else self
+    dim = dim % y.dim()
+    index = index.reshape(-1)
+    shape = list(y.shape)
+    shape[dim] = index.numel()
+    block = torch.zeros(shape, dtype=y.dtype, device=y.device) + value.to(y.dtype)
+    out = torch.index_copy(y, dim, index, block)
+    return out.squeeze(0) if self.dim() == 0 else out
+
+
+# -- Scalar-valued stores ------------------------------------------------
+#
+# A write whose value is a bare number reaches ``SpyreKernel.store`` as an
+# ``ops.constant`` and is rejected ("store value of unexpected type Constant"):
+# codegen can only store from an allocated buffer. The fix is always to
+# materialize the number into a real tensor first, but where that belongs
+# depends on how the op carries it:
+#
+#   * ``scatter.value`` -- no decomposition exists upstream, so the number stays
+#     an argument of the op and never becomes a node. A pass has nothing to
+#     match; only rewriting the op itself works, which is what this does.
+#
+# ``masked_fill`` needs no entry: it decomposes to ``where``, handled by the
+# ``where.Scalar*`` decompositions above.
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter.value])
+def spyre_scatter_value(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[int, float, bool],
+) -> torch.Tensor:
+    """`scatter.value` as `scatter.src` with the scalar materialized.
+
+    ``scatter.src`` takes its written values from a tensor shaped like ``index``
+    -- one value per index entry -- so the block is built to that shape and
+    forwarded. ``new_full`` carries ``self``'s dtype and device, so no promotion
+    is introduced, and it allocates: an ``expand`` of the scalar would put the
+    constant straight back into the store it is being materialized out of.
+
+    Duplicate entries in ``index`` are safe here: every writer to a slot stores
+    the same value, so the surviving writer does not matter.
+    """
+    dim = dim % self.dim()
+    src = self.new_full(list(index.shape), value)
+    return torch.ops.aten.scatter.src(self, dim, index, src)
+
+
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
     """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
 
