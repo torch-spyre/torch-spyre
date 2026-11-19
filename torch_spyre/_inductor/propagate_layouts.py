@@ -773,13 +773,26 @@ def _qfp8wt_stl(
     last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
     c_size = outer_sizes + [last_dim]
     c_stride = outer_strides + [1]
-    return SpyreTensorLayout(
+    stl = SpyreTensorLayout(
         c_size,
         c_stride,
         output.dtype,
         qfp8wt_dim_order(len(c_size)),
         ElementArrangement.QFP8WT,
     )
+    if unaligned > 0:
+        ve = stl.valid_elements
+        stick_dim = len(stl.device_size) - 1
+        stick_key = next(k for k in ve if stick_dim in k)
+        ve[stick_key] = stick_dim_size
+        stl = SpyreTensorLayout(
+            list(stl.device_size),
+            list(stl.stride_map),
+            stl.device_dtype,
+            ve,
+            stl.element_arrangement,
+        )
+    return stl
 
 
 def _reduction_layout_from_stl(
