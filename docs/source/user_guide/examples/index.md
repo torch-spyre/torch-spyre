@@ -26,6 +26,7 @@ common Torch-Spyre use cases.
 | `tensor_layout.py` | Moving a tensor to Spyre with an explicit on-device layout |
 | `custom_op.py` | Registering a custom op with a Spyre lowering |
 | `flash_attention.py` | Block-wise flash attention with online softmax |
+| `linear_attention.py` | Chunkwise causal linear attention with a normalizer and a carried state (`torch.ops.spyre.linear_attention`) |
 | `hf_model.py` | Running a HuggingFace causal LM through hf-adapters |
 
 ## Distributed Examples
