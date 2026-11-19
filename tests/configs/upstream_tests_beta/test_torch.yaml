@@ -46,13 +46,33 @@ test_suite_config:
             - TestTorch::test_index_fill_neg_dim
             - TestTorch::test_index_add_neg_dim
             - TestTorch::test_scatter_neg_dim
-            - TestTorch::test_index_add
-            - TestTorch::test_index_add_all_dtypes
-            - TestTorch::test_index_add_cornercase
             - TestTorch::test_index_add_correctness
             - TestTorchDeviceType::test_scatter_zero_size_index
             - TestTorchDeviceType::test_masked_scatter_large_tensor
           mode: mandatory_success
+
+        # ---------------------------------------------------------------------------
+        # Upstream beta e1217971 moved test_index_add, test_index_add_all_dtypes
+        # and test_index_add_cornercase from TestTorch into TestTorchDeviceType,
+        # so the OOT wrapper now instantiates their Spyre device variants for the
+        # first time. None is a torch-spyre regression; each hits a gap the CPU
+        # placement never exercised:
+        #   - test_index_add: aten::randperm.generator_out not registered (#4499)
+        #   - test_index_add_all_dtypes: InductorError "Spyre backend does not
+        #     support: add on DataFormats.SENUINT32" (the test now iterates
+        #     uint32)
+        #   - test_index_add_cornercase: ZeroDivisionError (integer modulo by
+        #     zero) on the device path
+        # Remove each entry when its gap is fixed. test_index_add_correctness
+        # and test_index_add_neg_dim stay mandatory_success: they still live in
+        # TestTorch upstream and pass.
+        # Evidence: https://github.com/torch-spyre/torch-spyre/actions/runs/44451907415
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_index_add  # issue 4499
+            - TestTorchDeviceType::test_index_add_all_dtypes
+            - TestTorchDeviceType::test_index_add_cornercase
+          mode: skip  # skip: moved to TestTorchDeviceType by beta e1217971; device variants hit unimplemented ops
 
         # ---------------------------------------------------------------------------
         # torch.repeat_interleave — YAML unique abort is Mod(d0, 2)
