@@ -38,6 +38,8 @@ from xml.etree import ElementTree
 
 import pytest
 import torch
+
+from torch_spyre._inductor import config as spyre_config
 from device_env import device_available, emulation_ready, mode_usable
 from torch.distributed.tensor import Shard
 
@@ -605,11 +607,15 @@ def test_mixed_dtypes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_dynamic_shapes_fail_at_compile():
+    """torch.compile(dynamic=True) is refused before lowering, so a sharded
+    operand never reaches the non-unified static-shape check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="need static shapes"):
+    with pytest.raises(
+        RuntimeError, match=r"does not support: torch\.compile\(dynamic=True\)"
+    ):
         torch.compile(lambda x, y: x + y, dynamic=True)(a, a)
 
 
@@ -618,23 +624,32 @@ def test_dynamic_shapes_fail_at_compile():
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
+    from torch_spyre.ops.fallbacks import fallback_ops
+
+    # The op must still be a Spyre fallback. An op that gets a lowering becomes
+    # a ComputedBuffer, which the op-kind check rejects first, so this test
+    # would no longer reach the fallback-consumer check (torch.cumsum, used
+    # here before, got a lowering in #3389).
+    assert torch.ops.aten.tril.default in fallback_ops, (
+        "aten.tril is no longer a Spyre fallback; pick another op from "
+        "torch_spyre/ops/fallbacks.py"
+    )
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
-    b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
+    # The fallback's result is the graph output: an op that combined it with
+    # a sharded operand would be rejected first, as mixed sharded/unsharded.
     with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
-        torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
+        torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
 
 
 @_requires_emulation
 @expects_raise
-def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
+@spyre_config.patch(bundle_symbolic_args=False)
+def test_bundle_symbolic_args_disabled_fails_at_compile():
     """Every core's start address is a bundle input_arg, so a sharded kernel
     cannot be compiled onto the launch-time-bound path."""
-    from torch_spyre._inductor import config as spyre_config
-
-    monkeypatch.setattr(spyre_config, "bundle_symbolic_args", False)
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
@@ -648,9 +663,8 @@ def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
 def test_dtype_casting_copy_fails_closed():
     """Dtype-converting copies of sharded tensors are rejected, not truncated.
 
-    The D2H conversion path bounds its host output only through the
-    post-factory host_capacity_bytes write in spyre_stream.cpp (a flex-side
-    TODO), and converting shard copies are untested against it.
+    Converting shard copies are untested against the D2H conversion path,
+    which bounds its host output by the host_capacity the DMA factories set.
     """
     n = _num_shards()
     torch.manual_seed(0)

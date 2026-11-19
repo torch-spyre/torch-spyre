@@ -26,6 +26,7 @@ it, because the SDSC content is irrelevant here: the whole point of this route
 is that nothing symbolic reaches the SDSC.
 """
 
+import dataclasses
 import os
 import tempfile
 import unittest
@@ -118,6 +119,44 @@ class _BundleHarness(InductorTestCase):
             count_symbol_bounds=({SYM: (MAX, tile)} if bounds is None else bounds),
             count_symbol_sources={SYM: (0, 0)} if sources is None else sources,
         )
+
+
+class TestATiedPairReachesTheBundleAsOneSymbol(_BundleHarness):
+    """From ``counted_loop`` to ``generate_bundle`` with a count spelled in the
+    replaced symbol. ``torch._check(a == b)`` lands in the ShapeEnv's
+    replacements; ``counted_loop`` applies them once, so the LoopSpec's count,
+    its bounds and the bundle's parameter all name the surviving symbol, and
+    ``_loop_level`` finds it in ``loop_dim_ssa``. ``symbolic_count_bounds`` alone
+    being right is not this test: the stored count is what the bundle decomposes.
+    """
+
+    def test_the_bundle_declares_the_surviving_symbol(self):
+        from types import SimpleNamespace
+
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.pass_utils import declared_dims
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        other = sympy.Symbol("s1", integer=True, positive=True)
+        env = SimpleNamespace(
+            bound_sympy=lambda _e: SimpleNamespace(lower=TILE, upper=sympy.oo),
+            replacements={other: _sym()},
+        )
+        graph = SimpleNamespace(sizevars=SimpleNamespace(shape_env=env))
+
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(graph):
+            spec = SpyreKernel.counted_loop(FloorDiv(other, TILE), [_op_spec()])
+
+        self.assertEqual(str(spec.count), str(FloorDiv(_sym(), TILE)))
+        self.assertEqual(spec.count_symbol_bounds, {SYM: (MAX, TILE)})
+        spec = dataclasses.replace(spec, count_symbol_sources={SYM: (0, 0)})
+
+        bundle, kinds = self._run([spec], [self._entry(TILE_STRIDE)])
+
+        self.assertIn(f"%dim_{SYM}_base: !sdscbundle.input_arg", bundle)
+        self.assertNotIn("s1", bundle)
+        self.assertEqual([k.pytorch_sym for k in kinds if k.is_loop_dimension], [SYM])
 
 
 class TestTheDimensionReachesTheBundle(_BundleHarness):

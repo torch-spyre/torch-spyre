@@ -55,6 +55,7 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -92,6 +93,8 @@ from for_each_tile_fixtures import (
     abs_add_mul_tiled_reference,
     abs_tiled_fn,
     abs_tiled_reference,
+    upcast_add_tiled_fn,
+    upcast_add_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
     batched_online_softmax_fn,
@@ -132,6 +135,10 @@ from for_each_tile_fixtures import (
     paged_gather_nested_fn,
     paged_gather_nested_reference,
     paged_gather_reference,
+    reshape_mul_sum_tiled_fn,
+    reshape_mul_sum_tiled_reference,
+    reshape_sum_tiled_fn,
+    reshape_sum_tiled_reference,
     scatter_carry_fn,
     scatter_carry_old_value_fn,
     softmax_row_tiled_fn,
@@ -673,8 +680,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
+        the advance read off the index, leave the read direct (never staged
+        into scratch),
         keep the loop term in the index (per_trip_index pins it in the base
         coordinates, so the advance is not applied twice), and
         insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
@@ -810,6 +817,36 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def _check_upcast_add_tiled(self, downcast_in_body):
+        # Multiples of 1/64 below 5 are exact in fp16 and fp32, so a staggered
+        # stick read as standard cannot hide inside a tolerance.
+        A = (torch.arange(STICK_ROWS * STICK_COLS) % 257 / 64).to(torch.float16)
+        A = A.reshape(STICK_ROWS, STICK_COLS)
+        compiled = torch.compile(
+            upcast_add_tiled_fn, backend="inductor", fullgraph=True, dynamic=False
+        )
+        out = compiled(A.to(DEVICE_NAME), 64, downcast_in_body)
+
+        torch.testing.assert_close(
+            out.cpu(), upcast_add_tiled_reference(A), atol=0, rtol=0
+        )
+
+    def test_upcast_add_downcast_in_body(self):
+        self._check_upcast_add_tiled(downcast_in_body=True)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile fails to preserve input EA tag in identity op. The "
+            "output is incorrectly tagged STANDARD (default) when data is "
+            "staggered it causes EA DCI to incorrectly apply / restore EA. "
+            "See issue #6462."
+        ),
+    )
+    def test_upcast_add_in_body_downcast_after_loop(self):
+        self._check_upcast_add_tiled(downcast_in_body=False)
+
     def test_abs_add_mul_tiled_small(self):
         A = cached_randn((ROWS, COLS))
         B = cached_randn((ROWS, COLS), differentiation=1)
@@ -879,6 +916,73 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         # corrupt stick groups after the first with an error far exceeding
         # fp16 rounding noise on random inputs in [0, 1).
         torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+    def test_reshape_sum_tiled_multi_stick(self):
+        """Issue #6407 shape class: the reduce axis only exists in a reshaped
+        view of the tile, entering the load with a stride that is a multiple
+        of the tile's row stride (here 16*128 vs 128)."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_column_tiled(self):
+        """#6407 on column tiles: the tile reads its input at row stride 128
+        but its own layout has row stride 64, so folding the reduce term into
+        any dim but the row dim reads the wrong elements."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 64, 8, dim=1)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 64, 8, 1)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_mul_sum_tiled_whole_operand(self):
+        """Wrong-answer form of #6407: a whole operand keeps the reduce axis in
+        the kernel, so the bug compiled and read one tile window per step."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        W = cached_randn((128, STICK_COLS))
+        ref = reshape_mul_sum_tiled_reference(X.float(), W.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_mul_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X.to(DEVICE_NAME), W.to(DEVICE_NAME), 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
@@ -1777,7 +1881,9 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         ]
         self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
-        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        # The advance is written in the loop's own induction variable (u<n>), which
+        # is an integer, so floor(64*u0) simplifies to 64*u0.
+        weight_step = re.fullmatch(r"(\d+)\*u\d+", weight_reads[0])
         self.assertIsNotNone(weight_step)
         # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
         # per stick is one H*F = 4096-element expert slab.
@@ -2206,26 +2312,41 @@ def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestASymbolicTripCountIsRefusedByName(_DynamoResetTestCase):
-    """A varying trip count reaches codegen and stops there with a clear reason.
+class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
+    """One compiled graph serves a declared range, at a second tile size.
 
-    TODO: becomes a positive test, one compile correct at several sizes, once
-    the geometry is built at the declared maximum and the launch reads the size
-    (the next pull request of the #5186 split).
+    A second body op (a plain scale) and a second granularity (32 rows) beside
+    ``tests/inductor/test_symbolic_loop_e2e.py``'s gelu at 64. The tensor is
+    declared with ``.to(DEVICE_NAME, dynamic=...)`` (#5179), so its buffer is
+    reserved at the maximum and the kernel's geometry is built there, and the
+    launch binds the logical size into the loop's dimension slot. 96 rows is
+    three trips of 32 and not a multiple of 64, so the granularity in use is
+    the declared one and not the other test's.
     """
 
-    @expects_raise
-    def test_a_varying_trip_count_says_what_is_missing(self):
-        from torch._inductor.exc import InductorError
+    SPEC = {"min": 64, "max": 512, "granularity": 32}
 
-        x = torch.randn(128, 64, dtype=torch.float16).to(DEVICE_NAME)
-        torch._dynamo.mark_dynamic(x, 0)
+    def test_one_graph_right_at_every_size(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
         compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
 
-        with self.assertRaisesRegex(
-            InductorError, "geometry at the declared maximum is not implemented"
-        ):
-            compiled(x)
+        for rows in (128, 64, 512, 96, 256):
+            y.resize_((rows, 64))
+            out = compiled(y).cpu().float()
+            # Not exact: the device rounds fp16 arithmetic its own way, and a
+            # plain eager ``y * 2`` on a Spyre tensor is already one fp16 ulp off
+            # the host on about half the elements (measured 6 Nov 2026). One
+            # ulp of a value below 4 is under 4e-3, so 1e-2 is a real check of
+            # the rows and not of the rounding.
+            torch.testing.assert_close(
+                out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
 if __name__ == "__main__":

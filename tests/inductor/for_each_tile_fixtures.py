@@ -1043,6 +1043,28 @@ def abs_tiled_reference(A: torch.Tensor) -> torch.Tensor:
     return A.abs()
 
 
+def upcast_add_tiled_fn(
+    A: torch.Tensor, tile_size: int, downcast_in_body: bool
+) -> torch.Tensor:
+    """Map mode: fp16 -> fp32 conversion inside the body, then ``+ 1``.
+
+    The result returns to fp16 inside the body or, with ``downcast_in_body``
+    false, after the loop, so the loop also writes an fp32 output.
+    """
+
+    def body(_, ops):
+        (a_tile,) = ops
+        out = a_tile.float() + 1.0
+        return None, out.half() if downcast_in_body else out
+
+    _, out = for_each_tile(body, (A,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out.half()
+
+
+def upcast_add_tiled_reference(A: torch.Tensor) -> torch.Tensor:
+    return (A.float() + 1.0).half()
+
+
 def abs_add_mul_tiled_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, tile_size: int
 ) -> torch.Tensor:
@@ -1084,6 +1106,71 @@ def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
 
 def softmax_row_tiled_reference(X: torch.Tensor) -> torch.Tensor:
     return torch.softmax(X, dim=-1)
+
+
+def reshape_sum_tiled_fn(
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
+) -> torch.Tensor:
+    """Map mode: reshape each tile to (group, -1, cols) and reduce dim 0.
+
+    The reduction axis exists only in the reshaped view of the tile, so its
+    input stride is a multiple of the tile's own row stride -- the load
+    shape whose reduce variable used to be dropped while inlining the tile
+    marker (issue #6407). ``dim=1`` tiles columns: the tile then reads its
+    input at a row stride different from its own layout's, so the read is
+    only right if the reduce term is folded into the row dim.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        return None, x_tile.reshape(group, -1, x_tile.shape[-1]).sum(dim=0)
+
+    _, out = for_each_tile(body, (X,), dims=(dim,), tile_size=tile_size, out_dim=dim)
+    return out
+
+
+def reshape_sum_tiled_reference(
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
+) -> torch.Tensor:
+    return torch.cat(
+        [
+            tile.reshape(group, -1, tile.shape[-1]).sum(dim=0)
+            for tile in X.split(tile_size, dim=dim)
+        ],
+        dim=dim,
+    )
+
+
+def reshape_mul_sum_tiled_fn(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    """Map mode: reduce (row-tile * W) over a reshaped axis, W passed whole.
+
+    W's read keeps the reduce variable even where the tile's read loses it,
+    so issue #6407 did not crash here: it compiled and every reduce step read
+    the same window of the tile.
+    """
+
+    def body(_, ops):
+        x_tile, w = ops
+        shape = (group, -1, x_tile.shape[-1])
+        return None, (x_tile.reshape(shape) * w.reshape(shape)).sum(dim=0)
+
+    _, out = for_each_tile(body, (X, W), dims=(0, None), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def reshape_mul_sum_tiled_reference(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    shape = (group, -1, X.shape[-1])
+    return torch.cat(
+        [
+            (tile.reshape(shape) * W.reshape(shape)).sum(dim=0)
+            for tile in X.split(tile_size, dim=0)
+        ],
+        dim=0,
+    )
 
 
 def nested_add_outer_row_inner_col_fn(
@@ -1164,7 +1251,7 @@ def paged_gather_fn(
     read -- one int32 element whose address moves with the spliced loop var and
     which carries no iteration dim of its own -- so it is the shape coarse
     tiling handles through squeezed_advance_per_read rather than a tiled dim
-    (see coarse_tile._point_splice_advance_for_dep). Pre-gathering the pages
+    (the advance is read off the index). Pre-gathering the pages
     ahead of the loop would compile without any of that, at the cost of keeping
     the whole sequence's K/V live across it.
     """
@@ -1768,6 +1855,36 @@ def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
     with spyre_hint(work_div={"T": row_split}):
         final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
     return final
+
+
+def grouped_carry_group_sum_fn(
+    values: torch.Tensor,
+    group: int,
+    cores: int,
+    init: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """values[E, T, C].sum(0) through a grouped carry: ``group`` slabs per trip
+    add into a carry [G, T, C], and one sum over G follows the loop.
+
+    The loop and its carry use the core map {G: group, T: cores // group}; the
+    sum uses {T: cores}. Each core of the sum then reads its rows from all
+    ``group`` parts of the carry, which are on ``group`` cores. ``init``
+    is the carry's first value (zeros when None); a caller-owned one makes the
+    loop write a compiler-made copy of it.
+    """
+
+    def body(acc, ops):
+        (tile,) = ops
+        return acc + tile, None
+
+    if init is None:
+        init = values.new_zeros(group, *values.shape[1:])
+    with spyre_hint(
+        named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}
+    ):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=group, init=init)
+    with spyre_hint(named_dims=["T", "C"], work_div={"T": cores}):
+        return final.sum(0)
 
 
 def carried_routed_expert_sum_fn(

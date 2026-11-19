@@ -30,6 +30,11 @@ from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
+from torch_spyre.ops import fft as spyre_fft
+from torch_spyre.ops import fft2 as spyre_fft2
+from torch_spyre.ops import fftn as spyre_fftn
+from torch_spyre.ops import ifft as spyre_ifft
+from torch_spyre.ops import ifftn as spyre_ifftn
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -741,104 +746,21 @@ TO_DTYPE_OP_PARAMS_SETS = {
 }
 
 
-_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, as does int64, which the device stores as
-# int32, so conversions among them have no stick pairs to keep together and are
-# exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [
-    (torch.float32, torch.int32),
-    (torch.int32, torch.float32),
-    (torch.float32, torch.int64),
-    (torch.int64, torch.float32),
-    (torch.int32, torch.int64),
-    (torch.int64, torch.int32),
-]
-
-TO_DTYPE_OP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.float8_e4m3fn  # TO_DTYPE_OP_PARAMS_SETS has no float8 sources
-    if (
-        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
-        or (
-            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-        # Sub-stick guard doesn't apply to fp32<->int32/int64 — all are 32-bit
-        # on device, so there's no width change to trip the fp16-stick boundary.
-        or (
-            src == torch.float32
-            and shape[-1] < 32
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-    )
-]
-
-# Cases the predicate above flags that now pass on every config (base and both LX
-# planning classes). Listing them here, rather than loosening the predicate, keeps
-# the still-failing cases generated from the same rule.
-_TO_DTYPE_OP_NOW_PASSING = {
-    "bfloat16_to_bool_4x68",
-    "bfloat16_to_bool_68",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "float16_to_bfloat16_4x68",
-    "float16_to_bfloat16_68",
-    "float16_to_bool_4x68",
-    "float16_to_bool_68",
-    "float32_to_bool_4x16",
-    "float32_to_bool_4x68",
-    "float32_to_bool_68",
-}
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
-]
-
-# Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
-# elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
-# 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
-# element arrangement cannot use a partially filled stick, so
-# rescale_stl_for_dtype rejects the conversion with Unsupported instead of
-# dropping data (flooring) or returning wrong values (rounding up) (#3809, #3604).
-# This is a rejection by design, so these cases assert it.
-_RESCALE_REJECTION = "cannot rescale device layout"
-_RESCALE_REJECTED_SHAPES = ("4x32", "4x68", "68")
-TO_DTYPE_OP_RESCALE_REJECTED = {
-    f"float32_to_{dst}_{shape}"
-    for dst in ("float16", "bfloat16")
-    for shape in _RESCALE_REJECTED_SHAPES
-}
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
-]
-
-# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
-# host, and the result is wrong on 27-88% of its elements. The values on the device
-# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
-# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
-# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
-# converting the result back on the device restores the input exactly, which shows
-# the values are right; the other four cannot be checked that way, because the
-# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
-# the partial-stick limit (4x68).
-_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
-_STAGGERED_READBACK_UNCHECKED = (
-    "readback of the staggered cast result is wrong, probably #4393 "
-    "(the values cannot be checked on the device for this shape)"
-)
-_STAGGERED_READBACK_UNCHECKED_CASES = {
+# After type conversion elements are staggered on device, in DCI path they are restored
+# to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
+# of at most 32 elements is converted to a single fp32 stick, so half of each stick
+# pair has nowhere to go and the EA DCI rejects it instead of reading back wrong
+# data. Wider dims are padded to whole stick pairs (#5048).
+_WHOLE_STICK_PAIRS = "requires whole stick pairs"
+_WHOLE_STICK_PAIRS_SHAPES = ("4x16", "4x32")
+TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED = {
     f"{src}_to_float32_{shape}"
     for src in ("float16", "bfloat16")
-    for shape in ("4x32", "4x68")
+    for shape in _WHOLE_STICK_PAIRS_SHAPES
 }
-TO_DTYPE_OP_EXPECT_FAIL = {
-    case: (
-        _STAGGERED_READBACK_UNCHECKED
-        if case in _STAGGERED_READBACK_UNCHECKED_CASES
-        else _STAGGERED_READBACK
-    )
-    for case in TO_DTYPE_OP_EXPECT_FAIL
+
+TO_DTYPE_OP_EXPECT_RAISE = {
+    **dict.fromkeys(TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED, _WHOLE_STICK_PAIRS),
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -851,139 +773,6 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES
 }
-
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.bfloat16, torch.float32]
-    for dst in [torch.float16, torch.float32]
-    if src != dst
-    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
-]
-
-# Explicit round trips that pass on a stick ending inside a stick; the rest of the
-# unaligned shapes need the consumer of the upcast value padded to whole stick
-# pairs (see test_upcast_consumed_on_partial_stick). The implicit round
-# trip still hits an unsupported op on these shapes.
-_ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
-# The explicit add and copy round trips are rejected for the rescale reason above
-# on fp32 -> fp16 at all three shapes, and on the 4x32 upcast to fp32. The implicit
-# round trip is rejected on every pair at all three shapes.
-ROUND_TRIP_RESCALE_REJECTED = {
-    *(f"float32_to_float16_{shape}" for shape in _RESCALE_REJECTED_SHAPES),
-    "float16_to_float32_4x32",
-    "bfloat16_to_float32_4x32",
-}
-ROUND_TRIP_IMPLICIT_RESCALE_REJECTED = {
-    f"{src}_to_{dst}_{shape}"
-    for src, dst in (
-        ("bfloat16", "float16"),
-        ("bfloat16", "float32"),
-        ("float16", "float32"),
-        ("float32", "float16"),
-    )
-    for shape in _RESCALE_REJECTED_SHAPES
-}
-_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
-    and case not in ROUND_TRIP_RESCALE_REJECTED
-]
-
-# Further round-trip cases that now pass on every config. They differ between the
-# add and copy variants, so each variant gets its own expect_fail list. The implicit
-# variant is the same as the shared implicit list minus its own passing cases.
-_ROUND_TRIP_ADD_NOW_PASSING = {
-    "bfloat16_to_float16_4x16",
-    "bfloat16_to_float16_4x32",
-    "bfloat16_to_float16_4x63",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "bfloat16_to_float32_4x63",
-    "float16_to_float32_4x63",
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
-    "bfloat16_to_float32_4x16",
-    "float16_to_float32_4x16",
-}
-_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_ADD_NOW_PASSING
-]
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_COPY_NOW_PASSING
-]
-# These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
-# the xfail-marked tests, each has passed in some of them), so they are non-strict
-# xfails. They fail on a single core as well, with the signature of the lost second
-# stick of a pair below (#5361), so splitting a dim across cores (#5285) does not
-# explain them; #5285 tracks the intermittency.
-_ROUND_TRIP_IMPLICIT_UNSTABLE = {
-    "float16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
-    "of a stick pair (#5361), intermittency #5285",
-    "bfloat16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
-    "of a stick pair (#5361), intermittency #5285",
-}
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
-    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
-    and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
-]
-
-# The round trips left in the three lists above return the right number of elements
-# with about half of them zero (#5361). The upcast value is staggered, so an fp16
-# stick is spread over a pair of fp32 sticks, in interleaved groups of four
-# elements; when the stick dim does not fill whole pairs, the pair's second stick is
-# missing. It happens in two ways:
-# - 4x16 and 4x63: the second stick is not allocated, so it fails on one core too;
-# - 4x68: it is allocated, but work division leaves it to no core, so it passes
-#   with SENCORES=1.
-_PAIR_SECOND_STICK_LOST = (
-    "the staggered fp32 value lacks the second stick of a stick pair, so half the "
-    "elements come back as zero (#5361)"
-)
-_PAIR_SECOND_STICK_UNSPLIT = (
-    "work division leaves the second stick of a stick pair to no core; correct "
-    "with SENCORES=1 (#5361)"
-)
-_ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
-    "4x16": _PAIR_SECOND_STICK_LOST,
-    "4x63": _PAIR_SECOND_STICK_LOST,
-    "4x68": _PAIR_SECOND_STICK_UNSPLIT,
-}
-
-
-def _round_trip_pair_reasons(cases):
-    """``{case: reason}`` for round trips that lose the second stick of a pair.
-
-    A case whose shape has no reason raises KeyError: a new failing shape has to
-    be looked at before it is given one.
-    """
-    return {
-        case: _ROUND_TRIP_PAIR_REASON_BY_SHAPE[case.rsplit("_", 1)[1]] for case in cases
-    }
-
-
-TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
-)
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
-)
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
@@ -1262,6 +1051,25 @@ _PATTERN_TOL = {
 }
 
 
+def _stick_splitting_read_param_sets():
+    """``{case: (view, x)}`` for reads that split a stick."""
+    reads = {
+        "flat_8x65": ((8, 65), lambda a: a.reshape(-1)),
+        "flat_2x3x65": ((2, 3, 65), lambda a: a.reshape(-1)),
+        "flat_4x100": ((4, 100), lambda a: a.reshape(-1)),
+        "split_1x4x800_to_1x4x5x160": ((1, 4, 800), lambda a: a.reshape(1, 4, 5, 160)),
+        "merge_1x4x5x160_to_1x4x800": ((1, 4, 5, 160), lambda a: a.reshape(1, 4, 800)),
+        "reshape_1x2x4x8x7_to_1x8x56": (
+            (1, 2, 4, 8, 7),
+            lambda a: a.reshape(1, 8, 56),
+        ),
+    }
+    return {
+        name: (view, cached_randn(shape, differentiation="ssr"))
+        for name, (shape, view) in reads.items()
+    }
+
+
 def _pattern_param_sets():
     out = {}
 
@@ -1511,6 +1319,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "1d_abs_nz": (cached_randn((64,), abs=True) + FP16_EPS,),
                 "2d_abs_nz": (cached_randn((67, 256), abs=True) + FP16_EPS,),
+                # Intentionally FP32_EPS (1.19e-7), not FP16_EPS: in fp16 this is
+                # ~2 subnormal steps, so the case covers rsqrt on subnormal inputs.
+                "4d_abs_nz": (cached_randn((8, 64, 128, 128), abs=True) + FP32_EPS,),
+                "5d_abs_nz": (cached_randn((1, 2, 3, 4, 5), abs=True) + FP16_EPS,),
+                "4d_zero": (torch.zeros((8, 64, 128, 128), dtype=torch.float16),),
+                "4d_nan": (
+                    torch.full((2, 3, 4, 5), float("nan"), dtype=torch.float16),
+                ),
+                "5d_ones": (torch.ones((1, 2, 3, 4, 5), dtype=torch.float16),),
+                "5d_neg": (-cached_randn((1, 2, 3, 4, 5), dtype=torch.float16).abs(),),
+                "5d_inf": (
+                    torch.full((1, 2, 3, 4, 5), float("inf"), dtype=torch.float16),
+                ),
+                "4d_inf": (
+                    torch.full((8, 64, 128, 128), float("inf"), dtype=torch.float16),
+                ),
+            },
+            "expect_fail": {
+                "rsqrt_4d_zero": "torch.rsqrt generates incorrect result(#707)",
+                "rsqrt_4d_nan": "torch.rsqrt generates incorrect result(#707)",
             },
         },
         (
@@ -1589,6 +1417,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     - FP16_EPS,
                 ),
                 "zero_val": (torch.zeros((64,), dtype=torch.float16),),
+                "5d_abs_nz": (cached_randn((2, 3, 4, 8, 8), abs=True) + FP16_EPS,),
+                "5d_fp16_eps": (
+                    torch.zeros((1, 1, 1, 1, 1), dtype=torch.float16) + FP16_EPS,
+                ),
+                "5d_ones": (torch.ones((2, 3, 4, 8, 8), dtype=torch.float16),),
+                "5d_neg": (-cached_randn((2, 3, 4, 8, 8), dtype=torch.float16).abs(),),
+                "5d_nan": (
+                    torch.full((1, 1, 2, 2, 3), float("nan"), dtype=torch.float16),
+                ),
             },
         },
         (
@@ -1665,6 +1502,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 71, 256),),
                 ]
             ),
+        },
+        (
+            "test_5d_neg",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "neg": torch.neg,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((2, 5, 4, 3, 6),),
+                ]
+            ),
+        },
+        (
+            "test_cos_sin",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "cos": torch.cos,
+                "sin": torch.sin,
+            },
+            "param_sets": {
+                "5d_pi_by_2": (
+                    torch.full((2, 5, 4, 3, 6), torch.pi / 2, dtype=torch.float32),
+                ),
+                "5d_pi": (
+                    torch.full((1, 1, 4, 16, 16), torch.pi, dtype=torch.float32),
+                ),
+                "5d_3pi_by2": (
+                    torch.full(
+                        (1, 1, 4, 16, 16), torch.pi * 3 / 2, dtype=torch.float32
+                    ),
+                ),
+                "5d_2pi": (
+                    torch.full((2, 3, 8, 32, 32), torch.pi * 2, dtype=torch.float32),
+                ),
+                "5d_zeros": (torch.zeros((1, 1, 1, 1, 1)),),
+                "5d_neg": (
+                    -cached_randn((1, 3, 1, 64, 64), dtype=torch.float32).abs(),
+                ),
+                "5d_nan": (
+                    torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
+                ),
+                "5d_inf": (
+                    torch.full((1, 1, 4, 4, 4), float("inf"), dtype=torch.float32),
+                ),
+            },
         },
         (
             "test_pointwise_binary_op",
@@ -2214,6 +2099,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),),
                     ((67, 256),),
                     ((67, 71, 256),),
+                    ((2, 3, 8, 32, 32),),
                 ]
             ),
         },
@@ -2327,6 +2213,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w192": (192,),
             },
         },
+        ("test_topk_wide_dim", "test_topk_wide_dim_int64_indices"): {
+            "param_sets": {
+                "n2048_k16": (2048, 16),
+                "n8192_k64": (8192, 64),
+                "n128256_k4": (128256, 4),
+            },
+        },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
             "param_sets": {
                 "k16_rows256_row_split": (256, 16),
@@ -2352,6 +2245,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_k3_dim1": (
                     unique_randn_along_dim((67, 71, 256), dim=1),
                     3,
+                    1,
+                ),
+                # #5846 reported wrong values here at k=4 while k=1 and k=8 were fine.
+                "3d_k4_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    4,
                     1,
                 ),
                 "3d_k4_dim0": (
@@ -2593,11 +2492,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     1,
                 ),
-            },
-            # The values and the fp16 indices are exact; the fp16 to int64 cast of
-            # the indices is not.
-            "expect_fail": {
-                "2d_k4_dim0": _STAGGERED_READBACK,
             },
             # The cast's fp32 value lacks the second stick of a stick pair, so it
             # reads memory that was never written: the result is wrong on most runs
@@ -3279,6 +3173,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float32),
                     torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float32),
                 ),
+                "4d": (
+                    torch.ceil(
+                        cached_randn((8, 64, 128, 128), abs=True, scale=10.0)
+                    ).to(dtype=torch.float16),
+                    torch.ceil(cached_randn((8, 64, 128, 128), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "5d": (
+                    torch.ceil(cached_randn((1, 2, 3, 4, 5), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((1, 2, 3, 4, 5), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "5d_equal_tensors": (
+                    torch.ones((1, 1, 7, 13, 19), dtype=torch.float16),
+                    torch.ones((1, 1, 7, 13, 19), dtype=torch.float16),
+                ),
+                "5d_unequal_tensors": (
+                    torch.ones((2, 3, 16, 112, 112), dtype=torch.float16),
+                    torch.zeros((2, 3, 16, 112, 112), dtype=torch.float16),
+                ),
+                "5d_inf": (
+                    torch.full((2, 3, 4, 5, 6), float("inf"), dtype=torch.float16),
+                    torch.ceil(cached_randn((2, 3, 4, 5, 6), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
             },
         },
         # -----------------------------------------------------------------------
@@ -3701,12 +3625,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
                 "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
                 "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
-            },
-            # The compare is right on the device, but its staggered result is read
-            # back permuted with no error (#4393).
-            "expect_fail": {
-                "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
-                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
@@ -4380,6 +4298,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                     127,
                 ),
+                "5d_min_max": (
+                    cached_randn((2, 3, 4, 5, 6), dtype=torch.float16),
+                    -1.0,
+                    1.0,
+                ),
+                "5d_asymmetric_mingtmax": (
+                    cached_randn((2, 4, 6, 8, 10), dtype=torch.float16),
+                    1.5,
+                    0.8,
+                ),
+                "5d_negative_range": (
+                    cached_randn((1, 3, 5, 7, 9), dtype=torch.float16),
+                    -5.0,
+                    -1.0,
+                ),
+                "5d_same_min_max": (
+                    torch.ones((2, 3, 4, 5, 6), dtype=torch.float16),
+                    0,
+                    0,
+                ),
+                "5d_nan": (
+                    torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
+                    0.0,
+                    100,
+                ),
+                "5d_inf": (
+                    torch.full((2, 3, 4, 5, 6), float("inf"), dtype=torch.float16),
+                    1.0,
+                    -100,
+                ),
+            },
+        },
+        ("test_clamp_without_min_or_max", "test_clamp_inplace_cpu"): {
+            "ops_dict": {
+                "clamp_": torch.Tensor.clamp_,
+            },
+            "param_sets": {
+                # without max
+                "5d_min_only": (
+                    cached_randn((1, 2, 3, 4, 5), dtype=torch.float16),
+                    -0.5,
+                    None,
+                ),
+                # without min
+                "5d_max_only": (
+                    cached_randn((4, 8, 16, 32, 64), dtype=torch.float16),
+                    None,
+                    2.0,
+                ),
             },
         },
         (
@@ -4417,6 +4384,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     },
                     0.01,
                 ),
+                "5d_tanh": (
+                    cached_randn((8, 8, 8, 8, 8), dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+                "5d_asymmetric": (
+                    cached_randn((2, 4, 6, 8, 10), dtype=torch.float16),
+                    {
+                        "approximate": "none",
+                    },
+                    0.01,
+                ),
+                "5d_zeros": (
+                    torch.zeros((1, 1, 2, 4, 4), dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+                "5d_min_point": (
+                    torch.full((1, 1, 1, 1, 1), -0.75, dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+                "5d_positive_linear_asymptote": (
+                    torch.full((1, 1, 2, 8, 8), 10.0, dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+                "5d_negative_zero_asymptote": (
+                    torch.full((1, 1, 2, 8, 8), -10.0, dtype=torch.float16),
+                    {
+                        "approximate": "none",
+                    },
+                    0.01,
+                ),
+                "5d_extreme_values": (
+                    torch.tensor([[[[[-100.0, 0.0, 100.0]]]]], dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
             },
         },
         (
@@ -4433,6 +4449,47 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128, 128), dtype=torch.float16),
                     0.01,
                 ),
+                "4d": (
+                    cached_randn((8, 16, 32, 64), dtype=torch.float16),
+                    0.01,
+                ),
+                "4d_zeros": (
+                    torch.zeros((8, 16, 32, 64), dtype=torch.float16),
+                    0.01,
+                ),
+                "4d_mixed_size": (
+                    cached_randn((1, 64, 1, 128), dtype=torch.float16),
+                    0.01,
+                ),
+                "4d_nan": (
+                    torch.full((2, 3, 4, 5), float("nan"), dtype=torch.float16),
+                    0.01,
+                ),
+                "4d_extreme_positive": (
+                    torch.full((1, 3, 224, 224), 100.0, dtype=torch.float16),
+                    0.01,
+                ),
+                "5d": (
+                    cached_randn((2, 4, 8, 16, 32), dtype=torch.float16),
+                    0.01,
+                ),
+                "5d_ones": (
+                    torch.ones((1, 1, 1, 1, 1), dtype=torch.float16),
+                    0.01,
+                ),
+                "5d_neg_inf": (
+                    torch.full((1, 2, 3, 4, 5), float("-inf"), dtype=torch.float16),
+                    0.01,
+                ),
+                "5d_neg": (
+                    torch.full((1, 3, 2, 64, 64), -100.0, dtype=torch.float16),
+                    0.01,
+                ),
+            },
+            "expect_fail": {
+                "silu_5d_neg_inf": "CPU and spyre mismatch with torch.functional.silu and mish for 5d tensor with -inf (#1831)",
+                "mish_5d_neg_inf": "CPU and spyre mismatch with torch.functional.silu and mish for 5d tensor with -inf (#1831)",
+                "sigmoid_4d_nan": "torch.sigmoid with NaN returns tensors of ones (#1774)",
             },
         },
         (
@@ -4754,6 +4811,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
                 ),
+            },
+        },
+        # A cat piece that needs a restickify is written straight into a slice of
+        # the cat buffer; the padding pass cannot pad such a write in place.
+        # TODO: restickify into a fresh buffer and copy it into the slice (the
+        # TODO in padding._pad_restickify_output); then this becomes a positive
+        # case.
+        (
+            "test_cat_of_reshapes",
+            "test_cat_of_reshapes_cpu",
+        ): {
+            "param_sets": {
+                "split_32x25600_to_32x160x160_dim1": (
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                ),
+            },
+            "expect_raise": {
+                "split_32x25600_to_32x160x160_dim1": "restickify written into a slice",
             },
         },
         (
@@ -5254,6 +5330,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(3, 4, 128, dtype=torch.float16),
                     cached_randn((3, 4, 128)),
                 ),
+                "4d": (
+                    cached_randn((2, 3, 4, 5), dtype=torch.float32),
+                    cached_randn((1, 3, 4, 5), dtype=torch.float32),
+                ),
+                "4d_with_zeros": (
+                    torch.zeros(2, 3, 16, 16, dtype=torch.float16),
+                    cached_randn((2, 3, 16, 16), dtype=torch.float16),
+                ),
+                "4d_with_nan": (
+                    cached_randn((2, 3, 4, 5), dtype=torch.float32),
+                    torch.full((2, 3, 4, 5), float("nan")),
+                ),
+                "5d": (
+                    cached_randn((2, 3, 4, 8, 8), dtype=torch.float16),
+                    cached_randn(
+                        (2, 3, 4, 8, 8), dtype=torch.float16, differentiation=1
+                    ),
+                ),
+                "5d_with_ones": (
+                    torch.ones(2, 10, 3, 32, 32, dtype=torch.float32),
+                    torch.ones(2, 10, 3, 32, 32, dtype=torch.float32),
+                ),
+                "5d_with_inf": (
+                    cached_randn((2, 3, 4, 8, 8), dtype=torch.float16),
+                    torch.full((2, 3, 4, 8, 8), float("inf"), dtype=torch.float16),
+                ),
+            },
+            "expect_fail": {
+                "mul_4d_with_nan": "cpu and spyre result mismatch for torch.mul_ with 4d tensor of NaN (#1829)",
+                "mul_5d_with_inf": "cpu and spyre result mismatch for torch.mul_ with 5d tensor of inf (#1830)",
             },
         },
         (
@@ -5291,6 +5397,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_transposed_src": (
                     torch.zeros(128, 256, dtype=torch.float16),
                     cached_randn((256, 128)).t(),
+                ),
+                # (dst, src): the smallest normal fp16 value is copied into zeros.
+                "5d_small_values": (
+                    torch.zeros(2, 3, 4, 5, 6, dtype=torch.float16),
+                    torch.full(
+                        (2, 3, 4, 5, 6),
+                        torch.finfo(torch.float16).tiny,
+                        dtype=torch.float16,
+                    ),
+                ),
+                # (dst, src): a quarter of the fp16 max (16376) is copied from a
+                # non-contiguous source into zeros. The LX wraps add the value
+                # to itself ((x + x) / 2, sum(dim=0)), so it must stay well
+                # below the fp16 max: 65504 overflows the CPU reference, and
+                # 32752 overflows on the device, where it rounds up to 32768
+                # and the sum reaches 65536.
+                "5d_large_strided": (
+                    torch.zeros(2, 3, 4, 8, 16, dtype=torch.float16),
+                    torch.full(
+                        (4, 6, 8, 16, 32),
+                        torch.finfo(torch.float16).max / 4,
+                        dtype=torch.float16,
+                    )[::2, ::2, ::2, ::2, ::2],
+                ),
+                "5d_nan_with_inf": (
+                    torch.full((2, 3, 4, 8, 8), float("inf")),
+                    torch.full((2, 3, 4, 8, 8), float("nan")),
                 ),
             },
         },
@@ -5479,6 +5612,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),
                     torch.zeros([128], dtype=torch.float16),
                 ),
+                "2d_fp32": (
+                    cached_randn((256, 128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
+                "2d_fp32_transposed": (
+                    cached_randn((128, 256), dtype=torch.float32).transpose(0, 1),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
@@ -5584,6 +5727,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_beta_50": (
                     cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
                     50.0,
+                ),
+                "5d_zeros": (torch.zeros((1, 1, 1, 1, 1), dtype=torch.float16),),
+                "5d_linear_asymptote": (
+                    torch.full((2, 3, 4, 5, 6), 25.0, dtype=torch.float16),
+                ),
+                "5d_negative_saturation": (
+                    torch.full((2, 3, 4, 5, 6), -50.0, dtype=torch.float16),
+                ),
+                "5d_nan": (
+                    torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
+                ),
+                "5d_pos_inf": (
+                    torch.full((2, 3, 4, 5, 6), float("inf"), dtype=torch.float16),
+                ),
+                "5d_neg_inf": (
+                    torch.full((2, 3, 4, 5, 6), float("-inf"), dtype=torch.float16),
                 ),
                 # Below about -4 the runtime primitive drifts and from -7 returns
                 # 0, while softplus(x) ~= e^x is still a normal fp16 value. Mamba's
@@ -5779,8 +5938,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
+                "5d": (cached_randn((2, 3, 4, 8, 8), dtype=torch.float16), 2.4),
+                "5d_zeros": (torch.zeros((2, 3, 4, 8, 8), dtype=torch.float16), 0.0),
+                "5d_negative": (
+                    -torch.ones((2, 3, 4, 8, 8), dtype=torch.float16),
+                    -0.5,
+                ),
                 "3d_fp32": (cached_randn((8, 64, 1024), dtype=torch.float32), 1.5),
                 "4d_fp32": (cached_randn((2, 4, 64, 1024), dtype=torch.float32), 2.4),
+            },
+            "expect_fail": {
+                "true_divide_5d_zeros": "torch.div returns wrong value when divided by 0 on spyre(#1867)",
+                "div_5d_zeros": "torch.div returns wrong value when divided by 0 on spyre(#1867)",
             },
         },
         ("test_linear", "test_linear_fn"): {
@@ -6770,6 +6939,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     False,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+            },
+        },
+        # Reductions over an expand()-broadcast operand, across dim alignment,
+        # op, and operand-order variations.
+        ("test_expand_broadcast_reduction", "test_expand_broadcast_reduction_base"): {
+            "param_sets": {
+                "fp16_70_to_2x32x70": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_1x2x1x4x1x256_to_8x2x4x4x16x256": (
+                    (8, 2, 4, 4, 16, 256),
+                    cached_randn((1, 2, 1, 4, 1, 256), dtype=torch.float16)
+                    .round()
+                    .clamp(-3, 3),
+                ),
+                "fp16_70_to_2x32x70_amax": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amax,
+                ),
+                "fp16_70_to_2x32x70_amin": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amin,
+                ),
+                "fp16_70_to_2x32x70_transposed": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    -1,
+                    (0, 1),
+                ),
+                "fp16_3x5x1_to_3x5x100_unaligned_expand_dim": (
+                    (3, 5, 100),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    1,
+                ),
+            },
+        },
+        # x.sum(1) + y.expand_as(x).sum(1) fuses into one op with two reduction
+        # operands sharing output dims: a plain operand (x) and a broadcast
+        # operand (y, expanded along dim -1). Checks that the merged dim order
+        # accounts for both, including an unaligned (non-stick-multiple) last
+        # dim.
+        (
+            "test_expand_broadcast_reduction_fused",
+            "test_expand_broadcast_reduction_fused_base",
+        ): {
+            "param_sets": {
+                "fp16_3x5x128": (
+                    cached_randn((3, 5, 128), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_3x5x100_unaligned": (
+                    cached_randn((3, 5, 100), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
                 ),
             },
         },
@@ -8031,18 +8259,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
+            "expect_raise": TO_DTYPE_OP_EXPECT_RAISE,
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -8259,10 +8480,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -8270,11 +8487,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
-            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_IMPLICIT_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         (
             "test_reduction_with_to_dtype",
@@ -8471,7 +8683,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x64_ksize5_stride2": (
                     cached_randn((2, 64, 32, 32)),
@@ -8481,7 +8693,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     64,
                     [[32, 32, 1, 2, 64], [5, 5, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 5, -1, 25, 25]],
+                    [[32, 1, 0, 65536, 1024], [1, 5, 0, 25, 25]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
@@ -8491,7 +8703,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
                 # the expect_fail note above.  The layouts are inherited from the
@@ -8504,7 +8716,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8514,7 +8726,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 9, 9]],
                 ),
                 # C == 1 (single-channel depthwise), strided.  The activation's
                 # channel axis is size 1, so its device stick is degenerate (stick
@@ -8529,7 +8741,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     1,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 16384, -1], [1, 3, -1, 9, -1]],
+                    [[128, 1, 0, 16384, 0], [1, 3, 0, 9, 0]],
                 ),
                 "1x3x64_ksize_1x3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8539,7 +8751,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_3x1": (
                     cached_randn((1, 3, 64, 64)),
@@ -8549,7 +8761,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_3x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8559,7 +8771,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_1x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8569,7 +8781,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
@@ -8579,7 +8791,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[32, 1, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                    [[32, 1, 0, 3072, 1024], [1, 1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
@@ -8589,7 +8801,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     16,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 65536, 4096], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
@@ -8599,7 +8811,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
@@ -8609,7 +8821,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
-                    [[128, 1, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                    [[128, 1, 0, 49152, 16384], [1, 5, 0, 25, 25]],
                 ),
                 # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
                 # the depthwise output is an intermediate the add reads rather than
@@ -8623,7 +8835,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2_bias": (
                     cached_randn((2, 32, 64, 64)),
@@ -8633,7 +8845,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
             },
         },
@@ -8721,7 +8933,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[32, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 2048, 32], [1, -1, 3, 3]],
+                    [[1, 0, 2048, 32], [1, 0, 3, 3]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128)),
@@ -8731,7 +8943,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=1: rejected, see
                 # the expect_raise note above.  The layouts are inherited from the
@@ -8744,7 +8956,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64)),
@@ -8754,7 +8966,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 4096, 64], [1, -1, 3, 3]],
+                    [[1, 0, 4096, 64], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_1": (
                     cached_randn((1, 3, 64)),
@@ -8764,7 +8976,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [1, 1, 1, 64]],
-                    [[1, -1, 192, 64], [1, -1, 1, 1]],
+                    [[1, 0, 192, 64], [1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32)),
@@ -8774,7 +8986,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[32, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 96, 32], [1, -1, 1, 1]],
+                    [[1, 0, 96, 32], [1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64)),
@@ -8784,7 +8996,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     16,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 1024, 64], [1, -1, 3, 3]],
+                    [[1, 0, 1024, 64], [1, 0, 3, 3]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64)),
@@ -8794,7 +9006,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     32,
                     [[64, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 2048, 64], [1, -1, 1, 1]],
+                    [[1, 0, 2048, 64], [1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128)),
@@ -8804,7 +9016,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[128, 1, 1, 64], [5, 1, 1, 64]],
-                    [[1, -1, 384, 128], [1, -1, 5, 5]],
+                    [[1, 0, 384, 128], [1, 0, 5, 5]],
                 ),
             },
         },
@@ -9352,6 +9564,101 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A stride inside the stick (the even/odd split of GPT-J style RoPE) is
+        # gathered. The views are those of q/k off a projection: [T, H*D] viewed
+        # [T, H, D], and the rope part of a [T, H, 192] head split [128 | 64].
+        ("test_strided_stick_slice", "test_strided_stick_slice_cpu"): {
+            "param_sets": {
+                "step2": (
+                    lambda t: t[..., ::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step2_offset": (
+                    lambda t: t[..., 1::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step3_bounded": (
+                    lambda t: t[..., 2:40:3],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step4_offset_2_sticks": (
+                    lambda t: t[..., 3::4],
+                    cached_randn((32, 4, 128), differentiation="sss_w"),
+                ),
+                "step2_2d": (
+                    lambda t: t[:, ::2],
+                    cached_randn((4, 128), differentiation="sss_2d"),
+                ),
+                "step2_of_head_view": (
+                    lambda t: t.view(32, 8, 64)[..., ::2],
+                    cached_randn((32, 512), differentiation="sss_v"),
+                ),
+                "step2_offset_of_head_split": (
+                    lambda t: t.view(32, 8, 192).split([128, 64], -1)[1][..., 1::2],
+                    cached_randn((32, 1536), differentiation="sss_s"),
+                ),
+            },
+        },
+        # GPT-J style RoPE on a single key head ([T, 1, D], as MLA's shared key),
+        # with cos and sin gathered per position. A size-1 dim must not become the
+        # stick of the transposed copy: the restickify of the gathered cos and sin
+        # then grows with T and overflows a dbo-opt immediate at T=1024.
+        ("test_interleaved_rope_single_head", "test_interleaved_rope_cpu"): {
+            "param_sets": {
+                "t1024": (
+                    cached_randn((1024, 1, 64), differentiation="irs_x"),
+                    cached_randn((4096, 32), differentiation="irs_cos"),
+                    cached_randn((4096, 32), differentiation="irs_sin"),
+                ),
+            },
+        },
+        # A stick-dim gather written at an offset inside a wider stick: the
+        # restickify of the gather output must target the consumer's stick, or
+        # it writes at stick position 0 and over the neighbouring lanes.
+        ("test_stick_gather_at_offset", "test_stick_gather_at_offset_cpu"): {
+            "param_sets": {
+                "cat_after": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                # The odd gather is the one written at the offset.
+                "cat_even_odd": (
+                    lambda x, i: torch.cat(
+                        (
+                            torch.index_select(x, -1, i),
+                            torch.index_select(x, -1, i + 1),
+                        ),
+                        -1,
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "cat_after_2d": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((8, 64), differentiation="sgo_x2"),
+                    cached_randn((8, 32), differentiation="sgo_a2"),
+                ),
+                "pad_left": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (32, 0)
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                # The fill value must survive next to the gathered lanes.
+                "pad_right_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (0, 32), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "pad_both_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (16, 16), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+            },
+        },
         # rotate_half on q/k built by view + transpose of the projection output:
         # the HF attention pattern issue #4050 was reported against.
         ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
@@ -9360,6 +9667,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((1, 8, 512), differentiation="rope_h"),
                     cached_randn((1, 8, 128), differentiation="rope_cos"),
                     cached_randn((1, 8, 128), differentiation="rope_sin"),
+                ),
+            },
+        },
+        # Reads whose row or slice boundary falls inside a stick (64 fp16
+        # elements): issues #5197, #5198, #5227, #5872. A row of 160 elements is
+        # 2.5 sticks, as in the (1, 64, 25600) <-> (1, 64, 160, 160) reshape of
+        # #5227; a smaller tensor with the same row length exercises the same
+        # split and merge.
+        (
+            "test_stick_splitting_read_pointwise",
+            "test_stick_splitting_read_pointwise_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        (
+            "test_stick_splitting_read_reduction",
+            "test_stick_splitting_read_reduction_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        # #2851: a dtype conversion that reads a strided slice (stick coordinate
+        # 2*Mod(d1, 32)).
+        (
+            "test_stick_splitting_read_strided_to_dtype",
+            "test_stick_splitting_read_strided_to_dtype_cpu",
+        ): {
+            "param_sets": {
+                "step2_8x128_float_half": (
+                    cached_randn((8, 128), differentiation="ssr_2851"),
                 ),
             },
         },
@@ -11259,6 +11591,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
         )
 
+    def test_topk_wide_dim_int64_indices(self, n: int, k: int):
+        # float32 indices are exact to 2**24, so a float32 topk gives exact int64
+        # indices at any width up to a full vocabulary (#5847). Each row holds
+        # k, k-1, ..., 1 at random positions on a zero background.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack([torch.randperm(n, generator=g)[:k] for _ in range(4)])
+        want = torch.arange(k, 0, -1).float().expand(4, k).contiguous()
+        x.scatter_(1, positions, want)
+
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=-1)
+            return values, indices.to(torch.int64)
+
+        values, indices = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        assert indices.dtype == torch.int64
+        assert torch.equal(values.cpu(), want)
+        assert torch.equal(indices.cpu(), positions)
+
+    @expects_raise
+    def test_topk_fp16_wide_dim_rejected(self):
+        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
+        # dim must be rejected instead of returning wrong indices (#5847).
+        x = torch.randn(4, 2048).half()
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -12034,6 +12393,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, *tensors)
 
+    def test_cat_of_reshapes_cpu(self, a, b):
+        """``cat(1)`` of two reshapes that cut the stick dim (issue #5227's
+        ``(1, N, 25600) -> (1, N, 160, 160)``)."""
+
+        def fn(a, b):
+            return torch.cat(
+                [a.reshape(1, 32, 160, 160), b.reshape(1, 32, 160, 160)], dim=1
+            )
+
+        self.compare_with_cpu(fn, a, b, run_eager=False)
+
     def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
         def fn(a, b):
             return torch.cat([a, b], dim=-1).sum(dim=-1)
@@ -12135,7 +12505,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    def test_softplus_cpu(self, x, beta):
+    def test_softplus_cpu(self, x, beta=1.0):
         threshold = 20.0
 
         def fn(input):
@@ -12295,6 +12665,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_strided_stick_slice_cpu(self, slicer, x):
+        """Read a strided slice of the stick dim into real compute.
+
+        The slice is scaled by a tensor, not a constant: a lone slice, or one times a
+        constant, is folded into a view of the input and never reaches the device.
+        """
+        scale = torch.linspace(0.5, 1.5, slicer(x).shape[-1], dtype=x.dtype)
+
+        def fn(x, scale):
+            return slicer(x) * scale
+
+        self.compare_with_cpu(fn, x, scale, run_eager=False)
+
+    def test_interleaved_rope_cpu(self, x, cos_cache, sin_cache):
+        """Interleaved RoPE as vLLM's ``ApplyRotaryEmb.forward_static`` reads it."""
+        positions = torch.arange(x.shape[0]) * 7 % cos_cache.shape[0]
+
+        def fn(x, cos_cache, sin_cache, positions):
+            cos = cos_cache.index_select(0, positions).unsqueeze(1)
+            sin = sin_cache.index_select(0, positions).unsqueeze(1)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+
+        self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
+
+    def test_stick_gather_at_offset_cpu(self, build, x, *partners):
+        """Write a gather of ``x``'s stick dim at an offset inside a wider stick.
+
+        ``index`` holds the even positions; ``partners`` are the tensors ``build``
+        writes beside the gather, if any.
+        """
+        index = torch.arange(0, x.shape[-1], 2)
+        self.compare_with_cpu(build, x, *partners, index, run_eager=False)
+
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""
         B, L, H, D = 1, 8, 4, 128
@@ -12313,6 +12717,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q.contiguous(), k.contiguous()
 
         self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
+
+    def test_stick_splitting_read_pointwise_cpu(self, view, x):
+        """A read whose row or slice boundary falls inside a stick (issues #5197,
+        #5198, #5227, #5872), compiled and eager.
+
+        ``(view * 2).exp()``, not ``view * 1.0``: the latter already passed on main.
+        """
+        self.compare_with_cpu(lambda a: (view(a) * 2).exp(), x, atol=0.5, rtol=0.1)
+
+    def test_stick_splitting_read_reduction_cpu(self, view, x):
+        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, rtol=0.1)
+
+    def test_stick_splitting_read_strided_to_dtype_cpu(self, x):
+        """``t[:, ::2].float().half()`` (issue #2851), compiled only.
+
+        The eager result of ``.float()`` is not comparable with the CPU even for
+        a dense tensor (see the D2H element-arrangement TODO in ``eager.py``).
+        """
+        self.compare_with_cpu(lambda a: a[:, ::2].float().half(), x, run_eager=False)
 
     # --- Migrated from test_ops.py ---
 
@@ -12910,6 +13333,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
 
+    def test_expand_broadcast_reduction_base(
+        self, expand_shape, x, op=torch.sum, dim=-1, transpose=None
+    ):
+        # Whole-number inputs let a zero-tolerance assert_close catch a dropped/
+        # double-counted term that a loose tolerance (or shape-broadcasting allclose)
+        # would hide.
+        def fn(t):
+            t = t.expand(expand_shape)
+            if transpose is not None:
+                t = t.transpose(*transpose)
+            return op(t, dim=dim)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    def test_expand_broadcast_reduction_fused_base(self, x, y):
+        self.compare_with_cpu(
+            lambda x, y: x.sum(1) + y.expand_as(x).sum(1), x, y, atol=0, rtol=0
+        )
+
     def test_mean_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
 
@@ -13242,11 +13684,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = cached_randn((64,), dtype=torch.float32)
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_host_to_fp32_cpu(self):
         # Literal repro from issue #1482: a host bool converted to fp32 and read
         # back directly, as a staggered float32 like any float16 source's.
@@ -13259,9 +13696,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @expects_raise
     def test_bool_host_reshaped_to_fp32_cpu(self):
         # Same as test_bool_host_to_fp32_cpu, but through a reshape view first,
-        # which leaves 8 elements on the stick dim.
-        # TODO: convert a stick-unaligned float16 tensor to float32 (#3999); then
-        # this reads back like test_bool_host_to_fp32_cpu.
+        # which leaves 8 elements on the stick dim. The only input layout folds
+        # rows into one stick (stick expression 8*d0 + d1), which the conversion
+        # cannot read, so no output layout is found.
+        # TODO: read a view that folds rows into one stick; then this reads back
+        # like test_bool_host_to_fp32_cpu.
         def fn(x):
             return x.reshape(8, 8).to(dtype=torch.float32)
 
@@ -13491,11 +13930,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "fp32toint32", fn, x, dsts=(torch.int32, torch.int64)
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_fp16_src_to_int64_readback_known_xfail(self):
         def fn(x):
             return (x > 2).to(dtype=torch.int64)
@@ -13531,12 +13965,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp32toint32", fn, x.to(src), dsts=(torch.int32, torch.int64)
                 )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_float16_to_int_readback_known_xfail(self):
+    def test_float16_to_int_readback(self):
         def fn(x):
             return x.to(dtype=torch.int32)
 
@@ -13560,12 +13989,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     values = x if dst == torch.float16 else x // 8 * 8
                     self._assert_conversion_on_device("fp32todl16", fn, values.to(src))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_int_to_float16_readback_known_xfail(self):
+    def test_int_to_float16_readback(self):
         def fn(x):
             return x.to(torch.float16)
 
@@ -14390,6 +14814,149 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @expects_raise
+    def test_index_put_bool_mask(self):
+        """``out[mask] = values`` with a boolean mask.
+
+        Upstream lowers a mask to a mutating fallback, which Spyre rejects.
+        TODO(issue#692): compare against CPU once this lowers on device.
+        """
+
+        def fn(x, mask, values):
+            out = x.clone()
+            out.index_put_((mask,), values, accumulate=False)
+            return out
+
+        with pytest.raises(InductorError, match="has no Spyre kernel"):
+            _compile_and_run(
+                fn,
+                [
+                    torch.zeros(4, 4, dtype=torch.float32),
+                    torch.eye(4, dtype=torch.bool),
+                    torch.tensor([1.0, 2.0, 3.0, 4.0]),
+                ],
+                "spyre",
+            )
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_put_integer_index(self):
+        """``out[index] = values`` with an integer index.
+
+        Compiled, this form lowers to a device scatter, so a host fallback is
+        a regression and fails the test. Eager is not run: it has no device
+        kernel for this op. Indices are distinct and the tolerance exact.
+        """
+
+        def fn(x, index, values):
+            out = x.clone()
+            out.index_put_((index,), values, accumulate=False)
+            return out
+
+        self.compare_with_cpu(
+            fn,
+            torch.zeros(4, 8, dtype=torch.float32),
+            torch.tensor([0, 2]),
+            torch.ones(2, 8, dtype=torch.float32),
+            run_eager=False,
+            atol=0,
+            rtol=0,
+        )
+
+    @expects_raise
+    def test_scatter_reduce_non_sum_modes(self):
+        """``scatter_reduce_`` with a reduction other than sum.
+
+        Upstream lowers these modes to a mutating fallback, which Spyre
+        rejects.
+        TODO(issue#4361): compare against CPU once they lower on device.
+        """
+
+        def fn(out, src, index, reduce):
+            o = out.clone()
+            o.scatter_reduce_(0, index, src, reduce)
+            return o
+
+        out = torch.full((128, 256), 2.0, dtype=torch.float16)
+        src = torch.full((3, 256), 4.0, dtype=torch.float16)
+        index = torch.arange(3).unsqueeze(1).expand(3, 256).contiguous()
+        for reduce in ("amax", "amin", "prod", "mean"):
+            with self.subTest(reduce=reduce):
+                with pytest.raises(InductorError, match="has no Spyre kernel"):
+                    _compile_and_run(fn, [out, src, index, reduce], "spyre")
+
+    def _index_reduce_all_modes(self, dst, dim, index, src):
+        """Compiled and eager index_reduce_ match CPU for every reduce mode.
+
+        amax/amin are exact and prod/mean combine at most a few fp16 values,
+        so 0.01 covers the DL16 rounding of the device result.
+        """
+        for reduce in ("amax", "amin", "prod", "mean"):
+            for include_self in (True, False):
+
+                def fn(d, i, s):
+                    return d.clone().index_reduce_(
+                        dim, i, s, reduce, include_self=include_self
+                    )
+
+                with self.subTest(reduce=reduce, include_self=include_self):
+                    torch._dynamo.reset()
+                    self.compare_with_cpu(fn, dst, index, src, atol=0.01, rtol=0.01)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_2d_dim0(self):
+        """The #4634 repro shape (dim 0 of a 4x8 tensor) with unique indices."""
+        dst = (torch.arange(4 * 8, dtype=torch.float32) / 7.0).reshape(4, 8)
+        src = (torch.arange(3 * 8, dtype=torch.float32) / 3.0).reshape(3, 8)
+        self._index_reduce_all_modes(
+            dst.to(torch.float16),
+            0,
+            torch.tensor([2, 0, 3]),
+            src.to(torch.float16),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_3d_middle_dim(self):
+        """A non-leading, non-stick dim; slot 1 is never hit and keeps self."""
+        self._index_reduce_all_modes(
+            cached_randn((2, 4, 64), abs=True),
+            1,
+            torch.tensor([3, 0, 2]),
+            cached_randn((2, 3, 64), abs=True, differentiation="src"),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_multi_stick_index(self):
+        """K = 70 unique indices span two sticks of the padded index column."""
+        self._index_reduce_all_modes(
+            cached_randn((140, 64), abs=True) + 0.5,
+            0,
+            torch.arange(0, 140, 2),
+            cached_randn((70, 64), abs=True, differentiation="src") + 0.5,
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_inplace_returns_self(self):
+        """Eager index_reduce_ writes into ``self`` and returns that tensor."""
+        dst = cached_randn((4, 64)).to("spyre")
+        src = cached_randn((3, 64), differentiation="src")
+        index = torch.tensor([2, 0, 3])
+        expected = dst.cpu().index_reduce_(0, index, src, "amax")
+        res = dst.index_reduce_(0, index.to("spyre"), src.to("spyre"), "amax")
+        assert res.data_ptr() == dst.data_ptr(), "index_reduce_ did not return self"
+        torch.testing.assert_close(dst.cpu(), expected, atol=0.01, rtol=0.01)
+
+    @expects_raise
+    def test_index_reduce_stick_dim_raises(self):
+        """index_reduce along the stick (last) dim is rejected with Unsupported.
+
+        TODO(#4404): make this a positive test once a stick-dim scatter lowers.
+        """
+        dst = torch.randn(4, 64, dtype=torch.float16, device="spyre")
+        src = torch.randn(4, 3, dtype=torch.float16, device="spyre")
+        index = torch.tensor([1, 5, 1], device="spyre")
+        with pytest.raises(Exception, match="stick \\(last\\) dim"):
+            dst.index_reduce(1, index, src, "amax")
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
@@ -15139,6 +15706,151 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
+
+
+class TestFFT(unittest.TestCase):
+    """DFT via matmul: the fft/ifft host wrappers run a real interleaved
+    ``u @ W`` on device and are checked end-to-end against ``torch.fft``; a few
+    host-only cases check the matrix builder and the device-matrix cache in
+    ``torch_spyre.ops._fft`` directly.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    def test_fft_matches_reference(self):
+        # End-to-end vs torch.fft (validates the interleaved DFT matrix), for
+        # powers of two and a prime. Bounded against the spectrum peak: fp16
+        # cancellation hurts per-element accuracy on near-zero outputs, so the
+        # standard FFT-roundoff measure is relative to peak magnitude. Measured
+        # on device: ~0.2-0.3% at these sizes, up to ~1.7% for a direct
+        # transform at n=32768, and <=0.6% for the four-step path at n=65536; a
+        # wrong transform is >100%. The 2e-2 gate keeps margin over the worst.
+        for n in (64, 97, 256):
+            with self.subTest(n=n):
+                x = torch.randn(3, n, dtype=torch.complex64)
+                ref = torch.fft.fft(x)
+                err = (spyre_fft(x) - ref).abs().max().item()
+                self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_roundtrip(self):
+        x = torch.randn(2, 128, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft2_matches_reference(self):
+        # N-D DFT is separable: fft along each of the last two axes.
+        x = torch.randn(32, 48, dtype=torch.complex64)
+        ref = torch.fft.fft2(x)
+        err = (spyre_fft2(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fftn_matches_reference(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        ref = torch.fft.fftn(x)
+        err = (spyre_fftn(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifftn_roundtrip(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        err = (spyre_ifftn(spyre_fftn(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_fourstep(self):
+        # Above the direct ceiling (32768) a composite length uses the
+        # four-step factorization (two sub-DFTs + twiddle), which also lets a
+        # transform too large for one direct matmul complete.
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_large_roundtrip(self):
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_prime_unsupported(self):
+        # A prime above the ceiling cannot be factored for four-step and
+        # would need an O(n^2) matrix; it is rejected rather than attempted.
+        with self.assertRaisesRegex(NotImplementedError, "prime factor"):
+            spyre_fft(torch.randn(65537, dtype=torch.complex64))
+
+    def test_fft_direct_max_env_forces_fourstep(self):
+        # TORCH_SPYRE_FFT_DIRECT_MAX lowers the direct/four-step boundary, so a
+        # small composite length takes the four-step path and still matches.
+        x = torch.randn(3, 128, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        with mock.patch.dict(os.environ, {"TORCH_SPYRE_FFT_DIRECT_MAX": "64"}):
+            err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_overflow_prescaled(self):
+        # The unnormalized DC term reaches n*|x| and an |x| > 65504 input
+        # overflows the fp16 cast; the host max-abs prescale keeps both in
+        # range, so a large-magnitude signal is finite and still matches.
+        x = torch.randn(2, 128, dtype=torch.complex64) * 1e5
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        self.assertTrue(torch.isfinite(y).all())
+        err = (y - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_per_row_prescale(self):
+        # The prescale is per row, not per tensor: a batch with a large row and
+        # a tiny row (here ~1e-5 apart in magnitude) must not cost the tiny row
+        # precision. Each row is checked against its own spectrum peak.
+        big = torch.randn(256, dtype=torch.complex64)
+        small = torch.randn(256, dtype=torch.complex64) * 1e-5
+        x = torch.stack([big, small])
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        for r in range(x.shape[0]):
+            peak = ref[r].abs().max().item()
+            err = (y[r] - ref[r]).abs().max().item()
+            self.assertLessEqual(err, 2e-2 * peak)
+
+    def test_inverse_matrix_unit_magnitude(self):
+        # The inverse matrix stays unit-magnitude (1/n applied on the host in
+        # fp32, not baked in): baked entries would be ~1/n, subnormal below the
+        # fp16 normal minimum (~6.1e-5) for n>16384. A baked matrix would
+        # already be far below 1 at these small n, so max|W| ~= 1 shows the
+        # 1/n is not in the matrix.
+        from torch_spyre.ops import _fft
+
+        for n in (256, 4096):
+            w = _fft._build_device_dft_matrix(n, inverse=True, device="cpu")
+            self.assertAlmostEqual(w.abs().max().item(), 1.0, places=2)
+
+    def test_w_cache_lru_eviction(self):
+        # _W_CACHE is bounded by total bytes: building distinct lengths past the
+        # budget evicts the least-recently-used entry and stays within budget.
+        from torch_spyre.ops import _fft
+
+        _fft._W_CACHE.clear()
+        budget = 8 * 128 * 128 + 8 * 160 * 160  # room for the two largest
+        with mock.patch.dict(
+            os.environ, {"TORCH_SPYRE_FFT_W_CACHE_BYTES": str(budget)}
+        ):
+            for n in (64, 96, 128, 160):
+                _fft._device_dft_matrix(n, False, "cpu")
+            cached = {k[1] for k in _fft._W_CACHE}
+            total = sum(_fft._entry_bytes(k) for k in _fft._W_CACHE)
+        self.assertLessEqual(total, budget)
+        self.assertNotIn(64, cached)  # least-recently-used, evicted
+        self.assertIn(160, cached)  # most recent, kept
+        _fft._W_CACHE.clear()
+
+    def test_dft_matrix_block_boundary(self):
+        # Row-block assembly must be independent of the block size.
+        from torch_spyre.ops import _fft
+
+        for inv in (False, True):
+            ref = _fft._build_device_dft_matrix(200, inv, "cpu", block=200)
+            small = _fft._build_device_dft_matrix(200, inv, "cpu", block=7)
+            self.assertTrue(torch.equal(ref, small))
+
 
 if __name__ == "__main__":
     unittest.main()

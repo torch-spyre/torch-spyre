@@ -153,11 +153,12 @@ SFU
   activations such as GELU, softmax, and other element-wise functions
   the {term}`PT` unit does not implement.
 
-span reduction
-  The first of two work-division passes (`span_reduction()`). Analyzes
-  the iteration space of each reduction and determines how its span
-  can be split across cores. Followed by {term}`work distribution`.
-  See [Work Division Planning](../compiler/work_division_planning.md).
+span floors
+  The minimum split per iteration dimension that keeps every tensor of
+  an op within the 256 MB per-core memory span (`span_floors()`). Not a
+  pass: whatever chooses an op's core split computes them at that point,
+  and every split must meet them, including {term}`work distribution`'s.
+  See [Work Division Planning](../compiler/work_division_planning.md#span-floors).
 
 SPMD
   Single Program, Multiple Data. Every core runs the same program on
@@ -200,9 +201,9 @@ tile
   is built from one or more {term}`stick`s.
 
 work distribution
-  The second of two work-division passes (`work_distribution()`).
-  Assigns the spans identified by {term}`span reduction` to the 32
-  cores. Enforces equal stick counts per core (no load imbalance) and
+  The default work-division pass (`work_distribution()`). Starting from
+  the op's {term}`span floors`, assigns its iteration dimensions to the
+  32 cores. Enforces equal stick counts per core (no load imbalance) and
   per-core addressable device memory limits. See
   [Work Division Planning](../compiler/work_division_planning.md).
 
