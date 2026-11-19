@@ -3342,14 +3342,21 @@ def dense_relocation_serves_read(
     sizes = [int(concretize_expr(v)) for v in in_host.size]
     strides = [int(concretize_expr(v)) for v in in_host.stride]
     by_stride = sorted(range(len(sizes)), key=lambda d: -strides[d])
-    # Skip size-1 dims: their stride ties with the real stick dim's, and a stable
-    # sort can then leave one of them last, which would hand
-    # _former_stick_dim_outermost the wrong dim's size and stride and leave the
-    # padding inside another dim.  restickify_dense_stl_to_sparse skips them for
-    # the same reason.
+    # Which host dim the stick is on is a property of stl, not of the host strides:
+    # an input whose stick was already moved does not have it on its smallest-stride
+    # dim.  Match it by stride as restickify_dense_stl_to_sparse does, skipping
+    # size-1 dims, whose stride ties with the real stick dim's and would otherwise
+    # win a sort by stride alone.  Handing _former_stick_dim_outermost the wrong
+    # dim leaves the padding inside another dim, which is what it exists to prevent.
+    stick_stride = stl.stride_map[-1]
     current_stick = next(
-        (d for d in reversed(by_stride) if sizes[d] > 1), by_stride[-1]
+        (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == stick_stride),
+        None,
     )
+    if current_stick is None:
+        current_stick = next(
+            (d for d in reversed(by_stride) if sizes[d] > 1), by_stride[-1]
+        )
     candidates = [d for d in range(len(sizes)) if d != current_stick and sizes[d] > 1]
     for stick in sorted(candidates, key=lambda d: -sizes[d]):
         order = [d for d in by_stride if d != stick] + [stick]
@@ -3461,25 +3468,20 @@ def compute_restickify_needed(
     if idc is None:
         # A read the input cannot serve (flattening [8, 65] into [520] splits a
         # stick) may be served by the input's host shape in a sparse layout.
-        # TODO(#5872): this returns the relocated or the sparse target for any
-        # output, without checking that it is stick_compatible with the output.
-        # For the sparse target that is safe because _default_pointwise_layout and
-        # _reduction_layout return the sparse output early.  The relocated target
-        # has no such guard: both rules carry on to _candidate_output_stls, which
-        # can offer an output whose stick is not the relocated one, and this would
-        # pair it with the relocated input anyway.  Return the target only for an
-        # output it can feed.
+        # Both targets below are returned only for an output they can feed.
+        # TODO(#5872): the end state is to offer them as candidates next to the
+        # normal ones rather than deciding here, so a rule that wants a dense
+        # output for this read can have one.  Today a pair this function rejects
+        # is reported infeasible and the beam search drops that candidate.
         # Before the sparse layout, which costs elems_per_stick times the memory,
         # try a dense layout with the stick on a dim the read leaves alone.
         dense = dense_relocation_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
         if dense is not None:
-            # The sparse target below is safe to return unchecked because both
-            # layout rules return the sparse output early.  A relocation has no
-            # such guard: the rules carry on to _candidate_output_stls, which can
-            # offer an output whose stick is not the relocated one.  Check this
-            # target can feed this output rather than trusting them.  A rule that
-            # relocated differently (it probes without the indirect context this
-            # function has) also lands here, and is rejected the same way.
+            # Both layout rules carry on to _candidate_output_stls after a
+            # relocation, so the output paired with this target need not have the
+            # relocated stick.  A rule that relocated differently (it probes
+            # without the indirect context this function has) also lands here,
+            # and is rejected the same way.
             dense_idc = try_device_coordinates(dense, in_dep, ind_sizes, op=op)
             out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
             if (
@@ -3492,6 +3494,14 @@ def compute_restickify_needed(
             in_stl, in_host, in_dep, ind_sizes, op=op
         )
         if sparse is not None:
+            # Returned unchecked, unlike the relocation above.  Running the same
+            # stick_compatible check here was tried and reverted: it rejects the
+            # sparse target for the yolo26 Detect head cat, which then fails with
+            # a bare "Unexpected stick expression Mod(Mod(d1, 80), 64)" from
+            # codegen instead of the padding pass's own message.  A sparse target
+            # is paired with a sparse output by both layout rules' early return,
+            # and stick_compatible does not model that pairing.  Checking it
+            # properly is part of #5872's end state, not a local fix.
             return True, sparse
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a

@@ -1733,21 +1733,20 @@ class TestDenseRelocationServesRead(TestCase):
                 _, dep = _flat_read(math.prod(shape))
                 self.assertIsNone(dense_relocation_serves_read(stl, host, dep))
 
-    def test_a_size1_dim_is_not_mistaken_for_the_stick(self):
-        # A size-1 dim's stride ties with the real stick dim's, so a sort by
-        # stride alone can leave it last. The former stick dim must still be
-        # identified as the 100-wide dim, not the size-1 one, or its padding
-        # would be left inside another dim.
-        host = FixedLayout(
-            torch.device("spyre:0"), torch.float16, [4, 100, 1], [100, 1, 1]
+    def test_an_already_relocated_input_keeps_its_own_dims(self):
+        # The stick is a property of the layout, not of the host strides: this
+        # input's stick is on host dim 0, not its smallest-stride dim. The read
+        # still cannot be served by moving it again, so the answer is the sparse
+        # layout. NOTE: this case does not distinguish the stride_map-based pick
+        # from the host-stride one -- both return None -- so it pins the contract,
+        # not the fix. No input reaching this helper has been found where the two
+        # picks differ.
+        host = _contiguous_host([4, 100])
+        moved = SpyreTensorLayout([4, 100], [100, 1], torch.float16, [1, 0])
+        self.assertEqual(list(moved.stride_map), [400, 1, 100])
+        self.assertIsNone(
+            dense_relocation_serves_read(moved, host, self._split_row_read(4, 100, 5))
         )
-        stl = SpyreTensorLayout([4, 100, 1], torch.float16)
-        target = dense_relocation_serves_read(
-            stl, host, self._split_row_read(4, 100, 5)
-        )
-        # No candidate serves this read, so it goes to the sparse layout. The
-        # point of the case is that the choice does not depend on the size-1 dim.
-        self.assertIsNone(target)
 
 
 class TestStickExprOffsetFree(TestCase):
