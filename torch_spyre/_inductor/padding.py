@@ -694,14 +694,15 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
     which it never did.
 
-    A restickify with exactly one elided operand counts: that is the case the
-    codegen assert covers (one operand's within-stick coordinate has no loop
-    symbol).  When both operands carry a loop symbol for the *same* dim, the
-    restore is a no-op and the slice write compiles correctly
-    (``torch.cat([a, b], -1).sum(-1)`` on ``(32, 8, 16, 1)``, or the copy-back
-    into a mutated graph input).  When they carry *different* dims, a dense stick
-    relocation put the stick elsewhere: the write is still a restickify into the
-    slice and still cannot be padded in place, so it counts too.
+    Every restickify ``is_restickify_coords`` recognizes counts.  It already
+    returns ``False`` when the two within-stick coordinates carry the same
+    symbols, so what reaches the raise is either one operand elided (exactly one
+    coordinate is symbol-free, the case the codegen assert covers) or the two on
+    different dims, which is what a dense stick relocation produces.  Neither can
+    have its old-stick dim padded in place.  Cases such as
+    ``torch.cat([a, b], -1).sum(-1)`` on ``(32, 8, 16, 1)`` and the copy-back into
+    a mutated graph input compile correctly and do not reach here, because
+    ``is_restickify_coords`` rejects them first.
 
     TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
     copy it into the slice (see the TODO in ``_pad_restickify_output``); then
@@ -725,22 +726,16 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
-    in_stick, out_stick = in_coords[-1], out_coords[-1]
-    elided = bool(in_stick.free_symbols) != bool(out_stick.free_symbols)
-    # A dense stick relocation keeps the stick on a dim the read leaves alone, so
-    # both operands carry a loop symbol but for different dims.  Without this the
-    # guard waves the write through and codegen emits wrong addresses.
-    relocated = bool(
-        in_stick.free_symbols
-        and out_stick.free_symbols
-        and in_stick.free_symbols != out_stick.free_symbols
+    # Unconditional: see the docstring.  is_restickify_coords has already ruled
+    # out the two coordinates carrying the same symbols, so this is either an
+    # elided operand or a dense relocation's two dims, and neither can be padded
+    # in place.  Narrowing it to the elided case let a relocated write through,
+    # and codegen emitted wrong addresses instead of raising.
+    raise Unsupported(
+        f"insert_restickify_padding: restickify written into a slice of "
+        f"another buffer on {op.get_name()} (for example torch.cat of "
+        f"tensors that need a restickify) cannot be padded in place"
     )
-    if elided or relocated:
-        raise Unsupported(
-            f"insert_restickify_padding: restickify written into a slice of "
-            f"another buffer on {op.get_name()} (for example torch.cat of "
-            f"tensors that need a restickify) cannot be padded in place"
-        )
 
 
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:

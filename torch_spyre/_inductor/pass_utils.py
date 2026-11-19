@@ -3335,7 +3335,14 @@ def dense_relocation_serves_read(
     sizes = [int(concretize_expr(v)) for v in in_host.size]
     strides = [int(concretize_expr(v)) for v in in_host.stride]
     by_stride = sorted(range(len(sizes)), key=lambda d: -strides[d])
-    current_stick = by_stride[-1]
+    # Skip size-1 dims: their stride ties with the real stick dim's, and a stable
+    # sort can then leave one of them last, which would hand
+    # _former_stick_dim_outermost the wrong dim's size and stride and leave the
+    # padding inside another dim.  restickify_dense_stl_to_sparse skips them for
+    # the same reason.
+    current_stick = next(
+        (d for d in reversed(by_stride) if sizes[d] > 1), by_stride[-1]
+    )
     candidates = [d for d in range(len(sizes)) if d != current_stick and sizes[d] > 1]
     for stick in sorted(candidates, key=lambda d: -sizes[d]):
         order = [d for d in by_stride if d != stick] + [stick]
@@ -3454,9 +3461,12 @@ def compute_restickify_needed(
         # stick) may be served by the input's host shape in a sparse layout.
         # TODO(#5872): this returns the relocated or the sparse target for any
         # output, without checking that it is stick_compatible with the output.
-        # That is safe only because _default_pointwise_layout and
-        # _reduction_layout relocate the input the same way and return a sparse
-        # output early. Return the target only for an output it can feed.
+        # For the sparse target that is safe because _default_pointwise_layout and
+        # _reduction_layout return the sparse output early.  The relocated target
+        # has no such guard: both rules carry on to _candidate_output_stls, which
+        # can offer an output whose stick is not the relocated one, and this would
+        # pair it with the relocated input anyway.  Return the target only for an
+        # output it can feed.
         # Before the sparse layout, which costs elems_per_stick times the memory,
         # try a dense layout with the stick on a dim the read leaves alone.
         dense = dense_relocation_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
