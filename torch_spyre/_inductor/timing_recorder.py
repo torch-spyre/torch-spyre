@@ -24,7 +24,7 @@ Off unless ``config.timing``. Enable it with ``TORCH_SPYRE_TIMING=1`` and point
 ``TORCH_SPYRE_TIMING_OUT`` at a path to get a record::
 
     {"meta": {...},
-     "events": [{"name": "pass:CustomPreSchedulingPasses:span_reduction",
+     "events": [{"name": "pass:CustomPreSchedulingPasses:plan_sharded_hbm",
                  "ordinal": 4, "parent_ordinal": 1,
                  "t_start_ns": ..., "t_end_ns": ...,
                  "inclusive_ns": ..., "self_ns": ...,
@@ -268,10 +268,10 @@ class TimingRecorder:
         # then record parent_ordinal None and no longer nest under the compile that
         # produced them. Identity, not equality: _Event is a dataclass, so == would
         # match a different event whose fields happen to agree.
-        if any(open_event is event for open_event in stack):
-            while stack:
-                if stack.pop() is event:
-                    break
+        for index in reversed(range(len(stack))):
+            if stack[index] is event:
+                del stack[index:]
+                break
 
     def _stack(self) -> list[_Event]:
         stack = getattr(self._stack_local, "stack", None)
@@ -380,6 +380,8 @@ def _run_metadata() -> dict[str, Any]:
         # stage:compile_fx:spyre_compile event's meta, not here.
         "frontend_only": config.frontend_only,
         "torch_version": torch.__version__,
+        # "Unknown" for a torch built without git metadata, e.g. from an sdist.
+        "torch_git_version": torch.version.git_version,
         "python_version": sys.version.split()[0],
     }
 

@@ -34,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -566,14 +567,6 @@ PYBIND11_MODULE(_C, m) {
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
-      .def(
-          py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
-                   spyre::ElementArrangement,
-                   std::map<std::vector<int64_t>, int64_t>>(),
-          py::arg("device_size"), py::arg("stride_map"),
-          py::arg("device_dtype"),
-          py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
-          py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{})
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
                     std::map<std::vector<int64_t>, int64_t>,
                     spyre::ElementArrangement>(),
@@ -604,7 +597,7 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[3].cast<std::vector<int64_t>>(),
-                                              t[4].cast<DataFormats>());
+                                              t[4].cast<DataFormats>(), {});
             } else if (version == 2) {
               // Version 2: (version, device_size, stride_map, device_dtype)
               if (t.size() != 4) {
@@ -613,7 +606,7 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[2].cast<std::vector<int64_t>>(),
-                                              t[3].cast<DataFormats>());
+                                              t[3].cast<DataFormats>(), {});
             } else if (version == 3) {
               // Version 3: (version, device_size, stride_map, device_dtype,
               // element_arrangement) — stride_map may contain legacy -1
@@ -625,7 +618,7 @@ PYBIND11_MODULE(_C, m) {
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
-                  t[4].cast<spyre::ElementArrangement>());
+                  {}, t[4].cast<spyre::ElementArrangement>());
             } else if (version == 4 || version == 5) {
               // Version 4: (version, device_size, stride_map, device_dtype,
               // element_arrangement, valid_elements); stride_map may contain
@@ -647,10 +640,32 @@ PYBIND11_MODULE(_C, m) {
                   std::to_string(version));
             }
           }));
-
-  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
-        py::arg("size"), py::arg("stride"), py::arg("dtype"),
-        py::arg("device_layout"), py::arg("device") = py::none());
+  m.def(
+      "spyre_empty_with_layout",
+      [](c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+         spyre::SpyreTensorLayout device_layout,
+         std::optional<c10::Device> device,
+         std::optional<std::map<int64_t, std::tuple<int64_t, int64_t, int64_t>>>
+             reserved_dims) {
+        // Python passes {dim: (min, max, granularity)}; convert it to
+        // ReservedDimInfo. get_reserved_dims does the reverse conversion.
+        std::optional<std::map<int64_t, spyre::ReservedDimInfo>> typed;
+        if (reserved_dims.has_value()) {
+          typed.emplace();
+          for (const auto& [dim, t] : *reserved_dims) {
+            (*typed)[dim] = spyre::ReservedDimInfo{
+                std::get<0>(t), std::get<1>(t), std::get<2>(t)};
+          }
+        }
+        return spyre::spyre_empty_with_layout(size, stride, dtype,
+                                              device_layout, device, typed);
+      },
+      py::arg("size"), py::arg("stride"), py::arg("dtype"),
+      py::arg("device_layout"), py::arg("device") = py::none(),
+      py::arg("reserved_dims") = py::none(),
+      "Allocate a Spyre tensor with an explicit device layout. If "
+      "`reserved_dims` ({dim: (min, max, granularity)}) is given it is "
+      "stamped on the tensor so get_reserved_dims() returns it.");
   m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
         py::arg("stride"), py::arg("dtype"), py::arg("dim"),
         py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
@@ -1209,7 +1224,7 @@ PYBIND11_MODULE(_C, m) {
         TORCH_CHECK(allocator != nullptr,
                     "num_memory_domains requires the Flex runtime to be "
                     "initialized");
-        return allocator->topology().num_domains();
+        return allocator->topology().numDomains();
       },
       "Number of memory domains in the Flex device topology.");
 
