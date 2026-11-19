@@ -1203,7 +1203,8 @@ def _reduction_syms(
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
         return frozenset()
-    return frozenset(s for s in splits if write.index.coeff(s) == 0)
+    index_syms = write.index.free_symbols
+    return frozenset(set(splits) - index_syms)
 
 
 def _core_division(
@@ -1244,7 +1245,9 @@ def _view_for_div(
     tiling; how the tiling owns the buffer is :func:`_tile_view_for_div`.
     """
     splits = division.splits
-    syms = _reduction_syms(op, splits)
+    # ``division`` is one of ``op``'s own candidates, built by _core_division
+    # or OpSplitSpace.division, so its reduction axes are already known.
+    syms = division.reduction_syms
     return _per_core_view_from_prep(
         _prep_for(op, dep, buf_name, prep_cache),
         splits,
@@ -1639,8 +1642,8 @@ class ResidencyEdge:
         view across the cross product; this is the single-pair form, for a
         caller holding one untiled candidate per side rather than a list.
         """
-        parent = CoreDivision(splits=parent_splits)
-        consumer = CoreDivision(splits=consumer_splits)
+        parent = _core_division(self.parent_op, parent_splits)
+        consumer = _core_division(self.consumer_op, consumer_splits)
         if self._cores_used(parent) != self._cores_used(consumer):
             return False
         parent_view = self.parent_view(parent)
