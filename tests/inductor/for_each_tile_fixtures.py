@@ -1251,7 +1251,7 @@ def paged_gather_fn(
     read -- one int32 element whose address moves with the spliced loop var and
     which carries no iteration dim of its own -- so it is the shape coarse
     tiling handles through squeezed_advance_per_read rather than a tiled dim
-    (see coarse_tile._point_splice_advance_for_dep). Pre-gathering the pages
+    (the advance is read off the index). Pre-gathering the pages
     ahead of the loop would compile without any of that, at the cost of keeping
     the whole sequence's K/V live across it.
     """

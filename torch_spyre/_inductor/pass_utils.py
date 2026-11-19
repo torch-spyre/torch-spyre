@@ -178,14 +178,14 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-        #    (_insert_reduction_copy_op), which mutates directly into a
+        #    (_lower_reduction), which mutates directly into a
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
         #    producer's output would be read; or
         #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
         #    whose target is a locally-created graph-output buffer (e.g.
-        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_out's
         #    inserted coarse_tile_copy_* op reads the mutation op's own output
         #    the same way. The mutation target there is an ordinary
         #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
@@ -1158,7 +1158,7 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
 
     Returns the first candidate (the base buffer, with no view applied), or
     None if no candidate exists -- e.g. a coarse_tile copy buffer (see
-    coarse_tile.py's _insert_copy_op), which is synthesized purely at
+    loop_tiling_lowering.py's _insert_copy_out), which is synthesized purely at
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
@@ -3985,7 +3985,7 @@ def lower_pad_sequence(
     later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
-    coarse_tile copy buffer (see coarse_tile.py's _insert_copy_op), which is
+    coarse_tile copy buffer (see loop_tiling_lowering.py's _insert_copy_out), which is
     synthesized purely at the IR level after FX lowering completed.  In that
     case ``arg_buf`` (the buffer itself) must be given instead, and the pad is
     lowered by calling the constant_pad_nd lowering function directly against a

@@ -440,27 +440,6 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     return ConstraintResult(blocked=set(window_dims))
 
 
-# Generated scratch-copy ops (coarse_tile.py's _insert_reduce_copy_op) inherit their tiled dims from the sizing op they
-# copy for, but their own write is per-tile scratch reused in place and
-# never advances (see PropagationPlan(kind="loop_internal")) -- no sibling op
-# in the fused loop body depends on which cores a copy op's OWN internal
-# work is split across the way it depends on a self-planning op's shared
-# coarse-tile-local loop variable. A copy op's read, by contrast, is often
-# into the full, un-tiled source tensor, so splitting its tile-local dims
-# across cores is exactly what lets the normal per-core span-limit search
-# (raise_if_per_core_overflow) shrink that read's footprint -- pinning them
-# to 1 forecloses that and can make an otherwise-legal plan look
-# Unsupported (confirmed: test_copy_running_max_4d_H4_Lq4 fails with
-# "per-core tensor span ... exceeds hardware limit" once its read-copy op's
-# H/Lq dims are pinned, and passes once they aren't).
-#
-# These prefixes are matched cross-module against names coarse_tile.py
-# constructs via V.graph.qualify_name: "coarse_tile_reduce_copy_..." in
-# _insert_reduce_copy_op and its _insert_combine_op/reduction-drain
-# call sites. If the naming site changes, update this tuple to match.
-_GENERATED_COPY_OP_PREFIXES = ("coarse_tile_reduce_copy_",)
-
-
 # Set on an operation whose coarse tiling and core division were chosen by one
 # solver, together. It exempts the op from
 # :func:`coarse_tile_local_dim_split_domains`, whose pin guards against
@@ -526,19 +505,12 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    Skips generated scratch-copy ops entirely (see
-    ``_GENERATED_COPY_OP_PREFIXES``): a copy op's own tile-local dims are not
-    shared, cross-op, ownership the way a self-planning op's loop variable
-    is, and pinning them can defeat the per-core span-limit search on a copy
-    whose read spans the full, un-tiled source tensor.
-
     ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
     ``loop_tiled_dims`` is the primary source (not
     ``tiled_dims_per_read``/``output_tiled_dims``): those are deliberately
-    zeroed for per-tile scratch that "must not advance" (the
-    ``_fixed_level_extents`` convention), which is correct for building
+    zeroed for per-tile scratch that "must not advance", which is correct for building
     ``device_tile_advance_expr`` but leaves them carrying no "is this op's
     own dim tiled" signal at all for such an op, exposing its dims to the
     greedy search's independent, unpinned choice.
@@ -546,13 +518,13 @@ def coarse_tile_local_dim_split_domains(
     self-planning path and generated-copy construction derive it from the
     op's own ranges), but it can be *inherited* un-remapped by nodes inserted
     after coarse tiling planned the loop group (``insert_restickify``,
-    ``_insert_combine_op``), so ``pin()`` skips positions outside
+    ``_make_combine_buffer``), so ``pin()`` skips positions outside
     ``ctx.op``'s own space rather than trusting them.
 
     Each raw position is translated to an ``ctx.it_space`` symbol via
     ``ctx.op``'s own raw->squeezed table (mirroring
     ``_raw_to_squeezed_pos``'s convention -- squeezed index ``i`` names
-    symbol ``d{i}``), the same bridge ``_tiled_dims_for_dep`` itself uses,
+    symbol ``d{i}``),
     rather than an independent survivor-count walk that silently assumes
     the raw numbering already matches ``ctx.op.data.ranges`` (that
     assumption is what this function's docstring above documents as
@@ -578,7 +550,7 @@ def coarse_tile_local_dim_split_domains(
 
     ``loop_tiled_reduction_dims`` can be non-empty on an op whose own
     ``data`` is a ``Pointwise`` with no ``reduction_ranges`` at all: a
-    reduction combine op (``_insert_combine_op``, coarse_tile.py)
+    reduction combine op (``_make_combine_buffer``, coarse_tile.py)
     deliberately inherits ``loop_tiled_reduction_dims`` verbatim from the
     ``Reduction`` op it combines into, purely so the scheduler places it in
     the same ``CountedLoopSchedulerNode`` -- the reduction dim has already
@@ -594,9 +566,6 @@ def coarse_tile_local_dim_split_domains(
 
     if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
         return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
-
-    if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
-        return ConstraintResult()
 
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
     hinted_syms = _hinted_work_div_syms(ctx)

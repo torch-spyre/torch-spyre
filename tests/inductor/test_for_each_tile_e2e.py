@@ -680,8 +680,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
+        the advance read off the index, leave the read direct (never staged
+        into scratch),
         keep the loop term in the index (per_trip_index pins it in the base
         coordinates, so the advance is not applied twice), and
         insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
@@ -946,6 +946,23 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             reshape_sum_tiled_fn, backend="inductor", fullgraph=True
         )
         out = compiled(X_spyre, 64, 8, 1)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
