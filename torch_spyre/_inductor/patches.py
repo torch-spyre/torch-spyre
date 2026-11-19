@@ -30,9 +30,34 @@ from torch._inductor.virtualized import V
 
 from . import pass_counters
 from .constants import DEVICE_NAME
+from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("patches")
+
+_DYNAMIC_TRUE_MESSAGE = (
+    "torch.compile(dynamic=True). To enable dynamism, declare the varying "
+    "dimension on the tensor and compile with the default dynamic=None:\n"
+    '    x = x.to("spyre", dynamic={0: dict(min=32, max=576, granularity=32)})\n'
+    "    compiled = torch.compile(model, dynamic=None)"
+)
+
+
+def _refuse_dynamic_true() -> None:
+    """Refuse a Spyre compile requested with ``torch.compile(dynamic=True)``.
+
+    ``dynamic=True`` makes every dimension of every input symbolic, with no
+    declared range. Spyre resolves such a symbol to the size of the call being
+    compiled, so the result is a fixed-size binary and a recompile for every new
+    shape: it never provides dynamism, only the appearance of it.
+
+    ``torch.compile(dynamic=True)`` is the only thing that clears
+    ``assume_static_by_default`` for the compile. The default ``dynamic=None``
+    keeps it set, and a dimension marked per tensor (``mark_dynamic``, or
+    ``.to("spyre", dynamic=...)``) never touches it, so neither is refused.
+    """
+    if not torch._dynamo.config.assume_static_by_default:
+        raise Unsupported(_DYNAMIC_TRUE_MESSAGE)
 
 
 @contextmanager
@@ -309,6 +334,7 @@ def enable_spyre_context(
             set real inputs in the virtualized context for shape inference and
             optimization decisions.
     """
+    _refuse_dynamic_true()
 
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
@@ -390,14 +416,14 @@ def enable_spyre_context(
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
     # coarse_tile.py's nested output-dim + reduction-dim tiling
-    # (_propagate_tiled_reduction_op) inserts a copy-out op
-    # (_insert_reduction_copy_op) that mutates a pre-loop accumulation buffer
+    # (lower_loop_tiling) inserts a copy-out op
+    # (_lower_reduction) that mutates a pre-loop accumulation buffer
     # (accum_full) so its updated value is visible to the NEXT outer-tile
     # iteration's copy-in. That cross-iteration read has no representation in
     # the single-pass, pre-unroll IR the scheduler's own dead_node_elimination
     # walks, so a copy-out with no other downstream reader looks dead and is
     # removed — even though it is required for correctness. Mark such ops
-    # with _coarse_tile_force_live (see _insert_reduction_copy_op) and force
+    # with _coarse_tile_force_live (see _lower_reduction) and force
     # SchedulerNode.has_side_effects() to report True for them, mirroring how
     # upstream itself protects effectful FallbackKernels from the same DCE
     # pass (torch/_inductor/lowering.py, effectful op handling).

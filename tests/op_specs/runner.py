@@ -181,12 +181,17 @@ def main(
     bundle_symbolic_args=None,
     ktir_emitter=False,
     argv=None,
+    observed=None,
 ):
     """Tiny CLI shared by this module and every captured script.
 
     ``--stage bundle`` and ``--stage ktir`` stop after writing one emitter's
     artifacts, which needs no hardware; ``--stage run`` (the default) goes all
     the way to a launch, through whichever emitter the capture used.
+
+    ``observed`` is what each arg held after the captured launch; a launch here
+    is compared against it, which tells a kernel that misbehaves on its own
+    from one that only misbehaves inside its program.
     """
     pin_bundle_symbolic_args(bundle_symbolic_args)
     parser = argparse.ArgumentParser(description=f"Run OpSpec kernel {name!r}.")
@@ -258,7 +263,11 @@ def main(
     )
     # Only after a launch: before one these are still the inputs.
     for i, t in enumerate(tensors):
-        print(f"arg{i} {tuple(t.shape)} {t.dtype}: {t.flatten()[:6].tolist()}")
+        line = f"arg{i} {tuple(t.shape)} {t.dtype}: {t.flatten()[:6].tolist()}"
+        if observed is not None and observed[i] is not None:
+            diff = (t.float() - observed[i].float()).abs().max().item()
+            line += f"  max|got - observed| = {diff:.6g}"
+        print(line)
     return code_dir
 
 

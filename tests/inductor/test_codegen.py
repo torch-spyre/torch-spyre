@@ -172,14 +172,19 @@ class TestSpyreConfig(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with patch(
-                "torch_spyre._inductor.pass_utils.V",
-                self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+            with (
+                patch(
+                    "torch_spyre._inductor.pass_utils.V",
+                    self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+                ),
+                # Pinned at the old default: the test checks the divisor pick,
+                # not the current max_buckets default.
+                config.patch(max_buckets=32),
             ):
                 result = _collect_symbol_metadata({s0: s0})
         # max comes straight from the ShapeEnv upper bound;
         # granularity is the smallest divisor of 512 with d >= 4 and
-        # 512/d <= 32, which is 16.
+        # 512/d <= 32 (the pinned cap), which is 16.
         self.assertEqual(result, {s0: (512, 16)})
 
     def test_collect_symbol_metadata_auto_dynamic_skipped(self):

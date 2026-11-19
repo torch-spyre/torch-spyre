@@ -915,7 +915,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         A cut is a tiled op whose value has to be published into a full-sized
         buffer because some consumer sits outside its loop nest -- the
-        ``kind="copy_out"`` classification ``_plan_tiling_propagation`` makes
+        ``kind="copy_out"`` classification the lowering makes
         later, expressed over the solver's own division variables so it can be
         ranked *while* the tiling is being chosen rather than discovered after.
 

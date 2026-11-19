@@ -1094,6 +1094,25 @@ _PATTERN_TOL = {
 }
 
 
+def _stick_splitting_read_param_sets():
+    """``{case: (view, x)}`` for reads that split a stick."""
+    reads = {
+        "flat_8x65": ((8, 65), lambda a: a.reshape(-1)),
+        "flat_2x3x65": ((2, 3, 65), lambda a: a.reshape(-1)),
+        "flat_4x100": ((4, 100), lambda a: a.reshape(-1)),
+        "split_1x4x800_to_1x4x5x160": ((1, 4, 800), lambda a: a.reshape(1, 4, 5, 160)),
+        "merge_1x4x5x160_to_1x4x800": ((1, 4, 5, 160), lambda a: a.reshape(1, 4, 800)),
+        "reshape_1x2x4x8x7_to_1x8x56": (
+            (1, 2, 4, 8, 7),
+            lambda a: a.reshape(1, 8, 56),
+        ),
+    }
+    return {
+        name: (view, cached_randn(shape, differentiation="ssr"))
+        for name, (shape, view) in reads.items()
+    }
+
+
 def _pattern_param_sets():
     out = {}
 
@@ -2235,6 +2254,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w128": (128,),
                 "w160": (160,),
                 "w192": (192,),
+            },
+        },
+        ("test_topk_wide_dim", "test_topk_wide_dim_int64_indices"): {
+            "param_sets": {
+                "n2048_k16": (2048, 16),
+                "n8192_k64": (8192, 64),
+                "n128256_k4": (128256, 4),
             },
         },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
@@ -3616,7 +3642,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # back permuted with no error (#4393).
             "expect_fail": {
                 "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
-                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
@@ -4803,6 +4828,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
                 ),
+            },
+        },
+        # A cat piece that needs a restickify is written straight into a slice of
+        # the cat buffer; the padding pass cannot pad such a write in place.
+        # TODO: restickify into a fresh buffer and copy it into the slice (the
+        # TODO in padding._pad_restickify_output); then this becomes a positive
+        # case.
+        (
+            "test_cat_of_reshapes",
+            "test_cat_of_reshapes_cpu",
+        ): {
+            "param_sets": {
+                "split_32x25600_to_32x160x160_dim1": (
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                    cached_randn((1, 32, 25600), dtype=torch.float16),
+                ),
+            },
+            "expect_raise": {
+                "split_32x25600_to_32x160x160_dim1": "restickify written into a slice",
             },
         },
         (
@@ -6912,6 +6956,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     False,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+            },
+        },
+        # Reductions over an expand()-broadcast operand, across dim alignment,
+        # op, and operand-order variations.
+        ("test_expand_broadcast_reduction", "test_expand_broadcast_reduction_base"): {
+            "param_sets": {
+                "fp16_70_to_2x32x70": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_1x2x1x4x1x256_to_8x2x4x4x16x256": (
+                    (8, 2, 4, 4, 16, 256),
+                    cached_randn((1, 2, 1, 4, 1, 256), dtype=torch.float16)
+                    .round()
+                    .clamp(-3, 3),
+                ),
+                "fp16_70_to_2x32x70_amax": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amax,
+                ),
+                "fp16_70_to_2x32x70_amin": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amin,
+                ),
+                "fp16_70_to_2x32x70_transposed": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    -1,
+                    (0, 1),
+                ),
+                "fp16_3x5x1_to_3x5x100_unaligned_expand_dim": (
+                    (3, 5, 100),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    1,
+                ),
+            },
+        },
+        # x.sum(1) + y.expand_as(x).sum(1) fuses into one op with two reduction
+        # operands sharing output dims: a plain operand (x) and a broadcast
+        # operand (y, expanded along dim -1). Checks that the merged dim order
+        # accounts for both, including an unaligned (non-stick-multiple) last
+        # dim.
+        (
+            "test_expand_broadcast_reduction_fused",
+            "test_expand_broadcast_reduction_fused_base",
+        ): {
+            "param_sets": {
+                "fp16_3x5x128": (
+                    cached_randn((3, 5, 128), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_3x5x100_unaligned": (
+                    cached_randn((3, 5, 100), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
                 ),
             },
         },
@@ -9478,6 +9581,101 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A stride inside the stick (the even/odd split of GPT-J style RoPE) is
+        # gathered. The views are those of q/k off a projection: [T, H*D] viewed
+        # [T, H, D], and the rope part of a [T, H, 192] head split [128 | 64].
+        ("test_strided_stick_slice", "test_strided_stick_slice_cpu"): {
+            "param_sets": {
+                "step2": (
+                    lambda t: t[..., ::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step2_offset": (
+                    lambda t: t[..., 1::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step3_bounded": (
+                    lambda t: t[..., 2:40:3],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step4_offset_2_sticks": (
+                    lambda t: t[..., 3::4],
+                    cached_randn((32, 4, 128), differentiation="sss_w"),
+                ),
+                "step2_2d": (
+                    lambda t: t[:, ::2],
+                    cached_randn((4, 128), differentiation="sss_2d"),
+                ),
+                "step2_of_head_view": (
+                    lambda t: t.view(32, 8, 64)[..., ::2],
+                    cached_randn((32, 512), differentiation="sss_v"),
+                ),
+                "step2_offset_of_head_split": (
+                    lambda t: t.view(32, 8, 192).split([128, 64], -1)[1][..., 1::2],
+                    cached_randn((32, 1536), differentiation="sss_s"),
+                ),
+            },
+        },
+        # GPT-J style RoPE on a single key head ([T, 1, D], as MLA's shared key),
+        # with cos and sin gathered per position. A size-1 dim must not become the
+        # stick of the transposed copy: the restickify of the gathered cos and sin
+        # then grows with T and overflows a dbo-opt immediate at T=1024.
+        ("test_interleaved_rope_single_head", "test_interleaved_rope_cpu"): {
+            "param_sets": {
+                "t1024": (
+                    cached_randn((1024, 1, 64), differentiation="irs_x"),
+                    cached_randn((4096, 32), differentiation="irs_cos"),
+                    cached_randn((4096, 32), differentiation="irs_sin"),
+                ),
+            },
+        },
+        # A stick-dim gather written at an offset inside a wider stick: the
+        # restickify of the gather output must target the consumer's stick, or
+        # it writes at stick position 0 and over the neighbouring lanes.
+        ("test_stick_gather_at_offset", "test_stick_gather_at_offset_cpu"): {
+            "param_sets": {
+                "cat_after": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                # The odd gather is the one written at the offset.
+                "cat_even_odd": (
+                    lambda x, i: torch.cat(
+                        (
+                            torch.index_select(x, -1, i),
+                            torch.index_select(x, -1, i + 1),
+                        ),
+                        -1,
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "cat_after_2d": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((8, 64), differentiation="sgo_x2"),
+                    cached_randn((8, 32), differentiation="sgo_a2"),
+                ),
+                "pad_left": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (32, 0)
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                # The fill value must survive next to the gathered lanes.
+                "pad_right_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (0, 32), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "pad_both_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (16, 16), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+            },
+        },
         # rotate_half on q/k built by view + transpose of the projection output:
         # the HF attention pattern issue #4050 was reported against.
         ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
@@ -9486,6 +9684,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((1, 8, 512), differentiation="rope_h"),
                     cached_randn((1, 8, 128), differentiation="rope_cos"),
                     cached_randn((1, 8, 128), differentiation="rope_sin"),
+                ),
+            },
+        },
+        # Reads whose row or slice boundary falls inside a stick (64 fp16
+        # elements): issues #5197, #5198, #5227, #5872. A row of 160 elements is
+        # 2.5 sticks, as in the (1, 64, 25600) <-> (1, 64, 160, 160) reshape of
+        # #5227; a smaller tensor with the same row length exercises the same
+        # split and merge.
+        (
+            "test_stick_splitting_read_pointwise",
+            "test_stick_splitting_read_pointwise_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        (
+            "test_stick_splitting_read_reduction",
+            "test_stick_splitting_read_reduction_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        # #2851: a dtype conversion that reads a strided slice (stick coordinate
+        # 2*Mod(d1, 32)).
+        (
+            "test_stick_splitting_read_strided_to_dtype",
+            "test_stick_splitting_read_strided_to_dtype_cpu",
+        ): {
+            "param_sets": {
+                "step2_8x128_float_half": (
+                    cached_randn((8, 128), differentiation="ssr_2851"),
                 ),
             },
         },
@@ -11385,6 +11608,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
         )
 
+    def test_topk_wide_dim_int64_indices(self, n: int, k: int):
+        # float32 indices are exact to 2**24, so a float32 topk gives exact int64
+        # indices at any width up to a full vocabulary (#5847). Each row holds
+        # k, k-1, ..., 1 at random positions on a zero background.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack([torch.randperm(n, generator=g)[:k] for _ in range(4)])
+        want = torch.arange(k, 0, -1).float().expand(4, k).contiguous()
+        x.scatter_(1, positions, want)
+
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=-1)
+            return values, indices.to(torch.int64)
+
+        values, indices = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        assert indices.dtype == torch.int64
+        assert torch.equal(values.cpu(), want)
+        assert torch.equal(indices.cpu(), positions)
+
+    @expects_raise
+    def test_topk_fp16_wide_dim_rejected(self):
+        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
+        # dim must be rejected instead of returning wrong indices (#5847).
+        x = torch.randn(4, 2048).half()
+        with pytest.raises(Exception, match="the indices are held in float16"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -12160,6 +12410,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, *tensors)
 
+    def test_cat_of_reshapes_cpu(self, a, b):
+        """``cat(1)`` of two reshapes that cut the stick dim (issue #5227's
+        ``(1, N, 25600) -> (1, N, 160, 160)``)."""
+
+        def fn(a, b):
+            return torch.cat(
+                [a.reshape(1, 32, 160, 160), b.reshape(1, 32, 160, 160)], dim=1
+            )
+
+        self.compare_with_cpu(fn, a, b, run_eager=False)
+
     def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
         def fn(a, b):
             return torch.cat([a, b], dim=-1).sum(dim=-1)
@@ -12421,6 +12682,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_strided_stick_slice_cpu(self, slicer, x):
+        """Read a strided slice of the stick dim into real compute.
+
+        The slice is scaled by a tensor, not a constant: a lone slice, or one times a
+        constant, is folded into a view of the input and never reaches the device.
+        """
+        scale = torch.linspace(0.5, 1.5, slicer(x).shape[-1], dtype=x.dtype)
+
+        def fn(x, scale):
+            return slicer(x) * scale
+
+        self.compare_with_cpu(fn, x, scale, run_eager=False)
+
+    def test_interleaved_rope_cpu(self, x, cos_cache, sin_cache):
+        """Interleaved RoPE as vLLM's ``ApplyRotaryEmb.forward_static`` reads it."""
+        positions = torch.arange(x.shape[0]) * 7 % cos_cache.shape[0]
+
+        def fn(x, cos_cache, sin_cache, positions):
+            cos = cos_cache.index_select(0, positions).unsqueeze(1)
+            sin = sin_cache.index_select(0, positions).unsqueeze(1)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+
+        self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
+
+    def test_stick_gather_at_offset_cpu(self, build, x, *partners):
+        """Write a gather of ``x``'s stick dim at an offset inside a wider stick.
+
+        ``index`` holds the even positions; ``partners`` are the tensors ``build``
+        writes beside the gather, if any.
+        """
+        index = torch.arange(0, x.shape[-1], 2)
+        self.compare_with_cpu(build, x, *partners, index, run_eager=False)
+
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""
         B, L, H, D = 1, 8, 4, 128
@@ -12439,6 +12734,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q.contiguous(), k.contiguous()
 
         self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
+
+    def test_stick_splitting_read_pointwise_cpu(self, view, x):
+        """A read whose row or slice boundary falls inside a stick (issues #5197,
+        #5198, #5227, #5872), compiled and eager.
+
+        ``(view * 2).exp()``, not ``view * 1.0``: the latter already passed on main.
+        """
+        self.compare_with_cpu(lambda a: (view(a) * 2).exp(), x, atol=0.5, rtol=0.1)
+
+    def test_stick_splitting_read_reduction_cpu(self, view, x):
+        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, rtol=0.1)
+
+    def test_stick_splitting_read_strided_to_dtype_cpu(self, x):
+        """``t[:, ::2].float().half()`` (issue #2851), compiled only.
+
+        The eager result of ``.float()`` is not comparable with the CPU even for
+        a dense tensor (see the D2H element-arrangement TODO in ``eager.py``).
+        """
+        self.compare_with_cpu(lambda a: a[:, ::2].float().half(), x, run_eager=False)
 
     # --- Migrated from test_ops.py ---
 
@@ -13035,6 +13349,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_expand_broadcast_reduction_base(
+        self, expand_shape, x, op=torch.sum, dim=-1, transpose=None
+    ):
+        # Whole-number inputs let a zero-tolerance assert_close catch a dropped/
+        # double-counted term that a loose tolerance (or shape-broadcasting allclose)
+        # would hide.
+        def fn(t):
+            t = t.expand(expand_shape)
+            if transpose is not None:
+                t = t.transpose(*transpose)
+            return op(t, dim=dim)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    def test_expand_broadcast_reduction_fused_base(self, x, y):
+        self.compare_with_cpu(
+            lambda x, y: x.sum(1) + y.expand_as(x).sum(1), x, y, atol=0, rtol=0
+        )
 
     def test_mean_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
