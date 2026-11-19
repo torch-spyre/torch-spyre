@@ -44,6 +44,18 @@ from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolve
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
 
+# An opaque FallbackKernel, which LX context switching brackets. The body
+# round-trips through the host so it compiles no Spyre graph of its own.
+_OPAQUE_LIB = torch.library.Library("test_solver_relayout_e2e", "FRAGMENT")
+if not hasattr(getattr(torch.ops, "test_solver_relayout_e2e", None), "opaque_clone"):
+    _OPAQUE_LIB.define("opaque_clone(Tensor x) -> Tensor")
+    _OPAQUE_LIB.impl(
+        "opaque_clone",
+        lambda x: x.cpu().to(x.device),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _OPAQUE_LIB._register_fake("opaque_clone", lambda x: torch.empty_like(x))
+
 
 def _no_matches(self, edges, *args, **kwargs):
     return {parent: [] for parent in edges}
@@ -1816,6 +1828,56 @@ def test_gate_up_halves_read_the_matmul_output_in_place(monkeypatch):
     observed.assert_emitted_in_lx(expected_plans=0)
     # Per core: 16 rows of 9 sticks precede the up half.
     assert sorted(offsets) == [0, (half // 64) * (rows // 32) * 64 * 2]
+
+
+def test_relayout_destination_restored_across_an_opaque_kernel(monkeypatch):
+    """TP gemma-4 decode: the residual's relayout copy is read before and after
+    the opaque moe_forward, so LX context switching restores it from an HBM
+    dump. That restore writes the destination but is not the certified copy."""
+    import torch_spyre._inductor.scratchpad.lx_context_switching as ctx_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+    bracketed = []
+    dump = ctx_mod._dump_buffers
+
+    def spy_dump(graph, editor, target_op, target_fx_node, at_risk_bufs):
+        bracketed.extend(buf.get_name() for buf in at_risk_bufs)
+        return dump(graph, editor, target_op, target_fx_node, at_risk_bufs)
+
+    monkeypatch.setattr(ctx_mod, "_dump_buffers", spy_dump)
+    rows, inner, width = 512, 128, 6400
+
+    def fn(x, weight, y):
+        with spyre_hint(work_div={"R": 8, "F": 4}):
+            fused = torch.nn.functional.linear(x, weight)
+        with spyre_hint(work_div={"R": 32}):
+            before = -fused
+        opaque = torch.ops.test_solver_relayout_e2e.opaque_clone(y)
+        with spyre_hint(work_div={"R": 32}):
+            return fused * 0.5 + before, opaque
+
+    host = ((torch.arange(rows * inner).reshape(rows, inner) % 33) - 16).to(
+        torch.float16
+    ) / 8
+    weight = torch.zeros(width, inner, dtype=torch.float16)
+    weight[torch.arange(width), torch.arange(width) % inner] = 1.0
+    for name, size in (("R", rows), ("K", inner), ("F", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["F", "K"])
+    y = torch.ones(64, 64, dtype=torch.float16)
+    fused = host.float() @ weight.float().T
+    with config.patch({**_COOPT, "sencores": 32}):
+        out, opaque = torch.compile(fn, dynamic=False, fullgraph=True)(
+            x, w, y.to("spyre")
+        )
+    torch.testing.assert_close(out.cpu().float(), fused * 0.5 - fused)
+    torch.testing.assert_close(opaque.cpu(), y)
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert observed.copies[plan.edge] in bracketed, bracketed
 
 
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):

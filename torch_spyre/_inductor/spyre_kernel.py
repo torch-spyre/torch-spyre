@@ -1379,7 +1379,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # The registry is keyed by the inserted destination buffer (``buf3``),
         # while scheduler nodes have operation names (``op3``). Certify the
         # identity from its write, which is the stable link between them.
+        # Other writers of the destination, such as an LX context-switch
+        # restore from its HBM dump, do not read the plan's source.
         written = V.graph.scheduler.mutation_real_name
+        read_names = {
+            written.get(dep.name, dep.name)
+            for dep in self.current_node.read_writes.reads
+            if isinstance(dep, MemoryDep)
+        }
         relayout_plans = [
             plan
             for dep in self.current_node.read_writes.writes
@@ -1390,6 +1397,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
             is not None
+            and plan.source_name in read_names
         ]
         if len(relayout_plans) > 1:
             raise RuntimeError("one operation writes multiple LX relayout destinations")
