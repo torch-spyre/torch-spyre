@@ -21,10 +21,16 @@ COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
 import itertools
+import random
 
 import numpy as np
 import pytest
 import sympy
+
+# ortools is not installed on s390x or ppc64le (pyproject.toml), and the table module
+# imports it at its top: skip the file there rather than fail to collect it.
+pytest.importorskip("ortools.sat.python.cp_model")
+
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
 
@@ -634,3 +640,174 @@ def test_the_naive_lowering_explodes_past_the_cap():
     plan, _ = case.lower(expr, cap=8192)
     index = plan.realization.index
     assert index.size == 4620
+
+
+# ------------------------------------------ synthetic examples of later optimizations
+
+
+def _with(objective, **inputs):
+    """A Case with the inputs named. An int n is a buffer's division, its split taking
+    the values 1 to n; a pair (lo, size) is an integer variable over lo to
+    lo + size - 1. Returns the Case and objective(s), s the symbols by name."""
+    case = Case()
+    for name, spec in inputs.items():
+        if isinstance(spec, tuple):
+            case.integer(name, *spec)
+        else:
+            case.add_input(name, **{name: [float(v) for v in range(1, spec + 1)]})
+    s = {name: case.symbol(name) for name in inputs}
+    return case, objective(s)
+
+
+def _refused(reason):
+    return pytest.mark.xfail(raises=TableLoweringError, strict=True, reason=reason)
+
+
+# One example per optimization of a later stage: an objective whose one table is past
+# its cap, which no stage before that one can lower and that stage's optimization can.
+# Each is refused today; the stage that lowers it drops its mark, so the marks show
+# what each stage adds. Stage 3's numpy steps change no lowering, so it has none, and
+# the fold's example comes with Stage 9, since whether it fits where Stage 8's switch
+# and rungs do not depends on the fold's own counts. The first example lowers today, so
+# the check below runs end to end on every stage.
+EXAMPLES = [
+    pytest.param(
+        lambda: _with(
+            lambda s: s["a"] ** 0.5 + 3 * s["b"] - 2 * s["x"],
+            a=8,
+            b=6,
+            x=(0, 2),
+        ),
+        CAP,
+        id="trivial",
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: s["a"] ** 0.5
+            + sympy.log(s["b"])
+            + s["c"] ** -0.25
+            + s["d"] ** 1.5,
+            a=10,
+            b=10,
+            c=10,
+            d=10,
+        ),
+        CAP,
+        id="linear_sum",
+        marks=_refused(
+            "Stage 4, linear sums: four terms on a buffer each, one table of 10^4"
+        ),
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: s["k"] * (s["a"] ** 0.5 + sympy.log(s["b"]) + s["c"] ** -0.25),
+            k=(1, 3),
+            a=16,
+            b=16,
+            c=16,
+        ),
+        CAP,
+        id="switch",
+        marks=_refused(
+            "Stage 5, the switch: a factor of 3 values times a sum, one table of 12288"
+        ),
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: s["x"] * sympy.log(s["a"] + 1 + s["x"] * s["a"] / 2),
+            x=(0, 2),
+            a=40,
+        ),
+        40,
+        id="gate",
+        marks=_refused(
+            "Stage 6, the gate: a 0/1 literal whose rest reads it, 80 entries under a "
+            "cap of 40 until the rest is read with the literal fixed"
+        ),
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: (sympy.floor(s["a"] / 16) * sympy.floor(s["b"] / 32)) ** 0.5,
+            a=128,
+            b=128,
+        ),
+        CAP,
+        id="ranks",
+        marks=_refused(
+            "Stage 7, ranks and pairs: a product under a power, one table of 16384, "
+            "45 entries as a pair of ranks"
+        ),
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: sympy.Max(s["a"], 1.5 * s["b"], 2 * s["c"] + 0.25),
+            a=24,
+            b=20,
+            c=18,
+        ),
+        CAP,
+        id="rung",
+        marks=_refused(
+            "Stage 8, a Min/Max by rung: a Max over three buffers of distinct values, "
+            "one table of 8640"
+        ),
+    ),
+    pytest.param(
+        lambda: _with(
+            lambda s: sympy.Min(
+                1000 - sum((20 + j) * s[f"x{j}"] for j in range(15)),
+                900 - sum((10 + j) * s[f"x{j}"] for j in range(14)),
+            ),
+            **{f"x{j}": (0, 2) for j in range(15)},
+        ),
+        CAP,
+        id="lin_min",
+        marks=_refused(
+            "Stage 10, a Min kept linear: a Min of two sums of 15 residency literals, "
+            "one table of 32768 and no operand that fits"
+        ),
+    ),
+]
+
+
+def _solve_at(
+    case: Case, objective, assignment: tuple[int, ...]
+) -> tuple[float, float]:
+    """The objective's minimum and maximum with every variable fixed."""
+    on = case.model.new_bool_var("assignment")
+    for var, value in zip(case.variables, assignment):
+        case.model.add(var == value).only_enforce_if(on)
+    case.model.clear_assumptions()
+    case.model.add_assumptions([on])
+    found = []
+    for sense in (case.model.minimize, case.model.maximize):
+        sense(objective)
+        solver = cp_model.CpSolver()
+        status = solver.solve(case.model)
+        assert status == cp_model.OPTIMAL, solver.status_name(status)
+        found.append(solver.objective_value)
+    return found[0], found[1]
+
+
+@pytest.mark.parametrize("example, cap", EXAMPLES)
+def test_a_later_optimization_lowers_its_example_exactly(example, cap):
+    """Each example is marked to fail with TableLoweringError until the stage whose
+    optimization lowers it. The marks are strict: an example that starts to lower fails
+    the run until its mark is dropped. An example that lowers is checked at three
+    assignments, each variable at its lowest value, at its highest and at a seeded
+    random one: minimizing and maximizing agree and equal COST_SCALE times sympy's
+    value, within half a unit per constraint the lowering adds, plus half."""
+    case, expr = example()
+    before = len(case.model.proto.constraints)
+    _, objective = case.lower(expr, cap)
+    bound = (len(case.model.proto.constraints) - before + 1) / 2
+    rng = random.Random(0)
+    domains = [case.values[v] for v in case.variables]
+    for assignment in (
+        tuple(d[0] for d in domains),
+        tuple(d[-1] for d in domains),
+        tuple(rng.choice(d) for d in domains),
+    ):
+        low, high = _solve_at(case, objective, assignment)
+        assert low == high
+        assert abs(low - COST_SCALE * case.sympy_value(expr, assignment)) <= bound
