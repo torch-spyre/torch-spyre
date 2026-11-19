@@ -68,6 +68,7 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
+    _reduction_syms,
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -3606,7 +3607,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
-        division = CoreDivision(splits=buffer.sym_core_divs)
+        division = CoreDivision(
+            splits=buffer.sym_core_divs,
+            reduction_syms=_reduction_syms(op, buffer.sym_core_divs),
+        )
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
         if config.auto_coarse_tiling:
@@ -5116,9 +5120,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
-                            }
+                            },
+                            # A clone op cannot have a reduction split.
+                            reduction_syms=frozenset(),
                         )
-                    )  # a clone op cannot have a reduction split
+                    )
                     clone_views.append(view)
                 # No core-count check here: ``same_partition`` already demands
                 # equal core counts, and the guard above ties each view's count
