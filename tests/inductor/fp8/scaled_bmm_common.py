@@ -614,20 +614,6 @@ _KNOWN_FAILURES = [
         "_cost_model_matmul_planner (no QFP8WT input)",
     ),
     _KnownFailure(
-        "test_scales",
-        r"(?!.*-None-None-).*-torch\.float32-cores\d+",
-        AssertionError,
-        _OUTSIDE_BOUND,
-        "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values",
-    ),
-    _KnownFailure(
-        "test_scale_dtypes",
-        r".*torch\.float32.*",
-        AssertionError,
-        "default out_dtype gave torch.float32",
-        "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values",
-    ),
-    _KnownFailure(
         "test_boundary",
         r".*-tiny-.*",
         AssertionError,
@@ -641,14 +627,6 @@ _KNOWN_FAILURES = [
         AssertionError,
         "subnormal values flushed to zero by quantize_fp8_with_scale",
         "#6084: [fp8] quantize_fp8_with_scale corrupts E4M3 subnormal values",
-    ),
-    _KnownFailure(
-        "test_out_dtype_bfloat16",
-        r".*",
-        AssertionError,
-        "out_dtype=torch.bfloat16 returned torch.float32",
-        "#6061: fp16 tensor multiplied by an fp32 scalar tensor returns wrong values"
-        " (the bf16 result times the 0-d fp16 scale is promoted to float32)",
     ),
     _KnownFailure(
         "test_rejections",

@@ -356,11 +356,7 @@ class TestScaledBmmParameters:
         _cases("test_out_dtype_bfloat16", _params(["SBQK-03"], cores=CORES_SEMANTIC)),
     )
     def test_out_dtype_bfloat16(self, fvt_id, sencores, request):
-        """out_dtype=bfloat16 compiles; the output must be bf16 or fp16 (SBREJ-12).
-
-        Fails today on #6061: scaled_bmm_decomp multiplies the bf16 bmm_fp8 result
-        by the 0-d fp16 scales, and that multiply is promoted to float32.
-        """
+        """out_dtype=bfloat16 compiles; the output must be bf16 or fp16 (SBREJ-12)."""
         with _expect_known_failure(request):
             out, ref, absum = _run_exact(fvt_id, sencores, out_dtype=torch.bfloat16)
             assert out.dtype in (torch.float16, torch.bfloat16), (
