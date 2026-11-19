@@ -15,7 +15,6 @@
 from __future__ import annotations
 import pytest
 import torch
-from torch._inductor.exc import InductorError
 from torch_spyre.constants import DEVICE_NAME
 
 E4M3 = torch.float8_e4m3fn
@@ -51,22 +50,6 @@ _XFAIL_3033 = pytest.mark.xfail(
     reason="https://github.com/torch-spyre/torch-spyre/issues/3033: for K>=16 a host "
     "FP8 copy is STANDARD but the FP8 kernels read and write QFP8CH, so from the 9th "
     "element of a row on, values come from the wrong offset",
-)
-
-_XFAIL_3024 = pytest.mark.xfail(
-    strict=True,
-    raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: some stick-"
-    "unaligned K (13, 50, 9) trip a compiler assertion 'Unsupported coordinate "
-    "expression 13*c0/64'; other unaligned K (77, 129) work",
-)
-
-_XFAIL_3999 = pytest.mark.xfail(
-    strict=True,
-    raises=RuntimeError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() of the FP16 "
-    "output raises 'Invalid device sizes and stride map': the conversion from FP8 pads "
-    "this stick-unaligned K to two FP16 sticks",
 )
 
 
@@ -275,7 +258,7 @@ class TestFP8Dequantize:
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
+            ((4, 8), 2.0),
             ((2, 2, 8), 1.0),
         ],
         ids=["2x8_s1", "4x8_s2", "2x2x8_s1"],
@@ -444,7 +427,6 @@ class TestFP8Dequantize:
         out = _compile(_dequantize_fn)(x_fp8_cpu.to(DEVICE), scale)
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0, equal_nan=True)
 
-    @_XFAIL_3999
     def test_shape_guard_recompile(self):
         """(2,8) then (4,8): shape guard must recompile, correct output for both shapes."""
         from torch._dynamo.testing import CompileCounterWithBackend
@@ -463,12 +445,6 @@ class TestFP8Dequantize:
             f"got {counter.frame_count}"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed FP8 "
-        "input fails to compile: 'no mechanism to resolve stick incompatibility'",
-    )
     def test_transposed_fp8_input(self):
         """Transposed non-contiguous FP8 input via .t()."""
         base = _make_arange_fp8((8, 2))
@@ -542,17 +518,7 @@ class TestWeightRoundtrip:
         "shape",
         [
             (2, 8),
-            pytest.param(
-                (4, 8),
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=RuntimeError,
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() "
-                    "of the FP16 output raises 'Invalid device sizes and stride map': "
-                    "the conversion from FP8 pads this stick-unaligned K to two FP16 "
-                    "sticks. Wrong values from issue 3022 are behind it",
-                ),
-            ),
+            (4, 8),
             (8, 8),
         ],
         ids=["2x8", "4x8", "8x8"],
@@ -589,7 +555,7 @@ class TestRoundtripBaseline:
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
+            ((4, 8), 2.0),
             ((8, 8), 1.0),
             ((2, 2, 8), 2.0),
         ],
@@ -646,7 +612,7 @@ class TestRoundtripBaseline:
         "seed,shape",
         [
             (42, (2, 8)),
-            pytest.param(0, (4, 8), marks=_XFAIL_3999),
+            (0, (4, 8)),
             (7, (2, 2, 8)),
         ],
         ids=["seed42_2x8", "seed0_4x8", "seed7_2x2x8"],
@@ -701,9 +667,9 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((2, 4), marks=_XFAIL_3999),
+            (2, 4),
             (4, 4),
-            pytest.param((2, 2, 4), marks=_XFAIL_3999),
+            (2, 2, 4),
         ],
         ids=["2x4", "4x4", "2x2x4"],
     )
@@ -885,13 +851,6 @@ class TestRoundtripShapes:
             out.cpu(), _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: (2,16,8) is "
-        "exact, but (2,17,8) and (2,32,8) return wrong values; the mismatch count "
-        "varies between runs",
-    )
     @pytest.mark.parametrize("S", [17, 32], ids=["S17", "S32"])
     def test_3d_shapes_varying_seq_k8(self, S):
         """3D (2,S,8) non-uniform input."""
@@ -929,10 +888,10 @@ class TestRoundtripShapes:
         "shape",
         [
             (63, 8),
-            pytest.param((63, 13), marks=_XFAIL_3024),
+            (63, 13),
             (63, 129),
-            pytest.param((17, 13), marks=_XFAIL_3024),
-            pytest.param((100, 50), marks=_XFAIL_3024),
+            (17, 13),
+            (100, 50),
             (7, 77),
             (67, 256),
         ],
@@ -952,7 +911,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((3, 7, 9), marks=_XFAIL_3024),
+            (3, 7, 9),
             (67, 71, 77),
             (2, 63, 128),
         ],
@@ -972,13 +931,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param(
-                (2, 8, 64, 64),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/6159: "
-                    "device reports Compute CB hardware error 0x9b01 (RAS HardwareError)"
-                ),
-            ),
+            (2, 8, 64, 64),
             (1, 4, 32, 128),
         ],
         ids=["2x8x64x64", "1x4x32x128"],
@@ -1017,20 +970,98 @@ class TestRoundtripScale:
             msg=f"scale={scale_val}: roundtrip differs",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3037: output is NaN, "
-        "not 0: the device computes reciprocal(0) as NaN instead of +inf, so the clamp "
-        "to 448 never happens (dequantize(448, scale=0) alone gives 0 correctly)",
-    )
     def test_zero_scale(self):
-        """scale=0: output must be all zero."""
-        x = torch.full((2, 8), 1.0, dtype=FP16, device=DEVICE)
+        """scale=0: output must be all zero for positive, negative, and zero inputs."""
+        x = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+            device=DEVICE,
+        )
         scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
         out = _compile(_quant_dequant_fn)(x, scale).cpu()
         assert not out.isnan().any()
         assert (out == 0.0).all()
+
+    def test_zero_scale_raw_quantize(self):
+        """scale=0 raw quantize: safe reciprocal substitutes 1.0, giving FP8(clamp(x))."""
+        x_cpu = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+        )
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        q = _compile(_quantize_fn)(x, scale).cpu()
+        assert not q.isnan().any()
+        torch.testing.assert_close(
+            q.float(),
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_zero_scale_weight(self):
+        """scale=0 weight roundtrip: output must be all zero."""
+        x = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+            device=DEVICE,
+        )
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        w_out = _compile(_weight_quant_dequant_fn)(x, scale).cpu()
+        assert not w_out.isnan().any()
+        assert (w_out == 0.0).all()
+
+    def test_zero_scale_raw_quantize_weight(self):
+        """scale=0 raw weight quantize: stick-aligned K=128 gives FP8(clamp(x))."""
+        x_cpu = torch.zeros((2, 128), dtype=FP16)
+        x_cpu[0, 0] = 1.0
+        x_cpu[0, 1] = -1.0
+        x_cpu[0, 2] = 0.0
+        x_cpu[1, 0] = 2.0
+        x_cpu[1, 1] = -2.0
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        q = _compile(lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s))(
+            x, scale
+        ).cpu()
+        q_f = q.float()
+        assert not q_f.isnan().any()
+        torch.testing.assert_close(
+            q_f,
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_zero_scale_mixed_per_row(self):
+        """Per-row scale with one zero row: row0 (scale=0) gives 0, row1 scales normally."""
+        x_cpu = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+        )
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor([[0.0], [2.0]], dtype=FP16, device=DEVICE)
+        out = _compile(_quant_dequant_fn)(x, scale).cpu()
+        assert not out.isnan().any()
+        assert (out[0] == 0.0).all()
+        torch.testing.assert_close(
+            out[1],
+            _roundtrip_ref(x_cpu[1], torch.tensor(2.0, dtype=FP16)),
+            atol=0.0,
+            rtol=0.0,
+        )
 
     def test_inf_scale(self):
         """scale=Inf: x/Inf -> 0 -> FP8(0) -> 0. Must not produce NaN."""
@@ -1191,12 +1222,6 @@ class TestRoundtripEdgeCases:
 class TestRoundtripInputVariants:
     """Activation roundtrip with non-standard inputs: non-contiguous (transposed) and BF16."""
 
-    @pytest.mark.xfail(
-        strict=False,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/6160: transposed input "
-        "returns wrong values (4/16 elements differ, up to 16.0)",
-    )
     def test_transposed_non_contiguous_input(self):
         """Transposed non-contiguous input, non-uniform."""
         base = _make_arange_fp16((8, 2))

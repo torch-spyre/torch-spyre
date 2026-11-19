@@ -726,8 +726,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         placement-only wrapper, whose footprint is ``size`` as given."""
         units = ceil_div(buffer.size, self.alignment)
         if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
+            # A fresh ``chosen_relayouts``: a shallow copy would share the
+            # caller's dict, so the solve would write into it and keep entries
+            # from before.
             return _CoreDivisionBufferWithCpVars(
-                buffer=replace(buffer, size=units),
+                buffer=replace(buffer, size=units, chosen_relayouts={}),
                 capacity_units=self._capacity_units,
                 model=model,
             )
@@ -912,7 +915,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         A cut is a tiled op whose value has to be published into a full-sized
         buffer because some consumer sits outside its loop nest -- the
-        ``kind="copy_out"`` classification ``_plan_tiling_propagation`` makes
+        ``kind="copy_out"`` classification the lowering makes
         later, expressed over the solver's own division variables so it can be
         ranked *while* the tiling is being chosen rather than discovered after.
 
