@@ -57,6 +57,7 @@ from torch_spyre._inductor.loop_node import LoopNode, all_ops
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import lx_relayout
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.wsr import for_each_tile
 
 from for_each_tile_fixtures import K, M, N, split_k_fn
@@ -310,21 +311,38 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
             for op in (node.body[0], node.body[-1])
             if isinstance(op, ComputedBuffer) and getattr(op, "loop_info", None) is None
         ]
+        # The clones hoisted in this compile, each in the unbroken run of hoisted
+        # clones that ends right before a node (several are hoisted to one loop).
         ops = list(graph.operations)
-        seen["before_node"] = [
-            op.get_name()
-            for op, nxt in zip(ops, ops[1:])
-            if isinstance(nxt, LoopNode)
-            and isinstance(op, ComputedBuffer)
-            and getattr(op, "loop_info", None) is None
-        ]
+        hoisted = set(seen["hoisted_now"])
+        placed: set[str] = set()
+        for i, op in enumerate(ops):
+            if isinstance(op, LoopNode):
+                j = i - 1
+                while j >= 0 and ops[j].get_name() in hoisted:
+                    placed.add(ops[j].get_name())
+                    j -= 1
+        seen["hoisted_total"] += len(hoisted)
+        seen["misplaced"] += sorted(hoisted - placed)
+        seen["hoisted_now"] = []
         real(graph)
+
+    place_clone = GraphEditor._place_clone
+    seen["hoisted_now"] = []
+    seen["hoisted_total"] = 0
+    seen["misplaced"] = []
+
+    def spy_place_clone(editor, new_com_buf, buf_name, **kwargs):
+        place_clone(editor, new_com_buf, buf_name, **kwargs)
+        if kwargs.get("lower_before") is not None:
+            seen["hoisted_now"].append(new_com_buf.get_name())
 
     @contextlib.contextmanager
     def patch():
         with (
             config.patch({"co_optimizing_lx_planning": False}),
             mock.patch.object(ts_passes, "_hand_off_loop_nodes", hand_off),
+            mock.patch.object(GraphEditor, "_place_clone", spy_place_clone),
         ):
             yield
 
@@ -333,8 +351,10 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     )
     # The clones are placed outside the loop; none ever sat at the edge of a body.
     assert seen["edge_non_members"] == [], seen["edge_non_members"]
-    # ... and they really were hoisted: they sit right before a node.
-    assert seen["before_node"], "no hoisted clone landed before a LoopNode"
+    # ... and the clones the allocator hoisted (it passed ``lower_before``) sit right
+    # before a node, not merely some op that happens to precede one.
+    assert seen["hoisted_total"], "the allocator hoisted no input clone"
+    assert seen["misplaced"] == [], seen["misplaced"]
     _assert_same_compile(flat, nodes)
     # The clones are once-run kernels before the loop on both paths.
     assert nodes["pre_fusion"] == flat["pre_fusion"]

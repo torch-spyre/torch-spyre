@@ -128,8 +128,11 @@ class TestPlaceClone(unittest.TestCase):
         )
         self.assertEqual(real, [a, w, clone, z])
 
-    def test_an_output_clone_of_a_buffer_written_in_a_loop_follows_the_loop(self):
-        """Its value is final only after the loop."""
+    def test_an_output_clone_of_a_buffer_written_in_a_loop_stays_beside_its_writer(
+        self,
+    ):
+        """It carries the buffer's ``loop_info``, so it is a member of the loop its
+        writer is in (a drain, which clears that, is the post-loop case)."""
         x, w = _Op("x"), _Op("w")
         node = _node("loop", [x, w])
         z = _Op("z")
@@ -142,10 +145,31 @@ class TestPlaceClone(unittest.TestCase):
             lower_anchor=None,
             lower_before=None,
             first_user=None,
-            last_writer=lambda name: x,
+            last_writer=lambda name: w,
         )
-        self.assertEqual(real, [node, clone, z])
-        self.assertEqual(node.body, [x, w])
+        self.assertEqual(node.body, [x, w, clone])
+        self.assertEqual(real, [node, z])
+
+    def test_a_hoist_from_a_loop_that_starts_with_non_counted_ops_stays_in_the_body(
+        self,
+    ):
+        """The allocator's live-range gate looked only from the entry on. Hoisting
+        before the whole loop would put the clone ahead of the ops that precede the
+        entry in the body; it goes right before the entry instead."""
+        extern, entry, y = _Op("extern"), _Op("entry"), _Op("y")
+        node = _node("loop", [extern, entry, y])
+        real = [node]
+        clone = _Op("clone")
+        self._place(
+            real,
+            clone,
+            input=True,
+            lower_anchor=None,
+            lower_before=entry,
+            first_user=entry,
+        )
+        self.assertEqual(node.body, [extern, clone, entry, y])
+        self.assertEqual(real, [node])
 
     def test_a_clone_with_no_consumers_and_no_anchor_is_refused(self):
         real = [_Op("a")]

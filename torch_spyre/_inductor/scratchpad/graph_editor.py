@@ -47,7 +47,12 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
-from torch_spyre._inductor.loop_node import move_after, move_before, top_level_entry
+from torch_spyre._inductor.loop_node import (
+    all_ops,
+    move_after,
+    move_before,
+    top_level_entry,
+)
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
 # In-place collectives whose codegen reads exactly one tensor operand,
@@ -353,12 +358,19 @@ class GraphEditor:
     ) -> None:
         """Put the freshly lowered clone (appended at the top level) in its place.
 
-        * a drain (``lower_anchor``, or an output clone's last writer) runs once,
-          after the whole loop that holds its anchor, so it goes right after the
-          outermost loop entry of the anchor (the anchor itself when it is not in a
-          loop);
+        * a drain (``lower_anchor``) runs once, after the whole loop that holds its
+          anchor, so it goes right after the outermost loop entry of the anchor
+          (the anchor itself when it is not in a loop);
         * a hoisted input clone (``lower_before``) runs once, before the loop its
-          consumers run in, so it goes right before that outermost entry;
+          consumers run in, so it goes right before that outermost entry, when
+          ``lower_before`` is the entry's first op. If ops that are not counted
+          loop members (extern kernels keep their ``loop_info``) come first in the
+          loop, ``lower_before`` is not the first op and the clone goes right before
+          it, in the body, as before: the allocator's live-range gate only looked
+          from ``lower_before`` on;
+        * an output clone with no drain plan copies the buffer's final value and
+          carries the buffer's ``loop_info``, so it goes right after its last
+          writer, in that writer's list (a member stays a member);
         * any other clone goes right before its first consumer, in that
           consumer's list: it runs every trip when the consumer is in a loop body.
 
@@ -373,14 +385,19 @@ class GraphEditor:
             # in-place mutation. ``buffer_users`` comes from get_buffer_users,
             # which lists writers as well as readers, so "before the first
             # user" would put the clone ahead of the producer it copies.
-            lower_anchor = self._last_writer(buf_name)
-        if lower_anchor is not None:
+            move_after(operations, self._last_writer(buf_name), new_com_buf)
+        elif lower_anchor is not None:
             move_after(
                 operations, top_level_entry(operations, lower_anchor), new_com_buf
             )
         elif lower_before is not None:
+            entry = top_level_entry(operations, lower_before)
+            # Hoist out of the loop only from its first op; see the docstring.
+            first_op = next(all_ops([entry]))
             move_before(
-                operations, top_level_entry(operations, lower_before), new_com_buf
+                operations,
+                entry if first_op is lower_before else lower_before,
+                new_com_buf,
             )
         else:
             assert first_user is not None, "a clone with no consumers needs an anchor"
