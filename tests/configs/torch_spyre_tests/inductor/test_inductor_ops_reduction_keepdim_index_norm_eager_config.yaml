@@ -24,6 +24,7 @@ test_suite_config:
             # variant was collected in the reductions shard via substring match.
             - TestOps::test_mean_3d_dim0_keepdim
             - TestOps::test_index_copy_.*
+            - TestOps::test_scatter_eager_.*
             # Regression guard for LX producer/consumer core->slice agreement
             # (#3374, #3387). Asserts both values and that the buffer stays in LX.
             - TestOps::test_shared_input_two_reductions.*
