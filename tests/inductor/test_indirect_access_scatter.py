@@ -39,7 +39,6 @@ from indirect_access_common import (  # noqa: E402
     CRASHED,
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
-    DIRECT_OP_SPEC,
     register_multicore_variants,
 )
 from utils_inductor import expects_raise  # noqa: E402
@@ -1600,6 +1599,9 @@ class _ScatterScenarios:
         )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
+    # These modes lower to a mutating fallback rather than an indirect
+    # store, so the backend rejects the form before any op spec.
+    # TODO(issue#4361): stage and run them once they lower on device.
     def test_scatter_reduce_amax(self):
         """out.scatter_reduce_(0, index, src, "amax")"""
         out, src, index = self._full_index_store(dtype=torch.int64)
@@ -1607,10 +1609,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amax")
 
-        # The device result is wrong (#5326); drop the pin once that is fixed.
-        self._stage_and_e2e(
-            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=False
-        )
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_amin(self):
         """out.scatter_reduce_(0, index, src, "amin")"""
@@ -1619,7 +1619,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amin")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_prod(self):
         """out.scatter_reduce_(0, index, src, "prod")"""
@@ -1628,7 +1629,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "prod")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     # -- Known crashes (separate from the indirect-store path) -------------
     def test_index_fill_crashes(self):
