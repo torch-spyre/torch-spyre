@@ -1160,12 +1160,6 @@ class TestExpandUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[70]→expand(2,32,70)→[2,32,70]. Inner 70 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (70,), dtype=dtype, differentiation=f"expand_1d_bias_70_{dtype}"
         )
@@ -1178,12 +1172,6 @@ class TestExpandUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[1,33]→expand(4,33)→[4,33]. Inner 33 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 33), dtype=dtype, differentiation=f"expand_2d_batch_33_{dtype}"
         )
@@ -1196,12 +1184,6 @@ class TestExpandUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[1,32,33]→expand(4,32,33)→[4,32,33]. Inner 33 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 32, 33), dtype=dtype, differentiation=f"expand_3d_batch_33_{dtype}"
         )
@@ -1212,11 +1194,11 @@ class TestExpandUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_expand_5d_gqa_unaligned_65(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,65]→expand(1,8,2,32,65)→[1,8,2,32,65]. Inner 65 unchanged. Both consumers."""
-        if consumer == "sum_last":
+        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
             strict_xfail(
                 request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6477",
             )
         x = cached_randn(
             (1, 8, 1, 32, 65), dtype=dtype, differentiation=f"expand_5d_gqa_65_{dtype}"
@@ -1232,12 +1214,6 @@ class TestExpandUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[1,1,33,33]→expand(2,8,33,33)→[2,8,33,33]. Inner 33 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 1, 33, 33), dtype=dtype, differentiation=f"expand_4d_mask_33_{dtype}"
         )
@@ -1252,12 +1228,6 @@ class TestExpandUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[2,1,70]→expand(-1,16,-1)→[2,16,70]. -1 preserves dim; inner 70 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (2, 1, 70), dtype=dtype, differentiation=f"expand_3d_minus_one_70_{dtype}"
         )
@@ -1268,12 +1238,6 @@ class TestExpandUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_expand_6d_unaligned_inner(self, request, execution_mode, dtype, consumer):
         """[1,2,1,4,1,13]→expand(1,2,8,4,16,13)→[1,2,8,4,16,13]. 6D; inner 13 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 2, 1, 4, 1, 13),
             dtype=dtype,
@@ -1384,12 +1348,6 @@ class TestExpandSize1:
         self, request, execution_mode, dtype, consumer
     ):
         """[1,1,1,256]→expand(4,16,32,256)→[4,16,32,256]. All outer size-1; inner 256 unchanged. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 1, 1, 256),
             dtype=dtype,
@@ -1404,12 +1362,6 @@ class TestExpandSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_expand_4d_mqa_16x(self, request, execution_mode, dtype, consumer):
         """[1,1,1,256]→expand(1,16,32,256)→[1,16,32,256]. MQA (KV=1) 16× broadcast. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 1, 1, 256), dtype=dtype, differentiation=f"expand_4d_mqa_16x_{dtype}"
         )
@@ -1458,12 +1410,6 @@ class TestExpandSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_expand_6d_size1_to_aligned(self, request, execution_mode, dtype, consumer):
         """[1,1,1,4,1,256]→expand(2,8,4,4,16,256)→[2,8,4,4,16,256]. 6D; multiple size-1 broadcast. Both consumers."""
-        if consumer == "sum_last":
-            strict_xfail(
-                request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
-            )
         x = cached_randn(
             (1, 1, 1, 4, 1, 256),
             dtype=dtype,
@@ -1478,11 +1424,11 @@ class TestExpandSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_expand_6d_aligned(self, request, execution_mode, dtype, consumer):
         """[1,2,1,4,1,256]→expand(8,2,4,4,16,256)→[8,2,4,4,16,256]. 6D aligned; inner 256 unchanged. Both consumers."""
-        if consumer == "sum_last":
+        if consumer == "sum_last" and dtype == torch.bfloat16:
             strict_xfail(
                 request,
-                InductorError,
-                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6477",
             )
         x = cached_randn(
             (1, 2, 1, 4, 1, 256),
