@@ -1717,6 +1717,12 @@ def _stamp_direct_loop_info(
 ) -> None:
     """Directly construct and stamp one CoarseTileInfo level per op.
 
+    NOTE (stage 7.4): the stored per-read / output advance lists stamped below are
+    read by nothing since part A (``CoarseTileInfo`` documents this); the kernel and
+    every other reader take the advance from the index, and part B deletes the
+    lists. Comments below that say ``SpyreKernel._index_tile_advance`` re-derives
+    from them describe the code before part A and go with them.
+
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
     lookup_marker_dim. Never goes through coarse_tile.py's group planning: the program

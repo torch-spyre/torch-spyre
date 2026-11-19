@@ -291,9 +291,9 @@ class TensorArg:
                   docs/source/compiler/hbm_pool_planning.md.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
-            SpyreKernel._index_tile_advance from CoarseTileInfo.tiled_dims_per_read /
-            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
-            level, substituted with that level's own minted symbol, reprojected to
+            SpyreKernel._index_tile_advance from the coefficient of each loop's
+            variable in the access's index: one term per nesting level, in that
+            level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
             ops without loop_info/coarse tiling.
