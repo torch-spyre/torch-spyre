@@ -49,6 +49,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -2021,10 +2022,32 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
+        # Check for the sub-stick-aligned view pattern: Mod(var, N) where N is
+        # smaller than the required elems_per_stick. This arises
+        # when a tensor whose innermost allocation stride is N (a sub-stick
+        # value, e.g. 32 for fp16 where elems_per_stick=64) is viewed into a
+        # wider shape -- the merged index produces Mod(var, N) instead of the
+        # required Mod(var, 64).
+        # Emit a targeted hint so the user knows to fix the allocation shape.
+        _sub_stick_hint = ""
+        if (
+            isinstance(stick_expr, sympy.Mod)
+            and len(stick_expr.args[0].free_symbols) == 1
+            and isinstance(stick_expr.args[1], sympy.Integer)
+            and int(stick_expr.args[1]) < elems_per_stick
+        ):
+            actual_stride = int(stick_expr.args[1])
+            _sub_stick_hint = (
+                f"The expression may result from a sub-stick-aligned allocation "
+                f"being viewed into a wider shape. The innermost allocation "
+                f"stride ({actual_stride}) is smaller than elems_per_stick "
+                f"({elems_per_stick}). Ensure the innermost allocation "
+                f"dimension is aligned to elems_per_stick ({elems_per_stick})."
+            )
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"with a constant offset.{_sub_stick_hint}"
         )
 
 
@@ -2286,7 +2309,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     subs = indirect_access_subs_from_op(op)
     if subs:
         ind_sizes = indirect_sizes_from_op(op)
-        for d in op.get_read_writes().reads:
+        for d in op_read_writes(op).reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))
                 coords = device_coordinates(layout.device_layout, d, ind_sizes)
@@ -2296,7 +2319,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     # way (integer row extent for coordinates, then xreplace to IndirectAccess).
     store_subs = indirect_store_subs_from_op(op)
     if store_subs:
-        write = next(iter(op.get_read_writes().writes))
+        write = next(iter(op_read_writes(op).writes))
         # Resolve the scatter destination's layout, leniently unwrapping the
         # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
         # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
@@ -3935,7 +3958,7 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
-    arg_buf: Optional[Buffer] = None,
+    arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -3973,6 +3996,11 @@ def lower_pad_sequence(
     a ``ComputedBuffer``, to recover the within-stick host dim from coordinate
     identity via ``_stick_host_dim`` -- see the device-layout-construction
     section below.
+
+    ``arg_buf`` may also be a ``ReinterpretView`` of a buffer, to pad that view
+    rather than the whole buffer; the padded buffer then has the view's shape.
+    ``insert_bmm_padding`` passes the part of y a matmul reads when y's buffer does
+    not hold K as one whole dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -4197,7 +4225,9 @@ def lower_pad_sequence(
         # an actual operand.
         from .lowering import lower_constant_pad_nd
 
-        arg_tb = TensorBox(StorageBox(arg_buf))
+        arg_tb = TensorBox(
+            arg_buf if isinstance(arg_buf, ReinterpretView) else StorageBox(arg_buf)
+        )
         with fx_graph.inserting_before(insert_before):
             pad_fx = fx_graph.create_node(
                 "call_function",

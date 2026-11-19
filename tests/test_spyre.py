@@ -140,6 +140,11 @@ class TestSpyre(TestCase):
             # element count is what catches it.
             subtest(lambda t: t[8:16].detach(), name="detached_rows_middle"),
             subtest(lambda t: t[:8].detach(), name="detached_rows_leading"),
+            # A tracked view of an untracked partial tensor: its base is the
+            # detached slice, so the base itself must be checked too.
+            subtest(lambda t: t[8:16].detach().view(-1), name="detached_rows_flat"),
+            subtest(lambda t: t[8:16].detach()[:], name="detached_rows_full_slice"),
+            subtest(lambda t: t[8:16].detach().t(), name="detached_rows_transposed"),
             # Broadcast: the base's offset and element count, but only row 0.
             subtest(lambda t: t[:1].expand(64, 64), name="broadcast_row"),
         ],
@@ -161,6 +166,31 @@ class TestSpyre(TestCase):
         self.assertTrue(torch.equal(d.cpu(), expected))
 
     @parametrize(
+        "mode",
+        [
+            subtest(torch.no_grad, name="no_grad"),
+            subtest(torch.inference_mode, name="inference_mode"),
+        ],
+    )
+    def test_fill_views_without_autograd(self, mode):
+        # Under no_grad, views are still tracked (the base check applies); under
+        # inference_mode they are not (the layout check applies). Either way a
+        # partial view must be rejected and a whole-tensor view must fill.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        with mode():
+            d = expected.to("spyre")
+            for view in (lambda t: t[8:16], lambda t: t[8:16].detach().view(-1)):
+                with self.assertRaisesRegex(
+                    RuntimeError, "partial view of a Spyre tensor"
+                ):
+                    view(d).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), expected))
+            d.view(-1).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), torch.full((64, 64), 3.0)))
+            d.t().zero_()
+            self.assertTrue(torch.equal(d.cpu(), torch.zeros(64, 64)))
+
+    @parametrize(
         "view",
         [
             subtest(lambda t: t, name="base"),
@@ -168,12 +198,18 @@ class TestSpyre(TestCase):
             subtest(lambda t: t.view(-1), name="flat"),
             subtest(lambda t: t.t(), name="transposed"),
             subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+            # A detached whole tensor is not a view, but its views are: the
+            # root check must accept them.
+            subtest(lambda t: t.detach().view(-1), name="detached_flat"),
+            subtest(lambda t: t.detach().t(), name="detached_transposed"),
         ],
     )
     def test_fill_whole_tensor_view(self, view):
         d = torch.zeros(64, 64).to("spyre")
         view(d).fill_(3.0)
         self.assertTrue(d.cpu().eq(3.0).all())
+        view(d).zero_()
+        self.assertTrue(d.cpu().eq(0.0).all())
 
     @parametrize(
         "shape, dtype",
@@ -327,9 +363,7 @@ class TestSpyre(TestCase):
         reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
         expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
         d = expected.to("spyre", dynamic=reserve)
-        with self.assertRaisesRegex(
-            RuntimeError, "view of a Spyre tensor is not supported yet"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "partial view of a Spyre tensor"):
             d[10:20].fill_(3.0)
         self.assertTrue(torch.equal(d.cpu(), expected))
 
@@ -1268,6 +1302,17 @@ class TestSpyre(TestCase):
             sliced_expanded.cpu(),
             torch.tensor([data[1]] * 4, dtype=torch.float16),
         )
+
+    def test_eager_expand_broadcast_reduction(self):
+        """Eager dispatch compiles a standalone kernel over the already-
+        materialised expand() output, a distinct trigger from the compiled
+        path's fused expand+sum kernel, so it needs its own check."""
+        x_cpu = torch.randint(-3, 4, (70,), dtype=torch.int32).to(torch.float16)
+        x = x_cpu.to("spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1).cpu().float()
+        expected = x_cpu.float().expand(2, 32, 70).sum(dim=-1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's

@@ -6901,6 +6901,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Reductions over an expand()-broadcast operand, across dim alignment,
+        # op, and operand-order variations.
+        ("test_expand_broadcast_reduction", "test_expand_broadcast_reduction_base"): {
+            "param_sets": {
+                "fp16_70_to_2x32x70": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_1x2x1x4x1x256_to_8x2x4x4x16x256": (
+                    (8, 2, 4, 4, 16, 256),
+                    cached_randn((1, 2, 1, 4, 1, 256), dtype=torch.float16)
+                    .round()
+                    .clamp(-3, 3),
+                ),
+                "fp16_70_to_2x32x70_amax": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amax,
+                ),
+                "fp16_70_to_2x32x70_amin": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amin,
+                ),
+                "fp16_70_to_2x32x70_transposed": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    -1,
+                    (0, 1),
+                ),
+                "fp16_3x5x1_to_3x5x100_unaligned_expand_dim": (
+                    (3, 5, 100),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    1,
+                ),
+            },
+        },
+        # x.sum(1) + y.expand_as(x).sum(1) fuses into one op with two reduction
+        # operands sharing output dims: a plain operand (x) and a broadcast
+        # operand (y, expanded along dim -1). Checks that the merged dim order
+        # accounts for both, including an unaligned (non-stick-multiple) last
+        # dim.
+        (
+            "test_expand_broadcast_reduction_fused",
+            "test_expand_broadcast_reduction_fused_base",
+        ): {
+            "param_sets": {
+                "fp16_3x5x128": (
+                    cached_randn((3, 5, 128), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_3x5x100_unaligned": (
+                    cached_randn((3, 5, 100), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+            },
+        },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
             "param_sets": {
@@ -13232,6 +13291,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_expand_broadcast_reduction_base(
+        self, expand_shape, x, op=torch.sum, dim=-1, transpose=None
+    ):
+        # Whole-number inputs let a zero-tolerance assert_close catch a dropped/
+        # double-counted term that a loose tolerance (or shape-broadcasting allclose)
+        # would hide.
+        def fn(t):
+            t = t.expand(expand_shape)
+            if transpose is not None:
+                t = t.transpose(*transpose)
+            return op(t, dim=dim)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    def test_expand_broadcast_reduction_fused_base(self, x, y):
+        self.compare_with_cpu(
+            lambda x, y: x.sum(1) + y.expand_as(x).sum(1), x, y, atol=0, rtol=0
+        )
 
     def test_mean_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)

@@ -834,6 +834,8 @@ def _reduction_layout_from_stl(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
 
+    out_coords = host_coordinates(output, output_dep, None)
+
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
     # dimension. Those reductions are currently unsupported in the backend.
@@ -842,17 +844,31 @@ def _reduction_layout_from_stl(
         data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
         and reduction_var in x_stick_expr.free_symbols
     ):
-        # Try to preserve input layout
-        out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-        )
-        if out_stl is not None:
-            return [out_stl]
+        # Try to preserve input layout. _compatible_output_stick_exprs starts
+        # with the preserved stick and, only for a size-1 (expanded) stick,
+        # appends one candidate per expanded output dim; reversed() puts those
+        # expanded-dim candidates first, since the back-end compiler cannot
+        # divide a reduction into a one-element-per-stick output of unaligned
+        # width across cores. For an ordinary (non-expanded) stick the list
+        # has one element, so reversed() has no effect.
+        output_stls = [
+            out_stl
+            for expr in reversed(
+                _compatible_output_stick_exprs(x_stick_expr, out_coords, dep)
+            )
+            for out_stl in [
+                _output_stl_from_stick_expr(
+                    expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+                )
+            ]
+            if out_stl is not None
+        ]
+        if output_stls:
+            return output_stls
 
     # Try alternative layouts when input layout is not supported.
     # Skip the dim already known to produce an unsupported stick.
     in_coords = host_coordinates(in_layout, dep, None)
-    out_coords = host_coordinates(output, output_dep, None)
     skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
     # Prefer stick-aligned input dims; fall back to unaligned dims (padded

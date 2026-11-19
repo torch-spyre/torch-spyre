@@ -682,6 +682,7 @@ def test_eager_upcast_of_a_stick_with_no_dim_counting_its_sticks(tokens):
         [4096, 64],
         [1, 4096],
         get_device_dtype(torch.float16),
+        {(0,): 4096, (1,): tokens},
         ElementArrangement.STANDARD,
     )
     hidden = spyre_empty_with_layout(

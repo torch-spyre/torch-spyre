@@ -236,9 +236,13 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 # compilation pipeline; until then these knobs are read only by the
 # helper and its unit tests. See #2284, #2287 for the design.
 
-# Cap on bucket count (= max_size / granularity).
-# TODO: confirm the default with the Deeptools team.
-max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+# Cap on bucket count (= max_size / granularity): the number of candidate
+# iterations of a loop over a declared dimension, one correction slot each.
+# 256 covers a 32K context at 128 tokens per page with granularity 1. Nothing
+# in the kernel, launch or correction path reads this knob; the measurements
+# behind the default are on #6432. A consumer may set it per process, by this
+# env variable or on this module before the first declaration.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "256"))
 
 # Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
 # plugin's linear wrapper branches on a row count below this, which would

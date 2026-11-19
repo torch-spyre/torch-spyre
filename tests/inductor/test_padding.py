@@ -1078,6 +1078,99 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.5, rtol=0.05)
 
+    def _assert_pads_y_operand(
+        self, ops: list[Operation], k: int, padded_size: list[int]
+    ) -> None:
+        """One matmul over K, reading one padded copy of y at ``padded_size``."""
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), k)
+        padded = self._padded_buf_ops(self._ops_before(ops, mm))
+        self.assertEqual(len(padded), 1, "expected exactly one padded buffer")
+        self.assertEqual(
+            [int(s) for s in padded[0].get_size()],
+            padded_size,
+            "y is padded along its K in the operand's own shape",
+        )
+        self.assertIn(
+            padded[0].get_name(),
+            self.captured_read_names[mm.get_name()],
+            "the matmul must read the padded copy of y",
+        )
+
+    def test_y_view_folding_k_into_one_buffer_dim_pads_the_operand(self) -> None:
+        """y is ``b.view(B, G, N)`` of a ``[B, G * N]`` buffer, with K = G unaligned.
+
+        The view puts K inside one host dim of the buffer (coordinate ``n + N * k``),
+        so that dim is not K and cannot be padded to K_padded in place: it would be
+        "padded" from G * N down to K_padded.  The pass pads a copy of the operand
+        as the matmul reads it, ``[B, K_padded, N]``.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N = 4, 16, 2, 128
+        assert G % stick_size != 0
+
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        b_cpu = torch.randn(B, G * N, dtype=dtype)
+
+        def fn(e, b):
+            return torch.matmul(e, torch.nn.functional.silu(b).view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), b_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        # The one-hot e copies one fp16 SiLU value into each output element.
+        expected = fn(e_cpu.float(), b_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_view_of_a_slice_folding_k_pads_the_operand(self) -> None:
+        """As above, with y a slice of a wider buffer: the ``B`` part of an in_proj's
+        ``[x | B | C]`` output.  K's coordinate also carries the slice offset
+        (``n + N * k + INNER``).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N, INNER = 4, 16, 2, 128, 1024
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        xbc_cpu = torch.randn(B, INNER + 2 * G * N, dtype=dtype)
+
+        def fn(e, xbc):
+            _, b, _ = torch.nn.functional.silu(xbc).split([INNER, G * N, G * N], -1)
+            return torch.matmul(e, b.view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), xbc_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        expected = fn(e_cpu.float(), xbc_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_slice_along_k_pads_only_the_slice(self) -> None:
+        """``x @ w[:K]`` reads K rows of a weight with more than K_padded rows.
+
+        K's coordinate is K's own, but its host dim holds R > K_padded rows, so
+        padding that dim to K_padded would shrink it.  The pass pads a copy of the
+        ``[K, N]`` slice instead.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        M, K, R, N = 55, 67, 200, 128
+        k_padded = K + stick_size - K % stick_size
+        assert K % stick_size != 0 and R > k_padded
+
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(R, N, dtype=dtype)
+
+        def fn(x, w):
+            return x @ w[:K]
+
+        ops, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, K, [k_padded, N])
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_linear_unaligned_in_features(self) -> None:
         """``F.linear`` (bias included) compiles and is correct for unaligned
         ``in_features`` -- e.g. ``nn.Linear(28 * 28, 512)`` (issue #4208)."""
