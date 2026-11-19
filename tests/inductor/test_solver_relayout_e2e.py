@@ -1999,18 +1999,32 @@ def test_relayout_destination_restored_across_an_opaque_kernel(monkeypatch):
     the opaque moe_forward, so LX context switching restores it from an HBM
     dump. That restore writes the destination but is not the certified copy."""
     import torch_spyre._inductor.scratchpad.lx_context_switching as ctx_mod
+    import torch_spyre._inductor.spyre_kernel as sk_mod
     import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch._inductor.virtualized import V
     from torch_spyre._inductor import spyre_hint
 
     observed = _Observed(monkeypatch, force=False)
-    bracketed = []
-    dump = ctx_mod._dump_buffers
+    restores = {}
+    certified = {}
+    restore = ctx_mod._restore_buffers
+    certify = sk_mod.is_lx_relayout_identity
 
-    def spy_dump(graph, editor, target_op, target_fx_node, at_risk_bufs):
-        bracketed.extend(buf.get_name() for buf in at_risk_bufs)
-        return dump(graph, editor, target_op, target_fx_node, at_risk_bufs)
+    def spy_restore(graph, editor, target_op, target_fx_node, at_risk_bufs, dumped):
+        restored = restore(
+            graph, editor, target_op, target_fx_node, at_risk_bufs, dumped
+        )
+        for buf, restored_buf in zip(at_risk_bufs, restored):
+            restores[buf.get_name()] = restored_buf.get_name()
+        return restored
 
-    monkeypatch.setattr(ctx_mod, "_dump_buffers", spy_dump)
+    def spy_certify(op, args, op_info=None):
+        result = certify(op, args, op_info)
+        certified[V.kernel.current_node.node.get_name()] = (op, result)
+        return result
+
+    monkeypatch.setattr(ctx_mod, "_restore_buffers", spy_restore)
+    monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_certify)
     rows, inner, width = 512, 128, 6400
 
     def fn(x, weight, y):
@@ -2041,7 +2055,10 @@ def test_relayout_destination_restored_across_an_opaque_kernel(monkeypatch):
     torch.testing.assert_close(opaque.cpu(), y)
     observed.assert_emitted_in_lx(expected_plans=1)
     (plan,) = observed.plans
-    assert observed.copies[plan.edge] in bracketed, bracketed
+    copy_name = observed.copies[plan.edge]
+    # The restore is emitted, as a plain copy into the destination's LX.
+    assert copy_name in restores, restores
+    assert certified[restores[copy_name]] == ("identity", False), certified
 
 
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):

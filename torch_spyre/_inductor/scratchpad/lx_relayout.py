@@ -1467,10 +1467,9 @@ def local_lx_subrange_source(graph, name: str, uses: list[int]) -> bool:
 def _local_lx_emission_view(op, dep, name):
     """Use the division transported to the scheduler at emission.
 
-    Scheduler finalization removes iteration_space_ownership from every op,
-    matmul producers included. Decode its existing coefficient transport
-    exactly as create_op_spec does; retain all physical-view comparisons and
-    final TensorArg ownership checks below.
+    Scheduler finalization removes iteration_space_ownership. Decode its
+    existing coefficient transport exactly as create_op_spec does; retain all
+    physical-view comparisons and final TensorArg ownership checks below.
     """
     ownership = getattr(op, "iteration_space_ownership", None)
     if ownership is None:
