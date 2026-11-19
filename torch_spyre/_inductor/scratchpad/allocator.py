@@ -68,6 +68,7 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
+    _reduction_syms,
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -3032,20 +3033,24 @@ def _drop_read_distance_violations(
     return surviving
 
 
-def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int:
+def _intern_view_group(groups: dict[object, int], view: PerCoreView) -> int:
     """Group index of ``view`` among ``groups``, keyed by physical ownership.
 
     A dict keyed on ``PerCoreView`` interns by structural equality, so two slot
     spellings of one partition (``core_id`` and ``core_id % 4`` over four cores)
     would become two groups and the solver would price two shuffles where one
-    copy serves both consumers. Look up by ``same_partition`` instead and only
-    then mint a new index; the first spelling seen stays the dict key.
+    copy serves both consumers. ``groups`` is keyed by the view's
+    :attr:`~PerCoreView.partition_key` instead, which every spelling of one
+    partition shares, so the lookup agrees with ``same_partition``.
     """
-    for known, index in groups.items():
-        if known.same_partition(view):
-            return index
-    index = len(groups)
-    groups[view] = index
+    key: object = view.partition_key
+    if key is None:
+        # Matches no view, not even an identical one: a group of its own.
+        key = object()
+    index = groups.get(key)
+    if index is None:
+        index = len(groups)
+        groups[key] = index
     return index
 
 
@@ -3602,7 +3607,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
-        division = CoreDivision(splits=buffer.sym_core_divs)
+        division = CoreDivision(
+            splits=buffer.sym_core_divs,
+            reduction_syms=_reduction_syms(op, buffer.sym_core_divs),
+        )
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
         if config.auto_coarse_tiling:
@@ -4385,7 +4393,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
-        self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
+        self._relayout_view_groups: dict[str, dict[object, int]] = {}
         lifetimes = calculate_liveness(graph)
         lifetime_start_overrides, lifetime_end_overrides = (
             counted_loop_lifetime_overrides(graph)
@@ -5112,9 +5120,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
-                            }
+                            },
+                            # A clone op cannot have a reduction split.
+                            reduction_syms=frozenset(),
                         )
-                    )  # a clone op cannot have a reduction split
+                    )
                     clone_views.append(view)
                 # No core-count check here: ``same_partition`` already demands
                 # equal core counts, and the guard above ties each view's count
