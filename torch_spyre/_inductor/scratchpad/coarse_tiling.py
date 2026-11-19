@@ -45,6 +45,7 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..loop_facts import counted_loop_path
+from ..loop_node import request_loop_nodes
 from ..pass_utils import (
     _prepare_per_core_view,
     iteration_space_from_op,
@@ -57,11 +58,11 @@ from ..views import convert_modular_indexing
 from ..work_division_constraints import JOINT_TILING_AND_DIVISION_ATTR
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
-    coarse_tile_post_stickify,
     reduction_loop_vars,
     reject_nested_loops,
     validate_coarse_tile_groups,
 )
+from ..wsr.loop_tiling_lowering import tile_groups
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
@@ -488,7 +489,7 @@ def derive_tiling_groups(
     breaks whenever an op is untiled (absent from ``choices`` or mapped to the
     empty spec) or its nest differs from the run's. Contiguity is a hard
     requirement, not an optimization -- ``validate_coarse_tile_groups`` and
-    ``_apply_plan`` both rely on each group occupying one contiguous stretch of
+    the lowering both rely on each group occupying one contiguous stretch of
     the operation list.
 
     Two non-adjacent runs on the same nest are therefore **two groups**, each
@@ -786,7 +787,10 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
         for group_ops, _levels in groups
         for op in group_ops
     }
-    coarse_tile_post_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
+    request_loop_nodes(
+        graph,
+        tile_groups(graph, groups=groups, group_idx_offset=group_idx_offset),
+    )
     for op in graph.operations:
         was = untiled_symbols.get(op.get_name())
         if was is None or not isinstance(op, ComputedBuffer):

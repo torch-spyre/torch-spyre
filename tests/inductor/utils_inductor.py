@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 
 DEVICE = torch.device("spyre")
 
+try:
+    from ortools.sat.python import cp_model as _cp_model  # noqa: F401
+
+    HAS_ORTOOLS = True
+except ImportError:
+    HAS_ORTOOLS = False
+
 
 def _make_generator(*args) -> torch.Generator:
     """Return a seeded Generator whose seed is a stable hash of ``args``.
