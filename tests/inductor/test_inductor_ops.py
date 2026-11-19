@@ -3642,7 +3642,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # back permuted with no error (#4393).
             "expect_fail": {
                 "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
-                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
@@ -6960,6 +6959,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Reductions over an expand()-broadcast operand, across dim alignment,
+        # op, and operand-order variations.
+        ("test_expand_broadcast_reduction", "test_expand_broadcast_reduction_base"): {
+            "param_sets": {
+                "fp16_70_to_2x32x70": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_1x2x1x4x1x256_to_8x2x4x4x16x256": (
+                    (8, 2, 4, 4, 16, 256),
+                    cached_randn((1, 2, 1, 4, 1, 256), dtype=torch.float16)
+                    .round()
+                    .clamp(-3, 3),
+                ),
+                "fp16_70_to_2x32x70_amax": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amax,
+                ),
+                "fp16_70_to_2x32x70_amin": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.amin,
+                ),
+                "fp16_70_to_2x32x70_transposed": (
+                    (2, 32, 70),
+                    cached_randn((70,), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    -1,
+                    (0, 1),
+                ),
+                "fp16_3x5x1_to_3x5x100_unaligned_expand_dim": (
+                    (3, 5, 100),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                    torch.sum,
+                    1,
+                ),
+            },
+        },
+        # x.sum(1) + y.expand_as(x).sum(1) fuses into one op with two reduction
+        # operands sharing output dims: a plain operand (x) and a broadcast
+        # operand (y, expanded along dim -1). Checks that the merged dim order
+        # accounts for both, including an unaligned (non-stick-multiple) last
+        # dim.
+        (
+            "test_expand_broadcast_reduction_fused",
+            "test_expand_broadcast_reduction_fused_base",
+        ): {
+            "param_sets": {
+                "fp16_3x5x128": (
+                    cached_randn((3, 5, 128), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+                "fp16_3x5x100_unaligned": (
+                    cached_randn((3, 5, 100), dtype=torch.float16).round().clamp(-3, 3),
+                    cached_randn((3, 5, 1), dtype=torch.float16).round().clamp(-3, 3),
+                ),
+            },
+        },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
             "param_sets": {
@@ -9520,6 +9578,101 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 8, 8, 64),
                     lambda t: t[:, :, 1::2, :],
                     cached_randn((1, 8, 512), differentiation="vss_s2o"),
+                ),
+            },
+        },
+        # A stride inside the stick (the even/odd split of GPT-J style RoPE) is
+        # gathered. The views are those of q/k off a projection: [T, H*D] viewed
+        # [T, H, D], and the rope part of a [T, H, 192] head split [128 | 64].
+        ("test_strided_stick_slice", "test_strided_stick_slice_cpu"): {
+            "param_sets": {
+                "step2": (
+                    lambda t: t[..., ::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step2_offset": (
+                    lambda t: t[..., 1::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step3_bounded": (
+                    lambda t: t[..., 2:40:3],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step4_offset_2_sticks": (
+                    lambda t: t[..., 3::4],
+                    cached_randn((32, 4, 128), differentiation="sss_w"),
+                ),
+                "step2_2d": (
+                    lambda t: t[:, ::2],
+                    cached_randn((4, 128), differentiation="sss_2d"),
+                ),
+                "step2_of_head_view": (
+                    lambda t: t.view(32, 8, 64)[..., ::2],
+                    cached_randn((32, 512), differentiation="sss_v"),
+                ),
+                "step2_offset_of_head_split": (
+                    lambda t: t.view(32, 8, 192).split([128, 64], -1)[1][..., 1::2],
+                    cached_randn((32, 1536), differentiation="sss_s"),
+                ),
+            },
+        },
+        # GPT-J style RoPE on a single key head ([T, 1, D], as MLA's shared key),
+        # with cos and sin gathered per position. A size-1 dim must not become the
+        # stick of the transposed copy: the restickify of the gathered cos and sin
+        # then grows with T and overflows a dbo-opt immediate at T=1024.
+        ("test_interleaved_rope_single_head", "test_interleaved_rope_cpu"): {
+            "param_sets": {
+                "t1024": (
+                    cached_randn((1024, 1, 64), differentiation="irs_x"),
+                    cached_randn((4096, 32), differentiation="irs_cos"),
+                    cached_randn((4096, 32), differentiation="irs_sin"),
+                ),
+            },
+        },
+        # A stick-dim gather written at an offset inside a wider stick: the
+        # restickify of the gather output must target the consumer's stick, or
+        # it writes at stick position 0 and over the neighbouring lanes.
+        ("test_stick_gather_at_offset", "test_stick_gather_at_offset_cpu"): {
+            "param_sets": {
+                "cat_after": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                # The odd gather is the one written at the offset.
+                "cat_even_odd": (
+                    lambda x, i: torch.cat(
+                        (
+                            torch.index_select(x, -1, i),
+                            torch.index_select(x, -1, i + 1),
+                        ),
+                        -1,
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "cat_after_2d": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((8, 64), differentiation="sgo_x2"),
+                    cached_randn((8, 32), differentiation="sgo_a2"),
+                ),
+                "pad_left": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (32, 0)
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                # The fill value must survive next to the gathered lanes.
+                "pad_right_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (0, 32), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                ),
+                "pad_both_fill": (
+                    lambda x, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (16, 16), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
                 ),
             },
         },
@@ -12529,6 +12682,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_strided_stick_slice_cpu(self, slicer, x):
+        """Read a strided slice of the stick dim into real compute.
+
+        The slice is scaled by a tensor, not a constant: a lone slice, or one times a
+        constant, is folded into a view of the input and never reaches the device.
+        """
+        scale = torch.linspace(0.5, 1.5, slicer(x).shape[-1], dtype=x.dtype)
+
+        def fn(x, scale):
+            return slicer(x) * scale
+
+        self.compare_with_cpu(fn, x, scale, run_eager=False)
+
+    def test_interleaved_rope_cpu(self, x, cos_cache, sin_cache):
+        """Interleaved RoPE as vLLM's ``ApplyRotaryEmb.forward_static`` reads it."""
+        positions = torch.arange(x.shape[0]) * 7 % cos_cache.shape[0]
+
+        def fn(x, cos_cache, sin_cache, positions):
+            cos = cos_cache.index_select(0, positions).unsqueeze(1)
+            sin = sin_cache.index_select(0, positions).unsqueeze(1)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+
+        self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
+
+    def test_stick_gather_at_offset_cpu(self, build, x, *partners):
+        """Write a gather of ``x``'s stick dim at an offset inside a wider stick.
+
+        ``index`` holds the even positions; ``partners`` are the tensors ``build``
+        writes beside the gather, if any.
+        """
+        index = torch.arange(0, x.shape[-1], 2)
+        self.compare_with_cpu(build, x, *partners, index, run_eager=False)
+
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""
         B, L, H, D = 1, 8, 4, 128
@@ -13162,6 +13349,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_expand_broadcast_reduction_base(
+        self, expand_shape, x, op=torch.sum, dim=-1, transpose=None
+    ):
+        # Whole-number inputs let a zero-tolerance assert_close catch a dropped/
+        # double-counted term that a loose tolerance (or shape-broadcasting allclose)
+        # would hide.
+        def fn(t):
+            t = t.expand(expand_shape)
+            if transpose is not None:
+                t = t.transpose(*transpose)
+            return op(t, dim=dim)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    def test_expand_broadcast_reduction_fused_base(self, x, y):
+        self.compare_with_cpu(
+            lambda x, y: x.sum(1) + y.expand_as(x).sum(1), x, y, atol=0, rtol=0
+        )
 
     def test_mean_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
