@@ -161,7 +161,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (advisory test-result gate)
   #
-  # Advisory only: the main/release-0.5 ruleset requires "linters" and "Spyre Test (amd64)", not this job, so it reports the suite result without blocking merge. Keep `if: always()` so it still reports when run-tests is skipped -- a docs-only change, or an integration-test-labeled commit whose testing Jenkins owns.
+  # Advisory: the only ruleset (main, release-0.5, merge queue included) requires
+  # "linters" and "Spyre Test (amd64)", not this job. Keep `if: always()` so it
+  # still reports when run-tests is skipped.
   #
   # It fans in the reusable workflow result. Three outcomes are handled:
   #
@@ -293,7 +295,8 @@ jobs:
 
   # Posts the required "Spyre Test (amd64)" context on merge-queue entries and on PRs where GHA ran
   # the suite and owns the check; the name only matches then, so a skipped run can never satisfy it.
-  # THIS is the name that must match the ruleset exactly, here and in the merge queue, which takes its checks from the same rule: rename either arm of the `name:` below and the required check goes MISSING, blocking every merge.
+  # THIS name must match the ruleset exactly: rename either arm of the `name:`
+  # below and the required check goes MISSING, blocking every merge.
   merge-queue-spyre-test:
     name: ${{ needs.decide-spyre-test.outputs.owns == 'true' && 'Spyre Test (amd64)' || 'gha-merge-queue-tests (inactive)' }}
     runs-on: ubuntu-latest
@@ -323,7 +326,9 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: spyre-test-verdict
+          # Attempt-scoped: the artifacts API lists every attempt's uploads, so a
+          # shared name would let attempt 1's verdict stand in for attempt 2's.
+          name: spyre-test-verdict-${{ github.run_attempt }}
           path: verdict.txt
           retention-days: 1
           overwrite: true
