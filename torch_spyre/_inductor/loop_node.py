@@ -510,6 +510,9 @@ def _move(
     # Find both before touching either list, so a missing one changes nothing.
     _holder(real, op)
     _holder(real, anchor)
+    if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
+        # Taking the node out would take the anchor with it.
+        raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
     remove_op(real, op)
     (insert_after if after else insert_before)(real, anchor, op)
 
@@ -524,7 +527,9 @@ def move_before(
     The usual case is a freshly lowered op (``GraphLowering.register_operation``
     appended it at the top level) that a pass relocates next to its consumer. The
     placement rule is :func:`insert_before`'s: before a node the op is outside the
-    loop, before a body op it is in that body. ``op`` may come from any list.
+    loop, before a body op it is in that body. ``op`` may come from any list, and
+    may be a :class:`LoopNode` (it moves with its body) as long as ``anchor`` is not
+    inside it.
     """
     _move(operations, anchor, op, after=False)
 

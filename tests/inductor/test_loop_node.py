@@ -761,6 +761,26 @@ class TestExplicitEdits(unittest.TestCase):
             move_before(OpsView(real), c, _Op("stranger"))
         self.assertEqual(inner.body, [c, d])
 
+    def test_a_node_cannot_be_moved_relative_to_an_op_it_holds(self):
+        """Detaching the node would detach the anchor: it raises before changing
+        anything, and the node is still where it was."""
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        for move in (move_before, move_after):
+            with self.assertRaises(ValueError):
+                move(OpsView(real), c, outer)  # c is in a node nested in outer
+            with self.assertRaises(ValueError):
+                move(OpsView(real), inner, outer)
+            self.assertEqual(real, [a, outer, f])
+            self.assertEqual(outer.body, [b, inner, e])
+            self.assertEqual(inner.body, [c, d])
+
+    def test_a_node_moves_with_its_body_relative_to_an_outside_anchor(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_before(OpsView(real), a, inner)
+        self.assertEqual(real, [inner, a, outer, f])
+        self.assertEqual(inner.body, [c, d])
+        self.assertEqual(outer.body, [b, e])
+
     def test_move_to_an_anchor_that_is_not_there_raises_and_changes_nothing(self):
         real, outer, inner, (a, b, c, d, e, f) = _nested()
         with self.assertRaises(ValueError):
