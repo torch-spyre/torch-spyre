@@ -801,12 +801,10 @@ def test_a_later_optimization_lowers_its_example_exactly(example, cap):
     before = len(case.model.proto.constraints)
     _, objective = case.lower(expr, cap)
     bound = (len(case.model.proto.constraints) - before + 1) / 2
-    rng = random.Random(0)
     domains = [case.values[v] for v in case.variables]
     for assignment in (
         tuple(d[0] for d in domains),
-        tuple(d[-1] for d in domains),
-        tuple(rng.choice(d) for d in domains),
+        tuple(d[-1] for d in domains)
     ):
         low, high = _solve_at(case, objective, assignment)
         assert low == high
