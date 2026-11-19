@@ -590,6 +590,14 @@ def _transfer_loop_info(
         restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
         restick_li.squeezed_advance_per_read = []
         restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+        # Also clear loop_tiled_dims/loop_tiled_reduction_dims: left as the
+        # consumer's (e.g. a per-tile token dim), they get misread against
+        # this copy's own unrelated dim at the same index.
+        # work_division_constraints.py reads them to pin a dim's split to 1,
+        # so a stale entry here blocks the split this full, untiled copy
+        # needs to fit the per-core span limit (issue #6277).
+        restick_li.loop_tiled_dims = [[] for _ in range(n_levels)]
+        restick_li.loop_tiled_reduction_dims = [[] for _ in range(n_levels)]
         restick_buff.loop_info = restick_li
         # Only this branch needs the pin: a tiled-stage copy above advances
         # per trip and takes its extent from the tile, while this fixed copy
