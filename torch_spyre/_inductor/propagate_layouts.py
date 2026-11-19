@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     Layout,
     MutableBox,
@@ -38,6 +39,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ScatterFallback,
     StorageBox,
     TensorBox,
     _CollectiveKernel,
@@ -657,6 +659,15 @@ def _typecast_layouts(
         out_ea = ElementArrangement.QFP8CH
     else:
         out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+        # A stick dim with no host dim, or only a size-1 one (0-dim, (1,), (2, 1)),
+        # holds a single element at position 0, which every arrangement leaves in
+        # place. Staggering is a no-op there and EA in DCI cannot permute.
+        # Decide from the read's coordinates, not the input's stride_map: a
+        # round-trip conversion rewrites the stride_map entry (#5566).
+        if out_ea in STAGGERED_EAS and all(
+            concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
+        ):
+            out_ea = ElementArrangement.STANDARD
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_coords = host_coordinates(output, output_dep, None)
@@ -827,6 +838,8 @@ def _reduction_layout_from_stl(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
 
+    out_coords = host_coordinates(output, output_dep, None)
+
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
     # dimension. Those reductions are currently unsupported in the backend.
@@ -835,17 +848,31 @@ def _reduction_layout_from_stl(
         data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
         and reduction_var in x_stick_expr.free_symbols
     ):
-        # Try to preserve input layout
-        out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-        )
-        if out_stl is not None:
-            return [out_stl]
+        # Try to preserve input layout. _compatible_output_stick_exprs starts
+        # with the preserved stick and, only for a size-1 (expanded) stick,
+        # appends one candidate per expanded output dim; reversed() puts those
+        # expanded-dim candidates first, since the back-end compiler cannot
+        # divide a reduction into a one-element-per-stick output of unaligned
+        # width across cores. For an ordinary (non-expanded) stick the list
+        # has one element, so reversed() has no effect.
+        output_stls = [
+            out_stl
+            for expr in reversed(
+                _compatible_output_stick_exprs(x_stick_expr, out_coords, dep)
+            )
+            for out_stl in [
+                _output_stl_from_stick_expr(
+                    expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+                )
+            ]
+            if out_stl is not None
+        ]
+        if output_stls:
+            return output_stls
 
     # Try alternative layouts when input layout is not supported.
     # Skip the dim already known to produce an unsupported stick.
     in_coords = host_coordinates(in_layout, dep, None)
-    out_coords = host_coordinates(output, output_dep, None)
     skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
     # Prefer stick-aligned input dims; fall back to unaligned dims (padded
@@ -3841,6 +3868,14 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
+        elif isinstance(op, (IndexPutFallback, ScatterFallback)):
+            # Upstream routes some index_put and scatter forms to a mutating
+            # fallback, which has no Spyre kernel. Reject here, not at run time.
+            # TODO(issue#692, issue#4361): drop this once they lower on device.
+            raise Unsupported(
+                f"{op.python_kernel_name}: upstream lowers this form to a "
+                f"mutating fallback, which has no Spyre kernel"
+            )
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

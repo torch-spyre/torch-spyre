@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 import torch
+
+from torch_spyre._inductor import config as spyre_config
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 import torch_spyre._sharded_api as sharded_api
@@ -192,11 +194,8 @@ def test_shard_count_must_equal_active_cores(
     assert no_runtime == []
 
 
-def test_active_core_count_reads_inductor_sencores(monkeypatch):
-    from torch_spyre._inductor import config
-
-    monkeypatch.setattr(config, "sencores", 16)
-
+@spyre_config.patch(sencores=16)
+def test_active_core_count_reads_inductor_sencores():
     assert _REAL_ACTIVE_CORE_COUNT() == 16
 
 

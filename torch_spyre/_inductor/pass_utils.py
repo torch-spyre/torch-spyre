@@ -49,6 +49,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -177,14 +178,14 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-        #    (_insert_reduction_copy_op), which mutates directly into a
+        #    (_lower_reduction), which mutates directly into a
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
         #    producer's output would be read; or
         #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
         #    whose target is a locally-created graph-output buffer (e.g.
-        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_out's
         #    inserted coarse_tile_copy_* op reads the mutation op's own output
         #    the same way. The mutation target there is an ordinary
         #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
@@ -515,6 +516,11 @@ def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
     return {str(s): current[str(s)] for s in expr.free_symbols if str(s) in current}
 
 
+def declared_dim_of(symbol) -> "tuple[int, int, int] | None":
+    """The ``(min, max, granularity)`` declared for one symbol, or None."""
+    return _DECLARED_DIMS.get().get(str(symbol))
+
+
 def substitute_declared_max(expr):
     """``expr`` with every declared symbol replaced by its declared maximum.
 
@@ -819,6 +825,73 @@ def max_trip_count(count) -> int:
     return upper
 
 
+def indirect_index_range(size) -> int:
+    """The valid range of an indirect index, as a plain int.
+
+    ``ops.indirect_indexing(index, size)`` carries the extent of the indexed
+    (source) dimension. For a gathered pool whose own length is symbolic, e.g. a
+    page pool reserved with ``.to("spyre", dynamic=...)``, that size is the
+    pool's symbol. It is a TABLE LENGTH, not a loop extent: it only bounds the
+    index values and never becomes a trip count, so it needs no bundle
+    parameter.
+
+    It resolves to the DECLARED MAXIMUM, never this call's hint. Every downstream
+    consumer uses the range to build static geometry and bounds, and the pool
+    buffer is reserved at the maximum, so every index valid at any runtime size
+    is inside it. Sizing it from the warm-up call would make a larger pool's
+    upper pages unaddressable while the binary claims to serve the whole range.
+
+    Resolving to the maximum also makes an out-of-range index unobservable: an
+    index at or above the current size but below the maximum reads a stale row
+    of the reservation, and nothing downstream can tell it from a valid one. A
+    device-side bounds check would need the source's LOGICAL size at launch.
+    No launch slot carries it today (the only ``kDimension`` slot of a gather
+    loop is its trip count, the index count), so such a check needs a new slot
+    for the source extent, not a change here.
+
+    Only a declared dimension has that maximum: the pool's reservation is what
+    makes it addressable. A ``mark_dynamic(max=...)`` or ``torch._check`` bound
+    reserves nothing, so it is refused rather than taken as the range.
+
+    Raises:
+        Unsupported: the size is symbolic and not a declared dimension, so no
+            static range exists.
+    """
+    if not (hasattr(size, "free_symbols") and size.free_symbols):
+        return int(size)
+    upper = declared_max_or_none(size)
+    if upper is None:
+        raise Unsupported(
+            undeclared_maximum_message(f"indirect index range {size}", size)
+        )
+    logger.debug(
+        "[symbolic-gather] indirect index range %s resolved to its declared "
+        "maximum %d (the source pool is reserved at that maximum)",
+        size,
+        upper,
+    )
+    return upper
+
+
+def undeclared_maximum_message(subject: str, expr) -> str:
+    """Refusal text for a symbolic extent that is not a declared dimension.
+
+    Shared by every site that must size a symbolic extent statically at its
+    declared maximum, so the advice is the same wherever the refusal fires.
+    Only ``.to("spyre", dynamic=...)`` declares a range: it reserves the buffer
+    at the maximum, which is what makes that maximum addressable. A
+    ``mark_dynamic(max=...)`` or ``torch._check`` bound reserves nothing.
+    """
+    syms = sorted(map(str, getattr(expr, "free_symbols", ()) or ()))
+    return (
+        f"{subject} is symbolic with no declared maximum for {syms}, so it "
+        "cannot be sized statically. Declare the dimension's range on the "
+        'tensor, e.g. x.to("spyre", dynamic={0: dict(min=8, max=16, '
+        "granularity=8)}); a mark_dynamic(max=...) or torch._check bound is "
+        "not a declaration"
+    )
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension. SDSC route only.
 
@@ -861,12 +934,25 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
         )
 
     user_min = _user_min_or_none(expr)
-    if user_min is not None:
-        if max_size % user_min != 0:
+    if user_min is not None and max_size % user_min != 0:
+        # "min divides max" only holds for a literal mark_dynamic(min=G),
+        # where min IS the granularity. A reserved_dims contract writes its
+        # own, independent min into the same ShapeEnv slot with no such
+        # requirement. Recognize that case via graph._spyre_dim_contracts
+        # (only that pass populates it) and fall back to auto-picking
+        # instead of raising. This whole disambiguation goes away once the
+        # symbolic-SDSC route it's guarding against is removed (TODO(issue#5890),
+        # tracked for a follow-up cleanup PR).
+        from .reserved_dims_contract import get_dim_contracts
+
+        if expr.free_symbols & get_dim_contracts(V.graph).keys():
+            user_min = None
+        else:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) must divide max={max_size}; "
                 f"got {max_size} % {user_min} = {max_size % user_min}"
             )
+    if user_min is not None:
         if max_size // user_min > max_buckets:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) produces {max_size // user_min} "
@@ -1072,7 +1158,7 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
 
     Returns the first candidate (the base buffer, with no view applied), or
     None if no candidate exists -- e.g. a coarse_tile copy buffer (see
-    coarse_tile.py's _insert_copy_op), which is synthesized purely at
+    loop_tiling_lowering.py's _insert_copy_out), which is synthesized purely at
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
@@ -1519,7 +1605,7 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            self._pending_indirect_index_size = indirect_index_range(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
@@ -1936,10 +2022,32 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
+        # Check for the sub-stick-aligned view pattern: Mod(var, N) where N is
+        # smaller than the required elems_per_stick. This arises
+        # when a tensor whose innermost allocation stride is N (a sub-stick
+        # value, e.g. 32 for fp16 where elems_per_stick=64) is viewed into a
+        # wider shape -- the merged index produces Mod(var, N) instead of the
+        # required Mod(var, 64).
+        # Emit a targeted hint so the user knows to fix the allocation shape.
+        _sub_stick_hint = ""
+        if (
+            isinstance(stick_expr, sympy.Mod)
+            and len(stick_expr.args[0].free_symbols) == 1
+            and isinstance(stick_expr.args[1], sympy.Integer)
+            and int(stick_expr.args[1]) < elems_per_stick
+        ):
+            actual_stride = int(stick_expr.args[1])
+            _sub_stick_hint = (
+                f"The expression may result from a sub-stick-aligned allocation "
+                f"being viewed into a wider shape. The innermost allocation "
+                f"stride ({actual_stride}) is smaller than elems_per_stick "
+                f"({elems_per_stick}). Ensure the innermost allocation "
+                f"dimension is aligned to elems_per_stick ({elems_per_stick})."
+            )
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"with a constant offset.{_sub_stick_hint}"
         )
 
 
@@ -2201,7 +2309,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     subs = indirect_access_subs_from_op(op)
     if subs:
         ind_sizes = indirect_sizes_from_op(op)
-        for d in op.get_read_writes().reads:
+        for d in op_read_writes(op).reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))
                 coords = device_coordinates(layout.device_layout, d, ind_sizes)
@@ -2211,7 +2319,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     # way (integer row extent for coordinates, then xreplace to IndirectAccess).
     store_subs = indirect_store_subs_from_op(op)
     if store_subs:
-        write = next(iter(op.get_read_writes().writes))
+        write = next(iter(op_read_writes(op).writes))
         # Resolve the scatter destination's layout, leniently unwrapping the
         # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
         # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
@@ -2877,13 +2985,13 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Indirect gather index (e.g. x[i] where i comes from another tensor):
-        # the symbol is not a loop variable so it is absent from dep.ranges, but
-        # the tensor does vary.  Indirect-access tensors are always 1D on the
-        # host; len(host_size) == 1 is the load-bearing guard that prevents
-        # silent mis-resolution if that assumption is ever violated.
-        if is_indirect(var.name) and len(host_size) == 1:
-            return host_size[0], host_stride[0]
+        # Indirect gather index (e.g. x[..., i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges. It
+        # resolves to the one host dim whose coordinate carries it; more than one
+        # would be ambiguous.
+        dims = [d for d, c in enumerate(host_coords) if var in c.free_symbols]
+        if is_indirect(var.name) and len(dims) == 1:
+            return host_size[dims[0]], host_stride[dims[0]]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
@@ -3494,6 +3602,7 @@ def compute_restickify_needed(
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
 
+    sparse_target = None
     if is_sparse_stl(in_stl):
         # We want to test whether a sparse to dense conversion is possible.
         # But if there is a trailing 1 dim, the STL will create a sparse layout
@@ -3513,29 +3622,40 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            # expanded_stl expands the sparse layout to the natural dense form,
-            # whose stick always points along the host's last (fastest-varying)
-            # dim.  When target_stick asks for a *different* dim (e.g. the row
-            # axis of a [64, 256] tensor for a topk-along-dim-1 consumer), the
-            # expanded form has the wrong stick and would cause a
-            # "different stick loop variables" error in parse_op_spec.  Fall
-            # through to compute_restickify_target_layout, which can target the
-            # correct dim, when the sticks differ.
-            exp_idc = try_device_coordinates(expanded_stl, in_dep, ind_sizes, op=op)
-            exp_stick = exp_idc[-1] if exp_idc else None
+            # expand_sparse keeps the stick on the input's own last host dim, so
+            # the expanded form is only usable when that stick matches what the
+            # consumer reads. Two cases need a different stick:
+            #  - the consumer wants another host dim (e.g. the row axis of a
+            #    [64, 256] tensor for a topk-along-dim-1 consumer); using the
+            #    expanded form would cause a "different stick loop variables"
+            #    error in parse_op_spec;
+            #  - the consumer reads another stick (a stick-dim gather written
+            #    into a wider stick at an offset, as in cat); a second,
+            #    stick-padded restickify would write at offset 0 and past it.
+            # In both cases restickify straight to the consumer's stick via
+            # compute_restickify_target_layout, keeping the expanded form as
+            # the fallback when that finds no target.
+            expanded_idc = try_device_coordinates(
+                expanded_stl, in_dep, ind_sizes, op=op
+            )
+            exp_stick = expanded_idc[-1] if expanded_idc else None
             if (
-                exp_stick is not None
+                expanded_idc is not None
+                and exp_stick is not None
                 and exp_stick.free_symbols == target_stick.free_symbols
+                and stick_compatible([expanded_idc, out_idc])
             ):
                 return True, expanded_stl
+            sparse_target = expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
 
     arg = PropArg(in_dep, in_host, [in_stl])
-    return True, compute_restickify_target_layout(
+    target = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+    return True, sparse_target if target is None else target
 
 
 def compute_size1_restickify_target(
@@ -3853,7 +3973,7 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
-    arg_buf: Optional[Buffer] = None,
+    arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -3880,7 +4000,7 @@ def lower_pad_sequence(
     later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
-    coarse_tile copy buffer (see coarse_tile.py's _insert_copy_op), which is
+    coarse_tile copy buffer (see loop_tiling_lowering.py's _insert_copy_out), which is
     synthesized purely at the IR level after FX lowering completed.  In that
     case ``arg_buf`` (the buffer itself) must be given instead, and the pad is
     lowered by calling the constant_pad_nd lowering function directly against a
@@ -3891,6 +4011,11 @@ def lower_pad_sequence(
     a ``ComputedBuffer``, to recover the within-stick host dim from coordinate
     identity via ``_stick_host_dim`` -- see the device-layout-construction
     section below.
+
+    ``arg_buf`` may also be a ``ReinterpretView`` of a buffer, to pad that view
+    rather than the whole buffer; the padded buffer then has the view's shape.
+    ``insert_bmm_padding`` passes the part of y a matmul reads when y's buffer does
+    not hold K as one whole dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -4115,7 +4240,9 @@ def lower_pad_sequence(
         # an actual operand.
         from .lowering import lower_constant_pad_nd
 
-        arg_tb = TensorBox(StorageBox(arg_buf))
+        arg_tb = TensorBox(
+            arg_buf if isinstance(arg_buf, ReinterpretView) else StorageBox(arg_buf)
+        )
         with fx_graph.inserting_before(insert_before):
             pad_fx = fx_graph.create_node(
                 "call_function",

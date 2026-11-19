@@ -24,6 +24,11 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .constants import FP8_E4M3FN_MAX
 from .errors import Unsupported
+from .linear_attention import (
+    DEFAULT_CHUNK_SIZE,
+    check_linear_attention,
+    reference_linear_attention,
+)
 from .scratchpad.lx_context_switching import mark_lx_safe
 
 aten = torch.ops.aten
@@ -924,17 +929,16 @@ def _(input: torch.Tensor) -> torch.Tensor:
 
 
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
-# four-step pipeline; the only difference is the final format-conversion kernel:
-#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
-#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
-#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
-#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+# pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: safe_recip = where(scale == 0, 1.0, 1 / scale)
+#   2. Scale and clamp:       x_clamped = clamp(x * safe_recip, -448, 448)
+#   3. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
 #
-# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
-# broadcast scales the compiler does not currently fuse it into a single multiply,
-# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
-# a hot-path constraint can pre-compute inv_scale and pass it directly to the
-# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+# Step 1 guards against reciprocal(0.0) evaluating to NaN on Spyre hardware so
+# that scaled inputs remain finite and dequantize with scale=0 evaluates to 0.0
+# (see #3037). For callers with hot-path constraints, inv_scale can be
+# pre-computed and passed directly to the underlying spyre.qfp8ch / spyre.qfp8wt
+# decomposition ops.
 
 
 @torch.library.custom_op(
@@ -1100,7 +1104,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
 def scaled_mm(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 matrix multiplication, with no scaling or bias applied.
@@ -1118,7 +1122,7 @@ def scaled_mm(
 
 @scaled_mm.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     if mat1.ndim != 2 or mat2.ndim != 2:
         raise ValueError(
@@ -1132,7 +1136,7 @@ def _(
 
 @torch.library.custom_op("spyre::bmm_fp8", mutates_args=(), device_types="spyre")
 def bmm_fp8(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
     Raw FP8 batched matrix multiplication, with no scaling applied.
@@ -1151,7 +1155,7 @@ def bmm_fp8(
 
 @bmm_fp8.register_fake
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
     output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
@@ -1164,7 +1168,7 @@ def scaled_bmm(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
@@ -1194,7 +1198,7 @@ def _(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
@@ -1298,6 +1302,44 @@ def triu_mask(
 
 
 @triu_mask.register_fake
+def _(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(h, w, dtype=dtype, device=device)
+
+
+@torch.library.custom_op("spyre::tril_mask", mutates_args=())
+def tril_mask(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build a lower triangular 0/1 mask on CPU and transfer to the target device.
+
+    Shape: [H, W] in the requested dtype. Follows ``torch.tril``: element
+    ``(i, j)`` is 1 when ``j - i <= diagonal``, so ``diagonal=0`` keeps the main
+    diagonal and everything below it.
+
+    The mirror of ``spyre::triu_mask``, built the same way for the same
+    reason: construction on CPU is opaque to torch.compile, so
+    assert_functional_graph is satisfied and the compiled graph only sees the
+    resulting device tensor. Linear attention multiplies its intra-chunk scores
+    by this mask (there is no softmax to carry an additive ``-inf`` mask).
+    """
+    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
+    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
+    mask = ((cols - rows) <= diagonal).to(dtype=dtype)  # [H, W]
+    return mask.to(device=device)
+
+
+@tril_mask.register_fake
 def _(
     h: int,
     w: int,
@@ -1433,6 +1475,98 @@ def _(
     k_win = key.new_empty((batch, num_kvheads, buffer_width, head_dim))
     v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
+
+
+@torch.library.custom_op(
+    "spyre::linear_attention", mutates_args=(), device_types="spyre"
+)
+def linear_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Linear attention entry point: ``(output, final_state)``.
+
+    ``query`` and ``key`` are ``[B, H, L, Dk]`` and ``value`` is
+    ``[B, H, L, Dv]``. Any feature map (for example ``elu(x) + 1``) is applied
+    by the caller; this op computes the kernelized attention itself. Causally
+    it is the recurrence ``S_t = S_{t-1} + k_t^T v_t``, ``o_t = scale * q_t S_t``
+    (the current token is included), so ``output`` is ``[B, H, L, Dv]`` and
+    ``final_state`` is the ``[B, H, Dk, Dv]`` state after the last token. With
+    ``is_causal=False`` every row reads the state summed over the whole
+    sequence.
+
+    ``initial_state`` (``[B, H, Dk, Dv]``, same dtype as ``query``) seeds the
+    recurrence. Feeding one call's ``final_state`` into the next is how chunked
+    prefill and token-by-token decode continue a sequence: the state is a fixed
+    size, unlike a KV cache. ``scale`` defaults to ``Dk ** -0.5``.
+
+    ``chunk_size`` (a multiple of 64, at most 512) is static configuration: the
+    sequence is padded at the end to a multiple of it and processed one chunk
+    per step with plain matmuls. A larger chunk means fewer steps but a larger
+    ``[chunk_size, chunk_size]`` score tile.
+
+    Phase 1 limits, enforced by ``check_linear_attention``: query, key and
+    value share one shape apart from ``Dv``; no grouped-query form; no gating or
+    decay. The chunk loop is a ``for_each_tile`` loop, so the number of chunks
+    is not capped. Each chunk's matmuls accumulate in FP32, but the carried
+    state is stored in the 16-bit device format between chunks, so its relative
+    error grows slowly with the number of chunks.
+
+    On a Spyre device this MUST be called under torch.compile(backend="inductor");
+    the real implementation is the decomposition in decompositions.py, and an
+    eager call on a Spyre device raises ``Unsupported`` rather than returning
+    nothing. On CPU it runs the fp32 reference recurrence, which is the accuracy
+    yardstick for the device path.
+    """
+    raise Unsupported("spyre::linear_attention must be called under torch.compile")
+
+
+@linear_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+
+    batch, heads, seqlen, key_dim = query.shape
+    value_dim = value.size(-1)
+    output = query.new_empty((batch, heads, seqlen, value_dim))
+    final_state = query.new_empty((batch, heads, key_dim, value_dim))
+    return output, final_state
+
+
+@torch.library.register_kernel("spyre::linear_attention", ["cpu"])
+def linear_attention_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Validate exactly as the device path does, so the CPU reference accepts
+    # and rejects the same calls and a test cannot pass on CPU for a shape the
+    # device refuses.
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+    return reference_linear_attention(
+        query, key, value, initial_state, scale, is_causal
+    )
 
 
 @torch.library.custom_op(
@@ -1597,6 +1731,7 @@ mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
+mark_lx_safe(torch.ops.spyre.tril_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)

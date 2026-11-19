@@ -136,14 +136,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
-            "that differ from the CPU result (#2847)"
-        ),
-    )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
         """Eager fp32→fp16 cast on a Spyre tensor."""
@@ -193,15 +185,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc02_half")
@@ -220,15 +203,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
         x = cached_randn(
@@ -732,6 +706,52 @@ class TestImplicitPromotion(unittest.TestCase):
             return a + scalar_fp32
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_fp16_with_0dim_fp32_tensor_keeps_fp16(self):
+        """fp16 tensor (op) 0-dim fp32 tensor gives eager's dtype and values (#6061).
+
+        Torch keeps the result fp16 because a 0-dim tensor does not promote a
+        dimensioned one of the same category. The lowerings used to broadcast
+        first and return fp32, which was also read back permuted (#4393).
+        ``compare_with_cpu`` does not check dtype, so it is checked here.
+        """
+        ops = {
+            "add": torch.add,
+            "sub": torch.sub,
+            "mul": torch.mul,
+            "div": torch.div,
+            "floor_divide": torch.floor_divide,
+            "maximum": torch.maximum,
+            "minimum": torch.minimum,
+            "eq": torch.eq,
+            "ne": torch.ne,
+            "lt": torch.lt,
+            "le": torch.le,
+            "gt": torch.gt,
+            "ge": torch.ge,
+        }
+        # Whole numbers >= 1: exact in fp16 and never zero, so division is safe
+        # in either operand order and comparisons have no rounding edge cases.
+        x = (torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)) + 1).to(
+            torch.float16
+        )
+        s = torch.tensor(3.0, dtype=torch.float32)
+        for name, op in ops.items():
+            for order in ("tensor_first", "scalar_first"):
+
+                def fn(a, b, op=op, order=order):
+                    return op(a, b) if order == "tensor_first" else op(b, a)
+
+                expected = fn(x, s)
+                for mode in ("compiled", "eager"):
+                    with self.subTest(op=name, order=order, mode=mode):
+                        run = torch.compile(fn) if mode == "compiled" else fn
+                        got = run(x.to("spyre"), s.to("spyre")).cpu()
+                        self.assertEqual(got.dtype, expected.dtype)
+                        # Device fp16 division can be 1 ulp off; every other op is
+                        # exact. A permuted readback would be off by whole numbers.
+                        tol = 1e-2 if name == "div" else 0
+                        torch.testing.assert_close(got, expected, atol=tol, rtol=tol)
 
 
 class TestDataTransfer(unittest.TestCase):
