@@ -48,6 +48,7 @@ import sys
 import pytest
 import regex as re
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -258,10 +259,20 @@ INDEX_ADD_DUPLICATES = _xfail(
 )
 # At T=1 the routing flatten succeeds and the grouped path stops at the stable sort.
 SORT_AT_DECODE = dict(decode_eager=STABLE_SORT, decode_compiled=STABLE_SORT)
-MIXED_EA = _xfail(
+BACKEND_ERROR = _xfail(
+    (InductorError, BackendCompilerFailed),
+    "Deeptools #4988: dbo-opt fails compile for some shapes to shuffle op",
+    "Cannot find a valid minimum value for data stage",
+)
+INDIRECT_RESTICKIFY_ARGS = _xfail(
     InductorError,
-    "#4714: BF16 x FP32 broadcast multiply raises mixed EA with no staggered operand",
-    "Multi-arg pointwise with mixed EA",
+    "restickify of an indirect store keeps its index arg in op_spec",
+    "restickify op_spec has 3 args",
+)
+SCATTER_IA_RETILE = _xfail(
+    InductorError,
+    "scatter-IA index buffer has no size-1 stick target for re-tiling",
+    "cannot re-tile .* no size-1 stick target",
 )
 FLOAT_IDS_AS_INDEX = _xfail(
     RuntimeError,
@@ -1092,7 +1103,12 @@ def test_G4_GM_003_grouped_mm_expert_ffn(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    ("execution_mode", "T"), _cases(eager=MIXED_EA, compiled=MIXED_EA)
+    ("execution_mode", "T"),
+    _cases(
+        eager=BACKEND_ERROR,
+        compiled=INDIRECT_RESTICKIFY_ARGS,
+        decode_compiled=SCATTER_IA_RETILE,
+    ),
 )
 def test_G4_GM_004_inverse_permute_fp32_combine(execution_mode, T):
     """Weight rows, restore token order and sum each token's 8 rows in FP32."""
