@@ -280,6 +280,11 @@ class TestFp8KvCacheStickAlignment:
             device_size=[num_slots, NUM_KV_HEADS, sticks, eps],
             stride_map=[NUM_KV_HEADS * sticks * eps, sticks * eps, eps, 1],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={
+                (0,): num_slots,
+                (1,): NUM_KV_HEADS,
+                (2, 3): HEAD_SIZE,
+            },
         )
         # torch.zeros → to(device, device_layout=layout) mirrors allocate_pages.
         t = torch.zeros((num_slots, NUM_KV_HEADS, HEAD_SIZE), dtype=dtype).to(
@@ -300,6 +305,11 @@ class TestFp8KvCacheStickAlignment:
             device_size=[folded_pages, BLOCK_SIZE, sticks, eps],
             stride_map=[BLOCK_SIZE * HEAD_SIZE, HEAD_SIZE, eps, 1],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={
+                (0,): folded_pages,
+                (1,): BLOCK_SIZE,
+                (2, 3): HEAD_SIZE,
+            },
         )
         shape = (NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
         t = torch.zeros(shape, dtype=dtype).to(DEVICE, device_layout=layout)
