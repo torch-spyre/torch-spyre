@@ -26,6 +26,11 @@ Collection (pytest_generate_tests):
 
 Eager is never collected as [1-eager] / [32-eager]. Request patch_sencores
 only when the compiled dest can split across cores.
+
+A test whose compiled rows only record a gap (rejection, xfail or
+``dynamic=True`` refusal) with the same error at every core count is tagged
+``@gap_one_core``: it is collected for 1 core only, because the chip-max row
+would repeat the 1-core row.
 """
 
 import functools
@@ -76,8 +81,25 @@ def _parametrized_argnames(metafunc):
     return names
 
 
+def gap_one_core(test):
+    """Collect a gap test for 1 core only.
+
+    Use it when every compiled row of the test records the same gap at 1 core
+    and at chip-max (same rejection or xfail, same message), so the chip-max row
+    adds nothing. Once the gap is fixed at 1 core, remove the tag so the test
+    runs at both core counts again.
+    """
+    test._gap_one_core = True
+    return test
+
+
 def pytest_generate_tests(metafunc):
     """Eager: one record, default config. Compiled multi-core: 1 and chip-max."""
+    cores = (
+        (1,)
+        if getattr(metafunc.function, "_gap_one_core", False)
+        else MULTICORE_SENCORES
+    )
     existing = _parametrized_argnames(metafunc)
     has_mode = "execution_mode" in metafunc.fixturenames
     has_sc = (
@@ -91,8 +113,7 @@ def pytest_generate_tests(metafunc):
             "execution_mode,sencores",
             [
                 pytest.param("eager", None, id="eager"),
-                pytest.param("compiled", 1, id="1-compiled"),
-                pytest.param("compiled", _max_sencores, id=f"{_max_sencores}-compiled"),
+                *(pytest.param("compiled", n, id=f"{n}-compiled") for n in cores),
             ],
         )
     elif has_mode:
@@ -106,7 +127,7 @@ def pytest_generate_tests(metafunc):
     elif has_sc:
         metafunc.parametrize(
             "sencores",
-            [pytest.param(n, id=str(n)) for n in MULTICORE_SENCORES],
+            [pytest.param(n, id=str(n)) for n in cores],
         )
 
 

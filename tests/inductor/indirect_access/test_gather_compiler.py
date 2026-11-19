@@ -21,6 +21,7 @@ import torch
 
 from utils_inductor import DEVICE, cached_randn
 from conftest import (
+    gap_one_core,
     _xfail_existing,
     compare_mode,
     expect_dynamic_true_refused,
@@ -101,6 +102,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         )
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_symbolic_args_encoding(self):
         """BUNDLE_SYMBOLIC_ARGS encoding in SDSC; dynamic idx shape."""
         x = cached_randn((64, 128), differentiation="gcp08", dtype=torch.float16)
@@ -153,6 +155,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
     # ------------------------------------------------------------------
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_source_size(self):
         """Dynamic M (source rows); compiled once, different M at runtime."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -165,6 +168,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_index_size(self):
         """Dynamic P (index length); compiled once, P=16 and P=32."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -175,6 +179,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_inner_dim(self):
         """Dynamic D (inner dim); D=64 and D=128 in same session."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -185,6 +190,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_symbolic_gather_dim0(self):
         """Symbolic shape at gather dim=0; GATHER_OP_SPEC generated."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -194,6 +200,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_symbolic_batch_seqlen(self):
         """Dynamic batch × seqlen; slot_idxs (B*Lk) varies."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -204,6 +211,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, kv[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_3d_source(self):
         """Dynamic 3D source (M, H, D); gather at dim=0."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -216,6 +224,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_with_downstream(self):
         """Dynamic shape + downstream fused op (tanh)."""
         fn = torch.compile(lambda x, i: torch.tanh(x[i]), dynamic=True)
@@ -227,6 +236,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, expected, atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_bfloat16(self):
         """Dynamic shape with bfloat16; SDSC wordLength=2."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -239,6 +249,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, x[idx], atol=_TOL_BF16, rtol=_TOL_BF16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_vocab_size(self):
         """Dynamic vocab size; embedding-like lookup with varying M."""
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
@@ -251,6 +262,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             torch.testing.assert_close(result, w[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_take_dynamic_true(self):
         """torch.take compile(dynamic=True) is refused (#5578).
 
@@ -423,6 +435,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
     # first compiler-context tests for the explicit gather API form.
     # ------------------------------------------------------------------
 
+    @gap_one_core
     def test_explicit_gather_dim0_lx(self):
         """torch.gather(src, 0, index) with LX_PLANNING=1; aten::gather.out through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
@@ -439,6 +452,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=0,
         )
 
+    @gap_one_core
     def test_explicit_gather_dim1_lx(self):
         """torch.gather(src, 1, index) with LX_PLANNING=1; dim=1 aten::gather.out through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
@@ -455,6 +469,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=0,
         )
 
+    @gap_one_core
     def test_explicit_gather_dim2_lx(self):
         """torch.gather(src, 2, index) with LX_PLANNING=1; dim=2 aten::gather.out through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
@@ -471,6 +486,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=0,
         )
 
+    @gap_one_core
     def test_explicit_gather_dim0_bfloat16_lx(self):
         """torch.gather(src, 0, index) bfloat16 + LX_PLANNING=1; wordLength=2 path through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
@@ -520,6 +536,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=0,
         )
 
+    @gap_one_core
     def test_dim1_explicit_gather_lx(self):
         """torch.gather(src, 1, index) + LX_PLANNING=1; dim=1 compiler path for KV-head reorder."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321

@@ -25,6 +25,7 @@ import torch
 
 from utils_inductor import DEVICE, cached_randn
 from conftest import (
+    gap_one_core,
     _xfail_existing,
     compare_mode,
     expect_dynamic_true_refused,
@@ -483,6 +484,7 @@ class TestScatterAddGroupedMmOffs:
     def env_base(self, patch_sencores):
         yield
 
+    @gap_one_core
     def test_scatter_add_grouped_mm_offs_int64(self, execution_mode):
         """scatter_add dim=0 int64 counts [128], T=192 — Gemma grouped_mm offs (#4395)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4396
@@ -534,6 +536,7 @@ class TestScatterRouterMaps:
     def env_base(self, patch_sencores):
         yield
 
+    @gap_one_core
     def test_scatter_llama4_router_k1(self, execution_mode):
         """torch.scatter dim=1 K=1 into -inf dest (192, 128) — Llama 4 router (#4403)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
@@ -568,6 +571,7 @@ class TestScatterRouterMaps:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_scatter_qwen3_router_k8(self, execution_mode):
         """torch.scatter dim=1 K=8 into zeros dest (192, 128) — Qwen3 MoE router (#4403)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
@@ -612,6 +616,7 @@ class TestScatterValueStamp:
     def env_base(self, patch_sencores):
         yield
 
+    @gap_one_core
     def test_scatter_value_grouped_mm_offs(self, execution_mode):
         """scatter_(0, idx, 1.0) onto fp16 dest [128], T=192 — leftover extra (#4436 Python).
 
@@ -645,6 +650,7 @@ class TestScatterValueStamp:
 
         compare_mode(execution_mode, fn, dst, idx, atol=0, rtol=0)
 
+    @gap_one_core
     def test_scatter_value_kv_cache_slots(self, execution_mode):
         """scatter_ stamp 0.0 into bf16 dest (256, 8, 128) at slots [3, 17] (#4436)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4473
@@ -712,6 +718,7 @@ class TestScatter1DDestRestickify:
 
         compare_mode(execution_mode, fn, x, index, src, atol=0, rtol=0)
 
+    @gap_one_core
     def test_scatter_1d_dest_length_64(self, execution_mode, patch_sencores):
         """scatter_ dest [64] fp16 — compile assert offset == 0 (#4399)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1002
@@ -760,6 +767,7 @@ class TestScatterReduceLegacyGroupedMm:
     def env_base(self, patch_sencores):
         yield
 
+    @gap_one_core
     def test_scatter_reduce_add_grouped_mm_int64(self, execution_mode):
         """scatter_(reduce='add') int64 dest [128], T=192 (#4407)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4413
@@ -789,6 +797,7 @@ class TestScatterReduceLegacyGroupedMm:
 
         compare_mode(execution_mode, fn, dst, idx, src, atol=0, rtol=0)
 
+    @gap_one_core
     def test_scatter_reduce_multiply_grouped_mm_fp16(self, execution_mode):
         """scatter_(reduce='multiply') fp16 dest [128], T=192; dest starts at ones (#4407)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4413
@@ -842,6 +851,7 @@ class TestScatterReduceTwoColliding:
             ),
         )
 
+    @gap_one_core
     def test_scatter_reduce_amax_colliding_dim0(self, execution_mode, patch_sencores):
         """scatter_reduce amax dim=0 dest/src (32, 64) non-unique index (#4351)."""
         self._xfail_colliding_dim0(execution_mode)
@@ -858,6 +868,7 @@ class TestScatterReduceTwoColliding:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_scatter_reduce_prod_colliding_dim0(self, execution_mode, patch_sencores):
         """scatter_reduce prod dim=0 dest/src (32, 64) non-unique index (#4351)."""
         self._xfail_colliding_dim0(execution_mode)
@@ -874,6 +885,7 @@ class TestScatterReduceTwoColliding:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_scatter_reduce_mean_colliding_dim0(self, execution_mode, patch_sencores):
         """scatter_reduce mean dim=0 dest/src (32, 64) non-unique index (#4351)."""
         self._xfail_colliding_dim0(execution_mode)
@@ -890,6 +902,7 @@ class TestScatterReduceTwoColliding:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_scatter_reduce_amin_must_write_dim0(self, execution_mode, patch_sencores):
         """scatter_reduce amin dim=0 dest=100 so dest is not already the min (#4351)."""
         self._xfail_colliding_dim0(execution_mode)

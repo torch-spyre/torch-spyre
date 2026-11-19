@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from utils_inductor import cached_randn
-from conftest import _xfail_existing, compare_mode, rejection
+from conftest import _xfail_existing, compare_mode, rejection, gap_one_core
 
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
@@ -126,6 +126,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=0,
         )
 
+    @gap_one_core
     def test_gather_then_matmul(self, execution_mode):
         """Gather followed by matmul; fused downstream linear."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
@@ -145,6 +146,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_gather_then_layer_norm(self, execution_mode):
         """Gather output into layer_norm; end-to-end embedding + norm."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
@@ -206,6 +208,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_gather_then_scatter_add(self, execution_mode):
         """Gather expert rows then scatter_add_ into dest (8, 32, 64) — MoE extra (#4395).
 
@@ -248,6 +251,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=0,
         )
 
+    @gap_one_core
     def test_split_gather_qkv(self, execution_mode):
         """QKV split after token embedding gather + linear projection."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
@@ -297,6 +301,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=0,
         )
 
+    @gap_one_core
     def test_chunk_then_reduce(self, execution_mode):
         """Gather + chunk + per-chunk sum reduction; each quarter summed independently."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4754
@@ -492,6 +497,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             rtol=0,
         )
 
+    @gap_one_core
     def test_e2e_speculative_token(self, execution_mode):
         """GE2E-11: Speculative decode: draft token prob lookup."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
@@ -533,6 +539,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     # ------------------------------------------------------------------
 
+    @gap_one_core
     def test_rope_neox_qk_both(self, execution_mode):
         """NeoX rotate-half RoPE applied to both Q and K after position gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399

@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from utils_inductor import cached_randn
-from conftest import _xfail_existing, compare_mode, rejection
+from conftest import _xfail_existing, compare_mode, rejection, gap_one_core
 
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
@@ -276,6 +276,7 @@ class TestGatherPagedAttentionAndSDPA:
             rtol=_TOL_SDPA,
         )
 
+    @gap_one_core
     def test_sdpa_batch_decode_b4(self, execution_mode):
         """Batched decode B=4; each request gathers 8 slots → SDPA per request."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6336
@@ -344,6 +345,7 @@ class TestGatherPagedAttentionAndSDPA:
             rtol=_TOL_SDPA,
         )
 
+    @gap_one_core
     def test_sdpa_rope_gather_then_attention(self, execution_mode):
         """Gather RoPE position embeddings → apply rotate-half → SDPA."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
@@ -505,6 +507,7 @@ class TestGatherPagedAttentionAndSDPA:
             rtol=_TOL_SDPA,
         )
 
+    @gap_one_core
     def test_sdpa_output_then_linear_projection(self, execution_mode, patch_sencores):
         """Gather KV → SDPA → linear output projection; full attention block pattern."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
@@ -653,6 +656,7 @@ class TestGatherPagedAttentionAndSDPA:
             rtol=_TOL_SDPA,
         )
 
+    @gap_one_core
     def test_sdpa_4d_kv_reshape_before_permute(self, execution_mode):
         """4D KV cache: reshape(Lk*blk, H, D) BEFORE permute(1, 0, 2) — compiler gap.
 

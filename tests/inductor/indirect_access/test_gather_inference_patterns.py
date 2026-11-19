@@ -19,6 +19,7 @@ import torch
 
 from utils_inductor import DEVICE, cached_randn
 from conftest import (
+    gap_one_core,
     _xfail_existing,
     compare_mode,
     expect_dynamic_true_refused,
@@ -29,6 +30,12 @@ from conftest import (
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
 _TOL_F16 = 1e-2
+# fp16 Q @ K^T over gathered K followed by softmax (test_paged_kv_online_softmax).  The
+# scores are sums of 64 products, so the fp16 matmul error is larger than in the
+# elementwise cases above.  Measured against an fp32 reference over 7 random inputs at 1
+# and 32 cores, the largest error was 9.5e-3 (1.06e-2 against the fp16 CPU result, so
+# 1e-2 has no margin); 2e-2 leaves about 1.9x.
+_TOL_F16_QK_SOFTMAX = 2e-2
 
 _INDEX_2D_EAGER = rejection(
     6335,
@@ -211,8 +218,8 @@ class TestGatherInferencePatternsEagerCompile:
             kv,
             q,
             idx,
-            atol=_TOL_F16,
-            rtol=_TOL_F16,
+            atol=_TOL_F16_QK_SOFTMAX,
+            rtol=_TOL_F16_QK_SOFTMAX,
         )
 
     def test_paged_kv_full_attention(self, execution_mode):
@@ -253,6 +260,7 @@ class TestGatherInferencePatternsEagerCompile:
         )
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_paged_kv_dynamic_seqlen(self, execution_mode):
         """Dynamic Lk; compile once, run at Lk=32 and Lk=64."""
         kv = cached_randn((512, 8, 64), differentiation="gpa22", dtype=torch.float16)
@@ -308,6 +316,7 @@ class TestGatherInferencePatternsEagerCompile:
 
         compare_mode(execution_mode, fn, cache, key, pos, atol=0, rtol=0)
 
+    @gap_one_core
     def test_vllm_logit_extraction(self, execution_mode):
         """Decode-step per-request last-token gather: logits[b, last_pos[b], :] via torch.gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
@@ -374,6 +383,7 @@ class TestGatherInferencePatternsEagerCompile:
         idx = torch.randint(0, 512, (4 * 64,), dtype=torch.int64)
         compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=0, rtol=0)
 
+    @gap_one_core
     def test_vllm_speculative_decode(self, execution_mode):
         """Speculative decode; gather target probs at draft positions."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
@@ -526,6 +536,7 @@ class TestGatherInferencePatternsEagerCompile:
 
         compare_mode(execution_mode, fn, expert_w, logits, atol=0, rtol=0)
 
+    @gap_one_core
     def test_topk_moe_weighted_routing(self, execution_mode):
         """MoE top-2 weighted: topk scores × gathered expert outputs → weighted sum."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
@@ -572,6 +583,7 @@ class TestGatherInferencePatternsEagerCompile:
 
         compare_mode(execution_mode, fn, embed, scores, atol=_TOL_F16, rtol=_TOL_F16)
 
+    @gap_one_core
     def test_topk_beam_search_kv_reorder(self, execution_mode):
         """Beam search: topk beam scores → gather KV rows for top beams."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
@@ -668,6 +680,7 @@ class TestGatherInferencePatternsEagerCompile:
         slots = torch.randint(0, pool, (32,), dtype=torch.int64)
         compare_mode(execution_mode, lambda x, i: x[i], kv, slots, atol=0, rtol=0)
 
+    @gap_one_core
     def test_index_put_view_n_32_32(self, execution_mode):
         """index_put_ on view [8, 32, 32] → [8, 1024]; compile Mod(d1, 32) (#4443)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/692

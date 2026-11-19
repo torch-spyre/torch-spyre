@@ -65,6 +65,7 @@ from utils_inductor import (
     compare_with_cpu,
 )
 from conftest import (
+    gap_one_core,
     _xfail_existing,
     compare_mode,
     dl16_snap,
@@ -338,6 +339,7 @@ class TestGatherImplicitLayout:
         compare_mode(execution_mode, lambda x, i: x[i], x, idx, atol=0, rtol=0)
 
     @expect_dynamic_true_refused
+    @gap_one_core
     def test_dynamic_compile(self, execution_mode):
         """torch.compile(dynamic=True); three runtime index sizes.
 

@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils_inductor import cached_randint, cached_randn
-from conftest import _xfail_existing, compare_mode, rejection
+from conftest import _xfail_existing, compare_mode, rejection, gap_one_core
 
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
@@ -179,6 +179,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=0,
         )
 
+    @gap_one_core
     def test_embedding_tied_lm_head(self, execution_mode):
         """Weight-tied model: same matrix for embedding and LM head."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
@@ -199,6 +200,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
 
     # ------------------------------------------------------------------
 
+    @gap_one_core
     def test_embeddingbag_sum_mode(self, execution_mode):
         """GEMB2-01: EmbeddingBag sum mode; output is sum of selected rows."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -220,6 +222,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_embeddingbag_mean_mode(self, execution_mode):
         """GEMB2-02: EmbeddingBag mean mode; output is mean of selected rows."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -241,6 +244,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_embeddingbag_max_mode(self, execution_mode):
         """GEMB2-03: EmbeddingBag max mode; output is element-wise max (float32)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -262,6 +266,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F32,
         )
 
+    @gap_one_core
     def test_embeddingbag_max_float16(self, execution_mode):
         """EmbeddingBag max mode in float16; 2-byte element max reduction via gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -283,6 +288,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_embeddingbag_per_sample_weights(self, execution_mode):
         """GEMB2-04: EmbeddingBag with per-sample weights; weighted sum."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -310,6 +316,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F32,
         )
 
+    @gap_one_core
     def test_embeddingbag_large_vocab(self, execution_mode):
         """GEMB2-05: EmbeddingBag with large vocabulary (V=32000)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -331,6 +338,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F32,
         )
 
+    @gap_one_core
     def test_embeddingbag_single_bag(self, execution_mode):
         """GEMB2-06: EmbeddingBag with one bag; degenerate offsets=[0]."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -352,6 +360,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F32,
         )
 
+    @gap_one_core
     def test_embeddingbag_nn_module(self, execution_mode):
         """GEMB2-07: nn.EmbeddingBag forward; sum mode via module API."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4319
@@ -467,6 +476,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F32,
         )
 
+    @gap_one_core
     def test_lookup_table_with_linear(self, execution_mode):
         """GEMB2-14: Lookup table + linear projection downstream."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6355
@@ -489,6 +499,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             rtol=_TOL_F16,
         )
 
+    @gap_one_core
     def test_embedding_max_norm_renorm(self, execution_mode):
         """F.embedding max_norm=1.0 → aten::embedding_renorm_ extra local (#4320).
 

@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from utils_inductor import DEVICE, cached_randint, cached_randn
-from conftest import _xfail_existing, compare_mode
+from conftest import _xfail_existing, compare_mode, gap_one_core
 
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
@@ -106,6 +106,7 @@ class TestGatherFusedDownstreamOperations:
             rtol=_TOL_BF16,
         )
 
+    @gap_one_core
     def test_gather_exp_float32(self, execution_mode):
         """float32 gather + exp downstream; test with device float32 tolerance."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6391
