@@ -33,6 +33,7 @@ import torch_spyre  # noqa: F401
 from torch_spyre.ops.eager import (
     _DYNAMO_DYNAMIC_MARKS,
     _has_dynamo_marks,
+    _materialize_unservable_view,
     _static_shape_call,
 )
 
@@ -156,6 +157,32 @@ class TestOtherEagerOpsOnDeclaredTensor(TestCase):
                 )
                 self.assertIn(0, a._dynamo_dynamic_indices)
 
+    def test_view_rebuild_when_the_base_is_declared(self) -> None:
+        # _rebuild_view_on_device compiles a dynamic=False kernel over the
+        # view's BASE. A [8, 65] flattened splits a stick, so the view cannot be
+        # read through its base's layout and has to be rebuilt.
+        declaration = {0: {"min": 8, "max": 64, "granularity": 8}}
+        cpu = torch.arange(8 * 65, dtype=torch.float16).reshape(8, 65)
+        base = cpu.to(DEVICE, dynamic=declaration)
+        view = base.reshape(-1)
+        self.assertIs(view._base, base)
+        rebuilt = _materialize_unservable_view(view)
+        torch.testing.assert_close(rebuilt.cpu(), cpu.reshape(-1))
+        self.assertIn(0, base._dynamo_dynamic_indices)
+
+    def test_requires_grad_on_declared_tensor(self) -> None:
+        # x + 1 (compile_once): the autograd kernel above records the op, so the
+        # result keeps its history. gelu (_OPWrapper): nothing sits above it, so
+        # the unmarked twin would silently drop the history; it raises instead,
+        # unless grad mode is off.
+        _, x = _declared(64)
+        x.requires_grad_(True)
+        self.assertIsNotNone((x + 1).grad_fn)
+        with self.assertRaisesRegex(RuntimeError, "requires grad"):
+            F.gelu(x)
+        with torch.no_grad():
+            F.gelu(x)
+
     def test_decomposed_op_matches_cpu(self) -> None:
         # gelu has a Spyre decomposition, so eager gelu goes through _OPWrapper
         # and not through compile_once.
@@ -233,6 +260,13 @@ class TestStaticShapeCall(TestCase):
         self.assertIs(result[2][0], plain)
         self.assertEqual(marked.sum().item(), 12)  # the write reached the caller
         self.assertTrue(_has_dynamo_marks(marked))
+
+        # A mark nested in a tuple inside a dict keyword argument is still found.
+        nested = torch.zeros(4, 3)
+        torch._dynamo.mark_dynamic(nested, 0)
+        _static_shape_call(
+            lambda *, kw: self.assertFalse(_has_dynamo_marks(kw["a"][0]))
+        )(kw={"a": (nested,)})
 
         # Nothing marked: the kernel gets the caller's own objects back untouched.
         seen = []

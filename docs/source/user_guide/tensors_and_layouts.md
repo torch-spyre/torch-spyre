@@ -504,7 +504,9 @@ stay the same, otherwise `resize_` raises.
   but do not use the declaration: each one runs a fixed-size kernel, compiled
   once for every distinct size, and returns a regular tensor of the current
   size. The dimension is dynamic only inside a `torch.compile` function that you
-  write yourself (see the next section).
+  write yourself (see the next section). Carrying the declaration over to the
+  result is tracked in
+  [#6490](https://github.com/torch-spyre/torch-spyre/issues/6490).
 
 #### Compiled graphs over a declared dimension
 

@@ -112,7 +112,29 @@ _DYNAMO_DYNAMIC_MARKS = (
 
 
 def _has_dynamo_marks(t):
-    return any(getattr(t, name, None) for name in _DYNAMO_DYNAMIC_MARKS)
+    # The marks are plain instance attributes, so one ``__dict__`` read replaces
+    # five ``getattr`` calls; most tensors have an empty one.
+    attrs = t.__dict__
+    return bool(attrs) and any(attrs.get(name) for name in _DYNAMO_DYNAMIC_MARKS)
+
+
+def _any_marked(values):
+    """Whether any tensor in ``values`` carries a mark, looking inside lists,
+    tuples and dicts, which is every container an op's arguments use. This runs
+    on every eager op, so it avoids a pytree flatten; ``_strip_dynamo_marks``
+    uses pytree and so sees a superset of what this finds.
+    """
+    for v in values:
+        if isinstance(v, torch.Tensor):
+            if _has_dynamo_marks(v):
+                return True
+        elif isinstance(v, (list, tuple)):
+            if _any_marked(v):
+                return True
+        elif isinstance(v, dict):
+            if _any_marked(v.values()):
+                return True
+    return False
 
 
 def _strip_dynamo_marks(args, kwargs):
@@ -143,7 +165,7 @@ def _metadata(t):
     return (tuple(t.shape), tuple(t.stride()), t.storage_offset())
 
 
-def _static_shape_call(compiled):
+def _static_shape_call(compiled, *, autograd_handled=True):
     """Wrap a ``dynamic=False`` compiled kernel so it never sees dynamic marks.
 
     A tensor declared with ``.to("spyre", dynamic=...)`` carries ``mark_dynamic``,
@@ -162,32 +184,61 @@ def _static_shape_call(compiled):
     The twin shares storage, so a write to the data reaches the caller's tensor.
     A change to its metadata (size, strides, offset, e.g. an ``out=`` that the
     kernel resizes) would not, so that case raises instead of silently leaving
-    the caller's tensor stale.
+    the caller's tensor stale. The kernel has already written its data by then,
+    as with any op that fails part-way.
+
+    ``detach()`` also cuts autograd history. ``autograd_handled`` says whether
+    an autograd kernel above this one has already recorded the op, which is the
+    case for the ``compile_once`` kernels. ``_OPWrapper`` ops have no autograd
+    kernel above them (they fall through, and ``torch.compile`` derives the
+    gradient from the inputs), so a twin would silently return a result with no
+    ``grad_fn``. With ``autograd_handled=False`` a marked tensor that requires
+    grad raises instead.
     """
 
     @functools.wraps(compiled)
     def call(*args, **kwargs):
-        # Common case, nothing marked: one flat scan, no rebuild of the args.
-        if not any(
-            isinstance(a, torch.Tensor) and _has_dynamo_marks(a)
-            for a in pytree.tree_leaves((args, kwargs))
-        ):
+        # Common case, nothing marked: a cheap scan, no rebuild of the args.
+        if not (_any_marked(args) or _any_marked(kwargs.values())):
             return compiled(*args, **kwargs)
         args, kwargs, pairs = _strip_dynamo_marks(args, kwargs)
+        if (
+            not autograd_handled
+            and torch.is_grad_enabled()
+            and any(original.requires_grad for _, original in pairs)
+        ):
+            raise RuntimeError(
+                "A tensor marked dynamic (mark_dynamic, e.g. through "
+                ".to('spyre', dynamic=...)) requires grad, and this eager op "
+                "cannot track gradients through it. Run it under "
+                "torch.no_grad() or on a tensor that is not marked."
+            )
         result = compiled(*args, **kwargs)
         for twin, original in pairs:
             before, after = _metadata(original), _metadata(twin)
             if before != after:
                 raise RuntimeError(
                     "A Spyre eager kernel changed the size, strides or offset of a "
-                    "tensor declared with .to('spyre', dynamic=...) "
-                    f"(size, strides, offset: {before} -> {after}). The change "
-                    "cannot be applied to the declared tensor; resize it with "
-                    "resize_() first."
+                    "tensor marked dynamic (mark_dynamic, e.g. through "
+                    ".to('spyre', dynamic=...)): "
+                    f"(size, strides, offset) {before} -> {after}. The change "
+                    "cannot be applied to the caller's tensor (the kernel's data "
+                    "writes already have been); resize it with resize_() first."
                 )
         return _remap_result(result, {id(t): o for t, o in pairs})
 
     return call
+
+
+def _static_compile(fn, *, autograd_handled=True, **compile_kwargs):
+    """``torch.compile(fn, dynamic=False)`` for an eager kernel, wrapped so it
+    never sees dynamic marks (``_static_shape_call``). Use this for every
+    static-shape compile on the eager path, so a new one cannot forget the strip.
+    """
+    return _static_shape_call(
+        torch.compile(fn, dynamic=False, **compile_kwargs),
+        autograd_handled=autograd_handled,
+    )
 
 
 # Decorator to keep track of compiled variant
@@ -202,9 +253,13 @@ def compile_once(op, **compile_kwargs):
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(_op_frame(op), **compile_kwargs)
                 if compile_kwargs.get("dynamic") is False:
-                    compiled = _static_shape_call(compiled)
+                    static_kwargs = {
+                        k: v for k, v in compile_kwargs.items() if k != "dynamic"
+                    }
+                    compiled = _static_compile(_op_frame(op), **static_kwargs)
+                else:
+                    compiled = torch.compile(_op_frame(op), **compile_kwargs)
             with _guard_reentry(op):
                 return fn(*args, compiled=compiled, **kwargs)
 
@@ -297,7 +352,9 @@ def _rebuild_view_on_device(x):
         view_copy.__code__ = view_copy.__code__.replace(
             co_varnames=view_copy.__code__.co_varnames
         )
-        rebuild = torch.compile(view_copy, dynamic=False)
+        # ``base`` can be a tensor declared with ``.to("spyre", dynamic=...)``,
+        # which carries ``mark_dynamic``; this kernel is ``dynamic=False`` (#6030).
+        rebuild = _static_compile(view_copy)
         _view_rebuilders[key] = rebuild
         if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
             _view_rebuilders.popitem(last=False)
