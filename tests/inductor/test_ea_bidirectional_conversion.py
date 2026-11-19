@@ -1442,7 +1442,9 @@ def test_ea_staggered_host_storage_offset():
     # H2D: Pair-aligned offset (64 elements) with boundary expand -> succeeds
     h2d_host_buf = torch.arange(64 + 4 * 68, dtype=torch.float32)
     h2d_host_slice = h2d_host_buf[64:].view(4, 68)
-    y_h2d = _convert_one_row_per_core(torch.zeros(4, 68, dtype=torch.float16), torch.float32)
+    y_h2d = _convert_one_row_per_core(
+        torch.zeros(4, 68, dtype=torch.float16), torch.float32
+    )
     assert_ea(y_h2d, ElementArrangement.DL16_TO_FP32)
     y_h2d.copy_(h2d_host_slice)
     assert torch.equal(y_h2d.cpu(), h2d_host_slice)
