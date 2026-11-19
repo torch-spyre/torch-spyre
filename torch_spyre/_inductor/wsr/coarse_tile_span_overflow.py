@@ -16,7 +16,7 @@
 
 Builds coarse-tile groups automatically when an op's per-core working set
 would overflow available span, for consumption by
-``coarse_tile_post_stickify()`` in ``coarse_tile.py``. Runs
+``tile_groups()`` in ``loop_tiling_lowering.py``. Runs
 POST-stickification (see ``passes.py``'s
 ``_maybe_coarse_tile_span_overflow``) — requires ``FixedTiledLayout``
 (``device_layout``) on all ops.
@@ -365,7 +365,7 @@ def _dims_to_hints(
 def span_overflow_groups(
     graph: GraphLowering,
 ) -> tuple[list[tuple], list[tuple[Operation, list[DimHint]]]]:
-    """Build coarse_tile_post_stickify() groups from automatic span-overflow
+    """Build tile_groups() groups from automatic span-overflow
     plans.
 
     This adapter converts SpanOverflowTilePlans into the same group shape that
@@ -373,12 +373,12 @@ def span_overflow_groups(
     a for_each_tile loop already tiles (they carry dim hints) are left alone.
     ``is_reduction`` is not carried in the group-level ``levels`` list; it
     lives on each op's own ``DimHint`` and is consulted directly by
-    ``plan_coarse_tile_groups``.
+    ``build_loop_tiling_plan``.
 
     Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
     is a list of ``(op, dim_hints)`` pairs this function decided on but did
     NOT apply — applying them (setting ``op.dim_hints``) is the caller's
-    responsibility, and must happen before ``coarse_tile_post_stickify()``/
+    responsibility, and must happen before ``tile_groups()``/
     ``validate_coarse_tile_groups`` run, since ``dim_hints`` is an input those
     consume, not something they produce.  Keeping the assignment out of this
     function's own decision logic keeps ``span_overflow_groups`` a pure

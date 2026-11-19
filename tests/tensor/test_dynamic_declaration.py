@@ -22,6 +22,8 @@ exceed the configured bucket cap. Also covers negative-dim canonicalization
 and unknown-key rejection in the same validation pass.
 """
 
+import warnings
+
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
@@ -81,6 +83,18 @@ class TestDynamicDeclarationValidation(TestCase):
         self._assert_rejected(
             {"min": 8, "max": over_cap, "granularity": 8},
             "exceeding the cap",
+        )
+
+    def test_default_cap_is_256_buckets(self) -> None:
+        # The default as a user sees it: 256 buckets are accepted and 257 are
+        # refused (#6432). `MAX_BUCKETS` overrides it per process.
+        self.assertEqual(inductor_config.max_buckets, 256)
+        spec = {"min": 8, "max": 2048, "granularity": 8}
+        x_dev = self.x.to(DEVICE, dynamic={0: spec})
+        self.assertEqual(get_reserved_dims(x_dev), {0: spec})
+        self._assert_rejected(
+            {"min": 8, "max": 2056, "granularity": 8},
+            "257 buckets, exceeding the cap of 256",
         )
 
     def test_real_size_outside_declared_range_rejected(self) -> None:
@@ -185,12 +199,17 @@ class TestDynamicDeclarationValidation(TestCase):
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
 
-    def test_reserved_transfer_warns_about_compiled_kernels(self) -> None:
-        # The buffer is reserved at max, but compiled kernels are not yet built
-        # for the reserved size. The transfer says so instead of staying silent.
-        with self.assertWarns(UserWarning) as cm:
+    def test_reserved_transfer_does_not_warn(self) -> None:
+        # The transfer used to warn that compiled kernels were built for the
+        # first compile's size (#5937). The compiler now builds a declared
+        # dimension's geometry at the declared maximum and binds the size at
+        # launch, so there is nothing to warn about.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             self.x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
-        self.assertIn("compiled", str(cm.warning))
+        self.assertEqual(
+            [str(w.message) for w in caught if "compiled" in str(w.message)], []
+        )
 
     def test_non_dict_spec_rejected(self) -> None:
         # The per-dim declaration must be a dict, not a bare number/list/None.

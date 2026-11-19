@@ -193,13 +193,22 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
   int64_t prev_size = 1;
   for (int i = device_rank - 1; i > -1; i--) {
-    if (stl.stride_map[i] == 0) {
-      dcsi_sizes[i] = stl.device_size[i];
-    }
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
-    // Size 1 dimensions are ignored.
-    if (stl.stride_map[i] == -1) continue;
+    if (stl.stride_map[i] == 0) {
+      // Broadcast: extent matches an expanded host dim, so keep it with stride
+      // 0.
+      if (i + 1 < device_rank && stl.device_size[i] > 1) {
+        for (int h = 0; h < host_rank; h++) {
+          if (strides[h] == 0 && sizes[h] == stl.device_size[i]) {
+            dcsi_sizes[i] = stl.device_size[i];
+            host_strides[i] = 0;
+            break;
+          }
+        }
+      }
+      continue;
+    }
     host_strides[i] = stl.stride_map[i];
   }
 
@@ -614,7 +623,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     for (int i = 0; i < device_rank; i++) {
       const int64_t device_size = stl.device_size[i];
       if (device_size == 1) {
-        dst_stride_map[i] = -1;
+        dst_stride_map[i] = 0;
         continue;
       }
       const int64_t device_stride = stl.stride_map[i];
@@ -666,7 +675,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     for (int i = 0; i < dma_rank; i++) {
       for (const int& j : tile_map[i]) {
         if (cpu_sizes[i] == 1) {
-          dst_stride_map[j] = -1;
+          dst_stride_map[j] = 0;
         } else if (dst_stride_map[j] > cpu_sizes[i] * cpu_strides[i]) {
           dst_stride_map[j] = cpu_sizes[i] * cpu_strides[i];
         }
@@ -1107,11 +1116,10 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
-                                   c10::IntArrayRef stride,
-                                   c10::ScalarType dtype,
-                                   SpyreTensorLayout device_layout,
-                                   std::optional<c10::Device> device_opt) {
+at::Tensor spyre_empty_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, std::optional<c10::Device> device_opt,
+    std::optional<std::map<int64_t, ReservedDimInfo>> reserved_dims) {
   at::detail::check_size_nonnegative(size);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
@@ -1141,6 +1149,22 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
+  if (reserved_dims.has_value()) {
+    // The compiled wrapper passes a graph output's [min, max, granularity]
+    // here so that a later compile can read it back with get_reserved_dims.
+    // Unlike spyre_empty_reserved this does not pad the layout: the compiler
+    // has already sized device_layout for the declared max.
+    for (const auto& [rdim, info] : *reserved_dims) {
+      TORCH_CHECK(rdim >= 0 && rdim < static_cast<int64_t>(size.size()),
+                  "reserved dim ", rdim, " out of range for tensor of rank ",
+                  size.size());
+      TORCH_CHECK(info.granularity >= 1, "granularity must be >= 1, got ",
+                  info.granularity);
+      TORCH_CHECK(info.min <= info.max, "min=", info.min,
+                  " must be <= max=", info.max, " at dim ", rdim);
+    }
+    spyre_tensor_impl->reserved_dims = std::move(*reserved_dims);
+  }
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -1469,10 +1493,9 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "sharded Spyre tensors only support whole-tensor copies");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
-  // Dtype-converting DMA is rejected: the D2H conversion path bounds its
-  // host output only through the post-factory host_capacity_bytes write in
-  // spyre_stream.cpp (a flex-side TODO), and converting shard copies are
-  // untested against it.
+  // Dtype-converting DMA is rejected: converting shard copies are untested
+  // against the D2H conversion path, which bounds its host output by the
+  // host_capacity the DMA factories set.
   TORCH_CHECK(host.dtype() == sharded.dtype(),
               "sharded Spyre tensors can only be copied without a dtype "
               "change (got ",
@@ -1870,9 +1893,88 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
+  // Sharded storage is a table of per-shard allocations whose layout
+  // describes one shard, so the checks below do not apply to it. Reject it
+  // here with the sharding message; get_composite_address would too, but only
+  // after the partial-view check below had misreported it.
+  TORCH_CHECK(!spyre_is_sharded(self),
+              "this operation does not support sharded Spyre tensors yet "
+              "(sharded storage can only be copied to or from the CPU)");
+
+  // The device-side MEMORY_FILL below writes every stick of the composite
+  // address, i.e. the whole storage, so it is only correct when self covers
+  // every element of the tensor that owns the storage, each exactly once. A
+  // partial view (d[8:16], d[:, 32:], d[:8], ...) would otherwise silently
+  // overwrite the elements outside it.
+  //  - self must be non-overlapping and dense: a broadcast view such as
+  //    d[:1].expand(64, 64) has the base's offset and element count but
+  //    covers only row 0. A transpose (d.t()) is dense and still fills.
+  //  - The root (a tracked view's base, otherwise self) must be the whole
+  //    tensor: at storage offset 0, with the elements its layout holds. That
+  //    catches a tensor sharing storage without view tracking
+  //    (d[8:16].detach()), and also a tracked view of one
+  //    (d[8:16].detach().view(-1)), whose base is that partial tensor. For a
+  //    reservation (to("spyre", dynamic=...)) the layout is sized for the
+  //    reserved max, and the space beyond the current shape holds no other
+  //    tensor's data, so the current shape is the whole tensor. A layout
+  //    whose valid_elements is unknown ({}) is not checked.
+  //  - A tracked view must also cover all of its base: the same storage
+  //    offset and element count.
+  // TODO(brunhe704): fill partial views that cover whole sticks with per-run
+  // fills.
+  TORCH_CHECK(self.is_non_overlapping_and_dense(),
+              "fill_/zero_ of a broadcast or overlapping view of a Spyre "
+              "tensor is not supported yet: the device fill writes every "
+              "stick of the storage once (view: ",
+              self.sizes(), " with strides ", self.strides(),
+              "). Fill the underlying tensor, or a CPU copy, instead.");
+  const at::TensorBase& root =
+      self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  const auto* root_impl =
+      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  int64_t whole_elements = -1;  // -1: unknown, do not check the root
+  if (root_impl->has_intact_reservation()) {
+    whole_elements = root.numel();
+  } else if (!root_impl->spyre_layout.valid_elements.empty()) {
+    whole_elements = 1;
+    for (const auto& [dims, count] : root_impl->spyre_layout.valid_elements) {
+      whole_elements *= count;
+    }
+  }
+  const bool root_is_whole =
+      whole_elements < 0 ||
+      (root.storage_offset() == 0 && root.numel() == whole_elements);
+  const bool covers_root = self.storage_offset() == root.storage_offset() &&
+                           self.numel() == root.numel();
+  TORCH_CHECK(root_is_whole && covers_root,
+              "fill_/zero_ of a partial view of a Spyre tensor is not "
+              "supported yet: the device fill writes whole sticks of the "
+              "storage, so it would also overwrite the elements outside the "
+              "view (view: ",
+              self.sizes(), " at storage offset ", self.storage_offset(),
+              "; the whole tensor has ",
+              whole_elements >= 0 ? whole_elements : root.numel(),
+              " elements at storage offset ",
+              whole_elements >= 0 ? 0 : root.storage_offset(),
+              "). Fill the whole tensor, or fill a CPU copy and copy it "
+              "back.");
+
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
+
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
 
   // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
   // to the dtype-specific fill pattern; launchFillAsync submits it.

@@ -33,6 +33,7 @@ from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.exc import InductorError
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.virtualized import V
@@ -46,6 +47,9 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
+
+from utils_inductor import expects_raise
+from torch_spyre._inductor.loop_facts import read_advance
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
@@ -129,7 +133,7 @@ def _nest_mismatch(nest: dict[str, CoarseTileInfo], expected: _Counts) -> Option
 
     Prefix holds for a nest that tiles only output dims, which is all these
     cases write.  A nest that tiles a reduction dim can give its fill op a
-    subset of levels that skips one (``_compute_fill_loop_info_planned``);
+    subset of levels that skips one (the legacy transform's fill);
     such a nest never matches here, and no case expects one to.
     """
     path = max((info.loop_group_id for info in nest.values()), key=len)
@@ -261,6 +265,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
+    read_advances: dict[str, list[tuple]] = {}
     core_splits: dict[str, dict[int, int]] = {}
     lx_resident: set[str] = set()
 
@@ -274,6 +279,16 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
             if getattr(op, "loop_info", None) is not None
         ]
         type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
+        # Per op, the advance of each read per trip at each level, from the record or
+        # the index, whichever the op carries.
+        type(self).read_advances = {
+            op.get_name(): [
+                tuple(read_advance(op, dep))
+                for dep in op.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            for op in tiled
+        }
         type(self).core_splits = {
             op.get_name(): dict(op.op_it_space_splits[0])
             for op in tiled
@@ -965,6 +980,37 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # sum(0) drops the producer's dim 0, so the consumer's d0 is dim 1.
         self._assert_group_split(lambda x, y: (x + y).sum(dim=0))
 
+    def test_apply_builds_each_tiled_group_into_a_loop_node(self):
+        """The allocator's tiling goes through the same transform as span-overflow
+        and is built into LoopNodes after the pass, one per group, each with its own
+        loop variable."""
+        from torch_spyre._inductor.loop_checker import find_violations
+        from torch_spyre._inductor.loop_node import LoopNode, all_ops
+
+        seen: dict = {}
+        original = ts_passes._hand_off_loop_nodes
+
+        def spy(graph):
+            nodes = [op for op in graph.operations if isinstance(op, LoopNode)]
+            seen["nodes"] = [
+                (
+                    n.get_name(),
+                    n.induction,
+                    [o.get_operation_name() for o in all_ops(n.body)],
+                )
+                for n in nodes
+            ]
+            seen["violations"] = find_violations(list(graph.operations))
+            return original(graph)
+
+        with patch.object(ts_passes, "_hand_off_loop_nodes", spy):
+            self._assert_group_split(lambda x, y: (x + y).sum(dim=0))
+        self.assertEqual(len(seen["nodes"]), 2, seen["nodes"])
+        inductions = [n[1] for n in seen["nodes"]]
+        self.assertNotIn(None, inductions)
+        self.assertEqual(len({i.name for i in inductions}), 2, inductions)
+        self.assertEqual(seen["violations"], [])
+
     def test_apply_splits_a_narrowing_consumer_from_the_nest(self):
         # Same dim, half the rows: tile t reads 8 rows where the producer
         # wrote 16.
@@ -991,6 +1037,35 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         ):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
         self.assertIn("more than once along", str(refusal.exception))
+
+    @expects_raise
+    def test_apply_refuses_a_nested_tiling(self):
+        """A two-level choice makes one group with two loop levels, and the
+        lowering builds one standalone loop per group (#6088). The search is
+        bounded to one level (``MAX_SEARCH_TILE_DEPTH``); forcing a nest checks the
+        apply itself.
+
+        TODO: when nested loops are supported this becomes a positive test."""
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        nested = TileSpec(
+            (TileAxis(host_dim=0, count=2), TileAxis(host_dim=1, count=2))
+        )
+
+        def chosen(graph, allocation):
+            return {
+                op.get_operation_name(): nested
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        with (
+            patch(_CHOSEN_TILINGS, chosen),
+            self.assertRaises(InductorError) as refusal,
+        ):
+            self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self.assertIn("nested loop tiling is not supported", str(refusal.exception))
+        self.assertIn("#6088", str(refusal.exception))
 
     def test_apply_accepts_a_consumer_that_reads_in_step(self):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
@@ -1144,9 +1219,10 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             and not name.startswith("coarse_tile_copy_")
         ]
         # The redirected read reached codegen advancing a tile's 16 rows along
-        # dim 0: without this the body would pass on a read held still.
-        outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
-        self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+        # dim 0 (16 rows of 8192 elements): without this the body would pass on a
+        # read held still.
+        outer = [advance[0] for advance in CollectTilingPasses.read_advances[consumer]]
+        self.assertIn(16 * 64 * 128, outer, _describe(tiling))
 
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and

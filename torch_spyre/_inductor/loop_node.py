@@ -29,8 +29,8 @@ the readers in between descend into them; at that hand-off
 :func:`peel_non_members` moves an op a pass left at the edge of a body
 without the loop's ``loop_info`` back out of the node.  :func:`expand`
 flattens them only
-on a pass error, for the passes in ``passes._PASSES_RUN_EXPANDED``, and in the
-equivalence tests that compare against the flat path.
+on a pass error, for any pass in ``passes._PASSES_RUN_EXPANDED`` (none at
+present), and in the equivalence tests that compare against the flat path.
 """
 
 from __future__ import annotations
@@ -308,18 +308,33 @@ class OpsView(MutableSequence):
         self._changed()
         del lst[j]
 
+    def hoist_to_front(self, ops: Iterable[ir.Operation]) -> None:
+        """Move ``ops``, in the order given, to the head of the TOP-LEVEL list,
+        taking each out of whichever list holds it (a loop body included).
+
+        This is the one edit that crosses a node boundary on purpose, which
+        ``view[:] = ...`` cannot express: it only permutes ops within the list
+        that holds them. ``dedup_and_promote_constants`` uses it to take
+        loop-invariant constants out of their loops. Drops the flat cache.
+        """
+        ops = list(ops)
+        for op in ops:
+            lst, i = self._locate(op)
+            lst.pop(i)
+        self.real[:0] = ops
+        self._changed()
+
     def _reorder(self, s: slice, new_flat: Iterable[ir.Operation]) -> None:
-        """``view[:] = reordered``: the one wholesale rewrite after the splice
-        (``dedup_and_promote_constants``).
+        """``view[:] = reordered``: a wholesale rewrite of the flat order.
 
         The view only receives a flat order, so it cannot tell whether a pass
         meant to move an op across a node boundary.  It therefore keeps every
         op in the list that holds it and only permutes ops WITHIN each list;
         nodes keep their place among the ops around them.  A pass that really
-        wants to hoist or sink an op across a boundary needs a different API:
-        this is the one place where the flat view hides a decision, and where
-        the expanded order can differ from what the same rewrite would give on
-        a flat list (a reordered op that sits in a body).
+        wants to hoist or sink an op across a boundary needs a different API
+        (:meth:`hoist_to_front`): through this one the expanded order can differ
+        from what the same rewrite would give on a flat list (a reordered op that
+        sits in a body). No pass in the pipeline reorders wholesale any more.
         """
         if s != slice(None):
             raise NotImplementedError("only view[:] = ... is supported")
@@ -425,13 +440,23 @@ def insert_before(
 
 
 def insert_after(
-    operations: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+    operations: list[ir.Operation] | OpsView,
+    anchor: ir.Operation,
+    op: ir.Operation,
 ) -> None:
     """Insert ``op`` immediately after ``anchor``, in the list that holds it.
 
     After a :class:`LoopNode` the op runs once, after the last trip (the
     allocator's post-loop drain). After a body op it runs every trip.
+
+    ``operations`` may be the flat :class:`OpsView` a pass is handed: the op then
+    goes next to its anchor in the nested list. ``view.insert`` cannot say that, and
+    puts an op inserted past the last flat position at the top level, outside the
+    loop it was meant for.
     """
+    if isinstance(operations, OpsView):
+        operations._changed()
+        operations = operations.real
     lst, i = _holder(operations, anchor)
     lst.insert(i + 1, op)
 
@@ -477,6 +502,7 @@ def _wrap(
     prefix: tuple[int, ...],
     inductions: Mapping[int, sympy.Symbol],
     counter: list[int],
+    only: frozenset[int] | None = None,
 ) -> list[ir.Operation]:
     """Wrap runs of ``ops`` sharing a ``loop_group_id`` prefix of length
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
@@ -492,7 +518,11 @@ def _wrap(
     i = 0
     while i < len(ops):
         path = _group_path(ops[i])
-        if len(path) <= depth or path[:depth] != prefix:
+        if (
+            len(path) <= depth
+            or path[:depth] != prefix
+            or (only is not None and depth == 0 and path[0] not in only)
+        ):
             out.append(ops[i])
             i += 1
             continue
@@ -509,11 +539,58 @@ def _wrap(
             trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
-        node.body = _wrap(run, depth + 1, key, inductions, counter)
+        node.body = _wrap(run, depth + 1, key, inductions, counter, only)
         node.carries = _carries_of(node.body)
         out.append(node)
         i = last + 1
     return out
+
+
+_PENDING_ATTR = "pending_loop_inductions"
+
+
+def request_loop_nodes(graph: Any, inductions: Mapping[int, sympy.Symbol]) -> None:
+    """Ask for the loops whose group index is in ``inductions`` to become nodes.
+
+    A lowering that builds a loop in the middle of the pass pipeline records it
+    here instead of wrapping it: the pass that called it may still be iterating
+    ``graph.operations`` (a flat view, or the real list), and a node wrapped under
+    it would change what the rest of the pass sees. The pass loop calls
+    :func:`build_pending_loop_nodes` once the pass has returned.
+    """
+    if inductions:
+        pending = getattr(graph, _PENDING_ATTR, None) or {}
+        pending.update(inductions)
+        setattr(graph, _PENDING_ATTR, pending)
+
+
+def build_pending_loop_nodes(graph: Any) -> None:
+    """Wrap the loops :func:`request_loop_nodes` named, leaving every other op
+    (existing nodes, flat loops no lowering has converted yet) where it is.
+
+    Called with the real list, after the pass that built the loops has returned.
+    Node names continue after the nodes already present.
+    """
+    pending = getattr(graph, _PENDING_ATTR, None)
+    if not pending:
+        return
+    setattr(graph, _PENDING_ATTR, None)
+    if not BUILD_LOOP_NODES:
+        return
+    operations = graph.operations
+    assert not isinstance(operations, OpsView), "needs the real list"
+    existing = sum(1 for _ in _nodes_in(operations))
+    with building_loop():
+        operations[:] = _wrap(
+            list(operations), 0, (), pending, [existing], frozenset(pending)
+        )
+
+
+def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
+    for op in operations:
+        if isinstance(op, LoopNode):
+            yield op
+            yield from _nodes_in(op.body)
 
 
 def collapse(

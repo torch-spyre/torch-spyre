@@ -29,7 +29,7 @@ from sympy import Expr
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
-from torch._inductor.utils import sympy_index_symbol, sympy_subs
+from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -129,57 +129,12 @@ def _clear_cache(obj: object, key: str) -> None:
         object.__delattr__(obj, key)
 
 
-class _ReadThroughLayout:
-    """Trace a consumer against the buffer it reads, not the producer's tile.
-
-    A consumer's ``inner_fn`` holds the loader Inductor bound to the producer
-    at lowering, and that loader rebuilds its indexer from the producer's
-    layout at every trace (``Buffer.make_loader``). After ``_divide_ranges``
-    that layout is the tile's, so a consumer in another loop nest, which reads
-    the producer's full buffer in HBM, would derive its index from a shape it
-    never reads: a dim the tile consumed whole has size 1 there and gets no
-    term at all (``_fixed_indexer``). For the duration of the trace, make the
-    producer's layout describe ``read`` instead, so the index comes out as if
-    the consumer had been lowered against that buffer.
-
-    The host fields are swapped on the shared layout object itself: a
-    consumer's loader may hold an earlier ``ComputedBuffer`` object for the
-    producer, and every such object shares this layout
-    (``replace_computed_buffer_body`` passes ``layout=op.layout``), exactly as
-    ``_divide_ranges`` relies on when it shrinks it in place. The device
-    layout is not touched: codegen resolves it by the name the load carries.
-    """
-
-    def __init__(self, layout: Layout, read: Layout):
-        if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            # Readers of a mutation target hold the target's own layout.
-            layout = layout.real_layout()
-        self._layout = layout
-        self._read = read
-        self._saved: tuple[list[Expr], list[Expr], Expr] | None = None
-
-    def __enter__(self) -> None:
-        layout = self._layout
-        self._saved = (list(layout.size), list(layout.stride), layout.offset)
-        layout.size = list(self._read.size)
-        layout.stride = list(self._read.stride)
-        layout.offset = self._read.offset
-        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
-
-    def __exit__(self, *exc: object) -> None:
-        assert self._saved is not None
-        layout = self._layout
-        layout.size, layout.stride, layout.offset = self._saved
-        self._saved = None
-        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
-
-
 def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     """Map ir_node's raw host-range positions to their squeezed d{i} number.
 
     Mirrors SpyreKernel._host_dim_to_index_symbol's own squeeze arithmetic
     (same source of truth, duplicated here because that method maps one
-    dim at a time and _tiled_dims_for_dep needs the whole table to build a
+    dim at a time and the callers need the whole table to build a
     dep_dims membership test): output dims are numbered densely over
     ir_node.data.ranges, skipping unit-size (==1) entries; reduction dims
     continue the same counter, offset by n_output_dims, over
@@ -212,46 +167,6 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
             pos[raw_n_output_dims + host_idx] = squeezed_n_output_dims + red_it_idx
             red_it_idx += 1
     return pos
-
-
-def _affine_point_read_index(
-    index: Expr, loop_vars: set[sympy.Symbol]
-) -> tuple[Expr, dict[sympy.Symbol, Expr]]:
-    """Decompose a point-read index into base plus affine loop advances."""
-    index = sympy.expand(sympy.sympify(index))
-    active_loop_vars = loop_vars & index.free_symbols
-    if not active_loop_vars:
-        return index, {}
-
-    coefficients: dict[sympy.Symbol, Expr] = {}
-    for loop_var in active_loop_vars:
-        coefficient = sympy.diff(index, loop_var)
-        if coefficient.free_symbols:
-            raise Unsupported(
-                f"point-read index {index} is not affine in spliced loop "
-                f"variables {sorted(map(str, loop_vars))} with a constant stride"
-            )
-        coefficients[loop_var] = coefficient
-
-    base = sympy.simplify(
-        index
-        - sum(
-            (coefficient * loop_var for loop_var, coefficient in coefficients.items()),
-            sympy.S.Zero,
-        )
-    )
-    if base.free_symbols & loop_vars:
-        raise Unsupported(
-            f"point-read index {index} is not a loop-invariant base plus "
-            "constant per-level advances"
-        )
-    reconstructed = base + sum(
-        (coefficient * loop_var for loop_var, coefficient in coefficients.items()),
-        sympy.S.Zero,
-    )
-    if sympy.simplify(index - reconstructed) != 0:
-        raise Unsupported(f"could not safely decompose point-read index {index}")
-    return base, coefficients
 
 
 def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
@@ -332,7 +247,7 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     ``d0 + 2*u0`` for a 2-row-per-iteration write into a dim tiled to size 2
     -- so requiring sym to be the ONLY free symbol never matches that case;
     the coefficient test is what catches it. Callers that consume this
-    position (_tiled_dims_for_dep's _dim_is_read) already use the same
+    position (the stored-record builders' _dim_is_read) already use the same
     coefficient test to decide whether a dependency reads a dim, so this
     keeps the two symbol/pos mappings consistent for that case.
     """
@@ -343,17 +258,6 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
         if len(free) == 1 or coord.coeff(sym) != 0:
             return i
     return None
-
-
-def _splice_loop_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
-    """Every WhileLoop-splice loop_var symbol folded into op's own indices.
-
-    Identified, as everywhere else in this file, by the DimHint carrying a
-    non-None ``loop_var_range`` (see propagate_hints.py's DimHint
-    docstring); ordinary ``spyre_hint()`` loop vars are real ``dep.ranges``
-    keys and never appear here.
-    """
-    return set(loop_var_ranges_from_dim_hints(op))
 
 
 def _hint_ranges_pos(
@@ -448,8 +352,7 @@ def _hint_ranges_pos(
     # ``dep.index == 32*u0`` with no ``d{i}`` coordinates at all -- so
     # loop_var can appear in its index without ever being resolvable
     # through the marker map. That is not a gap: it is the shape
-    # _point_splice_advance_for_dep's caller (plan_coarse_tile_groups)
-    # handles through squeezed_advance_per_read once this function returns
+    # for_each_tile handles through squeezed_advance_per_read once this function returns
     # (None, False) for it, by stashing hint.loop_var into
     # unattributed_loop_vars. Counting it here as "mentions loop_var"
     # would raise on every legitimate point-splice-advance read instead of
@@ -551,11 +454,8 @@ def _loop_var_hinted_ranges(op: ComputedBuffer) -> dict[int, Expr]:
     is a multiplier over a larger extent that is never materialized as a
     real dim anywhere -- never a divisor of op.data.ranges[pos]. Callers
     that would otherwise divide a tiled dim's range by the level's loop
-    count (_planned_tile_extents_per_level, _compute_per_tile_ranges_planned,
-    _divide_ranges) must check this first and skip the divide for any pos
-    present here, matching the resolution pattern _tiled_dims_for_dep
-    already uses (pos_to_loop_var, built the same way, for its own
-    coefficient-based dep.index test).
+    count (_planned_tile_extents_per_level, _divide_ranges) must check this first and skip the divide for any pos
+    present here, using the same coefficient-based dep.index test as the stored-record builders.
     """
     hints = getattr(op, "dim_hints", None) or ()
     if not hints:
@@ -902,94 +802,6 @@ def _divide_ranges(
     return _DivideRangesResult(retiled_info, symbol_remap)
 
 
-class _PointReadRebaseHandler(WrapperHandler):
-    """Rebase only the exact point-read dependencies selected by planning."""
-
-    def __init__(self, inner, rebases: dict[tuple[str, Expr], Expr]):
-        super().__init__(inner)
-        self._rebases = rebases
-
-    def load(self, name, index):
-        canonical_index = sympy.sympify(index)
-        index = self._rebases.get((name, canonical_index), index)
-        return super().load(name, index)
-
-
-def _rebase_point_splice_reads(operations: list[Operation]) -> None:
-    """Pin a direct point read's index to its iteration-0 base.
-
-    Read-side counterpart of _rebase_splice_write_offset, for the one read
-    shape that is neither staged into a copy buffer nor resolvable to a
-    tiled dim: a POINT read (no iteration var) whose address moves with the
-    spliced loop, e.g. paged attention's in-body page index, dep.index ==
-    32*u0. _full_buffer_read_deps deliberately leaves such a read direct,
-    and _point_splice_advance_for_dep records its per-trip step in
-    squeezed_advance_per_read, from which SpyreKernel._general_tile_advance
-    emits the device_tile_advance_expr. Leaving the u0 term in the index too
-    would apply the step twice, and would leak a raw unbacked symbol into
-    device_coordinates, which op_spec_validation's _check_symbol_consistency
-    rejects since it is not an iteration_space key.
-
-    Runs after the copy/reduction/copy-out passes so it sees each op's final
-    body, and rebases a read only when squeezed_advance_per_read actually
-    carries its advance: any other read keeps its index as planned, so a
-    shape this does not cover still fails loudly downstream instead of
-    silently losing its per-trip step.
-    """
-    for op in list(operations):
-        if not isinstance(op, ComputedBuffer):
-            continue
-        if not isinstance(op.data, (Pointwise, Reduction)):
-            continue
-        loop_vars = _splice_loop_vars(op)
-        if not loop_vars:
-            continue
-        loop_info = getattr(op, "loop_info", None)
-        advances = getattr(loop_info, "squeezed_advance_per_read", [])
-        if not advances:
-            continue
-        rebases: dict[tuple[str, Expr], Expr] = {}
-        for idx, dep in enumerate(op.get_read_writes().reads):
-            if not (
-                isinstance(dep, MemoryDep)
-                and not dep.var_names
-                and (dep.index.free_symbols & loop_vars)
-                and idx < len(advances)
-                and any(advances[idx])
-            ):
-                continue
-            original_index = sympy.sympify(dep.index)
-            base_index, _ = _affine_point_read_index(original_index, loop_vars)
-            key = (dep.name, original_index)
-            previous = rebases.setdefault(key, base_index)
-            if previous != base_index:
-                raise Unsupported(
-                    f"point-read dependency {dep.name}[{original_index}] has "
-                    "conflicting rebased indices"
-                )
-        if not rebases:
-            continue
-
-        def new_inner_fn(*args, _orig=op.data.inner_fn, _rebases=rebases):
-            with V.set_ops_handler(_PointReadRebaseHandler(V.ops, _rebases)):
-                return _orig(*args)
-
-        object.__setattr__(op.data, "inner_fn", new_inner_fn)
-        new_op = replace_computed_buffer_body(
-            op,
-            op.data,
-            operations,
-            pass_name="coarse_tile",
-            reason="rebase point splice read to iteration 0",
-        )
-        V.graph.name_to_buffer[new_op.get_name()] = new_op
-        logger.debug(
-            "coarse_tile: rebased point splice reads %s for %s",
-            sorted(f"{name}[{index}]" for name, index in rebases),
-            new_op.get_name(),
-        )
-
-
 class _NameSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) calls for names present in name_map.
 
@@ -1023,9 +835,13 @@ class _NameSwapHandler(WrapperHandler):
         self,
         inner,
         name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+        loop_terms: dict[str, Expr] | None = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
+        # swapped name -> a loop term added to the rescaled index of a load that
+        # was swapped. A load of the new name that was NOT swapped is left alone.
+        self._loop_terms = loop_terms or {}
 
     def load(self, name, index):
         if name in self._name_map:
@@ -1033,29 +849,40 @@ class _NameSwapHandler(WrapperHandler):
             new_index = _rescale_index(
                 index, full_strides, tile_strides, strip_constant=True
             )
+            if name in self._loop_terms:
+                new_index = new_index + self._loop_terms[name]
             return super().load(new_name, new_index)
         return super().load(name, index)
 
 
-class _LoopVarRebaseHandler(WrapperHandler):
-    """Pin one advancing source load to its iteration-zero base address.
+class _AddLoopTermHandler(WrapperHandler):
+    """Add a loop term to the index of every load of one buffer.
 
-    A spliced ``for_each_tile`` body carries its induction variable directly
-    in graph-input load indexes.  A staged copy removes that term and
-    represents it through ``device_tile_advance_expr`` instead.  A direct
-    read restored after planning must use the same single representation;
-    otherwise the offset is applied twice and the raw unbacked symbol leaks
-    into the OpSpec coordinates.
+    The direct read that replaces a staged copy reads the copy's source buffer.
+    The copy's own read of that source carries the loop's advance as a term in
+    its index (``step * u``); the swapped-in read must carry the same term, or
+    the index and the stored per-trip step disagree. The term is taken from the
+    copy's index (``loop_term``), not from the record.
+
+    The consumer lists the loop variable in its ``dim_hints``, so
+    ``pass_utils.per_trip_index`` pins it in the base coordinates and it does not
+    reach ``device_coordinates``.
+
+    This adds the term to EVERY load of ``source_name``, so it is for a body that
+    loads it exactly once: the staged copy, which is a pure identity
+    (``identity_load`` requires one load). A consumer body that may load the same
+    buffer on its own uses ``_NameSwapHandler(loop_terms=...)`` instead, which adds
+    the term only to the loads that were swapped.
     """
 
-    def __init__(self, inner, source_name: str, loop_var_zeros: dict[Expr, Expr]):
+    def __init__(self, inner, source_name: str, loop_term: Expr):
         super().__init__(inner)
         self._source_name = source_name
-        self._loop_var_zeros = loop_var_zeros
+        self._loop_term = loop_term
 
     def load(self, name, index):
         if name == self._source_name:
-            index = sympy_subs(index, self._loop_var_zeros)
+            index = index + self._loop_term
         return super().load(name, index)
 
 
@@ -1475,9 +1302,9 @@ def _index_already_at_new_scale(
     """Return True when index's atom coefficients already match new_stride.
 
     A consumer in the same tiling group as a retiled buffer can be resynced
-    (by name) to a *replacement* ComputedBuffer object spliced in by Pass
-    2/3 after ``_apply_plan`` already ran -- see coarse_tile_post_stickify's
-    by-name resync comment above its ``_patch_retiled_load_indexes`` call.
+    (by name) to a *replacement* ComputedBuffer object spliced in after
+    the group was divided (the lowering resyncs by name before its
+    ``_patch_retiled_load_indexes`` call).
     That replacement's inner_fn may have been retraced against the
     producer's already-mutated (new_stride) layout, in which case its load
     index is already correct and must not be decomposed against old_stride
@@ -1596,7 +1423,7 @@ def _retile_load_index(
         # This consumer's index was traced *after* the producer's layout was
         # already mutated to new_stride (e.g. built/retraced during Pass
         # 2/3, from a same-name replacement object resynced into group_ops
-        # -- see coarse_tile_post_stickify's by-name resync comment), so it is
+        # -- see tile_groups's by-name resync comment), so it is
         # already correct at the target scale. Rewriting it again would
         # decompose already-new-scale coefficients against old_stride and
         # silently produce a wrong (but plausible-looking) index -- see
@@ -1768,11 +1595,9 @@ def _patch_retiled_load_indexes(
     if not infos_by_name:
         return
 
-    from ..pass_utils import replace_computed_buffer_body
-
-    # Only ops that were already in the group when _apply_plan ran can hold a
+    # Only ops that were already in the group when the group was divided can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
-    # by Pass 1/2 (e.g. _insert_copy_op's copy_buf) read the retiled
+    # (e.g. _insert_copy_out's copy_buf) read the retiled
     # buffer's already-updated layout directly, so rewriting them here would
     # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).
@@ -1802,3 +1627,48 @@ def _patch_retiled_load_indexes(
         )
         _replace_group_op(group_ops, op, new_op)
         V.graph.name_to_buffer[new_op.get_name()] = new_op
+
+
+class _ReadThroughLayout:
+    """Trace a consumer against the buffer it reads, not the producer's tile.
+
+    A consumer's ``inner_fn`` holds the loader Inductor bound to the producer
+    at lowering, and that loader rebuilds its indexer from the producer's
+    layout at every trace (``Buffer.make_loader``). After ``_divide_ranges``
+    that layout is the tile's, so a consumer in another loop nest, which reads
+    the producer's full buffer in HBM, would derive its index from a shape it
+    never reads: a dim the tile consumed whole has size 1 there and gets no
+    term at all (``_fixed_indexer``). For the duration of the trace, make the
+    producer's layout describe ``read`` instead, so the index comes out as if
+    the consumer had been lowered against that buffer.
+
+    The host fields are swapped on the shared layout object itself: a
+    consumer's loader may hold an earlier ``ComputedBuffer`` object for the
+    producer, and every such object shares this layout
+    (``replace_computed_buffer_body`` passes ``layout=op.layout``), exactly as
+    ``_divide_ranges`` relies on when it shrinks it in place. The device
+    layout is not touched: codegen resolves it by the name the load carries.
+    """
+
+    def __init__(self, layout: Layout, read: Layout):
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            # Readers of a mutation target hold the target's own layout.
+            layout = layout.real_layout()
+        self._layout = layout
+        self._read = read
+        self._saved: tuple[list[Expr], list[Expr], Expr] | None = None
+
+    def __enter__(self) -> None:
+        layout = self._layout
+        self._saved = (list(layout.size), list(layout.stride), layout.offset)
+        layout.size = list(self._read.size)
+        layout.stride = list(self._read.stride)
+        layout.offset = self._read.offset
+        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
+
+    def __exit__(self, *exc: object) -> None:
+        assert self._saved is not None
+        layout = self._layout
+        layout.size, layout.stride, layout.offset = self._saved
+        self._saved = None
+        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
