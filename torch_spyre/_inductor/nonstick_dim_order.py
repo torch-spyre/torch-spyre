@@ -643,8 +643,8 @@ def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
         [stl.device_size[i] for i in order],
         [stl.stride_map[i] for i in order],
         stl.device_dtype,
-        stl.element_arrangement,
         valid_elements,
+        stl.element_arrangement,
     )
 
 

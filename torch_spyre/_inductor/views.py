@@ -14,7 +14,7 @@
 
 # Helper methods to handle views
 
-from dataclasses import dataclass, astuple
+from dataclasses import dataclass
 import functools
 import math
 import sympy
@@ -1182,18 +1182,18 @@ def align_tensors_pure(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
-        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
-            if var is not None:
-                if den != stick_size[i] or var != stick_dim[i]:
+        for term in terms:
+            if term.var is not None:
+                if term.den != stick_size[i] or term.var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
-                    splits[var].add(den)
+                    splits[term.var].add(term.den)
                 if (
-                    mod != stick_size[i]
-                    or var != stick_dim[i]
-                    or var in repeat_info.keys()
+                    term.mod != stick_size[i]
+                    or term.var != stick_dim[i]
+                    or term.var in repeat_info.keys()
                 ):
                     # add mod to splits unless stick dim and stick size
-                    splits[var].add(mod)
+                    splits[term.var].add(term.mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
     for var in new_vars:
@@ -1298,9 +1298,13 @@ def align_tensors_pure(
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size, offset in [
-            astuple(term) for term in terms[:-1]
-        ]:
+        for term in terms[:-1]:
+            num = term.num
+            den = term.den
+            var = term.var
+            mod = term.mod
+            dim_size = term.dim_size
+            offset = term.offset
             # for each term except last one (stick dim)
             if var is None:
                 # offset holds either 0 (broadcast/scalar dim) or an IndirectAccess
@@ -1332,16 +1336,21 @@ def align_tensors_pure(
             if var == stick_dim[j] and den == stick_size[j] and den not in splits[var]:
                 # outer stick dim
                 size[-1] //= den
-                (offset, term) = coordinates[-1].as_coeff_Add()
-                coordinates[-1] = term // den + offset
+                (offset, rest) = coordinates[-1].as_coeff_Add()
+                coordinates[-1] = rest // den + offset
             # normalize_coordinates realizes any stride (num > 1) on a
             # non-stick dim as an explicit gap term, so nothing is left here.
             assert num == 1, f"unexpected stride {num} on non-stick term for {var}"
         # add stick dim
-        num, den, var, mod, dim_size, offset = astuple(terms[-1])
-        size.append(dim_size)
+        stick_term = terms[-1]
+        size.append(stick_term.dim_size)
         coordinates.append(
-            (var % dim_size if var is not None else sympy.S.Zero) + offset
+            (
+                stick_term.var % stick_term.dim_size
+                if stick_term.var is not None
+                else sympy.S.Zero
+            )
+            + stick_term.offset
         )
         new_tensors.append({"size": size, "coordinates": coordinates})
 

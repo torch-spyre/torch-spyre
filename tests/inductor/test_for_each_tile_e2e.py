@@ -134,6 +134,10 @@ from for_each_tile_fixtures import (
     paged_gather_nested_fn,
     paged_gather_nested_reference,
     paged_gather_reference,
+    reshape_mul_sum_tiled_fn,
+    reshape_mul_sum_tiled_reference,
+    reshape_sum_tiled_fn,
+    reshape_sum_tiled_reference,
     scatter_carry_fn,
     scatter_carry_old_value_fn,
     softmax_row_tiled_fn,
@@ -675,8 +679,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
+        the advance read off the index, leave the read direct (never staged
+        into scratch),
         keep the loop term in the index (per_trip_index pins it in the base
         coordinates, so the advance is not applied twice), and
         insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
@@ -901,6 +905,73 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         # corrupt stick groups after the first with an error far exceeding
         # fp16 rounding noise on random inputs in [0, 1).
         torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+    def test_reshape_sum_tiled_multi_stick(self):
+        """Issue #6407 shape class: the reduce axis only exists in a reshaped
+        view of the tile, entering the load with a stride that is a multiple
+        of the tile's row stride (here 16*128 vs 128)."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_column_tiled(self):
+        """#6407 on column tiles: the tile reads its input at row stride 128
+        but its own layout has row stride 64, so folding the reduce term into
+        any dim but the row dim reads the wrong elements."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 64, 8, dim=1)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 64, 8, 1)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_mul_sum_tiled_whole_operand(self):
+        """Wrong-answer form of #6407: a whole operand keeps the reduce axis in
+        the kernel, so the bug compiled and read one tile window per step."""
+        X = cached_randn((STICK_ROWS, STICK_COLS))
+        W = cached_randn((128, STICK_COLS))
+        ref = reshape_mul_sum_tiled_reference(X.float(), W.float(), 128, 8)
+
+        compiled = torch.compile(
+            reshape_mul_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X.to(DEVICE_NAME), W.to(DEVICE_NAME), 128, 8)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 class TestForEachTileNestedMapE2E(_DynamoResetTestCase):

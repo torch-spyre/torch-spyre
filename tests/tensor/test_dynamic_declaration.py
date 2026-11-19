@@ -85,6 +85,18 @@ class TestDynamicDeclarationValidation(TestCase):
             "exceeding the cap",
         )
 
+    def test_default_cap_is_256_buckets(self) -> None:
+        # The default as a user sees it: 256 buckets are accepted and 257 are
+        # refused (#6432). `MAX_BUCKETS` overrides it per process.
+        self.assertEqual(inductor_config.max_buckets, 256)
+        spec = {"min": 8, "max": 2048, "granularity": 8}
+        x_dev = self.x.to(DEVICE, dynamic={0: spec})
+        self.assertEqual(get_reserved_dims(x_dev), {0: spec})
+        self._assert_rejected(
+            {"min": 8, "max": 2056, "granularity": 8},
+            "257 buckets, exceeding the cap of 256",
+        )
+
     def test_real_size_outside_declared_range_rejected(self) -> None:
         # Not one of the declaration-only rules above: the *current*
         # tensor's size must itself be admissible under the declared range.
