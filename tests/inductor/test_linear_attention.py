@@ -18,9 +18,10 @@ Four levels, in the order a failure is worth reading:
 
   1. ALGORITHM -- on CPU, no device. ``spyre_linear_attention`` (the real
      decomposition, which only needs plain torch ops, ``for_each_tile`` and the
-     CPU-built mask) against a token-by-token fp32 recurrence that shares no
-     structure with it, and the recurrence against the O(L^2) masked form so the
-     yardstick itself is checked. fp32 on both sides, so tolerances are tight.
+     mask's ``spyre::arange`` ramp, given a CPU kernel below) against a
+     token-by-token fp32 recurrence that shares no structure with it, and the
+     recurrence against the O(L^2) masked form so the yardstick itself is
+     checked. fp32 on both sides, so tolerances are tight.
      It also covers the feature map against ``F.elu`` and that the chunk loop
      traces to ONE ``scan`` whatever the sequence length.
 
@@ -62,6 +63,18 @@ from torch_spyre._inductor.linear_attention import (
 )
 from torch_spyre._inductor.sliding_window_plan import STICK
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
+
+
+@torch.library.register_kernel("spyre::arange", "cpu")
+def _cpu_arange(length, dtype, device, column=False, owned=False):
+    """The causal mask's ramp for the level-1 checks, which run on CPU.
+
+    ``spyre::arange`` is a Spyre-only op; this host kernel exists only for
+    these tests, which run the decomposition on CPU tensors.
+    """
+    ramp = torch.arange(length, dtype=dtype)
+    return ramp.unsqueeze(-1).clone() if column else ramp
+
 
 # fp32 CPU tolerance. Across the shape grid below (L up to 300, Dk/Dv up to 128,
 # chunk 64-256) the worst error of the chunked form against the recurrence is
@@ -328,19 +341,6 @@ def test_chunk_size_does_not_change_the_result():
     _assert_fp32_close(small_state, large_state, "state")
 
 
-@pytest.mark.parametrize(
-    "height,width,diagonal",
-    [(64, 64, 0), (64, 64, -1), (64, 64, 3), (4, 7, 0), (7, 4, 1)],
-    ids=lambda v: str(v),
-)
-def test_tril_mask_matches_torch_tril(height, width, diagonal):
-    mask = torch.ops.spyre.tril_mask(
-        height, width, diagonal, torch.float16, torch.device("cpu")
-    )
-    expected = torch.tril(torch.ones(height, width), diagonal).to(torch.float16)
-    assert torch.equal(mask, expected)
-
-
 def _trace_chunk_loop(num_chunks, chunk_size=64):
     """Trace the chunk recurrence the way an AOT decomposition reaches it."""
     query, key, value = _inputs(
@@ -406,9 +406,10 @@ def _graph_targets(gm):
 
 @pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "noncausal"])
 def test_single_token_call_has_no_mask_or_loop(is_causal):
-    """Decode (``L == 1``) is one state update and one matmul: no ``tril_mask``
-    and no chunk loop in the traced graph. The token axis is still padded to a
-    stick for the update, because a contraction-1 matmul does not lower."""
+    """Decode (``L == 1``) is one state update and one matmul: no mask (so no
+    ``spyre.arange`` coordinate) and no chunk loop in the traced graph. The
+    token dim is still padded to a stick for the update, because a
+    contraction-1 matmul does not lower."""
     query, key, value = _inputs(1, 2, 1, 64, 64, dtype=torch.float32)
     state = _state(1, 2, dtype=torch.float32)
 
@@ -418,7 +419,7 @@ def test_single_token_call_has_no_mask_or_loop(is_causal):
     gm = make_fx(decode, tracing_mode="fake")(query, key, value, state)
 
     targets = _graph_targets(gm)
-    assert torch.ops.spyre.tril_mask.default not in targets
+    assert torch.ops.spyre.arange.default not in targets
     assert _scan_nodes(gm) == []
 
 
@@ -432,7 +433,7 @@ def test_multi_token_call_still_builds_the_mask():
         tracing_mode="fake",
     )(query, key, value)
 
-    assert torch.ops.spyre.tril_mask.default in _graph_targets(gm)
+    assert torch.ops.spyre.arange.default in _graph_targets(gm)
 
 
 def test_unsupported_device_dtype_is_refused():
