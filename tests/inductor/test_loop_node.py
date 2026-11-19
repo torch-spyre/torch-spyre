@@ -929,6 +929,19 @@ class TestDeadcodeOnRealNestedList(unittest.TestCase):
         survivors = self._run([acc, node, keep], output_names=["keep"])
         self.assertEqual(survivors, [keep])
 
+    def test_a_dead_leaf_is_removed_from_its_body_through_the_flat_view(self):
+        """As the pass runs it: ``graph.operations`` is the flat view, and a dead op
+        inside a body leaves that body, not the top level."""
+        keep = self._buf("keep")
+        live = self._buf("live")
+        dead = self._buf("dead")
+        node = _node("loopnode0", [live, dead])
+        real = [node, keep]
+        self._run(OpsView(real), output_names=["keep", "live"])
+        self.assertEqual(node.body, [live])
+        self.assertEqual(real, [node, keep])
+        self.assertIn("dead", V.graph.removed_buffers)
+
     def test_impure_fallback_keeps_loop(self):
         fb = MagicMock(spec=FallbackKernel)
         fb.has_side_effects.return_value = True
