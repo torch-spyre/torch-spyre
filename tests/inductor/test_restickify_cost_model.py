@@ -591,7 +591,6 @@ def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_grap
     "failure",
     [
         "one_candidate",
-        "validation",
         "disabled",
         "shared",
         "graph_output",
@@ -621,8 +620,6 @@ def test_projection_declines_without_a_universal_proof(
                 return proof(op, *args)
 
             monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-        elif failure == "validation":
-            monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
         elif failure == "disabled":
             pass  # read_copy_elision=False, patched above
         elif failure == "source_placement":

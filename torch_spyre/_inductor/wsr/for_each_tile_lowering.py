@@ -88,6 +88,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -679,7 +680,9 @@ def _marker_axis_is_consumed(axis_coords: "list[sympy.Expr] | None") -> bool:
     return all(not c.free_symbols for c in axis_coords)
 
 
-def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
+def _delinearize_index(
+    index: sympy.Expr, size, stride, offset, *, fold_into_any_dim: bool = False
+) -> list[sympy.Expr]:
     """Invert a FixedLayout-style flat index back into per-dim coordinates.
 
     ``ops.load(name, index)`` receives ``index`` already flattened by the
@@ -693,7 +696,11 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     multiple of a stride: a reduction variable flattened through a
     contiguous reshape of the marker enters as ``512*d2`` against the
     marker's dim stride 64 (issue #6407). Such a term is folded into the
-    dim with the largest stride that divides it (``8*d2``).
+    dim with the largest stride, which must divide it (``8*d2``). With
+    ``fold_into_any_dim`` -- the caller composes the coordinates through
+    these same strides, so any exact split gives the same address -- it is
+    folded into the largest stride that divides it, which may be an inner
+    dim's and leave that coordinate out of range.
 
     A dim's coordinate can also be a compile-time-constant integer rather
     than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
@@ -709,10 +716,11 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
 
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
     constant portion doesn't decompose evenly across the constant dims, if
-    a recovered digit is out of bounds for its dim's size, or if a symbolic
-    term's coefficient is a multiple of no dim's stride -- all four
-    indicate the one-symbol/one-stride-per-term assumption above doesn't
-    hold for this index.
+    a recovered digit is out of bounds for its dim's size, or if a leftover
+    symbolic term is not an integer multiple of a single symbol or its
+    coefficient is not a multiple of a stride it may be folded into -- all
+    of which indicate the one-symbol/one-stride-per-term assumption above
+    doesn't hold for this index.
     """
     remaining = sympy.expand(index - offset)
     free_syms = remaining.free_symbols
@@ -788,9 +796,12 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
 
     # .coeff(st) only matches a term whose numeric factor is exactly st, so
     # a term at a multiple of a stride (512*d2 against 64) is still missing
-    # from coords here. Fold it into the largest stride that divides it: for
-    # a load flattened through this layout a smaller stride would put the
-    # coordinate out of bounds.
+    # from coords here. The largest-stride dim can take it: in a dense layout
+    # a valid flat index keeps that coordinate below its size whatever the
+    # loop variables' ranges, which the ops handler never receives. An inner
+    # dim can overflow (128*r into [2, 4, 64] gives b + 2*r, up to 7). That
+    # only matters if the caller composes the coordinates through other
+    # strides, so an inner dim takes a term only with fold_into_any_dim.
     recovered = sum(
         (coords[i] * stride[i] for i in range(len(coords)) if stride[i] != 0),
         sympy.S.Zero,
@@ -800,23 +811,55 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
         # S.Zero.as_ordered_terms() is [0], which would raise below for a
         # layout with no foldable dim (all size-1 or broadcast).
         return coords
+    live = [i for i in range(len(coords)) if stride[i] != 0 and size[i] != 1]
+    if not fold_into_any_dim:
+        # A symbolic stride hides which dim has the largest one.
+        live = (
+            [max(live, key=lambda i: int(stride[i]))]
+            if live and all(sympy.sympify(stride[i]).is_Integer for i in live)
+            else []
+        )
     for term in leftover.as_ordered_terms():
         coeff = term.as_coeff_Mul()[0]
-        eligible = [
-            i
-            for i in range(len(coords))
-            if stride[i] != 0 and size[i] != 1 and coeff % stride[i] == 0
-        ]
+        # Only an integer times one bare symbol is folded. A product like
+        # 512*s0*d2 is a coordinate only if s0 is a size, which nothing here
+        # can tell, so it raises instead.
+        if not (coeff.is_Integer and (term / coeff).is_Symbol):
+            raise AssertionError(
+                f"_delinearize_index: leftover term {term!r} of index "
+                f"{index!r} is not an integer multiple of a single symbol "
+                f"(size {size!r}, stride {stride!r}, offset {offset!r}); "
+                "cannot fold it into a dim coordinate."
+            )
+        eligible = [i for i in live if coeff % stride[i] == 0]
         if not eligible:
             raise AssertionError(
                 f"_delinearize_index: term {term!r} of index {index!r} is "
-                f"not a coordinate multiple of any dim (size {size!r}, "
-                f"stride {stride!r}, offset {offset!r}); cannot recover "
-                "per-dim coordinates for this index."
+                f"not a multiple of a stride it may be folded into (size "
+                f"{size!r}, stride {stride!r}, offset {offset!r}); an inner "
+                "dim could put that coordinate out of bounds."
             )
         best = max(eligible, key=lambda i: stride[i])
         coords[best] = coords[best] + term / stride[best]
     return coords
+
+
+@functools.lru_cache(maxsize=1024)
+def _reads_at_own_strides(read_index, var_names, size, stride) -> bool:
+    """True iff a marker reads its input at its own layout strides.
+
+    Then composing the consumer's coordinates into the marker's read gives
+    the consumer's flat index plus a var-free offset, so every exact split of
+    that index across the marker's dims, in range or not, reads the same
+    element. ``var_names`` align with the non-size-1 dims, as in
+    ``_InlineMarkerHandler.load``.
+    """
+    strides = [st for sz, st in zip(size, stride) if sz != 1]
+    if len(strides) != len(var_names):
+        return False
+    linear = sum((v * st for v, st in zip(var_names, strides)), sympy.S.Zero)
+    rest = sympy.expand(read_index - linear)
+    return not (rest.free_symbols & set(var_names))
 
 
 def _marker_substitution(
@@ -992,7 +1035,18 @@ class _InlineMarkerHandler(WrapperHandler):
 
     def load(self, name, index):
         if name == self._marker_name:
-            coords = _delinearize_index(index, self._size, self._stride, self._offset)
+            coords = _delinearize_index(
+                index,
+                self._size,
+                self._stride,
+                self._offset,
+                fold_into_any_dim=_reads_at_own_strides(
+                    self._marker_read_index,
+                    tuple(self._marker_var_names),
+                    tuple(self._size),
+                    tuple(self._stride),
+                ),
+            )
             if (
                 self._capture is not None
                 and self._marker_dim is not None
@@ -1213,9 +1267,8 @@ def _consume_tile_dim_markers(
     stable across such a reconstruction -- every rebuild-via-
     ``replace_computed_buffer_body`` site in this package (this one
     included) preserves the original name, and other Spyre metadata
-    (``PropagationPlan.outside_consumer_names``, etc.) already keys by name
-    for exactly this reason -- see that field's own docstring on name
-    stability. The returned map is keyed by ``(op.get_name(), dep)`` --
+    (the carry records' storage and update names, etc.) already keys by name
+    for exactly this reason. The returned map is keyed by ``(op.get_name(), dep)`` --
     ``lookup_marker_dim`` (the map's only reader) recomputes ``op.get_name()``
     itself, so callers never need the key's ``str`` half spelled out
     explicitly. For a StarDep-shaped consumer the dep stored is the StarDep
@@ -1553,7 +1606,7 @@ def lookup_marker_dim(
     ExternKernelOut -- see _consume_tile_dim_markers). StarDep has no
     .index/.ranges (.index raises NotImplementedError) and no coordinate
     space to resolve a position in at all -- but this is moot, not a gap:
-    plan_coarse_tile_groups (coarse_tile.py, this function's only real
+    build_loop_tiling_plan (loop_tiling_lowering.py, this function's only real
     caller path) already skips every non-ComputedBuffer op before ever
     calling _hint_ranges_pos, and every StarDep-shaped consumer
     (ExternKernelOut and the rest of the InputsKernel family) has no
@@ -1672,10 +1725,8 @@ def _stamp_direct_loop_info(
     inference is unnecessary and unsafe -- one
     level's committed metadata (e.g. tiled_dims_per_read computed against a
     provisional buffer name) can go stale once a later-spliced nested level
-    renames or rewires the buffers it depended on. propagation is never
-    produced -- every CoarseTileInfo built here leaves it None -- because
-    PropagationPlan has zero consumers outside coarse_tile.py's own Pass
-    2/3, which while_loop groups skip entirely.
+    renames or rewires the buffers it depended on. no
+    per-group propagation record is produced for a while_loop group.
 
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
@@ -1713,9 +1764,9 @@ def _stamp_direct_loop_info(
     index carries a nonzero coefficient on loop_var that neither
     _extent_at_pos nor _structural_resolve could attribute to one of this
     op's own tiled dims (e.g. a point-shaped or already-resolved-elsewhere
-    read/write) -- mirroring coarse_tile.py's own
-    _point_splice_advance_for_dep, which records the identical
-    (coefficient, 1) shape for its own splice-only advances. This is
+    read/write) -- the same
+    (coefficient, 1) shape the span-overflow lowering derives from the index for a
+    splice-only advance. This is
     stamped explicitly here, at ground-truth time, specifically so
     SpyreKernel._general_tile_advance never needs to re-derive whether a
     splice symbol merely appearing in dep.index implies a real per-trip
@@ -2017,9 +2068,8 @@ def _stamp_direct_loop_info(
                     # nothing to record here), or -- the case this branch
                     # exists for -- a point-shaped or otherwise dim-less
                     # dependency where loop_var is the SOLE source of the
-                    # per-trip address step (mirrors coarse_tile.py's
-                    # _point_splice_advance_for_dep, which records the
-                    # identical shape for its own splice-only advances).
+                    # per-trip address step (the span-overflow
+                    # lowering reads the same shape off the index).
                     # Stamp that coefficient explicitly into
                     # squeezed_advance_per_read/output rather than leaving
                     # it for SpyreKernel._general_tile_advance to re-derive
