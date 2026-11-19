@@ -219,11 +219,6 @@ STABLE_SORT = _xfail(
     "#4500: aten::sort.values_stable has no Spyre kernel",
     r"aten::sort\.values_stable",
 )
-FLOOR_DIVIDE = _xfail(
-    NotImplementedError,
-    "#4643: aten::floor_divide has no Spyre kernel",
-    "aten::floor_divide",
-)
 TILE_OFFSET_CUMSUM = _xfail(
     InductorError,
     "#4754: no offset-free alternative stick dim for mutation target",
@@ -234,10 +229,13 @@ TOPK_FLOAT_IDS = _xfail(
     "#5847: topk returns float32 indices",
     r"'dtype' do not match: torch\.float32 != torch\.int64",
 )
-TOPK_WRONG_VALUES = _xfail(
-    AssertionError,
-    "#4639: compiled K=8 topk returns incorrect values",
-    "Tensor-likes are not close",
+# An FP32 softmax of a BF16 [12, 128] input, or a .float() of its [12, 8] top-k
+# mask, stages a DL16_TO_FP32 operand whose stick pair is on no single dim. This
+# fails before #4639 (wrong compiled / tied topk values) can be observed.
+STAGGERED_UPCAST = _xfail(
+    InductorError,
+    "#6486: staggered read with no unique num-sticks dim on an FP32 upcast",
+    "staggered read with no unique num-sticks dim",
 )
 INDEX_2D = _xfail(
     NotImplementedError,
@@ -807,7 +805,7 @@ def _f32(tensors):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=TOPK_WRONG_VALUES, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
     ),
 )
 def test_G4_RT_001_batch_routing(execution_mode, T):
@@ -852,7 +850,7 @@ def test_G4_RT_001_batch_routing(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=TOPK_WRONG_VALUES, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
     ),
 )
 def test_G4_RT_002_routing_weight_normalization(execution_mode, T):
@@ -1215,11 +1213,7 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=_xfail(
-            AssertionError,
-            "#4639: eager topk selects ids outside the tied pool",
-            "Tensor-likes are not close",
-        ),
+        eager=STAGGERED_UPCAST,
         compiled=SORT_MULTI_OUTPUT,
         decode_eager=_xfail(
             InductorError,
@@ -1500,7 +1494,7 @@ def test_G4_E2E_003_decoder_layer_full(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    "execution_mode", _modes(eager=FLOOR_DIVIDE, compiled=TILE_OFFSET_CUMSUM)
+    "execution_mode", _modes(eager=TILE_OFFSET_CUMSUM, compiled=TILE_OFFSET_CUMSUM)
 )
 def test_G4_AB_003_pad_expert_segments_to_tile32(execution_mode):
     counts = torch.tensor([0, 1, 31, 32, 33, 63, 64] + [0] * 121)
