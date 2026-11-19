@@ -1989,7 +1989,10 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
           3.1 every STANDARD operand can broadcast   -> staggered output
           3.2 every staggered operand can broadcast  -> STANDARD output
           3.3 otherwise (a STANDARD and a staggered full operand coexist)
-                                                     -> unsupported (raise)
+                                                     -> STANDARD output;
+                                                        insert_ea_shuffle
+                                                        shuffles the staggered
+                                                        operands to STANDARD
     In the overlap, prefer the direction whose broadcast condition holds for
     every candidate of the opposite-EA inputs. That choice remains valid no
     matter which producer layouts the optimizer can actually reach. If both
@@ -2084,26 +2087,10 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
         return ElementArrangement.STANDARD
 
     # Case 3.3: a STANDARD operand and a staggered operand are both
-    # non-broadcast full tensors — a genuine mixed-order op we cannot
-    # represent yet (future: insert an explicit EA conversion at extra
-    # cost). Report the offending STANDARD operand (there is always one
-    # here, since 3.1 failed).
-    arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
-    stl = arg.layouts[0]
-    c_stride = [concretize_expr(s) for s in arg.layout.stride]
-    mapped = next(
-        (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-        None,
-    )
-    mapped_size = (
-        concretize_expr(arg.layout.size[mapped]) if mapped is not None else "unknown"
-    )
-    raise Unsupported(
-        f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-        f"must broadcast (device stick dimension size 1) to be compatible "
-        f"with a staggered EA, and no staggered operand is broadcastable "
-        f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
-    )
+    # non-broadcast full tensors. The output is STANDARD, and
+    # insert_ea_shuffle shuffles the staggered operands to it.
+    assert stag_split, "case 3.3 needs a staggered operand"
+    return ElementArrangement.STANDARD
 
 
 def _is_supported_pointwise_layout(
@@ -2184,9 +2171,10 @@ def _multi_arg_pointwise_layouts(
 
     ea_args = []
     for arg in args:
-        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
-        if lane0:
-            arg.layouts[:] = lane0
+        if arg.dep.name in ind_names:
+            lane0 = _lane0_candidates(arg)
+            if lane0:
+                arg.layouts[:] = lane0
         else:
             ea_args.append(arg)
 
