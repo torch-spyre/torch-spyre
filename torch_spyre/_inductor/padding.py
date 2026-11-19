@@ -693,11 +693,14 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
     which it never did.
 
-    Only a restickify with exactly one elided operand counts: that is the case the
+    A restickify with exactly one elided operand counts: that is the case the
     codegen assert covers (one operand's within-stick coordinate has no loop
-    symbol).  When both operands carry one, the restore is a no-op and the slice
-    write compiles correctly (``torch.cat([a, b], -1).sum(-1)`` on
-    ``(32, 8, 16, 1)``, or the copy-back into a mutated graph input).
+    symbol).  When both operands carry a loop symbol for the *same* dim, the
+    restore is a no-op and the slice write compiles correctly
+    (``torch.cat([a, b], -1).sum(-1)`` on ``(32, 8, 16, 1)``, or the copy-back
+    into a mutated graph input).  When they carry *different* dims, a dense stick
+    relocation put the stick elsewhere: the write is still a restickify into the
+    slice and still cannot be padded in place, so it counts too.
 
     TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
     copy it into the slice (see the TODO in ``_pad_restickify_output``); then
@@ -717,7 +720,17 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     out_coords = device_coordinates(real.device_layout, write_dep)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
-    if bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols):
+    in_stick, out_stick = in_coords[-1], out_coords[-1]
+    elided = bool(in_stick.free_symbols) != bool(out_stick.free_symbols)
+    # A dense stick relocation keeps the stick on a dim the read leaves alone, so
+    # both operands carry a loop symbol but for different dims.  Without this the
+    # guard waves the write through and codegen emits wrong addresses.
+    relocated = bool(
+        in_stick.free_symbols
+        and out_stick.free_symbols
+        and in_stick.free_symbols != out_stick.free_symbols
+    )
+    if elided or relocated:
         raise Unsupported(
             f"insert_restickify_padding: restickify written into a slice of "
             f"another buffer on {op.get_name()} (for example torch.cat of "
