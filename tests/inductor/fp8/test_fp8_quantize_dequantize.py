@@ -130,8 +130,8 @@ class TestQuantizeFP8:
         "shape",
         [
             (2, 8),
-            pytest.param((2, 16), marks=_XFAIL_3033),
-            pytest.param((16, 128), marks=_XFAIL_3033),
+            (2, 16),
+            (16, 128),
         ],
         ids=["2x8", "2x16", "16x128"],
     )
@@ -1219,8 +1219,8 @@ class TestFP8EagerMode:
         strict=True,
         raises=AssertionError,
         reason="https://github.com/torch-spyre/torch-spyre/issues/4313: no longer returns "
-        "None, but values differ from the CPU oracle: at K>=16 the .cpu() copy reads "
-        "elements from the wrong offset, as in issue 3033",
+        "None, but some values differ from the CPU oracle: subnormals and values near "
+        "FP8 midpoints round differently on the device",
     )
     def test_quantize_fp8_with_scale_eager(self):
         """quantize_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""

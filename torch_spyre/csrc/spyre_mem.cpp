@@ -389,6 +389,121 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 }
 
 /*
+ * Rewrites STANDARD stride infos for a QFP8CH device tensor.
+ *
+ * qfp8ch turns two fp16 sticks (64 elements each) into one fp8 stick of 128
+ * elements, and inside that stick it alternates 8-element chunks of the two:
+ *
+ *   physical: lo0 hi0 lo1 hi1 ... lo7 hi7      (lo = columns 0-63,
+ *                                              hi = columns 64-127)
+ *
+ * so the logical column c of a stick sits at physical position
+ *
+ *   p(c) = ((c % 64) / 8) * 16 + (c / 64) * 8 + c % 8.
+ *
+ * get_device_stride_infos describes the stick dimension (index 0, after its
+ * innermost-first reversal) as a contiguous run of logical columns, with host
+ * stride h. A whole stick becomes one info whose stick dimension is split into
+ * [element (8), half (2), chunk (8)], with host strides [h, 64h, 8h] and device
+ * strides [1, 8, 16]. The dims must be listed in that order, by increasing
+ * device stride, so each device stride equals the product of the inner sizes:
+ * flex then sees the whole stick as one contiguous device run. Listed as
+ * [element, chunk, half] (device strides [1, 16, 8]) the run is only 8
+ * elements long, and flex's strided D2H path reads each sub-flit range from the
+ * start of its 128-byte flit, so every chunk came back as chunk 0.
+ *
+ * A partial run (a partly filled stick, or one starting mid-stick) has gaps
+ * on the device, so it cannot be one contiguous run. It becomes one info per
+ * 8-element chunk (or part of one), each starting at the chunk's physical
+ * position. For D2H, flex handles such a sub-flit start as a head offset,
+ * because all the remaining outer device strides are whole sticks. H2D cannot
+ * do the same (see the check below).
+ *
+ * @param infos: stride infos for a STANDARD layout of the same tensor
+ * @param eps: elements per stick of the device tensor (128 for fp8)
+ * @param host2device: direction of data conversion
+ * @return stride infos that read or write the QFP8CH element order
+ */
+auto qfp8ch_stride_infos(const std::vector<DataConversionStrideInfo>& infos,
+                         int64_t eps, bool host2device)
+    -> std::vector<DataConversionStrideInfo> {
+  constexpr int64_t kChunk = 8;
+  const int64_t half = eps / 2;
+  TORCH_CHECK(eps == 128, "QFP8CH expects 128 elements per stick, got ", eps);
+
+  // Physical position of logical column c inside a stick.
+  auto phys = [&](int64_t c) {
+    return ((c % half) / kChunk) * (2 * kChunk) + (c / half) * kChunk +
+           c % kChunk;
+  };
+
+  std::vector<DataConversionStrideInfo> out;
+  for (const auto& info : infos) {
+    const auto& host_stride = host2device ? info.stride_src_ : info.stride_dst_;
+    const auto& dev_stride = host2device ? info.stride_dst_ : info.stride_src_;
+    const int64_t host_off = host2device ? info.offset_src_ : info.offset_dst_;
+    const int64_t dev_off = host2device ? info.offset_dst_ : info.offset_src_;
+    TORCH_CHECK(!info.size_.empty() && dev_stride[0] == 1,
+                "QFP8CH: expected the innermost device dimension to be the "
+                "stick dimension with stride 1");
+
+    const int64_t h = host_stride[0];
+    const int64_t first = dev_off % eps;  // logical column the run starts at
+    const int64_t stick_base = dev_off - first;
+    const int64_t last = first + info.size_[0];  // one past the last column
+    TORCH_CHECK(last <= eps, "QFP8CH: stick run [", first, ", ", last,
+                ") overflows a ", eps, "-element stick");
+
+    // One output info starting at logical column c: the given dims (sizes,
+    // host strides, device strides) replace the stick dimension, and the outer
+    // dims of `info` follow.
+    auto emit = [&](int64_t c, std::vector<int64_t> p_size,
+                    std::vector<int64_t> p_host, std::vector<int64_t> p_dev) {
+      DataConversionStrideInfo piece;
+      p_size.insert(p_size.end(), info.size_.begin() + 1, info.size_.end());
+      p_host.insert(p_host.end(), host_stride.begin() + 1, host_stride.end());
+      p_dev.insert(p_dev.end(), dev_stride.begin() + 1, dev_stride.end());
+      const int64_t p_host_off = host_off + (c - first) * h;
+      const int64_t p_dev_off = stick_base + phys(c);
+      piece.size_ = p_size;
+      piece.stride_src_ = host2device ? p_host : p_dev;
+      piece.stride_dst_ = host2device ? p_dev : p_host;
+      piece.offset_src_ = host2device ? p_host_off : p_dev_off;
+      piece.offset_dst_ = host2device ? p_dev_off : p_host_off;
+      out.push_back(piece);
+    };
+
+    if (first == 0 && last == eps) {
+      // Whole stick: one info, [element, half, chunk].
+      emit(0, {kChunk, 2, half / kChunk}, {h, half * h, kChunk * h},
+           {1, kChunk, 2 * kChunk});
+      continue;
+    }
+
+    // Partial stick: one info per chunk, or per part of a chunk at either end
+    // of the run. Flex DMAs each run from the start of its 128-byte flit and
+    // only skips a sub-flit head when reading (subFlitHead returns 0 for H2D,
+    // since writing the head would need a read-modify-write). A chunk that
+    // does not start the stick would be written over the stick's first chunk,
+    // so H2D supports a partial stick only when it is a single run at the
+    // start of the stick.
+    TORCH_CHECK(
+        !host2device || (first == 0 && last <= kChunk),
+        "QFP8CH host-to-device copy into a partly filled stick (columns ",
+        first, " to ", last,
+        " of the stick) is not supported: its chunks are not "
+        "contiguous on the device, and flex cannot write a run that "
+        "starts inside a 128-byte flit");
+    for (int64_t c = first; c < last;) {
+      const int64_t len = std::min((c / kChunk + 1) * kChunk, last) - c;
+      emit(c, {len}, {h}, {1});
+      c += len;
+    }
+  }
+  return out;
+}
+
+/*
  * Generate description of data conversion for a tensor.
  *
  * @param cpu_tensor: CPU-side tensor (source for H2D, destination for D2H)
@@ -840,6 +955,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   } else {
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device);
+    if (stl.element_arrangement == ElementArrangement::QFP8CH) {
+      dci.dcsi_ =
+          qfp8ch_stride_infos(dci.dcsi_, stl.elems_per_stick(), host2device);
+    }
 
     // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
