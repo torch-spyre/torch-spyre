@@ -746,69 +746,21 @@ TO_DTYPE_OP_PARAMS_SETS = {
 }
 
 
-_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, as does int64, which the device stores as
-# int32, so conversions among them have no stick pairs to keep together and are
-# exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [
-    (torch.float32, torch.int32),
-    (torch.int32, torch.float32),
-    (torch.float32, torch.int64),
-    (torch.int64, torch.float32),
-    (torch.int32, torch.int64),
-    (torch.int64, torch.int32),
-]
-
-TO_DTYPE_OP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.float8_e4m3fn  # TO_DTYPE_OP_PARAMS_SETS has no float8 sources
-    if (
-        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
-        or (
-            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-        # Sub-stick guard doesn't apply to fp32<->int32/int64 — all are 32-bit
-        # on device, so there's no width change to trip the fp16-stick boundary.
-        or (
-            src == torch.float32
-            and shape[-1] < 32
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-    )
-]
-
-# Cases the predicate above flags that now pass on every config (base and both LX
-# planning classes). Listing them here, rather than loosening the predicate, keeps
-# the still-failing cases generated from the same rule.
-_TO_DTYPE_OP_NOW_PASSING = {
-    "bfloat16_to_bool_4x68",
-    "bfloat16_to_bool_68",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "float16_to_bfloat16_4x68",
-    "float16_to_bfloat16_68",
-    "float16_to_bool_4x68",
-    "float16_to_bool_68",
-    "float32_to_bool_4x16",
-    "float32_to_bool_4x68",
-    "float32_to_bool_68",
+# After type conversion elements are staggered on device, in DCI path they are restored
+# to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
+# of at most 32 elements is converted to a single fp32 stick, so half of each stick
+# pair has nowhere to go and the EA DCI rejects it instead of reading back wrong
+# data. Wider dims are padded to whole stick pairs (#5048).
+_WHOLE_STICK_PAIRS = "requires whole stick pairs"
+_WHOLE_STICK_PAIRS_SHAPES = ("4x16", "4x32")
+TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in _WHOLE_STICK_PAIRS_SHAPES
 }
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
-]
 
-# The cases in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the host,
-# and the result is wrong on part of its elements. The values on the device are
-# correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a staggered
-# element arrangement, and the device-to-host copy reads it as STANDARD, so the
-# elements come back permuted with no error (#4393); converting the result back on
-# the device restores the input (the round-trip tests).
-_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
-TO_DTYPE_OP_EXPECT_FAIL = {
-    case: _STAGGERED_READBACK for case in TO_DTYPE_OP_EXPECT_FAIL
+TO_DTYPE_OP_EXPECT_RAISE = {
+    **dict.fromkeys(TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED, _WHOLE_STICK_PAIRS),
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -2511,11 +2463,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                 ),
             },
-            # The values and the fp16 indices are exact; the fp16 to int64 cast of
-            # the indices is not.
-            "expect_fail": {
-                "2d_k4_dim0": _STAGGERED_READBACK,
-            },
             # The cast's fp32 value lacks the second stick of a stick pair, so it
             # reads memory that was never written: the result is wrong on most runs
             # and right on some, and a pass is reported, not an error.
@@ -3648,11 +3595,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
                 "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
                 "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
-            },
-            # The compare is right on the device, but its staggered result is read
-            # back permuted with no error (#4393).
-            "expect_fail": {
-                "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
@@ -8287,7 +8229,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
+            "expect_raise": TO_DTYPE_OP_EXPECT_RAISE,
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
@@ -13712,11 +13654,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = cached_randn((64,), dtype=torch.float32)
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_host_to_fp32_cpu(self):
         # Literal repro from issue #1482: a host bool converted to fp32 and read
         # back directly, as a staggered float32 like any float16 source's.
@@ -13963,11 +13900,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "fp32toint32", fn, x, dsts=(torch.int32, torch.int64)
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_fp16_src_to_int64_readback_known_xfail(self):
         def fn(x):
             return (x > 2).to(dtype=torch.int64)
@@ -14003,12 +13935,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp32toint32", fn, x.to(src), dsts=(torch.int32, torch.int64)
                 )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_float16_to_int_readback_known_xfail(self):
+    def test_float16_to_int_readback(self):
         def fn(x):
             return x.to(dtype=torch.int32)
 
@@ -14032,12 +13959,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     values = x if dst == torch.float16 else x // 8 * 8
                     self._assert_conversion_on_device("fp32todl16", fn, values.to(src))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_int_to_float16_readback_known_xfail(self):
+    def test_int_to_float16_readback(self):
         def fn(x):
             return x.to(torch.float16)
 
