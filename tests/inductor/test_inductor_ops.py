@@ -5926,6 +5926,130 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # (op, dst, dim, index, src, run_eager): overwrite index_put family under
+        # torch.use_deterministic_algorithms(True). Upstream sends these to an
+        # eager fallback Spyre has no kernel for; Spyre keeps them on its
+        # (already deterministic) device path. Indices are unique.
+        ("test_index_put_deterministic", "test_index_put_deterministic_base"): {
+            "param_sets": {
+                "setitem_2d_fp16": (
+                    "setitem",
+                    cached_randn((128, 64)),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1),
+                    False,
+                ),
+                "setitem_2d_bf16": (
+                    "setitem",
+                    cached_randn((128, 64), dtype=torch.bfloat16),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1, dtype=torch.bfloat16),
+                    False,
+                ),
+                "setitem_2d_fp32": (
+                    "setitem",
+                    cached_randn((128, 64), dtype=torch.float32),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1, dtype=torch.float32),
+                    False,
+                ),
+                "setitem_3d_dim1": (
+                    "setitem",
+                    cached_randn((4, 16, 128)),
+                    1,
+                    torch.tensor([2, 9, 15]),
+                    cached_randn((4, 3, 128), differentiation=1),
+                    False,
+                ),
+                "index_put_2d": (
+                    "index_put",
+                    cached_randn((256, 128)),
+                    0,
+                    torch.randperm(256, generator=torch.Generator().manual_seed(0))[
+                        :32
+                    ],
+                    cached_randn((32, 128), differentiation=1),
+                    False,
+                ),
+                "index_put_3d_dim0": (
+                    "index_put",
+                    cached_randn((32, 8, 64)),
+                    0,
+                    torch.tensor([1, 30]),
+                    cached_randn((2, 8, 64), differentiation=1),
+                    False,
+                ),
+                "index_copy_2d": (
+                    "index_copy",
+                    cached_randn((128, 64)),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1),
+                    True,
+                ),
+                "index_copy_3d_dim0": (
+                    "index_copy",
+                    cached_randn((32, 8, 64)),
+                    0,
+                    torch.tensor([1, 30]),
+                    cached_randn((2, 8, 64), differentiation=1),
+                    True,
+                ),
+                "index_copy_3d_dim1": (
+                    "index_copy",
+                    cached_randn((4, 16, 128)),
+                    1,
+                    torch.tensor([2, 9, 15]),
+                    cached_randn((4, 3, 128), differentiation=1),
+                    True,
+                ),
+                "kv_cache_fp16": (
+                    "index_copy",
+                    torch.zeros(1, 8, 256, 128, dtype=torch.float16),
+                    2,
+                    torch.tensor([7, 8]),
+                    cached_randn((1, 8, 2, 128), differentiation=1),
+                    True,
+                ),
+                "kv_cache_bf16": (
+                    "index_copy",
+                    torch.zeros(1, 8, 256, 128, dtype=torch.bfloat16),
+                    2,
+                    torch.tensor([100]),
+                    cached_randn(
+                        (1, 8, 1, 128), differentiation=1, dtype=torch.bfloat16
+                    ),
+                    True,
+                ),
+                "kv_cache_prefill_64": (
+                    "index_copy",
+                    torch.zeros(1, 4, 512, 128, dtype=torch.float16),
+                    2,
+                    torch.arange(64),
+                    cached_randn((1, 4, 64, 128), differentiation=1),
+                    True,
+                ),
+                "index_add_2d": (
+                    "index_add",
+                    cached_randn((128, 64)),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1),
+                    False,
+                ),
+                "index_add_alpha": (
+                    "index_add_alpha",
+                    cached_randn((128, 64)),
+                    0,
+                    torch.tensor([3, 17, 90]),
+                    cached_randn((3, 64), differentiation=1),
+                    False,
+                ),
+            },
+        },
         ("test_scalar_cpu", "test_scalar_cpu"): {
             "ops_dict": {
                 "add": torch.add,
@@ -12827,6 +12951,67 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return out
 
         self.compare_with_cpu(fn, elements, test_elements)
+
+    @staticmethod
+    def _deterministic_algorithms():
+        """``torch.use_deterministic_algorithms(True)`` for a block, restored after."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def ctx():
+            prev = torch.are_deterministic_algorithms_enabled()
+            torch.use_deterministic_algorithms(True)
+            try:
+                yield
+            finally:
+                torch.use_deterministic_algorithms(prev)
+
+        return ctx()
+
+    def test_index_put_deterministic_base(self, op, dst, dim, index, src, run_eager):
+        # Before: the write was silently dropped under deterministic mode.
+        def fn(d, i, s):
+            d = d.clone()
+            if op == "setitem":
+                d[(slice(None),) * dim + (i,)] = s
+            elif op == "index_put":
+                d.index_put_((None,) * dim + (i,), s)
+            elif op == "index_copy":
+                d.index_copy_(dim, i, s)
+            elif op == "index_add":
+                d.index_add_(dim, i, s)
+            else:  # index_add_alpha
+                d.index_add_(dim, i, s, alpha=0.5)
+            return d
+
+        # Eager only where Spyre has an eager kernel (index_copy).
+        with self._deterministic_algorithms():
+            self.compare_with_cpu(fn, dst, index, src, run_eager=run_eager)
+            self.assertTrue(torch.are_deterministic_algorithms_enabled())
+
+    def test_index_put_deterministic_duplicates(self):
+        # Repeated indices: identical result on every run, last write wins
+        # (as on CPU), and the caller's warn_only setting is kept.
+        x = cached_randn((64, 64))
+        idx = torch.tensor([5, 9, 5, 5, 9])
+        v = cached_randn((5, 64), differentiation=1)
+        fn = torch.compile(lambda d, i, s: d.index_put((i,), s), dynamic=False)
+        prev = torch.are_deterministic_algorithms_enabled()
+        prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            outs = [
+                fn(x.to("spyre"), idx.to("spyre"), v.to("spyre")).cpu()
+                for _ in range(5)
+            ]
+            self.assertTrue(torch.are_deterministic_algorithms_enabled())
+            self.assertTrue(torch.is_deterministic_algorithms_warn_only_enabled())
+        finally:
+            torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+        for out in outs[1:]:
+            torch.testing.assert_close(out, outs[0], atol=0, rtol=0)
+        torch.testing.assert_close(outs[0][5], v[3], atol=1e-2, rtol=0)
+        torch.testing.assert_close(outs[0][9], v[4], atol=1e-2, rtol=0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_isin_tensor_scalar_cpu(self):
