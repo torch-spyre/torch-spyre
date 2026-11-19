@@ -2589,7 +2589,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                     2047,
                 ),
+                # TODO: N-D input. Flattening on the device works compiled for
+                # int32/int64/float32, but not in eager mode or for unaligned
+                # float16; when histc accepts N-D this becomes a positive case.
                 "2d_input": (torch.rand((4, 64)), 10, 0, 1),
+                # TODO: torch returns zeros; when histc does, this becomes a
+                # positive case.
+                "empty_input": (torch.empty((0,)), 8, 0, 1),
                 # fp16 inputs are multiples of 1/16, exact in device fp16, with
                 # values below min and above max. Counts stay under 1024, the
                 # largest whole number device fp16 holds exactly.
@@ -2644,6 +2650,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_raise": {
                 "2d_input": "histc: only 1-D input is supported",
+                "empty_input": "histc: empty input is not supported",
                 "fp16_bins_1025": "histc: float16 input supports at most 1024 bins",
             },
         },
@@ -11631,6 +11638,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             **ref,
         )
+
+    @expects_raise
+    def test_histc_argument_errors(self):
+        # torch's own argument checks. Compiled, torch's meta function raises
+        # them; eager dispatch skips it, so spyre_histc repeats them.
+        x = torch.rand((64,))
+        cases = {
+            "bins must be > 0": {"bins": 0, "min": 0, "max": 1},
+            "max must be larger than min": {"bins": 8, "min": 1, "max": 0},
+            "is not finite": {"bins": 8, "min": 0, "max": float("inf")},
+        }
+        for fragment, kwargs in cases.items():
+            for compile_mode in (True, False):
+                with pytest.raises(Exception, match=fragment):
+                    _compile_and_run(
+                        lambda x, _kw=kwargs: torch.histc(x, **_kw),
+                        [x],
+                        "spyre",
+                        compile=compile_mode,
+                    )
 
     @expects_raise
     def test_topk_largest_false_rejected(self):

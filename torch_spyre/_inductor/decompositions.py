@@ -1879,7 +1879,9 @@ def spyre_histc(
     max: float = 0,
 ) -> torch.Tensor:
     """1-D int32/int64/float32/float16 histc: bin index per element, then
-    spyre::histc_count."""
+    spyre::histc_count. The index maths is fp32, so integers are exact below
+    2**24, and a value within a float step of a bin edge can land in the
+    neighbouring bin: device fp32 arithmetic rounds differently from the CPU's."""
     if input.dtype not in (torch.int32, torch.int64, torch.float32, torch.float16):
         raise Unsupported(
             f"histc: {input.dtype} input is not supported "
@@ -1887,6 +1889,9 @@ def spyre_histc(
         )
     if input.dim() != 1:
         raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
+    if input.numel() == 0:
+        # TODO: torch returns zeros.
+        raise Unsupported("histc: empty input is not supported")
     # torch's checks; eager dispatch skips its meta checks.
     if bins <= 0:
         raise RuntimeError(f"torch.histc(): bins must be > 0, but got {bins}")
@@ -1909,6 +1914,7 @@ def spyre_histc(
     x = input.to(torch.float32)
     if lo == hi:
         # min == max: the data's range, widened by 1 if constant, as torch does.
+        # Unlike torch, NaN or inf in the data does not raise.
         lo_t, hi_t = torch.amin(x), torch.amax(x)
         same = lo_t == hi_t
         lo_t = torch.where(same, lo_t - 1, lo_t)

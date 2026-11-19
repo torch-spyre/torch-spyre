@@ -189,6 +189,7 @@ def _(
     return idx.new_empty((bins,), dtype=out_dtype)
 
 
+# Never evicted: one small device tensor per (bins_pad, dtype).
 _HISTC_BIN_IDS_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
