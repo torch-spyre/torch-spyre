@@ -545,12 +545,17 @@ def rescale_stl_for_dtype(
     stick_vars = stick_coord.free_symbols
     if not stick_vars:
         # A stick holding one element (a size-1 or sparse stick dim) needs no more
-        # sticks at any number of elements per stick.
+        # sticks at any number of elements per stick. Its valid count is capped
+        # at the new elements per stick.
+        valid = forward_valid_elements(stl)
+        stick_key = (len(stl.device_size) - 1,)
+        if stick_key in valid:
+            valid[stick_key] = min(valid[stick_key], out_eps)
         return SpyreTensorLayout(
             out_device_size,
             out_stride_map,
             get_device_dtype(out_dtype),
-            forward_valid_elements(stl),
+            valid,
             ea,
         )
 

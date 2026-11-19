@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -211,37 +212,40 @@ std::map<int64_t, int64_t> device_extent_by_stride(
   return extent;
 }
 
-// What cap_valid_elements_to_view needs to know about a view.
-struct ViewStrides {
-  std::set<int64_t> used;  // positive strides of the view
-  // Layout stride -> view size. Equal strides keep the larger size, since
-  // unsqueeze(-1) repeats the inner stride on a size-1 dim.
-  std::map<int64_t, int64_t> size_at_stride;
-  int64_t numel = 1;
-};
-
-ViewStrides analyze_view_strides(
+// Layout stride -> number of elements the view takes at that stride, for the
+// view dims that line up with the layout. Equal strides keep the larger size,
+// since unsqueeze(-1) repeats the inner stride on a size-1 dim. A view dim
+// above a stride the layout does not have (b.view(64, 8, 512) adds stride 4096
+// over layout stride 512) leaves the layout's count, recorded as no cap.
+std::map<int64_t, int64_t> view_size_at_stride(
     const std::map<int64_t, int64_t>& layout_extent,
     const std::vector<int64_t>& view_sizes,
     const std::vector<int64_t>& view_strides) {
-  ViewStrides view;
-  for (const int64_t size : view_sizes) view.numel *= size;
+  std::map<int64_t, int64_t> size_at_stride;
   for (size_t i = 0; i < view_sizes.size(); i++) {
     const int64_t stride = view_strides[i];
-    if (stride <= 0) continue;
-    view.used.insert(stride);
-    if (!layout_extent.contains(stride)) continue;
-    // A view dim above a stride the layout does not have (b.view(64, 8, 512)
-    // adds stride 4096 over layout stride 512) leaves the layout's count.
-    const bool foreign_dim_above =
-        std::ranges::any_of(view_strides, [&](int64_t other) {
-          return other > stride && !layout_extent.contains(other);
-        });
-    if (foreign_dim_above) continue;
-    auto [it, inserted] = view.size_at_stride.emplace(stride, view_sizes[i]);
-    if (!inserted) it->second = std::max(it->second, view_sizes[i]);
+    // A size-1 view dim indexes nothing. Its stride can equal a layout stride
+    // by coincidence (a batch dim of stride 2 * heads), so it must not cap the
+    // layout dim at that stride.
+    if (view_sizes[i] == 1) continue;
+    if (stride <= 0 || !layout_extent.contains(stride)) continue;
+    // A size-1 view dim indexes nothing, so its stride says nothing about the
+    // layout and does not count as a foreign dim.
+    // A size-1 view dim indexes nothing, so its stride says nothing about the
+    // layout and does not count as a foreign dim.
+    bool foreign_dim_above = false;
+    for (size_t j = 0; j < view_strides.size(); j++) {
+      if (view_sizes[j] != 1 && view_strides[j] > stride &&
+          !layout_extent.contains(view_strides[j])) {
+        foreign_dim_above = true;
+      }
+    }
+    const int64_t size =
+        foreign_dim_above ? std::numeric_limits<int64_t>::max() : view_sizes[i];
+    auto [it, inserted] = size_at_stride.emplace(stride, size);
+    if (!inserted) it->second = std::max(it->second, size);
   }
-  return view;
+  return size_at_stride;
 }
 
 // True when the view holds every layout stride at its full device extent, so
@@ -260,21 +264,20 @@ bool view_covers_layout(const std::map<int64_t, int64_t>& layout_extent,
   });
 }
 
-// The count a valid_elements key keeps in `view`. `finest` is the key's finest
-// positive stride_map value (for a stick pair, the host stick stride).
-int64_t capped_count(int64_t count, int64_t finest, const ViewStrides& view) {
-  if (view.used.contains(finest)) {
-    // The view has a dim at this stride: it limits the count to its size.
-    const auto size = view.size_at_stride.find(finest);
-    return size != view.size_at_stride.end() ? std::min(count, size->second)
-                                             : count;
-  }
+// The count a valid_elements key keeps in the view. `finest` is the key's
+// finest positive stride_map value (for a stick pair, the host stick stride).
+int64_t capped_count(int64_t count, int64_t finest,
+                     const std::map<int64_t, int64_t>& size_at_stride,
+                     int64_t view_numel) {
+  // A view dim at this stride limits the count to its size.
+  const auto size = size_at_stride.find(finest);
+  if (size != size_at_stride.end()) return std::min(count, size->second);
   // The view has no dim at this stride. A stick key (finest stride 1) is then
   // indexed away. Any other key is still covered when the view holds the
   // count * finest host elements it spans (a flattened view walks through the
   // device dims below its innermost contiguous run); otherwise it is indexed
   // away and one element (or row) remains.
-  if (finest == 1 || view.numel < count * finest) return 1;
+  if (finest == 1 || view_numel < count * finest) return 1;
   return count;
 }
 
@@ -287,8 +290,9 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
                                 const std::vector<int64_t>& view_strides) {
   const std::map<int64_t, int64_t> layout_extent = device_extent_by_stride(stl);
   if (view_covers_layout(layout_extent, view_sizes, view_strides)) return;
-  const ViewStrides view =
-      analyze_view_strides(layout_extent, view_sizes, view_strides);
+  const std::map<int64_t, int64_t> size_at_stride =
+      view_size_at_stride(layout_extent, view_sizes, view_strides);
+  const int64_t view_numel = c10::multiply_integers(view_sizes);
 
   for (auto& [dims, count] : stl.valid_elements) {
     std::optional<int64_t> finest;
@@ -296,7 +300,8 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
       const int64_t stride = stl.stride_map[d];
       if (stride > 0 && (!finest || stride < *finest)) finest = stride;
     }
-    if (finest) count = capped_count(count, *finest, view);
+    if (finest)
+      count = capped_count(count, *finest, size_at_stride, view_numel);
   }
 }
 
@@ -1245,88 +1250,26 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
 
 namespace {
 
-// A dimension of the layout seen in host strides, for deciding whether a view
-// can be read in place. All device dims sharing one host stride form one
-// TileDim. For the [40, 60] tensor stored as device [8, 5, 64] with stride_map
-// [300, 60, 1] there are three: stride 300 (size 8), 60 (size 5) and 1 (size
-// 64, pitch 60: a row holds 60 valid elements).
-struct TileDim {
-  int64_t stride;  // host stride of the dim
-  int64_t size;    // device extent (max over dims sharing the stride)
-  // Host distance from one index of this dim to the next. For the stick dim
-  // this is the valid row width (valid_elements), not the device stick size,
-  // so a slice that spans a stick boundary is seen in host coordinates.
-  int64_t pitch;
-  // Host strides of the finer tiles inside this dim, ascending. A tile that
-  // starts at one of these strides is split across device dims.
-  std::vector<int64_t> tile_strides;
-};
-
-// Tile dims of `stl`, coarsest stride first.
-std::vector<TileDim> tile_dims(const SpyreTensorLayout& stl) {
-  const std::map<int64_t, int64_t> extent = device_extent_by_stride(stl);
-
-  // Host row width of each stick pair: its valid count. The pitch of the dim
-  // carrying the inner stride is that width. Other dims keep size * stride.
-  std::map<int64_t, int64_t> row_width_of_stride;
+// True when a view cannot be read in place because it starts inside a stick
+// and runs past the end of it. The descriptors built from valid_elements and
+// the storage offset cannot express that: a slice along any other dim is a box
+// of whole rows. Only the stick pairs can hold such a view, so only they are
+// checked.
+bool view_crosses_stick(const SpyreTensorLayout& stl, c10::IntArrayRef sizes,
+                        c10::IntArrayRef strides, int64_t storage_offset) {
   for (const StickPair& pair : stick_pairs(stl)) {
-    const int64_t inner_stride = stl.stride_map[pair.inner];
-    if (inner_stride > 0) row_width_of_stride[inner_stride] = pair.count;
-  }
-
-  std::vector<TileDim> dims;
-  dims.reserve(extent.size());
-  for (auto it = extent.rbegin(); it != extent.rend(); ++it) {
-    const auto [stride, size] = *it;
-    const auto width = row_width_of_stride.find(stride);
-    const int64_t pitch =
-        width != row_width_of_stride.end() ? width->second : stride * size;
-    TileDim dim{stride, size, pitch, {}};
-    for (const auto& stride_extent : extent) {
-      const int64_t other = stride_extent.first;
-      if (other >= stride && other < pitch) dim.tile_strides.push_back(other);
+    const int64_t stick_stride = stl.stride_map[pair.inner];
+    if (stick_stride <= 0 || pair.count <= 0) continue;
+    const int64_t stick_size = stl.device_size[pair.inner];
+    // Position of the view's first element within its stick.
+    const int64_t start =
+        ((storage_offset / stick_stride) % pair.count) % stick_size;
+    // Number of elements the view takes along the stick dim.
+    int64_t extent = 1;
+    for (size_t i = 0; i < sizes.size(); i++) {
+      if (strides[i] == stick_stride) extent = std::max(extent, sizes[i]);
     }
-    dims.push_back(std::move(dim));
-  }
-  return dims;
-}
-
-// True when a view with positive strides, smaller than its layout's stored
-// elements, cannot be read in place: it starts inside a tile of a tiled dim and
-// runs past the end of that tile, or it splits a layout dim into dims that
-// do not cover all of it (a slice, or a view that drops part of the dim).
-bool view_needs_staging(const std::vector<TileDim>& dims,
-                        c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                        int64_t storage_offset) {
-  // Per layout dim: the product of the view sizes that land in it, and
-  // whether any of them is a plain split of the dim (not at a tile stride).
-  std::vector<int64_t> covered(dims.size(), 1);
-  std::vector<bool> split(dims.size(), false);
-  for (size_t i = 0; i < sizes.size(); i++) {
-    const int64_t stride = strides[i];
-    const int64_t size = sizes[i];
-    if (size == 1) continue;
-    for (size_t j = 0; j < dims.size(); j++) {
-      const int64_t pitch = dims[j].pitch;
-      if (stride < dims[j].stride || stride >= pitch) continue;
-      covered[j] *= size;
-      const auto& tiles = dims[j].tile_strides;
-      const auto tile = std::ranges::find(tiles, stride);
-      if (tile == tiles.end()) {
-        split[j] = true;
-        break;
-      }
-      const int64_t tile_end =
-          std::next(tile) != tiles.end() ? *std::next(tile) : pitch;
-      const int64_t tile_size = tile_end / stride;
-      const int64_t tile_offset =
-          ((storage_offset % pitch) / stride) % tile_size;
-      if (tile_offset != 0 && tile_offset + size > tile_size) return true;
-      break;
-    }
-  }
-  for (size_t j = 0; j < dims.size(); j++) {
-    if (split[j] && covered[j] != dims[j].size) return true;
+    if (start != 0 && start + extent > stick_size) return true;
   }
   return false;
 }
@@ -1359,8 +1302,25 @@ bool needs_host_staging(const at::Tensor& self, const SpyreTensorLayout& stl) {
   if (view_overlaps_itself(self.sizes(), self.strides())) return true;
   // A view covering every stored element is a plain DMA.
   if (valid_element_count(stl) == self.numel()) return false;
-  // Only this last check needs the allocation geometry.
-  return view_needs_staging(tile_dims(stl), self.sizes(), self.strides(),
+  // A view dim below the layout's largest stride that is not a layout stride
+  // (a step inside a stick, as in x[::2]) selects elements the descriptors
+  // cannot express. Dims above every layout stride are outer offsets and stay.
+  int64_t max_stride = 0;
+  std::set<int64_t> layout_strides;
+  for (const int64_t s : stl.stride_map) {
+    if (s > 0) {
+      layout_strides.insert(s);
+      max_stride = std::max(max_stride, s);
+    }
+  }
+  for (int64_t i = 0; i < self.dim(); i++) {
+    const int64_t s = self.stride(i);
+    if (self.size(i) > 1 && s > 0 && s < max_stride &&
+        !layout_strides.contains(s)) {
+      return true;
+    }
+  }
+  return view_crosses_stick(stl, self.sizes(), self.strides(),
                             self.storage_offset());
 }
 

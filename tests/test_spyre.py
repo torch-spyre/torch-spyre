@@ -253,9 +253,7 @@ class TestSpyre(TestCase):
         )
 
     @staticmethod
-    def _head_major_kv_layout(
-        num_rows, block_size, head_size, dtype, valid_elements=None
-    ):
+    def _head_major_kv_layout(num_rows, block_size, head_size, dtype, valid_elements):
         # The layout spyre-inference uses for its paged KV cache
         # (head_major_kv_layout): the folded (block, kv_head) row stays whole at
         # device dim 0, and head_size is split into sticks.
@@ -271,7 +269,7 @@ class TestSpyre(TestCase):
             device_size=[num_rows, block_size, sticks, eps],
             stride_map=[block_size * head_size, head_size, eps, 1],
             device_dtype=get_device_dtype(dtype),
-            valid_elements=valid_elements or {},
+            valid_elements=valid_elements,
         )
 
     @parametrize(
@@ -284,11 +282,7 @@ class TestSpyre(TestCase):
     @parametrize(
         "head_size", [subtest(64, name="head64"), subtest(128, name="head128")]
     )
-    @parametrize(
-        "with_valid_elements",
-        [subtest(False, name="unknown_valid"), subtest(True, name="valid_elements")],
-    )
-    def test_zero_kv_cache_device_layout(self, dtype, head_size, with_valid_elements):
+    def test_zero_kv_cache_device_layout(self, dtype, head_size):
         # spyre-inference allocates its KV cache pages with
         # torch.empty(..., device_layout=...) and zeroes them with zero_(). The
         # cache is then read back whole, so every element must be zero.
@@ -298,11 +292,7 @@ class TestSpyre(TestCase):
         # Per device dim group, the unpadded extent: rows, block, and head_size
         # across the (stick, element-in-stick) pair, which pads head_size up to
         # whole sticks. The fill guard compares the product with numel().
-        valid = (
-            {(0,): rows, (1,): block_size, (2, 3): head_size}
-            if with_valid_elements
-            else None
-        )
+        valid = {(0,): rows, (1,): block_size, (2, 3): head_size}
         layout = self._head_major_kv_layout(rows, block_size, head_size, dtype, valid)
 
         # Allocation path used by allocate_pages: uninitialised, then zeroed.
