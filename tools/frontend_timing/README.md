@@ -180,10 +180,24 @@ Self time is what ranks cost, and the `--passes` table orders by it.
 
 Pass counts are summed per compile under their bare key, to keep the name set small;
 per-pass counts stay in the raw records. Stage counts are keyed by their region instead,
-because two regions can carry the same key for different things -- the scratchpad records
-`buffers` on more than one -- and summing those would report a number that is neither.
+because two regions can carry the same key for different things, and summing those would
+report a number that is neither.
 Any number a pass puts in its event `meta` that is not a graph size becomes
 a counter, with no change needed here.
+
+### Names that have changed
+
+A region's name is the metric's identity, so a rename splits one series in two and
+the nights either side of it are not comparable. Reading an old sweep means knowing
+what it called things.
+
+| from | to |
+|---|---|
+| `stage.Scratchpad.pre_passes` + `.post_passes` | `stage.Scratchpad.run_passes` |
+
+Pre-passes and post-passes enter the same hook, so one region now covers both.
+Sweeps from 2026-10-07 to 10-23 hold the old pair and no `run_passes`; later ones
+hold `run_passes` and neither of the old names.
 
 ## The rows file
 
