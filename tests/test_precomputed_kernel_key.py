@@ -249,6 +249,16 @@ class TestFingerprint(unittest.TestCase):
                 ),
                 ("sencores", spyre_config.sencores + 1),
                 (
+                    "core_placement_mode",
+                    "clamshell"
+                    if spyre_config.core_placement_mode != "clamshell"
+                    else "dense",
+                ),
+                (
+                    "sencores_physical",
+                    16 if spyre_config.sencores_physical != 16 else 32,
+                ),
+                (
                     "disable_conv2d_spatial_split",
                     not spyre_config.disable_conv2d_spatial_split,
                 ),
@@ -281,6 +291,23 @@ class TestFingerprint(unittest.TestCase):
                 changed["sympy"] = kernel_key_fingerprint(0)
         for field, value in changed.items():
             self.assertNotEqual(value, base, field)
+
+    def test_placement_change_rejects_stored_key(self):
+        with _env(core_placement_mode="dense", sencores_physical=32):
+            spec = _make_op_spec()
+            dim = next(iter(spec.iteration_space))
+            spec.iteration_space[dim] = (Integer(64), 8)
+            from torch_spyre._inductor.core_mapping import derive_operation_mapping
+
+            spec.core_id_to_work_slice = derive_operation_mapping(spec.iteration_space)
+            stored = precompute_kernel_key(_src([spec]), "k")
+            self.assertIsNotNone(stored)
+            base_key = stored.rpartition("|")[0]
+            with spyre_config.patch(core_placement_mode="clamshell"):
+                self.assertIsNone(resolve_precomputed_key(stored))
+                self.assertNotEqual(compute_specs_hash([spec]), base_key)
+            with spyre_config.patch(sencores_physical=16):
+                self.assertIsNone(resolve_precomputed_key(stored))
 
     def test_key_and_fingerprint_share_inputs(self):
         # A non-spec input added to the key must reach the fingerprint too.

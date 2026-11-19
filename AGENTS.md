@@ -122,7 +122,9 @@ them with `PARAMS`, and `pr-review` checks them.
 | Variable | Purpose |
 |---|---|
 | `TORCH_SPYRE_DEBUG=1` | Enable C++ debug logging and `-O0` builds |
-| `SENCORES` | Number of Spyre cores (1–32, default 32) |
+| `SENCORES` | Logical core budget for work-division planning (1–32, default 32) |
+| `SENCORES_PHYSICAL` | Physical core count for placement (default 32), separate from the logical budget |
+| `SPYRE_CORE_PLACEMENT` | Physical placement of logical slices: `dense` (default), `stride`, or `clamshell`; sparse modes apply only when the slice count divides the physical core count and is between 1 and that count; non-unified sharded kernels stay dense |
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
 | `LAYOUT_SOLVER` | LX layout solver: `greedy`, `firstfit`, `bestfit`, `cpsat` (default), `simulated_annealing` |

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import dataclasses
 from functools import partial
 import logging
@@ -1708,3 +1709,141 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
                     == core % 8
                 )
     assert prep.dep_device_coordinates == coordinates
+
+
+class TestCorePlacementStrategies:
+    """Placement strategies for ops using fewer cores than the card.
+
+    Contract under test, shared by every strategy: the returned owner map
+    must give every dispatched core its work slice (dispatched set and
+    owner map agree), every non-dispatched fold position must stay in
+    range, and to_core_slices must accept the whole fold. Strategy-specific
+    tests pin each scheme's dispatched ids and non-member evaluation.
+    """
+
+    CORE_ID = sympy.Symbol("core_id")
+
+    def _placed(self, num_cores, physical_cores=32):
+        dim = sympy.Symbol("out")
+        return core_mapping_module.apply_clamshell(
+            {dim: self.CORE_ID}, num_cores, physical_cores
+        )
+
+    def _owner_map(self, strategy, num_cores, physical_cores=32):
+        dim = sympy.Symbol("out")
+        fn = (
+            core_mapping_module.apply_clamshell
+            if strategy == "clamshell"
+            else core_mapping_module.apply_core_stride
+        )
+        return fn({dim: self.CORE_ID}, num_cores, physical_cores)
+
+    @pytest.mark.parametrize(
+        "strategy, num_cores, expected_ids",
+        [
+            ("clamshell", 2, (0, 31)),
+            ("clamshell", 4, (0, 1, 30, 31)),
+            ("clamshell", 8, (0, 1, 2, 3, 28, 29, 30, 31)),
+            (
+                "clamshell",
+                16,
+                (0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31),
+            ),
+            ("stride", 2, (0, 16)),
+            ("stride", 4, (0, 8, 16, 24)),
+            ("stride", 8, (0, 4, 8, 12, 16, 20, 24, 28)),
+            ("stride", 16, tuple(range(0, 32, 2))),
+        ],
+    )
+    def test_dispatched_ids_match_strategy(self, strategy, num_cores, expected_ids):
+        # Dispatched ids are a sorted contract: consumers treat them as a
+        # set, and a canonical order keeps emitted SDSC stable.
+        _, _, ids = self._owner_map(strategy, num_cores)
+        assert ids == expected_ids
+
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
+    @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
+    def test_members_get_their_work_slices(self, strategy, num_cores):
+        owner_map, span, ids = self._owner_map(strategy, num_cores)
+        assert span == 32
+        slices_by_core = {
+            core: int(owner_map[sympy.Symbol("out")].subs(self.CORE_ID, core))
+            for core in ids
+        }
+        assert sorted(slices_by_core.values()) == list(range(num_cores)), (
+            f"{strategy}: dispatched cores own {sorted(slices_by_core.values())}, "
+            f"want a permutation of 0..{num_cores - 1}"
+        )
+
+    def test_clamshell_eight_slice_member_mapping(self):
+        owner_map, span, ids = self._placed(8)
+        assert span == 32
+        expr = owner_map[sympy.Symbol("out")]
+        assert {core: int(expr.subs(self.CORE_ID, core)) for core in ids} == {
+            0: 4,
+            1: 5,
+            2: 6,
+            3: 7,
+            28: 0,
+            29: 1,
+            30: 2,
+            31: 3,
+        }
+
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
+    @pytest.mark.parametrize("num_cores", [2, 4, 8, 16])
+    def test_non_members_stay_in_range(self, strategy, num_cores):
+        # Every fold position must evaluate to a slice inside [0, num_cores):
+        # to_core_slices validates exactly this over the full fold, and the
+        # backend requires the shared base symbol to be reachable from the
+        # non-dispatched positions.
+        owner_map, span, ids = self._owner_map(strategy, num_cores)
+        dim = sympy.Symbol("out")
+        division = TensorWorkDivision({dim: num_cores}, owner_map, num_cores=span)
+        slices = division.to_core_slices(span)
+        assert len(slices) == span
+
+    def test_clamshell_zeroes_non_members(self):
+        # Load-bearing for address planning: non-dispatched fold positions
+        # evaluate to slice 0 so the shared base symbol (anchored on the
+        # slice-0 owner) covers them.
+        owner_map, span, ids = self._placed(8)
+        expr = owner_map[sympy.Symbol("out")]
+        for core in range(32):
+            if core not in ids:
+                assert int(expr.subs(self.CORE_ID, core)) == 0
+
+    def test_stride_non_members_repeat_preceding_slice(self):
+        # Stride's floor(core/stride) maps non-members onto the slice of the
+        # dispatched core below them; in range, never slice 0 in general.
+        owner_map, span, ids = self._owner_map("stride", 8)
+        expr = owner_map[sympy.Symbol("out")]
+        for core in range(32):
+            if core not in ids:
+                assert int(expr.subs(self.CORE_ID, core)) == core // 4
+
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
+    def test_no_op_cases(self, strategy):
+        # Single-slice ops and full-card ops never shift under any strategy.
+        for num_cores in (1, 32):
+            owner_map, span, ids = self._owner_map(strategy, num_cores)
+            assert ids == tuple(range(num_cores))
+            assert span == num_cores
+
+    @pytest.mark.parametrize("strategy", ["clamshell", "stride"])
+    def test_non_dividing_slice_counts_stay_dense(self, strategy):
+        # Neither strategy spreads a slice count that does not divide the
+        # physical core count (e.g. 12 slices over 32 cores).
+        owner_map, span, ids = self._owner_map(strategy, 12)
+        assert ids == tuple(range(12))
+        assert span == 12
+
+    def test_default_mode_is_dense(self):
+        import torch_spyre._inductor.config as config_module
+
+        # The env var legitimately selects a mode in a placement test run;
+        # only its absence pins the dense default.
+        if os.environ.get("SPYRE_CORE_PLACEMENT") is None:
+            assert config_module.core_placement_mode == "dense"
+        else:
+            assert config_module.core_placement_mode in ("dense", "stride", "clamshell")

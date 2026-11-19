@@ -592,6 +592,58 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
 
 
+class TestShardedCorePlacement(InductorTestCase):
+    def test_non_unified_core_ids_stay_shard_local(self):
+        shard = sympy.Symbol("c0")
+        iteration_space = {shard: (sympy.Integer(64), 8)}
+        args = [
+            TensorArg(
+                is_input=is_input,
+                arg_index=index,
+                device_dtype=DataFormats.IEEE_FP16,
+                device_size=[1, 64, 1],
+                device_coordinates=[sympy.Integer(0), shard, sympy.Integer(0)],
+                allocation={"hbm": index},
+                non_unified_shard_bytes=16,
+            )
+            for is_input, index in ((True, 0), (False, 1))
+        ]
+        spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            args=args,
+            op_info={},
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+        )
+        for mode in ("dense", "stride", "clamshell"):
+            with (
+                self.subTest(mode=mode),
+                config.patch(
+                    sencores=8, sencores_physical=32, core_placement_mode=mode
+                ),
+            ):
+                sdsc, _ = parse_op_spec(spec)
+                self.assertEqual(sdsc.num_cores, 8)
+                payload, _, _, symbol_kinds = compile_op_spec(0, spec, [])
+                root = next(iter(payload.values()))
+                self.assertEqual(root["numCoresUsed_"], 8)
+                self.assertEqual(
+                    root["dscs_"][0]["add"]["coreIdsUsed_"], list(range(8))
+                )
+                self.assertEqual(
+                    [root["coreIdToWkSlice_"][str(core)]["out"] for core in range(8)],
+                    list(range(8)),
+                )
+                for tensor in sdsc.args:
+                    self.assertTrue(tensor.non_unified)
+                    self.assertEqual(tensor.active_core_ids, ())
+                self.assertEqual(
+                    [(kind.arg_index, kind.core_idx) for kind in symbol_kinds],
+                    [(index, core) for index in range(2) for core in range(8)],
+                )
+
+
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
     def test_restickify_preserves_negative_window_gap(self):
         """Restickify must not replace an unfold gap with a padding gap."""
@@ -1211,6 +1263,9 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
             symbolic_dim_bounds={"s0": (512, 64)},
         )
 
+    @config.patch(
+        {"sencores": 8, "sencores_physical": 32, "core_placement_mode": "stride"}
+    )
     def test_per_core_symbolic_addresses_emitted(self):
         op_spec = self._make_symbolic_op_spec()
         sdsc_json, _, _, symbol_kinds = compile_op_spec(
@@ -1219,13 +1274,22 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
 
         top = next(iter(sdsc_json.values()))
         dsc = next(iter(top["dscs_"][0].values()))
+        physical_cores = top["coreFoldProp_"]["factor_"]
+        active_cores = (0, 4, 8, 12, 16, 20, 24, 28)
+        self.assertEqual(physical_cores, 32)
+        self.assertEqual(dsc["coreIdsUsed_"], list(active_cores))
+        self.assertEqual(set(top["coreIdToDsc_"]), {str(c) for c in active_cores})
+        self.assertEqual(
+            top["coreIdToWkSlice_"],
+            {str(c): {"mb": i, "out": 0} for i, c in enumerate(active_cores)},
+        )
 
-        # The dim symbol s0 -> mb is still bound the same way; this change
-        # layers per-core symbols on top of the dim mapping.
+        # The dim symbol s0 -> mb is still bound the same way; per-core
+        # addresses use the physical IDs selected by sparse placement.
         self.assertEqual(dsc["dimToSymbolMapping_"], {"mb": [-1]})
 
-        # Every HBM tensor's allocate node carries the symbolic-address flag and
-        # a full per-core data_ map whose c>0 values are symbol id strings.
+        # Every HBM tensor has a positional core-fold address map. Each
+        # dispatched core beyond zero must resolve to its own symbolic address.
         hbm_allocate_nodes = [
             node
             for node in dsc["scheduleTree_"]
@@ -1237,28 +1301,26 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         for node in hbm_allocate_nodes:
             self.assertEqual(node["isStartAddrSymbolic_"], 1)
             data = node["startAddressCoreCorelet_"]["data_"]
-            self.assertEqual(len(data), self._NUM_CORES)
-            for c in range(self._NUM_CORES):
-                key = f"[{c}, 0, 0]"
-                self.assertIn(key, data)
-                value = int(data[key])
-                # c>0 must be a negative symbol id: a positive value would mean
-                # the per-core symbolic path did not fire for that core.
-                if c > 0:
-                    self.assertLess(value, 0)
-                    per_core_symbol_ids.append(value)
+            self.assertEqual(len(data), physical_cores)
+            for core in active_cores[1:]:
+                value = int(data[f"[{core}, 0, 0]"])
+                self.assertLess(value, 0)
+                per_core_symbol_ids.append(value)
+                kind = symbol_kinds[-value - 1]
+                self.assertTrue(kind.is_derived_symbolic)
+                self.assertEqual(kind.arg_index, node["ldsIdx_"])
+                self.assertEqual(kind.core_idx, core)
+                self.assertEqual(kind.split_count, self._NUM_CORES)
+                self.assertEqual(kind.pytorch_sym, "s0")
+                self.assertEqual(kind.offset, 0)
 
-        # The dim-symbol id (-1) must not collide with any per-core address id.
+        self.assertEqual(len(set(per_core_symbol_ids)), len(per_core_symbol_ids))
         self.assertNotIn(-1, per_core_symbol_ids)
 
-        # symbol_kinds carries the dim kinds followed by the address kinds.
-        # Exactly 3 HBM tensors * (NUM_CORES - 1) symbolic per-core addresses.
+        # Inactive fold positions may also carry address symbols because the
+        # address map spans the fold. They are not dispatched or required here.
         symbolic_kinds = [sk for sk in symbol_kinds if sk.is_derived_symbolic]
-        self.assertEqual(len(symbolic_kinds), 3 * (self._NUM_CORES - 1))
-        for sk in symbolic_kinds:
-            self.assertEqual(sk.split_count, self._NUM_CORES)
-            self.assertEqual(sk.pytorch_sym, "s0")
-            self.assertGreaterEqual(sk.core_idx, 1)
+        self.assertGreaterEqual(len(symbolic_kinds), len(per_core_symbol_ids))
 
         # This PR only tags the symbolic split; no per-element stride is stored
         # on the marker (that is the bundle-arm follow-up), so offset stays at

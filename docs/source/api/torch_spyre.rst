@@ -712,7 +712,21 @@ Environment Variables
    * - Variable
      - Purpose
    * - ``SENCORES``
-     - Number of Spyre cores (1--32, default 32)
+     - Logical core limit for work division and LX planning (1--32,
+       default 32). Sparse placement can use physical core IDs above
+       this limit.
+   * - ``SENCORES_PHYSICAL``
+     - Physical core count for placement (default ``32``). Set it to the
+       card's core count. It does not change the ``SENCORES`` planning limit.
+   * - ``SPYRE_CORE_PLACEMENT``
+     - Place planned work slices on physical cores: ``dense`` (default)
+       keeps consecutive IDs; ``stride`` spaces them evenly;
+       ``clamshell`` wraps them across the ring boundary. The sparse modes
+       apply when the slice count exceeds 1, is less than
+       ``SENCORES_PHYSICAL``, and divides that count. Non-unified sharded
+       kernels stay dense: core ``c`` must access shard ``c``. ``clamshell``
+       needs the deeptools ``GatherBuffers.cpp`` fix (commit ``209ca4aa5a``)
+       for wrapping windows with indirect access.
    * - ``DXP_LX_FRAC_AVAIL``
      - Fraction of LX scratchpad available to the planner (default ``0.2``)
    * - ``LX_PLANNING``

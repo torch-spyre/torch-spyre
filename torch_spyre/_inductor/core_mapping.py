@@ -24,7 +24,7 @@ from itertools import permutations, product
 from typing import Any, Callable
 
 import sympy
-from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy import Expr, Integer, Max, Mod, Symbol, floor, sympify
 from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
@@ -595,6 +595,115 @@ def core_to_slice_mapping(
         result[dims[dim]] = coordinate
         stride *= split
     return result
+
+
+def placement_applies(num_cores: int, physical_cores: int) -> bool:
+    """Whether a sparse placement moves ``num_cores`` slices at all.
+
+    The single applicability gate shared by ``apply_core_stride``,
+    ``apply_clamshell``, and every consumer that mirrors their decisions
+    (route remapping, dispatch admission). A placement never moves a
+    single slice, a full card, or a count that does not divide the
+    physical core count, so those cases must stay dense everywhere —
+    shifting routes without moving the placement would strand them.
+    """
+    if num_cores <= 1 or num_cores >= physical_cores:
+        return False
+    return physical_cores % num_cores == 0
+
+
+def resolve_core_stride(num_cores: int, physical_cores: int) -> int:
+    """Spread ``num_cores`` logical slices evenly over a wider physical span.
+
+    Returns ``physical_cores // num_cores`` when ``placement_applies`` is
+    true, so slice ``i`` lands on physical core ``i * S``. Otherwise returns
+    1 and leaves the slices densely placed.
+    """
+    if num_cores <= 1 or physical_cores <= 0 or physical_cores % num_cores != 0:
+        return 1
+    return physical_cores // num_cores
+
+
+def apply_core_stride(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices onto a strided physical core span.
+
+    ``core_map`` holds formulas in ``Symbol("core_id")`` over the logical
+    range ``0..num_cores-1``. The backend's core fold is positional: its size
+    is the highest id in use plus one, and the dispatched set is whatever ids
+    are actually listed, so a wider, evenly spaced span is a legal physical
+    placement as long as exactly one physical id per logical slice is
+    dispatched. ``resolve_core_stride`` picks that spacing from the physical
+    core count; a stride of 1 returns ``core_map`` unchanged.
+
+    Returns the rewritten map, the widened fold size (``num_cores * stride``),
+    and the dispatched physical ids; the fold includes non-dispatched positions.
+    """
+    stride = resolve_core_stride(num_cores, physical_cores)
+    if stride == 1:
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    core_id = Symbol("core_id")
+    rewritten = {
+        dim: owner.xreplace({core_id: floor(core_id / stride)})
+        for dim, owner in core_map.items()
+    }
+    span = num_cores * stride
+    return rewritten, span, tuple(range(0, span, stride))
+
+
+def apply_clamshell(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices with a downward half-count shift.
+
+    Logical slice ``i`` dispatches physical core ``(i - num_cores // 2)
+    % physical_cores``. The resulting set balances the two 16-core halves
+    of the card (low ids of the first half, high ids of the second)
+    at every applicable count, including the [0, 31] two-core placement.
+    Returns the rewritten map, the fold size ``physical_cores``, and the
+    sorted dispatched physical ids. A no-op — the original map, a fold of
+    ``num_cores``, and dense ids — whenever ``placement_applies`` is false
+    (single slice, full card, or a slice count that does not divide the
+    physical core count).
+
+    Owner rewrite: each owner expression is rebuilt by substituting
+    ``core_id`` with the operation-logical slice of the physical core,
+    gated to zero outside the window: with ``t = Mod(core_id + shift,
+    physical_cores)``, the substitution is ``t * Max(1 - floor(t /
+    num_cores), 0)``. Dispatched members have ``t < num_cores`` and map to
+    their exact slices (including across the fold wrap); non-dispatched
+    fold positions evaluate to slice 0, which is required by the backend:
+    every non-dispatched position must carry the shared HBM base symbol
+    (the slice-0 address that address planning anchors on the fold
+    position owning work slice 0), not a derived per-core address.
+    """
+    if not placement_applies(num_cores, physical_cores):
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    shift = num_cores // 2
+    ids = tuple(sorted((i - shift) % physical_cores for i in range(num_cores)))
+    # Owner expression: the wrapping term t = Mod(core_id + shift,
+    # physical_cores) is the logical slice at dispatched members (t < n, so
+    # the gate below stays open and members map to their exact slices,
+    # including across the fold wrap — the clamshell window, n=8 -> ids
+    # [0..3, 28..31]). At non-dispatched fold positions t >= n and the gate
+    # floor(t / n) zeroes the expression, so non-members evaluate to
+    # slice 0. That is load-bearing, not cosmetic: address planning anchors
+    # the shared HBM base symbol on the fold position that owns work slice
+    # 0, and the backend requires every non-dispatched position to carry
+    # that same base symbol in startAddressCoreCorelet_ — non-members on a
+    # derived (slice n-1) address fault the card with a PCIe BusFence
+    # during attention-graph recording even though every address is
+    # in-bounds. Zeroing non-members reproduces exactly the symbol-sharing
+    # structure of the validated non-wrap legs.
+    core_id = Symbol("core_id")
+    t = Mod(core_id + Integer(shift), Integer(physical_cores))
+    op_logical = t * Max(Integer(1) - floor(t / Integer(num_cores)), Integer(0))
+    rewritten = {
+        dim: owner.xreplace({core_id: op_logical}) for dim, owner in core_map.items()
+    }
+    span = max(physical_cores, num_cores)
+    return rewritten, span, ids
 
 
 def matmul_reduction_dim(

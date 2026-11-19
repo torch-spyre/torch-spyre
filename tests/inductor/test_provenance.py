@@ -522,6 +522,70 @@ class TestGenerateSdscEmit:
         sdsc_json, *_ = generate_sdsc(0, sdsc_spec, [])
         assert sdsc_json[f"0_{sdsc_spec.opfunc}"]["debug_handle_"] is None
 
+    def test_core_work_slice_map_only_emits_active_cores(self):
+        spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=DataFormats.SEN169_FP16,
+            num_inputs=1,
+            iteration_space={Symbol("x"): 8},
+            num_cores=32,
+            work_slices={Symbol("x"): 8},
+            core_id_to_work_slice={Symbol("x"): Symbol("core_id") // 4},
+            padding={},
+            layouts={},
+            args=[],
+            constants={},
+            coordinate_masking={},
+            completed_producer_cores=(0, 4, 8, 12, 16, 20, 24, 28),
+        )
+        sdsc_json, *_ = generate_sdsc(0, spec, [])
+        emitted = sdsc_json["0_add"]["coreIdToWkSlice_"]
+
+        assert tuple(map(int, emitted)) == spec.completed_producer_cores
+        assert emitted == {str(core): {"x": core // 4} for core in range(0, 32, 4)}
+
+    def test_rejects_fold_without_zero_slice_owner(self):
+        spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=DataFormats.SEN169_FP16,
+            num_inputs=1,
+            iteration_space={Symbol("x"): 8},
+            num_cores=8,
+            work_slices={Symbol("x"): 8},
+            core_id_to_work_slice={Symbol("x"): (Symbol("core_id") + 1) % 7 + 1},
+            padding={},
+            layouts={},
+            args=[],
+            constants={},
+            coordinate_masking={},
+        )
+        with pytest.raises(ValueError, match="No fold position owns the all-zero"):
+            generate_sdsc(0, spec, [])
+
+    def test_core_work_slice_map_keeps_dense_core_ids(self):
+        spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=DataFormats.SEN169_FP16,
+            num_inputs=1,
+            iteration_space={Symbol("x"): 8},
+            num_cores=8,
+            work_slices={Symbol("x"): 8},
+            core_id_to_work_slice={Symbol("x"): Symbol("core_id")},
+            padding={},
+            layouts={},
+            args=[],
+            constants={},
+            coordinate_masking={},
+        )
+        sdsc_json, *_ = generate_sdsc(0, spec, [])
+
+        assert tuple(map(int, sdsc_json["0_add"]["coreIdToWkSlice_"])) == tuple(
+            range(8)
+        )
+
 
 class TestCodegenRoundTrip:
     """The OpSpec source-codegen -> exec seam.

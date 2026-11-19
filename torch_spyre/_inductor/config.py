@@ -76,6 +76,25 @@ sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lowe
     "yes",
 )
 
+# Sparse physical core placement for ops using fewer cores than the card
+# has: "dense" (default) keeps the original mapping — logical slice i runs
+# on core i, no remapping; "clamshell" dispatches logical slice i to
+# (i - n//2) % sencores_physical, balancing the two 16-core
+# halves (low ids of the first, high ids of the second) and wraps the fold
+# boundary; "stride" spreads slices at equal stride i*(sencores_physical/n) and
+# stays inside monotonic fold order. The clamshell requires the deeptools
+# gather-buffer fix (GatherBuffers.cpp filtering the original SDSC's
+# coreIdsUsed_); on an unfixed backend it faults with a PCIe BusFence on
+# indirect-access ops with wrapping sets.
+core_placement_mode: Literal["dense", "stride", "clamshell"] = os.environ.get(
+    "SPYRE_CORE_PLACEMENT", "dense"
+)  # type: ignore[assignment]
+if core_placement_mode not in ("dense", "stride", "clamshell"):
+    raise ValueError(
+        "SPYRE_CORE_PLACEMENT must be one of dense/stride/clamshell, got "
+        f"{core_placement_mode!r}"
+    )
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
@@ -230,6 +249,15 @@ allow_all_ops_in_lx_planning: bool = False
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
+
+# The card's physical core count. ``sencores`` is the LOGICAL planning bound:
+# the work-division planner and LX allocator size their divisions from it, and
+# spyre-inference caps it per compile (e.g. attention's _run_with_capped_cores
+# sets sencores=8) to plan over fewer cores. Physical core placement must NOT
+# follow that cap — remapping spreads slices over the real card regardless of
+# how many cores the op was planned on — so the placement and producer-core
+# remap read this value instead.
+sencores_physical: int = int(os.getenv("SENCORES_PHYSICAL", "32"))
 
 # Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
 # The pointwise work-division PR (#2499) wires that helper into the
