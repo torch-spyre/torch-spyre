@@ -836,7 +836,7 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         reason=(
             "for_each_tile fails to preserve input EA tag in identity op. The "
             "output is incorrectly tagged STANDARD (default) when data is "
-            "staggered it causes EA DCI to incorrectlly apply / restore EA. "
+            "staggered it causes EA DCI to incorrectly apply / restore EA. "
             "See issue #6462."
         ),
     )

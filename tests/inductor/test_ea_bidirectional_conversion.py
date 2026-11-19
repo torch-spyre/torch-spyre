@@ -1438,6 +1438,14 @@ def test_ea_staggered_host_storage_offset():
     pair_aligned_slice_odd.copy_(y_odd_fp32)
     assert torch.equal(pair_aligned_slice_odd, y_odd_fp32.cpu())
 
+    # H2D: Pair-aligned offset (64 elements) with boundary expand -> succeeds
+    h2d_host_buf = torch.arange(64 + 4 * 68, dtype=torch.float32)
+    h2d_host_slice = h2d_host_buf[64:].view(4, 68)
+    y_h2d = _convert_one_row_per_core(torch.zeros(4, 68, dtype=torch.float16), torch.float32)
+    assert_ea(y_h2d, ElementArrangement.DL16_TO_FP32)
+    y_h2d.copy_(h2d_host_slice)
+    assert torch.equal(y_h2d.cpu(), h2d_host_slice)
+
     # FP32_TO_DL16: stick is 64 elements (1 FP16 stick)
     x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
     y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
@@ -1456,8 +1464,8 @@ def test_ea_staggered_host_storage_offset():
     assert torch.equal(stick_aligned_slice, y_dl16.cpu())
 
 
-def test_ea_staggered_device_storage_offset_probe():
-    """Probe whether device-side slices with pair-aligned offsets restore correctly."""
+def test_ea_staggered_device_storage_offset():
+    """Verify whether device-side slices with pair-aligned offsets restore correctly."""
     # DL16_TO_FP32 D2H: pair-aligned device slice (64 elements / 2 FP32 sticks)
     x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
     y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
