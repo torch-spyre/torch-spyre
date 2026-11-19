@@ -4478,7 +4478,7 @@ class TestDeferredWorkDivision(unittest.TestCase):
 
 
 class _SqueezingPostStickify:
-    """Stands in for ``coarse_tile_post_stickify``: divides each grouped op's
+    """Stands in for ``tile_groups``: divides each grouped op's
     ranges by ``tiling``, which is the part of the apply that renumbers its
     iteration symbols."""
 
@@ -4571,9 +4571,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 )
             ]
             with (
-                patch.object(
-                    coarse_tiling, "coarse_tile_post_stickify", post_stickify(tiling)
-                ),
+                patch.object(coarse_tiling, "tile_groups", post_stickify(tiling)),
                 patch.object(
                     allocator_module, "commit_iteration_space_ownership"
                 ) as commit,

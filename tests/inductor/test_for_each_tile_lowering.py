@@ -1670,7 +1670,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
     def test_private_in_graph_fill_keeps_single_buffer(self):
         """A compiler-owned in-graph `torch.zeros` fill is not copied."""
@@ -1867,7 +1866,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
             records_by_name = {
                 op.get_name(): record
@@ -5664,7 +5662,6 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             info = op.loop_info
             self.assertEqual(info.loop_group_id, (0,))
             self.assertEqual(info.loop_count, [result.trip_count])
-            self.assertIsNone(info.propagation)
 
     def test_marker_resolved_dim_appears_in_loop_tiled_dims(self):
         """A marker-resolved tile read surfaces in loop_tiled_dims.

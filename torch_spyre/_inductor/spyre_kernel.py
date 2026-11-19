@@ -1007,8 +1007,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         stored per-read fields are deleted (stage 7.4) the record is still built, and
         the two must agree: a difference is a compiler bug (a pass edited one source
         and not the other), so it raises instead of emitting a kernel that advances
-        by the wrong amount. Every other op (span-overflow and the allocator's
-        tiling have no loop variable) keeps the record.
+        by the wrong amount. Every other op keeps the record.
         """
         ir_node = self.current_node.node
         if isinstance(getattr(ir_node, "loop_info", None), LoopShim):
@@ -1298,7 +1297,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # op's own iteration space entirely (no d{i} symbol survives), so it
         # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
         # only advance via squeezed_advance_per_read/squeezed_advance_output
-        # (see coarse_tile.py's _insert_copy_op, the "d not in
+        # (see loop_tiling_lowering.py's _insert_copy_out, the "d not in
         # squeeze_pos" branch). _general_tile_advance already mints/uses a
         # level symbol from squeezed_advance_per_level regardless of
         # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
