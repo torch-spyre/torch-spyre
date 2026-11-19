@@ -16,6 +16,8 @@ import io
 import itertools
 import math
 import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -47,6 +49,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -63,7 +66,6 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
-    get_device_dtype,
     get_elem_in_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -83,7 +85,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .logging_utils import get_inductor_logger
+from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
@@ -176,14 +178,14 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-        #    (_insert_reduction_copy_op), which mutates directly into a
+        #    (_lower_reduction), which mutates directly into a
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
         #    producer's output would be read; or
         #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
         #    whose target is a locally-created graph-output buffer (e.g.
-        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_out's
         #    inserted coarse_tile_copy_* op reads the mutation op's own output
         #    the same way. The mutation target there is an ordinary
         #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
@@ -208,71 +210,131 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def rescale_stl_for_dtype(
+def forward_valid_elements(
     stl: SpyreTensorLayout,
-    out_dtype: torch.dtype,
-    ea: ElementArrangement,
-) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
+) -> dict[tuple[int, ...], int]:
+    """Copy valid_elements from stl unchanged.
 
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
-
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
-
-    The rescale must be exact: the dim's sticks must hold a whole number of
-    output sticks. Flooring an inexact ratio either drops data (three fp32
-    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
-    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
-    dim used to reach ``get_device_stride_infos`` and kill the process with
-    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
-    partially filled stick builds its own layout instead (see
-    ``_qfp8ch_stl`` in propagate_layouts.py).
-
-    Args:
-        stl: Input device layout to rescale.
-        out_dtype: Torch dtype of the conversion output.
-        ea: ElementArrangement to stamp on the returned layout.
-
-    Raises:
-        Unsupported: If the stick-indexing dim does not rescale to a whole
-            number of output sticks.
+    Use when the new STL has identical geometry to the input: dtype rescale,
+    element_arrangement-only change, broadcast-zero, clone, or any reshape
+    that does not move which device dims belong to which host dim.
     """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            total_elems = stl.device_size[i] * in_eps
-            if total_elems % out_eps != 0:
-                raise Unsupported(
-                    f"cannot rescale device layout {list(stl.device_size)} for "
-                    f"conversion to {out_dtype}: device dim {i} holds "
-                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
-                    f"not a whole number of {out_eps}-element output sticks"
-                )
-            out_device_size[i] = total_elems // out_eps
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
-    )
+    return dict(stl.valid_elements)
+
+
+def reorder_valid_elements(
+    stl: SpyreTensorLayout,
+    new_order: list[int],
+) -> dict[tuple[int, ...], int]:
+    """Remap device-dim indices through a permutation.
+
+    new_order[new_pos] = old_pos.  Use when device dims are reordered without
+    changing which host dim they map to (e.g. nonstick_dim_order swaps).
+    """
+    inv = {old: new for new, old in enumerate(new_order)}
+    return {
+        tuple(sorted(inv[d] for d in key)): val
+        for key, val in stl.valid_elements.items()
+    }
+
+
+def collapse_valid_elements(
+    stl: SpyreTensorLayout,
+    outer_dims: list[int],
+    keep: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after collapsing several outer dims into one.
+
+    outer_dims is the sorted list of device dim indices being merged; keep is
+    the surviving dim (must be outer_dims[0]).  The merged dims' valid counts
+    are multiplied together (they all covered the same variable, so the product
+    is the total valid tile count for the new dim).  Remaining dims are
+    renumbered to account for the removed indices.
+    """
+    remove = set(outer_dims[1:])
+    # Map old dim index → new dim index after deletions.
+    shift = {d: d - sum(r < d for r in remove) for d in range(len(stl.device_size))}
+    new_ve: dict[tuple[int, ...], int] = {}
+    merged_val = 1
+    for key, val in stl.valid_elements.items():
+        merged_dims = [d for d in key if d in outer_dims]
+        rest = [d for d in key if d not in outer_dims]
+        if not merged_dims:
+            new_key = tuple(sorted(shift[d] for d in key))
+            new_ve[new_key] = val
+        elif not rest:
+            merged_val *= val
+        else:
+            # A key shared with non-merged dims (e.g. the stick group (1, 3) when
+            # dim 1 is merged).  The rest keeps its positions; the merged dims
+            # get the remaining count, rounded up so no valid position is lost.
+            rest_size = math.prod(stl.device_size[d] for d in rest)
+            rest_val = min(val, rest_size)
+            merged_val *= -(-val // rest_size)
+            new_ve[tuple(sorted(shift[d] for d in rest))] = rest_val
+    new_ve[(shift[keep],)] = merged_val
+    return new_ve
+
+
+def prepend_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new outermost device dimension at index 0.
+
+    Shifts all existing dim indices by +1. The new dim at index 0 has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()
+    }
+    shifted[(0,)] = new_dim_size
+    return shifted
+
+
+def restickify_valid_elements(
+    stl: SpyreTensorLayout,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after moving the stick to a new host dimension.
+
+    Updates the stick group's count to new_sd_host_size and makes
+    new_sd_outer_dim a standalone key with old_sd_host_size. Dims that shared a
+    touched key are split out with count 1. Returns {} (valid extents unknown)
+    when old == new, or when ``stl`` has no valid_elements stick group to update.
+    """
+    if old_sd_outer_dim == new_sd_outer_dim:
+        return {}
+    stick_dim = len(stl.device_size) - 1
+    old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+    if old_stick_key is None:
+        return {}
+    # Fold the old outer dim into the stick group if it still holds sticks.
+    stick_size = stl.device_size[stick_dim]
+    new_old_outer_size = -(-new_sd_host_size // stick_size)
+    if old_sd_outer_dim not in old_stick_key and new_old_outer_size > 1:
+        old_stick_key = tuple(sorted(set(old_stick_key) | {old_sd_outer_dim}))
+    # The new outer dim becomes standalone, so it must leave the stick key.
+    old_stick_key = tuple(d for d in old_stick_key if d != new_sd_outer_dim)
+    regrouped = set(old_stick_key) | {new_sd_outer_dim}
+    # Split keys containing the old outer dim too, so it isn't duplicated.
+    touched = regrouped | {old_sd_outer_dim}
+    result = {}
+    for key, val in stl.valid_elements.items():
+        if touched.isdisjoint(key):
+            result[key] = val
+        else:
+            for d in set(key) - touched:
+                result[(d,)] = 1
+    result[old_stick_key] = new_sd_host_size
+    result[(new_sd_outer_dim,)] = old_sd_host_size
+    # A standalone old outer dim left at size 1 must hold a count of 1 at most.
+    if new_old_outer_size == 1 and old_sd_outer_dim not in old_stick_key:
+        result[(old_sd_outer_dim,)] = 1
+    return result
 
 
 def op_read_writes(op: Operation) -> ReadWrites:
@@ -341,14 +403,198 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     output expressions are never touched, so the generated coordinate
     expressions remain symbolic and will carry through to the SDSC when
     symbolic SDSC generation is implemented.
+
+    A structural parameter that depends on a DECLARED dimension, one the caller
+    moved with ``tensor.to("spyre", dynamic={d: {min, max, granularity}})``,
+    resolves to that dimension's declared MAXIMUM, not to this call's hint. One
+    binary has to stay valid for every size in the range, and the hint is one
+    warm-up call's size. Measured: a binary built against a 320-row warm-up was
+    correct at 128 and 256 and wrong at 448 and 512, relative error 3.96 and
+    4.37. Over-declaring the geometry is harmless and under-declaring it is a
+    silent wrong answer, which puts the maximum at the safe end. The maximum is
+    the declaration's, recorded for this compile by ``declared_dims``, not a
+    bound the ShapeEnv happens to know.
+
+    This changes nothing for anyone else: a concrete expression returns early
+    above, and a symbol that went dynamic by ``mark_dynamic`` alone, with or
+    without a ``max=``, is not declared and still takes the hint.
+
+    Depends on the max-strided reservation (#5179). Geometry sized from the
+    maximum is only addressable because the buffer was reserved for the maximum.
     """
     if isinstance(expr, int):
         return expr
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.optimization_hint(expr)
+        if not declared_dims_in(expr):
+            return V.graph.sizevars.optimization_hint(expr)
+        # Declared symbols at their maximum, anything else at its hint, so a
+        # size mixing the two is still built for the declared range and the
+        # undeclared part keeps the behaviour it has without this registry.
+        partial = substitute_declared_max(expr)
+        at_max = (
+            int(partial)
+            if partial.is_number
+            else V.graph.sizevars.optimization_hint(partial)
+        )
+        # The substitution assumes the size grows with the dimension. For the
+        # structural sizes this serves (an extent, a tile count, a stride
+        # product) it does. Catch the ones it does not: a value at the maximum
+        # below the value at this call's hint means the geometry built here
+        # would not cover the call being compiled.
+        hint_of = getattr(V.graph.sizevars, "optimization_hint", None)
+        if hint_of is not None:
+            at_hint = hint_of(expr)
+            if at_max < at_hint:
+                raise Unsupported(
+                    f"structural size {expr} is {at_max} at the declared maximum "
+                    f"of {sorted(declared_dims_in(expr))} but {at_hint} at this "
+                    f"call's size, so it does not grow with the dimension and "
+                    f"geometry built at the maximum would not cover this call. "
+                    f"A declared dimension must enter a size monotonically."
+                )
+        return at_max
     return int(expr)
+
+
+def trip_count_estimate(count) -> int:
+    """A loop's trip count as an ``int`` (at least 1), for pricing re-reads.
+
+    A symbolic count resolves with :func:`concretize_expr`. An unbacked count,
+    or one that does not resolve, is 1.
+    """
+    try:
+        return max(1, int(count))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if free_unbacked_symbols(count):
+            return 1
+        return max(1, int(concretize_expr(count)))
+    except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
+        warn_once(
+            logger,
+            f"trip_count_estimate:{type(e).__name__}",
+            "trip count %s not resolved, priced as 1 trip: %r",
+            count,
+            e,
+        )
+        return 1
+
+
+# The dimensions declared with ``tensor.to("spyre", dynamic=...)`` for the compile
+# in progress, by symbol name: {name: (min, max, granularity)}. Set for the span
+# of one Spyre ``compile_fx`` by ``patches.enable_spyre_context`` from the graph
+# inputs that carry a reservation (``torch_spyre._C.get_reserved_dims``), before
+# lowering starts, because ``concretize_expr`` is already called during
+# lowering. Keyed by name because the name is what ``LoopSpec`` carries in
+# ``count_symbol_bounds`` and what survives the reload.
+#
+# A ContextVar rather than a module global: a compile in another thread sees its
+# own set, or none, never this one's.
+_DECLARED_DIMS: ContextVar[dict[str, tuple[int, int, int]]] = ContextVar(
+    "spyre_declared_dims", default={}
+)
+
+
+@contextmanager
+def declared_dims(mapping: "dict[str, tuple[int, int, int]] | None"):
+    """Make ``mapping`` the declared dimensions of the compile inside the block."""
+    token = _DECLARED_DIMS.set(dict(mapping or {}))
+    try:
+        yield
+    finally:
+        _DECLARED_DIMS.reset(token)
+
+
+def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
+    """The declared dimensions among ``expr``'s free symbols, by name."""
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return {}
+    current = _DECLARED_DIMS.get()
+    return {str(s): current[str(s)] for s in expr.free_symbols if str(s) in current}
+
+
+def declared_dim_of(symbol) -> "tuple[int, int, int] | None":
+    """The ``(min, max, granularity)`` declared for one symbol, or None."""
+    return _DECLARED_DIMS.get().get(str(symbol))
+
+
+def substitute_declared_max(expr):
+    """``expr`` with every declared symbol replaced by its declared maximum.
+
+    Undeclared symbols stay, so the caller sees what is left: nothing (a number),
+    or the undeclared part to resolve its own way.
+    """
+    declared = declared_dims_in(expr)
+    if not declared:
+        return expr
+    return expr.xreplace(
+        {
+            s: sympy.Integer(declared[str(s)][1])
+            for s in expr.free_symbols
+            if str(s) in declared
+        }
+    )
+
+
+def undeclared_symbols_in(count) -> list[str]:
+    """The names of ``count``'s free symbols that no declaration covers."""
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return []
+    declared = declared_dims_in(count)
+    return sorted(str(s) for s in count.free_symbols if str(s) not in declared)
+
+
+def require_declared_count(count) -> None:
+    """Refuse a symbolic loop count over a dimension nobody declared.
+
+    A ``for_each_tile`` count only ever becomes one binary for a range when the
+    operand was moved with ``tensor.to("spyre", dynamic={d: {min, max,
+    granularity}})``: that reserves the buffer at the maximum and keeps the
+    device layout, so one graph serves every size. A dimension that only went
+    dynamic by ``mark_dynamic`` reserves nothing, its layout guard carries the
+    exact size and every size recompiles anyway, so a symbolic loop over it
+    would be a per-size kernel with its extent sized from a ShapeEnv bound no
+    reservation backs. Measured on device, 6 November 2026: four sizes, four
+    graphs. Refused here, at the one place every loop level's count passes,
+    with the fix in the message.
+
+    Raises:
+        Unsupported: ``count`` has a free symbol with no declaration.
+    """
+    undeclared = undeclared_symbols_in(count)
+    if undeclared:
+        raise Unsupported(
+            f"for_each_tile trip count {count} depends on {undeclared}, which "
+            f'no tensor.to("spyre", dynamic=...) declaration covers. A symbolic '
+            f"loop runs as one binary only over a declared dimension: move the "
+            f'operand with tensor.to("spyre", dynamic={{d: {{"min": ..., '
+            f'"max": ..., "granularity": ...}}}}) instead of mark_dynamic.'
+        )
+
+
+def declared_max_or_none(expr) -> Optional[int]:
+    """``expr`` evaluated at the declared maximum of every symbol in it, or None.
+
+    None when ``expr`` has no free symbols, or when any of them is not a declared
+    dimension: a symbol that went dynamic by ``mark_dynamic`` alone is left to
+    the caller's fallback (the hint for geometry, the ShapeEnv bound for a loop
+    count). The structural sizes this serves are monotonic in the dimension (a
+    size, a tile count, a stride product), so substituting the maximum gives the
+    largest extent the geometry has to cover.
+    """
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return None
+    if not declared_dims_in(expr):
+        return None
+    at_max = substitute_declared_max(expr)
+    if isinstance(at_max, sympy.Integer):
+        return int(at_max)
+    if getattr(at_max, "is_integer", False) and at_max.is_number:
+        return int(at_max)
+    return None
 
 
 def _user_min_or_none(expr: Expr) -> Optional[int]:
@@ -379,12 +625,21 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
 
 
 def finite_upper_or_none(expr: Expr) -> Optional[int]:
-    """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
-    A bound is usable iff it is a positive concrete
-    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
-    values all return ``None``.
+    """Return the finite upper bound for ``expr``, or ``None``.
+
+    A declared dimension's bound is its declaration's maximum (``declared_dims``),
+    whether or not the trace also carried a ``torch._check`` range for it.
+    Otherwise it is the ShapeEnv's bound, usable iff it is a positive concrete
+    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive values all
+    return ``None``.
     """
-    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    at_max = declared_max_or_none(expr)
+    if at_max is not None:
+        return at_max
+    # A mixed expression: the declared part at its maximum, the rest asked of
+    # the ShapeEnv, so the declared symbol never falls back to a bound it did
+    # not declare.
+    vr = V.graph.sizevars.shape_env.bound_sympy(substitute_declared_max(expr))
     if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
         return int(vr.upper)
     return None
@@ -432,6 +687,22 @@ def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
     return None
 
 
+def with_shape_env_replacements(count):
+    """``count`` with the ShapeEnv's replacements applied, else unchanged.
+
+    ``torch._check(a == b)`` lands in ``shape_env.replacements``; applying them
+    makes a tied pair one symbol everywhere the count is read.
+    """
+    replacements = getattr(
+        getattr(getattr(V.graph, "sizevars", None), "shape_env", None),
+        "replacements",
+        None,
+    )
+    if replacements and hasattr(count, "free_symbols") and count.free_symbols:
+        return sympy_subs(count, replacements)
+    return count
+
+
 def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
     """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
 
@@ -457,11 +728,7 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
             one per symbolic loop, so that is a check failure there rather than
             a degraded kernel here.
     """
-    replacements = getattr(
-        getattr(V.graph.sizevars, "shape_env", None), "replacements", None
-    )
-    if replacements and hasattr(count, "free_symbols"):
-        count = sympy_subs(count, replacements)
+    count = with_shape_env_replacements(count)
     free_symbols = getattr(count, "free_symbols", None) or set()
     if len(free_symbols) > 1:
         raise Unsupported(
@@ -502,6 +769,127 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
         tile_size,
     )
     return {str(symbol): (upper, tile_size)}
+
+
+def max_trip_count(count) -> int:
+    """The largest number of iterations one loop level can run.
+
+    SDSC codegen multiplies a tiled tensor's per-step device advance by this to
+    get that dimension's full pre-tiling extent, which is what
+    ``OpSpec.tiled_symbol_trip_counts`` carries. A symbolic count has no single
+    value and the extent has to be the LARGEST one, because the HBM buffer is
+    reserved at the maximum and the bundle's own loop bound is what limits how
+    many iterations actually run.
+
+    So this takes the declared maximum and never the hint. Baking in one call's
+    size specialises the SDSC to it while the binary claims to serve the whole
+    range, and that is invisible at the warm-up size. A count over a dimension
+    that only ``mark_dynamic`` made dynamic is refused first
+    (``require_declared_count``), so the ShapeEnv fallback inside
+    ``finite_upper_or_none`` never sizes a loop's extent here.
+
+    NOT the same number as ``symbolic_count_bounds`` carries, which is easy to
+    confuse because both are "the max". For ``FloorDiv(s, 64)`` with ``s <= 512``
+    this is 8, the trip count, while the bounds carry 512, the dimension's own
+    ceiling that the bundle declares as ``max_value``.
+
+    Depends on the max-strided reservation (#5179), for the same reason
+    ``concretize_expr`` does: an extent sized from the maximum is only
+    addressable because the buffer was reserved for it.
+
+    Raises:
+        Unsupported: the count is symbolic over an undeclared dimension, or has
+            no finite upper bound, so there is no extent to describe. The
+            message names the symbol.
+    """
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return int(count)
+
+    require_declared_count(count)
+    upper = finite_upper_or_none(count)
+    if upper is None:
+        raise Unsupported(
+            f"symbolic loop count {count} has no finite upper bound, so SDSC "
+            f"codegen cannot describe the tiled dimension's extent. Declare the "
+            f"range for {sorted(map(str, count.free_symbols))} in the traced "
+            f"region"
+        )
+    logger.info(
+        "[symbolic-loop] max_trip_count(%s) = %d, from the declared maximum of "
+        "%s. This is the SDSC's full extent, NOT how many iterations run: that "
+        "comes from the bundle's own loop bound at launch",
+        count,
+        upper,
+        sorted(declared_dims_in(count)),
+    )
+    return upper
+
+
+def indirect_index_range(size) -> int:
+    """The valid range of an indirect index, as a plain int.
+
+    ``ops.indirect_indexing(index, size)`` carries the extent of the indexed
+    (source) dimension. For a gathered pool whose own length is symbolic, e.g. a
+    page pool reserved with ``.to("spyre", dynamic=...)``, that size is the
+    pool's symbol. It is a TABLE LENGTH, not a loop extent: it only bounds the
+    index values and never becomes a trip count, so it needs no bundle
+    parameter.
+
+    It resolves to the DECLARED MAXIMUM, never this call's hint. Every downstream
+    consumer uses the range to build static geometry and bounds, and the pool
+    buffer is reserved at the maximum, so every index valid at any runtime size
+    is inside it. Sizing it from the warm-up call would make a larger pool's
+    upper pages unaddressable while the binary claims to serve the whole range.
+
+    Resolving to the maximum also makes an out-of-range index unobservable: an
+    index at or above the current size but below the maximum reads a stale row
+    of the reservation, and nothing downstream can tell it from a valid one. A
+    device-side bounds check would need the source's LOGICAL size at launch.
+    No launch slot carries it today (the only ``kDimension`` slot of a gather
+    loop is its trip count, the index count), so such a check needs a new slot
+    for the source extent, not a change here.
+
+    Only a declared dimension has that maximum: the pool's reservation is what
+    makes it addressable. A ``mark_dynamic(max=...)`` or ``torch._check`` bound
+    reserves nothing, so it is refused rather than taken as the range.
+
+    Raises:
+        Unsupported: the size is symbolic and not a declared dimension, so no
+            static range exists.
+    """
+    if not (hasattr(size, "free_symbols") and size.free_symbols):
+        return int(size)
+    upper = declared_max_or_none(size)
+    if upper is None:
+        raise Unsupported(
+            undeclared_maximum_message(f"indirect index range {size}", size)
+        )
+    logger.debug(
+        "[symbolic-gather] indirect index range %s resolved to its declared "
+        "maximum %d (the source pool is reserved at that maximum)",
+        size,
+        upper,
+    )
+    return upper
+
+
+def undeclared_maximum_message(subject: str, expr) -> str:
+    """Refusal text for a symbolic extent that is not a declared dimension.
+
+    Shared by every site that must size a symbolic extent statically at its
+    declared maximum, so the advice is the same wherever the refusal fires.
+    Only ``.to("spyre", dynamic=...)`` declares a range: it reserves the buffer
+    at the maximum, which is what makes that maximum addressable. A
+    ``mark_dynamic(max=...)`` or ``torch._check`` bound reserves nothing.
+    """
+    syms = sorted(map(str, getattr(expr, "free_symbols", ()) or ()))
+    return (
+        f"{subject} is symbolic with no declared maximum for {syms}, so it "
+        "cannot be sized statically. Declare the dimension's range on the "
+        'tensor, e.g. x.to("spyre", dynamic={0: dict(min=8, max=16, '
+        "granularity=8)}); a mark_dynamic(max=...) or torch._check bound is "
+        "not a declaration"
+    )
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
@@ -546,12 +934,25 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
         )
 
     user_min = _user_min_or_none(expr)
-    if user_min is not None:
-        if max_size % user_min != 0:
+    if user_min is not None and max_size % user_min != 0:
+        # "min divides max" only holds for a literal mark_dynamic(min=G),
+        # where min IS the granularity. A reserved_dims contract writes its
+        # own, independent min into the same ShapeEnv slot with no such
+        # requirement. Recognize that case via graph._spyre_dim_contracts
+        # (only that pass populates it) and fall back to auto-picking
+        # instead of raising. This whole disambiguation goes away once the
+        # symbolic-SDSC route it's guarding against is removed (TODO(issue#5890),
+        # tracked for a follow-up cleanup PR).
+        from .reserved_dims_contract import get_dim_contracts
+
+        if expr.free_symbols & get_dim_contracts(V.graph).keys():
+            user_min = None
+        else:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) must divide max={max_size}; "
                 f"got {max_size} % {user_min} = {max_size % user_min}"
             )
+    if user_min is not None:
         if max_size // user_min > max_buckets:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) produces {max_size // user_min} "
@@ -610,7 +1011,7 @@ def loop_induction_symbols(
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
-    With ``dynamic=True``, the host index may contain symbolic strides. When
+    With automatic dynamic shapes, the host index may contain symbolic strides. When
     ``normalize_coordinates`` isolates each loop variable's contribution
     by substituting 0 for all other free symbols, the size symbol ``s1``
     is also zeroed.  This function replaces size symbols with their concrete
@@ -653,14 +1054,14 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     for s in size_syms:
         try:
             hint = V.graph.sizevars.optimization_hint(s)
-            subs[s] = hint  # Successfully concretized
+            subs[s] = sympy.Integer(hint)  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
             pass
 
     if not subs:
         return index  # No symbols concretized, return original
-    result = index.subs(subs)
+    result = index.xreplace(subs)
     return result
 
 
@@ -687,27 +1088,6 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     # intended "best-effort max estimate" semantics (a heuristic/fallback for
     # unbacked symbols) rather than raising.
     return V.graph.sizevars.optimization_hint(expr)
-
-
-def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
-    """Return (max_size, granularity) bounds for a symbolic expression from ShapeEnv.
-
-    Returns None for concrete expressions (no free symbols).
-    max_size is the computed maximum size,
-    granularity from compute_granularity.
-    """
-    if isinstance(expr, (int, sympy.Integer)):
-        return None
-    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
-        return None
-    shape_env = V.graph.sizevars.shape_env
-    if shape_env is None:
-        return None
-
-    max_size = compute_max_size(expr)
-    granularity = compute_granularity(expr, max_size)
-
-    return (max_size, granularity)
 
 
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
@@ -778,7 +1158,7 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
 
     Returns the first candidate (the base buffer, with no view applied), or
     None if no candidate exists -- e.g. a coarse_tile copy buffer (see
-    coarse_tile.py's _insert_copy_op), which is synthesized purely at
+    loop_tiling_lowering.py's _insert_copy_out), which is synthesized purely at
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
@@ -1225,7 +1605,7 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            self._pending_indirect_index_size = indirect_index_range(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
@@ -1613,6 +1993,8 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
+        # Mod(Mod(var, row), N) is a stick split by a row boundary, not a stick.
+        and not isinstance(stick_expr.args[0], sympy.Mod)
         and stick_expr.args[1] == elems_per_stick
     )
     is_bare_var = stick_expr.is_symbol
@@ -1640,10 +2022,32 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
+        # Check for the sub-stick-aligned view pattern: Mod(var, N) where N is
+        # smaller than the required elems_per_stick. This arises
+        # when a tensor whose innermost allocation stride is N (a sub-stick
+        # value, e.g. 32 for fp16 where elems_per_stick=64) is viewed into a
+        # wider shape -- the merged index produces Mod(var, N) instead of the
+        # required Mod(var, 64).
+        # Emit a targeted hint so the user knows to fix the allocation shape.
+        _sub_stick_hint = ""
+        if (
+            isinstance(stick_expr, sympy.Mod)
+            and len(stick_expr.args[0].free_symbols) == 1
+            and isinstance(stick_expr.args[1], sympy.Integer)
+            and int(stick_expr.args[1]) < elems_per_stick
+        ):
+            actual_stride = int(stick_expr.args[1])
+            _sub_stick_hint = (
+                f"The expression may result from a sub-stick-aligned allocation "
+                f"being viewed into a wider shape. The innermost allocation "
+                f"stride ({actual_stride}) is smaller than elems_per_stick "
+                f"({elems_per_stick}). Ensure the innermost allocation "
+                f"dimension is aligned to elems_per_stick ({elems_per_stick})."
+            )
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"with a constant offset.{_sub_stick_hint}"
         )
 
 
@@ -1879,9 +2283,10 @@ def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
         device_size[out_pos],
     )
     return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=list(out_stl.stride_map),
-        device_dtype=out_stl.device_dtype,
+        device_size,
+        list(out_stl.stride_map),
+        out_stl.device_dtype,
+        forward_valid_elements(out_stl),
     )
 
 
@@ -1904,7 +2309,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     subs = indirect_access_subs_from_op(op)
     if subs:
         ind_sizes = indirect_sizes_from_op(op)
-        for d in op.get_read_writes().reads:
+        for d in op_read_writes(op).reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))
                 coords = device_coordinates(layout.device_layout, d, ind_sizes)
@@ -1914,7 +2319,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     # way (integer row extent for coordinates, then xreplace to IndirectAccess).
     store_subs = indirect_store_subs_from_op(op)
     if store_subs:
-        write = next(iter(op.get_read_writes().writes))
+        write = next(iter(op_read_writes(op).writes))
         # Resolve the scatter destination's layout, leniently unwrapping the
         # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
         # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
@@ -2145,6 +2550,91 @@ def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
     return coeff
 
 
+def _is_concrete_unit_extent(size: sympy.Expr) -> bool:
+    """Whether ``size`` is a compile-time-known extent of 1.
+
+    A symbolic extent carries no compile-time guarantee of triviality (see
+    ``views.compute_coordinates``), so only a concrete 1 counts. Shared by
+    :func:`unrepresentable_splits_by_index_coeff` and
+    :func:`apply_splits_from_index_coeff` so the two stay in lockstep: a
+    symbol this predicate calls trivial is one the decoder skips
+    unconditionally, so a coefficient collision solely with such a symbol is
+    not a real transport hazard.
+    """
+    return isinstance(size, (int, sympy.Integer)) and int(size) <= 1
+
+
+def unrepresentable_splits_by_index_coeff(
+    splits: dict[sympy.Symbol, int],
+    it_space: dict[sympy.Symbol, sympy.Expr],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> list[str]:
+    """Report which of ``splits`` (factor > 1 entries) ``splits_by_index_coeff``
+    cannot carry losslessly.
+
+    The coefficient-keyed scheduler transport keys output-axis splits by
+    their symbol's coefficient in ``write_index``, and reduction-axis splits
+    (those absent from ``write_index``) by their coefficient in
+    ``read_index``. An axis's split is unrepresentable there when:
+
+    - its symbol's coefficient in the relevant index is 0 (the symbol is not
+      a linear term there -- e.g. a kernel-window offset that lives in op
+      metadata rather than the index expression), or
+    - it shares a nonzero coefficient with a *different*, non-trivial
+      (``_is_concrete_unit_extent`` false) symbol of ``it_space`` -- split or
+      not: the coefficient-keyed dict holds one entry per coefficient, so the
+      decoder cannot tell the two symbols apart and applies the stored split
+      to both, splitting an axis the planner meant to leave whole. A
+      collision with a symbol of concrete extent 1 is not a hazard:
+      ``apply_splits_from_index_coeff`` skips such a symbol unconditionally,
+      never consulting the coefficient it shares with anything else.
+
+    ``it_space`` must be every iteration symbol the op defines, not just the
+    ones ``splits`` mentions: a caller (such as a user hint) may omit an
+    unsplit axis from ``splits`` entirely rather than recording it as 1, and
+    that omitted axis can still collide on a coefficient with one that is
+    split.
+
+    Returns one description string per unrepresentable axis/collision, empty
+    iff ``splits`` is fully representable. This is the single
+    collision-detection implementation shared by
+    :func:`~.work_division.WorkDivisionContext.is_legal`,
+    :func:`~.work_division._apply_user_hint`, and
+    :func:`~.work_division.apply_splits` (which must reject an unrepresentable
+    candidate before it is ever committed) and by
+    :func:`finalize_work_division_for_scheduler` (which must never see a
+    non-empty result once those checks hold, and raises if it does).
+    """
+    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
+    problems: list[str] = []
+    for label, index, symbols in (
+        ("output", write_index, [s for s in it_space if s not in reduction_syms]),
+        ("reduction", read_index, [s for s in it_space if s in reduction_syms]),
+    ):
+        coeff_syms: dict[sympy.Expr, list[sympy.Symbol]] = {}
+        for sym in symbols:
+            if _is_concrete_unit_extent(it_space[sym]):
+                continue  # the decoder skips this symbol unconditionally
+            coeff = index.coeff(sym)
+            if coeff != 0:
+                coeff_syms.setdefault(coeff, []).append(sym)
+        for sym in symbols:
+            if splits.get(sym, 1) <= 1:
+                continue
+            coeff = index.coeff(sym)
+            if coeff == 0:
+                problems.append(f"{label}:{sym}=absent")
+                continue
+            collisions = [s for s in coeff_syms.get(coeff, []) if s != sym]
+            if collisions:
+                problems.append(
+                    f"{label}: coeff {coeff} {sym} collides with "
+                    f"{', '.join(str(s) for s in collisions)}"
+                )
+    return problems
+
+
 def _coeff_splits_from_index(
     splits: dict[sympy.Symbol, _V],
     index: sympy.Expr,
@@ -2180,8 +2670,12 @@ def splits_by_index_coeff(
     This is intentionally a boundary representation: pre-scheduler passes keep
     symbol-keyed ownership. Coefficients are stable across scheduler renaming,
     but cannot distinguish distinct non-unity splits sharing one coefficient.
-    This encoder retains the established iteration-order last-axis-wins behavior;
-    ``finalize_work_division_for_scheduler`` warns when that transport is lossy.
+    Callers (``WorkDivisionContext.is_legal``, ``_apply_user_hint``, and
+    ``apply_splits``) must reject a ``splits`` map
+    ``unrepresentable_splits_by_index_coeff`` flags before it is ever
+    committed, so this encoder may assume representability holds;
+    ``finalize_work_division_for_scheduler`` re-checks it defensively and
+    raises rather than encoding a lossy result.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
@@ -2307,63 +2801,56 @@ def select_work_division_transport_indexes(
     return write_index, read.index if read is not None else write_index
 
 
+def work_division_transport_indexes(
+    op: Operation,
+    rw: ReadWrites,
+    it_space: dict[sympy.Symbol, sympy.Expr],
+    splits: dict[sympy.Symbol, int] | None = None,
+    *,
+    message_prefix: str = "work division for",
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Select scheduler indexes; optionally reject an unrepresentable split.
+
+    Operations without an indexed write do not use the coefficient transport.
+    Legality callers pass ``splits`` to apply the same losslessness check;
+    candidate contexts omit it and cache the selected indexes. ``message_prefix``
+    identifies the requesting pass in rejection diagnostics.
+    """
+    if not any(isinstance(dep, MemoryDep) for dep in rw.writes):
+        return None
+    write_index, read_index = select_work_division_transport_indexes(op, rw, it_space)
+    if splits is None:
+        return write_index, read_index
+    problems = unrepresentable_splits_by_index_coeff(
+        splits, it_space, write_index, read_index
+    )
+    if problems:
+        raise Unsupported(
+            f"{message_prefix} {op.get_name()} split {splits} cannot be represented "
+            "by the scheduler's coefficient-keyed transport: "
+            f"{'; '.join(problems)}."
+        )
+    return write_index, read_index
+
+
 def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
     """Convert committed symbol ownership to legacy scheduler split transport.
 
-    Coefficient keys cannot distinguish every symbol.  Preserve the established
-    iteration-order last-wins behavior, but warn once per affected operation.
-
-    Runs after the pass loop, where ``graph.operations`` may hold LoopNodes
-    (they reach the Scheduler as one node each). The ops inside a loop are
-    finalized like any other: a LoopNode has no ownership of its own, so a
-    loop over the top level would skip its whole body without an error.
+    Reject split maps the scheduler cannot carry losslessly. Recurse through
+    LoopNodes because the pass may run before they are expanded.
     """
     for op in all_ops(graph.operations):
         ownership = getattr(op, "iteration_space_ownership", None)
         if ownership is None:
             continue
+        it_space = iteration_space_from_op(op)
         rw = op_read_writes(op)
-        try:
-            write_index, read_index = select_work_division_transport_indexes(
-                op, rw, iteration_space_from_op(op)
-            )
-        except Unsupported:
+        indexes = work_division_transport_indexes(
+            op, rw, it_space, ownership.work_slices
+        )
+        if indexes is None:
             continue
-        collisions: list[str] = []
-        for label, index, symbols in (
-            ("output", write_index, ownership.work_slices),
-            (
-                "reduction",
-                read_index,
-                {
-                    sym: split
-                    for sym, split in ownership.work_slices.items()
-                    if write_index.coeff(sym) == 0
-                },
-            ),
-        ):
-            seen: dict[sympy.Expr, tuple[sympy.Symbol, int, sympy.Expr]] = {}
-            for sym, split in symbols.items():
-                if split <= 1:
-                    continue
-                coeff = index.coeff(sym)
-                if coeff == 0:
-                    collisions.append(f"{label}:{sym}=absent")
-                    continue
-                value = (sym, split, ownership.core_id_to_work_slice[sym])
-                if coeff in seen and seen[coeff][1:] != value[1:]:
-                    collisions.append(
-                        f"{label}: coeff {coeff} {seen[coeff][0]}={seen[coeff][1:]} "
-                        f"-> {sym}={value[1:]}"
-                    )
-                seen[coeff] = value
-        if collisions:
-            logger.warning(
-                "lossy work-division scheduler transport for %s; using "
-                "iteration-order last-axis-wins: %s",
-                op.get_name(),
-                "; ".join(collisions),
-            )
+        write_index, read_index = indexes
         op.op_it_space_splits = splits_by_index_coeff(
             ownership.work_slices, write_index, read_index
         )
@@ -2386,12 +2873,10 @@ def apply_splits_from_index_coeff(
     output_coeff_splits, reduction_coeff_splits = coeff_splits
     result: dict[sympy.Symbol, int] = dict.fromkeys(sched_it_space, 1)
     for sym, size in sched_it_space.items():
-        # Skip iteration vars with trivial range.  For symbolic ranges we
-        # cannot statically determine triviality (and a symbolic size
-        # carries no compile-time guarantee that it is 1), so we assume
-        # they are non-trivial — consistent with views.compute_coordinates.
-        # TODO(issue#1373): replace with a sympy-aware predicate.
-        if isinstance(size, (int, sympy.Integer)) and int(size) <= 1:
+        # Skip iteration vars with a compile-time-known trivial range; see
+        # _is_concrete_unit_extent. TODO(issue#1373): replace with a fuller
+        # sympy-aware predicate for symbolic ranges.
+        if _is_concrete_unit_extent(size):
             continue
         wc = write_index.coeff(sym)
         if wc != 0:
@@ -2426,6 +2911,20 @@ def iteration_space_with_splits(
 # but are here to avoid circular dependences in those files
 
 
+def _zero_outer_dim_for_stick(stl: SpyreTensorLayout, idc: list) -> int | None:
+    """Pick the outer device dim a stick variable that is absent from idc occupies.
+
+    Prefers a zero-coordinate dim in the stick's own valid_elements group, so the
+    restickify rewrites the stick group rather than an unrelated size-1 dim (which
+    would leave one dim in two valid_elements keys).  Falls back to the first
+    zero-coordinate dim.
+    """
+    zeros = [j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero]
+    stick_dim = len(stl.device_size) - 1
+    stick_key = next((k for k in stl.valid_elements if stick_dim in k), ())
+    return next((j for j in zeros if j in stick_key), next(iter(zeros), None))
+
+
 def restickify_device_size(
     old_device_size: list,
     old_sd_outer_dim: int,
@@ -2457,7 +2956,7 @@ def restickify_stride_map(
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
     new_stride_map[old_sd_outer_dim] = (
-        -1 if new_sd_host_stride < 0 else new_sd_host_stride * stick_size
+        0 if new_sd_host_stride <= 0 else new_sd_host_stride * stick_size
     )
     new_stride_map[new_sd_outer_dim] = old_sd_host_stride
     return new_stride_map
@@ -2486,13 +2985,13 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Indirect gather index (e.g. x[i] where i comes from another tensor):
-        # the symbol is not a loop variable so it is absent from dep.ranges, but
-        # the tensor does vary.  Indirect-access tensors are always 1D on the
-        # host; len(host_size) == 1 is the load-bearing guard that prevents
-        # silent mis-resolution if that assumption is ever violated.
-        if is_indirect(var.name) and len(host_size) == 1:
-            return host_size[0], host_stride[0]
+        # Indirect gather index (e.g. x[..., i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges. It
+        # resolves to the one host dim whose coordinate carries it; more than one
+        # would be ambiguous.
+        dims = [d for d, c in enumerate(host_coords) if var in c.free_symbols]
+        if is_indirect(var.name) and len(dims) == 1:
+            return host_size[dims[0]], host_stride[dims[0]]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
@@ -2511,7 +3010,7 @@ def _host_size_stride_for_expr(
     # reduced form unchanged and is a valid, stick-aligned slice.
     d = host_dims[0]
     coord = host_coords[d]
-    offset_diff = coord.subs(var, 0) - expr.subs(var, 0)
+    offset_diff = (coord - expr).xreplace({var: 0})
     if sympy.Mod(offset_diff, stick_size) != 0:
         return None
     return host_size[d], host_stride[d]
@@ -2584,7 +3083,7 @@ def compute_restickify_target_layout(
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
@@ -2613,7 +3112,18 @@ def compute_restickify_target_layout(
         new_sd_host_stride,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        stl.device_dtype,
+        restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            new_sd_host_size,
+        ),
+    )
 
 
 def compute_size1_restickify_layout(
@@ -2657,7 +3167,7 @@ def compute_size1_restickify_layout(
         return None
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
@@ -2694,7 +3204,29 @@ def compute_size1_restickify_layout(
         -1,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    if old_sd_outer_dim == new_sd_outer_dim:
+        # Synthetic size-1 dim reuses the old outer slot: the stick group keeps
+        # its key but its count becomes 1 (one element per stick).
+        stick_dim = len(stl.device_size) - 1
+        old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+        # No stick group (extents unknown): nothing to update, so stay unknown.
+        new_ve = (
+            {}
+            if old_stick_key is None
+            else {
+                k: (1 if k == old_stick_key else v)
+                for k, v in stl.valid_elements.items()
+            }
+        )
+    else:
+        new_ve = restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            1,
+        )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype, new_ve)
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
@@ -2722,7 +3254,7 @@ def is_sparse_stl(stl) -> bool:
 
     A sparse layout is produced by a reduction along the stick dimension:
     the stick dim (device_size[-1] == elems_per_stick) is synthetic with
-    stride_map[-1] == -1 (no corresponding host stride).
+    stride_map[-1] == 0 (no corresponding host stride).
 
     A device tensor has a device_size and stride_map. Remove the dimensions of
     size one from both lists. The stride of a dimension is the prod of the
@@ -2775,14 +3307,129 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
     if restick:
+        eps = in_stl.elems_per_stick()
         out_stl = SpyreTensorLayout(
-            [in_stl.elems_per_stick()] + out_stl.device_size,
+            [eps] + out_stl.device_size,
             [c_stride[0] * c_size[0]] + out_stl.stride_map,
             out_stl.device_dtype,
+            prepend_dim_valid_elements(out_stl, eps),
         )
         return True, out_stl
 
     return False, out_stl
+
+
+def sparse_stl_from_host(
+    host: FixedLayout, dtype: "torch.dtype | None" = None
+) -> SpyreTensorLayout:
+    """Build a SpyreTensorLayout from the host shape of ``host``: the stick moves
+    onto a new size-1 dim and the other host dims are kept.  The former stick dim
+    becomes the outermost device dim.
+
+    Used only when no device layout of the input can be restickified, so the host
+    shape is the only source of dims (see ``propagate_layouts``).
+
+    dim_order convention (``SpyreTensorLayout`` in spyre_tensor_impl.cpp): the
+    C++ constructor puts ``dim_order[1]`` in the OUTERMOST device slot, the entry
+    ``-1`` (the new size-1 dim) in the slot second from the innermost, and
+    ``dim_order[0]`` in the slot just before the stick.  So for rank above 2 the
+    list is rebuilt as ``[outer_first[0], outer_first[-1]] + outer_first[1:-1]``:
+    the stick (smallest stride, ``outer_first[-1]``) is ``dim_order[1]``, outermost.
+    Do not "simplify" this to a plain sort; TestHostSparseLayout checks the result.
+
+    The former stick dim is the one padded to a whole number of sticks, and the
+    padding is added at the end of that dim.  Only when it is outermost does the
+    padding sit at the end of the buffer, where a consumer that reads the sparse
+    tensor as one run of sticks expects it; inside another dim larger than 1 it
+    would fall between the slices of that dim.
+
+    ``dtype`` overrides ``host.dtype`` for an op whose layout dtype differs from
+    its host dtype (for example a bool output)."""
+    sizes = [int(concretize_expr(v)) for v in host.size]
+    strides = [int(concretize_expr(v)) for v in host.stride]
+    outer_first = sorted(range(len(sizes)), key=lambda d: -strides[d])
+    if len(outer_first) > 2:
+        outer_first = [outer_first[0], outer_first[-1]] + outer_first[1:-1]
+    return SpyreTensorLayout(
+        sizes, strides, host.dtype if dtype is None else dtype, outer_first + [-1]
+    )
+
+
+def restickify_dense_stl_to_sparse(
+    stl: SpyreTensorLayout, in_host: FixedLayout
+) -> "SpyreTensorLayout | None":
+    """The sparse layout of ``in_host`` that keeps the outer dim order of the dense
+    ``stl`` and moves the stick to the outermost device slot.
+
+    The device dims of ``stl`` are read outermost first, and each is matched to a
+    host dim by its stride.  The stick's outer part (stride ``stick_size`` times the
+    stick's host stride) is the stick dim itself, so it is skipped here.  The
+    result is built with the ``dim_order`` convention of ``sparse_stl_from_host``.
+
+    Returns None when a device dim cannot be matched to a host dim.
+    """
+    sizes = [int(concretize_expr(v)) for v in in_host.size]
+    strides = [int(concretize_expr(v)) for v in in_host.stride]
+    stick_size = stl.elems_per_stick()
+    stick_stride = stl.stride_map[-1]
+    stick_dim = next(
+        (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == stick_stride),
+        None,
+    )
+    if stick_dim is None:
+        return None
+    outer_first = [stick_dim]
+    for j in range(len(stl.device_size) - 1):
+        s = stl.stride_map[j]
+        if stl.device_size[j] == 1 or s == 0 or s == stick_size * stick_stride:
+            continue
+        d = next(
+            (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == s), None
+        )
+        if d is None or d in outer_first:
+            return None
+        outer_first.append(d)
+    outer_first += [d for d in range(len(sizes)) if d not in outer_first]
+    dim_order = [outer_first[-1]] + outer_first[:-1] + [-1]
+    return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
+
+
+def sparse_target_for_unservable_read(
+    stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    *,
+    op: "Operation | None" = None,
+) -> "SpyreTensorLayout | None":
+    """The sparse restickify target for ``in_host`` when it serves the read of
+    ``dep`` that the dense ``stl`` cannot, else ``None``.
+
+    A read whose device coordinates are unsupported on ``stl`` (for example the
+    flatten of ``[8, 65]`` into ``[520]``, which splits a stick) may still be
+    representable with the stick on a new size-1 dim.  The target keeps the dims
+    of ``stl`` (``restickify_dense_stl_to_sparse``) and is returned only if it
+    serves the read; otherwise the host-shape layout is tried.  Only a STANDARD
+    input in a restickify format can be moved.
+    """
+    if (
+        stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        or stl.element_arrangement != ElementArrangement.STANDARD
+        or is_sparse_stl(stl)
+        or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
+    ):
+        return None
+    candidates = [
+        restickify_dense_stl_to_sparse(stl, in_host),
+        sparse_stl_from_host(in_host),
+    ]
+    for target in candidates:
+        if (
+            target is not None
+            and try_device_coordinates(target, dep, indirect_sizes, op=op) is not None
+        ):
+            return target
+    return None
 
 
 def compute_restickify_needed(
@@ -2812,6 +3459,22 @@ def compute_restickify_needed(
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
+        # A read the input cannot serve (flattening [8, 65] into [520] splits a
+        # stick) may be served by the input's host shape in a sparse layout.
+        # TODO(#5872): this returns the sparse target for any output, without
+        # checking that it is stick_compatible with the output. That is safe only
+        # because _default_pointwise_layout and _reduction_layout return a sparse
+        # output early. Return the target only for an output it can feed.
+        # TODO(#5966): before the sparse layout, try a dense relocation of the
+        # stick: the first layout with the stick on another real dim (larger
+        # dims first, the former stick dim outermost) on which
+        # try_device_coordinates serves this read. Keep the sparse layout below
+        # as the fallback for a read with no such dim, such as a flatten to 1-D.
+        sparse = sparse_target_for_unservable_read(
+            in_stl, in_host, in_dep, ind_sizes, op=op
+        )
+        if sparse is not None:
+            return True, sparse
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
         # candidate can never be a feasible restickify source/target.
@@ -2890,7 +3553,7 @@ def compute_restickify_needed(
         # dimensions, which may include size-1 dims (e.g. M=1) that cause
         # SpyreTensorLayout constructor 2 to produce an extra device dimension.
         # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
-        # it by stick_size, promote the element stride there, set stick to -1.
+        # it by stick_size, promote the element stride there, set stick to 0.
         stick_size = get_elem_in_stick(in_host.dtype)
         ds = list(in_stl.device_size)
         sm = list(in_stl.stride_map)
@@ -2904,8 +3567,27 @@ def compute_restickify_needed(
             y_sm = list(sm)
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
-            y_sm[-1] = -1
-            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+            y_sm[-1] = 0
+            stick_dim = len(ds) - 1
+            y_ve: dict[tuple[int, ...], int] = {}
+            for key, val in in_stl.valid_elements.items():
+                if stick_dim in key:
+                    # The stick's group.  After moving K onto the stick, the
+                    # stick gets a count of 1; k_chunk_dim, if it shared this
+                    # group, becomes independent with the original count.
+                    if set(key) - {k_chunk_dim, stick_dim}:
+                        raise Unsupported(
+                            f"sparse-N=1 restickify with valid_elements group "
+                            f"{key} spanning dims beyond k_chunk_dim "
+                            f"{k_chunk_dim} and the stick"
+                        )
+                    if k_chunk_dim in key:
+                        y_ve[(k_chunk_dim,)] = val
+                    y_ve[(stick_dim,)] = 1
+                else:
+                    # Includes a standalone k_chunk_dim group: unchanged.
+                    y_ve[key] = val
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype, y_ve)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "
             f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
@@ -2920,6 +3602,7 @@ def compute_restickify_needed(
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
 
+    sparse_target = None
     if is_sparse_stl(in_stl):
         # We want to test whether a sparse to dense conversion is possible.
         # But if there is a trailing 1 dim, the STL will create a sparse layout
@@ -2939,15 +3622,25 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expand_sparse keeps the stick on the input's own last host dim. When the
+            # consumer reads another stick (a stick-dim gather written into a wider
+            # stick at an offset, as in cat), restickify straight to that stick: a
+            # second, stick-padded restickify would write at offset 0 and past it.
+            expanded_idc = try_device_coordinates(
+                expanded_stl, in_dep, ind_sizes, op=op
+            )
+            if expanded_idc is not None and stick_compatible([expanded_idc, out_idc]):
+                return True, expanded_stl
+            sparse_target = expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
 
     arg = PropArg(in_dep, in_host, [in_stl])
-    return True, compute_restickify_target_layout(
+    target = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+    return True, sparse_target if target is None else target
 
 
 def compute_size1_restickify_target(
@@ -3265,7 +3958,7 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
-    arg_buf: Optional[Buffer] = None,
+    arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -3292,7 +3985,7 @@ def lower_pad_sequence(
     later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
-    coarse_tile copy buffer (see coarse_tile.py's _insert_copy_op), which is
+    coarse_tile copy buffer (see loop_tiling_lowering.py's _insert_copy_out), which is
     synthesized purely at the IR level after FX lowering completed.  In that
     case ``arg_buf`` (the buffer itself) must be given instead, and the pad is
     lowered by calling the constant_pad_nd lowering function directly against a
@@ -3303,6 +3996,11 @@ def lower_pad_sequence(
     a ``ComputedBuffer``, to recover the within-stick host dim from coordinate
     identity via ``_stick_host_dim`` -- see the device-layout-construction
     section below.
+
+    ``arg_buf`` may also be a ``ReinterpretView`` of a buffer, to pad that view
+    rather than the whole buffer; the padded buffer then has the view's shape.
+    ``insert_bmm_padding`` passes the part of y a matmul reads when y's buffer does
+    not hold K as one whole dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -3527,7 +4225,9 @@ def lower_pad_sequence(
         # an actual operand.
         from .lowering import lower_constant_pad_nd
 
-        arg_tb = TensorBox(StorageBox(arg_buf))
+        arg_tb = TensorBox(
+            arg_buf if isinstance(arg_buf, ReinterpretView) else StorageBox(arg_buf)
+        )
         with fx_graph.inserting_before(insert_before):
             pad_fx = fx_graph.create_node(
                 "call_function",

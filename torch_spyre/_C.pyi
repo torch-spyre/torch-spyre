@@ -235,15 +235,6 @@ class SpyreTensorLayout:
         device_size: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
-        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
-        valid_elements: dict[tuple[int, ...], int] = {},
-    ) -> None: ...
-    @typing.overload
-    def __init__(
-        self,
-        device_size: collections.abc.Sequence[typing.SupportsInt],
-        stride_map: collections.abc.Sequence[typing.SupportsInt],
-        device_dtype: DataFormats,
         valid_elements: dict[tuple[int, ...], int],
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
@@ -512,6 +503,8 @@ class SymbolicArg:
     tensor_id: int
     dim_index: int
     num_shards: int
+    granularity: int
+    max_value: int
     def __init__(
         self,
         kind: SymbolicArgKind,
@@ -519,6 +512,8 @@ class SymbolicArg:
         dim_index: int = -1,
         value: int = -1,
         num_shards: int = -1,
+        granularity: int = -1,
+        max_value: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 

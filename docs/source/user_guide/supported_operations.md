@@ -13,6 +13,13 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 [embedding example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/embedding.py), and the
 [FP8 quantization example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fp8.py).
 
+The discrete Fourier transform
+([FFT example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fft.py))
+is a host library function (`torch_spyre.ops.fft` / `ifft` / `fft2` / `ifft2` /
+`fftn` / `ifftn`), not a `torch.compile` lowering: it runs the DFT as a real
+matmul on device, while the complex packing and the fp16 casts stay on the
+host. `torch.fft.*` itself is not supported on the device (it is complex).
+
 ## Operations Table
 
 | Operation | Eager | Compiled | Execution | Notes |
@@ -130,7 +137,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.pad` / `torch.constant_pad_nd` | Y | Y | Spyre | Custom lowering |
 | **In-place / Initialization** | | | | |
-| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable |
+| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable. Eager `fill_`/`zero_` raise on a partial, broadcast or overlapping view and on sharded tensors |
 | `torch.Tensor.normal_` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.Tensor.uniform_` | Y | | CPU fallback | Eager only; random values generated on CPU, copied back |
 | `torch.Tensor.random_` | Y | | CPU fallback | Eager only; `from` overload |

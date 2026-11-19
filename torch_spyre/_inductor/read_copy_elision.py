@@ -43,13 +43,10 @@ from .pass_utils import (
     commit_iteration_space_ownership,
     device_coordinates,
     find_matmul_generated_var,
+    finite_upper_or_none,
     identify_matmul_inputs,
     per_core_views_equal,
     replace_computed_buffer_body,
-)
-from .wsr.coarse_tile import (
-    validate_reader_tile_advance,
-    validate_writer_tile_advance,
 )
 
 logger = get_inductor_logger("read_copy_elision")
@@ -82,11 +79,30 @@ def _static_int(expr: sympy.Expr) -> int | None:
         return None
 
 
+def _trip_count_bound(trip_expr) -> int | None:
+    """The trip count the advance proof may assume, or None to decline.
+
+    A concrete count is itself. A symbolic count over a declared dimension
+    (``FloorDiv(s, G)`` from ``for_each_tile``) resolves to its count at the
+    declared maximum: the step per trip is static and the reach grows with the
+    count, so the bound at the maximum contains the reach at every admissible
+    size, and a read proven inside the source at the maximum is inside it at
+    every size. The layouts under a declaration are built at the maximum too,
+    so the source extent the proof compares against is the one the kernel is
+    built for. A symbol with no declaration has no finite bound here and
+    declines, as every symbolic count did before #6433.
+    """
+    trip_count = _static_int(trip_expr)
+    if trip_count is not None:
+        return trip_count
+    return finite_upper_or_none(sympy.sympify(trip_expr))
+
+
 def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     """Inclusive min/max source indexes for one invocation, in elements."""
     expr = sympy.expand(dep.index)
     zero_subs = {var: sympy.Integer(0) for var in dep.var_names}
-    constant = sympy.expand(expr.subs(zero_subs))
+    constant = sympy.expand(expr.xreplace(zero_subs))
     lo = _static_int(constant)
     if lo is None:
         return None
@@ -145,7 +161,7 @@ def _loop_advance_bound(
     lo = 0
     hi = 0
     for level_idx, trip_expr in enumerate(loop_info.loop_count):
-        trip_count = _static_int(trip_expr)
+        trip_count = _trip_count_bound(trip_expr)
         if trip_count is None or trip_count < 1:
             return None
         dim_pairs = tiled[level_idx] if level_idx < len(tiled) else []
@@ -158,8 +174,8 @@ def _loop_advance_bound(
                 return None
             level_subs = dict(zero_subs)
             level_subs[symbol] = sympy.Integer(extent)
-            step_expr += sympy.expand(dep.index.subs(level_subs))
-            step_expr -= sympy.expand(dep.index.subs(zero_subs))
+            step_expr += sympy.expand(dep.index.xreplace(level_subs))
+            step_expr -= sympy.expand(dep.index.xreplace(zero_subs))
         pairs = squeezed[level_idx] if level_idx < len(squeezed) else []
         step = 0
         for stride_expr, extent_expr in pairs:
@@ -528,23 +544,6 @@ def _prove_matmul_direct_read(
     return direct_op, "proved"
 
 
-def _validate_proposal(
-    operations: list[Operation],
-    consumer: ComputedBuffer,
-    direct_op: ComputedBuffer,
-    copy_op: ComputedBuffer,
-) -> str | None:
-    proposed = [
-        direct_op if op is consumer else op for op in operations if op is not copy_op
-    ]
-    try:
-        validate_writer_tile_advance(proposed)
-        validate_reader_tile_advance(proposed)
-    except Exception as exc:
-        return f"coarse-tile validation failed: {exc}"
-    return None
-
-
 def project_transport_read_copies(graph, division_splits, *, relayout_sources=()):
     """Non-mutating cost view of transport copies removable for every candidate.
 
@@ -587,13 +586,12 @@ def project_transport_read_copies(graph, division_splits, *, relayout_sources=()
             continue
         direct_op = None
         for splits in candidates:
+            # `candidates` comes from the solver menu, filtered by
+            # WorkDivisionContext.is_legal including transport representability.
             candidate = copy.copy(consumer)
             commit_iteration_space_ownership(candidate, splits)
             direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)
             if direct_op is None:
-                break
-            if _validate_proposal(operations, consumer, direct_op, copy_op) is not None:
-                direct_op = None
                 break
         if direct_op is not None:
             operations = [
@@ -652,15 +650,6 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 detail,
             )
             continue
-        validation_error = _validate_proposal(operations, consumer, direct_op, copy_op)
-        if validation_error is not None:
-            logger.debug(
-                "read-copy elision declined for %s: %s",
-                record.consumer_name,
-                validation_error,
-            )
-            continue
-
         replacement = replace_computed_buffer_body(
             consumer,
             direct_op.data,

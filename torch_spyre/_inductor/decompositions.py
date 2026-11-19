@@ -38,7 +38,12 @@ from torch._prims_common import (
     elementwise_dtypes,
 )
 
-from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .constants import (
+    DEVICE_NAME,
+    FP16_TOPK_MAX_DIM,
+    FP8_E4M3FN_MAX,
+    FP8_E4M3FN_MIN,
+)
 from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
 from .sliding_window_plan import (
@@ -1838,6 +1843,16 @@ def spyre_topk(
         raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
+    # The index is counted in the input dtype, so a longer fp16 search dim returns
+    # wrong indices without an error (#5847). The way around it is to search in
+    # float32, but the device float16 to float32 cast is not reliable yet (it
+    # permutes elements within a stick pair, #5856), so reject instead.
+    n = input.size(dim)
+    if input.dtype == torch.float16 and n > FP16_TOPK_MAX_DIM:
+        raise Unsupported(
+            f"topk along a float16 dim of size {n}: the indices are held in float16, "
+            f"which is exact only up to {FP16_TOPK_MAX_DIM}; use a float32 input"
+        )
     # sorted=False is a no-op: our reduction always returns sorted output.
     # Index stays in the input dtype (not int64) all the way out; topkindex's
     # fake reports it so Dynamo traces it with no meta conflict.
@@ -3833,7 +3848,7 @@ def scaled_mm_decomp(
     scale_b: torch.Tensor = None,
     bias: torch.Tensor = None,
     scale_result: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
@@ -3871,7 +3886,7 @@ def scaled_bmm_decomp(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
@@ -3931,13 +3946,26 @@ def where_scalar_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
+def _quantize_fp8_clamped_input(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Compute clamped input scaled for FP8 quantization.
+
+    On Spyre hardware, reciprocal(0.0) produces NaN instead of +inf.
+    To prevent NaN propagation when scale=0, use safe reciprocal so that
+    scaled inputs remain finite and dequantization by scale=0 correctly
+    evaluates to 0.0 (see #3037).
+    """
+    safe_recip = torch.where(scale == 0, 1.0, torch.reciprocal(scale))
+    x_scaled = input * safe_recip
+    return torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+
+
 @register_spyre_decompositions([torch.ops.spyre.quantize_fp8_with_scale])
 def spyre_quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 
@@ -3945,9 +3973,7 @@ def spyre_quantize_fp8_with_scale(
 def spyre_quantize_weight_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8wt(x_clamped)
 
 
@@ -4157,7 +4183,108 @@ def spyre_index_add(
     gathered = torch.index_select(self, dim, index)
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
-    return torch.index_put(self, indices, updated, accumulate=False)
+    # The aten overload takes the schema's ``Tensor?[]``; the torch.index_put
+    # binding demands a TensorList and rejects a None that selects a whole dim.
+    return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
+
+
+_INDEX_REDUCE_TYPES = ("prod", "mean", "amax", "amin")
+_INDEX_REDUCE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_reduce.default])
+def spyre_index_reduce(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    reduce: str,
+    *,
+    include_self: bool = True,
+) -> torch.Tensor:
+    """``index_reduce`` for unique indices as gather + combine + overwrite.
+
+    Upstream Inductor lowers ``mean`` through ``index_add`` and falls back to
+    the (missing) eager kernel for ``prod`` / ``amax`` / ``amin``. With unique
+    indices each slot receives at most one source slice, so a plain
+    read-modify-write is exact -- the same pattern as :func:`spyre_index_add`::
+
+        gathered = self[index]                      # include_self only
+        final    = reduce(gathered, source)         # or source itself
+        out      = index_put(self, index, final)    # overwrite
+
+    PRECONDITION -- ``index`` must contain NO DUPLICATE values. Spyre's
+    indirect store only overwrites, so colliding writes keep just one source
+    slice and the result is SILENTLY WRONG. It cannot be detected on device:
+    ``torch._assert_async`` does not fire on Spyre. Once the backend gains a
+    combining scatter (max / min / prod / add on collision), duplicates can be
+    handled here by scattering ``source`` with that reduce instead.
+
+    Only a non-stick ``dim`` is supported: the gather/scatter along the last
+    dim does not lower (the same limit as ``index_copy``, #4404).
+    """
+    if reduce not in _INDEX_REDUCE_TYPES:
+        raise RuntimeError(
+            f"index_reduce(): Expected reduce to be one of prod, mean, amax or "
+            f"amin but got {reduce}."
+        )
+    dtype = self.dtype
+    if dtype not in _INDEX_REDUCE_DTYPES:
+        raise Unsupported(
+            f"index_reduce on {dtype}: only float16, bfloat16 and float32"
+        )
+    if source.dtype != dtype:
+        raise RuntimeError(
+            f"index_reduce_(): self ({dtype}) and source ({source.dtype}) must "
+            f"have the same scalar type"
+        )
+    if index.dim() > 1:
+        raise RuntimeError("index_reduce_(): Index is supposed to be a vector")
+    ndim = self.dim()
+    if ndim == 0:
+        raise Unsupported("index_reduce on a 0-d tensor")
+    dim = dim % ndim
+    if dim == ndim - 1:
+        raise Unsupported(
+            "index_reduce along the stick (last) dim: its gather/scatter along "
+            "the stick does not lower on Spyre (#4404)"
+        )
+    if index.numel() == 0 or self.numel() == 0:
+        return self.clone()
+
+    if include_self:
+        gathered = torch.index_select(self, dim, index)
+        if reduce == "amax":
+            final = torch.maximum(gathered, source)
+        elif reduce == "amin":
+            final = torch.minimum(gathered, source)
+        elif reduce == "prod":
+            final = gathered * source
+        else:  # mean of self and one source slice
+            final = (gathered + source) / 2.0
+    else:
+        # One source slice per slot: its amax / amin / prod / mean is itself.
+        final = source
+    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
+    # The aten op, not torch.index_put: only it accepts None placeholders for
+    # the leading dims when called eagerly.
+    return torch.ops.aten.index_put.default(self, indices, final, False)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_reduce_.default])
+def spyre_index_reduce_(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    reduce: str,
+    *,
+    include_self: bool = True,
+) -> torch.Tensor:
+    """In-place ``index_reduce_``: compute :func:`spyre_index_reduce`, copy back."""
+    return self.copy_(
+        spyre_index_reduce(self, dim, index, source, reduce, include_self=include_self)
+    )
 
 
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
