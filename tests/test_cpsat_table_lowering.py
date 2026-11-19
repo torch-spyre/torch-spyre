@@ -21,7 +21,6 @@ COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
 import itertools
-import random
 
 import numpy as np
 import pytest
@@ -802,10 +801,7 @@ def test_a_later_optimization_lowers_its_example_exactly(example, cap):
     _, objective = case.lower(expr, cap)
     bound = (len(case.model.proto.constraints) - before + 1) / 2
     domains = [case.values[v] for v in case.variables]
-    for assignment in (
-        tuple(d[0] for d in domains),
-        tuple(d[-1] for d in domains)
-    ):
+    for assignment in (tuple(d[0] for d in domains), tuple(d[-1] for d in domains)):
         low, high = _solve_at(case, objective, assignment)
         assert low == high
         assert abs(low - COST_SCALE * case.sympy_value(expr, assignment)) <= bound
