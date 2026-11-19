@@ -3201,7 +3201,9 @@ def compute_restickify_target_layout(
         f"new_sd={new_sd_outer_dim} "
         f"old_sd_host_size={old_sd_host_size} new_sd_host_size={new_sd_host_size} "
         f"_old_var_elems={_old_var_elems} _new_var_elems={_new_var_elems} "
-        f"stick_size={stick_size}"
+        f"stick_size={stick_size} stride_map={old_stride_map} "
+        f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
+        f"old_var={old_var} new_var={new_var}"
     )
     stride_map = restickify_stride_map(
         old_stride_map,
@@ -3319,7 +3321,9 @@ def compute_size1_restickify_layout(
         f"new_sd={new_sd_outer_dim} "
         f"old_sd_host_size={old_sd_host_size} "
         f"_old_var_elems={_old_var_elems_s1} "
-        f"stick_size={stick_size}"
+        f"stick_size={stick_size} stride_map={list(stl.stride_map)} "
+        f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
+        f"old_var={old_var}"
     )
     stride_map = restickify_stride_map(
         list(stl.stride_map),

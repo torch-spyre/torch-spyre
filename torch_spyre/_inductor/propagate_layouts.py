@@ -781,6 +781,7 @@ def _qfp8wt_stl(
         ElementArrangement.QFP8WT,
     )
     if unaligned > 0:
+        # TEMP while FP8 is broken: revisit this workaround once it is fixed.
         # c_size padded K to a full stick, so the constructor records 64 valid
         # elements where the weight has stick_dim_size (e.g. 8).  Correct the
         # count by rebuilding the layout: valid_elements is read-only on the
