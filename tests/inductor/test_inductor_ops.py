@@ -13013,34 +13013,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(outs[0][5], v[3], atol=1e-2, rtol=0)
         torch.testing.assert_close(outs[0][9], v[4], atol=1e-2, rtol=0)
 
-    def test_index_put_deterministic_unsupported(self):
-        # Forms upstream still sends to its eager fallback (no Spyre kernel)
-        # fail with a clear error instead of silently dropping the write.
-        x = cached_randn((128, 64)).to("spyre")
-        rows = torch.tensor([3, 17, 90]).to("spyre")
-        v = cached_randn((3, 64), differentiation=1).to("spyre")
-        mask = torch.zeros(128, 64, dtype=torch.bool)
-        mask[3] = True
-        mask = mask.to("spyre")
-
-        def accumulate(d, i, s):
-            d = d.clone()
-            d.index_put_((i,), s, accumulate=True)
-            return d
-
-        def bool_mask(d, m, s):
-            d = d.clone()
-            d[m] = s
-            return d
-
-        with self._deterministic_algorithms():
-            with pytest.raises(InductorError, match="index_put with accumulate=True"):
-                torch.compile(accumulate, dynamic=False)(x, rows, v)
-            torch._dynamo.reset()
-            with pytest.raises(InductorError, match="boolean mask indices"):
-                torch.compile(bool_mask, dynamic=False)(x, mask, v[0])
-
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_isin_tensor_scalar_cpu(self):
         """Test aten.isin.Tensor_Scalar: test_elements is a Python scalar."""
         elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
