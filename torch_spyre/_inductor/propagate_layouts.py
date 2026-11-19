@@ -825,6 +825,8 @@ def _reduction_layout_from_stl(
     if x_dev_coords is None:
         # The stick moved to another real dim serves the read densely; derive the
         # output from the read on that layout, as for any other input layout.
+        # Probed without indirect_sizes or op, as above; see the note on the same
+        # call in _default_pointwise_layout.
         relocated = dense_relocation_serves_read(stl, in_layout, dep)
         if relocated is not None:
             stl = relocated
@@ -978,6 +980,12 @@ def _default_pointwise_layout(
     if in_device_coords is None:
         # As in _reduction_layout: a dense relocation of the stick serves the
         # read, so the normal candidates below are derived from it.
+        # No indirect_sizes or op here, matching the try_device_coordinates calls
+        # around it; compute_restickify_needed probes with both, so the two can
+        # pick different targets for a read with indirect symbols. It checks the
+        # target it picks against this output (stick_compatible) and reports the
+        # restickify infeasible when they disagree, so a mismatch costs a
+        # discarded candidate rather than a wrong layout.
         relocated = dense_relocation_serves_read(stl, in_layout, dep)
         if relocated is not None:
             stl = relocated

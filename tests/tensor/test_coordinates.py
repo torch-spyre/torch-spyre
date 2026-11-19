@@ -40,6 +40,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     _check_stick_expr_supported,
     compute_restickify_needed,
+    dense_relocation_serves_read,
     device_coordinates,
     is_stick_expr_offset_free,
     restickify_dense_stl_to_sparse,
@@ -1690,6 +1691,63 @@ class TestRestickifyDenseStlToSparse(TestCase):
             values = [int(c.subs({c0: flat})) for c in coords]
             offset = sum(v * st for v, st in zip(values, target.stride_map) if st > 0)
             self.assertEqual(offset, flat, f"c0={flat}")
+
+
+class TestDenseRelocationServesRead(TestCase):
+    """``dense_relocation_serves_read`` moves the stick to a dim the read leaves
+    alone, keeping the tensor dense, and puts the former stick dim outermost so
+    the restickify's padding lands at the end of the buffer rather than between
+    another dim's slices."""
+
+    @staticmethod
+    def _split_row_read(outer, row, inner):
+        """``[outer, row]`` read as ``[outer, row // inner, inner]``: the row is
+        split at a point that cuts the stick, and dim 0 is left alone."""
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        index = row * d0 + inner * d1 + d2
+        return MemoryDep("arg0_1", index, (d0, d1, d2), (outer, row // inner, inner))
+
+    def test_former_stick_dim_is_outermost(self):
+        # [4, 100] split to [4, 20, 5]. The stick moves to dim 0, and the former
+        # stick dim (100, padded to 128) must come first in the device layout.
+        host = _contiguous_host([4, 100])
+        stl = SpyreTensorLayout([4, 100], torch.float16)
+        target = dense_relocation_serves_read(
+            stl, host, self._split_row_read(4, 100, 5)
+        )
+        self.assertIsNotNone(target)
+        self.assertEqual(list(target.device_size), [100, 1, 64])
+        self.assertEqual(list(target.stride_map), [1, 400, 100])
+        # Dense, not sparse: the former stick dim still holds its own elements.
+        self.assertEqual(target.device_size[0], 100)
+
+    def test_a_flatten_has_no_dim_to_take_the_stick(self):
+        # Every dim is merged, so nothing is left alone and the read falls through
+        # to the sparse layout instead (issue #5872's flatten cases).
+        for shape in ([8, 65], [4, 100], [2, 3, 65]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                stl = SpyreTensorLayout(list(shape), torch.float16)
+                _, dep = _flat_read(math.prod(shape))
+                self.assertIsNone(dense_relocation_serves_read(stl, host, dep))
+
+    def test_a_size1_dim_is_not_mistaken_for_the_stick(self):
+        # A size-1 dim's stride ties with the real stick dim's, so a sort by
+        # stride alone can leave it last. The former stick dim must still be
+        # identified as the 100-wide dim, not the size-1 one, or its padding
+        # would be left inside another dim.
+        host = FixedLayout(
+            torch.device("spyre:0"), torch.float16, [4, 100, 1], [100, 1, 1]
+        )
+        stl = SpyreTensorLayout([4, 100, 1], torch.float16)
+        target = dense_relocation_serves_read(
+            stl, host, self._split_row_read(4, 100, 5)
+        )
+        # No candidate serves this read, so it goes to the sparse layout. The
+        # point of the case is that the choice does not depend on the size-1 dim.
+        self.assertIsNone(target)
 
 
 class TestStickExprOffsetFree(TestCase):

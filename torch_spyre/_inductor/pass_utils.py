@@ -3324,6 +3324,13 @@ def dense_relocation_serves_read(
     The restickify into the layout this returns is a dense one whose new stick dim
     is one stick wide, so it carries the per-core span limit of #6132, as the
     sparse layout carries #6113.
+
+    Candidates are tried widest first, but a dim narrower than a stick is still
+    padded up to one, so "dense" is not free: relocating onto a size-4 dim costs
+    4x the elements it holds, 16x at fp16. That stays well under the sparse
+    layout's elems_per_stick (64x at fp16), which is why it is still preferred,
+    but EdgeCostMap prices every restickify by its input size and cannot see the
+    difference, so it cannot choose between two relocations on cost.
     """
     if (
         stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -3378,16 +3385,11 @@ def _former_stick_dim_outermost(
     if j is None or j == 0:
         return stl
     perm = [j] + [k for k in range(len(size)) if k != j]
-    where = {old: new for new, old in enumerate(perm)}
-    valid = {
-        tuple(sorted(where[k] for k in dims)): n
-        for dims, n in dict(stl.valid_elements).items()
-    }
     return SpyreTensorLayout(
         [size[k] for k in perm],
         [smap[k] for k in perm],
         stl.device_dtype,
-        valid,
+        reorder_valid_elements(stl, perm),
         stl.element_arrangement,
     )
 
@@ -3471,7 +3473,21 @@ def compute_restickify_needed(
         # try a dense layout with the stick on a dim the read leaves alone.
         dense = dense_relocation_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
         if dense is not None:
-            return True, dense
+            # The sparse target below is safe to return unchecked because both
+            # layout rules return the sparse output early.  A relocation has no
+            # such guard: the rules carry on to _candidate_output_stls, which can
+            # offer an output whose stick is not the relocated one.  Check this
+            # target can feed this output rather than trusting them.  A rule that
+            # relocated differently (it probes without the indirect context this
+            # function has) also lands here, and is rejected the same way.
+            dense_idc = try_device_coordinates(dense, in_dep, ind_sizes, op=op)
+            out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
+            if (
+                dense_idc is not None
+                and out_idc is not None
+                and stick_compatible([dense_idc, out_idc])
+            ):
+                return True, dense
         sparse = sparse_target_for_unservable_read(
             in_stl, in_host, in_dep, ind_sizes, op=op
         )
