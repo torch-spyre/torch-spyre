@@ -2590,14 +2590,61 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2047,
                 ),
                 "2d_input": (torch.rand((4, 64)), 10, 0, 1),
-                # TODO: fp16 needs fp16 <-> fp32 conversions of every length on
-                # device (#3999, #5361, #4714); when they land this becomes a
-                # positive case.
-                "fp16_input": (torch.rand((192,)).to(torch.float16), 10, 0, 1),
+                # fp16 inputs are multiples of 1/16, exact in device fp16, with
+                # values below min and above max. Counts stay under 1024, the
+                # largest whole number device fp16 holds exactly.
+                "fp16_192": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                "fp16_8": (
+                    (torch.randint(-4, 21, (8,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                "fp16_65": (
+                    (torch.randint(-4, 21, (65,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                # NaN, +-inf, both edges and values outside the range.
+                "fp16_nan_inf": (
+                    torch.tensor(
+                        [float("nan"), float("inf"), -float("inf")]
+                        + [0.5, 1.0, 0.0, -0.25, 1.25],
+                        dtype=torch.float16,
+                    ).repeat(16),
+                    10,
+                    0,
+                    1,
+                ),
+                "fp16_auto_range": (
+                    (torch.randint(-4, 21, (128,)) / 16).to(torch.float16),
+                    20,
+                    0,
+                    0,
+                ),
+                # The most bins fp16 allows.
+                "fp16_bins_1024": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    1024,
+                    0,
+                    1,
+                ),
+                "fp16_bins_1025": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    1025,
+                    0,
+                    1,
+                ),
             },
             "expect_raise": {
                 "2d_input": "histc: only 1-D input is supported",
-                "fp16_input": "histc: float16 input is not supported yet",
+                "fp16_bins_1025": "histc: float16 input supports at most 1024 bins",
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -11569,14 +11616,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_histc_cpu(self, x, bins: int, min: float, max: float):
         # CPU histc has no integer kernel, so the reference counts the fp32 copy
         # and is cast back; counts are whole numbers, so the comparison is exact.
-        ref = torch.histc(x.float(), bins=bins, min=min, max=max).to(x.dtype)
+        counts = torch.histc(x.float(), bins=bins, min=min, max=max)
+        if x.dtype == torch.float16:
+            # The lx wraps append an op to an fp16 result, so they need a
+            # reference they can apply the same op to.
+            ref = {"dlfloat16_reference": counts.double()}
+        else:
+            ref = {"cpu_eager_result": counts.to(x.dtype)}
         self.compare_with_cpu(
             lambda x: torch.histc(x, bins=bins, min=min, max=max),
             x,
             atol=0,
             rtol=0,
-            cpu_eager_result=ref,
             cpu_compile=False,
+            **ref,
         )
 
     @expects_raise

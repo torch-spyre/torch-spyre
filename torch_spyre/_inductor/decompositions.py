@@ -1878,15 +1878,12 @@ def spyre_histc(
     min: float = 0,
     max: float = 0,
 ) -> torch.Tensor:
-    """1-D int32/int64/float32 histc: bin index per element, then
+    """1-D int32/int64/float32/float16 histc: bin index per element, then
     spyre::histc_count."""
-    if input.dtype == torch.float16:
-        # Needs fp16 <-> fp32 on device for every length: #3999, #5361, #4714.
-        raise Unsupported("histc: float16 input is not supported yet; use float32")
-    if input.dtype not in (torch.int32, torch.int64, torch.float32):
+    if input.dtype not in (torch.int32, torch.int64, torch.float32, torch.float16):
         raise Unsupported(
             f"histc: {input.dtype} input is not supported "
-            "(int32, int64 and float32 are)"
+            "(int32, int64, float32 and float16 are)"
         )
     if input.dim() != 1:
         raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
@@ -1898,10 +1895,17 @@ def spyre_histc(
         raise RuntimeError(f"torch.histc: range of [{lo}, {hi}] is not finite")
     if lo > hi:
         raise RuntimeError("torch.histc: max must be larger than min")
+    # An fp16 input is compared as fp16 (the index maths stays in fp32).
+    idx_dtype = torch.float16 if input.dtype == torch.float16 else torch.float32
+    if idx_dtype == torch.float16 and bins > 1024:
+        # Device fp16 holds whole numbers exactly only up to 1024.
+        raise Unsupported("histc: float16 input supports at most 1024 bins")
 
     # First, so this extern call does not split the kernels that follow.
-    stick = get_elem_in_stick(torch.float32)
-    bin_ids = torch.ops.spyre.histc_bin_ids((bins + stick - 1) // stick * stick)
+    stick = get_elem_in_stick(idx_dtype)
+    bin_ids = torch.ops.spyre.histc_bin_ids(
+        (bins + stick - 1) // stick * stick, idx_dtype
+    )
     x = input.to(torch.float32)
     if lo == hi:
         # min == max: the data's range, widened by 1 if constant, as torch does.
@@ -1919,6 +1923,10 @@ def spyre_histc(
             float(np.float32(hi) - np.float32(lo)),
             bins,
         )
+    if idx_dtype == torch.float16:
+        # The fp32 index of an fp16 input is in staggered order; the cast back to
+        # fp16 restores standard order for histc_count.
+        idx = idx.to(torch.float16)
     return torch.ops.spyre.histc_count(idx, bin_ids, bins, input.dtype)
 
 
