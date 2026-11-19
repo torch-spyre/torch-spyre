@@ -96,6 +96,27 @@ class TestStickRelocation(unittest.TestCase):
             cases[f"merge w={w}"] = ([(1, 32, w, w)], _silu_reshape((1, 32, w * w)))
         self._check_dense(cases)
 
+    def test_conv_output_reshape_read_by_another_op(self):
+        # #5227: conv2d_via_bmm_decomp ends with (N, C, H*W) -> (N, C, H, W), so a
+        # conv whose output width is not a multiple of 64 followed by an
+        # activation failed to compile; YOLOv5n hits it at widths 160 and 80.
+        # Here the consumer reads the reshaped view, unlike the cases above,
+        # where the pointwise runs before the reshape and the view is of its
+        # output. The issue reports two different errors: "Unsupported coordinate
+        # expression 5*c1/2" for a row wider than a stick (160, 96, 80), and "no
+        # supported output layout found" for one narrower than a stick (40).
+        cases = {}
+        for w in (160, 96, 80, 40):
+            cases[f"consumer reads the reshape w={w}"] = (
+                [(1, 32, w * w)],
+                lambda x, w=w: F.silu(x.reshape(1, 32, w, w)),
+            )
+            cases[f"pointwise before the reshape w={w}"] = (
+                [(1, 32, w * w)],
+                lambda x, w=w: (x * 2).reshape(1, 32, w, w),
+            )
+        self._check_dense(cases)
+
     def test_stick_moved_to_a_wide_dim(self):
         # The stick moves to a dim wider than one stick, with nothing in front of
         # it. This gave wrong values when the padded former stick dim was not
