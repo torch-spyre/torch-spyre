@@ -29,6 +29,7 @@ from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
 from torch._inductor.virtualized import V
 
 
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
@@ -2261,6 +2262,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "n2048_k16": (2048, 16),
                 "n8192_k64": (8192, 64),
                 "n128256_k4": (128256, 4),
+            },
+        },
+        ("test_topk_16bit", "test_topk_16bit_wide_dim_rejected"): {
+            "param_sets": {
+                "fp16_n1025": (torch.float16, 1025),
+                "bf16_n257": (torch.bfloat16, 257),
+            },
+        },
+        ("test_topk_16bit", "test_topk_16bit_dim_at_limit_exact"): {
+            "param_sets": {
+                "fp16_n1024": (torch.float16, 1024),
+                "bf16_n256": (torch.bfloat16, 256),
             },
         },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
@@ -11628,12 +11641,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert torch.equal(indices.cpu(), positions)
 
     @expects_raise
-    def test_topk_fp16_wide_dim_rejected(self):
-        # A float16 index is exact only up to FP16_TOPK_MAX_DIM; a longer search
-        # dim must be rejected instead of returning wrong indices (#5847).
-        x = torch.randn(4, 2048).half()
-        with pytest.raises(Exception, match="the indices are held in float16"):
+    def test_topk_16bit_wide_dim_rejected(self, dtype: torch.dtype, n: int):
+        # fp16 and bf16 count the topk index in the input dtype, so a search dim
+        # past FP16_TOPK_MAX_DIM (fp16) or BF16_TOPK_MAX_DIM (bf16) must be rejected
+        # instead of returning wrong indices (#5847). The first width past each
+        # limit pins the constant, so changing it has to be deliberate.
+        x = torch.randn(4, n).to(dtype)
+        name = str(dtype).removeprefix("torch.")
+        with pytest.raises(BackendCompilerFailed, match=f"topk along a {name} dim"):
             _compile_and_run(lambda x: torch.topk(x, 4, dim=-1), [x], "spyre")
+
+    def test_topk_16bit_dim_at_limit_exact(self, dtype: torch.dtype, n: int):
+        # The widest search dim the guard accepts must still give exact indices.
+        # Each row holds 4, 3, 2, 1 at random positions on a zero background, so
+        # values and indices have a single correct answer. The last position is
+        # always one of them: the worst case for a rounded index.
+        g = torch.Generator().manual_seed(n)
+        x = torch.zeros(4, n)
+        positions = torch.stack(
+            [torch.randperm(n - 1, generator=g)[:4] for _ in range(4)]
+        )
+        positions[:, 3] = n - 1
+        want = torch.arange(4, 0, -1).float().expand(4, 4).contiguous()
+        x.scatter_(1, positions, want)
+        values, indices = torch.compile(
+            lambda x: torch.topk(x, 4, dim=-1), dynamic=False
+        )(x.to(dtype).to("spyre"))
+        assert torch.equal(values.cpu().float(), want)
+        assert torch.equal(indices.cpu().float().round().long(), positions)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
