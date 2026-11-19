@@ -2682,9 +2682,10 @@ def splits_by_index_coeff(
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    write_index_syms = write_index.free_symbols
+    # Reduction splits: symbols not in write_index but in read_index
     reduction_only = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in splits.items() if sym not in write_index_syms
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
@@ -5103,8 +5104,9 @@ def _per_core_view_on_buf(
 
     prep = _prepare_per_core_view(op, dep, buf_name)
     write_index = prep.write_index if prep is not None else sympy.S.Zero
+    write_index_syms = write_index.free_symbols
     reduction_splits = {
-        sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
+        sym: split for sym, split in splits.items() if sym not in write_index_syms
     }
     result = _per_core_view_from_prep(
         prep,
