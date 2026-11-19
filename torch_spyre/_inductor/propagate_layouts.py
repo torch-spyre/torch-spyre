@@ -2878,7 +2878,9 @@ def _align_single_source_producer(
     # Do not overwrite a producer whose layout already carries a non-STANDARD
     # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
     # the mutation target is always STANDARD; forcing it onto the producer strips
-    # the arrangement and causes the codegen to misread the HBM layout.
+    # the arrangement and causes the codegen to misread the HBM layout.  The
+    # caller then gives the target the same QFP8WT arrangement (see
+    # source_is_qfp8wt there), so producer and target still agree.
     if any(
         getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
         != ElementArrangement.STANDARD
@@ -3708,6 +3710,7 @@ def propagate_spyre_tensor_layouts(
                 rw = op_read_writes(op)
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+                caller_target_stl = target_stl
 
                 # An unsupported write stick expression (an offset like v+32, or
                 # an offset-free sub-stick write) needs the stick dim relocated
@@ -3756,7 +3759,7 @@ def propagate_spyre_tensor_layouts(
 
                 # When the scatter source carries QFP8WT EA (i.e. the value
                 # being written was produced by quantize_weight_fp8_with_scale),
-                # promote the destination to QFP8WT so that:
+                # the destination must be QFP8WT too so that:
                 #   1. reorder_nonstick_dims sees QFP8WT on k_cache and the
                 #      deferred IA-rotate entry records QFP8WT EA.
                 #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
@@ -3764,6 +3767,10 @@ def propagate_spyre_tensor_layouts(
                 #   3. reorder_nonstick_dims_mutation rewrites the target's layout
                 #      in place to that required_stl, so the scatter writes in
                 #      2D-stick addressing with no copy-in / copy-back.
+                # A graph input must already be QFP8WT: the caller's tensor keeps
+                # the layout it was allocated with, so relabelling a STANDARD
+                # input here would leave its device_tensor_layout() wrong for
+                # every later reader.  Internal buffers are promoted.
                 source_is_qfp8wt = any(
                     any(
                         stl.element_arrangement == ElementArrangement.QFP8WT
@@ -3772,6 +3779,18 @@ def propagate_spyre_tensor_layouts(
                     for a in args
                     if a.dep.name != target_name
                 )
+                if (
+                    source_is_qfp8wt
+                    and graph_input is not None
+                    and caller_target_stl.element_arrangement
+                    != ElementArrangement.QFP8WT
+                ):
+                    raise Unsupported(
+                        f"QFP8WT scatter into graph input {target_name} requires "
+                        f"a QFP8WT destination; allocate it with "
+                        f"spyre_empty_with_layout(..., QFP8WT) "
+                        f"(got {caller_target_stl.element_arrangement})"
+                    )
                 if source_is_qfp8wt:
                     qfp8wt_stl = target_stl.with_element_arrangement(
                         ElementArrangement.QFP8WT

@@ -829,48 +829,81 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t sK = host_tensor_strides[host_tensor_strides.size() - 2];
     const int64_t sN = host_tensor_strides[host_tensor_strides.size() - 1];
     const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
     const std::vector<int64_t> host_strides = {sK, sN, si * sK, so * sN};
 
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   → stride_dst = [1, si, dst2, dst3]
+    // The device interleaves the matrices of a batched tensor with their
+    // N-strips, in this order (outermost first):
+    //   [outer batch dims] [N-strip] [last batch dim] [K/si] [stick]
+    // ignoring batch dims of extent 1, so one [K, N] matrix is not contiguous:
+    // consecutive N-strips of it are dst3 apart.  The allocation's own sizes
+    // (dma_sizes) give the batch geometry, so a view such as ``dev[b]``
+    // addresses the right matrices.
+    const size_t full_rank = dma_sizes.size();
+    TORCH_CHECK(full_rank >= 2 && full_rank <= 4,
+                "QFP8WT host transfers support tensors of rank 2 to 4, got ",
+                full_rank);
+    const int64_t full_K = dma_sizes[full_rank - 2];
+    const int64_t full_N = dma_sizes[full_rank - 1];
+    TORCH_CHECK(full_K == K && full_N == N,
+                "QFP8WT host transfers of a view must cover whole [K, N] "
+                "matrices: view is [",
+                K, ", ", N, "], allocation is [", full_K, ", ", full_N, "]");
+    const int64_t matrix_elems = K * N;
+    const int64_t matrix_stride = dim2 * eps;  // one matrix's share of a strip
+    // Batch dims of extent 1 take no part in the interleave.
+    int64_t last_batch_extent = 1;
+    for (size_t d = 0; d + 2 < full_rank; ++d) {
+      if (dma_sizes[d] > 1) last_batch_extent = dma_sizes[d];
+    }
+    const int64_t dst3 = last_batch_extent * matrix_stride;  // strip stride
     const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
 
-    // The device stores batch elements densely, one [K, N] matrix after
-    // another.
-    const int64_t device_batch_stride = si * so * dim2 * dim3;  // = K * N
-
-    // Compute total batch count from cpu_sizes[2..] (outer dims beyond K and
-    // N).
+    // Batch geometry of the view (row-major over its leading dims).
+    const size_t host_batch_rank = host_tensor_sizes.size() - 2;
+    // dev_strides was inflated above for sliced views; use the view's own.
+    const std::vector<int64_t> view_strides = dev_tensor->strides().vec();
+    TORCH_CHECK(view_strides.size() == host_tensor_sizes.size(),
+                "QFP8WT host transfer: device and host ranks differ");
+    const int64_t dev_storage_offset = dev_tensor->storage_offset();
+    TORCH_CHECK(dev_storage_offset % matrix_elems == 0,
+                "QFP8WT host transfers must start on a whole [K, N] matrix, "
+                "got storage offset ",
+                dev_storage_offset);
     int64_t batch = 1;
-    for (size_t i = 2; i < cpu_sizes.size(); ++i) batch *= cpu_sizes[i];
+    for (size_t d = 0; d < host_batch_rank; ++d) {
+      batch *= host_tensor_sizes[d];
+      TORCH_CHECK(view_strides[d] % matrix_elems == 0,
+                  "QFP8WT host transfers require whole-matrix batch strides");
+    }
 
     // Emit one DataConversionStrideInfo per batch element so each independent
     // [K, N] QFP8WT matrix is transferred with the correct 2D-stick interleave.
-    // For the common 2D case (batch==1) this produces a single entry, matching
-    // the previous behaviour exactly.
+    // For the common 2D case (batch==1) this produces a single entry.
     dci.dcsi_.reserve(static_cast<size_t>(batch));
-    const size_t host_batch_rank = host_tensor_sizes.size() - 2;
     for (int64_t b = 0; b < batch; ++b) {
-      // Host element offset of batch element b: unravel b over the outer dims
-      // (row-major, matching the device's dense batch order).
+      // Unravel b over the view's batch dims (row-major) to get the host
+      // element offset and the matrix's index in the allocation.
       int64_t host_batch_offset = 0;
+      int64_t dev_matrix_index = dev_storage_offset / matrix_elems;
       int64_t rem = b;
       for (size_t d = host_batch_rank; d-- > 0;) {
-        host_batch_offset +=
-            (rem % host_tensor_sizes[d]) * host_tensor_strides[d];
+        const int64_t idx = rem % host_tensor_sizes[d];
+        host_batch_offset += idx * host_tensor_strides[d];
+        dev_matrix_index += idx * (view_strides[d] / matrix_elems);
         rem /= host_tensor_sizes[d];
       }
+      const int64_t outer = dev_matrix_index / last_batch_extent;
+      const int64_t last = dev_matrix_index % last_batch_extent;
+      const int64_t device_matrix_offset =
+          outer * dim3 * dst3 + last * matrix_stride;
       DataConversionStrideInfo dcsi;
       dcsi.size_ = {si, so, dim2, dim3};
       dcsi.stride_src_ = host2device ? host_strides : device_strides;
       dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-      dcsi.offset_src_ = host2device ? cpu_offset + host_batch_offset
-                                     : b * device_batch_stride;
-      dcsi.offset_dst_ = host2device ? b * device_batch_stride
-                                     : cpu_offset + host_batch_offset;
+      dcsi.offset_src_ =
+          host2device ? cpu_offset + host_batch_offset : device_matrix_offset;
+      dcsi.offset_dst_ =
+          host2device ? device_matrix_offset : cpu_offset + host_batch_offset;
       dci.dcsi_.push_back(dcsi);
     }
 

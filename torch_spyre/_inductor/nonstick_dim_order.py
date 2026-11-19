@@ -1309,6 +1309,19 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
                     real_buf.data, StorageBox
                 ):
                     real_buf = real_buf.data.data
+                if entry.buf_name in graph.graph_inputs:
+                    # The caller's tensor keeps the layout it was allocated
+                    # with, so the scatter must be compiled against exactly it.
+                    caller_layout = _real_layout(buf)
+                    if (
+                        isinstance(caller_layout, FixedTiledLayout)
+                        and caller_layout.device_layout != entry.required_stl
+                    ):
+                        raise Unsupported(
+                            f"QFP8WT scatter into graph input {entry.buf_name} "
+                            f"needs layout {entry.required_stl}, but the tensor "
+                            f"was allocated as {caller_layout.device_layout}"
+                        )
                 _rewrite_producer_layout(real_buf, entry.required_stl)
             elif isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
                 _insert_mutation_relayout_copy(graph, entry.op, entry.required_stl)

@@ -118,7 +118,8 @@ In the direct-FP8-matmul workflow::
 
 import pytest
 import torch
-from utils_inductor import DEVICE, cached_randn, compare_with_pytorch
+from torch._inductor.exc import InductorError
+from utils_inductor import DEVICE, cached_randn, compare_with_pytorch, expects_raise
 
 from torch_spyre._C import (
     ElementArrangement,
@@ -165,6 +166,43 @@ def _cpu_quantize_dequantize(x: torch.Tensor, scale: torch.Tensor) -> torch.Tens
 def _cpu_per_token_scale(x: torch.Tensor) -> torch.Tensor:
     """amax-based per-token scale: shape [..., 1] fp16."""
     return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
+
+
+def _qfp8wt_zeros(shape) -> torch.Tensor:
+    """Zero-filled device tensor a compiled graph can write into as QFP8WT.
+
+    A QFP8WT cache that a compiled graph scatters into must already be QFP8WT,
+    with the page dim outermost: ``[pages, ..., K, 1, stick]``.  The caller's
+    tensor keeps the layout it was allocated with, so the graph is compiled
+    against it rather than relabelling it.  A 2D ``[K, N]`` buffer takes the
+    default 2D-stick weight layout.
+    """
+    host = torch.zeros(shape, dtype=torch.float8_e4m3fn)
+    if len(shape) == 2:
+        # A plain [K, N] weight: the default 2D-stick layout.
+        stl = SpyreTensorLayout(
+            list(shape),
+            list(host.stride()),
+            torch.float8_e4m3fn,
+            [0, 1],
+            ElementArrangement.QFP8WT,
+        )
+        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
+        copy_tensor(host, dev, non_blocking=False)
+        return dev
+    lead = list(shape[:-1])
+    lead_strides = list(host.stride()[:-1])
+    n = shape[-1]
+    stl = SpyreTensorLayout(
+        lead + [1, n],
+        lead_strides + [n, 1],
+        SpyreTensorLayout(list(shape), torch.float8_e4m3fn).device_dtype,
+        ElementArrangement.QFP8WT,
+        {**{(d,): shape[d] for d in range(len(lead))}, (len(lead), len(lead) + 1): n},
+    )
+    dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
+    copy_tensor(host, dev, non_blocking=False)
+    return dev
 
 
 def _device_write_read_fp8(
@@ -340,7 +378,7 @@ class TestFp8KvCacheWrite:
 
         # FP8 quantization is lossy; atol is calibrated to the max FP8 spacing
         # (32) times the scale (≤ 1.0 for unit-variance inputs).
-        compare_with_pytorch(spyre_fn, cpu_fn, kv, scale, atol=2.0, rtol=0.0)
+        compare_with_pytorch(spyre_fn, cpu_fn, kv, scale, atol=0.3, rtol=0.0)
 
     def test_quantize_kv_token_dtype_is_fp8(self):
         """quantize_fp8_with_scale must return float8_e4m3fn."""
@@ -388,7 +426,7 @@ class TestFp8KvCacheWrite:
         def cpu_ref(src, sc):
             return _cpu_quantize_dequantize(src, sc)
 
-        # atol=2.0: FP8 quantization error (max spacing ≈ 32 × scale ≈ 32/448 ≈ 0.07
+        # atol=0.2: FP8 quantization error (max spacing ≈ 32 × scale ≈ 32/448 ≈ 0.07
         # for unit-variance inputs; device arithmetic adds a small rounding delta).
         compare_with_pytorch(
             dequant_fn,
@@ -396,7 +434,7 @@ class TestFp8KvCacheWrite:
             src_fp16,
             scale,
             target=torch.compile(dequant_fn, dynamic=False)(gathered, scale_d).cpu(),
-            atol=2.0,
+            atol=0.2,
             rtol=0.0,
         )
 
@@ -498,8 +536,8 @@ class TestFp8PagedAttentionDecode:
         k0_scale = k_scale[:BLOCK_SIZE].reshape(1, BLOCK_SIZE, NUM_KV_HEADS, 1)
         expected = _cpu_quantize_dequantize(k0_fp16, k0_scale)
 
-        # atol=2.0: FP8 spacing at scale≈0.5/448 ≈ 0.001; device arithmetic adds ~fp16 ulp.
-        torch.testing.assert_close(result.cpu(), expected, atol=2.0, rtol=0.0)
+        # atol=0.2: FP8 spacing at scale≈0.5/448 ≈ 0.001; device arithmetic adds ~fp16 ulp.
+        torch.testing.assert_close(result.cpu(), expected, atol=0.2, rtol=0.0)
 
     def test_fp8_decode_attention_single_block(self):
         """One-block decode attention over an on-device fp8 KV cache.
@@ -731,13 +769,13 @@ class TestFp8PagedAttentionPrefill:
         torch.testing.assert_close(
             k_result.cpu(),
             _cpu_quantize_dequantize(k_paged, k_sc_paged),
-            atol=2.0,
+            atol=0.2,
             rtol=0.0,
         )
         torch.testing.assert_close(
             v_result.cpu(),
             _cpu_quantize_dequantize(v_paged, v_sc_paged),
-            atol=2.0,
+            atol=0.2,
             rtol=0.0,
         )
 
@@ -834,8 +872,8 @@ class TestFp8ReshapeAndCache:
         k_expected = _cpu_quantize_dequantize(key, _cpu_per_token_scale(key))
         v_expected = _cpu_quantize_dequantize(value, _cpu_per_token_scale(value))
 
-        torch.testing.assert_close(k_roundtrip.cpu(), k_expected, atol=2.0, rtol=0.0)
-        torch.testing.assert_close(v_roundtrip.cpu(), v_expected, atol=2.0, rtol=0.0)
+        torch.testing.assert_close(k_roundtrip.cpu(), k_expected, atol=0.3, rtol=0.0)
+        torch.testing.assert_close(v_roundtrip.cpu(), v_expected, atol=0.3, rtol=0.0)
 
     def test_fused_quantize_and_store_roundtrip_1token(self):
         """num_tokens=1: full write → on-device dequantize → CPU comparison."""
@@ -924,8 +962,8 @@ class TestFp8ReshapeAndCache:
         k_expected = _cpu_quantize_dequantize(key, _cpu_per_token_scale(key))
         v_expected = _cpu_quantize_dequantize(value, _cpu_per_token_scale(value))
 
-        torch.testing.assert_close(k_roundtrip.cpu(), k_expected, atol=2.0, rtol=0.0)
-        torch.testing.assert_close(v_roundtrip.cpu(), v_expected, atol=2.0, rtol=0.0)
+        torch.testing.assert_close(k_roundtrip.cpu(), k_expected, atol=0.2, rtol=0.0)
+        torch.testing.assert_close(v_roundtrip.cpu(), v_expected, atol=0.2, rtol=0.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1024,6 +1062,9 @@ class TestFp8HeadMajorReshapeAndCache:
 
         k_exp = _cpu_quantize_dequantize(key, _cpu_per_token_scale(key))
 
+        # atol=2.0 is deliberately loose: with two index_copy_ calls into one
+        # destination the first write is lost (head 0 reads back as zeros), so
+        # this only bounds the output by the value range.  Tracked separately.
         torch.testing.assert_close(
             k_p0.cpu()[0, :num_tokens], k_exp[:, 0], atol=2.0, rtol=0.0
         )
@@ -1103,7 +1144,7 @@ class TestFp8IndexSelect:
         )
         expected = _cpu_quantize_dequantize(p2, s2)
 
-        torch.testing.assert_close(result.cpu(), expected, atol=2.0, rtol=0.0)
+        torch.testing.assert_close(result.cpu(), expected, atol=0.2, rtol=0.0)
 
     @pytest.mark.parametrize("page_indices", [[0], [1, 3], [0, 2, 3]])
     def test_index_select_fp8_multi_page(self, page_indices):
@@ -1128,7 +1169,7 @@ class TestFp8IndexSelect:
         sel_sc = flat_sc[page_indices]  # [n, B, KV, 1]
         expected = _cpu_quantize_dequantize(sel_fp16, sel_sc)
 
-        torch.testing.assert_close(result.cpu(), expected, atol=2.0, rtol=0.0)
+        torch.testing.assert_close(result.cpu(), expected, atol=0.2, rtol=0.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1697,7 +1738,7 @@ class TestFp8IndexSelectRobustness:
         expected = _cpu_quantize_dequantize(sel_fp16, sel_sc)
 
         # Shape: [3, B, KV, D]; repeated rows [0] and [1] must both equal page-1's dequantized data.
-        torch.testing.assert_close(result.cpu(), expected, atol=2.0, rtol=0.0)
+        torch.testing.assert_close(result.cpu(), expected, atol=0.2, rtol=0.0)
         # Explicitly verify the duplicate rows are numerically identical.
         torch.testing.assert_close(
             result.cpu()[0],
@@ -2041,7 +2082,7 @@ class TestFp8KvCacheWriteQFP8WT:
         sk_d = sk_cpu.to(DEVICE)
         sq_d = sq_cpu.to(DEVICE)
         block_d = block_idx.to(DEVICE)
-        k_cache_d = k_cache.to(DEVICE)
+        k_cache_d = _qfp8wt_zeros(k_cache.shape)
 
         def write_and_score(k, sk, block, k_cache, q, sq):
             # ── Fill ───────────────────────────────────────────────────────────
@@ -2086,6 +2127,110 @@ class TestFp8KvCacheWriteQFP8WT:
 
         expected = (torch.matmul(q_dq, k_dq) * attn_scale).to(torch.float16)
 
+        torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
+
+    @expects_raise
+    def test_standard_layout_cache_is_rejected(self):
+        """Scattering a QFP8WT value into a STANDARD cache fails loudly.
+
+        The caller's tensor keeps its STANDARD layout, so compiling the write as
+        QFP8WT would leave every other reader of the tensor misreading it.
+        """
+        k_cache_d = torch.zeros(
+            (NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE),
+            dtype=torch.float8_e4m3fn,
+        ).to(DEVICE)
+        k_d = torch.zeros(
+            (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), dtype=torch.float16
+        ).to(DEVICE)
+        sk_d = torch.ones(1, dtype=torch.float16).to(DEVICE)
+        block_d = torch.tensor([1], dtype=torch.int32).to(DEVICE)
+
+        def fill(k, sk, block, k_cache):
+            k_perm = k.permute(1, 2, 0).contiguous()
+            k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k_perm, sk)
+            k_cache.index_copy_(0, block, k_fp8.unsqueeze(0))
+
+        with pytest.raises(InductorError, match="requires a QFP8WT destination"):
+            torch.compile(fill, dynamic=False)(k_d, sk_d, block_d, k_cache_d)
+
+    @pytest.mark.parametrize("block", [1, NUM_BLOCKS - 1])
+    def test_fill_and_decode_in_separate_graphs(self, block):
+        """A filled cache keeps its layout, so the host and later graphs read it.
+
+        The fill graph writes one block of a zero-initialised QFP8WT cache.  The
+        cache is then read on the host and by a second, separately compiled
+        decode graph; both see the written block and nothing else.
+        """
+        attn_scale = float(HEAD_SIZE**-0.5)
+        gqa = 1
+        k_fp16 = cached_randn(
+            (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="qfp8wt_split_k",
+        )
+        q_fp16 = cached_randn(
+            (1, NUM_KV_HEADS, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="qfp8wt_split_q",
+        )
+        sq_cpu = _cpu_per_token_scale(q_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE))
+        sq_cpu = sq_cpu.unsqueeze(2)  # [KV, 1, 1, 1]
+        k_perm_cpu = k_fp16.permute(1, 2, 0).contiguous()  # [KV, D, BS]
+        sk_cpu = torch.tensor(
+            [_cpu_per_token_scale(k_perm_cpu).amax().item()], dtype=torch.float16
+        )
+        block_d = torch.tensor([block], dtype=torch.int32).to(DEVICE)
+        k_cache_d = _qfp8wt_zeros((NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE))
+
+        def fill(k, sk, block, k_cache):
+            k_perm = k.permute(1, 2, 0).contiguous()
+            k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k_perm, sk)
+            k_cache.index_copy_(0, block, k_fp8.unsqueeze(0))
+
+        torch.compile(fill, dynamic=False)(
+            k_fp16.to(DEVICE), sk_cpu.to(DEVICE), block_d, k_cache_d
+        )
+
+        # The cache is still QFP8WT, so the host reads each block as written.
+        assert (
+            k_cache_d.device_tensor_layout().element_arrangement
+            == ElementArrangement.QFP8WT
+        )
+        cache_cpu = k_cache_d.cpu()
+        expected_block = _cpu_quantize(k_perm_cpu, sk_cpu)
+        for b in range(NUM_BLOCKS):
+            if b == block:
+                # One fp8 step of rounding between device and CPU quantization.
+                torch.testing.assert_close(
+                    cache_cpu[b].float(),
+                    expected_block.float(),
+                    rtol=0.13,
+                    atol=0.01,
+                )
+            else:
+                assert not cache_cpu[b].view(torch.uint8).any()
+
+        def decode(q, sq, sk, block, k_cache):
+            k_block = k_cache.index_select(0, block)  # [1, KV, D, BLOCK_SIZE]
+            k_4d = k_block.squeeze(0).unsqueeze(1)  # [KV, 1, D, BLOCK_SIZE]
+            q_4d = q.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)
+            q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)
+            raw = torch.ops.spyre.scaled_bmm(q_fp8, k_4d, out_dtype=torch.float16)
+            return raw * (sq * sk) * attn_scale
+
+        result = torch.compile(decode, dynamic=False)(
+            q_fp16.to(DEVICE), sq_cpu.to(DEVICE), sk_cpu.to(DEVICE), block_d, k_cache_d
+        )
+
+        q_4d_cpu = q_fp16.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)
+        q_dq = _cpu_dequantize(_cpu_quantize(q_4d_cpu, sq_cpu), sq_cpu).float()
+        k_dq = _cpu_dequantize(
+            _cpu_quantize(k_perm_cpu.unsqueeze(1), sk_cpu), sk_cpu
+        ).float()
+        expected = (torch.matmul(q_dq, k_dq) * attn_scale).to(torch.float16)
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
 
 
@@ -2183,7 +2328,7 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
         v_d = v_fp16.to(DEVICE)
         q_d = query_fp16.to(DEVICE)
         block_d = block_idx.to(DEVICE)
-        k_cache_d = k_cache.to(DEVICE)
+        k_cache_d = _qfp8wt_zeros(k_cache.shape)
         k_scale_cache_d = k_scale_cache.to(DEVICE)
         v_cache_d = v_cache.to(DEVICE)
         v_scale_cache_d = v_scale_cache.to(DEVICE)
@@ -2319,7 +2464,7 @@ class TestFp8Qfp8wtSliceCopy:
         expected = torch.compile(
             lambda x, y: torch.ops.aten._scaled_mm(x, y, **self._SCALED_MM)
         )(qa, qb)
-        buf = torch.zeros(k, n, dtype=torch.float8_e4m3fn).to(DEVICE)
+        buf = _qfp8wt_zeros((k, n))
         return qa, qb, buf, expected.cpu().float()
 
     def test_qfp8wt_full_copy(self):
@@ -2359,6 +2504,7 @@ class TestFp8Qfp8wtSliceCopy:
         result = torch.compile(fn)(qa, qb, buf).cpu().float()
         torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
 
+    @expects_raise
     def test_qfp8wt_odd_k_offset_slice_rejected(self):
         """A 2-row stick cannot start mid-pair: an odd K offset fails loudly."""
         qa, qb, buf, _ = self._operands(128, 128)
@@ -2367,7 +2513,7 @@ class TestFp8Qfp8wtSliceCopy:
             buf[1:65].copy_(qb[1:65])
             return torch.ops.aten._scaled_mm(qa, buf, **self._SCALED_MM)
 
-        with pytest.raises(Exception, match="multiple of 2 rows"):
+        with pytest.raises(InductorError, match="multiple of 2 rows"):
             torch.compile(fn)(qa, qb, buf)
 
 
@@ -2379,7 +2525,9 @@ class TestFp8Qfp8wtBatchTransfer:
     values, so a transfer that reused the first element's offsets would fail.
     """
 
-    @pytest.mark.parametrize("shape", [(2, 128, 128), (3, 2, 128, 64)])
+    @pytest.mark.parametrize(
+        "shape", [(2, 128, 128), (3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)]
+    )
     def test_batched_round_trip(self, shape):
         n = 1
         for s in shape:
@@ -2397,6 +2545,101 @@ class TestFp8Qfp8wtBatchTransfer:
         dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
         copy_tensor(host, dev, non_blocking=False)
         assert torch.equal(dev.cpu().view(torch.uint8), host.view(torch.uint8))
+
+    @staticmethod
+    def _device_tensor(shape):
+        n = 1
+        for s in shape:
+            n *= s
+        host = ((torch.arange(n) % 251).to(torch.float16).reshape(shape)).to(
+            torch.float8_e4m3fn
+        )
+        stl = SpyreTensorLayout(
+            list(host.shape),
+            list(host.stride()),
+            torch.float8_e4m3fn,
+            list(range(host.dim())),
+            ElementArrangement.QFP8WT,
+        )
+        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
+        copy_tensor(host, dev, non_blocking=False)
+        return host, dev
+
+    @pytest.mark.parametrize("shape", [(3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)])
+    def test_batch_view_reads_its_own_matrix(self, shape):
+        """``dev[b]`` and ``dev[b, h]`` read the matrices they name, not page 0."""
+        host, dev = self._device_tensor(shape)
+        for b in range(shape[0]):
+            assert torch.equal(
+                dev[b].cpu().view(torch.uint8), host[b].view(torch.uint8)
+            )
+            h = shape[1] - 1
+            assert torch.equal(
+                dev[b, h].cpu().view(torch.uint8), host[b, h].view(torch.uint8)
+            )
+
+    @pytest.mark.parametrize("shape", [(3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)])
+    def test_batch_view_write_leaves_other_matrices(self, shape):
+        """Copying a host page into ``dev[b]`` changes only that page."""
+        host, dev = self._device_tensor(shape)
+        b = shape[0] - 1
+        page = torch.full(shape[1:], 7, dtype=torch.float16).to(torch.float8_e4m3fn)
+        dev[b].copy_(page)
+        expected = host.clone()
+        expected[b] = page
+        assert torch.equal(dev.cpu().view(torch.uint8), expected.view(torch.uint8))
+
+    def test_host_written_batch_is_read_by_a_device_kernel(self):
+        """``scaled_bmm`` scores a host-written batched K like the CPU does.
+
+        A round trip through one transfer cannot tell a wrong batch/strip
+        order from the right one, so the weight is built on the host, written
+        through the transfer, and consumed by a kernel that fixes the meaning
+        of every element.
+        """
+        gqa = 1
+        k_fp16 = cached_randn(
+            (NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="qfp8wt_host_k",
+        )
+        q_fp16 = cached_randn(
+            (NUM_KV_HEADS, gqa, 1, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="qfp8wt_host_q",
+        )
+        sk = torch.tensor(
+            [_cpu_per_token_scale(k_fp16).amax().item()], dtype=torch.float16
+        )
+        sq = _cpu_per_token_scale(q_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE))
+        sq = sq.reshape(NUM_KV_HEADS, gqa, 1, 1)
+
+        k_host = _cpu_quantize(k_fp16.unsqueeze(1), sk)  # [KV, 1, D, BS]
+        # A QFP8WT tensor the compiler accepts as a matmul weight: allocate it
+        # with a kernel, then overwrite its contents from the host.
+        k_dev = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s),
+            dynamic=False,
+        )(torch.zeros_like(k_fp16).unsqueeze(1).to(DEVICE), sk.to(DEVICE))
+        copy_tensor(k_host, k_dev, non_blocking=False)
+
+        def score(q, sq, k, sk):
+            q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q, sq)
+            raw = torch.ops.spyre.scaled_bmm(q_fp8, k, out_dtype=torch.float16)
+            # Scale inside the graph: the raw fp16 scores overflow on their own.
+            return raw * (sq * sk)
+
+        result = torch.compile(score, dynamic=False)(
+            q_fp16.to(DEVICE), sq.to(DEVICE), k_dev, sk.to(DEVICE)
+        )
+        q_dq = _cpu_dequantize(_cpu_quantize(q_fp16, sq), sq).float()
+        k_dq = _cpu_dequantize(k_host, sk).float()
+        expected = torch.matmul(q_dq, k_dq).to(torch.float16)
+        # Scores reach ~8 and fp8 rounding of Q costs ~0.15; a transfer that
+        # permutes the batch or N-strip order is off by ~10.
+        torch.testing.assert_close(result.cpu(), expected, atol=3e-1, rtol=0.0)
 
     @pytest.mark.parametrize("shape", [(128, 128), (2, 128, 128), (3, 2, 128, 64)])
     def test_non_contiguous_host_is_read_in_logical_order(self, shape):

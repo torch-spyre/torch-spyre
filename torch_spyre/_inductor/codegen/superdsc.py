@@ -35,7 +35,6 @@ from torch_spyre._inductor.constants import (
     FP16_MIN,
     FP32TOINT32_OP,
     FP8TODL16_OP,
-    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -1343,7 +1342,8 @@ def _check_qfp8wt_offset(arg: TensorArg, reject_column_offset: bool) -> None:
     """Reject a QFP8WT offset that cannot be addressed.
 
     An odd K start falls inside a stick, and offsets on other axes (column
-    slices) are not modelled for every op; either would read the wrong data.
+    slices) are modelled only for plain copies; either would read the wrong
+    data.
     """
     origin = [
         None
@@ -1428,7 +1428,7 @@ def _create_sdsc_tensors(
     for i, arg in enumerate(op_spec.args):
         is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
         if is_qfp8wt_2d_stick:
-            _check_qfp8wt_offset(arg, op_spec.op in FP8_2D_STICK_OPS)
+            _check_qfp8wt_offset(arg, op_spec.op != IDENTITY_OP)
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1622,14 +1622,14 @@ def _create_sdsc_tensors(
                         f"{op_spec.op}: no free dimension available as the stick "
                         f"dimension of argument {i}"
                     )
-                # The chosen dim is absent from the *op*'s dim_order, but an
-                # individual arg may already carry it: a conv2d kernel tensor
-                # gets ki/kj added explicitly by _get_device_dim_order (they are
-                # structural for the weight even when they do not appear in its
-                # device_coordinates). Appending unconditionally would repeat the
-                # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
-                # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
-                # rejects with "external allocations with repeated dimensions".
+            # The stick dim is absent from the *op*'s dim_order, but an
+            # individual arg may already carry it: a conv2d kernel tensor
+            # gets ki/kj added explicitly by _get_device_dim_order (they are
+            # structural for the weight even when they do not appear in its
+            # device_coordinates). Appending unconditionally would repeat the
+            # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
+            # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
+            # rejects with "external allocations with repeated dimensions".
             if stick_dim not in dim_order:
                 dim_order = dim_order + [stick_dim]
 
@@ -2656,12 +2656,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     ),
                     None,
                 )
-                # Read stick size from the value tensor if found; fall back to args[0].
-                sdsc_iteration_space[stick_sym] = (
-                    val_arg.device_dtype.elems_per_stick()
-                    if val_arg is not None
-                    else op_spec.args[0].device_dtype.elems_per_stick()
-                )
+                if val_arg is None:
+                    raise ValueError(
+                        f"{op_spec.op}: sub-stick indirect access has no value "
+                        "tensor to take the stick extent from"
+                    )
+                # The stick extent applies to gathers as well as scatters.
+                sdsc_iteration_space[stick_sym] = val_arg.device_dtype.elems_per_stick()
                 # Remember which sym is the stick so _create_sdsc_tensors step 3
                 # can use it for value/destination tensors instead of mistakenly
                 # picking the first outer loop dim (e.g. mb=T) as the stick.
