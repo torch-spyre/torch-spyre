@@ -197,8 +197,8 @@ def _qfp8wt_zeros(shape) -> torch.Tensor:
         lead + [1, n],
         lead_strides + [n, 1],
         SpyreTensorLayout(list(shape), torch.float8_e4m3fn).device_dtype,
-        ElementArrangement.QFP8WT,
         {**{(d,): shape[d] for d in range(len(lead))}, (len(lead), len(lead) + 1): n},
+        ElementArrangement.QFP8WT,
     )
     dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
     copy_tensor(host, dev, non_blocking=False)
