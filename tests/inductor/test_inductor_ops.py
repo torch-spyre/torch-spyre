@@ -8465,7 +8465,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"sum": torch.sum},
             "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
         },
-        # EA propagation through reduction ops (#5553, #5598).
+        # EA propagation through reduction ops (#5553).
         #
         # Two staggered EA cases × two reduction directions (10 combinations
         # from the table in docs/source/compiler/element_arrangement.md):
@@ -8473,7 +8473,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # DL16_TO_FP32 input: fp16 upcast to fp32 in-graph (x.to(fp32)).
         # Case A: reduce stick → stagger consumed → STANDARD output.
         # Case B: reduce non-stick → stagger preserved → DL16_TO_FP32 output;
-        #         D2H restore (#5187) must un-shuffle the elements correctly.
+        #         D2H restore (#5484) must un-shuffle the elements correctly.
         (
             "test_ea_reduction_dl16tofp32",
             "test_ea_reduction_dl16tofp32_cpu",
@@ -8495,7 +8495,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph (x.to(fp16)).
         # Case A: reduce stick → stagger consumed → STANDARD output.
         # Case B: reduce non-stick → stagger preserved → FP32_TO_DL16 output;
-        #         D2H restore (#5187) must un-shuffle the elements correctly.
+        #         D2H restore (#5484) must un-shuffle the elements correctly.
         (
             "test_ea_reduction_fp32todl16",
             "test_ea_reduction_fp32todl16_cpu",
@@ -13640,7 +13640,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # DL16_TO_FP32 input: fp16 upcast to fp32 in-graph.
         # Case A (dim=-1, stick): stagger consumed → STANDARD output.
         # Case B (dim=0/1, non-stick): stagger preserved → DL16_TO_FP32 output;
-        #   EA tag propagation requires #5598, D2H restore requires #5187.
+        #   D2H restore (#5484) un-shuffles the staggered output.
         def fn(op, dim, x):
             z = x.to(torch.float32)
             return op(z, dim=dim)
@@ -13651,7 +13651,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph.
         # Case A (dim=-1, stick): stagger consumed → STANDARD output.
         # Case B (dim=0/1, non-stick): stagger preserved → FP32_TO_DL16 output;
-        #   EA tag propagation requires #5598, D2H restore requires #5187.
+        #   D2H restore (#5484) un-shuffles the staggered output.
         def fn(op, dim, x):
             z = x.to(torch.float16)
             return op(z, dim=dim)
