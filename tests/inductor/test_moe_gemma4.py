@@ -151,25 +151,55 @@ def _xfail(raises, reason, match):
     return pytest.mark.xfail(strict=True, raises=raises, reason=reason, match=match)
 
 
+# A strict xfail fails the run as soon as its bug is fixed, so one case per
+# (mode, failure) gives the whole signal and the repeats only add shard time.
+# Every scenario still lists all of its cases. _keep drops a Spyre xfail whose
+# (mode, reason) an earlier scenario in this file already runs. When an issue is
+# fixed and its marker is removed, the dropped cases come back as positive tests.
+_XFAILS_RUN = set()
+
+
+def _keep(mode, mark, case_id, sentinel=None):
+    if mark is None:
+        return True
+    key = (mode, mark.kwargs["reason"])
+    if key in _XFAILS_RUN and case_id != sentinel:
+        return False
+    _XFAILS_RUN.add(key)
+    return True
+
+
 def _modes(eager=None, compiled=None):
-    return [
-        "cpu",
-        pytest.param("eager", marks=eager or ()),
-        pytest.param("compiled", marks=compiled or ()),
-    ]
+    cases = ["cpu"]
+    for mode, mark in (("eager", eager), ("compiled", compiled)):
+        if _keep(mode, mark, mode):
+            cases.append(pytest.param(mode, marks=mark or ()))
+    return cases
 
 
-def _cases(eager=None, compiled=None, decode_eager=None, decode_compiled=None):
+def _cases(
+    eager=None, compiled=None, decode_eager=None, decode_compiled=None, sentinel=None
+):
+    """cpu, eager and compiled cases at T=12 and T=1.
+
+    ``sentinel`` (for example ``"eager-decode1"``) names one xfail case to keep even
+    if its failure already runs elsewhere, so the scenario still fails loudly when
+    the issue is fixed.
+    """
     cases = []
     for T, name in ((PREFILL_T, "prefill12"), (DECODE_T, "decode1")):
         decode = T == DECODE_T
-        e = decode_eager if decode and decode_eager is not None else eager
-        c = decode_compiled if decode and decode_compiled is not None else compiled
-        cases += [
-            pytest.param("cpu", T, id=f"cpu-{name}"),
-            pytest.param("eager", T, marks=e or (), id=f"eager-{name}"),
-            pytest.param("compiled", T, marks=c or (), id=f"compiled-{name}"),
-        ]
+        marks = {
+            "eager": decode_eager if decode and decode_eager is not None else eager,
+            "compiled": (
+                decode_compiled if decode and decode_compiled is not None else compiled
+            ),
+        }
+        cases.append(pytest.param("cpu", T, id=f"cpu-{name}"))
+        for mode, mark in marks.items():
+            case_id = f"{mode}-{name}"
+            if _keep(mode, mark, case_id, sentinel):
+                cases.append(pytest.param(mode, T, marks=mark or (), id=case_id))
     return cases
 
 
@@ -240,6 +270,14 @@ SORT_MULTI_OUTPUT = _xfail(
     InductorError,
     "#5831: split_multi_ops fails on multi-output sort",
     "'tuple' object has no attribute 'to'",
+)
+HISTC = _xfail(
+    NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
+)
+REPEAT_INTERLEAVE = _xfail(
+    NotImplementedError,
+    "#673: repeat_interleave.Tensor has no Spyre kernel",
+    r"aten::repeat_interleave\.Tensor",
 )
 # The grouped_mm MoE stops at its sort: no stable-sort kernel eager, and
 # split_multi_ops rejects the multi-output sort compiled.
@@ -381,20 +419,19 @@ def _expert_ffn(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor):
     return (torch.nn.functional.gelu(gate, approximate="tanh") * up) @ down
 
 
-def _moe_reference(hidden, expert_ids, weights, expert_bank):
+def _moe_reference(hidden, expert_ids, weights, expert_bank, dtype=torch.bfloat16):
+    """Per-expert MoE reference in ``dtype``: run each expert's rows, weight, sum."""
     T, K = expert_ids.shape
-    out = torch.zeros(T, HIDDEN, dtype=torch.bfloat16, device=hidden.device)
-    flat_x = hidden.repeat_interleave(K, dim=0)
+    out = torch.zeros(T, HIDDEN, dtype=dtype, device=hidden.device)
+    flat_x = hidden.to(dtype).repeat_interleave(K, dim=0)
     flat_e = expert_ids.reshape(-1)
     flat_w = weights.reshape(-1)
     flat_token = torch.arange(T, device=hidden.device).repeat_interleave(K)
     for e in torch.unique(flat_e).tolist():
-        e = int(e)
         mask = flat_e == e
-        rows = flat_x[mask]
-        ge, de = expert_bank[e]
-        y = _expert_ffn(rows, ge.to(hidden.device), de.to(hidden.device))
-        y = y * flat_w[mask].to(y.dtype).unsqueeze(1)
+        ge, de = (w.to(device=hidden.device, dtype=dtype) for w in expert_bank[int(e)])
+        y = _expert_ffn(flat_x[mask], ge, de)
+        y = y * flat_w[mask].to(dtype).unsqueeze(1)
         out.index_add_(0, flat_token[mask], y)
     return out
 
@@ -502,27 +539,6 @@ def _hf_moe(hidden, weights, ids, gate_up, down):
     expert_ids_g, perm, x_g, w_g = _hf_dispatch(hidden, weights, ids)
     y_g = _hf_experts(x_g, _hf_offsets(expert_ids_g), gate_up, down)
     return _hf_combine(y_g, w_g, perm, hidden.shape[0]).to(hidden.dtype)
-
-
-def _moe_fp32_reference(hidden, ids, weights, bank):
-    h = hidden.float()
-    out = torch.zeros_like(h)
-    flat_x = h.repeat_interleave(K8, 0)
-    flat_ids = ids.reshape(-1)
-    flat_w = weights.reshape(-1)
-    flat_token = torch.arange(hidden.shape[0]).repeat_interleave(K8)
-    for e in torch.unique(flat_ids).tolist():
-        e = int(e)
-        mask = flat_ids == e
-        rows = flat_x[mask]
-        gu = bank[e][0].float()
-        down = bank[e][1].float()
-        gu = gu.to(h.device)
-        down = down.to(h.device)
-        y = _expert_ffn(rows, gu, down).float()
-        y = y * flat_w[mask].unsqueeze(1)
-        out.index_add_(0, flat_token[mask], y)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +743,7 @@ def _decoder_weights(kind):
 def _moe_fp32(hidden, weights, ids, gate_up, down):
     """FP32 reference for _hf_moe, one expert at a time."""
     bank = {e: (gate_up[e], down[e]) for e in torch.unique(ids).tolist()}
-    return _moe_fp32_reference(hidden, ids, weights, bank)
+    return _moe_reference(hidden, ids, weights, bank, dtype=torch.float32)
 
 
 def _decoder_layer(
@@ -966,17 +982,7 @@ def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(
-        eager=STABLE_SORT,
-        compiled=_xfail(
-            InductorError,
-            "#5831: split_multi_ops fails on multi-output sort",
-            "'tuple' object has no attribute 'to'",
-        ),
-    ),
-)
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
 def test_G4_GM_001_sort_dispatch(execution_mode, T):
     """torch.sort by expert, then gather rows with perm // K."""
     _seed()
@@ -1005,14 +1011,7 @@ def test_G4_GM_001_sort_dispatch(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(
-        eager=_xfail(
-            NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
-        ),
-        compiled=_xfail(
-            NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
-        ),
-    ),
+    _cases(eager=HISTC, compiled=HISTC),
 )
 def test_G4_GM_002_histc_cumsum_offsets(execution_mode, T):
     """Per-expert row counts with histc, then int32 cumulative offsets."""
@@ -1127,7 +1126,7 @@ def test_G4_GM_005_router_and_grouped_mm_moe(execution_mode, T):
     assert got.dtype == torch.bfloat16
     weights, ids = _gemma4_router(hidden, *params)
     bank = _expert_weights(torch.unique(ids).tolist())
-    ref = _moe_fp32_reference(hidden, ids, weights, bank)
+    ref = _moe_reference(hidden, ids, weights, bank, dtype=torch.float32)
     assert (got.float() - ref).abs().max().item() <= FP32_REF_ATOL
 
 
@@ -1471,7 +1470,11 @@ def _decoder_case(kind, execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+    _cases(
+        eager=FLOAT_IDS_AS_INDEX_EAGER,
+        compiled=FLOAT_IDS_AS_INDEX,
+        sentinel="eager-decode1",
+    ),
 )
 def test_G4_E2E_002_decoder_layer_sliding(execution_mode, T):
     """Gemma4TextDecoderLayer with sliding-window attention, dense MLP and MoE."""
@@ -1480,7 +1483,11 @@ def test_G4_E2E_002_decoder_layer_sliding(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+    _cases(
+        eager=FLOAT_IDS_AS_INDEX_EAGER,
+        compiled=FLOAT_IDS_AS_INDEX,
+        sentinel="eager-decode1",
+    ),
 )
 def test_G4_E2E_003_decoder_layer_full(execution_mode, T):
     """Gemma4TextDecoderLayer with full attention (K = V), dense MLP and MoE."""
@@ -1526,18 +1533,7 @@ def test_G4_AB_003_pad_expert_segments_to_tile32(execution_mode):
 
 @pytest.mark.parametrize(
     "execution_mode",
-    _modes(
-        eager=_xfail(
-            NotImplementedError,
-            "#673: repeat_interleave.Tensor has no Spyre kernel",
-            r"aten::repeat_interleave\.Tensor",
-        ),
-        compiled=_xfail(
-            NotImplementedError,
-            "#673: repeat_interleave.Tensor has no Spyre kernel",
-            r"aten::repeat_interleave\.Tensor",
-        ),
-    ),
+    _modes(eager=REPEAT_INTERLEAVE, compiled=REPEAT_INTERLEAVE),
 )
 def test_G4_AB_008_exact_dst_pos_construction(execution_mode):
     counts = torch.zeros(EXPERTS, dtype=torch.long)
