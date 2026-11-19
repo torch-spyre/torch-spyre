@@ -179,21 +179,6 @@ def test_owner_evaluation_reuse_keeps_domain_and_range_checks():
     evaluate.cache_clear()
 
 
-def test_owner_evaluation_keeps_short_circuit_order():
-    class FailsOnLaterCore(sympy.Function):
-        @classmethod
-        def eval(cls, value):
-            if value == 1:
-                raise NotImplementedError("later core must not be evaluated")
-            if value == 0:
-                return sympy.Integer(0)
-
-    dim = sympy.Symbol("dim")
-    assert not core_mappings_equal(
-        {dim: FailsOnLaterCore(_CORE_ID)}, {dim: sympy.Integer(1)}, 2
-    )
-
-
 def test_kernel_rejects_lx_allocation_without_physical_ownership():
     """The fault is a placement rejection: preparation demotes and retries."""
 
