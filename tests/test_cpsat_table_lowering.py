@@ -862,10 +862,10 @@ def _refused(reason):
 # One example per optimization of a later stage: an objective whose one table is past
 # its cap, which no stage before that one can lower and that stage's optimization can.
 # Each is refused today; the stage that lowers it drops its mark, so the marks show
-# what each stage adds. Stage 3's numpy steps change no lowering, so it has none, and
-# the fold's example comes with Stage 9, since whether it fits where Stage 8's switch
-# and rungs do not depends on the fold's own counts. The first example lowers today, so
-# the check below runs end to end on every stage.
+# what each stage adds. Stage 3's caching and Stage 4's numpy steps change no lowering,
+# so they have none, and the fold's example comes with Stage 10, since whether it fits
+# where the switch and Stage 9's rungs do not depends on the fold's own counts. The
+# first example lowers today, so the check below runs end to end on every stage.
 EXAMPLES = [
     pytest.param(
         lambda: _with(
@@ -891,7 +891,7 @@ EXAMPLES = [
         CAP,
         id="linear_sum",
         marks=_refused(
-            "Stage 4, linear sums: four terms on a buffer each, one table of 10^4"
+            "Stage 5, linear sums: four terms on a buffer each, one table of 10^4"
         ),
     ),
     pytest.param(
@@ -905,7 +905,7 @@ EXAMPLES = [
         CAP,
         id="switch",
         marks=_refused(
-            "Stage 5, the switch: a factor of 3 values times a sum, one table of 12288"
+            "Stage 6, the switch: a factor of 3 values times a sum, one table of 12288"
         ),
     ),
     pytest.param(
@@ -917,7 +917,7 @@ EXAMPLES = [
         40,
         id="gate",
         marks=_refused(
-            "Stage 6, the gate: a 0/1 literal whose rest reads it, 80 entries under a "
+            "Stage 7, the gate: a 0/1 literal whose rest reads it, 80 entries under a "
             "cap of 40 until the rest is read with the literal fixed"
         ),
     ),
@@ -930,7 +930,7 @@ EXAMPLES = [
         CAP,
         id="ranks",
         marks=_refused(
-            "Stage 7, ranks and pairs: a product under a power, one table of 16384, "
+            "Stage 8, ranks and pairs: a product under a power, one table of 16384, "
             "45 entries as a pair of ranks"
         ),
     ),
@@ -944,7 +944,7 @@ EXAMPLES = [
         CAP,
         id="rung",
         marks=_refused(
-            "Stage 8, a Min/Max by rung: a Max over three buffers of distinct values, "
+            "Stage 9, a Min/Max by rung: a Max over three buffers of distinct values, "
             "one table of 8640"
         ),
     ),
@@ -959,7 +959,7 @@ EXAMPLES = [
         CAP,
         id="lin_min",
         marks=_refused(
-            "Stage 10, a Min kept linear: a Min of two sums of 15 residency literals, "
+            "Stage 11, a Min kept linear: a Min of two sums of 15 residency literals, "
             "one table of 32768 and no operand that fits"
         ),
     ),

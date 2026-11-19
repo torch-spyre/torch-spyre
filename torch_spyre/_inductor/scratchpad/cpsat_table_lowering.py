@@ -176,7 +176,7 @@ def _read_only(values: Any, index: Index) -> np.ndarray:
 class AbstractRealization(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
     it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
-    realization is a subclass: here a TableRealization, and from Stage 4 a
+    realization is a subclass: here a TableRealization, and from Stage 5 a
     LinearRealization too, what a sum is realized as."""
 
     @abstractmethod
@@ -477,7 +477,7 @@ class InputNode(Node):
         variable's lowest and highest values. Raises TableLoweringError naming the
         symbol, so a parent that reads it is refused by the symbol's name, when it has
         no input, when its variable is not an integer variable or its domain has gaps
-        (a position lookup for one comes with Stage 12), and when its values are not
+        (a position lookup for one comes with Stage 13), and when its values are not
         one number per value of its variable."""
         if self.input is None:
             raise TableLoweringError(self.expr, "a symbol with no input")
