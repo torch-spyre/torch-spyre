@@ -162,7 +162,7 @@ class CoarseTileInfo:
         the wrong device axis when the two happen to diverge silently
         advances the wrong dimension (see issue surfaced by
         ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
-        ``SpyreKernel._general_tile_advance`` can add its device-address
+        ``SpyreKernel._index_tile_advance`` can add its device-address
         contribution as an extra term via ``tiling_expr_to_device_expr``
         rather than by substitution. An empty per-read list means that read
         has no such dims. The outer list may also be empty when no read in the

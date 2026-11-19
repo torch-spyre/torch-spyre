@@ -1768,14 +1768,14 @@ def _stamp_direct_loop_info(
     (coefficient, 1) shape the span-overflow lowering derives from the index for a
     splice-only advance. This is
     stamped explicitly here, at ground-truth time, specifically so
-    SpyreKernel._general_tile_advance never needs to re-derive whether a
+    SpyreKernel._index_tile_advance never needs to re-derive whether a
     splice symbol merely appearing in dep.index implies a real per-trip
     advance -- it does not in general (a restickified V-tile pool read is
     genuinely pinned across trips despite loop_var being a free symbol of
     its dep.index by construction). A dep whose coefficient on
     loop_var is exactly zero gets no entry at all here, which is itself the
     explicit "pinned, do not advance" verdict -- not a gap for
-    _general_tile_advance to fill in.
+    _index_tile_advance to fill in.
 
     Also appends a minimal ``DimHint(loop_var=loop_var,
     loop_var_range=trip_count)`` onto ``op.dim_hints``. This is NOT a
@@ -1839,7 +1839,7 @@ def _stamp_direct_loop_info(
         a stamped level at that same position from a strictly-inner call --
         that is a genuine collision: two independent levels both claiming
         the same device dim, each minting its own advance symbol in
-        _general_tile_advance, so the dim would advance twice per trip
+        _index_tile_advance, so the dim would advance twice per trip
         instead of once. Rejecting merely because `loop_var` shares free
         symbols with another coordinate is NOT safe: a WhileLoop-splice-
         folded write index (e.g. coordinate ``d0 + 2*u5``, where ``d0`` is
@@ -2072,7 +2072,7 @@ def _stamp_direct_loop_info(
                     # lowering reads the same shape off the index).
                     # Stamp that coefficient explicitly into
                     # squeezed_advance_per_read/output rather than leaving
-                    # it for SpyreKernel._general_tile_advance to re-derive
+                    # it for SpyreKernel._index_tile_advance to re-derive
                     # from raw dep.index.free_symbols -- that re-derivation
                     # cannot distinguish "loop_var present but this dep is
                     # pinned" from "loop_var present and this dep genuinely
@@ -2131,7 +2131,7 @@ def _stamp_direct_loop_info(
                     # directly. Leaving it empty here caused the minted
                     # advance symbol to appear in
                     # TensorArg.device_tile_advance_expr (built from
-                    # output_tiled_dims via _general_tile_advance) but
+                    # output_tiled_dims via _index_tile_advance) but
                     # never in OpSpec.tiled_symbols (built from
                     # loop_tiled_dims via create_op_spec) -- exactly the
                     # failure mode create_op_spec's own comment warns
@@ -2144,7 +2144,7 @@ def _stamp_direct_loop_info(
                     # Same explicit-stamping rationale as the read-side
                     # else-branch above: record a genuinely splice-var-only
                     # write advance directly, rather than leaving it for
-                    # _general_tile_advance to re-derive from raw
+                    # _index_tile_advance to re-derive from raw
                     # dep.index.free_symbols.
                     write_coeff = write_dep.index.coeff(loop_var)
                     if write_coeff != 0:

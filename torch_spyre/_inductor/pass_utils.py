@@ -1266,7 +1266,7 @@ def per_trip_index(
     advance from one counted-loop trip to the next, not an in-tile iteration
     axis. Codegen already applies that advance exactly once, through
     ``device_tile_advance_expr`` (see ``spyre_kernel.create_tensor_arg`` and
-    ``_general_tile_advance``), and pins the var to zero in the *base*
+    ``_index_tile_advance``), and pins the var to zero in the *base*
     coordinates so the raw unbacked symbol neither leaks into the OpSpec
     iteration space nor applies the same advance twice.
 
