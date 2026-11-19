@@ -21,6 +21,7 @@ position and the cost are determined by the inputs, and that solution's cost is
 COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
+import inspect
 import itertools
 import math
 
@@ -719,6 +720,19 @@ def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
     np.testing.assert_allclose(
         nodes[expr].realization.values, _stage_1(nodes[expr]), rtol=1e-12
     )
+
+
+def test_a_function_takes_its_operands_by_their_own_names():
+    """lambdify renames every argument when any is a Dummy, rebuilding the node once
+    per argument: seconds for a Min or Max of a few dozen operands. Plain symbols
+    whose names are identifiers are taken as they are, so the function's parameters
+    are the placeholders' own names, and a Min of 35 is quick to lambdify."""
+    lowering._lambdified.cache_clear()
+    func = lowering._lambdified(sympy.Min, (None,) * 35)
+    assert list(inspect.signature(func).parameters) == [
+        f"operand{i}" for i in range(35)
+    ]
+    assert func(*np.arange(35.0, 0.0, -1.0)) == 1.0
 
 
 def test_a_quotient_is_divided_as_lambdify_prints_it():

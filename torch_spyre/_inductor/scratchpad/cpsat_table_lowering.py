@@ -248,11 +248,17 @@ def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     lambdified with the numpy module over one placeholder per operand. lambdify runs
     once for each class and forms, and every node of them shares the function.
 
+    The placeholders are plain symbols, operand0, operand1, ..., whose names are
+    Python identifiers, so lambdify takes them as they are. It renames every argument
+    when any is a Dummy, rebuilding the node once per argument: a Min of 35 operands
+    took 10.5 s, against 0.28 s here. The expression holds nothing but placeholders,
+    so no name of its own can clash with theirs.
+
     A condition is compared with 0, as a table holds it as 1.0 or 0.0. A Piecewise
     pairs its operands, value then condition. A Mul raises the base of a factor with
     a negative rational exponent to it, so a quotient is divided, as lambdify prints
     it: 98/a, where 98*(1/a) is 1.9999999999999998 at a = 49."""
-    placeholders = [sympy.Dummy(f"operand{i}") for i in range(len(forms))]
+    placeholders = [sympy.Symbol(f"operand{i}") for i in range(len(forms))]
     args = [
         p if form is None else sympy.Ne(p, 0) if form == CONDITION else p**form
         for p, form in zip(placeholders, forms)
