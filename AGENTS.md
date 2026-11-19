@@ -166,7 +166,9 @@ correct pattern: `NameSwapHandler` in `insert_restickify.py`,
 
 ## Skills
 
-Task-specific guidance is available in `.claude/skills/`. These cover:
+Task-specific guidance is available in `.claude/skills/`. Skills live only
+in `.claude/skills/`; other tools reach them through a symlink (such as
+`.agents/skills` or `.bob/skills`), never a copy. These cover:
 
 - **project-overview** — repo layout, Spyre architecture, compilation pipeline
 - **add-spyre-operation** — patterns for adding new ops

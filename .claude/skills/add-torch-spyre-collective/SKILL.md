@@ -16,14 +16,15 @@ templates; copy their shape rather than inventing a new one:
 Paths below are relative to the torch-spyre repo root. spyre-comms is checked out alongside it
 at `../spyre-comms`.
 
-Scope: only touch `torch-spyre/`. Do not edit `spyre-comms/` here. If an API is missing, stop and
-tell the user it must be exposed first; the procedure is in
-`../spyre-comms/.bob/skills/expose-spyre-comms-collective-api/SKILL.md` (a Bob skill — read it
-with `Read`, it is not loadable via the `Skill` tool).
+Prerequisite: spyre-comms must already expose the collective's eager, plan, and apply calls on
+`spyre_comms::Context`. That work belongs in the spyre-comms repo, not here.
+
+Scope: only touch `torch-spyre/`. Do not edit `spyre-comms/` here. If the spyre-comms API is
+missing, stop and tell the user it must be exposed in spyre-comms first.
 
 ## Step 0 — Gather facts
 
-Use `AskUserQuestion` only for what you cannot determine from the code:
+Ask the user only about what you cannot determine from the code:
 
 1. Which `_c10d_functional` op is being lowered (check `torch.ops._c10d_functional.<op>`)?
    Note its schema: non-tensor args, in order. They become `constant_args`.
@@ -118,7 +119,7 @@ Add, modelled on the existing allreduce files:
    `config: distributed_tests/test_allreduce.yaml` entries (around line 1212).
 
 Then, if `spyre-comms` mirrors torch-spyre distributed tests, tell the user the new `test_<op>.py`
-should be mirrored there (procedure: `../spyre-comms/.bob/skills/mirror-test-coverage/SKILL.md`).
+should be mirrored there as well.
 
 ## Step 7 — Optional follow-ups (mention, do not do unprompted)
 
