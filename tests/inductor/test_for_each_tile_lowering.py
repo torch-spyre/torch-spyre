@@ -191,12 +191,12 @@ class TestDelinearizeIndex(unittest.TestCase):
     data.
     """
 
-    def _delinearize(self, index, size, stride, offset):
+    def _delinearize(self, index, size, stride, offset, **kwargs):
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _delinearize_index,
         )
 
-        return _delinearize_index(index, size, stride, offset)
+        return _delinearize_index(index, size, stride, offset, **kwargs)
 
     def test_recovers_symbolic_coordinate_per_dim(self):
         import sympy
@@ -297,6 +297,64 @@ class TestDelinearizeIndex(unittest.TestCase):
         d0 = sympy.Symbol("d0")
         with self.assertRaises(AssertionError):
             self._delinearize(4 * d0, size=[4], stride=[8], offset=0)
+
+    def test_symbolic_multiplier_leftover_term_raises(self):
+        """512*s0*d2 is a row coordinate only if s0 is a size, which
+        _delinearize_index cannot tell, so it raises instead of folding
+        8*s0*d2. (s0*d2 itself never folds: with a unit-stride dim .coeff(1)
+        takes it, and without one no stride divides its coefficient 1.)"""
+        import sympy
+
+        d0, d1, d2, s0 = sympy.symbols("d0 d1 d2 s0")
+        with self.assertRaises(AssertionError):
+            self._delinearize(
+                64 * d0 + d1 + 512 * s0 * d2, size=[72, 64], stride=[64, 1], offset=0
+            )
+
+    def test_term_only_an_inner_stride_divides_raises(self):
+        """tile.reshape(4, 2, 64) of a [2, 4, 64] tile reads 128*r + 64*b + c:
+        only the inner stride 64 divides 128*r, and folding it there would
+        give b + 2*r, out of bounds for size 4 once r >= 2."""
+        import sympy
+
+        r, b, c = sympy.symbols("r b c")
+        with self.assertRaises(AssertionError):
+            self._delinearize(
+                128 * r + 64 * b + c, size=[2, 4, 64], stride=[256, 64, 1], offset=0
+            )
+
+    def test_inner_fold_allowed_when_composed_through_own_strides(self):
+        """The same index with fold_into_any_dim: b + 2*r is out of range, but
+        a caller composing through these strides reads the same element."""
+        import sympy
+
+        r, b, c = sympy.symbols("r b c")
+        coords = self._delinearize(
+            128 * r + 64 * b + c,
+            size=[2, 4, 64],
+            stride=[256, 64, 1],
+            offset=0,
+            fold_into_any_dim=True,
+        )
+        self.assertEqual(coords, [sympy.Integer(0), b + 2 * r, c])
+
+    def test_reads_at_own_strides_tells_row_from_column_tiles(self):
+        """A row tile of [4, 4, 64] reads its input at its own strides plus a
+        per-trip offset; a column tile of [256, 128] reads at row stride 128
+        against its own 64."""
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _reads_at_own_strides,
+        )
+
+        d0, d1, d2, u0 = sympy.symbols("d0 d1 d2 u0")
+        row = 256 * d0 + 64 * d1 + d2 + 512 * u0
+        self.assertTrue(
+            _reads_at_own_strides(row, (d0, d1, d2), (2, 4, 64), (256, 64, 1))
+        )
+        column = 128 * d0 + d1 + 64 * u0
+        self.assertFalse(_reads_at_own_strides(column, (d0, d1), (256, 64), (64, 1)))
 
 
 class TestIndirectIndexStepGuard(unittest.TestCase):
@@ -1670,7 +1728,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
     def test_private_in_graph_fill_keeps_single_buffer(self):
         """A compiler-owned in-graph `torch.zeros` fill is not copied."""
@@ -1867,7 +1924,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
             records_by_name = {
                 op.get_name(): record
@@ -5664,7 +5720,6 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             info = op.loop_info
             self.assertEqual(info.loop_group_id, (0,))
             self.assertEqual(info.loop_count, [result.trip_count])
-            self.assertIsNone(info.propagation)
 
     def test_marker_resolved_dim_appears_in_loop_tiled_dims(self):
         """A marker-resolved tile read surfaces in loop_tiled_dims.

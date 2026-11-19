@@ -170,7 +170,7 @@ _MAX_AUTO_TILE_SPLIT_COUNT = 64
 
 # Non-matmul reduction types whose partial results recombine associatively
 # through coarse_tile's identity-fill + per-tile combine + drain path
-# (see coarse_tile._reduction_identity_value / _insert_combine_op).  A
+# (see coarse_tile._reduction_identity_value / _make_combine_buffer).  A
 # reduction whose type is in this set and which has exactly one reduction
 # range is eligible for an automatic reduction-range ("K-style") coarse tile,
 # the same mechanism BMM K already uses.  Intentionally excluded: ``mean``
@@ -359,8 +359,7 @@ def _post_tile_resize_error(
     ``_resize_device_layout`` call, which raises on e.g. a device dim folding
     two host dims. The full buffer the tiles are gathered into needs no check:
     it is not grown back from the tile, it takes the layout planning recorded
-    (``PropagationPlan.full_device_layout`` for a copy-out,
-    ``ReductionPlan.full_output_device_layout`` for an accumulator). A symbolic
+    (for a copy-out the full buffer's layout, for an accumulator the reduction's). A symbolic
     size is read at its compile-time value, which the device layout was built
     from."""
     layout = op.layout

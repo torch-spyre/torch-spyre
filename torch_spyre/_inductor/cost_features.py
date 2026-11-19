@@ -1241,8 +1241,7 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
-    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
-    records.
+    the graph returns.
 
     ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
     "interior write", and unlike the input side an output arg has no naming-convention

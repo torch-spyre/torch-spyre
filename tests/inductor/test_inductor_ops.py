@@ -30,6 +30,11 @@ from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
+from torch_spyre.ops import fft as spyre_fft
+from torch_spyre.ops import fft2 as spyre_fft2
+from torch_spyre.ops import fftn as spyre_fftn
+from torch_spyre.ops import ifft as spyre_ifft
+from torch_spyre.ops import ifftn as spyre_ifftn
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -741,69 +746,21 @@ TO_DTYPE_OP_PARAMS_SETS = {
 }
 
 
-_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, as does int64, which the device stores as
-# int32, so conversions among them have no stick pairs to keep together and are
-# exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [
-    (torch.float32, torch.int32),
-    (torch.int32, torch.float32),
-    (torch.float32, torch.int64),
-    (torch.int64, torch.float32),
-    (torch.int32, torch.int64),
-    (torch.int64, torch.int32),
-]
-
-TO_DTYPE_OP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.float8_e4m3fn  # TO_DTYPE_OP_PARAMS_SETS has no float8 sources
-    if (
-        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
-        or (
-            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-        # Sub-stick guard doesn't apply to fp32<->int32/int64 — all are 32-bit
-        # on device, so there's no width change to trip the fp16-stick boundary.
-        or (
-            src == torch.float32
-            and shape[-1] < 32
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-    )
-]
-
-# Cases the predicate above flags that now pass on every config (base and both LX
-# planning classes). Listing them here, rather than loosening the predicate, keeps
-# the still-failing cases generated from the same rule.
-_TO_DTYPE_OP_NOW_PASSING = {
-    "bfloat16_to_bool_4x68",
-    "bfloat16_to_bool_68",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "float16_to_bfloat16_4x68",
-    "float16_to_bfloat16_68",
-    "float16_to_bool_4x68",
-    "float16_to_bool_68",
-    "float32_to_bool_4x16",
-    "float32_to_bool_4x68",
-    "float32_to_bool_68",
+# After type conversion elements are staggered on device, in DCI path they are restored
+# to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
+# of at most 32 elements is converted to a single fp32 stick, so half of each stick
+# pair has nowhere to go and the EA DCI rejects it instead of reading back wrong
+# data. Wider dims are padded to whole stick pairs (#5048).
+_WHOLE_STICK_PAIRS = "requires whole stick pairs"
+_WHOLE_STICK_PAIRS_SHAPES = ("4x16", "4x32")
+TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in _WHOLE_STICK_PAIRS_SHAPES
 }
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
-]
 
-# The cases in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the host,
-# and the result is wrong on part of its elements. The values on the device are
-# correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a staggered
-# element arrangement, and the device-to-host copy reads it as STANDARD, so the
-# elements come back permuted with no error (#4393); converting the result back on
-# the device restores the input (the round-trip tests).
-_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
-TO_DTYPE_OP_EXPECT_FAIL = {
-    case: _STAGGERED_READBACK for case in TO_DTYPE_OP_EXPECT_FAIL
+TO_DTYPE_OP_EXPECT_RAISE = {
+    **dict.fromkeys(TO_DTYPE_OP_WHOLE_STICK_PAIRS_REJECTED, _WHOLE_STICK_PAIRS),
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -2290,6 +2247,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     1,
                 ),
+                # #5846 reported wrong values here at k=4 while k=1 and k=8 were fine.
+                "3d_k4_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    4,
+                    1,
+                ),
                 "3d_k4_dim0": (
                     unique_randn_along_dim((67, 71, 256), dim=0),
                     4,
@@ -2499,11 +2462,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     1,
                 ),
-            },
-            # The values and the fp16 indices are exact; the fp16 to int64 cast of
-            # the indices is not.
-            "expect_fail": {
-                "2d_k4_dim0": _STAGGERED_READBACK,
             },
             # The cast's fp32 value lacks the second stick of a stick pair, so it
             # reads memory that was never written: the result is wrong on most runs
@@ -3772,11 +3730,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
                 "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
                 "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
-            },
-            # The compare is right on the device, but its staggered result is read
-            # back permuted with no error (#4393).
-            "expect_fail": {
-                "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
@@ -8411,7 +8364,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
+            "expect_raise": TO_DTYPE_OP_EXPECT_RAISE,
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
@@ -13875,11 +13828,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = cached_randn((64,), dtype=torch.float32)
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_host_to_fp32_cpu(self):
         # Literal repro from issue #1482: a host bool converted to fp32 and read
         # back directly, as a staggered float32 like any float16 source's.
@@ -14126,11 +14074,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "fp32toint32", fn, x, dsts=(torch.int32, torch.int64)
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_fp16_src_to_int64_readback_known_xfail(self):
         def fn(x):
             return (x > 2).to(dtype=torch.int64)
@@ -14166,12 +14109,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp32toint32", fn, x.to(src), dsts=(torch.int32, torch.int64)
                 )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_float16_to_int_readback_known_xfail(self):
+    def test_float16_to_int_readback(self):
         def fn(x):
             return x.to(dtype=torch.int32)
 
@@ -14195,12 +14133,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     values = x if dst == torch.float16 else x // 8 * 8
                     self._assert_conversion_on_device("fp32todl16", fn, values.to(src))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_int_to_float16_readback_known_xfail(self):
+    def test_int_to_float16_readback(self):
         def fn(x):
             return x.to(torch.float16)
 
@@ -15025,6 +14958,79 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    def _index_reduce_all_modes(self, dst, dim, index, src):
+        """Compiled and eager index_reduce_ match CPU for every reduce mode.
+
+        amax/amin are exact and prod/mean combine at most a few fp16 values,
+        so 0.01 covers the DL16 rounding of the device result.
+        """
+        for reduce in ("amax", "amin", "prod", "mean"):
+            for include_self in (True, False):
+
+                def fn(d, i, s):
+                    return d.clone().index_reduce_(
+                        dim, i, s, reduce, include_self=include_self
+                    )
+
+                with self.subTest(reduce=reduce, include_self=include_self):
+                    torch._dynamo.reset()
+                    self.compare_with_cpu(fn, dst, index, src, atol=0.01, rtol=0.01)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_2d_dim0(self):
+        """The #4634 repro shape (dim 0 of a 4x8 tensor) with unique indices."""
+        dst = (torch.arange(4 * 8, dtype=torch.float32) / 7.0).reshape(4, 8)
+        src = (torch.arange(3 * 8, dtype=torch.float32) / 3.0).reshape(3, 8)
+        self._index_reduce_all_modes(
+            dst.to(torch.float16),
+            0,
+            torch.tensor([2, 0, 3]),
+            src.to(torch.float16),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_3d_middle_dim(self):
+        """A non-leading, non-stick dim; slot 1 is never hit and keeps self."""
+        self._index_reduce_all_modes(
+            cached_randn((2, 4, 64), abs=True),
+            1,
+            torch.tensor([3, 0, 2]),
+            cached_randn((2, 3, 64), abs=True, differentiation="src"),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_multi_stick_index(self):
+        """K = 70 unique indices span two sticks of the padded index column."""
+        self._index_reduce_all_modes(
+            cached_randn((140, 64), abs=True) + 0.5,
+            0,
+            torch.arange(0, 140, 2),
+            cached_randn((70, 64), abs=True, differentiation="src") + 0.5,
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_inplace_returns_self(self):
+        """Eager index_reduce_ writes into ``self`` and returns that tensor."""
+        dst = cached_randn((4, 64)).to("spyre")
+        src = cached_randn((3, 64), differentiation="src")
+        index = torch.tensor([2, 0, 3])
+        expected = dst.cpu().index_reduce_(0, index, src, "amax")
+        res = dst.index_reduce_(0, index.to("spyre"), src.to("spyre"), "amax")
+        assert res.data_ptr() == dst.data_ptr(), "index_reduce_ did not return self"
+        torch.testing.assert_close(dst.cpu(), expected, atol=0.01, rtol=0.01)
+
+    @expects_raise
+    def test_index_reduce_stick_dim_raises(self):
+        """index_reduce along the stick (last) dim is rejected with Unsupported.
+
+        TODO(#4404): make this a positive test once a stick-dim scatter lowers.
+        """
+        dst = torch.randn(4, 64, dtype=torch.float16, device="spyre")
+        src = torch.randn(4, 3, dtype=torch.float16, device="spyre")
+        index = torch.tensor([1, 5, 1], device="spyre")
+        with pytest.raises(Exception, match="stick \\(last\\) dim"):
+            dst.index_reduce(1, index, src, "amax")
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
@@ -15774,6 +15780,151 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
+
+
+class TestFFT(unittest.TestCase):
+    """DFT via matmul: the fft/ifft host wrappers run a real interleaved
+    ``u @ W`` on device and are checked end-to-end against ``torch.fft``; a few
+    host-only cases check the matrix builder and the device-matrix cache in
+    ``torch_spyre.ops._fft`` directly.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    def test_fft_matches_reference(self):
+        # End-to-end vs torch.fft (validates the interleaved DFT matrix), for
+        # powers of two and a prime. Bounded against the spectrum peak: fp16
+        # cancellation hurts per-element accuracy on near-zero outputs, so the
+        # standard FFT-roundoff measure is relative to peak magnitude. Measured
+        # on device: ~0.2-0.3% at these sizes, up to ~1.7% for a direct
+        # transform at n=32768, and <=0.6% for the four-step path at n=65536; a
+        # wrong transform is >100%. The 2e-2 gate keeps margin over the worst.
+        for n in (64, 97, 256):
+            with self.subTest(n=n):
+                x = torch.randn(3, n, dtype=torch.complex64)
+                ref = torch.fft.fft(x)
+                err = (spyre_fft(x) - ref).abs().max().item()
+                self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_roundtrip(self):
+        x = torch.randn(2, 128, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft2_matches_reference(self):
+        # N-D DFT is separable: fft along each of the last two axes.
+        x = torch.randn(32, 48, dtype=torch.complex64)
+        ref = torch.fft.fft2(x)
+        err = (spyre_fft2(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fftn_matches_reference(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        ref = torch.fft.fftn(x)
+        err = (spyre_fftn(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifftn_roundtrip(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        err = (spyre_ifftn(spyre_fftn(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_fourstep(self):
+        # Above the direct ceiling (32768) a composite length uses the
+        # four-step factorization (two sub-DFTs + twiddle), which also lets a
+        # transform too large for one direct matmul complete.
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_large_roundtrip(self):
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_prime_unsupported(self):
+        # A prime above the ceiling cannot be factored for four-step and
+        # would need an O(n^2) matrix; it is rejected rather than attempted.
+        with self.assertRaisesRegex(NotImplementedError, "prime factor"):
+            spyre_fft(torch.randn(65537, dtype=torch.complex64))
+
+    def test_fft_direct_max_env_forces_fourstep(self):
+        # TORCH_SPYRE_FFT_DIRECT_MAX lowers the direct/four-step boundary, so a
+        # small composite length takes the four-step path and still matches.
+        x = torch.randn(3, 128, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        with mock.patch.dict(os.environ, {"TORCH_SPYRE_FFT_DIRECT_MAX": "64"}):
+            err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_overflow_prescaled(self):
+        # The unnormalized DC term reaches n*|x| and an |x| > 65504 input
+        # overflows the fp16 cast; the host max-abs prescale keeps both in
+        # range, so a large-magnitude signal is finite and still matches.
+        x = torch.randn(2, 128, dtype=torch.complex64) * 1e5
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        self.assertTrue(torch.isfinite(y).all())
+        err = (y - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_per_row_prescale(self):
+        # The prescale is per row, not per tensor: a batch with a large row and
+        # a tiny row (here ~1e-5 apart in magnitude) must not cost the tiny row
+        # precision. Each row is checked against its own spectrum peak.
+        big = torch.randn(256, dtype=torch.complex64)
+        small = torch.randn(256, dtype=torch.complex64) * 1e-5
+        x = torch.stack([big, small])
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        for r in range(x.shape[0]):
+            peak = ref[r].abs().max().item()
+            err = (y[r] - ref[r]).abs().max().item()
+            self.assertLessEqual(err, 2e-2 * peak)
+
+    def test_inverse_matrix_unit_magnitude(self):
+        # The inverse matrix stays unit-magnitude (1/n applied on the host in
+        # fp32, not baked in): baked entries would be ~1/n, subnormal below the
+        # fp16 normal minimum (~6.1e-5) for n>16384. A baked matrix would
+        # already be far below 1 at these small n, so max|W| ~= 1 shows the
+        # 1/n is not in the matrix.
+        from torch_spyre.ops import _fft
+
+        for n in (256, 4096):
+            w = _fft._build_device_dft_matrix(n, inverse=True, device="cpu")
+            self.assertAlmostEqual(w.abs().max().item(), 1.0, places=2)
+
+    def test_w_cache_lru_eviction(self):
+        # _W_CACHE is bounded by total bytes: building distinct lengths past the
+        # budget evicts the least-recently-used entry and stays within budget.
+        from torch_spyre.ops import _fft
+
+        _fft._W_CACHE.clear()
+        budget = 8 * 128 * 128 + 8 * 160 * 160  # room for the two largest
+        with mock.patch.dict(
+            os.environ, {"TORCH_SPYRE_FFT_W_CACHE_BYTES": str(budget)}
+        ):
+            for n in (64, 96, 128, 160):
+                _fft._device_dft_matrix(n, False, "cpu")
+            cached = {k[1] for k in _fft._W_CACHE}
+            total = sum(_fft._entry_bytes(k) for k in _fft._W_CACHE)
+        self.assertLessEqual(total, budget)
+        self.assertNotIn(64, cached)  # least-recently-used, evicted
+        self.assertIn(160, cached)  # most recent, kept
+        _fft._W_CACHE.clear()
+
+    def test_dft_matrix_block_boundary(self):
+        # Row-block assembly must be independent of the block size.
+        from torch_spyre.ops import _fft
+
+        for inv in (False, True):
+            ref = _fft._build_device_dft_matrix(200, inv, "cpu", block=200)
+            small = _fft._build_device_dft_matrix(200, inv, "cpu", block=7)
+            self.assertTrue(torch.equal(ref, small))
+
 
 if __name__ == "__main__":
     unittest.main()
