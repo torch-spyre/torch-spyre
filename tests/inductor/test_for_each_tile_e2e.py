@@ -58,6 +58,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._dynamo.exc import BackendCompilerFailed
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
@@ -170,6 +171,8 @@ from utils_inductor import (
     expects_raise,
     opspec_summaries,
 )
+
+_BACKEND_ERROR = "Cannot find a valid minimum value for data stage"
 
 
 def _with_dynamo_reset(test_fn):
@@ -841,12 +844,13 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
 
     @pytest.mark.xfail(
         strict=True,
-        raises=AssertionError,
+        raises=BackendCompilerFailed,
         reason=(
-            "for_each_tile fails to preserve input EA tag in identity op. The "
-            "output is incorrectly tagged STANDARD (default) when data is "
-            "staggered it causes EA DCI to incorrectly apply / restore EA. "
-            "See issue #6462."
+            f"Fails with backend compiler error '{_BACKEND_ERROR}'. "
+            "Additionally, for_each_tile fails to preserve input EA tag in "
+            "identity op. The output is incorrectly tagged STANDARD (default) "
+            "when data is staggered it causes EA DCI to incorrectly apply / "
+            "restore EA. See issue #6462."
         ),
     )
     def test_upcast_add_in_body_downcast_after_loop(self):
