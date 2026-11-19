@@ -141,6 +141,51 @@ def test_shard_local_reduction_of_rank2_tensor(launched):
 
 
 @requires_emulation
+def test_shard_local_reduction_after_the_shard_dim(launched):
+    """Reducing a dim after the shard dim keeps the shard dim in place.
+
+    Input [3, 4n, 5, 64] is Shard(1); reducing dim 2 leaves [3, 4n, 64]
+    sharded on dim 1 (the shard dim keeps its position — the
+    ``expected = s`` branch of the output-placement check).
+    """
+    n = num_shards()
+    src = _small_ints((3, 4 * n, 5, 64), seed=6)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(2), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert torch.spyre.is_sharded(y)
+    info = torch.spyre.sharding_info(y)
+    assert info.placement == Shard(1) and info.num_shards == n
+    assert tuple(y.shape) == (3, 4 * n, 64)
+    assert torch.equal(y.cpu(), src.sum(2))
+
+
+@requires_emulation
+def test_shard_local_reduction_of_multiple_dims(launched):
+    """Reducing several dims at once, none of them the shard dim.
+
+    Input [3, 4n, 5, 64] is Shard(1); reducing dims 0 and 2 leaves
+    [4n, 64] sharded on dim 0 (the shard dim moves down past one reduced
+    dim — the ``s - sum(r < s)`` branch), and exercises pinning more than
+    one reduction var to split 1.
+    """
+    n = num_shards()
+    src = _small_ints((3, 4 * n, 5, 64), seed=7)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum((0, 2)), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert torch.spyre.is_sharded(y)
+    info = torch.spyre.sharding_info(y)
+    assert info.placement == Shard(0) and info.num_shards == n
+    assert tuple(y.shape) == (4 * n, 64)
+    assert torch.equal(y.cpu(), src.sum((0, 2)))
+
+
+@requires_emulation
 def test_each_core_reduces_only_its_own_shard():
     """Every input shard gets a distinct value, so a core reading another
     core's shard (or writing another core's output shard) shows up."""

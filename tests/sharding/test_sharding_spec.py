@@ -276,6 +276,12 @@ def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
     from device_env import promote_vf_mode_to_emulation
     from torch_spyre._inductor import config as spyre_config
 
+    if not hasattr(torch, "spyre"):
+        pytest.skip(
+            "TORCH_DEVICE_BACKEND_AUTOLOAD=0: torch.spyre is not registered, "
+            "so the runtime-open interplay this test pins cannot exist"
+        )
+
     # The promotion must be a no-op once the runtime is open (the mode is
     # fixed then). Earlier tests in a combined run may have opened it, so
     # pin the state this test reasons about instead of inheriting it.

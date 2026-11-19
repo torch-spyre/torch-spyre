@@ -25,17 +25,38 @@ every log instead of silent.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from device_env import device_available, mode_usable, promote_vf_mode_to_emulation
 from device_suite import DEVICE_MODES, device_coverage_verdict
 
-# Before anything below (or any test module) can load the Flex runtime: a
-# process started in VF mode must run the emulation device instead, so the
-# device tests trigger the emulation code path on a VF-mode host.
-promote_vf_mode_to_emulation()
-
 _GUARD_MARKERS = ("sharding_device", "sharding_device_suite")
+
+_SHARDING_DIR = Path(__file__).resolve().parent
+
+
+def _session_is_sharding_only(config) -> bool:
+    """Whether this pytest session collects nothing outside ``tests/sharding``.
+
+    The VF -> emulation rewrite is only safe when it cannot reach another
+    directory's tests: a session that also collects e.g. ``tests/`` as a
+    whole would run every test in it emulated at 8 cores. Judge by the
+    invocation's paths (``config.args``), resolved against the invocation
+    directory; a bare ``pytest`` collects from the invocation directory
+    itself. Collection has not run yet at configure time, so args are the
+    contract: a session whose args all name files or directories inside
+    ``tests/sharding`` is sharding-only.
+    """
+    inv_dir = Path(config.invocation_params.dir).resolve()
+    paths = [Path(a) for a in config.args] or [inv_dir]
+    for arg in paths:
+        resolved = (inv_dir / arg).resolve() if not arg.is_absolute() else arg.resolve()
+        if resolved != _SHARDING_DIR and _SHARDING_DIR not in resolved.parents:
+            return False
+    return True
+
 
 # Node ids of the guard-marked tests this session collected and executed,
 # per marker (the device tests themselves, and the subprocess wrappers).
@@ -53,6 +74,14 @@ def pytest_configure(config):
             f"{marker}: internal to tests/sharding — tags tests the "
             f"coverage guard counts (see device_suite.py)",
         )
+    # Before collection imports any test module (and so before anything
+    # loads the Flex runtime): a sharding-only session on a VF-mode host
+    # runs the emulation device instead. In a mixed session (e.g.
+    # ``pytest tests/``) the rewrite is skipped — other directories keep
+    # the ambient environment, and the wrapper subprocesses still force
+    # their own shape for the device tests.
+    if _session_is_sharding_only(config):
+        promote_vf_mode_to_emulation()
 
 
 def pytest_collection_modifyitems(items):
@@ -72,7 +101,10 @@ def pytest_deselected(items):
 
 
 def pytest_runtest_logreport(report):
-    if report.when == "call" and report.passed:
+    # Count executions, not passes: a session whose device tests all
+    # failed has real failures to show; the guard's "none executed"
+    # message would only mislead next to them.
+    if report.when == "call" and report.outcome in ("passed", "failed"):
         if report.nodeid in _device_collected:
             _device_executed.add(report.nodeid)
         if report.nodeid in _suite_collected:
@@ -104,13 +136,20 @@ def pytest_sessionfinish(session, exitstatus):
     if hasattr(session.config, "workerinput"):
         return
 
+    # TORCH_DEVICE_BACKEND_AUTOLOAD=0 (a supported mode, see device_env)
+    # leaves torch.spyre unregistered; is_initialized would raise there.
+    try:
+        runtime_open = torch.spyre.is_initialized()
+    except AttributeError:
+        runtime_open = False
+
     verdict, message = device_coverage_verdict(
         device_collected=len(_device_collected),
         device_executed=len(_device_executed),
         suite_collected=len(_suite_collected),
         suite_executed=len(_suite_executed),
         vf_capable=_vf_capable(),
-        runtime_open=torch.spyre.is_initialized(),
+        runtime_open=runtime_open,
         collect_only=session.config.option.collectonly,
     )
     if verdict == "pass":
