@@ -940,6 +940,23 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
     def test_reshape_mul_sum_tiled_whole_operand(self):
         """Wrong-answer form of #6407: a whole operand keeps the reduce axis in
         the kernel, so the bug compiled and read one tile window per step."""
