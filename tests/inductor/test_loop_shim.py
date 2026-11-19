@@ -458,18 +458,11 @@ def test_an_op_in_no_loop_has_no_advance():
         assert kernel._tile_advance(None, True, "arg0_1") is None
 
 
-@pytest.mark.parametrize(
-    "consumer_is_shim, copy_is_shim",
-    [(True, False), (False, True), (True, True)],
-    ids=["shim_consumer", "shim_copy", "both_shim"],
-)
-def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
-    consumer_is_shim, copy_is_shim
-):
-    """Decided: it does not migrate; an op without a complete loop-address record
-    keeps its copy, and says so, not crashes. It tests the consumer and the copy
-    separately and returns the same reason for both, so each combination is run:
-    a test with both shim could not tell which check declined."""
+def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
+    """Decided: it does not migrate; only a ``for_each_tile`` consumer (a
+    ``CoarseTileInfo``) has a saved direct form, so a shim consumer keeps its copy,
+    and says so, not crashes."""
+    consumer_is_shim, copy_is_shim = True, False
     _, legacy = _equal_infos()
     other = _dep("other", d0)
     cp = _dep("cp", d0 + d1)
@@ -499,8 +492,6 @@ def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
         consumer_name="c",
         source_name="src",
         copy_name="cp",
-        direct_tiled_dims_per_level=None,
-        direct_squeezed_advance_per_level=None,
     )
     with mock.patch.object(
         read_copy_elision, "_clone_direct_consumer", lambda *a: direct
@@ -509,4 +500,4 @@ def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
             consumer, copy_op, record
         )
     assert built is None
-    assert reason == "copy has no complete loop-address record"
+    assert reason == "copy reads its source more than once, or consumer is not looped"

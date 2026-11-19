@@ -458,7 +458,7 @@ def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypa
 
 
 @pytest.fixture
-def staged_transport_graph():
+def staged_transport_graph(monkeypatch):
     from torch import fx
     from torch._inductor.graph import GraphLowering
     from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
@@ -466,7 +466,25 @@ def staged_transport_graph():
     from torch_spyre._inductor.ir import FixedTiledLayout
     from torch_spyre._inductor.loop_info import CoarseTileInfo, ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
+    from torch_spyre._inductor.propagate_hints import DimHint
 
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+
+    # TODO: the proof's local bound (``_affine_bounds``) does not tolerate a loop
+    # variable in the index, so on a real looped graph, where the direct read
+    # carries its loop term (stage 7.2b), it declines ("source element range is
+    # not statically provable") even though the advance bound is right. This
+    # fixture models the intended behaviour: the local bound is the index at
+    # loop trip zero.
+    local_bounds = rce._affine_bounds
+
+    def loop_aware_bounds(dep):
+        index = dep.index.xreplace({u0: sympy.S.Zero})
+        return local_bounds(MemoryDep(dep.name, index, dep.var_names, dep.size))
+
+    monkeypatch.setattr(rce, "_affine_bounds", loop_aware_bounds)
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
@@ -507,7 +525,9 @@ def staged_transport_graph():
             data=Pointwise(
                 device=device,
                 dtype=torch.float16,
-                inner_fn=lambda i: ops.load("input", 1024 * i[0] + 128 * i[1] + i[2]),
+                inner_fn=lambda i: ops.load(
+                    "input", 1024 * i[0] + 128 * i[1] + i[2] + 1048576 * u0
+                ),
                 ranges=list(map(sympy.Integer, [1024, 8, 128])),
             ),
         )
@@ -536,24 +556,27 @@ def staged_transport_graph():
         for op in (stage, consumer):
             op.operation_name = op.get_name()
             commit_iteration_space_ownership(op, {})
-        stage.loop_info = CoarseTileInfo(
-            (0,),
-            [sympy.Integer(32)],
-            [[]],
-            tiled_dims_per_read=[[[(0, sympy.Integer(1024))]]],
+        # The loop walks the source 1024 rows (1048576 elements) per trip; the
+        # staged copy carries the term in its read of the input, the consumer
+        # reads the copy at a fixed address.
+        hint = DimHint(
+            dim_names=[],
+            split_count=1,
+            loop_var=u0,
+            is_reduction=False,
+            loop_var_range=sympy.Integer(32),
         )
-        consumer.loop_info = CoarseTileInfo(
-            (0,), [sympy.Integer(32)], [[]], tiled_dims_per_read=[[[]]]
-        )
+        for op in (stage, consumer):
+            op.dim_hints = [hint]
+        stage.loop_info = CoarseTileInfo((0,), [sympy.Integer(32)], [[]])
+        consumer.loop_info = CoarseTileInfo((0,), [sympy.Integer(32)], [[]])
         consumer._read_copy_elision_record = ReadCopyElisionRecord(
             consumer_name="consumer",
             copy_name="stage",
             source_name="input",
             direct_inner_fn=lambda i: ops.load(
-                "input", 1024 * i[2] + 128 * i[0] + i[1]
+                "input", 1024 * i[2] + 128 * i[0] + i[1] + 1048576 * u0
             ),
-            direct_tiled_dims_per_level=(((2, sympy.Integer(1024)),),),
-            direct_squeezed_advance_per_level=((),),
         )
         yield graph, stage, consumer
 

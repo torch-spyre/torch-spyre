@@ -653,7 +653,6 @@ def _looped_matmul_features(
     it_space,
     work_slices=None,
     ranges=None,
-    output_tiled_dims=None,
 ):
     """``extract_op_features`` on a batch-matmul body op inside a loop nest."""
     from torch_spyre._inductor.constants import BATCH_MATMUL_OP
@@ -667,8 +666,6 @@ def _looped_matmul_features(
     op.get_size = lambda: list(size)
     if tiled_red is not None:
         op.loop_info.loop_tiled_reduction_dims = [list(lv) for lv in tiled_red]
-    if output_tiled_dims is not None:
-        op.loop_info.output_tiled_dims = output_tiled_dims
     monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _op: it_space)
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: None)
     with V.set_graph_handler(_StubGraph()):
@@ -1164,7 +1161,7 @@ def test_a_read_walked_only_by_the_levels_tiled_dim_is_a_coarse_loop_read(
 # menu and the default params.
 
 
-def _row_tiled_expert_matmul(read_stamps):
+def _row_tiled_expert_matmul():
     """One expert per trip of an 8-trip loop that also tiles the output rows ``d0``.
 
     ``arg0`` is the activation tile; its index carries ``d0`` and ``u0``.
@@ -1184,13 +1181,9 @@ def _row_tiled_expert_matmul(read_stamps):
         ),
     )
     op.get_size = lambda: [64, 64]
-    op.loop_info.tiled_dims_per_read = read_stamps
-    op.loop_info.squeezed_advance_per_read = []
     return op
 
 
-_ADVANCES = [[(0, sympy.Integer(64))]]  # one level, advancing
-_PINNED = [[]]  # one level, the explicit "pinned" verdict
 _IT_SPACE = {d0: 64, d1: 64, d2: 64}
 _MENU = [{d0: 2, d1: 4}, {d1: 8}]  # 8 cores: the delivery estimate is nonzero
 
@@ -1239,9 +1232,7 @@ def test_the_allocator_prices_loop_delivery_only_for_reads_the_loop_variable_wal
 ):
     """Both reads advance by the lowering's stamps: both are walked once and both
     get the allocator's loop-delivery estimate."""
-    walked = _allocator_features(
-        monkeypatch, _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
-    )
+    walked = _allocator_features(monkeypatch, _row_tiled_expert_matmul())
     flags = {
         a.name: (a.advances_with_loop_var, a.loop_factor, a.has_partitioning_candidate)
         for a in walked.args
@@ -1258,7 +1249,7 @@ def test_the_report_omits_the_loop_delivery_estimate(monkeypatch):
     does."""
     from torch_spyre._inductor.cost_model import CostParams
 
-    op = _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
+    op = _row_tiled_expert_matmul()
     report = _features(monkeypatch, op, _IT_SPACE)
     assert [a.advances_with_loop_var for a in report.args if a.role == "input"] == [
         True,
@@ -1541,13 +1532,16 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
     assert (priced[0] > 0) == ("arg1" not in declined)
 
 
-def test_a_stamped_coarse_loop_read_keeps_loop_delivery_disabled(monkeypatch):
-    """Complete coarse-loop stamps affect traffic, without enabling loop delivery.
+def test_a_coarse_loop_read_without_a_paired_variable_keeps_loop_delivery_disabled(
+    monkeypatch,
+):
+    """A coarse loop affects traffic (the read is walked by the level's tiled dim),
+    without enabling loop delivery.
 
     The allocator has a legal partitioning menu, but no paired for_each_tile
-    variable. Applying #4995's stamp-precedence fix must keep that distinction.
+    variable, so no read advances with a loop variable.
     """
-    op = _row_tiled_expert_matmul([_ADVANCES, _PINNED])
+    op = _row_tiled_expert_matmul()
     op.dim_hints = []
     feature = _allocator_features(monkeypatch, op)
     read = _read(feature, "arg0")

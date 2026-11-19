@@ -712,9 +712,9 @@ class SpyreKernel(Kernel[CSEVariable]):
     def _host_dim_to_index_symbol(ir_node: Any, dim: int) -> sympy.Symbol:
         """Map a host-range positional dim index to its dep.index d{i} symbol.
 
-        CoarseTileInfo.tiled_dims_per_read/output_tiled_dims store *host-range*
-        positional indices (indices into op.data.ranges, or
-        n_output_dims + reduction_pos for reduction dims -- see loop_info.py).
+        A host-range positional index is an index into op.data.ranges, or
+        n_output_dims + reduction_pos for a reduction dim (``loop_tiled_dims`` /
+        ``loop_tiled_reduction_dims`` hold these, in two lists).
         But dep.index's own free symbols are minted by Inductor's
         extract_read_writes -> index_vars_squeeze, which -- via
         SqueezeView.squeezer -- drops unit-size (==1) dims from op.data.ranges/
