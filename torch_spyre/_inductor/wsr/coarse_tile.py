@@ -66,6 +66,7 @@ from torch_spyre._C import SpyreTensorLayout
 
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..loop_node import move_before
 from ..pass_utils import (
     op_out_coords,
     identify_matmul_inputs,
@@ -904,15 +905,15 @@ def _allocate_full_buffer(
     full_ranges: list[Expr],
     full_strides: tuple[Expr, ...],
     operations: list[Operation],
-    insert_at_idx: int,
+    before: Operation,
     device_layout: SpyreTensorLayout | None = None,
 ) -> ComputedBuffer:
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
     Creates a spyre.empty FX node, lowers it via V.graph.run_node(), assigns
     a layout matching tiled_op's layout type (FixedLayout pre-stickify,
-    FixedTiledLayout post-stickify), splices it into operations at
-    insert_at_idx, and returns the new ComputedBuffer.
+    FixedTiledLayout post-stickify), splices it into operations
+    immediately before ``before``, and returns the new ComputedBuffer.
 
     ``device_layout`` is the buffer's device layout, required post-stickify:
     the one planning recorded for a full buffer
@@ -1001,9 +1002,8 @@ def _allocate_full_buffer(
         )
     full_buf.layout = layout
 
-    # Splice into operations at the correct position.
-    operations.remove(full_buf)
-    operations.insert(insert_at_idx, full_buf)
+    # Splice in immediately before ``before``; the lowering appended it at the end.
+    move_before(operations, before, full_buf)
 
     return full_buf
 
