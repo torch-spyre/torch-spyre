@@ -8365,7 +8365,7 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
                 [Integer(s) for s in size],
                 tuple(Integer(s) for s in FlexibleLayout.contiguous_strides(size)),
                 operations,
-                0,
+                op,
             )
         self.assertEqual((len(operations), len(V.graph.graph.nodes)), before)
 

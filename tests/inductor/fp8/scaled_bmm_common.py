@@ -571,6 +571,15 @@ _KNOWN_FAILURES = [
     ),
     _KnownFailure(
         "test_shapes",
+        r"4d_global_prefill_qk_1x16x24x512x24-cores3",
+        AssertionError,
+        _OUTSIDE_BOUND,
+        "Unstable: #6527: [fp8] scaled_bmm: 4D global-prefill QKᵀ at 3 cores "
+        "intermittently returns wrong values (fails in CI, passes locally)",
+        strict=False,
+    ),
+    _KnownFailure(
+        "test_shapes",
         r"3d_moe_bmm_as_captured_(8|96)x2816x704x1-cores\d+",
         InductorError,
         _NO_STICK_MECHANISM,
