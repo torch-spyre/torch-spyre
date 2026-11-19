@@ -15,8 +15,10 @@
 """CPU tests of the forked inner-compile helper (no device needed)."""
 
 import os
+import pickle
 import subprocess
 import time
+import types
 
 import pytest
 import torch
@@ -161,3 +163,152 @@ def test_second_pass_check_reports_hits_and_misses(monkeypatch):
         counters["inductor"]["fxgraph_cache_miss"] += 1
     assert (check.hits, check.misses) == (1, 1)
     assert len(warnings) == 1
+
+
+def _graph_with_outputs(*specs):
+    """A GraphModule whose output node carries fake metadata like Inductor's."""
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    outs = []
+    for spec in specs:
+        if spec is None:
+            outs.append(0)  # a constant output, passed through as is
+            continue
+        shape, dtype = spec
+        node = g.call_function(torch.ops.aten.mul.Tensor, (x, 2))
+        node.meta["val"] = torch.empty(shape, dtype=dtype)  # a fake tensor in Inductor
+        outs.append(node)
+    g.output(tuple(outs))
+    return torch.fx.GraphModule(torch.nn.Module(), g)
+
+
+def test_placeholders_follow_the_output_metadata_when_a_child_reports_nothing(
+    monkeypatch, tmp_path
+):
+    parent = os.getpid()
+
+    def fake_inner(gm, example_inputs, **kwargs):
+        assert os.getpid() != parent
+        (tmp_path / str(len(gm.graph.output_node().args[0]))).write_text("")
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", fake_inner)
+    gm = _graph_with_outputs(((2, 3), torch.float16), None, ((4,), torch.int64))
+    with pp.fork_inner_compiles(2, placeholders=True) as pool:
+        assert pool.submitted == 0
+        stand_in = spyre_inductor._spyre_inner_compile(gm, [torch.empty(1)])
+        assert pool.submitted == 1
+        out = stand_in([torch.empty(1)])
+        assert [getattr(o, "shape", o) for o in out] == [(2, 3), 0, (4,)]
+        assert [getattr(o, "dtype", None) for o in out] == [
+            torch.float16,
+            None,
+            torch.int64,
+        ]
+        assert out[0].device.type == "cpu" and not out[0].any()
+        # The same graph passed by keyword is read the same way.
+        stand_in = spyre_inductor._spyre_inner_compile(gm=gm, example_inputs=[])
+        assert stand_in([])[2].shape == (4,)
+    assert (pool.submitted, pool.ok, pool.failed) == (2, 2, 0)
+    assert not pool.reports  # every report pipe is closed
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["3"]
+    with pytest.raises(RuntimeError, match="reset_code"):
+        stand_in([])
+
+
+def test_placeholders_take_the_layouts_the_child_reports(monkeypatch):
+    def fake_inner(gm, example_inputs):
+        time.sleep(0.2)  # the parent waits for the report, not for the exit
+        pp._report_outputs(
+            [
+                ("new", [2, 3], [1, 2], 0, torch.float32, "cpu", None),
+                None,
+                ("alias", 0, [2], [2], 1),
+            ]
+        )
+        time.sleep(0.5)
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", fake_inner)
+    gm = _graph_with_outputs(((2, 3), torch.float16), None, ((2,), torch.float32))
+    x = torch.arange(6.0)
+    with pp.fork_inner_compiles(1, placeholders=True) as pool:
+        stand_in = spyre_inductor._spyre_inner_compile(gm, [x])
+        t0 = time.time()
+        out = stand_in([x])
+        assert time.time() - t0 < 0.45  # returned before the child exited
+        assert pool.running  # the child is still compiling
+        assert out[0].shape == (2, 3) and out[0].stride() == (1, 2)
+        assert out[0].dtype == torch.float32 and not out[0].any()
+        assert out[1] == 0
+        assert torch.equal(out[2], x[1:5:2]) and out[2].data_ptr() == x[1:].data_ptr()
+        # A second run of the same stand-in reuses the report.
+        assert stand_in([x])[2].stride() == (2,)
+    assert (pool.ok, pool.failed) == (1, 0)
+
+
+def test_a_single_tensor_output_is_still_a_list(monkeypatch):
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", lambda gm, inputs: None)
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    node = g.call_function(torch.ops.aten.neg.default, (x,))
+    node.meta["val"] = torch.empty(5)
+    g.output(node)
+    gm = torch.fx.GraphModule(torch.nn.Module(), g)
+    with pp.fork_inner_compiles(1, placeholders=True):
+        out = spyre_inductor._spyre_inner_compile(gm, [])([])
+    assert len(out) == 1 and out[0].shape == (5,)
+
+
+def test_output_specs_tell_fresh_buffers_from_views_of_inputs():
+    from torch._inductor import ir
+    from torch._inductor.graph import GraphLowering
+    from torch._inductor.virtualized import V
+
+    cpu = torch.device("cpu")
+    arg = ir.InputBuffer(
+        name="arg0_1", layout=ir.FixedLayout(cpu, torch.float32, [6], [1])
+    )
+    view = ir.ReinterpretView(
+        data=ir.StorageBox(arg),
+        layout=ir.FixedLayout(cpu, torch.float32, [2], [2], offset=1),
+    )
+    buf = ir.Buffer(
+        name="buf0", layout=ir.FixedLayout(cpu, torch.float16, [2, 3], [1, 2])
+    )
+    graph = types.SimpleNamespace(
+        graph_input_names=["arg0_1"],
+        graph_outputs=[ir.TensorBox(ir.StorageBox(buf)), 7, ir.TensorBox(view)],
+    )
+    specs = pp._output_specs(graph)
+    assert specs == [
+        ("new", [2, 3], [1, 2], 0, torch.float16, "cpu", None),
+        None,
+        ("alias", 0, [2], [2], 1),
+    ]
+    del GraphLowering, V
+
+
+def test_without_placeholders_nothing_changes(monkeypatch):
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", lambda *a, **k: None)
+    with pp.fork_inner_compiles(1) as pool:
+        stand_in = spyre_inductor._spyre_inner_compile(
+            _graph_with_outputs(((1,), torch.float32)), []
+        )
+        with pytest.raises(pp.CompileOnlyAbort):
+            stand_in([])
+    assert pool.submitted == 1 and not pool.reports
+
+
+def test_the_report_pass_sends_the_specs_once_and_only_in_a_child(monkeypatch):
+    graph = types.SimpleNamespace(graph_input_names=[], graph_outputs=[3])
+    # Not a child: nothing to send, and the graph is left alone.
+    pp.report_output_layouts(graph)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(pp, "_report_fd", write_fd)
+    pp.report_output_layouts(types.SimpleNamespace(parent=object()))  # a subgraph
+    assert pp._report_fd == write_fd
+    pp.report_output_layouts(graph)
+    assert pp._report_fd is None and pp._reported == [None]
+    pp.report_output_layouts(graph)  # a second top-level codegen reports nothing more
+    assert pickle.loads(os.read(read_fd, 1 << 16)) == [None]
+    assert os.read(read_fd, 1) == b""  # the write end is closed
+    os.close(read_fd)

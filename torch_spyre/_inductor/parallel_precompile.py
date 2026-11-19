@@ -28,6 +28,17 @@ fails only costs time, because the second run compiles whatever is missing.
 ``SecondPassCheck`` around that second run logs a warning with the numbers when
 any compile missed the FX graph cache, so a lost speedup does not go unnoticed.
 
+With ``placeholders=True`` the stand-in returns placeholder tensors instead of
+raising, so a caller that traces a whole forward (a model warm-up bucket) gets past
+the first graph and submits every graph of that forward. The FX graph cache key
+holds each input's device layout and storage offset, so a placeholder must carry
+the layout the real output will have: the child reports its graph's output layouts
+through a pipe as soon as the pre-scheduling passes have fixed them, before LX
+planning (most of a compile's time) and the dbo-opt backend, and the stand-in waits
+for that report before it allocates. A child that reports nothing (its compile hit
+the cache, or failed) gets default-layout zeros, and the graphs downstream of it
+compile again in the second run.
+
 What a child may use: the compile itself (Python, the Inductor and Spyre lowering
 code, CP-SAT, and dbo-opt as a subprocess). What it may not use: the device. Every
 Python entry point of the Spyre runtime (start, allocation, copies, fills, streams,
@@ -44,9 +55,13 @@ process tree grew from 16.9 GB to 25.1 GB (about 1 GB per child).
 
 import contextlib
 import os
+import pickle
+import select
 import signal
 import time
 from typing import Any, Callable, Optional
+
+import torch
 
 from .logging_utils import get_inductor_logger
 
@@ -58,20 +73,204 @@ class CompileOnlyAbort(Exception):
 
 
 class _StandIn:
-    """The graph this process gets back for a compile that runs in a child."""
+    """The graph this process gets back for a compile that runs in a child.
+
+    ``outputs`` is the graph's output metadata (fake tensors and constants) when the
+    pool hands out placeholders, and ``pid`` the child whose output-layout report
+    the first call waits for.
+    """
 
     _boxed_call = True
 
-    def __init__(self, pool: "_Pool") -> None:
+    def __init__(
+        self, pool: "_Pool", outputs: Optional[list] = None, pid: Optional[int] = None
+    ) -> None:
         self._pool = pool
+        self._outputs = outputs
+        self._pid = pid
+        self._specs: Optional[list] = None
 
     def __call__(self, args: list) -> Any:
-        if self._pool.open:
+        if not self._pool.open:
+            raise RuntimeError(
+                "parallel precompile: a stand-in graph ran after the precompile; "
+                "reset its frame with torch._dynamo.reset_code"
+            )
+        if self._outputs is None:
             raise CompileOnlyAbort()
-        raise RuntimeError(
-            "parallel precompile: a stand-in graph ran after the precompile; "
-            "reset its frame with torch._dynamo.reset_code"
+        if self._pid is not None:
+            self._specs = self._pool.report(self._pid)
+            self._pid = None
+        return [
+            _placeholder(meta, self._specs[i] if self._specs else None, args)
+            if isinstance(meta, torch.Tensor)
+            else meta
+            for i, meta in enumerate(self._outputs)
+        ]
+
+
+def _output_metadata(gm: Any) -> list:
+    """The fake tensors (or constants) the graph returns, from its output node."""
+    outputs = gm.graph.output_node().args[0]
+    if not isinstance(outputs, (tuple, list)):
+        outputs = [outputs]
+    found = []
+    for out in outputs:
+        if isinstance(out, torch.fx.Node):
+            val = out.meta.get("val")
+            found.append(val if isinstance(val, torch.Tensor) else None)
+        else:
+            found.append(out)
+    return found
+
+
+def _placeholder(meta: torch.Tensor, spec: Optional[tuple], args: list) -> torch.Tensor:
+    """A tensor with the metadata of a graph output, from the child's spec if any.
+
+    A spec is ``("alias", input_index, size, stride, offset)`` for an output that
+    is a view of a graph input, or ``("new", size, stride, offset, dtype, device,
+    layout_repr)`` for a buffer the graph allocates, where ``layout_repr`` is the
+    ``SpyreTensorLayout`` as the generated wrapper spells it (None off the device).
+    """
+    if spec is not None and spec[0] == "alias":
+        _, index, size, stride, offset = spec
+        base = args[index]
+        layout = (
+            base.device_tensor_layout()
+            if hasattr(base, "device_tensor_layout")
+            else None
         )
+        if layout is not None:
+            from torch_spyre._C import as_strided_with_layout
+
+            return as_strided_with_layout(
+                base, tuple(size), tuple(stride), offset, layout
+            )
+        return torch.as_strided(base, size, stride, offset)
+    if spec is not None and spec[0] == "new":
+        _, size, stride, _offset, dtype, device, layout_repr = spec
+        device = torch.device(device)
+        if layout_repr is not None:
+            from torch_spyre._C import fill_tensor, spyre_empty_with_layout
+            from torch_spyre._inductor.wrapper import spec_eval_namespace
+
+            layout = eval(layout_repr, spec_eval_namespace())  # noqa: S307 - our own repr
+            out = spyre_empty_with_layout(
+                tuple(size), tuple(stride), dtype, layout, device=device
+            )
+            fill_tensor(out, 0.0)
+            return out
+        return torch.empty_strided(size, stride, dtype=dtype, device=device).zero_()
+    return torch.zeros(
+        tuple(int(d) for d in meta.shape), dtype=meta.dtype, device=meta.device
+    )
+
+
+def _output_specs(graph: Any) -> list:
+    """The specs of a lowered graph's outputs (see ``_placeholder``), after codegen."""
+    from torch._inductor import ir
+
+    specs: list = []
+    for out in graph.graph_outputs:
+        if not isinstance(out, ir.IRNode):
+            specs.append(None)
+            continue
+        node = out
+        while isinstance(node, ir.MutableBox):
+            node = node.data
+        try:
+            layout = node.get_layout()
+            size = [int(s) for s in layout.size]
+            stride = [int(s) for s in layout.stride]
+            offset = int(layout.offset)
+        except Exception:  # noqa: BLE001 - symbolic or layout-less output: no spec
+            specs.append(None)
+            continue
+        base = node.data if isinstance(node, ir.ReinterpretView) else None
+        while isinstance(base, ir.MutableBox):
+            base = base.data
+        if (
+            isinstance(base, ir.InputBuffer)
+            and base.get_name() in graph.graph_input_names
+        ):
+            index = graph.graph_input_names.index(base.get_name())
+            specs.append(("alias", index, size, stride, offset))
+            continue
+        device_layout = getattr(layout, "device_layout", None)
+        specs.append(
+            (
+                "new",
+                size,
+                stride,
+                offset,
+                layout.dtype,
+                str(layout.device),
+                repr(device_layout) if device_layout is not None else None,
+            )
+        )
+    return specs
+
+
+_report_fd: Optional[int] = None  # in a child: the pipe its output specs go to
+_reported: Optional[list] = None  # in a child: the specs it sent
+
+
+def _report_outputs(specs: Optional[list]) -> None:
+    """Child: send the graph's output specs to the parent, once, and close the pipe."""
+    global _report_fd, _reported
+    if _report_fd is None:
+        return
+    fd, _report_fd = _report_fd, None
+    _reported = specs
+    try:
+        data = pickle.dumps(specs)
+        while data:
+            data = data[os.write(fd, data) :]
+    finally:
+        os.close(fd)
+
+
+def report_output_layouts(graph: Any) -> None:
+    """Pre-scheduling pass: in a forked compile child, send the top-level graph's
+    output specs to the parent. A no-op in every other process."""
+    if _report_fd is None or getattr(graph, "parent", None) is not None:
+        return
+    try:
+        _report_outputs(_output_specs(graph))
+    except Exception:  # noqa: BLE001 - the parent falls back to default layouts
+        logger.warning(
+            "parallel precompile: could not report the output layouts", exc_info=True
+        )
+        _report_outputs(None)
+
+
+def _install_output_report() -> None:
+    """Child: after codegen, report the output specs if no pass did, and warn if
+    they no longer match what was reported (the second run then misses the cache)."""
+    from torch._inductor.graph import GraphLowering
+
+    original = GraphLowering.codegen
+
+    def codegen(self: Any) -> Any:
+        result = original(self)
+        if getattr(self, "parent", None) is None:
+            if _report_fd is not None:
+                report_output_layouts(self)
+            elif _reported is not None:
+                try:
+                    final = _output_specs(self)
+                except Exception:  # noqa: BLE001 - a check only
+                    final = None
+                if final != _reported:
+                    logger.warning(
+                        "parallel precompile: the output layouts changed after the "
+                        "report: reported %s, final %s",
+                        _reported,
+                        final,
+                    )
+        return result
+
+    GraphLowering.codegen = codegen
 
 
 # The ``torch_spyre._C`` functions that reach the runtime or the device.
@@ -121,8 +320,10 @@ class _Pool:
         self.timeout_s = timeout_s
         self.open = True
         self.running: dict[int, float] = {}  # pid -> start time
+        self.reports: dict[int, int] = {}  # pid -> read end of its report pipe
         self.ok = 0
         self.failed = 0
+        self.submitted = 0
 
     @staticmethod
     def _kill(pid: int) -> None:
@@ -149,14 +350,28 @@ class _Pool:
                     self.failed += 1
         return finished
 
-    def submit(self, compile_fn: Callable[[], Any]) -> None:
+    def submit(self, compile_fn: Callable[[], Any], report: bool = False) -> int:
+        """Fork a child for ``compile_fn``; returns its pid.
+
+        With ``report`` the child gets a pipe to send its graph's output specs
+        through (see ``report``).
+        """
         while len(self.running) >= self.workers:
             if not self._reap():
                 time.sleep(0.02)
+        self.submitted += 1
+        read_fd = write_fd = -1
+        if report:
+            read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:  # child: compile, then exit without returning to the caller
             code = 1
             try:
+                if report:
+                    global _report_fd
+                    os.close(read_fd)
+                    _report_fd = write_fd
+                    _install_output_report()
                 _child_setup()
                 compile_fn()
                 code = 0
@@ -165,11 +380,45 @@ class _Pool:
             finally:
                 os._exit(code)
         self.running[pid] = time.time()
+        if report:
+            os.close(write_fd)
+            self.reports[pid] = read_fd
+        return pid
+
+    def report(self, pid: int) -> Optional[list]:
+        """Wait for the child's output specs; None if it exited without reporting."""
+        fd = self.reports.pop(pid, None)
+        if fd is None:
+            return None
+        chunks: list[bytes] = []
+        try:
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if ready:
+                    chunk = os.read(fd, 1 << 16)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    continue
+                self._reap()
+                if pid in self.running:
+                    continue
+                if not select.select([fd], [], [], 0)[0]:
+                    break  # the child is gone and left nothing to read
+        finally:
+            os.close(fd)
+        if not chunks:
+            logger.info("parallel precompile: child %d reported no output layouts", pid)
+            return None
+        return pickle.loads(b"".join(chunks))
 
     def wait(self) -> None:
         while self.running:
             if not self._reap():
                 time.sleep(0.05)
+        for fd in self.reports.values():
+            os.close(fd)
+        self.reports.clear()
 
     def kill_all(self) -> None:
         for pid in list(self.running):
@@ -178,11 +427,15 @@ class _Pool:
 
 
 @contextlib.contextmanager
-def fork_inner_compiles(workers: int, timeout_s: float = 300.0):
+def fork_inner_compiles(
+    workers: int, timeout_s: float = 300.0, placeholders: bool = False
+):
     """Run each Spyre inner compile in a forked child, at most ``workers`` at once.
 
     Yields the pool. Leaving the block waits for every child, or kills them all if
-    the block raised.
+    the block raised. With ``placeholders`` the stand-ins return zero tensors in
+    the layouts the children report instead of raising, so a traced forward runs
+    to its end.
     """
     import torch_spyre._inductor as spyre_inductor
 
@@ -190,8 +443,13 @@ def fork_inner_compiles(workers: int, timeout_s: float = 300.0):
     pool = _Pool(max(1, workers), timeout_s)
 
     def inner_compile(*args: Any, **kwargs: Any) -> _StandIn:
-        pool.submit(lambda: original(*args, **kwargs))
-        return _StandIn(pool)
+        if not placeholders:
+            pool.submit(lambda: original(*args, **kwargs))
+            return _StandIn(pool)
+        gm = kwargs.get("gm", args[0] if args else None)
+        outputs = _output_metadata(gm)
+        pid = pool.submit(lambda: original(*args, **kwargs), report=True)
+        return _StandIn(pool, outputs, pid)
 
     started = time.time()
     spyre_inductor._spyre_inner_compile = inner_compile
