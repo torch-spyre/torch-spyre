@@ -47,6 +47,7 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
+from torch_spyre._inductor.loop_node import move_after, move_before, top_level_entry
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
 # In-place collectives whose codegen reads exactly one tensor operand,
@@ -330,7 +331,42 @@ class GraphEditor:
                         f"unexpected buffer user type {type(consumer)} ({consumer})"
                     )
 
-        self.lowering.operations.remove(new_com_buf)
+        self._place_clone(
+            new_com_buf,
+            buf_name,
+            input=input,
+            lower_anchor=lower_anchor,
+            lower_before=lower_before,
+            first_user=first_user,
+        )
+        return new_com_buf
+
+    def _place_clone(
+        self,
+        new_com_buf: ComputedBuffer,
+        buf_name: str,
+        *,
+        input: bool,
+        lower_anchor: Operation | None,
+        lower_before: Operation | None,
+        first_user: Operation | None,
+    ) -> None:
+        """Put the freshly lowered clone (appended at the top level) in its place.
+
+        * a drain (``lower_anchor``, or an output clone's last writer) runs once,
+          after the whole loop that holds its anchor, so it goes right after the
+          outermost loop entry of the anchor (the anchor itself when it is not in a
+          loop);
+        * a hoisted input clone (``lower_before``) runs once, before the loop its
+          consumers run in, so it goes right before that outermost entry;
+        * any other clone goes right before its first consumer, in that
+          consumer's list: it runs every trip when the consumer is in a loop body.
+
+        The anchors are Operation objects, not saved indexes: earlier clones in the
+        same push only insert before or after existing entries, so the identity
+        survives and a stale index cannot.
+        """
+        operations = self.lowering.operations
         if lower_anchor is None and not input:
             # An output clone copies the buffer's final value, so it runs right
             # after the last op that writes it: the producer, or a later
@@ -339,23 +375,16 @@ class GraphEditor:
             # user" would put the clone ahead of the producer it copies.
             lower_anchor = self._last_writer(buf_name)
         if lower_anchor is not None:
-            # Post-loop drain: insert after the loop's last member (an
-            # Operation object, not a saved index -- earlier clones in the same
-            # push only insert before/after existing ops, so the identity
-            # survives and a stale index cannot).
-            self.lowering.operations.insert(
-                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            move_after(
+                operations, top_level_entry(operations, lower_anchor), new_com_buf
+            )
+        elif lower_before is not None:
+            move_before(
+                operations, top_level_entry(operations, lower_before), new_com_buf
             )
         else:
-            # A hoisted input clone goes before its consumers' loop entry; any
-            # other clone goes before its first consumer, as before.
-            before = lower_before if lower_before is not None else first_user
-            assert before is not None, "a clone with no consumers needs an anchor"
-            self.lowering.operations.insert(
-                self.lowering.operations.index(before), new_com_buf
-            )
-
-        return new_com_buf
+            assert first_user is not None, "a clone with no consumers needs an anchor"
+            move_before(operations, first_user, new_com_buf)
 
     def _last_writer(self, buf_name: str) -> Operation:
         """The last op in the lowered order that writes ``buf_name``: its

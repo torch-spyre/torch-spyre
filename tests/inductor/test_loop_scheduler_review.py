@@ -281,12 +281,13 @@ def test_lx_local_read_contract_with_a_loop_in_the_graph(monkeypatch):
 
 def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     """The LX allocator hoists an input clone "before its consumers' loop
-    entry" (``push_allocation_with_clone``) by inserting it at the flat
-    position of the loop's first member; through ``OpsView`` that is inside
-    the LoopNode's body, and the clone carries no ``loop_info``.  The flat
-    path rebuilt loops from ``loop_info`` and ran it once, before the loop;
-    the flow-through ran it every trip (and, before the member check, did so
-    silently).  ``peel_non_members`` at the hand-off moves it out.  The graph
+    entry" (``push_allocation_with_clone``). It used to insert it at the flat
+    position of the loop's first member, which through ``OpsView`` is inside
+    the LoopNode's body with no ``loop_info``; the flat path rebuilt loops from
+    ``loop_info`` and ran it once, before the loop, while the flow-through ran it
+    every trip, until ``peel_non_members`` at the hand-off moved it out. Stage
+    8.2 places it before the loop's node, so no hoisted clone is ever at the edge
+    of a body, and the two paths agree. The graph
     of ``test_for_each_tile_lowering.test_one_unhinted_scan_does_not_block_the_other``
     (two sibling paged-gather scans)."""
     from for_each_tile_fixtures import (
@@ -309,6 +310,14 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
             for op in (node.body[0], node.body[-1])
             if isinstance(op, ComputedBuffer) and getattr(op, "loop_info", None) is None
         ]
+        ops = list(graph.operations)
+        seen["before_node"] = [
+            op.get_name()
+            for op, nxt in zip(ops, ops[1:])
+            if isinstance(nxt, LoopNode)
+            and isinstance(op, ComputedBuffer)
+            and getattr(op, "loop_info", None) is None
+        ]
         real(graph)
 
     @contextlib.contextmanager
@@ -322,8 +331,10 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     flat, nodes = _compile_both(
         paged_gather_kv_one_hinted_fn, paged_gather_kv_inputs(), patch
     )
-    # The clones really were at the edge of a body before the peel.
-    assert seen["edge_non_members"], "no hoisted clone landed in a LoopNode"
+    # The clones are placed outside the loop; none ever sat at the edge of a body.
+    assert seen["edge_non_members"] == [], seen["edge_non_members"]
+    # ... and they really were hoisted: they sit right before a node.
+    assert seen["before_node"], "no hoisted clone landed before a LoopNode"
     _assert_same_compile(flat, nodes)
     # The clones are once-run kernels before the loop on both paths.
     assert nodes["pre_fusion"] == flat["pre_fusion"]

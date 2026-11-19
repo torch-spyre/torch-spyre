@@ -62,6 +62,7 @@ from torch_spyre._inductor.loop_node import (
     remove_op,
     peel_non_members,
     request_loop_nodes,
+    top_level_entry,
 )
 
 
@@ -812,6 +813,32 @@ class TestExplicitEdits(unittest.TestCase):
         real, *_ = _nested()
         with self.assertRaises(ValueError):
             remove_op(OpsView(real), _Op("stranger"))
+
+
+class TestTopLevelEntry(unittest.TestCase):
+    """``top_level_entry``: the op, or the outermost node that holds it. A clone that
+    must run once, outside every loop of its anchor, is placed beside this."""
+
+    def test_a_top_level_op_is_its_own_entry(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        self.assertIs(top_level_entry(OpsView(real), a), a)
+        self.assertIs(top_level_entry(real, f), f)
+
+    def test_a_body_op_has_the_outermost_node_as_its_entry(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        self.assertIs(top_level_entry(view, b), outer)  # one level down
+        self.assertIs(top_level_entry(view, d), outer)  # two levels down
+
+    def test_a_node_is_its_own_entry_at_the_top_level_and_nested(self):
+        real, outer, inner, _ = _nested()
+        self.assertIs(top_level_entry(real, outer), outer)
+        self.assertIs(top_level_entry(real, inner), outer)
+
+    def test_an_op_that_is_not_there_raises(self):
+        real, *_ = _nested()
+        with self.assertRaises(ValueError):
+            top_level_entry(OpsView(real), _Op("stranger"))
 
 
 class TestPeelNonMembers(unittest.TestCase):
