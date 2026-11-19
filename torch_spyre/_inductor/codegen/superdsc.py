@@ -2462,7 +2462,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             not (is_matmul or is_pool or has_indirect_access)
             and not is_conv
             and not _is_topk(op_spec.op)
-            and not _is_keep_by_index(op_spec.op)
+            and not _is_index_masking_op(op_spec.op)
         ):
             op_dim_order, op_stick_dim = _merged_reduction_dim_order(
                 op_spec, symbol_mapping
