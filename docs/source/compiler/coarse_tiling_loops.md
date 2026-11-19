@@ -784,6 +784,7 @@ self.passes = [
     reorder_nonstick_dims,
     finalize_layouts,
     insert_restickify,
+    insert_ea_shuffle,
     validate_no_restickify_on_mutation_targets,
     enforce_indirect_access_layout,
     reorder_nonstick_dims_mutation,
