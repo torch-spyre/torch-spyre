@@ -1430,7 +1430,7 @@ def _create_sdsc_tensors(
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
-        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # advance, stamped by loop_tiling_lowering.lower_loop_tiling (host-stride
         # terms) and substituted to device-stride terms, per-arg, by
         # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
         # levels is handled later, in compute_ops.generate_sdsc's

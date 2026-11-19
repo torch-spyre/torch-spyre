@@ -988,7 +988,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - the copy-back elision optimization (propagate_layouts.py),
                 #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
                 #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-                #    (_insert_reduction_copy_op), which mutates directly into a
+                #    (_lower_reduction), which mutates directly into a
                 #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
                 #    in-group consumer (e.g. the next outer-tile iteration's
                 #    copy-in) reads that copy op's own output the same way an
@@ -996,7 +996,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE
                 #    op whose target is a locally-created graph-output buffer
                 #    (e.g. copy_forced(src, c) where c is returned directly) --
-                #    _insert_copy_op's inserted coarse_tile_copy_* op reads the
+                #    _insert_copy_out's inserted coarse_tile_copy_* op reads the
                 #    mutation op's own output the same way. The mutation target
                 #    there is an ordinary ComputedBuffer, not a SpyreEmptyFallback,
                 #    so this case is recognized by layout alone.
