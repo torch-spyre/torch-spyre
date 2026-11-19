@@ -210,16 +210,21 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        # core_mapping imports this module's TensorWorkDivision.
-        from .core_mapping import same_owner_maps
+        key = self.ownership_key
+        return key is not None and key == other.ownership_key
 
-        return same_owner_maps(
-            self.work_slices,
-            self.core_id_to_work_slice,
-            self.physical_core_count,
-            other.work_slices,
-            other.core_id_to_work_slice,
-            other.physical_core_count,
+    @functools.cached_property
+    def ownership_key(self) -> "tuple | None":
+        """This division's :func:`~.core_mapping.ownership_key`, computed once.
+
+        Cached on the instance, so ``work_slices`` and ``core_id_to_work_slice``
+        must not be changed after the first ownership comparison.
+        """
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import ownership_key
+
+        return ownership_key(
+            self.work_slices, self.core_id_to_work_slice, self.physical_core_count
         )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
