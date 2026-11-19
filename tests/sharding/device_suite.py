@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
@@ -246,3 +247,29 @@ def device_coverage_verdict(
             "ran its device-less tests)",
         )
     return "pass", None
+
+
+def session_is_sharding_only(args: list[str], invocation_dir: Path) -> bool:
+    """Whether a pytest session with these args collects nothing outside
+    ``tests/sharding``.
+
+    The VF -> emulation rewrite is only safe when it cannot reach another
+    directory's tests: a session that also collects e.g. ``tests/`` as a
+    whole would run every test in it emulated at 8 cores. Judge by the
+    invocation's paths, resolved against the invocation directory; empty
+    args (a bare ``pytest``) collect from the invocation directory itself.
+    Collection has not run yet at configure time, so args are the contract:
+    a session whose args all name files or directories inside
+    ``tests/sharding`` is sharding-only. A node id
+    (``tests/sharding/test_x.py::test_y``) counts as inside — its path
+    prefix is inside.
+    """
+    sharding_dir = Path(__file__).resolve().parent
+    paths = [Path(a) for a in args] or [invocation_dir]
+    for arg in paths:
+        resolved = (
+            arg.resolve() if arg.is_absolute() else (invocation_dir / arg).resolve()
+        )
+        if resolved != sharding_dir and sharding_dir not in resolved.parents:
+            return False
+    return True

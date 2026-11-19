@@ -30,32 +30,13 @@ from pathlib import Path
 import pytest
 
 from device_env import device_available, mode_usable, promote_vf_mode_to_emulation
-from device_suite import DEVICE_MODES, device_coverage_verdict
+from device_suite import (
+    DEVICE_MODES,
+    device_coverage_verdict,
+    session_is_sharding_only,
+)
 
 _GUARD_MARKERS = ("sharding_device", "sharding_device_suite")
-
-_SHARDING_DIR = Path(__file__).resolve().parent
-
-
-def _session_is_sharding_only(config) -> bool:
-    """Whether this pytest session collects nothing outside ``tests/sharding``.
-
-    The VF -> emulation rewrite is only safe when it cannot reach another
-    directory's tests: a session that also collects e.g. ``tests/`` as a
-    whole would run every test in it emulated at 8 cores. Judge by the
-    invocation's paths (``config.args``), resolved against the invocation
-    directory; a bare ``pytest`` collects from the invocation directory
-    itself. Collection has not run yet at configure time, so args are the
-    contract: a session whose args all name files or directories inside
-    ``tests/sharding`` is sharding-only.
-    """
-    inv_dir = Path(config.invocation_params.dir).resolve()
-    paths = [Path(a) for a in config.args] or [inv_dir]
-    for arg in paths:
-        resolved = (inv_dir / arg).resolve() if not arg.is_absolute() else arg.resolve()
-        if resolved != _SHARDING_DIR and _SHARDING_DIR not in resolved.parents:
-            return False
-    return True
 
 
 # Node ids of the guard-marked tests this session collected and executed,
@@ -80,7 +61,9 @@ def pytest_configure(config):
     # ``pytest tests/``) the rewrite is skipped — other directories keep
     # the ambient environment, and the wrapper subprocesses still force
     # their own shape for the device tests.
-    if _session_is_sharding_only(config):
+    if session_is_sharding_only(
+        config.args, Path(config.invocation_params.dir).resolve()
+    ):
         promote_vf_mode_to_emulation()
 
 

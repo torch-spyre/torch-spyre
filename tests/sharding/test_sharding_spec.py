@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from pathlib import Path
 
 import torch
 
@@ -329,3 +330,53 @@ def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
         monkeypatch.setenv("SENCORES", "8")
         assert promote_vf_mode_to_emulation() is False
         assert os.environ["FLEX_DEVICE"] == "VF"
+
+
+def test_session_is_sharding_only():
+    """The scoping gate for the VF -> emulation promotion (see conftest).
+
+    Pure function of the session's path arguments and the invocation
+    directory: the rewrite must apply only when nothing outside
+    tests/sharding is collected. The repo layout is fixed, so real paths
+    are used, resolved against a fake invocation directory.
+    """
+    from device_suite import session_is_sharding_only
+
+    repo = Path(__file__).resolve().parents[2]
+    sharding = repo / "tests" / "sharding"
+
+    # A bare pytest (no args) collects from the invocation directory: inside
+    # promotes, the repo root does not.
+    assert session_is_sharding_only([], sharding) is True
+    assert session_is_sharding_only([], repo) is False
+
+    # Paths and node ids inside the directory.
+    assert session_is_sharding_only(["tests/sharding"], repo) is True
+    assert (
+        session_is_sharding_only(["tests/sharding/test_sharded_add.py"], repo) is True
+    )
+    assert (
+        session_is_sharding_only(
+            ["tests/sharding/test_sharded_add.py::test_eager_add_on_sharded_inputs"],
+            repo,
+        )
+        is True
+    )
+    assert (
+        session_is_sharding_only([str(sharding / "test_sharding_spec.py")], repo)
+        is True
+    )
+
+    # Relative to a different invocation directory (cd tests && pytest sharding).
+    assert session_is_sharding_only(["sharding"], repo / "tests") is True
+
+    # Anything outside, alone or mixed with an inside path.
+    assert session_is_sharding_only(["tests"], repo) is False
+    assert session_is_sharding_only(["tests/test_allocator_e2e.py"], repo) is False
+    assert (
+        session_is_sharding_only(
+            ["tests/sharding/test_sharded_add.py", "tests/test_allocator_e2e.py"], repo
+        )
+        is False
+    )
+    assert session_is_sharding_only([".."], sharding) is False
