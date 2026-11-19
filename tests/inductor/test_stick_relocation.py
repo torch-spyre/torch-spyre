@@ -45,6 +45,16 @@ def _silu_reshape(out_shape):
     return lambda x: F.silu(x * 2).reshape(out_shape) + 1
 
 
+def _reduce_after(view, kind):
+    """``view`` of the input, times two, reduced along its last dim by ``kind``."""
+    reduce = {
+        "sum": lambda t: t.sum(-1),
+        "amax": lambda t: t.amax(-1),
+        "argmax": lambda t: t.argmax(-1),
+    }[kind]
+    return lambda a: reduce(view(a) * 2)
+
+
 def _compile_and_measure(fn, *shapes):
     """Compile ``fn`` on Spyre, check it against an fp32 CPU reference, and return
     the peak extra device memory of the compiled call relative to its inputs."""
@@ -172,6 +182,50 @@ class TestStickRelocation(unittest.TestCase):
                 ratio = _compile_and_measure(fn, *shapes)
                 self.assertGreater(ratio, SPARSE_MIN_MEMORY_RATIO)
 
+    def test_reduction_kinds_over_a_reshaped_read(self):
+        # _reduction_layout_from_stl derives its output candidates from the
+        # relocated layout, and it takes the same path for every reduction kind,
+        # so sum alone does not cover it. amax and argmax are checked here on a
+        # read with no dim to take the stick (the flatten of [8, 65], which stays
+        # sparse) and on one that takes the dense relocation.
+        reads = {
+            "flatten [8,65] (sparse)": ((8, 65), lambda a: a.reshape(-1)),
+            "merge (1,32,20,20) (dense)": (
+                (1, 32, 20, 20),
+                lambda a: a.reshape(1, 32, 400),
+            ),
+        }
+        for read_name, (shape, view) in reads.items():
+            torch.manual_seed(0)
+            # Positive values: summing 400 signed fp16 terms cancels, and a row
+            # whose total lands near zero has no meaningful relative error.
+            x = torch.randn(*shape, dtype=torch.float16).abs() + 0.05
+            for kind in ("sum", "amax", "argmax"):
+                with self.subTest(f"{read_name} {kind}"):
+                    whole = _reduce_after(view, kind)
+                    torch.compiler.reset()
+                    with inductor_config.patch(force_disable_caches=True):
+                        out = torch.compile(whole, dynamic=False)(x.to("spyre")).cpu()
+                    torch.spyre.synchronize()
+                    if kind == "argmax":
+                        # The index is checked by the value it points at, against
+                        # the same data the device saw: the device holds fp16 in
+                        # DLFloat16, one mantissa bit narrower, so a host-side
+                        # reference can rank two values the device sees as equal.
+                        # An index into a tie is a correct answer; one into a
+                        # smaller value is not.
+                        seen = view(x.to("spyre").cpu() * 2).float()
+                        rows = seen.reshape(-1, seen.shape[-1])
+                        picked = rows.gather(-1, out.reshape(-1, 1).long())
+                        torch.testing.assert_close(
+                            picked.reshape(-1), rows.max(-1).values
+                        )
+                    else:
+                        ref = whole(x.float())
+                        torch.testing.assert_close(
+                            out.float(), ref.float(), atol=5e-2, rtol=1e-2
+                        )
+
     def test_escaping_view_with_in_graph_consumer(self):
         # The view escapes and also feeds another op. Nothing is rewritten in the
         # graph, so the view stays a view of ``y``.
@@ -241,18 +295,14 @@ class TestStickRelocation(unittest.TestCase):
             )(a, a.clone())
 
     @expects_raise
-    def test_cat_of_reshaped_reads_is_rejected(self):
-        # TODO(#6163): each cat operand is restickified straight into its slice
-        # of the cat buffer, where its old-stick dim cannot be padded in place.
+    def test_yolo26_detect_head_cat_is_rejected(self):
+        # TODO(#6163): each cat operand is restickified straight into its slice of
+        # the cat buffer, where its old-stick dim cannot be padded in place.
         # Restickify into a fresh buffer and copy it into the slice, then make this
-        # a positive test. The yolo26 Detect head (three views, then a cat along
-        # the stick dim) stops at the same point.
+        # a positive test. Case 1 of #6163 on two operands is
+        # test_cat_of_reshapes in test_inductor_ops.py; this is the yolo26 Detect
+        # head, where three views of different sizes meet a cat on the stick dim.
         cases = {
-            "cat of two reshapes": (
-                [(1, 2, 4, 8, 7)] * 2,
-                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1)
-                * 2,
-            ),
             "yolo26 detect head": (
                 [(1, 80, 80, 80), (1, 80, 40, 40), (1, 80, 20, 20)],
                 lambda a, b, c: torch.cat([t.reshape(1, 80, -1) for t in (a, b, c)], -1)
