@@ -3659,15 +3659,16 @@ def compute_size1_restickify_target(
     A Scatter caller must pass it: indirect_info_from_op returns sizes=None
     for a Scatter, which drops the scatter index symbol from the coordinates.
     """
-    
+
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
-    
+
+    ind_sizes: "dict[sympy.Symbol, int] | None"
     if indirect_sizes is not None:
         ind_sizes = indirect_sizes
     else:
         _, _, ind_sizes = indirect_info_from_op(op)
-    
+
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None

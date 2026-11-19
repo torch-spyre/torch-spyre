@@ -1231,7 +1231,7 @@ def _refresh_input_layout_override(
         or override.device_layout == unpadded_layout.device_layout
     ):
         overrides[name] = padded_layout
-        
+
 
 def _clone_input_for_padding(
     op: ComputedBuffer, in_dep, in_buf, graph: GraphLowering, pass_name: str
