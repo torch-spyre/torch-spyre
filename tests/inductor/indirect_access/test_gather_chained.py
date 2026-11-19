@@ -51,10 +51,11 @@ _POINTWISE_NO_LAYOUT = rejection(
     "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
     r"Multi-arg pointwise .*no supported output layout found",
 )
-_RESTICKIFY_3ARGS = rejection(
+_GATHER_STICK_MISMATCH = (
     4327,
-    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
-    r"cannot re-tile \S+: no size-1 stick target",
+    "compile gather at dim>=1 compiles and returns values that differ from CPU "
+    "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _MATMUL_MISMATCH = (
     4722,
@@ -498,7 +499,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
         _xfail_existing(
             execution_mode,
             eager=_GATHER_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         probs = cached_randn((16, 512), differentiation="e2e11", dtype=torch.float16)
         draft_tok = torch.randint(0, 512, (5,), dtype=torch.int64)

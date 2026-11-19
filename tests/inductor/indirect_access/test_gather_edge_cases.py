@@ -88,6 +88,12 @@ _RESTICKIFY_3ARGS = rejection(
     "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
     r"cannot re-tile \S+: no size-1 stick target",
 )
+_GATHER_STICK_MISMATCH = (
+    4327,
+    "compile gather at dim>=1 compiles and returns values that differ from CPU "
+    "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
 _TAKE_EAGER = rejection(
     4307,
     "aten::take is not registered on Spyre.",
@@ -309,10 +315,6 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_index_select_dim1(self, execution_mode):
         """index_select at dim=1; column selection."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing(
-            execution_mode, eager=_RESTICKIFY_3ARGS, compiled=_RESTICKIFY_3ARGS
-        )
         x = cached_randn((32, 128), differentiation="idxs02", dtype=torch.float16)
         idx = torch.randint(0, 128, (64,), dtype=torch.int64)
         compare_mode(
@@ -840,10 +842,6 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_index_select_negative_dim(self, execution_mode):
         """index_select with dim=-1 (negative dim normalization); selects 3 of 32 columns from (8,32)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing(
-            execution_mode, eager=_RESTICKIFY_3ARGS, compiled=_RESTICKIFY_3ARGS
-        )
         x = cached_randn((8, 32), differentiation="isel_neg01", dtype=torch.float16)
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
         compare_mode(
@@ -1040,7 +1038,9 @@ class TestGatherOutParameterEagerCompile:
         """torch.gather(x, 2, idx, out=buf): out= with dim=2 feature selection."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing(execution_mode, eager=_GATHER_OUT, compiled=_RESTICKIFY_3ARGS)
+        _xfail_existing(
+            execution_mode, eager=_GATHER_OUT, compiled=_GATHER_STICK_MISMATCH
+        )
         B, H, F, K = 2, 8, 128, 32
         x = cached_randn((B, H, F), differentiation="out03", dtype=torch.float16)
         idx = torch.randint(0, F, (B, H, K), dtype=torch.int64)

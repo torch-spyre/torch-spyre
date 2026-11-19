@@ -45,10 +45,11 @@ _DXP_STANDALONE_FAIL = (
     "compile gather dxp_standalone returned non-zero exit status 1.",
     r"SubprocException",
 )
-_RESTICKIFY_3ARGS = rejection(
+_GATHER_STICK_MISMATCH = (
     4327,
-    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
-    r"cannot re-tile \S+: no size-1 stick target",
+    "compile gather at dim>=1 compiles and returns values that differ from CPU "
+    "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _TAKE_ALONG_DIM_FLAT_RESTICKIFY = rejection(
     4327,
@@ -340,7 +341,7 @@ class TestGatherShapeRankAndIndexPatterns:
         _xfail_existing(
             execution_mode,
             eager=_GATHER_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         x = (
             (torch.arange(256, dtype=torch.float32) / 7.0 - 1.5)
@@ -544,7 +545,7 @@ class TestGatherNonLeadingDimEagerCompile:
         _xfail_existing(
             execution_mode,
             eager=_GATHER_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         B, H, F, K = 2, 8, 128, 32
         x = cached_randn((B, H, F), differentiation="ndl05", dtype=torch.float16)
@@ -561,11 +562,10 @@ class TestGatherNonLeadingDimEagerCompile:
     def test_take_along_dim_dim2(self, execution_mode):
         """torch.take_along_dim(x, idx, dim=2): channel selection via take_along_dim."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
         _xfail_existing(
             execution_mode,
             eager=_REMAINDER_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_REMAINDER_COMPILED,
         )
         B, H, F, K = 2, 8, 128, 32
         x = cached_randn((B, H, F), differentiation="ndl07", dtype=torch.float16)
@@ -586,7 +586,7 @@ class TestGatherNonLeadingDimEagerCompile:
         _xfail_existing(
             execution_mode,
             eager=_GATHER_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         B, H, F, K = 2, 4, 64, 16
         x = cached_randn((B, H, F), differentiation="ndl08", dtype=torch.bfloat16)

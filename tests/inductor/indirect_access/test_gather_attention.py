@@ -63,11 +63,12 @@ _RESTICKIFY_MOD = rejection(
     "compile batched SDPA decode: insert_restickify_padding new-stick extent needs a re-base copy.",
     r"insert_restickify_padding: new-stick extent .* requires a re-base copy",
 )
-_CANON_FACTORIZED = rejection(
+_RESTICKIFY_NOT_DENSE = rejection(
     4760,
-    "compile 4D KV cache layout/reshape-before-permute: cannot canonicalize factorized y_var "
-    "(expected an affine contiguous host dimension chain).",
-    r"cannot canonicalize factorized y_var",
+    "compile 4D KV cache reshape-before-permute: insert_restickify_padding rejects a host "
+    "dimension that is neither dense nor a set of non-overlapping stick windows.",
+    r"insert_restickify_padding: host dim \d+ of buf\d+ .* is neither dense nor a set of "
+    r"non-overlapping stick windows",
 )
 _SUBPROC_EAGER = (
     4760,
@@ -624,11 +625,6 @@ class TestGatherPagedAttentionAndSDPA:
         See test_sdpa_4d_kv_reshape_before_permute for the reshape-before-permute
         variant (tracked compiler gap).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
-        _xfail_existing(
-            execution_mode,
-            compiled=_CANON_FACTORIZED,
-        )
         pool, H, blk, D = 128, 8, 4, 32
         k_cache = cached_randn(
             (pool, H, blk, D), differentiation="attn20k", dtype=torch.float16
@@ -669,11 +665,11 @@ class TestGatherPagedAttentionAndSDPA:
         Mod/FloorDiv multi-symbol host coordinate after coarse tiling that
         insert_restickify_padding does not yet handle.
 
-        Tracked: see _CANON_FACTORIZED / _SUBPROC_EAGER markers.
+        Tracked: see _RESTICKIFY_NOT_DENSE / _SUBPROC_EAGER markers.
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
         _xfail_existing(
-            execution_mode, eager=_SUBPROC_EAGER, compiled=_CANON_FACTORIZED
+            execution_mode, eager=_SUBPROC_EAGER, compiled=_RESTICKIFY_NOT_DENSE
         )
         pool, H, blk, D = 128, 8, 4, 32
         k_cache = cached_randn(

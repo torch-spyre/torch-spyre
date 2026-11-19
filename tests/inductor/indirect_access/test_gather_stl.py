@@ -29,7 +29,7 @@ Three groups:
 
   3. Explicit 4-arg STL annotation (TestGatherExplicitStl4Arg) — tensors
      annotated with the full ``SpyreTensorLayout(device_size, stride_map,
-     device_dtype)`` 3-keyword constructor.  Exercises GQA/MQA KV cache shapes,
+     device_dtype, valid_elements)`` constructor.  Exercises GQA/MQA KV cache shapes,
      downstream ops, bfloat16, and named dims.  A final section asserts that
      explicit-STL and implicit compiled outputs are bit-identical.
 
@@ -125,7 +125,7 @@ def _stl_2arg(shape, dtype) -> "SpyreTensorLayout":
 
 
 def _stl_generic(shape, dtype) -> "SpyreTensorLayout":
-    """Full 3-keyword constructor matching the canonical generic-stick layout.
+    """Full 4-keyword constructor matching the canonical generic-stick layout.
 
     Replicates ``canonical_device_layout`` from indirect_access_common.py:
         shape (H, W)    -> device_size [H, W//eps, eps], stride_map [W, eps, 1]
@@ -144,6 +144,7 @@ def _stl_generic(shape, dtype) -> "SpyreTensorLayout":
         device_size=device_size,
         stride_map=stride_map,
         device_dtype=get_device_dtype(dtype),
+        valid_elements={},
     )
 
 
@@ -519,13 +520,13 @@ class TestGatherExplicitStl2Arg:
 
 
 # ---------------------------------------------------------------------------
-# Group 3 — Explicit 4-arg (3-keyword) STL annotation
+# Group 3 — Explicit 4-arg (4-keyword) STL annotation
 # ---------------------------------------------------------------------------
 
 
 @_requires_stl
 class TestGatherExplicitStl4Arg:
-    """Gather source pre-annotated with the full 3-keyword STL constructor.
+    """Gather source pre-annotated with the full 4-keyword STL constructor.
 
     ``SpyreTensorLayout(device_size=..., stride_map=..., device_dtype=...)``
     built by ``_stl_generic`` encodes the canonical generic-stick layout
@@ -551,7 +552,7 @@ class TestGatherExplicitStl4Arg:
         yield
 
     def _to_dev(self, x_cpu):
-        """Move *x_cpu* to Spyre using the full 3-keyword STL constructor."""
+        """Move *x_cpu* to Spyre using the full 4-keyword STL constructor."""
         return x_cpu.to(DEVICE, device_layout=_stl_generic(x_cpu.shape, x_cpu.dtype))
 
     def _run(self, fn, x_cpu, idx_cpu, execution_mode, atol, rtol):

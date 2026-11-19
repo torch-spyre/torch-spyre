@@ -45,10 +45,11 @@ _GATHER_OUT_EAGER = rejection(
     "aten::gather.out is not registered on Spyre.",
     r"Could not run 'aten::gather.out'",
 )
-_RESTICKIFY_3ARGS = rejection(
+_GATHER_STICK_MISMATCH = (
     4327,
-    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
-    r"cannot re-tile \S+: no size-1 stick target",
+    "compile gather at dim>=1 compiles and returns values that differ from CPU "
+    "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 _CAST_STAGGERED_READ = rejection(
     5856,
@@ -380,7 +381,7 @@ class TestGatherInferencePatternsEagerCompile:
         _xfail_existing(
             execution_mode,
             eager=_GATHER_OUT_EAGER,
-            compiled=_RESTICKIFY_3ARGS,
+            compiled=_GATHER_STICK_MISMATCH,
         )
         probs = cached_randn((512, 64), differentiation="vllm15", dtype=torch.float16)
         draft_tokens = torch.randint(0, 64, (5,), dtype=torch.int64)

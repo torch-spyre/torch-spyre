@@ -24,7 +24,6 @@ from conftest import (
     _xfail_existing,
     compare_mode,
     expect_dynamic_true_refused,
-    rejection,
 )
 
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
@@ -41,10 +40,11 @@ _DXP_STANDALONE_FAIL = (
     "compile gather dxp_standalone returned non-zero exit status 1.",
     r"SubprocException",
 )
-_RESTICKIFY_3ARGS = rejection(
+_GATHER_STICK_MISMATCH = (
     4327,
-    "compile gather / index_select / take_along_dim at dim>=1: cannot re-tile the source, no size-1 stick target (the issue reported an 'op_spec has 3 args' abort).",
-    r"cannot re-tile \S+: no size-1 stick target",
+    "compile gather at dim>=1 compiles and returns values that differ from CPU "
+    "(the issue reported an 'op_spec has 3 args' abort, then a 'cannot re-tile' error).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
 
 
@@ -442,7 +442,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
     def test_explicit_gather_dim1_lx(self):
         """torch.gather(src, 1, index) with LX_PLANNING=1; dim=1 aten::gather.out through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing("compiled", compiled=_RESTICKIFY_3ARGS)
+        _xfail_existing("compiled", compiled=_GATHER_STICK_MISMATCH)
         os.environ["LX_PLANNING"] = "1"
         src = cached_randn((32, 64), differentiation="xgth02", dtype=torch.float16)
         index = torch.randint(0, 64, (32, 16), dtype=torch.int64)
@@ -458,7 +458,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
     def test_explicit_gather_dim2_lx(self):
         """torch.gather(src, 2, index) with LX_PLANNING=1; dim=2 aten::gather.out through LX planner."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing("compiled", compiled=_RESTICKIFY_3ARGS)
+        _xfail_existing("compiled", compiled=_GATHER_STICK_MISMATCH)
         os.environ["LX_PLANNING"] = "1"
         src = cached_randn((8, 16, 64), differentiation="xgth03", dtype=torch.float16)
         index = torch.randint(0, 64, (8, 16, 32), dtype=torch.int64)
@@ -508,8 +508,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
 
     def test_dim2_fancy_indexing_lx(self):
         """x[:, :, idx] dim=2 gather with LX_PLANNING=1; innermost-dim indirect access through LX planner."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing("compiled", compiled=_RESTICKIFY_3ARGS)
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((8, 16, 64), differentiation="dim02", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
