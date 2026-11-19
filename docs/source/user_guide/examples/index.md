@@ -27,6 +27,7 @@ common Torch-Spyre use cases.
 | `custom_op.py` | Registering a custom op with a Spyre lowering |
 | `flash_attention.py` | Block-wise flash attention with online softmax |
 | `linear_attention.py` | Chunkwise causal linear attention with a normalizer and a carried state (`torch.ops.spyre.linear_attention`) |
+| `fft.py` | Discrete Fourier transform (`fft`/`fft2`/`fftn`) as a device matmul |
 | `hf_model.py` | Running a HuggingFace causal LM through hf-adapters |
 
 ## Distributed Examples
