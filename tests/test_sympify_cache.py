@@ -142,6 +142,7 @@ class TestWrapperSympify(unittest.TestCase):
             inspect.getsource(wrapper.SpyrePythonWrapperCodegen.write_header),
         )
         header = wrapper.SPYRE_WRAPPER_IMPORTS
+        self.assertIn("_spyre_empty_sharded", header)
         self.assertIn(
             "from torch_spyre._inductor.op_spec import wrapper_sympify as sympify",
             header,

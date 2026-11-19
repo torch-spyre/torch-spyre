@@ -621,6 +621,29 @@ def spyre_empty_reserved_with_layout(
     device_layout=...).
     """
 
+def dma_bytes(dst: torch.Tensor) -> int:
+    """Physical transfer size; 0 for a multi-chunk allocation."""
+    ...
+
+def copy_raw_h2d_batch(entries: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    """Copy device-format CPU uint8 buffers on one current stream, then wait.
+
+    Each buffer must be page-aligned and exactly match its destination's physical
+    allocation size. All destinations must be on the same Spyre device.
+    Keep the buffers unchanged until the call completes successfully.
+    Uncertain completion retains storage and rejects further batches; do not
+    reuse that storage and restart the process.
+    """
+    ...
+
+def convert_h2d_into(
+    entries: list[tuple[typing.Any, torch.Tensor, torch.Tensor]],
+    num_threads: int = 0,
+) -> None:
+    """Convert each (buffer, cpu_tensor, dst_tensor) into its writable host buffer:
+    the bytes copy_tensor(cpu_tensor, dst_tensor) would DMA."""
+    ...
+
 def spyre_empty_with_layout(
     size: tuple[int, ...],
     stride: tuple[int, ...],

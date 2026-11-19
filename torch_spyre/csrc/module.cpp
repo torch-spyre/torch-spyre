@@ -49,6 +49,7 @@
 #include "distributed/spyre_ccl.hpp"
 #endif
 
+#include "host_transfer.h"
 #include "logging.h"
 #include "logging_bindings.h"
 #include "logging_config.h"
@@ -847,6 +848,39 @@ PYBIND11_MODULE(_C, m) {
         "Return a read-only handle over the device address backing a Spyre "
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
+
+  m.def("dma_bytes", &spyre::dma_bytes, py::arg("dst"),
+        "Physical transfer size; 0 for a multi-chunk Spyre allocation.");
+  m.def("copy_raw_h2d_batch", &spyre::copy_raw_h2d_batch, py::arg("entries"),
+        py::call_guard<py::gil_scoped_release>(),
+        "Copy (aligned CPU uint8 buffer, Spyre destination) pairs without "
+        "conversion. Enqueue all entries on the current stream, then wait. "
+        "Keep buffers unchanged until the call completes successfully. "
+        "On uncertain completion, retain storage and reject further batches; "
+        "the caller must not reuse that storage and must restart the process.");
+
+  m.def(
+      "convert_h2d_into",
+      [](py::list entries, unsigned int num_threads) {
+        std::vector<spyre::HostConvertTarget> targets;
+        targets.reserve(entries.size());
+        for (auto& item : entries) {
+          auto tup = item.cast<py::tuple>();
+          TORCH_CHECK(tup.size() == 3,
+                      "convert_h2d_into: each entry must be a 3-tuple "
+                      "(buffer, cpu_tensor, dst_tensor)");
+          auto buf = tup[0].cast<py::buffer>().request(/*writable=*/true);
+          targets.push_back(spyre::HostConvertTarget{
+              buf.ptr, static_cast<size_t>(buf.size * buf.itemsize),
+              tup[1].cast<at::Tensor>(), tup[2].cast<at::Tensor>()});
+        }
+        py::gil_scoped_release release;
+        spyre::convert_h2d_into(targets, num_threads);
+      },
+      py::arg("entries"), py::arg("num_threads") = 0u,
+      "Convert each (buffer, cpu_tensor, dst_tensor) entry into its writable\n"
+      "host buffer in parallel: the bytes copy_tensor(cpu_tensor, dst_tensor)\n"
+      "would DMA.  dst_tensor's device memory is not touched.");
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
