@@ -643,11 +643,7 @@ at::Tensor spyre_reducescatter_run_impl(const at::Tensor& input,
       staged_stl.toString(), "), got ", input_stl.toString());
   at::Tensor output =
       at::empty({input.size(0), input.size(2)}, input.options());
-  TORCH_CHECK(
-      get_device_size_in_bytes(get_spyre_tensor_layout(output)) * group_size ==
-          get_device_size_in_bytes(input_stl),
-      "reduce_scatter: per-rank output device size does not tile the "
-      "staged input");
+  check_reduce_scatter_output_tiles(output, input_stl, group_size);
 
   auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
       output.storage().data_ptr().get_context());
