@@ -30,6 +30,11 @@ from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
+from torch_spyre.ops import fft as spyre_fft
+from torch_spyre.ops import fft2 as spyre_fft2
+from torch_spyre.ops import fftn as spyre_fftn
+from torch_spyre.ops import ifft as spyre_ifft
+from torch_spyre.ops import ifftn as spyre_ifftn
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -15600,6 +15605,151 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
+
+
+class TestFFT(unittest.TestCase):
+    """DFT via matmul: the fft/ifft host wrappers run a real interleaved
+    ``u @ W`` on device and are checked end-to-end against ``torch.fft``; a few
+    host-only cases check the matrix builder and the device-matrix cache in
+    ``torch_spyre.ops._fft`` directly.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    def test_fft_matches_reference(self):
+        # End-to-end vs torch.fft (validates the interleaved DFT matrix), for
+        # powers of two and a prime. Bounded against the spectrum peak: fp16
+        # cancellation hurts per-element accuracy on near-zero outputs, so the
+        # standard FFT-roundoff measure is relative to peak magnitude. Measured
+        # on device: ~0.2-0.3% at these sizes, up to ~1.7% for a direct
+        # transform at n=32768, and <=0.6% for the four-step path at n=65536; a
+        # wrong transform is >100%. The 2e-2 gate keeps margin over the worst.
+        for n in (64, 97, 256):
+            with self.subTest(n=n):
+                x = torch.randn(3, n, dtype=torch.complex64)
+                ref = torch.fft.fft(x)
+                err = (spyre_fft(x) - ref).abs().max().item()
+                self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_roundtrip(self):
+        x = torch.randn(2, 128, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft2_matches_reference(self):
+        # N-D DFT is separable: fft along each of the last two axes.
+        x = torch.randn(32, 48, dtype=torch.complex64)
+        ref = torch.fft.fft2(x)
+        err = (spyre_fft2(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fftn_matches_reference(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        ref = torch.fft.fftn(x)
+        err = (spyre_fftn(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifftn_roundtrip(self):
+        x = torch.randn(8, 16, 32, dtype=torch.complex64)
+        err = (spyre_ifftn(spyre_fftn(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_fourstep(self):
+        # Above the direct ceiling (32768) a composite length uses the
+        # four-step factorization (two sub-DFTs + twiddle), which also lets a
+        # transform too large for one direct matmul complete.
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_ifft_large_roundtrip(self):
+        x = torch.randn(2, 65536, dtype=torch.complex64)
+        err = (spyre_ifft(spyre_fft(x)) - x).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * x.abs().max().item())
+
+    def test_fft_large_prime_unsupported(self):
+        # A prime above the ceiling cannot be factored for four-step and
+        # would need an O(n^2) matrix; it is rejected rather than attempted.
+        with self.assertRaisesRegex(NotImplementedError, "prime factor"):
+            spyre_fft(torch.randn(65537, dtype=torch.complex64))
+
+    def test_fft_direct_max_env_forces_fourstep(self):
+        # TORCH_SPYRE_FFT_DIRECT_MAX lowers the direct/four-step boundary, so a
+        # small composite length takes the four-step path and still matches.
+        x = torch.randn(3, 128, dtype=torch.complex64)
+        ref = torch.fft.fft(x)
+        with mock.patch.dict(os.environ, {"TORCH_SPYRE_FFT_DIRECT_MAX": "64"}):
+            err = (spyre_fft(x) - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_overflow_prescaled(self):
+        # The unnormalized DC term reaches n*|x| and an |x| > 65504 input
+        # overflows the fp16 cast; the host max-abs prescale keeps both in
+        # range, so a large-magnitude signal is finite and still matches.
+        x = torch.randn(2, 128, dtype=torch.complex64) * 1e5
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        self.assertTrue(torch.isfinite(y).all())
+        err = (y - ref).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref.abs().max().item())
+
+    def test_fft_per_row_prescale(self):
+        # The prescale is per row, not per tensor: a batch with a large row and
+        # a tiny row (here ~1e-5 apart in magnitude) must not cost the tiny row
+        # precision. Each row is checked against its own spectrum peak.
+        big = torch.randn(256, dtype=torch.complex64)
+        small = torch.randn(256, dtype=torch.complex64) * 1e-5
+        x = torch.stack([big, small])
+        ref = torch.fft.fft(x)
+        y = spyre_fft(x)
+        for r in range(x.shape[0]):
+            peak = ref[r].abs().max().item()
+            err = (y[r] - ref[r]).abs().max().item()
+            self.assertLessEqual(err, 2e-2 * peak)
+
+    def test_inverse_matrix_unit_magnitude(self):
+        # The inverse matrix stays unit-magnitude (1/n applied on the host in
+        # fp32, not baked in): baked entries would be ~1/n, subnormal below the
+        # fp16 normal minimum (~6.1e-5) for n>16384. A baked matrix would
+        # already be far below 1 at these small n, so max|W| ~= 1 shows the
+        # 1/n is not in the matrix.
+        from torch_spyre.ops import _fft
+
+        for n in (256, 4096):
+            w = _fft._build_device_dft_matrix(n, inverse=True, device="cpu")
+            self.assertAlmostEqual(w.abs().max().item(), 1.0, places=2)
+
+    def test_w_cache_lru_eviction(self):
+        # _W_CACHE is bounded by total bytes: building distinct lengths past the
+        # budget evicts the least-recently-used entry and stays within budget.
+        from torch_spyre.ops import _fft
+
+        _fft._W_CACHE.clear()
+        budget = 8 * 128 * 128 + 8 * 160 * 160  # room for the two largest
+        with mock.patch.dict(
+            os.environ, {"TORCH_SPYRE_FFT_W_CACHE_BYTES": str(budget)}
+        ):
+            for n in (64, 96, 128, 160):
+                _fft._device_dft_matrix(n, False, "cpu")
+            cached = {k[1] for k in _fft._W_CACHE}
+            total = sum(_fft._entry_bytes(k) for k in _fft._W_CACHE)
+        self.assertLessEqual(total, budget)
+        self.assertNotIn(64, cached)  # least-recently-used, evicted
+        self.assertIn(160, cached)  # most recent, kept
+        _fft._W_CACHE.clear()
+
+    def test_dft_matrix_block_boundary(self):
+        # Row-block assembly must be independent of the block size.
+        from torch_spyre.ops import _fft
+
+        for inv in (False, True):
+            ref = _fft._build_device_dft_matrix(200, inv, "cpu", block=200)
+            small = _fft._build_device_dft_matrix(200, inv, "cpu", block=7)
+            self.assertTrue(torch.equal(ref, small))
+
 
 if __name__ == "__main__":
     unittest.main()
