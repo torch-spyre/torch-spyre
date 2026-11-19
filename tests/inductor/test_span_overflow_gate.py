@@ -55,7 +55,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor import nonstick_dim_order, passes, work_division
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.coarse_tiling import MAX_SEARCH_TILE_DEPTH
-from torch_spyre._inductor.wsr import coarse_tile, span_overflow_hint_analysis
+from torch_spyre._inductor.wsr import span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
 
@@ -107,7 +107,7 @@ def normalise(text):
 def compile_span_overflow(fn, args, limit_bytes):
     """Compile ``fn`` with span-overflow on and the span limit lowered."""
     formed, added = [], []
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         before = {op.get_operation_name() for op in graph.operations}
@@ -129,8 +129,7 @@ def compile_span_overflow(fn, args, limit_bytes):
 
     torch._dynamo.reset()
     with (
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
         span_limit(limit_bytes),
         config.patch({"ignore_span_overflow_hints": False}),
         torch._inductor.config.patch(force_disable_caches=True),

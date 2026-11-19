@@ -20,8 +20,11 @@
 #include <c10/util/intrusive_ptr.h>
 
 #include <flex/flex.hpp>
+#include <map>
+#include <optional>
 
 #include "module.h"
+#include "spyre_tensor_impl.h"
 
 namespace spyre {
 
@@ -53,7 +56,9 @@ class SpyreTensorLayout;
 at::Tensor spyre_empty_with_layout(
     c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
     SpyreTensorLayout device_layout,
-    std::optional<c10::Device> device_opt = std::nullopt);
+    std::optional<c10::Device> device_opt = std::nullopt,
+    std::optional<std::map<int64_t, ReservedDimInfo>> reserved_dims =
+        std::nullopt);
 
 /**
  * Allocate a Spyre tensor whose logical size/stride are `size`/`stride`
@@ -77,6 +82,22 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
                                 c10::ScalarType dtype, int64_t dim,
                                 int64_t min_size, int64_t max_size,
                                 int64_t granularity);
+
+/**
+ * spyre_empty_reserved with the device layout given instead of derived.
+ * `device_layout` describes the buffer at `max_size` along `dim`, so the
+ * reserved host dimension must occupy one whole device dimension (never the
+ * stick-elements dimension) whose extent is `max_size`: that is the dimension
+ * the transfer and resize_ move along, and a dimension folded into another or
+ * split across the stick could not be resized in place. The same reservation
+ * rules as spyre_empty_reserved apply (dim 0 only, min/max/granularity
+ * checked), the layout is stored as given, and the contract is stamped on the
+ * tensor. Backs `tensor.to("spyre", dynamic={dim: {...}}, device_layout=...)`.
+ */
+at::Tensor spyre_empty_reserved_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, int64_t dim, int64_t min_size,
+    int64_t max_size, int64_t granularity);
 
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
