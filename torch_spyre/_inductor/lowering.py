@@ -1624,9 +1624,7 @@ def lower_keep_by_index(values, indices, dim, fill_value):
 
 
 @register_spyre_lowering(torch.ops.spyre.mask_by_index)
-def lower_mask_by_index(values, indices, dim):
-    # Unlike keep_by_index, no "maskval" constant is passed: the backend
-    # maskbyindex always masks with -inf and ignores any such constant.
+def lower_mask_by_index(values, indices, dim, fill_value):
     from .pass_utils import concretize_expr
 
     x_size = values.get_size()
@@ -1652,6 +1650,7 @@ def lower_mask_by_index(values, indices, dim):
         indices_index[norm_dim] = rindex[0]
         return (values_loader(values_index), indices_loader(indices_index))
 
+    op_info = {"constants": {"maskval": fill_value}}
     result = SpyreReduction.create(
         reduction_type="maskbyindex",
         input_node=[values, indices],
@@ -1661,7 +1660,7 @@ def lower_mask_by_index(values, indices, dim):
         inner_fn=inner_fn,
         ranges=ranges,
         reduction_ranges=reduction_ranges,
-        op_info={},
+        op_info=op_info,
     )
     result.realize()
     return result

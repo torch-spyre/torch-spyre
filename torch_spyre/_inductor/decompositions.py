@@ -1930,7 +1930,9 @@ def spyre_topk(
         idxs_list.append(i)
         remaining_k -= chunk_k
         if remaining_k > 0:
-            curr_input = torch.ops.spyre.mask_by_index(curr_input, i, dim)
+            curr_input = torch.ops.spyre.mask_by_index(
+                curr_input, i, dim, float("-inf")
+            )
 
     if len(vals_list) == 1:
         values, indices = vals_list[0], idxs_list[0]

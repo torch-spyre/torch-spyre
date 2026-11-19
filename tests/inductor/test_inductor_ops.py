@@ -1392,6 +1392,41 @@ _SORT_INT_CASES = {
 }
 
 
+# keep_by_index / mask_by_index cases, as (shape, k, dim, fill value). Each runs
+# in fp16 (plain names) and fp32 (names suffixed _fp32); see _masking_ops_params.
+_MASKING_OPS_CASES = {
+    # Stick-aligned (every dim a multiple of 64).
+    "2d_aligned_dim0": ((64, 128), 8, 0, -1.0),
+    "3d_aligned_dim0": ((64, 64, 128), 2, 0, 0.0),
+    "4d_aligned_dim2": ((2, 4, 64, 64), 16, 2, -1.0),
+    # Unaligned.
+    "2d_dim0": ((67, 256), 8, 0, -1.0),
+    "2d_dim1": ((256, 64), 12, 1, -1.0),
+    "3d_dim0": ((67, 71, 256), 2, 0, 0.0),
+    "4d_dim0": ((6, 17, 7, 64), 2, 0, -1.0),
+    "4d_dim2": ((6, 17, 64, 64), 16, 2, 0.0),
+    # Other fill values on one aligned and one unaligned shape.
+    "2d_aligned_dim0_fill_neginf": ((64, 128), 8, 0, float("-inf")),
+    "2d_dim0_fill_neginf": ((67, 256), 8, 0, float("-inf")),
+    "2d_aligned_dim0_fill_pos": ((64, 128), 8, 0, 5.0),
+    "2d_dim0_fill_pos": ((67, 256), 8, 0, 5.0),
+}
+
+
+def _masking_ops_params(dtype):
+    """Param sets for _MASKING_OPS_CASES, with values generated in ``dtype``."""
+    suffix = {torch.float16: "", torch.float32: "_fp32"}[dtype]
+    return {
+        f"{name}{suffix}": (
+            unique_randn_along_dim(shape, dim=dim, dtype=dtype),
+            k,
+            dim,
+            fill,
+        )
+        for name, (shape, k, dim, fill) in _MASKING_OPS_CASES.items()
+    }
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -2648,85 +2683,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_keep_by_index", "test_keep_by_index_cpu"): {
-            "param_sets": {
-                "2d_dim0": (
-                    unique_randn_along_dim((67, 256), dim=0),
-                    8,
-                    0,
-                    -1.0,
-                ),
-                "2d_dim1": (
-                    unique_randn_along_dim((256, 64), dim=1),
-                    12,
-                    1,
-                    -1.0,
-                ),
-                "3d_dim0": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    2,
-                    0,
-                    0.0,
-                ),
-                "4d_dim0": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    2,
-                    0,
-                    -1.0,
-                ),
-                "4d_dim2": (
-                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
-                    16,
-                    2,
-                    0.0,
-                ),
+        ("test", "test_masking_ops_cpu"): {
+            "ops_dict": {
+                "keep_by_index": torch.ops.spyre.keep_by_index,
+                "mask_by_index": torch.ops.spyre.mask_by_index,
             },
-        },
-        ("test_mask_by_index", "test_mask_by_index_cpu"): {
-            # mask_by_index always masks with -inf, so there is no fill value.
             "param_sets": {
-                # Stick-aligned (every dim a multiple of 64).
-                "2d_aligned_dim0": (
-                    unique_randn_along_dim((64, 128), dim=0),
-                    8,
-                    0,
-                ),
-                "3d_aligned_dim0": (
-                    unique_randn_along_dim((64, 64, 128), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_aligned_dim2": (
-                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
-                    16,
-                    2,
-                ),
-                # Unaligned.
-                "2d_dim0": (
-                    unique_randn_along_dim((67, 256), dim=0),
-                    8,
-                    0,
-                ),
-                "2d_dim1": (
-                    unique_randn_along_dim((256, 64), dim=1),
-                    12,
-                    1,
-                ),
-                "3d_dim0": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_dim0": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_dim2": (
-                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
-                    16,
-                    2,
-                ),
+                **_masking_ops_params(torch.float16),
+                **_masking_ops_params(torch.float32),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -11732,30 +11696,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with pytest.raises(Exception, match="the indices are held in float16"):
             _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
 
-    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+    def test_masking_ops_cpu(self, op, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
+        indices = indices.to(x.dtype)
 
         def fn(x, indices):
-            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+            return op(x, indices, dim, fill_value)
 
         compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(
-            x.to("spyre"), indices.to(torch.float16).to("spyre")
-        ).cpu()
-        expected = fn(x, indices)
-
-        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
-
-    def test_mask_by_index_cpu(self, x, k: int, dim: int):
-        _, indices = torch.topk(x, k, dim=dim, largest=True)
-
-        def fn(x, indices):
-            return torch.ops.spyre.mask_by_index(x, indices, dim)
-
-        compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(
-            x.to("spyre"), indices.to(torch.float16).to("spyre")
-        ).cpu()
+        result_spyre = compiled_fn(x.to("spyre"), indices.to("spyre")).cpu()
         expected = fn(x, indices)
 
         torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
