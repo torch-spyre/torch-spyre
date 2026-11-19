@@ -54,7 +54,9 @@ The tests cover two approaches for handling K at decode time:
 
   This requires ``spyre.scaled_bmm`` (``torch.ops.spyre.scaled_bmm``) and the
   QFP8WT 2D-stick scatter fix in the compiler (``index_copy_`` emits 2D-stick
-  HBM layout for QFP8WT destinations).
+  HBM layout for QFP8WT destinations).  The cache must be allocated as QFP8WT
+  (``spyre_empty_with_layout(..., QFP8WT)``): the caller's tensor keeps the
+  layout it was allocated with, so a STANDARD cache is rejected at compile time.
 
 Test classes
 ------------
@@ -2535,27 +2537,6 @@ class TestFp8Qfp8wtBatchTransfer:
     values, so a transfer that reused the first element's offsets would fail.
     """
 
-    @pytest.mark.parametrize(
-        "shape", [(2, 128, 128), (3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)]
-    )
-    def test_batched_round_trip(self, shape):
-        n = 1
-        for s in shape:
-            n *= s
-        host = ((torch.arange(n) % 251).to(torch.float16).reshape(shape)).to(
-            torch.float8_e4m3fn
-        )
-        stl = SpyreTensorLayout(
-            list(host.shape),
-            list(host.stride()),
-            torch.float8_e4m3fn,
-            list(range(host.dim())),
-            ElementArrangement.QFP8WT,
-        )
-        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
-        copy_tensor(host, dev, non_blocking=False)
-        assert torch.equal(dev.cpu().view(torch.uint8), host.view(torch.uint8))
-
     @staticmethod
     def _device_tensor(shape):
         n = 1
@@ -2574,6 +2555,13 @@ class TestFp8Qfp8wtBatchTransfer:
         dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
         copy_tensor(host, dev, non_blocking=False)
         return host, dev
+
+    @pytest.mark.parametrize(
+        "shape", [(2, 128, 128), (3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)]
+    )
+    def test_batched_round_trip(self, shape):
+        host, dev = self._device_tensor(shape)
+        assert torch.equal(dev.cpu().view(torch.uint8), host.view(torch.uint8))
 
     @pytest.mark.parametrize("shape", [(3, 2, 128, 64), (NUM_BLOCKS, 2, 128, 128)])
     def test_batch_view_reads_its_own_matrix(self, shape):
