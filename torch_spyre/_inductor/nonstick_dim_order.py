@@ -1180,19 +1180,6 @@ def _insert_mutation_relayout_copy(
         f"got {type(target_layout).__name__}"
     )
 
-    # If the target already has exactly the required layout, no copy-in/copy-back
-    # is needed — the scatter can write directly into the target buffer.
-    # (QFP8WT targets never get here: they are rewritten in place by
-    # reorder_nonstick_dims_mutation.)
-    if target_layout.device_layout == required_stl:
-        logger.info(
-            "nonstick_dim_order: scatter target %s already has required layout "
-            "(%s) — skipping copy-in/copy-back",
-            target_name,
-            required_stl,
-        )
-        return
-
     buf_tmp_layout = _fixed_tiled(target_layout, required_stl)
     orig_stl_layout = target_layout
 
