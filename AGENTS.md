@@ -139,7 +139,6 @@ them with `PARAMS`, and `pr-review` checks them.
 | `TORCH_SPYRE_NARROWING_CHECK` | Guards that split a `dynamic=` range: `warn` (default), `error`, `off` |
 | `TORCH_SPYRE_RECOMPILE_CHECK` | Recompiles that break a `dynamic=` range: `warn` (default), `error`, `all`, `off` |
 
-
 ## Spyre Hardware Basics
 
 - Default dtype: `torch.float16`
