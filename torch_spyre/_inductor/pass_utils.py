@@ -2921,6 +2921,25 @@ def restickify_device_size(
     return new_device_size
 
 
+def _tmp_log_restick(event, stl, idc, **kw):  # TEMP-LOG
+    import json  # TEMP-LOG
+    import os  # TEMP-LOG
+
+    rec = {  # TEMP-LOG
+        "event": event,  # TEMP-LOG
+        "test": os.environ.get("PYTEST_CURRENT_TEST"),  # TEMP-LOG
+        "pid": os.getpid(),  # TEMP-LOG
+        "device_size": list(stl.device_size),  # TEMP-LOG
+        "stride_map": list(stl.stride_map),  # TEMP-LOG
+        "ve": {str(k): v for k, v in stl.valid_elements.items()},  # TEMP-LOG
+        "idc": [str(e) for e in idc],  # TEMP-LOG
+    }  # TEMP-LOG
+    rec.update(kw)  # TEMP-LOG
+    path = "/home/marnold/dt-inductor/torch-spyre/skips.jsonl"  # TEMP-LOG
+    with open(path, "a") as f:  # TEMP-LOG
+        f.write(json.dumps(rec, default=str) + "\n")  # TEMP-LOG
+
+
 def _ve_for_dim(valid_elements: dict, dim: int) -> int | None:
     """Return the valid_elements count for the group containing ``dim``."""
     for key, val in valid_elements.items():
@@ -3144,6 +3163,29 @@ def compute_restickify_target_layout(
     _ve_reliable = old_var is None or _ve_same_group(
         stl.valid_elements, old_sd_outer_dim, stick_dim
     )
+    _tmp_log_restick(  # TEMP-LOG
+        "crtl_ran"  # TEMP-LOG
+        # TEMP-LOG
+        if (
+            _old_var_elems is not None  # TEMP-LOG
+            and _new_var_elems is not None  # TEMP-LOG
+            and _ve_reliable  # TEMP-LOG
+        )  # TEMP-LOG
+        else "crtl_skip",  # TEMP-LOG
+        stl=stl,  # TEMP-LOG
+        idc=idc,  # TEMP-LOG
+        old_sd=old_sd_outer_dim,  # TEMP-LOG
+        new_sd=new_sd_outer_dim,  # TEMP-LOG
+        old_var=old_var,  # TEMP-LOG
+        new_var=new_var,  # TEMP-LOG
+        old_elems=_old_var_elems,  # TEMP-LOG
+        new_elems=_new_var_elems,  # TEMP-LOG
+        reliable=_ve_reliable,  # TEMP-LOG
+        old_result=device_size,  # TEMP-LOG
+        old_sd_host_size=old_sd_host_size,  # TEMP-LOG
+        new_sd_host_size=new_sd_host_size,  # TEMP-LOG
+        stick_size=stick_size,  # TEMP-LOG
+    )  # TEMP-LOG
     if _old_var_elems is not None and _new_var_elems is not None and _ve_reliable:
         _new_device_size = restickify_device_size_new(
             old_device_size,
@@ -3257,6 +3299,24 @@ def compute_size1_restickify_layout(
     stick_dim_s1 = len(stl.device_size) - 1
     _old_var_elems_s1 = _ve_for_dim(stl.valid_elements, old_sd_outer_dim)
     _ve_reliable_s1 = _ve_same_group(stl.valid_elements, old_sd_outer_dim, stick_dim_s1)
+    _tmp_log_restick(  # TEMP-LOG
+        "csrl_ran"  # TEMP-LOG
+        if (_old_var_elems_s1 is not None and _ve_reliable_s1)  # TEMP-LOG
+        else "csrl_skip",  # TEMP-LOG
+        stl=stl,  # TEMP-LOG
+        idc=idc,  # TEMP-LOG
+        old_sd=old_sd_outer_dim,  # TEMP-LOG
+        new_sd=new_sd_outer_dim,  # TEMP-LOG
+        old_var=old_var,  # TEMP-LOG
+        new_var=None,  # TEMP-LOG
+        old_elems=_old_var_elems_s1,  # TEMP-LOG
+        new_elems=1,  # TEMP-LOG
+        reliable=_ve_reliable_s1,  # TEMP-LOG
+        old_result=device_size,  # TEMP-LOG
+        old_sd_host_size=old_sd_host_size,  # TEMP-LOG
+        new_sd_host_size=1,  # TEMP-LOG
+        stick_size=stick_size,  # TEMP-LOG
+    )  # TEMP-LOG
     if _old_var_elems_s1 is not None and _ve_reliable_s1:
         _new_device_size_s1 = restickify_device_size_new(
             list(stl.device_size),
