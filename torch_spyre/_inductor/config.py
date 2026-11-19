@@ -236,9 +236,13 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 # compilation pipeline; until then these knobs are read only by the
 # helper and its unit tests. See #2284, #2287 for the design.
 
-# Cap on bucket count (= max_size / granularity).
-# TODO: confirm the default with the Deeptools team.
-max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+# Cap on bucket count (= max_size / granularity): the number of candidate
+# iterations of a loop over a declared dimension, one correction slot each.
+# 256 covers a 32K context at 128 tokens per page with granularity 1. Nothing
+# in the kernel, launch or correction path reads this knob; the measurements
+# behind the default are on #6432. A consumer may set it per process, by this
+# env variable or on this module before the first declaration.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "256"))
 
 # Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
 # plugin's linear wrapper branches on a row count below this, which would
@@ -403,23 +407,6 @@ ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
-
-# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
-# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
-# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
-# the CoarseTileInfo transform is deleted.
-def _choose_loop_tiling_lowering(value: str) -> str:
-    if value not in ("legacy", "plan"):
-        raise ValueError(
-            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
-            "'plan'"
-        )
-    return value
-
-
-loop_tiling_lowering: str = _choose_loop_tiling_lowering(
-    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
-)
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
