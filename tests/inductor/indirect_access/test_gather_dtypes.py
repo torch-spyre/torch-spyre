@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -139,20 +139,20 @@ class TestGatherValueAndIndexDtypeCoverage:
     # -- downstream dtype combinations ------------------------------------
 
     @pytest.mark.parametrize(
-        "val_dtype,downstream,diff_key,atol",
+        "val_dtype,downstream,diff_key,tol",
         [
             (torch.bfloat16, torch.exp, "gdt13", 2e-2),
             (torch.float32, torch.abs, "gdt14", 1e-5),
         ],
     )
     def test_gather_with_downstream_dtype(
-        self, execution_mode, val_dtype, downstream, diff_key, atol
+        self, execution_mode, val_dtype, downstream, diff_key, tol
     ):
         """gather + downstream op fused; dtype-specific tolerance."""
         x = cached_randn((32, 128), differentiation=diff_key, dtype=val_dtype)
         idx = torch.randint(0, 32, (16,), dtype=torch.int32)
         compare_mode(
-            execution_mode, lambda x, i: downstream(x[i]), x, idx, atol=atol, rtol=atol
+            execution_mode, lambda x, i: downstream(x[i]), x, idx, atol=tol, rtol=tol
         )
 
     # -- SDSC wordLength checks (structural; run compile, check output) ---

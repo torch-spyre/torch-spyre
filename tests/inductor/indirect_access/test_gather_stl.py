@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -84,13 +84,13 @@ import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
 # bit fewer than fp16), so the error grows with the number of rows and depends on
 # which rows are drawn.  Measured over 1500 random index draws against an fp32
 # reference the largest error was 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps
 # ~25% above that and stays 30x below the error of one wrong row (~1).
-_ATOL_F16_SUM = 3e-2
+_TOL_F16_SUM = 3e-2
 
 # ---------------------------------------------------------------------------
 # Module-level xfail issue markers
@@ -268,8 +268,8 @@ class TestGatherImplicitLayout:
             lambda x, i: torch.tanh(x[i]),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_2d_with_scalar_div(self, execution_mode):
@@ -296,8 +296,8 @@ class TestGatherImplicitLayout:
             lambda x, i: x[i].sum(dim=1),
             x,
             idx,
-            atol=_ATOL_F16_SUM,
-            rtol=_ATOL_F16_SUM,
+            atol=_TOL_F16_SUM,
+            rtol=_TOL_F16_SUM,
         )
 
     def test_interior_dim_no_stl_needed(self, execution_mode):
@@ -623,8 +623,8 @@ class TestGatherExplicitStl4Arg:
             x,
             idx,
             execution_mode,
-            _ATOL_F16,
-            _ATOL_F16,
+            _TOL_F16,
+            _TOL_F16,
         )
 
     def test_4arg_with_named_dims(self, execution_mode):

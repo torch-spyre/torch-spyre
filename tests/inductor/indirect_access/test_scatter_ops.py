@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,10 +34,10 @@ from conftest import (
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
 # (layer norm).
-_ATOL_F32 = 1e-5
+_TOL_F32 = 1e-5
 
 
 _MASKED_FILL_FP32 = rejection(
@@ -101,13 +101,13 @@ class TestIndexReduceEagerCompile:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
         _xfail_existing(execution_mode, eager=_IR_OUT, compiled=_IR_MEAN_CONST)
 
-    def _run(self, execution_mode, dst, src, idx, reduce_op, atol):
+    def _run(self, execution_mode, dst, src, idx, reduce_op, tol):
         def fn(dst, src, idx):
             return dst.clone().index_reduce_(
                 0, idx, src, reduce=reduce_op, include_self=False
             )
 
-        compare_mode(execution_mode, fn, dst, src, idx, atol=atol, rtol=atol)
+        compare_mode(execution_mode, fn, dst, src, idx, atol=tol, rtol=tol)
 
     def test_index_reduce_mean_dim0(self, execution_mode):
         """index_reduce_ mean on dim=0; duplicate indices average rows into destination.
@@ -121,7 +121,7 @@ class TestIndexReduceEagerCompile:
             (3, 8), differentiation="irdc_mean01_src", dtype=torch.float16
         )
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "mean", _ATOL_F16)
+        self._run(execution_mode, dst, src, idx, "mean", _TOL_F16)
 
     def test_index_reduce_prod_dim0(self, execution_mode):
         """index_reduce_ prod on dim=0; duplicate indices multiply rows into destination."""
@@ -131,7 +131,7 @@ class TestIndexReduceEagerCompile:
             (3, 8), differentiation="irdc_prod01_src", dtype=torch.float16
         )
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "prod", _ATOL_F16)
+        self._run(execution_mode, dst, src, idx, "prod", _TOL_F16)
 
     def test_index_reduce_amax_dim0(self, execution_mode):
         """index_reduce_ amax on dim=0; duplicate indices take element-wise max across rows."""
@@ -141,7 +141,7 @@ class TestIndexReduceEagerCompile:
             (3, 8), differentiation="irdc_amax01_src", dtype=torch.float16
         )
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "amax", _ATOL_F16)
+        self._run(execution_mode, dst, src, idx, "amax", _TOL_F16)
 
     def test_index_reduce_amin_dim0(self, execution_mode):
         """index_reduce_ amin on dim=0; duplicate indices take element-wise min across rows."""
@@ -151,7 +151,7 @@ class TestIndexReduceEagerCompile:
             (3, 8), differentiation="irdc_amin01_src", dtype=torch.float16
         )
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "amin", _ATOL_F16)
+        self._run(execution_mode, dst, src, idx, "amin", _TOL_F16)
 
     def test_index_reduce_mean_float32(self, execution_mode):
         """index_reduce_ mean in float32; validates 4-byte word path for row accumulation."""
@@ -161,7 +161,7 @@ class TestIndexReduceEagerCompile:
             (3, 8), differentiation="irdc_f32_01_src", dtype=torch.float32
         )
         idx = torch.tensor([2, 0, 2], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "mean", _ATOL_F32)
+        self._run(execution_mode, dst, src, idx, "mean", _TOL_F32)
 
     def test_index_reduce_single_index(self, execution_mode):
         """index_reduce_ with a single-element index; boundary case — P=1 row update."""
@@ -171,7 +171,7 @@ class TestIndexReduceEagerCompile:
             (1, 16), differentiation="irdc_p1_01_src", dtype=torch.float16
         )
         idx = torch.tensor([3], dtype=torch.int64)
-        self._run(execution_mode, dst, src, idx, "amax", _ATOL_F16)
+        self._run(execution_mode, dst, src, idx, "amax", _TOL_F16)
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +391,8 @@ class TestPutFlatIndexWriteEagerCompile:
             x,
             idx,
             vals,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_put_overwrite_float32(self, execution_mode):
@@ -423,8 +423,8 @@ class TestPutFlatIndexWriteEagerCompile:
             x,
             idx,
             vals,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_put_bfloat16(self, execution_mode):
@@ -564,8 +564,8 @@ class TestScatterRouterMaps:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_qwen3_router_k8(self, execution_mode):
@@ -596,8 +596,8 @@ class TestScatterRouterMaps:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
 
@@ -816,7 +816,7 @@ class TestScatterReduceLegacyGroupedMm:
             out.scatter_(0, i, s, reduce="multiply")
             return out
 
-        compare_mode(execution_mode, fn, dst, idx, src, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, dst, idx, src, atol=_TOL_F16, rtol=_TOL_F16)
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -854,8 +854,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_reduce_prod_colliding_dim0(self, execution_mode, patch_sencores):
@@ -870,8 +870,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_reduce_mean_colliding_dim0(self, execution_mode, patch_sencores):
@@ -886,8 +886,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_reduce_amin_must_write_dim0(self, execution_mode, patch_sencores):
@@ -902,8 +902,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_reduce_sum_dim1_fp16(self, execution_mode):
@@ -941,8 +941,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_scatter_reduce_sum_dim1_fp32(self, execution_mode):
@@ -968,8 +968,8 @@ class TestScatterReduceTwoColliding:
             dst,
             idx,
             src,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
 
@@ -995,4 +995,4 @@ class TestScatterReduceCompileDynamic:
             lambda d, i, s: d.scatter_reduce(0, i, s, reduce="sum"),
             dynamic=True,
         )(dst.to(DEVICE), idx.to(DEVICE), src.to(DEVICE)).cpu()
-        torch.testing.assert_close(got, ref, atol=_ATOL_F16, rtol=_ATOL_F16)
+        torch.testing.assert_close(got, ref, atol=_TOL_F16, rtol=_TOL_F16)

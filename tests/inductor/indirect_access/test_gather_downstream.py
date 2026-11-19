@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,20 +25,20 @@ from conftest import _xfail_existing, compare_mode
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
 # bit fewer than fp16), so the error grows with the number of rows and depends on
 # which rows are drawn.  Measured over 1500 random index draws against an fp32
 # reference the largest error was 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps
 # ~25% above that and stays 30x below the error of one wrong row (~1).
-_ATOL_F16_SUM = 3e-2
+_TOL_F16_SUM = 3e-2
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
 # error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
-_ATOL_BF16 = 2e-2
+_TOL_BF16 = 2e-2
 # fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
 # (layer norm).
-_ATOL_F32 = 1e-5
+_TOL_F32 = 1e-5
 
 _NUMERICAL_MISMATCH = (
     6391,
@@ -87,8 +87,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: op(x[i]),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_sqrt_bfloat16(self, execution_mode):
@@ -102,8 +102,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.sqrt(x[i]),
             x,
             idx,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=_TOL_BF16,
+            rtol=_TOL_BF16,
         )
 
     def test_gather_exp_float32(self, execution_mode):
@@ -122,8 +122,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.exp(x[i].clamp(max=10.0)),
             x,
             idx,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_gather_triple_unary(self, execution_mode):
@@ -135,8 +135,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.sigmoid(torch.tanh(torch.exp(x[i].clamp(max=5.0)))),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_scalar_sub(self, execution_mode):
@@ -148,8 +148,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: x[i] - 0.5,
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_scalar_div(self, execution_mode):
@@ -174,15 +174,15 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: x[i].mean(dim=1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_sum_dim0(self, execution_mode):
         """sum(dim=0) after gather; output shape (128,).
 
         Index is seeded: the device accumulates 16 fp16 rows in dl16, and the error
-        depends on which rows are drawn (see _ATOL_F16_SUM).
+        depends on which rows are drawn (see _TOL_F16_SUM).
         """
         x = cached_randn((32, 128), differentiation="gds10", dtype=torch.float16)
         idx = cached_randint(
@@ -193,8 +193,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: x[i].sum(dim=0),
             x,
             idx,
-            atol=_ATOL_F16_SUM,
-            rtol=_ATOL_F16_SUM,
+            atol=_TOL_F16_SUM,
+            rtol=_TOL_F16_SUM,
         )
 
     def test_gather_cos_cpu_fallback(self, execution_mode):
@@ -208,8 +208,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.cos(x[i].float()).half(),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_log_cpu_fallback(self, execution_mode):
@@ -225,8 +225,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.log(x[i].float().clamp(min=1e-6)).half(),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_softmax(self, execution_mode):
@@ -240,8 +240,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.softmax(x[i].float(), dim=-1).half(),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_abs_then_sum(self, execution_mode):
@@ -253,8 +253,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.abs(x[i]).sum(dim=1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_scalar_mul_3d(self, execution_mode):
@@ -298,8 +298,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.exp(x[i]).sum(dim=1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     # ------------------------------------------------------------------
@@ -314,8 +314,8 @@ class TestGatherFusedDownstreamOperations:
             lambda x, i: torch.exp(x[i]),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_compile_cache_hit_with_downstream(self, execution_mode):
@@ -338,8 +338,8 @@ class TestGatherFusedDownstreamOperations:
             x,
             bias,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_then_mul_and_add_residual(self, execution_mode):
@@ -357,6 +357,6 @@ class TestGatherFusedDownstreamOperations:
             residual,
             gate,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )

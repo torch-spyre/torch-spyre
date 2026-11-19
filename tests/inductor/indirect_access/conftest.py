@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,16 +49,20 @@ except ImportError:
 MULTICORE_SENCORES = (1, _max_sencores)
 
 
-def pytest_configure(config):
-    """Ensure OpSpec validation is enabled and dynamo recompile limits are high."""
-    os.environ["SPYRE_VALIDATE_OP_SPECS"] = "1"
-    try:
-        import torch._dynamo.config
+@pytest.fixture(scope="module", autouse=True)
+def _raised_dynamo_recompile_limits():
+    """Raise Dynamo's recompile limits for this directory only, then restore them.
 
-        torch._dynamo.config.accumulated_recompile_limit = 65536
-        torch._dynamo.config.recompile_limit = 65536
-    except Exception:
-        pass
+    Many shape and dtype variants compile in one process, which exceeds the
+    production limit. ``config.patch`` puts the old values back when the module
+    ends, so a run such as ``pytest tests/inductor/`` does not change the
+    settings of other tests. OpSpec validation needs no setting here:
+    ``tests/inductor/conftest.py`` already enables it for this directory.
+    """
+    with torch._dynamo.config.patch(
+        recompile_limit=65536, accumulated_recompile_limit=65536
+    ):
+        yield
 
 
 def _parametrized_argnames(metafunc):
@@ -143,6 +147,18 @@ def pytest_runtest_makereport(item, call):
     the xfail. xfail_existing records the expected message pattern on the item;
     here, a failure whose message does not match is turned into a real FAILED
     so the stale or wrong reason is noticed. XPASS stays a strict failure.
+
+    Why a hook and not ``@expects_raise`` with ``pytest.raises(match=...)``
+    (AGENTS.md): every test here runs in eager, 1-core compiled and chip-max
+    compiled mode, and the expected outcome differs per mode. Eager can raise
+    ``Could not run 'aten::X'`` while the compiled rows pass, or the reverse. One
+    ``xfail_existing(...)`` call at the top of the test declares the expectation
+    for each mode, and this hook applies it without wrapping the body in
+    ``pytest.raises`` under an ``if execution_mode`` at about 120 call sites. The
+    semantics match ``pytest.raises(match=...)``: the test passes only on the
+    documented message, and the failure text says when the gap is fixed.
+    ``expect_dynamic_true_refused`` has one expectation for every mode, so it
+    uses the standard form (``pytest.raises`` plus ``expects_raise``).
     """
     outcome = yield
     rep = outcome.get_result()

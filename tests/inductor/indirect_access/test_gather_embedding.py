@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,16 +25,16 @@ from conftest import _xfail_existing, compare_mode, rejection
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # fp16 sum over 12-16 gathered rows.  The device accumulates in dl16 (one mantissa
 # bit fewer than fp16), so the error grows with the number of rows and depends on
 # which rows are drawn.  Measured over 1500 random index draws against an fp32
 # reference the largest error was 2.4e-2 (1e-2 is exceeded in 17% of draws).  3e-2 keeps
 # ~25% above that and stays 30x below the error of one wrong row (~1).
-_ATOL_F16_SUM = 3e-2
+_TOL_F16_SUM = 3e-2
 # fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
 # (layer norm).
-_ATOL_F32 = 1e-5
+_TOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = rejection(
     6335,
@@ -162,8 +162,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda w, i: torch.exp(w[i]),
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_embedding_functional_api(self, execution_mode):
@@ -195,7 +195,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lm_out = torch.matmul(h, w.t())
             return emb_out, lm_out
 
-        compare_mode(execution_mode, fn, w, h, idx, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, w, h, idx, atol=_TOL_F16, rtol=_TOL_F16)
 
     # ------------------------------------------------------------------
 
@@ -216,8 +216,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_embeddingbag_mean_mode(self, execution_mode):
@@ -237,8 +237,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_embeddingbag_max_mode(self, execution_mode):
@@ -258,8 +258,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_embeddingbag_max_float16(self, execution_mode):
@@ -279,8 +279,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_embeddingbag_per_sample_weights(self, execution_mode):
@@ -306,8 +306,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             input_ids,
             offsets,
             per_sample_w,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_embeddingbag_large_vocab(self, execution_mode):
@@ -327,8 +327,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_embeddingbag_single_bag(self, execution_mode):
@@ -348,8 +348,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             input_ids,
             offsets,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_embeddingbag_nn_module(self, execution_mode):
@@ -372,8 +372,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             input_ids,
             offsets,
             w,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_lookup_table_two_tables(self, execution_mode):
@@ -397,7 +397,7 @@ class TestGatherEmbeddingTableLookupAndPooling:
         """GEMB2-09: Lookup + sum pooling; table[idx].sum(dim=0).
 
         Index is seeded: the device accumulates 16 fp16 rows in dl16, and the error
-        depends on which rows are drawn (see _ATOL_F16_SUM).
+        depends on which rows are drawn (see _TOL_F16_SUM).
         """
         w = cached_randn((64, 128), differentiation="emb2_09", dtype=torch.float16)
         idx = cached_randint(
@@ -408,8 +408,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda w, i: w[i].sum(dim=0),
             w,
             idx,
-            atol=_ATOL_F16_SUM,
-            rtol=_ATOL_F16_SUM,
+            atol=_TOL_F16_SUM,
+            rtol=_TOL_F16_SUM,
         )
 
     def test_lookup_table_mean_pooling(self, execution_mode):
@@ -421,8 +421,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda w, i: w[i].mean(dim=0),
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_lookup_table_concat(self, execution_mode):
@@ -463,8 +463,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             idx,
             weight,
             bias,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
     def test_lookup_table_with_linear(self, execution_mode):
@@ -485,8 +485,8 @@ class TestGatherEmbeddingTableLookupAndPooling:
             w,
             idx,
             proj_weight,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_embedding_max_norm_renorm(self, execution_mode):
@@ -507,6 +507,6 @@ class TestGatherEmbeddingTableLookupAndPooling:
             lambda w, i: F.embedding(i, w.clone(), max_norm=1.0),
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )

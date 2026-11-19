@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ from conftest import (
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 
 _INDEX_2D_EAGER = rejection(
     6335,
@@ -133,8 +133,8 @@ class TestGatherInferencePatternsEagerCompile:
             w,
             ids,
             scores,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_moe_multi_layer(self, execution_mode):
@@ -210,8 +210,8 @@ class TestGatherInferencePatternsEagerCompile:
             kv,
             q,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_paged_kv_full_attention(self, execution_mode):
@@ -232,8 +232,8 @@ class TestGatherInferencePatternsEagerCompile:
             kv_v,
             q,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_paged_kv_two_gathers(self, execution_mode):
@@ -260,7 +260,7 @@ class TestGatherInferencePatternsEagerCompile:
             idx = torch.randint(0, 512, (lk,), dtype=torch.int64)
             expected = kv[idx]
             result = fn(kv.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, expected, atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, expected, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_paged_kv_5d_split_kv(self, execution_mode):
         """FMS 5D combined K+V along dim=1; gather + split downstream."""
@@ -323,9 +323,7 @@ class TestGatherInferencePatternsEagerCompile:
             idx = pos.view(-1, 1, 1).expand(-1, 1, x.shape[-1])
             return x.gather(1, idx).squeeze(1)
 
-        compare_mode(
-            execution_mode, fn, logits, last_pos, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, logits, last_pos, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_vllm_4d_kv_layout(self, execution_mode):
         """vLLM native 4D KV layout (num_blocks, block_sz, kv_h, head_d)."""
@@ -393,8 +391,8 @@ class TestGatherInferencePatternsEagerCompile:
             ).diagonal(),
             probs,
             draft_tokens,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     # ------------------------------------------------------------------
@@ -551,9 +549,7 @@ class TestGatherInferencePatternsEagerCompile:
             selected = expert_w[ids.flatten()].view(4, 2, 64)
             return (selected * weights.unsqueeze(-1)).sum(dim=1)
 
-        compare_mode(
-            execution_mode, fn, expert_w, logits, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, expert_w, logits, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_topk_speculative_candidate_embed(self, execution_mode, patch_sencores):
         """Speculative decode: topk draft candidates → gather their token embeddings."""
@@ -573,7 +569,7 @@ class TestGatherInferencePatternsEagerCompile:
             candidate_ids = torch.topk(scores.float(), 16).indices.to(torch.int64)
             return embed[candidate_ids]
 
-        compare_mode(execution_mode, fn, embed, scores, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, embed, scores, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_topk_beam_search_kv_reorder(self, execution_mode):
         """Beam search: topk beam scores → gather KV rows for top beams."""
@@ -588,9 +584,7 @@ class TestGatherInferencePatternsEagerCompile:
             beam_ids = torch.topk(scores.float(), 4).indices.to(torch.int64)
             return kv[beam_ids]
 
-        compare_mode(
-            execution_mode, fn, kv, beam_scores, atol=_ATOL_F16, rtol=_ATOL_F16
-        )
+        compare_mode(execution_mode, fn, kv, beam_scores, atol=_TOL_F16, rtol=_TOL_F16)
 
     # ------------------------------------------------------------------
 

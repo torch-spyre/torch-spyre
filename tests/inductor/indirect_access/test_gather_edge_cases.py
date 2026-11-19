@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,14 +24,14 @@ from conftest import _xfail_existing, compare_mode, rejection
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
 # error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
-_ATOL_BF16 = 2e-2
+_TOL_BF16 = 2e-2
 # fp32 compute.  The largest error measured against an fp32 CPU reference is 4.3e-7
 # (layer norm).
-_ATOL_F32 = 1e-5
+_TOL_F32 = 1e-5
 
 _INDEX_2D_EAGER = rejection(
     6335,
@@ -488,7 +488,7 @@ class TestGatherBoundaryNumericsAndAPIForms:
         else:
             fn = torch.compile(lambda x, i: x[i], fullgraph=True)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_api_take_along_dim_argmax(self, execution_mode):
         """take_along_dim(x, argmax, dim=0); pick argmax rows."""
@@ -537,8 +537,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: torch.softmax(x[i].float(), dim=-1).half(),
             logits,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     # ------------------------------------------------------------------
@@ -618,8 +618,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             x,
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_two_gathers_sequential_independent_correct(self, execution_mode):
@@ -661,8 +661,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             a,
             b,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_cor_inner_dim_multiple_sticks(self, execution_mode):
@@ -682,8 +682,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: F.normalize(x[i].float(), dim=-1).half(),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_cor_gather_3d_non_leading(self, execution_mode):
@@ -725,8 +725,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, i: x[i].sum(dim=-1),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     # ------------------------------------------------------------------
@@ -981,8 +981,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
             lambda x, m: torch.masked_select(x, m),
             x,
             mask,
-            atol=_ATOL_F32,
-            rtol=_ATOL_F32,
+            atol=_TOL_F32,
+            rtol=_TOL_F32,
         )
 
 
@@ -1019,7 +1019,7 @@ class TestGatherOutParameterEagerCompile:
             out = torch.empty(P, N, dtype=torch.float16, device=x.device)
             return torch.gather(x, 0, idx, out=out)
 
-        compare_mode(execution_mode, fn, x, idx, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, x, idx, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_out_dim1(self, execution_mode):
         """torch.gather(x, 1, idx, out=buf): out= with dim=1 gather for GQA head selection."""
@@ -1034,7 +1034,7 @@ class TestGatherOutParameterEagerCompile:
             out = torch.empty(B, K, D, dtype=torch.float16, device=x.device)
             return torch.gather(x, 1, idx, out=out)
 
-        compare_mode(execution_mode, fn, x, idx, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, x, idx, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_out_dim2(self, execution_mode):
         """torch.gather(x, 2, idx, out=buf): out= with dim=2 feature selection."""
@@ -1049,7 +1049,7 @@ class TestGatherOutParameterEagerCompile:
             out = torch.empty(B, H, K, dtype=torch.float16, device=x.device)
             return torch.gather(x, 2, idx, out=out)
 
-        compare_mode(execution_mode, fn, x, idx, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, x, idx, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_out_dim0_single_row(self, execution_mode):
         """out= with P=1 single-output gather; boundary case for buffer allocation."""
@@ -1064,7 +1064,7 @@ class TestGatherOutParameterEagerCompile:
             out = torch.empty(1, N, dtype=torch.float16, device=x.device)
             return torch.gather(x, 0, idx, out=out)
 
-        compare_mode(execution_mode, fn, x, idx, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, x, idx, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_out_dim0_reused_buffer(self, execution_mode):
         """out= buffer passed to two consecutive gather calls; second call overwrites first."""
@@ -1081,7 +1081,7 @@ class TestGatherOutParameterEagerCompile:
             torch.gather(x, 0, idx1, out=out)
             return torch.gather(x, 0, idx2, out=out)
 
-        compare_mode(execution_mode, fn, x, idx1, idx2, atol=_ATOL_F16, rtol=_ATOL_F16)
+        compare_mode(execution_mode, fn, x, idx1, idx2, atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_out_dim0_bfloat16(self, execution_mode):
         """out= gather on bfloat16 source; validates wordLength=2 on the out= path."""
@@ -1096,4 +1096,4 @@ class TestGatherOutParameterEagerCompile:
             out = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
             return torch.gather(x, 0, idx, out=out)
 
-        compare_mode(execution_mode, fn, x, idx, atol=_ATOL_BF16, rtol=_ATOL_BF16)
+        compare_mode(execution_mode, fn, x, idx, atol=_TOL_BF16, rtol=_TOL_BF16)

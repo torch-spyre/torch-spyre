@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@ from conftest import _xfail_existing, compare_mode, rejection
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
 # error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
-_ATOL_BF16 = 2e-2
+_TOL_BF16 = 2e-2
 
 
 _GATHER_EAGER = rejection(
@@ -106,8 +106,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             table1,
             table2,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_then_gather_on_output(self, execution_mode):
@@ -140,8 +140,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             emb,
             w,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_then_layer_norm(self, execution_mode):
@@ -156,8 +156,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             lambda e, i: F.layer_norm(e[i].float(), [128]).half(),
             emb,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_add_residual(self, execution_mode):
@@ -171,8 +171,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             emb,
             residual,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_split_rope_apply(self, execution_mode):
@@ -201,8 +201,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             t1,
             t2,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_then_scatter_add(self, execution_mode):
@@ -227,7 +227,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             return dst.clone().scatter_add_(0, idx, gathered)
 
         compare_mode(
-            execution_mode, fn, expert_w, ids, dst, atol=_ATOL_F16, rtol=_ATOL_F16
+            execution_mode, fn, expert_w, ids, dst, atol=_TOL_F16, rtol=_TOL_F16
         )
 
     # ------------------------------------------------------------------
@@ -262,8 +262,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             emb,
             W,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_rope_gather_broadcast(self, execution_mode):
@@ -313,8 +313,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             ),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_rope_gather_mul(self, execution_mode):
@@ -335,8 +335,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             sin,
             q,
             pos,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_gather_unbind_stack(self, execution_mode):
@@ -509,8 +509,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             ).diagonal(),
             probs,
             draft_tok,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_e2e_full_pipeline_bfloat16(self, execution_mode):
@@ -565,7 +565,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             return apply_rope(q), apply_rope(k)
 
         compare_mode(
-            execution_mode, fn, cos_sin, q, k, pos, atol=_ATOL_F16, rtol=_ATOL_F16
+            execution_mode, fn, cos_sin, q, k, pos, atol=_TOL_F16, rtol=_TOL_F16
         )
 
     def test_rope_interleaved_separate_cos_sin_caches(self, execution_mode):
@@ -586,5 +586,5 @@ class TestGatherComposedChainsAndEndToEndPipelines:
             return q * c + q_rot * s, k * c + k_rot * s
 
         compare_mode(
-            execution_mode, fn, cos, sin, q, k, pos, atol=_ATOL_F16, rtol=_ATOL_F16
+            execution_mode, fn, cos, sin, q, k, pos, atol=_TOL_F16, rtol=_TOL_F16
         )

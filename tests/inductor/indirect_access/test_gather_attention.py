@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,11 +26,11 @@ from conftest import _xfail_existing, compare_mode, rejection
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
 # error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
-_ATOL_BF16 = 2e-2
+_TOL_BF16 = 2e-2
 # fp16/bf16 scaled_dot_product_attention over gathered K/V (matmul + softmax + matmul).
 # The largest error measured against an fp32 reference is 6.5e-3 (fp16's own error:
 # 1.8e-3), so 2e-2 leaves about 3x margin.
-_ATOL_SDPA = 2e-2
+_TOL_SDPA = 2e-2
 
 
 _INDEX_2D_EAGER = rejection(
@@ -118,8 +118,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_paged_prefill_full_context(self, execution_mode):
@@ -146,8 +146,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_gqa_32q_8kv(self, execution_mode):
@@ -184,8 +184,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_mqa_single_kv_head(self, execution_mode):
@@ -212,8 +212,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_bfloat16_paged_decode(self, execution_mode):
@@ -240,8 +240,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_BF16,
-            rtol=_ATOL_BF16,
+            atol=_TOL_BF16,
+            rtol=_TOL_BF16,
         )
 
     def test_sdpa_attention_bias_neg_inf_padding(self, execution_mode, patch_sencores):
@@ -271,8 +271,8 @@ class TestGatherPagedAttentionAndSDPA:
             q,
             slots,
             attn_bias,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_batch_decode_b4(self, execution_mode):
@@ -306,8 +306,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_2d_slot_index_batched_decode(self, execution_mode, patch_sencores):
@@ -339,8 +339,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slot_idxs,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_rope_gather_then_attention(self, execution_mode):
@@ -392,8 +392,8 @@ class TestGatherPagedAttentionAndSDPA:
             q_raw,
             pos,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_chunked_prefill_then_single_decode(self, execution_mode):
@@ -424,8 +424,8 @@ class TestGatherPagedAttentionAndSDPA:
                 v_cache,
                 q,
                 slots,
-                atol=_ATOL_SDPA,
-                rtol=_ATOL_SDPA,
+                atol=_TOL_SDPA,
+                rtol=_TOL_SDPA,
             )
         q_dec = cached_randn(
             (1, H, 1, D), differentiation="attn14qd", dtype=torch.float16
@@ -444,8 +444,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q_dec,
             dec_slot,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_large_kv_pool_decode(self, execution_mode):
@@ -472,8 +472,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_separate_k_v_caches_different_shapes(self, execution_mode):
@@ -500,8 +500,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_output_then_linear_projection(self, execution_mode, patch_sencores):
@@ -543,8 +543,8 @@ class TestGatherPagedAttentionAndSDPA:
             q,
             out_proj,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_beam_reorder_then_attend(self, execution_mode):
@@ -579,8 +579,8 @@ class TestGatherPagedAttentionAndSDPA:
             q,
             slots,
             beam_idx,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_speculative_draft_verify(self, execution_mode, patch_sencores):
@@ -609,8 +609,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q_draft,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_4d_kv_layout_paged(self, execution_mode):
@@ -653,8 +653,8 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )
 
     def test_sdpa_4d_kv_reshape_before_permute(self, execution_mode):
@@ -697,6 +697,6 @@ class TestGatherPagedAttentionAndSDPA:
             v_cache,
             q,
             slots,
-            atol=_ATOL_SDPA,
-            rtol=_ATOL_SDPA,
+            atol=_TOL_SDPA,
+            rtol=_TOL_SDPA,
         )

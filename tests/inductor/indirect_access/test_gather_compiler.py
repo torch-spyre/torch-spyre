@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,11 +30,11 @@ from conftest import (
 # fp16 compute after a gather (unary, binary, small reductions).  The largest error
 # measured against an fp32 reference is 5.1e-3 (fp16's own compute error: up to 1.7e-3),
 # so 1e-2 leaves about 2x margin.  Pure data movement uses atol=0 instead.
-_ATOL_F16 = 1e-2
+_TOL_F16 = 1e-2
 # bf16 compute after a gather.  bf16 keeps 8 significant bits (one ulp ~ 4e-3); the
 # largest error measured against an fp32 reference is 7.1e-3 (bf16's own compute
 # error: up to 3.0e-3), so 2e-2 leaves about 2.8x margin.
-_ATOL_BF16 = 2e-2
+_TOL_BF16 = 2e-2
 
 _DXP_STANDALONE_FAIL = (
     4321,
@@ -107,7 +107,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         fn = torch.compile(lambda x, i: x[i], dynamic=True)
         result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-        torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+        torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     def test_gather_with_downstream_fused(self):
         """Downstream op fused into SDSC; single kernel generated."""
@@ -118,8 +118,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: torch.tanh(x[i]),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     # ------------------------------------------------------------------
@@ -162,7 +162,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             )
             idx = torch.randint(0, M, (16,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_dynamic_index_size(self):
@@ -172,7 +172,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         for P in (16, 32):
             idx = torch.randint(0, 64, (P,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_dynamic_inner_dim(self):
@@ -182,7 +182,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         for D in (64, 128):
             x = cached_randn((32, D), differentiation=f"dyn03_{D}", dtype=torch.float16)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_symbolic_gather_dim0(self):
@@ -191,7 +191,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         x = cached_randn((64, 64), differentiation="dyn05", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-        torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+        torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_symbolic_batch_seqlen(self):
@@ -201,7 +201,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         for B_Lk in (32, 64):
             idx = torch.randint(0, 512, (B_Lk,), dtype=torch.int64)
             result = fn(kv.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, kv[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, kv[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_dynamic_3d_source(self):
@@ -213,7 +213,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             )
             idx = torch.randint(0, M, (16,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_dynamic_with_downstream(self):
@@ -224,7 +224,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             idx = torch.randint(0, 64, (P,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
             expected = torch.tanh(x[idx])
-            torch.testing.assert_close(result, expected, atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, expected, atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_dynamic_bfloat16(self):
@@ -236,7 +236,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             )
             idx = torch.randint(0, 64, (P,), dtype=torch.int64)
             result = fn(x.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, x[idx], atol=_ATOL_BF16, rtol=_ATOL_BF16)
+            torch.testing.assert_close(result, x[idx], atol=_TOL_BF16, rtol=_TOL_BF16)
 
     @expect_dynamic_true_refused
     def test_dynamic_vocab_size(self):
@@ -248,7 +248,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             )
             idx = torch.randint(0, V, (32,), dtype=torch.int64)
             result = fn(w.to(DEVICE), idx.to(DEVICE)).cpu()
-            torch.testing.assert_close(result, w[idx], atol=_ATOL_F16, rtol=_ATOL_F16)
+            torch.testing.assert_close(result, w[idx], atol=_TOL_F16, rtol=_TOL_F16)
 
     @expect_dynamic_true_refused
     def test_take_dynamic_true(self):
@@ -261,7 +261,7 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
         fn = torch.compile(torch.take, dynamic=True)
         result = fn(inp.to(DEVICE), idx.to(DEVICE)).cpu()
         torch.testing.assert_close(
-            result, torch.take(inp, idx), atol=_ATOL_F16, rtol=_ATOL_F16
+            result, torch.take(inp, idx), atol=_TOL_F16, rtol=_TOL_F16
         )
 
     # ------------------------------------------------------------------
@@ -299,8 +299,8 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             lambda x, i: torch.sigmoid(torch.relu(x[i])),
             x,
             idx,
-            atol=_ATOL_F16,
-            rtol=_ATOL_F16,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
         )
 
     def test_lxd_gate_off_no_lx(self):
