@@ -1863,8 +1863,8 @@ def spyre_topk(
 
 
 def _histc_bin_index(x, lo, hi, width_den, bins):
-    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range, negative or
-    -1 (never a bin) below ``lo``, above ``hi`` or NaN."""
+    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range; below ``lo``,
+    above ``hi`` or for NaN, a negative number or NaN, which matches no bin."""
     valid = (x <= hi).to(torch.float32)
     pos = torch.floor((x - lo) * float(bins) / width_den)
     pos = pos - torch.relu(pos - (bins - 1.0))  # x == hi -> bins - 1
@@ -1889,9 +1889,6 @@ def spyre_histc(
         )
     if input.dim() != 1:
         raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
-    if input.numel() == 0:
-        # TODO: torch returns zeros.
-        raise Unsupported("histc: empty input is not supported")
     # torch's checks; eager dispatch skips its meta checks.
     if bins <= 0:
         raise RuntimeError(f"torch.histc(): bins must be > 0, but got {bins}")
@@ -1905,6 +1902,8 @@ def spyre_histc(
     if idx_dtype == torch.float16 and bins > 1024:
         # Device fp16 holds whole numbers exactly only up to 1024.
         raise Unsupported("histc: float16 input supports at most 1024 bins")
+    if input.numel() == 0:
+        return input.new_zeros((bins,))
 
     # First, so this extern call does not split the kernels that follow.
     stick = get_elem_in_stick(idx_dtype)

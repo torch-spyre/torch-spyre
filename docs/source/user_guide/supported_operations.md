@@ -94,7 +94,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
 | `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.histc` | Y | Y | Spyre | Custom decomposition + `spyre::histc_count`. 1-D int32, int64, float32 or float16 input; counts have the input's dtype. float16: at most 1024 bins, counts exact up to 1024. A value within a float step of a bin edge may fall in the neighbouring bin; integers are exact below `2**24`. Time grows with N x bins; N-D and empty input raise `Unsupported` |
+| `torch.histc` | Y | Y | Spyre | Custom decomposition + `spyre::histc_count`. 1-D int32, int64, float32 or float16 input; counts have the input's dtype. float16: at most 1024 bins, counts exact up to 1024. A value within a float step of a bin edge may fall in the neighbouring bin; integers are exact below `2**24`. Time grows with N x bins; N-D input raises `Unsupported` |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |

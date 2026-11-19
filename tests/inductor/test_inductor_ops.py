@@ -2519,9 +2519,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # (x, bins, min, max), all 1-D. The MoE router case is int32 expert ids with
-        # min=0, max=bins-1 (gemma-4-26B-A4B: 24 tokens x top-8 = 192 ids, 128
-        # experts).
+        # (x, bins, min, max). The MoE router case is int32 expert ids with min=0,
+        # max=bins-1 (gemma-4-26B-A4B: 24 tokens x top-8 = 192 ids, 128 experts).
         ("test_histc", "test_histc_cpu"): {
             "param_sets": {
                 "int32_gemma_192_sorted": (
@@ -2561,6 +2560,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     50,
                 ),
                 # Every bin edge, one float step either side of it, NaN and +-inf.
+                # With min=0 and max=1 the subtraction and division are exact; in
+                # other ranges an edge value can land in the neighbouring bin
+                # (see spyre_histc).
                 "fp32_edges_nan_inf": (
                     torch.cat(
                         [
@@ -2593,8 +2595,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # int32/int64/float32, but not in eager mode or for unaligned
                 # float16; when histc accepts N-D this becomes a positive case.
                 "2d_input": (torch.rand((4, 64)), 10, 0, 1),
-                # TODO: torch returns zeros; when histc does, this becomes a
-                # positive case.
+                # No elements: every count is zero.
                 "empty_input": (torch.empty((0,)), 8, 0, 1),
                 # fp16 inputs are multiples of 1/16, exact in device fp16, with
                 # values below min and above max. Counts stay under 1024, the
@@ -2650,7 +2651,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_raise": {
                 "2d_input": "histc: only 1-D input is supported",
-                "empty_input": "histc: empty input is not supported",
                 "fp16_bins_1025": "histc: float16 input supports at most 1024 bins",
             },
         },
