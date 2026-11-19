@@ -131,7 +131,11 @@ def pytest_sessionfinish(session, exitstatus):
         device_executed=len(_device_executed),
         suite_collected=len(_suite_collected),
         suite_executed=len(_suite_executed),
-        vf_capable=_vf_capable(),
+        # Lazy: the probe opens the card in a subprocess, so it must not
+        # run on a session whose verdict cannot use it (--collect-only,
+        # everything executed, an empty selection, or an open runtime —
+        # the parent may still hold the card).
+        vf_capable=_vf_capable,
         runtime_open=runtime_open,
         collect_only=session.config.option.collectonly,
     )

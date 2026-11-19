@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -191,7 +192,7 @@ def device_coverage_verdict(
     device_executed: int,
     suite_collected: int,
     suite_executed: int,
-    vf_capable: bool,
+    vf_capable: bool | Callable[[], bool],
     runtime_open: bool,
     collect_only: bool,
 ) -> tuple[str, str | None]:
@@ -200,10 +201,17 @@ def device_coverage_verdict(
     The ``device_*`` counts are the tests marked ``sharding_device`` (they
     skip in a plain process; the wrapper runs them in children), the
     ``suite_*`` counts the wrappers marked ``sharding_device_suite``.
+    ``runtime_open`` says the Spyre runtime is already open in this
+    process, in which case the wrapper skips by design (run the file on
+    its own).
+
     ``vf_capable`` says whether this host could run the device suite
-    (device present and the EMUL1p5 mode can open it); ``runtime_open``
-    says the Spyre runtime is already open in this process, in which case
-    the wrapper skips by design (run the file on its own).
+    (device present and the EMUL1p5 mode can open it). It may be a
+    callable, and if so it is resolved **only on the verdict path that
+    needs it**: probing opens the card in a subprocess (up to 180 s, and
+    it can contend with a parent that holds the card), so
+    ``--collect-only``, sessions that executed their device tests, empty
+    device selections, and an open runtime must not pay for it.
 
     Returns ``("pass", None)`` or ``("warn" | "fail", message)``.
 
@@ -222,14 +230,17 @@ def device_coverage_verdict(
         return "pass", None
     if device_executed > 0 or suite_executed > 0:
         return "pass", None
-    if vf_capable:
-        if runtime_open:
-            return (
-                "warn",
-                "sharding device tests: none executed (the Spyre runtime "
-                "is already open in this process; run the device test "
-                "files on their own)",
-            )
+    if device_collected == 0 and suite_collected == 0:
+        return "pass", None
+    if runtime_open:
+        return (
+            "warn",
+            "sharding device tests: none executed (the Spyre runtime "
+            "is already open in this process; run the device test "
+            "files on their own)",
+        )
+    host_capable = vf_capable() if callable(vf_capable) else vf_capable
+    if host_capable:
         if suite_collected > 0:
             return (
                 "fail",

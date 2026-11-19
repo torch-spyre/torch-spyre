@@ -380,3 +380,34 @@ def test_session_is_sharding_only():
         is False
     )
     assert session_is_sharding_only([".."], sharding) is False
+
+
+def test_coverage_guard_never_probes_when_the_verdict_cannot_use_it():
+    """The vf-capability probe opens the card in a subprocess; it must not
+    run on a session whose verdict ignores it (review finding on #6206:
+    --collect-only paid ~12 s for a probe whose answer was discarded, and
+    a completed run probed while the parent still held the card)."""
+    from device_suite import device_coverage_verdict
+
+    def boom() -> bool:
+        raise AssertionError("the probe must not run on this verdict path")
+
+    # --collect-only.
+    assert device_coverage_verdict(36, 0, 2, 0, boom, False, True)[0] == "pass"
+    # The session executed its device tests (or wrappers).
+    assert device_coverage_verdict(36, 5, 2, 1, boom, False, False)[0] == "pass"
+    assert device_coverage_verdict(0, 0, 2, 2, boom, False, False)[0] == "pass"
+    # Nothing guard-marked was selected at all.
+    assert device_coverage_verdict(0, 0, 0, 0, boom, False, False)[0] == "pass"
+    # The runtime is open: the wrapper skipped by design, no probe needed.
+    assert device_coverage_verdict(36, 0, 2, 0, boom, True, False)[0] == "warn"
+
+    # On the one path that needs it, the callable is consulted.
+    calls = []
+
+    def counting() -> bool:
+        calls.append(1)
+        return True
+
+    assert device_coverage_verdict(36, 0, 2, 0, counting, False, False)[0] == "fail"
+    assert calls == [1]
