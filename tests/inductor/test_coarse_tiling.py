@@ -3818,7 +3818,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         check flagged tiled_on_split_dim=True whenever sym_dim_name was
         *any* active dim of a tensor that advanced at all, regardless of
         which dim actually drove that advance -- because a minted symbol's
-        combined coefficient (spyre_kernel._general_tile_advance sums every
+        combined coefficient (spyre_kernel._tile_advance sums every
         host dim tiled at a level into one coefficient before this tensor's
         device_tile_advance_expr is built) carries no per-dimension
         provenance to check against. Here the tensor is split on `mb` but
@@ -5307,80 +5307,59 @@ class TestIsReadAdvancingAnywhere(unittest.TestCase):
     def tearDown(self):
         self._graph_ctx.__exit__(None, None, None)
 
-    def test_advancing_copy_in_read_detected(self):
-        from torch_spyre._inductor.scratchpad.utils import (
-            _get_buffer_user_deps,
-            _is_read_advancing_anywhere,
-        )
+    def _reader_with_index(self, index):
+        """The fixture's tiled op, listing loop variable ``u0`` for its one level, with
+        its read of the full buffer indexed by ``index``.
+
+        Returns ``(full buffer name, user deps)``. The op is real IR; only its
+        dependencies are replaced, so the index can carry (or lack) ``u0``.
+        """
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.scratchpad.utils import _get_buffer_user_deps
 
         tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
-        self.assertEqual(len(full_deps), 1)
-        full_buf = V.graph.get_buffer(full_deps[0].name)
-        # full_buf itself has no loop_info -- its write is fixed (it is
-        # never produced inside a coarse-tile loop). tiled_op reads it via
-        # an advancing copy-in: dim 0 divided across tiled_op's own outer
-        # loop (matches the fixture's loop_count=[8] over dim 0).
-        tiled_op.loop_info.tiled_dims_per_read = [[[(0, Integer(8))]]]
+        name = full_deps[0].name
+        d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
+        u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+        tiled_op.dim_hints = [
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=u0,
+                is_reduction=False,
+                loop_var_range=Integer(8),
+            )
+        ]
+        dep = MemoryDep(name, index(u0, d0, d1), (d0, d1), (8, 128))
+        tiled_op.get_read_writes = lambda: SimpleNamespace(
+            reads=OrderedSet([dep]), writes=OrderedSet()
+        )
+        return name, _get_buffer_user_deps(SimpleNamespace(operations=operations))
 
-        fake_graph = SimpleNamespace(operations=operations)
-        buf_user_deps = _get_buffer_user_deps(fake_graph)
-        self.assertTrue(_is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps))
+    def test_advancing_copy_in_read_detected(self):
+        """The reader's copy-in moves with its loop: ``u0`` is in the index."""
+        from torch_spyre._inductor.scratchpad.utils import _is_read_advancing_anywhere
+
+        name, buf_user_deps = self._reader_with_index(
+            lambda u0, d0, d1: 128 * d0 + d1 + 8 * u0
+        )
+        self.assertTrue(_is_read_advancing_anywhere(name, buf_user_deps))
 
     def test_fixed_copy_in_read_not_detected(self):
-        """Same shape, but the reader's copy-in is fixed (not advancing):
-        the dep has no tiled levels at all (empty outer list)."""
-        from torch_spyre._inductor.scratchpad.utils import (
-            _get_buffer_user_deps,
-            _is_read_advancing_anywhere,
-        )
+        """Same shape, but the reader's copy-in is fixed: the loop variable is not in
+        its index, so the read is re-entered at the same address every trip."""
+        from torch_spyre._inductor.scratchpad.utils import _is_read_advancing_anywhere
 
-        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
-        full_buf = V.graph.get_buffer(full_deps[0].name)
-        tiled_op.loop_info.tiled_dims_per_read = [[]]
-
-        fake_graph = SimpleNamespace(operations=operations)
-        buf_user_deps = _get_buffer_user_deps(fake_graph)
-        self.assertFalse(
-            _is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps)
-        )
-
-    def test_fixed_copy_in_read_with_empty_levels_not_detected(self):
-        """Fixed can also show up as a non-empty outer list whose every
-        per-level entry is itself empty -- e.g. tiled_op has one loop level
-        that does not divide any dim this dep's index depends on.
-        _general_tile_advance's own per-level loop (`if not
-        dim_extent_pairs: continue`) never contributes a term for such a
-        level, so this must be treated as fixed too, not merely "has some
-        levels" (regression coverage: an earlier version of this check used
-        a shallow `if tiled_dims_per_read[dep_idx]:` truthiness test, which
-        wrongly treated [[]] as advancing since the outer list is
-        non-empty)."""
-        from torch_spyre._inductor.scratchpad.utils import (
-            _get_buffer_user_deps,
-            _is_read_advancing_anywhere,
-        )
-
-        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
-        full_buf = V.graph.get_buffer(full_deps[0].name)
-        tiled_op.loop_info.tiled_dims_per_read = [[[]]]
-
-        fake_graph = SimpleNamespace(operations=operations)
-        buf_user_deps = _get_buffer_user_deps(fake_graph)
-        self.assertFalse(
-            _is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps)
-        )
+        name, buf_user_deps = self._reader_with_index(lambda u0, d0, d1: 128 * d0 + d1)
+        self.assertFalse(_is_read_advancing_anywhere(name, buf_user_deps))
 
     def test_unrelated_buffer_not_detected(self):
-        from torch_spyre._inductor.scratchpad.utils import (
-            _get_buffer_user_deps,
-            _is_read_advancing_anywhere,
+        from torch_spyre._inductor.scratchpad.utils import _is_read_advancing_anywhere
+
+        _, buf_user_deps = self._reader_with_index(
+            lambda u0, d0, d1: 128 * d0 + d1 + 8 * u0
         )
-
-        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
-        tiled_op.loop_info.tiled_dims_per_read = [[[(0, Integer(8))]]]
-
-        fake_graph = SimpleNamespace(operations=operations)
-        buf_user_deps = _get_buffer_user_deps(fake_graph)
         self.assertFalse(_is_read_advancing_anywhere("no_such_buffer", buf_user_deps))
 
 
