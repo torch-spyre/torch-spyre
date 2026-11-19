@@ -33,7 +33,17 @@ from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
-from utils_inductor import expects_raise
+from utils_inductor import (
+    cached_randn,
+    shapes2key,
+    expects_raise,
+)
+from torch_spyre._inductor.propagate_hints import spyre_hint
+from torch_spyre._inductor.wsr import propagate_named_dims as pnd
+
+
+def _dtype_name(dt):
+    return str(dt).split(".")[-1]
 
 
 def _run(fn, *args, mode="compile"):
@@ -57,48 +67,88 @@ def assert_ea(tensor, expected_ea):
     assert actual_ea == expected_ea, f"Expected: {expected_ea}, Got: {actual_ea}"
 
 
-def assert_val(fn, x, result):
+def assert_val(fn, x, result, intermediate=None):
+    """Compare a device result with the CPU result of ``fn``.
+
+    The tolerance follows the lowest-precision dtype involved. Pass
+    ``intermediate`` when ``fn`` rounds through a dtype that is neither the
+    input nor the output (for example fp32 -> fp16 -> fp32).
+    """
     x_cpu = x.cpu()
     result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+    dtypes = {x.dtype, result.dtype}
+    if intermediate is not None:
+        dtypes.add(intermediate)
+    if torch.bfloat16 in dtypes:
+        rtol, atol = 1.6e-2, 1.6e-2
+    elif torch.float16 in dtypes:
+        # For randn-scale values (<5), fp16 half-ulp is <= ~2e-3.
+        rtol, atol = 2e-3, 2e-3
+    else:
+        rtol, atol = 1e-5, 1e-5
+    torch.testing.assert_close(result.cpu(), result_cpu, rtol=rtol, atol=atol)
 
 
 def ea_of(dev):
     return ElementArrangement.STANDARD if dev == DEVICE_NAME else None
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+    (1, 1, 1, 1),
+    # A size-1 stick dim with several rows also holds one element per stick (#5566).
+    (2, 1),
+    (3, 1, 1),
+]
+
+# Stick aligned shape
+BASIC_SHAPES = [(4, 128)]
+
+_SHAPES = STICK_ONLY_SHAPES + BASIC_SHAPES
+
 _TEST_CASES = [
-    (device, mode, fp16)
+    (device, mode, fp16, shape)
     for device in [DEVICE_NAME]
     for mode in ["compile", "eager"]
     for fp16 in DtypeOpTable.fp16_types()
+    for shape in _SHAPES
 ]
 
 _TEST_IDS = [
-    f"{device}-{mode}-{fp16}".replace("torch.", "")
-    for device, mode, fp16 in _TEST_CASES
+    f"{device}-{mode}-{fp16}-{shapes2key((shape,))}".replace("torch.", "")
+    for device, mode, fp16, shape in _TEST_CASES
 ]
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp16_to_fp32_standard_input(device, mode, fp16):
+def test_fp16_to_fp32_standard_input(device, mode, fp16, shape):
     """Test FP16/BF16→FP32 with STANDARD input creates DL16_TO_FP32 (#2843)."""
 
     def fn(x):
         return x.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = _run(fn, x, mode=mode)
 
     # Verify output EA
-    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.DL16_TO_FP32
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has DL16_TO_FP32 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print(f"✓ {fp16}→FP32 with STANDARD input produces DL16_TO_FP32 ({mode})")
 
@@ -119,25 +169,30 @@ def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device, mode):
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp32_to_fp16_standard_input(device, mode, fp16):
+def test_fp32_to_fp16_standard_input(device, mode, fp16, shape):
     """Test FP32→FP16 with STANDARD input creates FP32_TO_DL16."""
 
     def fn(x):
         return x.to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = _run(fn, x, mode=mode)
 
     # Eager and compiled casts use the same compiled D2D conversion path, so
     # both preserve the hardware conversion's staggered element arrangement.
-    assert_ea(result, ElementArrangement.FP32_TO_DL16)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.FP32_TO_DL16
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has FP32_TO_DL16 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print("✓ FP32→{fp16} with STANDARD input produces FP32_TO_DL16 ({mode})")
 
@@ -164,8 +219,8 @@ def test_fp16_to_fp32_restoration(device, fp16):
     # Verify output EA is STANDARD (restored)
     assert_ea(result, ElementArrangement.STANDARD)
 
-    # Verify correctness
-    assert_val(fn, x, result)
+    # Verify correctness (value is rounded through fp16/bf16 in between)
+    assert_val(fn, x, result, intermediate=fp16)
 
     print("✓ FP16→FP32 restoration (FP32_TO_DL16 → STANDARD) works")
 
@@ -267,21 +322,10 @@ def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
     # Verify final EA is STANDARD
     assert_ea(result, ElementArrangement.STANDARD)
 
-    # Verify correctness
-    assert_val(fn, x, result)
+    # Verify correctness (value is rounded through fp16/bf16 in between)
+    assert_val(fn, x, result, intermediate=fp16)
 
     print("✓ FP32→FP16→FP32 roundtrip works")
-
-
-# Shapes whose whole content fits in a single stick, so the tensor has no
-# spatial dim outside the stick dim for the conversion op to loop over.
-STICK_ONLY_SHAPES = [
-    (),
-    (1,),
-    (1, 1),
-    (1, 1, 1),
-    (1, 1, 1, 1),
-]
 
 
 @pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)
@@ -1077,4 +1121,370 @@ def test_downcast_of_one_row_of_an_upcast(row, cols):
     assert torch.equal(out.cpu(), fn(x))
 
 
-# Made with Bob
+# ---------------------------------------------------------------------------
+# D2H EA restore, H2D write back
+# ---------------------------------------------------------------------------
+def _build_ea_dci_tests():
+    # Shapes common to both conversions: the stick dim is a whole number of
+    # 64-element sticks.
+    STICK_ALIGNED_SHAPES = [
+        (64,),
+        (128,),
+        (4, 64),
+        (4, 128),
+        (7, 128),
+        (2, 4, 64),
+        (3, 5, 128),
+        (4, 8, 128),
+        (8, 16, 64),
+        (8, 16, 128),
+        (2, 3, 4, 64),
+        (2, 3, 4, 128),
+        (2, 4, 8, 64),
+    ]
+
+    # n (2, 63]: 2 <= n <= 63 shapes
+    SMALL_N_SHAPES = [
+        (2,),
+        (3,),
+        (4,),
+        (16,),
+        (32,),
+        (63,),
+        (2, 2),
+        (4, 16),
+        (4, 32),
+    ]
+
+    # base shapes
+    BASE_SHAPES = STICK_ALIGNED_SHAPES + SMALL_N_SHAPES + STICK_ONLY_SHAPES
+
+    # fp16 -> fp32 doubles the stick count, so the output is always whole stick
+    # pairs once the stick dim is wider than 32 (padded by #5048). Stick dims of
+    # at most 32 only get a single fp32 stick; these are rejected on D2H.
+    FP16_TO_FP32_SHAPES = BASE_SHAPES + [
+        # Partial last stick or pair
+        (68,),
+        (4, 68),
+        (8, 16, 68),
+        (2, 96),
+        (4, 96),
+        (8, 16, 96),
+        (4, 100),
+        (8, 16, 100),
+        (4, 160),
+        (8, 16, 160),
+        # 44 is padded to a stick pair; 16 and 32 are rejected on D2H
+        (44,),
+        (4, 16),
+        (4, 32),
+        (4, 44),
+        (7, 44),
+        (2, 4, 44),
+        (2, 3, 4, 44),
+    ]
+
+    # fp32 -> fp16 halves the stick count; an odd number of 32-element fp32 sticks
+    # (32 wide, 68, 96, 160) is padded to a whole pair by #5048.
+    FP32_TO_FP16_SHAPES = BASE_SHAPES + [
+        # One stick + a partial stick
+        (4, 100),
+        (8, 16, 100),
+        # Single partial stick
+        (44,),
+        (4, 16),
+        (4, 44),
+        (7, 44),
+        (2, 4, 44),
+        (2, 3, 4, 44),
+    ]
+
+    EA = ElementArrangement
+    FP32 = torch.float32
+    params = {}
+    for FP16 in DtypeOpTable.fp16_types():
+        tests = [
+            (FP16, FP32, EA.DL16_TO_FP32, FP16_TO_FP32_SHAPES),
+            (FP32, FP16, EA.FP32_TO_DL16, FP32_TO_FP16_SHAPES),
+        ]
+        for src_dtype, dst_dtype, base_expected_ea, shapes in tests:
+            conv_name = f"{_dtype_name(src_dtype)}_to_{_dtype_name(dst_dtype)}"
+            for shape in shapes:
+                expected_ea = (
+                    ElementArrangement.STANDARD
+                    if shape in STICK_ONLY_SHAPES
+                    else base_expected_ea
+                )
+                key = f"{conv_name}_{shapes2key((shape,))}"
+                params[key] = (src_dtype, dst_dtype, expected_ea, shape)
+    return params
+
+
+EA_D2H_TEST_PARAMS = _build_ea_dci_tests()
+
+
+def _whole_stick_pairs_rejected(expected_ea, shape):
+    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim of at most one fp32
+    # stick (32 elements) only gets a single fp32 stick, so half of each pair has
+    # nowhere to go. Wider dims are padded to a whole pair by #5048.
+    # Note: shape[-1] is safe for 0-dim shapes () because expected_ea is forced
+    # to STANDARD in those cases, so the expected_ea == DL16_TO_FP32 check
+    # short-circuits and will not reach shape[-1].
+    return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] <= 32
+
+
+def _convert_one_row_per_core(x, dst_dtype):
+    """Convert on device with one M row per core.
+
+    Work division does not account for stick padding yet, so a single row per
+    core keeps the converted values correct for padded stick dims.
+    """
+    names = list("TBMN"[-x.dim() :])  # last dim is the stick dim N
+    torch._dynamo.reset()  # also clears declared dim names
+    for name, size in zip(names, x.shape):
+        pnd.declare_tensor_dim(name, size)
+    x_dev = x.to(DEVICE_NAME)
+    pnd.name_tensor_dims(x_dev, names)
+
+    def convert(a):
+        if a.dim() < 2:  # no M dim to divide
+            return a.to(dst_dtype)
+        with spyre_hint(work_div={"M": x.shape[-2]}):
+            return a.to(dst_dtype)
+
+    # static: a dynamic recompile is a different kernel
+    return torch.compile(convert, dynamic=False)(x_dev)
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_D2H_TEST_PARAMS.values(),
+    ids=EA_D2H_TEST_PARAMS.keys(),
+)
+def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
+    # Small integers are exact in fp32, fp16 and bf16, so no rounding noise
+    values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
+    x = values.to(src_dtype)
+    ref = values.to(dst_dtype)
+
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    if _whole_stick_pairs_rejected(expected_ea, shape):
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            y.cpu()
+        return
+
+    got = y.cpu()
+    assert got.dtype == ref.dtype
+    assert got.shape == ref.shape
+    assert torch.equal(got, ref)
+
+
+EA_H2D_TEST_PARAMS = EA_D2H_TEST_PARAMS
+
+
+def _shape_of(param):
+    values = param.values if hasattr(param, "values") else param
+    return values[3]
+
+
+EA_H2D_BASIC_TEST_PARAMS = {
+    key: params
+    for key, params in EA_H2D_TEST_PARAMS.items()
+    if _shape_of(params) in _SHAPES
+}
+
+
+def _make_x_and_new(shape, src_dtype, dst_dtype, offset=100.0):
+    """Small integers, exact in fp16, bf16 and fp32, for reproducible compares.
+
+    bf16 only represents integers exactly up to 256, so the offset keeps
+    values + offset + 1 under that. A +1000 offset would round in bf16.
+    """
+    values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
+    x = values.to(src_dtype)  # source data on host
+    new = (values + offset).to(dst_dtype)  # data to be H2D-copied
+    return x, new
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_TEST_PARAMS.values(),
+    ids=EA_H2D_TEST_PARAMS.keys(),
+)
+def test_ea_restore_h2d(src_dtype, dst_dtype, expected_ea, shape):
+    x, new = _make_x_and_new(shape, src_dtype, dst_dtype)
+
+    # Create staggered tensor on device
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    if _whole_stick_pairs_rejected(expected_ea, shape):
+        # ea_restore now runs for H2D too and applies the same whole-stick-pair
+        # check as D2H, so the copy_ itself is rejected.
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            y.copy_(new)
+        return
+
+    # H2D `copy_` of new (STANDARD host data) into the staggered y.
+    # The EA tag is unchanged, copy_ writes only the data.
+    y.copy_(new)
+    assert_ea(y, expected_ea)
+
+    # D2H restore must now produce exactly `new`.
+    got = y.cpu()
+    assert got.dtype == new.dtype
+    assert got.shape == new.shape
+    assert torch.equal(got, new), (
+        f"{shape} {src_dtype}->{dst_dtype}: H2D copy_ into staggered tensor "
+        f"mismatch ({(got != new).sum().item()}/{new.numel()} wrong)"
+    )
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_BASIC_TEST_PARAMS.values(),
+    ids=EA_H2D_BASIC_TEST_PARAMS.keys(),
+)
+def test_ea_restore_h2d_compiled_consumer(src_dtype, dst_dtype, expected_ea, shape):
+    x, new = _make_x_and_new(shape, src_dtype, dst_dtype)
+
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    # H2D copy into the staggered buffer.
+    y.copy_(new)
+
+    # Compiled consumer: (y + 1).to(src_dtype). Reading y through a kernel
+    # verifies that the data on the device really is in staggered order.
+    def consume(a):
+        return (a + 1.0).to(src_dtype)
+
+    torch._dynamo.reset()
+    z = torch.compile(consume, dynamic=False)(y)
+    got = z.cpu()
+
+    # `new` is already dst_dtype, so add 1 in dst_dtype like the device does.
+    expected = (new + 1.0).to(src_dtype)
+    assert torch.equal(got, expected), (
+        f"{shape} {src_dtype}->{dst_dtype}: compiled consumer after H2D "
+        f"mismatch ({(got != expected).sum().item()}/{expected.numel()} wrong)"
+    )
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_BASIC_TEST_PARAMS.values(),
+    ids=EA_H2D_BASIC_TEST_PARAMS.keys(),
+)
+def test_ea_h2d_d2h_h2d_chain(src_dtype, dst_dtype, expected_ea, shape):
+    x, new1 = _make_x_and_new(shape, src_dtype, dst_dtype, offset=100.0)
+    _, new2 = _make_x_and_new(shape, src_dtype, dst_dtype, offset=50.0)
+    assert not torch.equal(new1, new2)  # distinct payloads
+
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    # H2D #1 -> D2H
+    y.copy_(new1)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new1), f"{shape}: chain read1 mismatch"
+
+    # H2D #2 (same staggered tensor, different data) -> D2H
+    y.copy_(new2)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new2), f"{shape}: chain read2 mismatch"
+
+    # A third round, back to the first payload, so it can't be a one-shot fluke.
+    y.copy_(new1)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new1), f"{shape}: chain read3 mismatch"
+
+
+def test_ea_staggered_host_storage_offset():
+    """Host slices with pair-aligned offsets succeed; mid-pair offsets raise."""
+    # DL16_TO_FP32: pair is 64 elements (2 FP32 sticks)
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    # Mid-pair offset (32 elements) -> rejected
+    host_buf = torch.empty(32 + 4 * 128, dtype=torch.float32)
+    mid_pair_slice = host_buf[32:].view(4, 128)
+    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+        mid_pair_slice.copy_(y_fp32)
+
+    # Pair-aligned offset (64 elements) -> succeeds
+    host_buf2 = torch.empty(64 + 4 * 128, dtype=torch.float32)
+    pair_aligned_slice = host_buf2[64:].view(4, 128)
+    pair_aligned_slice.copy_(y_fp32)
+    assert torch.equal(pair_aligned_slice, y_fp32.cpu())
+
+    # DL16_TO_FP32 with odd stick-pair width (ea_boundary needed, shape (4, 68)):
+    # 68 elements = 3 sticks (padded to 4 sticks / 128 elements in DCI)
+    x_odd = torch.arange(4 * 68, dtype=torch.float16).reshape(4, 68)
+    y_odd_fp32 = _convert_one_row_per_core(x_odd, torch.float32)
+    assert_ea(y_odd_fp32, ElementArrangement.DL16_TO_FP32)
+
+    # Mid-pair offset (32 elements) -> rejected
+    host_buf_odd = torch.empty(32 + 4 * 68, dtype=torch.float32)
+    mid_pair_slice_odd = host_buf_odd[32:].view(4, 68)
+    with pytest.raises(RuntimeError, match="not aligned to a stick pair boundary"):
+        mid_pair_slice_odd.copy_(y_odd_fp32)
+
+    # Pair-aligned offset (64 elements) with boundary slice -> succeeds
+    host_buf2_odd = torch.empty(64 + 4 * 68, dtype=torch.float32)
+    pair_aligned_slice_odd = host_buf2_odd[64:].view(4, 68)
+    pair_aligned_slice_odd.copy_(y_odd_fp32)
+    assert torch.equal(pair_aligned_slice_odd, y_odd_fp32.cpu())
+
+    # H2D: Pair-aligned offset (64 elements) with boundary expand -> succeeds
+    h2d_host_buf = torch.arange(64 + 4 * 68, dtype=torch.float32)
+    h2d_host_slice = h2d_host_buf[64:].view(4, 68)
+    y_h2d = _convert_one_row_per_core(
+        torch.zeros(4, 68, dtype=torch.float16), torch.float32
+    )
+    assert_ea(y_h2d, ElementArrangement.DL16_TO_FP32)
+    y_h2d.copy_(h2d_host_slice)
+    assert torch.equal(y_h2d.cpu(), h2d_host_slice)
+
+    # FP32_TO_DL16: stick is 64 elements (1 FP16 stick)
+    x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+
+    # Mid-stick offset (32 elements) -> rejected
+    host_buf_fp16 = torch.empty(32 + 4 * 128, dtype=torch.float16)
+    mid_stick_slice = host_buf_fp16[32:].view(4, 128)
+    with pytest.raises(RuntimeError, match="not aligned to a stick boundary"):
+        mid_stick_slice.copy_(y_dl16)
+
+    # Stick-aligned offset (64 elements) -> succeeds
+    host_buf2_fp16 = torch.empty(64 + 4 * 128, dtype=torch.float16)
+    stick_aligned_slice = host_buf2_fp16[64:].view(4, 128)
+    stick_aligned_slice.copy_(y_dl16)
+    assert torch.equal(stick_aligned_slice, y_dl16.cpu())
+
+
+def test_ea_staggered_device_storage_offset():
+    """Verify whether device-side slices with pair-aligned offsets restore correctly."""
+    # DL16_TO_FP32 D2H: pair-aligned device slice (64 elements / 2 FP32 sticks)
+    x_dl16 = torch.arange(4 * 128, dtype=torch.float16).reshape(4, 128)
+    y_fp32 = _convert_one_row_per_core(x_dl16, torch.float32)
+    assert_ea(y_fp32, ElementArrangement.DL16_TO_FP32)
+
+    dev_slice_fp32 = y_fp32[:, 64:]
+    got_fp32 = dev_slice_fp32.cpu()
+    expected_fp32 = x_dl16[:, 64:].to(torch.float32)
+    assert torch.equal(got_fp32, expected_fp32)
+
+    # FP32_TO_DL16 D2H: stick-aligned device slice (64 elements / 1 FP16 stick)
+    x_fp32 = torch.arange(4 * 128, dtype=torch.float32).reshape(4, 128)
+    y_dl16 = _convert_one_row_per_core(x_fp32, torch.float16)
+    assert_ea(y_dl16, ElementArrangement.FP32_TO_DL16)
+
+    dev_slice_dl16 = y_dl16[:, 64:]
+    got_dl16 = dev_slice_dl16.cpu()
+    expected_dl16 = x_fp32[:, 64:].to(torch.float16)
+    assert torch.equal(got_dl16, expected_dl16)
