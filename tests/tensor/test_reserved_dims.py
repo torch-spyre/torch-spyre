@@ -113,6 +113,9 @@ class TestGetReservedDims(TestCase):
             "alias": torch.ops.aten.alias(x_dev),
             "as_strided": x_dev.as_strided(x_dev.shape, x_dev.stride()),
             "view, then detach": x_dev.view(x_dev.shape).detach(),
+            # The flat view carries the map but is not intact; viewing back to
+            # the original geometry makes it intact again.
+            "round trip": x_dev.view(-1).view(x_dev.shape),
         }
         for name, v in same.items():
             with self.subTest(view=name):
@@ -130,6 +133,24 @@ class TestGetReservedDims(TestCase):
             with self.subTest(view=name):
                 self.assertIsNone(get_reserved_dims(v))
 
+    def test_resize_on_changed_geometry_view_raises(self) -> None:
+        # Views copy the map, so a changed-geometry view carries it but fails
+        # has_intact_reservation(). resize_ then refuses, as after an in-place
+        # reshape. Before views copied the map, these took the unreserved path
+        # and the base read back wrong data.
+        _, x_dev = declared_tensor()
+        resizes = {
+            "slice": (x_dev[1:], (139, 1024)),
+            "reshape": (x_dev.view(280, 2048), (140, 2048)),
+            "flatten": (x_dev.view(-1), (70 * 1024,)),
+        }
+        for name, (v, new_size) in resizes.items():
+            with self.subTest(view=name):
+                with self.assertRaisesRegex(
+                    RuntimeError, "no longer match the allocation"
+                ):
+                    v.resize_(new_size)
+
     def test_same_geometry_views_share_the_base_data(self) -> None:
         x, x_dev = declared_tensor()
         for v in (
@@ -137,7 +158,7 @@ class TestGetReservedDims(TestCase):
             torch.ops.aten.alias(x_dev),
             x_dev.as_strided(x_dev.shape, x_dev.stride()),
         ):
-            self.assertTrue(torch.allclose(v.cpu(), x, atol=1e-3))
+            self.assertEqual(v.cpu(), x, atol=1e-3, rtol=0)
         x_dev.view(x_dev.shape).zero_()
         self.assertTrue(x_dev.cpu().eq(0).all())
 
@@ -149,10 +170,22 @@ class TestGetReservedDims(TestCase):
         v = x_dev.view(x_dev.shape)
         v.resize_((140, 1024))
         self.assertEqual(tuple(v.shape), (140, 1024))
-        self.assertTrue(torch.allclose(v.cpu(), x[:140], atol=1e-3))
+        self.assertEqual(v.cpu(), x[:140], atol=1e-3, rtol=0)
         # The base is untouched.
         self.assertEqual(tuple(x_dev.shape), (560, 1024))
-        self.assertTrue(torch.allclose(x_dev.cpu(), x, atol=1e-3))
+        self.assertEqual(x_dev.cpu(), x, atol=1e-3, rtol=0)
+
+    def test_grow_on_view_matches_cpu(self) -> None:
+        # Growing is what the reserved path exists for: the buffer is already
+        # sized for the declared max, so nothing is reallocated. Only the rows
+        # that existed before the grow have defined values.
+        x = torch.rand(140, 1024, dtype=torch.float16)
+        x_dev = x.to(DEVICE, dynamic=DECLARATION)
+        v = x_dev.view(x_dev.shape)
+        v.resize_((630, 1024))
+        self.assertEqual(tuple(v.shape), (630, 1024))
+        self.assertEqual(v.cpu()[:140], x, atol=1e-3, rtol=0)
+        self.assertEqual(tuple(x_dev.shape), (140, 1024))
 
 
 # One compiled function reused over these sizes: the kernel sees the whole range.
@@ -192,23 +225,23 @@ def _compile_fresh(fn, **kwargs):
 
 
 class TestViewResultIntoCompiledKernel(TestCase):
-    """x.to(dynamic=...) -> eager op -> compiled kernel, against the CPU
-    equivalent (a mark_dynamic'd tensor -> the same op -> a symbolic compile).
+    """x.to(dynamic=...) -> eager op -> compiled kernel, against eager x + x.
 
     An eager result is a new tensor and does not inherit the mark_dynamic that
-    .to(dynamic=...) set, so the test marks dim 0 dynamic itself. The compile
-    then reads get_reserved_dims(result) to decide whether that dim is declared.
-    With no map it is an ordinary dynamic dim, sized from a hint; with one, the
-    kernel is built for the declared maximum. Both give right values at the
-    sizes tried, so the test also checks what the compile concluded.
+    .to(dynamic=...) set, so the first compile of it would be static and see no
+    symbolic dim. The test marks dim 0 dynamic itself so that every compile has
+    one. The compile then reads get_reserved_dims(result) to decide whether that
+    dim is declared. With no map it is an ordinary dynamic dim, sized from a
+    hint; with one, the kernel is built for the declared maximum. Both give
+    right values at the sizes tried, so the test also checks what the compile
+    concluded.
     """
 
-    def test_compile_sees_the_declared_range_and_matches_cpu(self) -> None:
+    def test_compile_sees_the_declared_range_and_matches_eager(self) -> None:
         real_declared_dims_of = spyre_inductor._declared_dims_of
         for name, op in OPS.items():
             with self.subTest(op=name):
                 dev_fn = _compile_fresh(_double_per_tile, fullgraph=True)
-                cpu_fn = _compile_fresh(lambda t: t + t, backend="aot_eager")
                 # What the compile wrapper concluded, per device compile.
                 seen: list[dict[object, tuple[int, ...]]] = []
 
@@ -226,16 +259,12 @@ class TestViewResultIntoCompiledKernel(TestCase):
                     ):
                         out_dev = dev_fn(v)
 
-                    x_cpu = x.clone()
-                    torch._dynamo.mark_dynamic(x_cpu, 0)
-                    out_cpu = cpu_fn(op(x_cpu))
-
-                    # Eager x + x anchors the CPU reference, so a wrong
-                    # reference cannot hide a wrong device result.
-                    self.assertTrue(torch.allclose(out_cpu, x + x), f"{name}@{n}")
-                    self.assertTrue(
-                        torch.allclose(out_dev.cpu(), out_cpu, atol=1e-3),
-                        f"{name}@{n}: device differs from CPU",
+                    self.assertEqual(
+                        out_dev.cpu(),
+                        x + x,
+                        atol=1e-3,
+                        rtol=0,
+                        msg=f"{name}@{n}: device differs from CPU",
                     )
 
                 self.assertTrue(seen, "the device kernel never compiled")

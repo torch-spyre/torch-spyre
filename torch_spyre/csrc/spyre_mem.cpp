@@ -1757,16 +1757,20 @@ const at::Tensor& spyre_resize_(
   std::vector<int64_t> layout_size = size_int.vec();
   if (!self_impl->reserved_dims.empty()) {
     // reserved_dims keys are absolute dim indices. If the shape, strides or
-    // offset were changed in place since allocation (t_, squeeze_,
-    // as_strided_, ...), a key can name a different axis than it did, and
-    // every check below would validate the wrong dimension. Fail rather than
-    // trust it; falling through as "unreserved" would reallocate instead.
+    // offset no longer match the allocation, a key can name a different axis
+    // than it did, and every check below would validate the wrong dimension.
+    // That happens after an in-place change (t_, squeeze_, as_strided_, ...)
+    // and on a view that changed the geometry (a slice, a reshape): views
+    // copy the map, and has_intact_reservation() is what rejects them here.
+    // Fail rather than trust it; falling through as "unreserved" would
+    // reallocate instead.
     TORCH_CHECK(self_impl->has_intact_reservation(),
-                "resize_ on a max-reserved Spyre tensor: its shape, strides "
-                "or storage offset were changed in place after allocation "
-                "(e.g. t_(), transpose_(), squeeze_(), as_strided_()), so the "
-                "reservation no longer refers to the same axis. current "
-                "shape=",
+                "resize_ on a max-reserved Spyre tensor: this tensor's shape, "
+                "strides or storage offset no longer match the allocation, so "
+                "the reservation no longer refers to the same axis. This "
+                "happens after an in-place change (t_(), transpose_(), "
+                "squeeze_(), as_strided_()) and on a view that changed the "
+                "geometry (a slice, a reshape). current shape=",
                 self.sizes(), ", shape at allocation=",
                 c10::IntArrayRef(self_impl->dma_sizes));
     // Scope today: at most one entry, so this loop runs once; the guard is

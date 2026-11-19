@@ -112,13 +112,13 @@ class TestReservationResizeGuard(TestCase):
         # so resize_ would validate the wrong axis. It must refuse.
         d = self.x_dev.detach()
         d.t_()
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1024, 140))
 
     def test_resize_after_in_place_rank_change_rejected(self) -> None:
         d = self.x_dev.detach()
         d.unsqueeze_(0)
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1, DIM_MAX, 1024))
 
     def test_resize_after_valid_resize_still_allowed(self) -> None:
