@@ -3320,6 +3320,10 @@ def dense_relocation_serves_read(
     most ops, and it keeps the tensor dense, so it is tried before the sparse layout
     (``sparse_target_for_unservable_read``), which costs ``elems_per_stick`` times the
     memory. Larger dims are tried first; the first that serves the read wins.
+
+    The restickify into the layout this returns is a dense one whose new stick dim
+    is one stick wide, so it carries the per-core span limit of #6132, as the
+    sparse layout carries #6113.
     """
     if (
         stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -3448,9 +3452,10 @@ def compute_restickify_needed(
     if idc is None:
         # A read the input cannot serve (flattening [8, 65] into [520] splits a
         # stick) may be served by the input's host shape in a sparse layout.
-        # TODO(#5872): this returns the sparse target for any output, without
-        # checking that it is stick_compatible with the output. That is safe only
-        # because _default_pointwise_layout and _reduction_layout return a sparse
+        # TODO(#5872): this returns the relocated or the sparse target for any
+        # output, without checking that it is stick_compatible with the output.
+        # That is safe only because _default_pointwise_layout and
+        # _reduction_layout relocate the input the same way and return a sparse
         # output early. Return the target only for an output it can feed.
         # Before the sparse layout, which costs elems_per_stick times the memory,
         # try a dense layout with the stick on a dim the read leaves alone.

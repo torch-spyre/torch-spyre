@@ -94,6 +94,7 @@ from .pass_utils import (
     prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
+    try_device_coordinates,
 )
 from .views import compute_coordinates, matching_dim
 from torch_spyre._C import (
@@ -716,8 +717,12 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     if in_dep is None or not isinstance(real, FixedTiledLayout):
         return
     write_dep = _write_dep(op)
-    in_coords = device_coordinates(in_layout.device_layout, in_dep)
-    out_coords = device_coordinates(real.device_layout, write_dep)
+    # This runs on every pointwise op with a mutation-layout output, which the
+    # padding pass never computed coordinates for before.  Probe rather than
+    # compute, so an unrepresentable coordinate leaves the op to fail with its
+    # own error instead of the generic one from here.
+    in_coords = try_device_coordinates(in_layout.device_layout, in_dep, None)
+    out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
     in_stick, out_stick = in_coords[-1], out_coords[-1]
