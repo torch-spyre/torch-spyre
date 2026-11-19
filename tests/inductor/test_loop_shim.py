@@ -202,8 +202,8 @@ def test_a_coarsetileinfo_op_still_reads_its_lists():
 
 
 # ---------------------------------------------------------------------------
-# The readers that can see a shim op (the inventory is tests/inductor/
-# loop_shim_audit.py; the sites below are what it found)
+# The readers that can see a shim op (the sites below are what an audit of
+# the readers found)
 # ---------------------------------------------------------------------------
 
 import ast  # noqa: E402

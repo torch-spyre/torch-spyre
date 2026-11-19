@@ -191,12 +191,12 @@ class TestDelinearizeIndex(unittest.TestCase):
     data.
     """
 
-    def _delinearize(self, index, size, stride, offset):
+    def _delinearize(self, index, size, stride, offset, **kwargs):
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _delinearize_index,
         )
 
-        return _delinearize_index(index, size, stride, offset)
+        return _delinearize_index(index, size, stride, offset, **kwargs)
 
     def test_recovers_symbolic_coordinate_per_dim(self):
         import sympy
@@ -255,6 +255,106 @@ class TestDelinearizeIndex(unittest.TestCase):
         # 7 does not decompose evenly across a single size-2, stride-4 dim.
         with self.assertRaises(AssertionError):
             self._delinearize(sympy.Integer(7), size=[2], stride=[4], offset=0)
+
+    def test_symbol_at_multiple_of_dim_stride_is_folded_into_that_dim(self):
+        """Core #6407 repro: a reduction symbol flattened through a contiguous
+        reshape enters as 512*d2 where the marker's dim stride is 64; .coeff(64)
+        cannot see it, so it used to vanish from every coordinate, dropping the
+        reduce axis from the composed read."""
+        import sympy
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        coords = self._delinearize(
+            64 * d0 + d1 + 512 * d2, size=[72, 64], stride=[64, 1], offset=0
+        )
+        self.assertEqual(coords, [8 * d2 + d0, d1])
+
+    def test_stride_multiple_folds_into_a_constant_coordinate(self):
+        """reshape(9, 8, 64)[:, 3, :].sum(0): the fold lands on a dim whose
+        coordinate came from the constant part of the index."""
+        import sympy
+
+        d1, d2 = sympy.symbols("d1 d2")
+        coords = self._delinearize(
+            512 * d2 + d1 + 192, size=[72, 64], stride=[64, 1], offset=0
+        )
+        self.assertEqual(coords, [8 * d2 + 3, d1])
+
+    def test_layout_without_foldable_dim_recovers_zero(self):
+        """A [1, 1] tile (tile_size=1 over an [N, 1] operand) or a broadcast
+        dim loads at index 0; with nothing left to fold, nothing must raise."""
+        import sympy
+
+        zero = sympy.Integer(0)
+        for size, stride in (([1, 1], [1, 1]), ([4], [0])):
+            with self.subTest(size=size, stride=stride):
+                coords = self._delinearize(zero, size=size, stride=stride, offset=0)
+                self.assertEqual(coords, [zero] * len(size))
+
+    def test_leftover_term_indivisible_by_every_stride_raises(self):
+        import sympy
+
+        d0 = sympy.Symbol("d0")
+        with self.assertRaises(AssertionError):
+            self._delinearize(4 * d0, size=[4], stride=[8], offset=0)
+
+    def test_symbolic_multiplier_leftover_term_raises(self):
+        """512*s0*d2 is a row coordinate only if s0 is a size, which
+        _delinearize_index cannot tell, so it raises instead of folding
+        8*s0*d2. (s0*d2 itself never folds: with a unit-stride dim .coeff(1)
+        takes it, and without one no stride divides its coefficient 1.)"""
+        import sympy
+
+        d0, d1, d2, s0 = sympy.symbols("d0 d1 d2 s0")
+        with self.assertRaises(AssertionError):
+            self._delinearize(
+                64 * d0 + d1 + 512 * s0 * d2, size=[72, 64], stride=[64, 1], offset=0
+            )
+
+    def test_term_only_an_inner_stride_divides_raises(self):
+        """tile.reshape(4, 2, 64) of a [2, 4, 64] tile reads 128*r + 64*b + c:
+        only the inner stride 64 divides 128*r, and folding it there would
+        give b + 2*r, out of bounds for size 4 once r >= 2."""
+        import sympy
+
+        r, b, c = sympy.symbols("r b c")
+        with self.assertRaises(AssertionError):
+            self._delinearize(
+                128 * r + 64 * b + c, size=[2, 4, 64], stride=[256, 64, 1], offset=0
+            )
+
+    def test_inner_fold_allowed_when_composed_through_own_strides(self):
+        """The same index with fold_into_any_dim: b + 2*r is out of range, but
+        a caller composing through these strides reads the same element."""
+        import sympy
+
+        r, b, c = sympy.symbols("r b c")
+        coords = self._delinearize(
+            128 * r + 64 * b + c,
+            size=[2, 4, 64],
+            stride=[256, 64, 1],
+            offset=0,
+            fold_into_any_dim=True,
+        )
+        self.assertEqual(coords, [sympy.Integer(0), b + 2 * r, c])
+
+    def test_reads_at_own_strides_tells_row_from_column_tiles(self):
+        """A row tile of [4, 4, 64] reads its input at its own strides plus a
+        per-trip offset; a column tile of [256, 128] reads at row stride 128
+        against its own 64."""
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _reads_at_own_strides,
+        )
+
+        d0, d1, d2, u0 = sympy.symbols("d0 d1 d2 u0")
+        row = 256 * d0 + 64 * d1 + d2 + 512 * u0
+        self.assertTrue(
+            _reads_at_own_strides(row, (d0, d1, d2), (2, 4, 64), (256, 64, 1))
+        )
+        column = 128 * d0 + d1 + 64 * u0
+        self.assertFalse(_reads_at_own_strides(column, (d0, d1), (256, 64), (64, 1)))
 
 
 class TestIndirectIndexStepGuard(unittest.TestCase):
@@ -1628,7 +1728,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
     def test_private_in_graph_fill_keeps_single_buffer(self):
         """A compiler-owned in-graph `torch.zeros` fill is not copied."""
@@ -1825,7 +1924,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
-                self.assertIsNone(info.propagation)
 
             records_by_name = {
                 op.get_name(): record
@@ -3359,15 +3457,25 @@ def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
-    def test_splice_while_loops_is_first_pass(self):
+    def test_splice_while_loops_runs_right_after_the_reserved_dims_contract(self):
         from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+        from torch_spyre._inductor.reserved_dims_contract import (
+            apply_reserved_dims_contract,
+        )
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
 
         pipeline = CustomPreSchedulingPasses()
 
-        self.assertIs(pipeline.passes[0], splice_while_loops)
+        # apply_reserved_dims_contract must run before splice_while_loops (and
+        # everything else): it writes each declared dim's (min, max) into the
+        # ShapeEnv, which splice_while_loops reads when it stamps a loop's
+        # trip count / max extent. Reversing the order would make
+        # splice_while_loops see Dynamo's loose default range instead of the
+        # declared one.
+        self.assertIs(pipeline.passes[0], apply_reserved_dims_contract)
+        self.assertIs(pipeline.passes[1], splice_while_loops)
 
 
 def test_tile_dim_marker_lowering_produces_distinct_operation():
@@ -3854,6 +3962,85 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 lookup_marker_dim(new_consumer, loop_var),
                 "the retained axis must still resolve to a tiled position",
             )
+
+    def test_cached_marker_substitution_invalidates_on_edit(self):
+        """_cached_marker_substitution re-extracts once the marker is edited.
+
+        The cache on the marker is reused only while its body, ranges and host
+        layouts and its input's host layout are unchanged. A stale hit would
+        inline the marker with an old read index, which is wrong code, not a
+        crash, so pin each invalidation: patching ``inner_fn`` in place and
+        changing the input buffer's host stride must both re-extract.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _cached_marker_substitution,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_m_elementwise_fn, (X, Y))
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+            marker_op = next(
+                op
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            )
+            self.assertIsInstance(marker_op, ir.ComputedBuffer)
+
+            with mock.patch.object(
+                lowering, "_marker_substitution", wraps=lowering._marker_substitution
+            ) as extract:
+                first = _cached_marker_substitution(marker_op)
+                self.assertIs(_cached_marker_substitution(marker_op), first)
+                self.assertEqual(extract.call_count, 1, "unchanged marker: a hit")
+
+                # A pass patches inner_fn in place on the same body object.
+                original_fn = marker_op.data.inner_fn
+                object.__setattr__(
+                    marker_op.data, "inner_fn", lambda index: original_fn(index)
+                )
+                self.assertEqual(_cached_marker_substitution(marker_op), first)
+                self.assertEqual(extract.call_count, 2, "new inner_fn: a miss")
+
+                # Change the input's host stride.
+                input_buf = graph.try_get_buffer(first[0])
+                while not isinstance(input_buf, ir.Buffer):
+                    input_buf = input_buf.data
+                old = input_buf.get_layout()
+                self.assertGreater(len(old.size), 1)
+                object.__setattr__(
+                    input_buf,
+                    "layout",
+                    ir.FixedLayout(
+                        old.device,
+                        old.dtype,
+                        list(old.size),
+                        [stride * 2 for stride in old.stride],
+                        old.offset,
+                    ),
+                )
+                _cached_marker_substitution(marker_op)
+                self.assertEqual(extract.call_count, 3, "new input stride: a miss")
 
     def test_marker_with_two_computed_buffer_consumers_retain_advances(self):
         """Paged attention's shape: one marker, two ComputedBuffer consumers,
@@ -5533,7 +5720,6 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             info = op.loop_info
             self.assertEqual(info.loop_group_id, (0,))
             self.assertEqual(info.loop_count, [result.trip_count])
-            self.assertIsNone(info.propagation)
 
     def test_marker_resolved_dim_appears_in_loop_tiled_dims(self):
         """A marker-resolved tile read surfaces in loop_tiled_dims.

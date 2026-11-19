@@ -33,6 +33,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     _repoint_mutation_targets,
@@ -303,9 +304,13 @@ class TestPassUtils(unittest.TestCase):
 
     def test_compute_granularity_user_min_exceeds_bucket_cap_raises(self):
         expr = sympy.Symbol("s0", integer=True, positive=True)
-        # min=4, max=512 -> 128 buckets > default cap of 32.
+        # min=4, max=512 -> 128 buckets > a cap of 32. The cap is pinned so the
+        # test does not depend on the configured default (#6432).
         mock_v = self._mock_v(sympy.Integer(4), sympy.Integer(512))
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+        with (
+            patch("torch_spyre._inductor.pass_utils.V", mock_v),
+            spyre_config.patch(max_buckets=32),
+        ):
             with self.assertRaises(Unsupported) as cm:
                 compute_granularity(expr, max_size=512)
         msg = str(cm.exception)
@@ -313,10 +318,13 @@ class TestPassUtils(unittest.TestCase):
 
     def test_compute_granularity_default_with_warning(self):
         # lower=2 (PyTorch default) -> "no min"; smallest divisor of 1024
-        # >= 4 with 1024/d <= 32 is 32.
+        # >= 4 with 1024/d <= 32 is 32. The cap is pinned at 32 for the test.
         expr = sympy.Symbol("s0", integer=True, positive=True)
         mock_v = self._mock_v(sympy.Integer(2), sympy.Integer(1024))
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+        with (
+            patch("torch_spyre._inductor.pass_utils.V", mock_v),
+            spyre_config.patch(max_buckets=32),
+        ):
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 granularity = compute_granularity(expr, max_size=1024)
@@ -325,9 +333,14 @@ class TestPassUtils(unittest.TestCase):
 
     def test_compute_granularity_hint_fallback_emits_warning(self):
         # No finite upper bound -> max came from optimization_hint; helper warns.
+        # The cap is pinned at 32 so the divisor the test expects does not move
+        # with the configured default (#6432).
         expr = sympy.Symbol("s0", integer=True, positive=True)
         mock_v = self._mock_v(sympy.Integer(2), sympy.oo)
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+        with (
+            patch("torch_spyre._inductor.pass_utils.V", mock_v),
+            spyre_config.patch(max_buckets=32),
+        ):
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 granularity = compute_granularity(expr, max_size=1024)

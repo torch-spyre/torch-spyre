@@ -118,7 +118,7 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
     nesting level from outermost to innermost (stamped by
-    coarse_tile_post_stickify() or the for_each_tile lowering).
+    tile_groups() or the for_each_tile lowering).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.

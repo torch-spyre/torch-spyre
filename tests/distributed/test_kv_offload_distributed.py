@@ -87,6 +87,7 @@ def slot_major_layout(num_slots, num_kv_heads, head_size, dtype=torch.float16):
         device_size=[num_slots, num_kv_heads, sticks, eps],
         stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
         device_dtype=get_device_dtype(dtype),
+        valid_elements={(0,): num_slots, (1,): num_kv_heads, (2, 3): head_size},
     )
 
 

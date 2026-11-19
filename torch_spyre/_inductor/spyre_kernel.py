@@ -31,7 +31,7 @@ from torch._inductor.codegen.common import (
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.ir import ComputedBuffer, Pointwise
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
@@ -626,6 +626,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
+        # (node, its read/writes): the tile-advance builders run once per
+        # argument of a node, so trace the node once. Keyed by identity,
+        # holding the node.
+        self._tile_advance_rw: "tuple[Any, ReadWrites] | None" = None
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
         self._alignment_repeat_info: dict[sympy.Symbol, dict[str, Any]] = {}
         self.scheduled_nodes: list[SchedulerNode] = []
@@ -753,6 +757,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             mapped = dim
         return sympy_index_symbol(f"d{mapped}")
 
+    def _tile_advance_read_writes(self, ir_node: Any) -> ReadWrites:
+        """``ir_node.get_read_writes()``, traced once per kernel node.
+
+        ``_general_tile_advance`` and ``_index_tile_advance`` each run once per
+        argument of a node; both share this trace.
+        """
+        cached = self._tile_advance_rw
+        if cached is not None and cached[0] is ir_node:
+            return cached[1]
+        rw = ir_node.get_read_writes()
+        self._tile_advance_rw = (ir_node, rw)
+        return rw
+
     def _general_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
@@ -787,13 +804,10 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         op_name = ir_node.get_operation_name()
         squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
+        rw = self._tile_advance_read_writes(ir_node)
 
         if is_input:
-            read_deps = [
-                dep
-                for dep in ir_node.get_read_writes().reads
-                if isinstance(dep, MemoryDep)
-            ]
+            read_deps = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
                 scheduler.mutation_real_name if scheduler is not None else {}
@@ -822,11 +836,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if squeezed_advance_per_read and dep_idx < len(squeezed_advance_per_read):
                 squeezed_advance_per_level = squeezed_advance_per_read[dep_idx]
         else:
-            write_deps = [
-                dep
-                for dep in ir_node.get_read_writes().writes
-                if isinstance(dep, MemoryDep)
-            ]
+            write_deps = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
             if not write_deps:
                 return None
             dep = write_deps[0]
@@ -918,7 +928,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 len(enclosing_loops(ir_node)),
             )
             return None
-        reads_writes = ir_node.get_read_writes()
+        reads_writes = self._tile_advance_read_writes(ir_node)
         if is_input:
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
@@ -997,8 +1007,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         stored per-read fields are deleted (stage 7.4) the record is still built, and
         the two must agree: a difference is a compiler bug (a pass edited one source
         and not the other), so it raises instead of emitting a kernel that advances
-        by the wrong amount. Every other op (span-overflow and the allocator's
-        tiling have no loop variable) keeps the record.
+        by the wrong amount. Every other op keeps the record.
         """
         ir_node = self.current_node.node
         if isinstance(getattr(ir_node, "loop_info", None), LoopShim):
@@ -1288,7 +1297,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # op's own iteration space entirely (no d{i} symbol survives), so it
         # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
         # only advance via squeezed_advance_per_read/squeezed_advance_output
-        # (see coarse_tile.py's _insert_copy_op, the "d not in
+        # (see loop_tiling_lowering.py's _insert_copy_out, the "d not in
         # squeeze_pos" branch). _general_tile_advance already mints/uses a
         # level symbol from squeezed_advance_per_level regardless of
         # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
@@ -1936,7 +1945,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"{pool_var_name} = spyre_empty_with_layout("
                 f"({self.pool_size},), (1,), torch.uint8, "
                 f"SpyreTensorLayout(device_size=[{self.pool_size}], "
-                f"stride_map=[1], device_dtype=DataFormats.SENINT8), "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8, "
+                f"valid_elements={{(0,): {self.pool_size}}}), "
                 f"device=torch.device('{device}'))"
             )
             call_args.append(pool_var_name)
