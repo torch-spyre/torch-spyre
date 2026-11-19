@@ -133,7 +133,7 @@ def _nest_mismatch(nest: dict[str, CoarseTileInfo], expected: _Counts) -> Option
 
     Prefix holds for a nest that tiles only output dims, which is all these
     cases write.  A nest that tiles a reduction dim can give its fill op a
-    subset of levels that skips one (``_compute_fill_loop_info_planned``);
+    subset of levels that skips one (the legacy transform's fill);
     such a nest never matches here, and no case expects one to.
     """
     path = max((info.loop_group_id for info in nest.values()), key=len)
