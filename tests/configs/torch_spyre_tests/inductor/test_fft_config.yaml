@@ -1,0 +1,22 @@
+test_suite_config:
+  labels: [unit, regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestFFT::test_fft_matches_reference
+            - TestFFT::test_ifft_roundtrip
+            - TestFFT::test_fft2_matches_reference
+            - TestFFT::test_fftn_matches_reference
+            - TestFFT::test_ifftn_roundtrip
+            - TestFFT::test_fft_large_fourstep
+            - TestFFT::test_ifft_large_roundtrip
+            - TestFFT::test_fft_large_prime_unsupported
+            - TestFFT::test_fft_direct_max_env_forces_fourstep
+            - TestFFT::test_fft_overflow_prescaled
+            - TestFFT::test_fft_per_row_prescale
+            - TestFFT::test_inverse_matrix_unit_magnitude
+            - TestFFT::test_w_cache_lru_eviction
+            - TestFFT::test_dft_matrix_block_boundary
+          mode: mandatory_success
