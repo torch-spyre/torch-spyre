@@ -231,6 +231,11 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Compiling for Spyre 1p5 (the backend compiler reads the same SENARCH). Its
+# matmul takes BFLOAT16 inputs only, so a matmul input must already be BFLOAT16
+# on the device: see spyre_kernel._check_sen1p5_matmul_inputs.
+sen1p5: bool = os.environ.get("SENARCH", "").lower() == "sen1p5"
+
 # Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
 # The pointwise work-division PR (#2499) wires that helper into the
 # compilation pipeline; until then these knobs are read only by the
@@ -407,23 +412,6 @@ ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
-
-# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
-# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
-# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
-# the CoarseTileInfo transform is deleted.
-def _choose_loop_tiling_lowering(value: str) -> str:
-    if value not in ("legacy", "plan"):
-        raise ValueError(
-            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
-            "'plan'"
-        )
-    return value
-
-
-loop_tiling_lowering: str = _choose_loop_tiling_lowering(
-    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
-)
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future

@@ -70,6 +70,86 @@ def test_rank_preserving_static_mutation_slice_can_reuse_backing_layout():
     assert _real_layout_matches_op_size(node, backing_layout)
 
 
+def test_rank_preserving_different_size_static_offset_can_reuse_backing_layout():
+    """Same rank, different size, but a concrete (symbol-free) offset.
+
+    The op writes a fixed sub-region of the backing buffer (e.g. the copy
+    interior of a constant_pad_nd output).  real_layout() is safe to reuse.
+    """
+    logical_size = [2, 128]
+    logical_layout = FixedLayout(
+        torch.device("spyre"),
+        torch.float16,
+        logical_size,
+        [128, 1],
+        offset=sympy.Integer(512),  # concrete, no free symbols
+    )
+    mutation_layout = SimpleNamespace(
+        size=logical_size, target=SimpleNamespace(layout=logical_layout)
+    )
+    node = SimpleNamespace(
+        data=SimpleNamespace(get_size=lambda: logical_size),
+        get_layout=lambda: mutation_layout,
+    )
+    backing_layout = FixedLayout(
+        torch.device("spyre"), torch.float16, [8, 128], [128, 1]
+    )
+
+    assert _real_layout_matches_op_size(node, backing_layout)
+
+
+def test_rank_preserving_different_size_symbolic_offset_cannot_reuse_backing_layout():
+    """Same rank, different size, offset contains a loop symbol.
+
+    The op writes a per-iteration tile (e.g. a while_loop body mutation at
+    offset 12*u0).  real_layout() covers the whole underlying buffer, not the
+    tile this iteration writes, so it must NOT be reused.
+    """
+    loop_var = sympy.Symbol("u0", integer=True)
+    logical_size = [2, 6]
+    logical_layout = FixedLayout(
+        torch.device("spyre"),
+        torch.float16,
+        logical_size,
+        [6, 1],
+        offset=12 * loop_var,  # free symbol → per-iteration placement
+    )
+    mutation_layout = SimpleNamespace(
+        size=logical_size, target=SimpleNamespace(layout=logical_layout)
+    )
+    node = SimpleNamespace(
+        data=SimpleNamespace(get_size=lambda: logical_size),
+        get_layout=lambda: mutation_layout,
+    )
+    backing_layout = FixedLayout(
+        torch.device("spyre"), torch.float16, [4, 2, 6], [12, 6, 1]
+    )
+
+    assert not _real_layout_matches_op_size(node, backing_layout)
+
+
+def test_mutation_view_with_no_target_layout_cannot_reuse_backing_layout():
+    """Target has no layout attribute (e.g. a SpyreEmptyFallback-like stub).
+
+    getattr(target, 'layout', None) returns None → must return False rather
+    than crashing.
+    """
+    logical_size = [4, 128]
+    mutation_layout = SimpleNamespace(
+        size=logical_size,
+        target=SimpleNamespace(),  # no .layout attribute
+    )
+    node = SimpleNamespace(
+        data=SimpleNamespace(get_size=lambda: logical_size),
+        get_layout=lambda: mutation_layout,
+    )
+    backing_layout = FixedLayout(
+        torch.device("spyre"), torch.float16, [8, 128], [128, 1]
+    )
+
+    assert not _real_layout_matches_op_size(node, backing_layout)
+
+
 def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
     loop_var, inner_var = sympy.symbols("u0 d0", integer=True)
     operation = SimpleNamespace(

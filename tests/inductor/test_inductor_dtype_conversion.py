@@ -136,14 +136,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
-            "that differ from the CPU result (#2847)"
-        ),
-    )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
         """Eager fp32→fp16 cast on a Spyre tensor."""
@@ -193,15 +185,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc02_half")
@@ -220,15 +203,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
         x = cached_randn(
@@ -989,6 +963,22 @@ class TestUnsupportedGates(unittest.TestCase):
         x = torch.randn(2, 2, dtype=torch.float64)
         with self.assertRaises(RuntimeError):
             x.to("spyre")
+
+    def test_kernel_to_dtype_without_src_dtype_raises_unsupported(self):
+        """A kernel cast without src_dtype is rejected with Unsupported (#5783).
+
+        OpsHandler.to_dtype declares src_dtype optional, and some upstream
+        Inductor lowerings omit it. Spyre picks the hardware op from the
+        (src_dtype, dtype) pair, so it must reject the cast with a clear
+        message instead of failing with TypeError.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        for kwargs in ({}, {"use_compute_types": False}, {"src_dtype": None}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(Unsupported, "without a source dtype"):
+                    SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
 
 
 class TestModelIntegration(unittest.TestCase):

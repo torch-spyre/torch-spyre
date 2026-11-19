@@ -55,6 +55,7 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -679,8 +680,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         pool invariant, and let the body read its page index out of the tile.
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
-        coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), leave the read direct (never staged into scratch),
+        the advance read off the index, leave the read direct (never staged
+        into scratch),
         keep the loop term in the index (per_trip_index pins it in the base
         coordinates, so the advance is not applied twice), and
         insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
@@ -833,6 +834,16 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile fails to preserve input EA tag in identity op. The "
+            "output is incorrectly tagged STANDARD (default) when data is "
+            "staggered it causes EA DCI to incorrectly apply / restore EA. "
+            "See issue #6462."
+        ),
+    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
@@ -935,6 +946,23 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
             reshape_sum_tiled_fn, backend="inductor", fullgraph=True
         )
         out = compiled(X_spyre, 64, 8, 1)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_reshape_sum_tiled_3d_inner_fold(self):
+        """A [2, 4, 64] row tile reshaped to (4, 2, 64): the reduce term 128*r
+        only divides the inner stride 64, so the fold leaves that coordinate
+        out of range -- harmless, since the tile reads at its own strides."""
+        X = cached_randn((4, 4, 64))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = reshape_sum_tiled_reference(X.float(), 2, 4)
+
+        compiled = torch.compile(
+            reshape_sum_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2, 4)
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
@@ -2319,6 +2347,106 @@ class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
                 out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
             )
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
+# #6496: shapes for a loop whose first reduction is over rows of Q and whose
+# body also has ops of other sizes (the K page), with Q built before the loop.
+FS_E, FS_KV, FS_QG, FS_D, FS_N, FS_PAGES = 4, 2, 4, 128, 128, 2
+
+
+def rows_max_scores_fn(query, rows, k_pages):
+    """Running max of normalized-Q @ K_page^T scores over the K pages.
+
+    Q comes from an index_select before the loop, a [4, 8, 128] pointwise
+    node with as many elements as the loop's first reduction (32 rows x 128).
+    """
+    q = query.index_select(0, rows).reshape(FS_E, FS_KV, FS_QG, FS_D)
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        qn = q / q.abs().amax(-1, keepdim=True)
+        k = k_page[0] * 0.5
+        sc = qn @ k.transpose(-2, -1)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_E, FS_KV, FS_QG, 1),
+        float("-inf"),
+        dtype=torch.float16,
+        device=query.device,
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+def rows_max_scores_reference(query, rows, k_pages):
+    q = query.float().index_select(0, rows.long()).reshape(FS_E, FS_KV, FS_QG, FS_D)
+    qn = q / q.abs().amax(-1, keepdim=True)
+    sc = qn.unsqueeze(0) @ (k_pages.float() * 0.5).transpose(-2, -1)
+    return sc.amax(-1, keepdim=True).amax(0)
+
+
+def fp8_folded_rows_max_fn(q, k_pages):
+    """The prefill body of #6496: Q rows folded and FP8-quantized in the loop."""
+    rows = 4
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        folded = q.reshape(FS_KV, FS_QG * rows, FS_D)
+        scale = torch.ops.spyre.quantscalepertokenfp8(folded, 1.0)
+        q8 = torch.ops.spyre.quantize_fp8_with_scale(folded, scale)
+        k8 = torch.ops.spyre.qfp8wt(k_page[0].transpose(-2, -1).contiguous())
+        sc = torch.ops.spyre.scaled_bmm(q8, k8, out_dtype=torch.float16) * scale
+        sc = sc.reshape(FS_KV, FS_QG, rows, FS_N)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_KV, FS_QG, rows, 1), float("-inf"), dtype=torch.float16, device=q.device
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+class TestForEachTileFusionScoringE2E(_DynamoResetTestCase):
+    """A loop next to a node outside it that has the loop's first-reduction size.
+
+    The loop's scheduler node holds ops of several sizes and takes its group
+    from its first reduction. Inductor's fusion scoring
+    (``_try_reindex_pointwise_for_reduction``) runs before Spyre declines the
+    fusion and used to assert on such a loop ("expected pointwise sizes to
+    match pointwise_numel * red_numel", #6496). Spyre turns the reindex off.
+    """
+
+    def test_reduction_over_rows_of_a_tensor_built_before_the_loop(self):
+        torch.manual_seed(0)
+        query = torch.randn(2, FS_KV * FS_QG, FS_D, dtype=torch.float16)
+        rows = torch.arange(2, dtype=torch.int32).repeat(2)
+        k_pages = torch.randn(FS_PAGES, FS_E, FS_KV, FS_N, FS_D, dtype=torch.float16)
+
+        compiled = torch.compile(rows_max_scores_fn, dynamic=False, fullgraph=True)
+        out = compiled(*(t.to(DEVICE_NAME) for t in (query, rows, k_pages)))
+
+        torch.testing.assert_close(
+            out.cpu().float(),
+            rows_max_scores_reference(query, rows, k_pages),
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_fp8_quantize_of_rows_folded_in_the_loop(self):
+        """Compiles and runs; numerics of the FP8 block are covered elsewhere."""
+        torch.manual_seed(0)
+        q = torch.randn(FS_KV, FS_QG, 4, FS_D, dtype=torch.float16)
+        k_pages = (
+            (torch.randn(FS_PAGES, FS_KV, FS_N, FS_D) * 100)
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+            .to(torch.float16)
+        )
+
+        compiled = torch.compile(fp8_folded_rows_max_fn, dynamic=False, fullgraph=True)
+        out = compiled(q.to(DEVICE_NAME), k_pages.to(DEVICE_NAME)).cpu()
+
+        self.assertEqual(tuple(out.shape), (FS_KV, FS_QG, 4, 1))
+        self.assertTrue(torch.isfinite(out).all())
 
 
 if __name__ == "__main__":

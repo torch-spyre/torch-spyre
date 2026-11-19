@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     Layout,
     MutableBox,
@@ -38,6 +39,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ScatterFallback,
     StorageBox,
     TensorBox,
     _CollectiveKernel,
@@ -655,6 +657,15 @@ def _typecast_layouts(
         out_ea = ElementArrangement.QFP8CH
     else:
         out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+        # A stick dim with no host dim, or only a size-1 one (0-dim, (1,), (2, 1)),
+        # holds a single element at position 0, which every arrangement leaves in
+        # place. Staggering is a no-op there and EA in DCI cannot permute.
+        # Decide from the read's coordinates, not the input's stride_map: a
+        # round-trip conversion rewrites the stride_map entry (#5566).
+        if out_ea in STAGGERED_EAS and all(
+            concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
+        ):
+            out_ea = ElementArrangement.STANDARD
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_coords = host_coordinates(output, output_dep, None)
@@ -3899,6 +3910,14 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
+        elif isinstance(op, (IndexPutFallback, ScatterFallback)):
+            # Upstream routes some index_put and scatter forms to a mutating
+            # fallback, which has no Spyre kernel. Reject here, not at run time.
+            # TODO(issue#692, issue#4361): drop this once they lower on device.
+            raise Unsupported(
+                f"{op.python_kernel_name}: upstream lowers this form to a "
+                f"mutating fallback, which has no Spyre kernel"
+            )
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:
