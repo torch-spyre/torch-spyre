@@ -472,7 +472,7 @@ def staged_transport_graph(monkeypatch):
 
     u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
 
-    # TODO: the proof's local bound (``_affine_bounds``) does not tolerate a loop
+    # TODO(#6509): the proof's local bound (``_affine_bounds``) does not tolerate a loop
     # variable in the index, so on a real looped graph, where the direct read
     # carries its loop term (stage 7.2b), it declines ("source element range is
     # not statically provable") even though the advance bound is right. This
