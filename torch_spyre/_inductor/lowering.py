@@ -210,6 +210,37 @@ def _spyre_index_put_impl_(stock):
     return impl
 
 
+def _spyre_index_put_fallback(stock):
+    """Reject an ``index_put`` of a Spyre tensor that upstream would send to
+    its eager fallback.
+
+    ``IndexPutFallback`` calls the eager ``aten::_index_put_impl_`` kernel,
+    which Spyre does not have, so the write could never happen (and was
+    silently dropped). The forms that still get here are ``accumulate=True``
+    and boolean-mask indices; fail with a clear error instead.
+    """
+
+    def impl(self, indices, values, accumulate):
+        device = self.get_device()
+        if device is None or device.type != DEVICE_NAME:
+            return stock(self, indices, values, accumulate)
+        if accumulate:
+            form = "accumulate=True"
+        elif any(
+            i is not None and i.get_dtype() in (torch.bool, torch.uint8)
+            for i in indices
+        ):
+            form = "boolean mask indices"
+        else:
+            form = "this form"
+        raise Unsupported(
+            f"index_put with {form}: upstream lowers it to an eager fallback "
+            f"(aten::_index_put_impl_), which has no Spyre kernel"
+        )
+
+    return impl
+
+
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
 @contextmanager
 def enable_spyre_lowerings():
@@ -272,6 +303,12 @@ def enable_spyre_lowerings():
 
             enable_spyre_lowerings._stock_index_put_impl = lowering.index_put_impl_
             lowering.index_put_impl_ = _spyre_index_put_impl_(lowering.index_put_impl_)
+            enable_spyre_lowerings._stock_index_put_fallback = (
+                lowering.index_put_fallback
+            )
+            lowering.index_put_fallback = _spyre_index_put_fallback(
+                lowering.index_put_fallback
+            )
 
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
@@ -291,6 +328,9 @@ def enable_spyre_lowerings():
                     else:
                         lowering.lowerings[ov] = prev
                 lowering.index_put_impl_ = enable_spyre_lowerings._stock_index_put_impl
+                lowering.index_put_fallback = (
+                    enable_spyre_lowerings._stock_index_put_fallback
+                )
                 # Clean up
                 enable_spyre_lowerings._saved_aten_lowerings = {}
                 # Reset the saved in-tree lowerings if needed
