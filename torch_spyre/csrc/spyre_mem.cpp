@@ -485,20 +485,121 @@ auto qfp8ch_stride_infos(const std::vector<DataConversionStrideInfo>& infos,
     // only skips a sub-flit head when reading (subFlitHead returns 0 for H2D,
     // since writing the head would need a read-modify-write). A chunk that
     // does not start the stick would be written over the stick's first chunk,
-    // so H2D supports a partial stick only when it is a single run at the
-    // start of the stick.
+    // so H2D supports a partial stick here only when it is a single run at
+    // the start of the stick. generate_dci pads the other H2D cases to whole
+    // sticks (qfp8ch_padded_h2d_infos) when the destination is not a slice.
     TORCH_CHECK(
         !host2device || (first == 0 && last <= kChunk),
-        "QFP8CH host-to-device copy into a partly filled stick (columns ",
+        "QFP8CH host-to-device copy into a slice that covers only columns ",
         first, " to ", last,
-        " of the stick) is not supported: its chunks are not "
-        "contiguous on the device, and flex cannot write a run that "
-        "starts inside a 128-byte flit");
+        " of a stick is not supported: its chunks are not contiguous on the "
+        "device, flex cannot write a run that starts inside a 128-byte "
+        "flit, and padding the stick would overwrite the columns outside "
+        "the slice");
     for (int64_t c = first; c < last;) {
       const int64_t len = std::min((c / kChunk + 1) * kChunk, last) - c;
       emit(c, {len}, {h}, {1});
       c += len;
     }
+  }
+  return out;
+}
+
+/*
+ * True when some stride info of a QFP8CH copy covers only part of a stick.
+ */
+bool qfp8ch_has_partial_stick(
+    const std::vector<DataConversionStrideInfo>& infos, int64_t eps,
+    bool host2device) {
+  for (const auto& info : infos) {
+    const int64_t dev_off = host2device ? info.offset_dst_ : info.offset_src_;
+    if (info.size_.empty() || dev_off % eps != 0 || info.size_[0] != eps) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * H2D stride infos for a QFP8CH device tensor with partly filled sticks.
+ *
+ * Flex cannot write a run that starts inside a 128-byte flit (see
+ * qfp8ch_stride_infos), so every stick has to be written whole. The host data
+ * is gathered into `staging`, a new host buffer with one zero-padded
+ * 128-element stick per device stick, and each stride info is replaced by a
+ * whole-stick info reading from it. The device sticks' padding columns are
+ * written as zeros.
+ *
+ * Writing whole sticks is only right when the columns outside each run are
+ * padding, not data of a larger tensor the destination is a slice of; the
+ * caller checks that.
+ *
+ * @param infos: STANDARD stride infos (innermost first) reading `cpu_tensor`
+ * @param cpu_tensor: host source of the copy
+ * @param eps: elements per stick of the device tensor (128 for fp8)
+ * @param staging: receives the padded host buffer the result reads from
+ * @return stride infos that write whole QFP8CH sticks from `staging`
+ */
+auto qfp8ch_padded_h2d_infos(const std::vector<DataConversionStrideInfo>& infos,
+                             const at::Tensor& cpu_tensor, int64_t eps,
+                             at::Tensor* staging)
+    -> std::vector<DataConversionStrideInfo> {
+  constexpr int64_t kChunk = 8;
+  const int64_t half = eps / 2;
+  TORCH_CHECK(eps == 128, "QFP8CH expects 128 elements per stick, got ", eps);
+
+  // Elements of `staging` each info takes: one padded stick per combination
+  // of its outer indices.
+  std::vector<int64_t> bases;
+  int64_t total = 0;
+  for (const auto& info : infos) {
+    bases.push_back(total);
+    total +=
+        eps * c10::multiply_integers(info.size_.begin() + 1, info.size_.end());
+  }
+  *staging = at::zeros({total}, cpu_tensor.options());
+
+  std::vector<DataConversionStrideInfo> out;
+  for (size_t i = 0; i < infos.size(); ++i) {
+    const auto& info = infos[i];
+    TORCH_CHECK(!info.size_.empty() && info.stride_dst_[0] == 1,
+                "QFP8CH: expected the innermost device dimension to be the "
+                "stick dimension with stride 1");
+    const int64_t first = info.offset_dst_ % eps;
+    const int64_t last = first + info.size_[0];
+    TORCH_CHECK(last <= eps, "QFP8CH: stick run [", first, ", ", last,
+                ") overflows a ", eps, "-element stick");
+
+    // Gather this info's host elements into its block of `staging`, laid out
+    // [outer..., eps] (outermost first) with the run at columns [first, last).
+    std::vector<int64_t> sizes(info.size_.rbegin(), info.size_.rend());
+    std::vector<int64_t> strides(info.stride_src_.rbegin(),
+                                 info.stride_src_.rend());
+    const at::Tensor src =
+        cpu_tensor.as_strided(sizes, strides, info.offset_src_);
+    std::vector<int64_t> padded_sizes = sizes;
+    padded_sizes.back() = eps;
+    at::Tensor block =
+        staging->narrow(0, bases[i], c10::multiply_integers(padded_sizes))
+            .view(padded_sizes);
+    block.narrow(-1, first, info.size_[0]).copy_(src);
+
+    // Whole stick, split [element, half, chunk] as in qfp8ch_stride_infos,
+    // then the outer dims: dense in `staging`, unchanged on the device.
+    DataConversionStrideInfo piece;
+    piece.size_ = {kChunk, 2, half / kChunk};
+    piece.stride_src_ = {1, half, kChunk};
+    piece.stride_dst_ = {1, kChunk, 2 * kChunk};
+    int64_t host_extent = eps;
+    for (size_t d = 1; d < info.size_.size(); ++d) {
+      piece.size_.push_back(info.size_[d]);
+      piece.stride_src_.push_back(host_extent);
+      piece.stride_dst_.push_back(info.stride_dst_[d]);
+      host_extent *= info.size_[d];
+    }
+    piece.offset_src_ = bases[i];
+    piece.offset_dst_ = info.offset_dst_ - first;
+    out.push_back(piece);
   }
   return out;
 }
@@ -511,8 +612,8 @@ auto qfp8ch_stride_infos(const std::vector<DataConversionStrideInfo>& infos,
  * @return data conversion information
  */
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
-                  SpyreTensorLayout stl, bool host2device)
-    -> DataConversionInfo {
+                  SpyreTensorLayout stl, bool host2device,
+                  at::Tensor* h2d_staging) -> DataConversionInfo {
   // Support dtype conversion: populate DCI with both source and destination
   // dtype formats
   auto cpu_str_type = torchScalarToString[cpu_tensor->scalar_type()];
@@ -956,8 +1057,20 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device);
     if (stl.element_arrangement == ElementArrangement::QFP8CH) {
-      dci.dcsi_ =
-          qfp8ch_stride_infos(dci.dcsi_, stl.elems_per_stick(), host2device);
+      const int64_t eps = stl.elems_per_stick();
+      // Padding whole sticks with zeros is only right when the columns
+      // outside the copied runs are stick padding: not for a slice of a
+      // larger tensor, whose other columns hold data. A slice falls through
+      // to qfp8ch_stride_infos, which raises unless each run fits the first
+      // chunk of its stick.
+      if (host2device && h2d_staging != nullptr && !dev_sliced &&
+          device_offset == 0 &&
+          qfp8ch_has_partial_stick(dci.dcsi_, eps, host2device)) {
+        dci.dcsi_ =
+            qfp8ch_padded_h2d_infos(dci.dcsi_, *cpu_tensor, eps, h2d_staging);
+      } else {
+        dci.dcsi_ = qfp8ch_stride_infos(dci.dcsi_, eps, host2device);
+      }
     }
 
     // Reverse PyTorch ordering

@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch_spyre.constants import DEVICE_NAME
+from utils_inductor import expects_raise
 
 E4M3 = torch.float8_e4m3fn
 FP16 = torch.float16
@@ -149,6 +150,46 @@ class TestQuantizeFP8:
         torch.testing.assert_close(
             out_cpu.float(), expected.float(), atol=0.0, rtol=0.0
         )
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(2, 16), (4, 64), (4, 100), (4, 192), (16, 128), (2, 384)],
+        ids=["2x16", "4x64", "4x100", "4x192", "16x128", "2x384"],
+    )
+    def test_activation_quantize_2d_h2d_copy(self, shape):
+        """copy_ of host FP8 values into an activation FP8 (QFP8CH) tensor.
+
+        The copy must write the values in the element order qfp8ch uses, so
+        .cpu() gives them back. Shapes whose last dim is not a multiple of 128
+        end in a partly filled stick, which the copy pads to a whole one.
+        """
+        from torch_spyre._C import ElementArrangement
+
+        x = _make_arange_fp16(shape)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        assert (
+            out.device_tensor_layout().element_arrangement == ElementArrangement.QFP8CH
+        )
+        # 2..32 in steps of 2: exact in E4M3, and different from what out holds.
+        new = (x.cpu().to(FP32) * 2).to(E4M3)
+        out.copy_(new)
+        torch.testing.assert_close(out.cpu().float(), new.float(), atol=0.0, rtol=0.0)
+
+    @expects_raise
+    def test_activation_quantize_h2d_copy_into_partial_stick_slice_raises(self):
+        """copy_ into a slice that covers only part of a QFP8CH stick is rejected.
+
+        Its chunks are not contiguous on the device and flex cannot write a run
+        that starts inside a 128-byte flit, while padding the stick would
+        overwrite the columns outside the slice.
+        """
+        x = _make_arange_fp16((4, 128))
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        new = (x.cpu()[:, :64].to(FP32) * 2).to(E4M3)
+        with pytest.raises(RuntimeError, match="covers only columns 0 to 64"):
+            out[:, :64].copy_(new)
 
     @pytest.mark.parametrize("op_name", _RAW_QUANTIZE_PARAMS)
     @pytest.mark.parametrize(

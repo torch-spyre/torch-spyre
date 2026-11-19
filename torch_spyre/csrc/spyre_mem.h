@@ -110,9 +110,15 @@ uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes);
 
+// Describes a copy between `cpu_tensor` and `dev_tensor`. Some H2D copies
+// cannot read the host tensor in place (a QFP8CH device tensor whose sticks are
+// only partly filled): for those the host data is gathered into a new host
+// buffer, returned in `h2d_staging`, and the DCI describes that buffer instead
+// of `cpu_tensor`'s storage. The caller must then DMA from `h2d_staging`. With
+// `h2d_staging` null such copies raise.
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
-                  SpyreTensorLayout stl, bool host2device)
-    -> DataConversionInfo;
+                  SpyreTensorLayout stl, bool host2device,
+                  at::Tensor* h2d_staging = nullptr) -> DataConversionInfo;
 
 // True when the DCI describes a dense same-format copy (a pure memcpy); the
 // caller can then submit the DMA without a DCI and skip host-side conversion.
