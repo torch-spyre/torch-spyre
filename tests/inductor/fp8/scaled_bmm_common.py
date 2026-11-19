@@ -646,14 +646,6 @@ _KNOWN_FAILURES = [
         "#6079: [fp8] scaled_bmm: dbo-opt DtException when the contraction K is "
         "not a multiple of 128",
     ),
-    _KnownFailure(
-        "test_for_each_tile",
-        r".*",
-        InductorError,
-        _NO_STICK_MECHANISM,
-        "#5423: `batchmatmulfp8` fails layout planning inside `for_each_tile`: "
-        '"no mechanism to resolve stick incompatibility"',
-    ),
 ]
 
 

@@ -657,8 +657,9 @@ class TestScaledBmmForEachTile:
     def test_for_each_tile(self, fvt_id, key, b, m, d, n, sencores, request):
         """The FP8 block inside for_each_tile gives the CPU result.
 
-        Today every case fails on #5423 (batchmatmulfp8 layout planning inside
-        for_each_tile), so this test exercises only that bug, and one case runs.
+        Paged Q·Kᵀ and P·V over pages, and the MoE map over experts. Every case
+        runs since #5907 fixed #5423 (batchmatmulfp8 layout planning inside
+        for_each_tile).
         """
         with _expect_known_failure(request):
             pages = 4
