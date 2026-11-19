@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 
 DEVICE = torch.device("spyre")
 
+try:
+    from ortools.sat.python import cp_model as _cp_model  # noqa: F401
+
+    HAS_ORTOOLS = True
+except ImportError:
+    HAS_ORTOOLS = False
+
 
 def _make_generator(*args) -> torch.Generator:
     """Return a seeded Generator whose seed is a stable hash of ``args``.
@@ -88,6 +95,23 @@ def cached_randn(
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
+
+
+@functools.lru_cache(maxsize=None)
+def cached_randint(
+    shape,
+    differentiation=None,
+    low=0,
+    high=512,
+    dtype=torch.int32,
+):
+    """Return a cached integer tensor with the given shape and dtype.
+
+    Uses a stable seed derived from the arguments so results are identical
+    across processes regardless of PYTHONHASHSEED.
+    """
+    gen = _make_generator(shape, differentiation, low, high, dtype)
+    return torch.randint(low, high, shape, dtype=dtype, generator=gen)
 
 
 @functools.lru_cache(maxsize=None)
@@ -461,6 +485,13 @@ def make_param_dict(cases, rand_type="randn"):
     }
 
 
+def _safe_test_name(name: str) -> str:
+    # PyTorch >= 2.14 rejects generated test names containing "." (pytorch#192648),
+    # since unittest.TestLoader.loadTestsFromName splits on it. Param keys built
+    # from floats (e.g. "alpha_0.5") are spelled with "p" instead ("alpha_0p5").
+    return name.replace(".", "p")
+
+
 # ParameterizedTestMeta injects parameterized test methods
 # based on PARAMS of the subclass.
 # The metaclass looks through the keys in the PARAMS dict,
@@ -509,6 +540,8 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
+# - Any "." in a materialized name is replaced with "p"
+#   (e.g. "alpha_0.5" -> "alpha_0p5"); see _safe_test_name.
 def _generated_names(cases):
     """The case names one PARAMS item can be addressed by: ``case`` or ``op_case``."""
     ops = cases.get("ops_dict") or {}
@@ -648,7 +681,9 @@ class ParameterizedTestMeta(type):
                                 )
                             return test
 
-                        test_name = f"{test_name_prefix}_{op_name}_{test_case}"
+                        test_name = _safe_test_name(
+                            f"{test_name_prefix}_{op_name}_{test_case}"
+                        )
                         assert test_name not in namespace, (
                             f"Test name conflict: {test_name}"
                         )
@@ -725,7 +760,7 @@ class ParameterizedTestMeta(type):
                             )
                         return test
 
-                    test_name = f"{test_name_prefix}_{test_case}"
+                    test_name = _safe_test_name(f"{test_name_prefix}_{test_case}")
                     assert test_name not in namespace, (
                         f"Test name conflict: {test_name}"
                     )
@@ -806,7 +841,7 @@ def _compile_and_run(
     if compile:
         comp_func = torch.compile(fn, backend=backend)
 
-        if source_check is not None and device == "spyre":
+        if source_check is not None and device.type == "spyre":
             result, source_codes = run_and_get_code(
                 comp_func, *device_args, **device_kwargs
             )
@@ -1050,8 +1085,8 @@ def capture_backend_output_dirs():
     output_dirs = []
     get_output_dir = async_compile_module.get_output_dir
 
-    def capture(kernel_name):
-        output_dir = get_output_dir(kernel_name)
+    def capture(kernel_name, sdsc_bundle_dir_prefix=None):
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         output_dirs.append(Path(output_dir))
         return output_dir
 
@@ -1213,3 +1248,56 @@ def patch_row_major_out_coords() -> Any:
         "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
         side_effect=lambda op: list(next(iter(op.get_read_writes().writes)).var_names),
     )
+
+
+class patch_tiling_helper:
+    """Patch a helper that lives in ``loop_tiling_common`` and is re-exported.
+
+    ``coarse_tile`` re-exports the helpers it moved to ``loop_tiling_common``
+    (and, for ``op_read_writes`` and friends, the ``pass_utils`` functions they
+    both import).  A moved function looks a global up in its *new* module, so a
+    patch on ``coarse_tile.<name>`` alone no longer reaches it and the test can
+    pass vacuously.  This patches the same mock into both modules, so callers
+    that stayed in ``coarse_tile`` and callers that moved are both covered.
+
+    Pass ``common_only=True`` for a name that no function left in
+    ``coarse_tile`` uses (``reduction_loop_vars``, ``_loop_var_to_ranges_pos``).
+
+    Usable as a context manager (yielding the mock) or via ``start``/``stop``.
+    """
+
+    _MODULES = (
+        "torch_spyre._inductor.wsr.loop_tiling_common",
+        "torch_spyre._inductor.wsr.coarse_tile",
+    )
+
+    def __init__(self, name: str, *, common_only: bool = False, **mock_kwargs: Any):
+        from unittest.mock import MagicMock
+
+        self._mock = MagicMock(**mock_kwargs)
+        modules = self._MODULES[:1] if common_only else self._MODULES
+        self._patchers = [
+            mock_patch(f"{module}.{name}", new=self._mock) for module in modules
+        ]
+
+    def start(self) -> Any:
+        started = []
+        try:
+            for patcher in self._patchers:
+                patcher.start()
+                started.append(patcher)
+        except BaseException:
+            for patcher in reversed(started):
+                patcher.stop()
+            raise
+        return self._mock
+
+    def stop(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+
+    def __enter__(self) -> Any:
+        return self.start()
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.stop()

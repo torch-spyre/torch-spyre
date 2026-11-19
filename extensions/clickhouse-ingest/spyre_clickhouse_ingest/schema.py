@@ -14,8 +14,10 @@
 
 """The v2 ClickHouse schema as classes: one class per table, sharing `Table`."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypedDict
+
+from spyre_clickhouse_ingest.batching import insert_chunks
 
 # The DDL's CHECK constraints, re-expressed: unreadable from the server at ingest
 # time. Keep in step with schema/10-functional-tests.sql and schema/20-artifacts.sql.
@@ -96,6 +98,7 @@ EVENT_TYPE_VALUES = frozenset(
 )
 DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
 REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+RBAC_SUBJECT_TYPE_VALUES = frozenset({"user", "group"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
@@ -146,6 +149,9 @@ class Table:
     enums: tuple[tuple[str, frozenset[str]], ...] = ()
     # id column for cross-run identity dedup; None for fact tables, which append freely.
     identity: str | None = None
+    # True for a ReplacingMergeTree whose sort key a resent row repeats: a blind retry of a
+    # failed batch collapses on merge. Plain MergeTree and SummingMergeTree tables stay False.
+    idempotent: bool = False
     # The TypedDict shape a caller should build for this table -- checked by mypy/the editor,
     # never at runtime; `row()` below is still what actually validates a row.
     Row: type = dict
@@ -180,16 +186,28 @@ class Table:
 
     @classmethod
     def insert(
-        cls, client, rows: Sequence[Mapping[str, Any]], db: str | None = None
+        cls,
+        client,
+        rows: Sequence[Mapping[str, Any]],
+        db: str | None = None,
+        landed: Callable[[], int] | None = None,
     ) -> int:
-        """Insert dicts, ordering every row through the one column list."""
+        """Insert dicts, ordering every row through the one column list, in retried batches.
+
+        `landed` counts this call's rows already stored (see batching.insert_chunks).
+        """
         if not rows:
             return 0
         ordered = [cls.row(r) for r in rows]
-        client.insert(
-            cls.name, ordered, column_names=list(cls.columns), database=db or None
+        return insert_chunks(
+            client,
+            cls.name,
+            ordered,
+            list(cls.columns),
+            database=db or None,
+            already_landed=landed,
+            idempotent=cls.idempotent,
         )
-        return len(ordered)
 
     @classmethod
     def insert_identities(
@@ -452,6 +470,7 @@ class ArtifactRefRow(TypedDict):
 class ArtifactRefs(Table):
     """How a consumer obtains an artifact, and the address that takes."""
 
+    idempotent = True
     name = "artifact_refs"
     columns = (
         "artifact_id",
@@ -536,6 +555,7 @@ class ArtifactResultReasonRow(TypedDict):
 class ArtifactResultReasons(Table):
     """Why a verdict did not pass, written after the verdict itself; one row per source."""
 
+    idempotent = True
     name = "artifact_result_reasons"
     columns = (
         "artifact_id",
@@ -566,6 +586,8 @@ class PipelineRuns(Table):
     Jenkins rows arrive as JSONEachRow from vars/pushToClickhouse.groovy; this model is the
     shape the gha_runs poller writes through.
     """
+
+    idempotent = True
 
     name = "pipeline_runs"
     columns = (
@@ -629,6 +651,8 @@ class CiRunTimings(Table):
     columns. `leg` and every `*_ms` are MATERIALIZED in the DDL, so they are not modelled here:
     the server derives them and ignores a value a writer supplies.
     """
+
+    idempotent = True
 
     name = "ci_run_timings"
     columns = (
@@ -712,6 +736,7 @@ class CiRunTimings(Table):
 class ArtifactSubscriptions(Table):
     """Who an artifact triggers; one row per version, the newest updated_at wins."""
 
+    idempotent = True
     name = "artifact_subscriptions"
     columns = (
         "subscription_id",
@@ -749,6 +774,45 @@ class ArtifactSubscriptions(Table):
     enums = (("target_type", TARGET_TYPE_VALUES),)
 
 
+class RbacRoles(Table):
+    """A named set of '<resource>:<action>' permissions; the newest updated_at wins."""
+
+    idempotent = True
+    name = "rbac_roles"
+    columns = (
+        "role_id",
+        "updated_at",
+        "active",
+        "permissions",
+        "description",
+        "updated_by",
+        "props",
+    )
+    required = ("role_id",)
+
+
+class RbacBindings(Table):
+    """A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins."""
+
+    idempotent = True
+    name = "rbac_bindings"
+    columns = (
+        "binding_id",
+        "updated_at",
+        "active",
+        "subject_type",
+        "subject",
+        "role_id",
+        "scope",
+        "expires_at",
+        "updated_by",
+        "notes",
+        "props",
+    )
+    required = ("binding_id", "subject", "role_id")
+    enums = (("subject_type", RBAC_SUBJECT_TYPE_VALUES),)
+
+
 class DispatchRequests(Table):
     """A person's or pipeline's "run this subscription against this artifact"."""
 
@@ -772,6 +836,7 @@ class DispatchRequests(Table):
 class ArtifactDispatches(Table):
     """One dispatch, upserted on every state change; written only by the dispatcher."""
 
+    idempotent = True
     name = "artifact_dispatches"
     columns = (
         "dispatch_id",
@@ -862,6 +927,8 @@ PIPELINE_RUNS = PipelineRuns
 PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+RBAC_ROLES = RbacRoles
+RBAC_BINDINGS = RbacBindings
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
@@ -884,6 +951,8 @@ TABLES = {
         PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
+        RbacRoles,
+        RbacBindings,
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,

@@ -666,9 +666,10 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         # TODO: add a conv-specific stick check.
         return
     elif op in _pointwise_ops() | DTYPE_OPS | REDUCTION_OPS:
-        # avgpoolfwd is in REDUCTION_OPS but its full constraint (window dims
-        # must not appear in the stick) is deferred — _check_stick_all_same
-        # only catches the case where different args have different sticks.
+        # The POOL_OPS (avgpoolfwd/maxpoolfwd) are in REDUCTION_OPS but their
+        # full constraint (window dims must not appear in the stick) is deferred
+        # — _check_stick_all_same only catches the case where different args
+        # have different sticks.
         _check_stick_all_same(op_spec, stage)
 
 

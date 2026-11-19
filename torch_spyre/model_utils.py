@@ -414,10 +414,14 @@ class _Upload(NamedTuple):
 
     module: nn.Module
     name: str
+    # Dotted path, as in ``named_parameters``, for logs.
+    path: str
     # None for a buffer, else the requires_grad of the parameter.
     requires_grad: bool | None
     # Uploads the tensor and returns (device tensor, kind for the log counts).
     run: Callable[[], tuple[torch.Tensor, str]]
+    # The other (module, name) slots holding the same parameter (tied weights).
+    ties: list[tuple[nn.Module, str]]
 
 
 def _transfer_module(
@@ -434,11 +438,17 @@ def _transfer_module(
     ``_apply`` is delegated to and pruned from the walk; its tensors are moved
     right away, one at a time. For all other modules, each parameter and buffer
     is added to ``uploads``; ``_run_uploads`` moves them. A module reachable by
-    two paths (such as ``torch.compile``'s ``_orig_mod``) is visited once.
-    Tensors already on Spyre are skipped (idempotent). ``prefix`` is the
-    module's dotted path (as in ``named_modules``) for logs.
+    two paths (such as ``torch.compile``'s ``_orig_mod``) is visited once. A
+    parameter shared by two modules (tied weights) is listed once, in the layout
+    of the first module that holds it, so it stays one tensor as with
+    ``nn.Module.to``; a tied LM head after its embedding gets the indirect-access
+    layout rather than ``dim_order=[1, 0]``. Tensors already on Spyre are skipped
+    (idempotent). ``prefix`` is the module's dotted path (as in
+    ``named_modules``) for logs.
     """
     # Keyed on id(): a module that overrides __eq__ must not hide a sibling.
+    # Holds module and parameter ids alike; the model keeps both alive, so
+    # they cannot collide.
     if seen is None:
         seen = set()
     if id(module) in seen:
@@ -463,6 +473,20 @@ def _transfer_module(
     for name, param in list(module._parameters.items()):
         if param is None or param.device.type == DEVICE_NAME:
             continue
+        path = f"{prefix}.{name}" if prefix else name
+        # Each upload swaps into the one shared object, so a second would race it.
+        if id(param) in seen:
+            first = next(
+                u for u in uploads if u.module._parameters.get(u.name) is param
+            )
+            first.ties.append((module, name))
+            logger.warning(
+                "load_model_to_spyre: %s is tied to %s and shares its layout",
+                path,
+                first.path,
+            )
+            continue
+        seen.add(id(param))
         # Checked here so the fallback warning comes from the caller's thread.
         indirect = (
             is_embedding
@@ -483,13 +507,14 @@ def _transfer_module(
             prefix,
             use_fp8_weights,
         )
-        uploads.append(_Upload(module, name, param.requires_grad, run))
+        uploads.append(_Upload(module, name, path, param.requires_grad, run, []))
 
     for name, buf in list(module._buffers.items()):
         if buf is None or buf.device.type == DEVICE_NAME:
             continue
         run = functools.partial(_upload_buffer, buf, dtype)
-        uploads.append(_Upload(module, name, None, run))
+        path = f"{prefix}.{name}" if prefix else name
+        uploads.append(_Upload(module, name, path, None, run, []))
 
 
 def _upload_parameter(
@@ -593,14 +618,38 @@ def _start_upload_thread(device_index: int) -> None:
 def _put_upload(
     upload: _Upload, result: tuple[torch.Tensor, str], counts: dict[str, int]
 ) -> None:
+    """Put an uploaded tensor into its module.
+
+    A parameter keeps its Python object, as ``nn.Module.to`` keeps it, so a caller
+    holding it (an optimizer, an attention impl, a weight loader) sees the device
+    tensor, and its class and attributes stay. ``param.data = dev`` is refused:
+    ``set_data`` rejects a tensor with a different backend key set.
+    ``swap_tensors`` refuses a parameter that has a view or another strong
+    reference; this swaps the impl without that check, so a view of the old
+    parameter keeps the host tensor. Grad hooks and ``.grad`` are not carried
+    over. A parameter the swap still refuses (a C++ weakref) is replaced, as
+    before, with a warning, in every module that holds it.
+    """
     dev, kind = result
     counts[kind] += 1
     if upload.requires_grad is None:
         upload.module._buffers[upload.name] = dev
-    else:
-        upload.module._parameters[upload.name] = nn.Parameter(
-            dev, requires_grad=upload.requires_grad
+        return
+    param = upload.module._parameters[upload.name]
+    assert param is not None, "the walk lists only parameters that are set"
+    new = nn.Parameter(dev, requires_grad=upload.requires_grad)
+    try:
+        torch._C._swap_tensor_impl(param, new)
+    except RuntimeError as e:
+        logger.warning(
+            "load_model_to_spyre: could not keep %s as the same object (%s); "
+            "replacing it, so a holder outside the model keeps the host tensor",
+            upload.path,
+            e,
         )
+        upload.module._parameters[upload.name] = new
+        for module, name in upload.ties:
+            module._parameters[name] = new
 
 
 def _run_uploads(
@@ -663,6 +712,10 @@ def load_model_to_spyre(
     default layout with a warning.
 
     All other parameters and buffers use the default Spyre layout.
+
+    Each parameter stays the same Python object, as with ``nn.Module.to``; only
+    its tensor moves. This does not hold under a submodule that overrides
+    ``_apply``, whose own ``_apply`` decides. Buffers are replaced.
 
     Submodules that override ``_apply`` are honored, matching ``nn.Module.to``
     semantics.  Idempotent: parameters already on Spyre are skipped.

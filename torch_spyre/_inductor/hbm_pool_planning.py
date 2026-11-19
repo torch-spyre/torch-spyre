@@ -154,6 +154,14 @@ def _compute_live_ranges(
         for dep in rw.writes:
             if dep.name in pool_candidates:
                 start[dep.name] = idx
+                if isinstance(node, CountedLoopSchedulerNode):
+                    # A counted loop is one opaque step: a buffer it writes is
+                    # live at least through that step (every trip), whether
+                    # or not its node keeps the internal read (a
+                    # LoopSchedulerNode keeps external reads only).  Without
+                    # this, such a buffer would stay live to the end of the
+                    # bundle and block reuse by a later sibling loop.
+                    end[dep.name] = max(end.get(dep.name, idx), idx)
         for dep in rw.reads:
             if dep.name in pool_candidates:
                 end[dep.name] = idx

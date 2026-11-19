@@ -52,9 +52,11 @@ them with `PARAMS`, and `pr-review` checks them.
   (`expect_fail`, `expect_fail_unstable`, `expect_raise`), or, when it depends on a
   fixture or parameter, `strict_xfail(request, raises, reason)` from
   `tests/inductor/utils_inductor.py`, which applies the marker from inside the body.
-  (`expected_unimplemented` in `tests/inductor/test_solver_auto_coarse_tiling.py` is
-  the one exception: it xfails only on the expected error and fails if the body
-  passes.)
+  (`_check_tiling_discovered` in `tests/inductor/test_solver_auto_coarse_tiling.py`
+  is the one exception. Its `pytest.xfail` runs last, after the result has been
+  checked against CPU, and only when the simulated-annealing solver leaves a case
+  untiled whose `sa_may_stay_untiled` says its cost model prefers untiled. A tiled
+  result passes.)
 - **A failure that kills the process (SIGFPE, SIGABRT, a hang) is a skip, not an
   xfail**, because the run dies with it. Cite an issue in the reason.
 
@@ -130,6 +132,7 @@ them with `PARAMS`, and `pr-review` checks them.
 | `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
 | `TORCH_SPYRE_TIMING=1` | Structured per-compile frontend timing records |
 | `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
+| `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS` | Seconds allowed for each `dbo-opt` invocation (default 60; non-positive disables) |
 | `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before the backend compiler; no runnable kernel, measurement only |
 
 ## Spyre Hardware Basics
@@ -170,6 +173,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
+- **find-numerical-divergence** — the first kernel where a right run and a wrong run part
 - **check-docs** — documentation consistency and staleness audit
 - **daily-status** — automated standup updates from git activity
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow

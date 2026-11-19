@@ -14,6 +14,7 @@
 
 import dataclasses
 from functools import partial
+import logging
 import math
 from types import SimpleNamespace
 from unittest import mock
@@ -21,8 +22,8 @@ from unittest import mock
 import pytest
 import sympy
 
-import torch_spyre._inductor.codegen.superdsc as superdsc_module
 import torch_spyre._inductor.core_mapping as core_mapping_module
+import torch_spyre._inductor.kernel_provenance as kernel_provenance_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -40,6 +41,7 @@ from torch_spyre._inductor.core_mapping import (
     derive_partition_mapping,
     derive_operation_mapping,
     finalize_tensor_work_divisions,
+    matmul_reduction_dim,
     select_unique_partition_division,
 )
 from torch_spyre._inductor.op_spec import (
@@ -228,7 +230,7 @@ def test_selected_dim_varies_first(contiguous_dim):
 def _mapping_coordinates(mapping, dims, num_cores):
     core_id = sympy.Symbol("core_id")
     return [
-        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
+        tuple(int(mapping[dim].xreplace({core_id: core})) for dim in dims)
         for core in range(num_cores)
     ]
 
@@ -351,7 +353,7 @@ def test_fused_decomposition_is_exact_and_bounded(
         return
     assert result is not None and result[0] == accepted
     assert [
-        tuple(int(slot.subs(_CORE_ID, c)) for _, slot in result[1])
+        tuple(int(slot.xreplace({_CORE_ID: c})) for _, slot in result[1])
         for c in range(split)
     ] == [owner(c) for c in range(split)]
 
@@ -375,7 +377,7 @@ def test_index_regions_match_exact_points(coords, extent, split, sizes):
     width = extent // split
     for part in range(split):
         points = {
-            tuple(c.subs(_FUSED, p) for c in coords)
+            tuple(c.xreplace({_FUSED: p}) for c in coords)
             for p in range(part * width, (part + 1) * width)
         }
         region = tuple(zip(map(min, zip(*points)), map(max, zip(*points))))
@@ -715,69 +717,179 @@ def test_planner_and_sdsc_use_the_same_mapping(
 
     monkeypatch.setattr(pass_utils_module, "Reduction", FakeReduction)
     monkeypatch.setattr(pass_utils_module, "ComputedBuffer", FakeComputedBuffer)
-    monkeypatch.setattr(
-        pass_utils_module.config,
-        "core_id_k_fast_emission",
-        reduction_contiguous,
-    )
-    monkeypatch.setattr(
-        superdsc_module._spyre_config,
-        "core_id_k_fast_emission",
-        reduction_contiguous,
-    )
+    # config.patch rather than monkeypatch.setattr: monkeypatch records a config
+    # option's old value as unset (it is not in the module __dict__), so its undo
+    # deletes the option and hides it from every later test. superdsc's
+    # _spyre_config is the same module, so one patch covers both.
+    with pass_utils_module.config.patch(core_id_k_fast_emission=reduction_contiguous):
+        op_spec = _bmm_op_spec(op)
+        dims = tuple(op_spec.iteration_space)
+        splits = dict(zip(dims, dim_splits))
+        op_spec.iteration_space = {
+            dim: (extent, splits[dim])
+            for dim, (extent, _) in op_spec.iteration_space.items()
+        }
+        monkeypatch.setattr(
+            pass_utils_module,
+            "iteration_space_from_op",
+            lambda _: {
+                dim: extent for dim, (extent, _) in op_spec.iteration_space.items()
+            },
+        )
+        ownership = pass_utils_module.make_iteration_space_ownership(
+            FakeComputedBuffer(op), splits
+        )
+        assert ownership.num_cores == math.prod(dim_splits)
+        assert dataclasses.replace(
+            ownership, num_cores=None
+        ).physical_core_count == math.prod(dim_splits)
+        prep = _view_prep(
+            iter_space={
+                dim: extent for dim, (extent, _) in op_spec.iteration_space.items()
+            },
+            write_index=dims[0],
+            dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
+            dep_device_coordinates=(dims[0], dims[1]),
+            device_size=[2, 4],
+            stride_map=[1, 2],
+            device_stride_to_dim={1: 0, 2: 1},
+            is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
+        )
+        planner_view, partial, representable = (
+            pass_utils_module._per_core_view_from_prep(
+                prep,
+                ownership.work_slices,
+                {dims[2]: dim_splits[2]},
+                ownership=ownership,
+            )
+        )
 
+        op_spec.core_id_to_work_slice = derive_operation_mapping(
+            op_spec.iteration_space,
+            contiguous_dim=dims[-1] if reduction_contiguous else None,
+        )
+        sdsc_spec, renamed = parse_op_spec(op_spec)
+        sdsc_output_mapping = {
+            device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
+            for device_dim, dim in enumerate(dims[:2])
+            if splits[dim] > 1
+        }
+        assert representable
+        assert partial
+        assert planner_view.num_cores == ownership.num_cores
+        assert dict(planner_view.core_to_slot) == sdsc_output_mapping
+        if dim_splits[:2] == (1, 1):
+            assert planner_view.work_slice_dims == ()
+            assert not planner_view.same_partition(PerCoreView((), (), num_cores=1))
+
+
+def test_matmul_reduction_dim_is_found_by_identity():
+    """K is the one loop that both inputs index and the output does not."""
+    mb, out, reduction, restored = sympy.symbols("mb out reduction restored")
+    space = {mb: (512, 2), out: (12800, 4), reduction: (4096, 4), restored: (1, 1)}
+
+    def args(x, y, output):
+        return [
+            SimpleNamespace(is_input=True, device_coordinates=x),
+            SimpleNamespace(is_input=True, device_coordinates=y),
+            SimpleNamespace(is_input=False, device_coordinates=output),
+        ]
+
+    x = [restored, mb, reduction]
+    y = [restored, reduction, sympy.Mod(out, 64)]
+    # Alignment appends a restored loop after K, so the last loop is not K.
+    assert matmul_reduction_dim(space, args(x, y, [restored, mb, out])) == reduction
+    # K is K whatever its split; an integer coordinate indexes no loop.
+    unsplit = {**space, reduction: (4096, 1)}
+    output = [sympy.Integer(0), restored, mb, out]
+    assert matmul_reduction_dim(unsplit, args(x, y, output)) == reduction
+    # An N of 1 that y and the output fold away is not K.
+    folded = args(x, [restored, reduction], [restored, mb])
+    assert matmul_reduction_dim({**space, out: (1, 1)}, folded) == reduction
+    # Two loops that both inputs index and the output does not: no single K.
+    assert matmul_reduction_dim(space, args(x, y, [mb, out])) is None
+
+
+def _bmm_op_spec_on_a_slice(op: str, restored_loops: int) -> OpSpec:
+    """A bmm whose x is one slice of a larger buffer, before alignment.
+
+    Each added device dimension of x has size 2 and a constant coordinate.
+    Alignment restores a range-1 loop for each such dimension, and it puts the
+    loop in every tensor. It adds these loops after K, as for a batch-1 matmul in
+    a ``for_each_tile`` body.
+    """
     op_spec = _bmm_op_spec(op)
-    dims = tuple(op_spec.iteration_space)
-    splits = dict(zip(dims, dim_splits))
-    op_spec.iteration_space = {
-        dim: (extent, splits[dim])
-        for dim, (extent, _) in op_spec.iteration_space.items()
-    }
-    monkeypatch.setattr(
-        pass_utils_module,
-        "iteration_space_from_op",
-        lambda _: {dim: extent for dim, (extent, _) in op_spec.iteration_space.items()},
-    )
-    ownership = pass_utils_module.make_iteration_space_ownership(
-        FakeComputedBuffer(op), splits
-    )
-    assert ownership.num_cores == math.prod(dim_splits)
-    assert dataclasses.replace(
-        ownership, num_cores=None
-    ).physical_core_count == math.prod(dim_splits)
-    prep = _view_prep(
-        iter_space={
-            dim: extent for dim, (extent, _) in op_spec.iteration_space.items()
-        },
-        write_index=dims[0],
-        dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
-        dep_device_coordinates=(dims[0], dims[1]),
-        device_size=[2, 4],
-        stride_map=[1, 2],
-        device_stride_to_dim={1: 0, 2: 1},
-        is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
-    )
-    planner_view, partial, representable = pass_utils_module._per_core_view_from_prep(
-        prep, ownership.work_slices, {dims[2]: dim_splits[2]}, ownership=ownership
-    )
+    x = op_spec.args[0]
+    x.device_size = [2] * restored_loops + x.device_size
+    x.device_coordinates = [sympy.Integer(1)] * restored_loops + x.device_coordinates
+    return op_spec
 
-    op_spec.core_id_to_work_slice = derive_operation_mapping(
-        op_spec.iteration_space,
-        contiguous_dim=dims[-1] if reduction_contiguous else None,
+
+@pytest.mark.parametrize("op", [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP])
+@pytest.mark.parametrize(
+    "restored_loops,labels",
+    [(1, ["x", "mb", "out", "in"]), (2, ["y", "x", "mb", "out", "in"])],
+)
+@pass_utils_module.config.patch(core_id_k_fast_emission=True)
+def test_restored_loops_go_in_front_of_k(op, restored_loops, labels):
+    """Every reader that takes K as the last loop sees K after alignment."""
+    op_spec = _bmm_op_spec_on_a_slice(op, restored_loops)
+    mb, out, reduction = op_spec.iteration_space
+    simplify_op_spec(op_spec)
+    dims = list(op_spec.iteration_space)
+    restored = dims[:restored_loops]
+    assert dims[restored_loops:] == [mb, out, reduction]
+    assert [op_spec.iteration_space[dim] for dim in restored] == [(1, 1)] * len(
+        restored
     )
+    for arg in op_spec.args:
+        indexed = {s for c in arg.device_coordinates for s in c.free_symbols}
+        assert indexed.issuperset(restored)
+    # Core order: the four K slices of each output slice are on adjacent cores.
+    coordinates = _mapping_coordinates(
+        op_spec.core_id_to_work_slice, (mb, out, reduction), 32
+    )
+    assert coordinates == [(core // 4 % 2, core // 8, core % 4) for core in range(32)]
+    # Provenance takes this K-fast order as the default one.
+    assert kernel_provenance_module._is_canonical_core_mapping(op_spec)
+    # SDSC: the restored loops are batch dims, and K is `in`.
     sdsc_spec, renamed = parse_op_spec(op_spec)
-    sdsc_output_mapping = {
-        device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
-        for device_dim, dim in enumerate(dims[:2])
-        if splits[dim] > 1
-    }
-    assert representable
-    assert partial
-    assert planner_view.num_cores == ownership.num_cores
-    assert dict(planner_view.core_to_slot) == sdsc_output_mapping
-    if dim_splits[:2] == (1, 1):
-        assert planner_view.work_slice_dims == ()
-        assert not planner_view.same_partition(PerCoreView((), (), num_cores=1))
+    assert [str(renamed[dim]) for dim in dims] == labels
+    assert [str(label) for label in sdsc_spec.iteration_space] == labels
+
+
+def test_matmul_loop_order_is_kept_without_a_proven_batch_loop(caplog):
+    """No single K, or a loop after K that a tensor does not index: no change.
+
+    The readers then take the last loop as K, and a debug line gives the reason.
+    """
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    mb, out, reduction = op_spec.iteration_space
+    spyre_kernel_module._restore_matmul_loop_order(op_spec)
+    assert list(op_spec.iteration_space) == [mb, out, reduction]
+
+    def kept(op_spec, message):
+        dims = list(op_spec.iteration_space)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=spyre_kernel_module.logger.name):
+            spyre_kernel_module._restore_matmul_loop_order(op_spec)
+        assert list(op_spec.iteration_space) == dims
+        assert message in caplog.text
+
+    # A loop after K that y does not index is not a batch loop.
+    extra = sympy.Symbol("extra")
+    op_spec.iteration_space = {**op_spec.iteration_space, extra: (1, 1)}
+    for arg in (op_spec.args[0], op_spec.args[-1]):
+        arg.device_coordinates = [extra, *arg.device_coordinates]
+    kept(op_spec, "are not in every tensor")
+
+    # K in two loops: both inputs index each one and the output indexes neither.
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    second = sympy.Symbol("second")
+    op_spec.iteration_space = {**op_spec.iteration_space, second: (2, 2)}
+    for arg in op_spec.args[:2]:
+        arg.device_coordinates = [second, *arg.device_coordinates]
+    kept(op_spec, "no single reduction loop")
 
 
 def test_flattened_iteration_span_is_not_a_single_axis_view():
@@ -796,7 +908,7 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
             sympy.Mod(flat, 64),
         ),
         device_size=[2, 1, 1, 1, 4, 16, 64],
-        stride_map=[256, -1, -1, -1, 64, 512, 1],
+        stride_map=[256, 0, 0, 0, 64, 512, 1],
         device_stride_to_dim={256: 0, 64: 4, 512: 5, 1: 6},
         stick_host_stride=1,
         num_stick_dim=4,
@@ -860,7 +972,7 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
     physical_splits = dict(view.work_slice_dims)
     physical_slots = dict(view.core_to_slot)
     for c in range(split):
-        logical_slot = int(owner.subs(core, c))
+        logical_slot = int(owner.xreplace({core: c}))
         expected = set(
             range(
                 logical_slot * (extent // split), (logical_slot + 1) * (extent // split)
@@ -870,16 +982,16 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
             point
             for point in range(extent)
             if all(
-                int(coordinates[axis].subs(flat, point))
+                int(coordinates[axis].xreplace({flat: point}))
                 // (device_size[axis] // factor)
-                == int(physical_slots[axis].subs(core, c))
+                == int(physical_slots[axis].xreplace({core: c}))
                 for axis, factor in physical_splits.items()
             )
         }
         assert actual == expected, (c, actual, expected)
 
 
-def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
+def test_fused_split_view_is_gated_and_preserves_exact_owner_order():
     fused = sympy.Symbol("fused")
     prep = _view_prep(
         iter_space={fused: 32},
@@ -891,23 +1003,23 @@ def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
             sympy.S.Zero,
         ),
         device_size=[4, 8, 1],
-        stride_map=[-1, -1, 1],
+        stride_map=[0, 0, 1],
         device_stride_to_dim={},
         elems_per_stick=1,
     )
 
-    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", False)
-    disabled_view, disabled_partial, disabled_representable = (
-        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
-    )
+    with pass_utils_module.config.patch(lx_planner_relayout=False):
+        disabled_view, disabled_partial, disabled_representable = (
+            pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+        )
     assert not disabled_representable
     assert not disabled_partial
     assert not disabled_view.work_slice_dims
 
-    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
-    enabled_view, enabled_partial, enabled_representable = (
-        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
-    )
+    with pass_utils_module.config.patch(lx_planner_relayout=True):
+        enabled_view, enabled_partial, enabled_representable = (
+            pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+        )
     assert enabled_representable
     assert not enabled_partial
     assert enabled_view.work_slice_dims == ((0, 4), (1, 8))
@@ -926,7 +1038,8 @@ def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
 @pytest.mark.parametrize(
     "feature_owned", [True, False], ids=["v_owned_tuple", "interleaved"]
 )
-def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned):
+@pass_utils_module.config.patch(lx_planner_relayout=True)
+def test_fused_split_view_checks_complete_owned_tuple(feature_owned):
     query, fused, feature = sympy.symbols("query fused feature")
     qsplit = 2 if feature_owned else 4
     space, sizes = {query: qsplit, fused: 32}, [4, 8]
@@ -961,13 +1074,12 @@ def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned
         dep_coeff={dim: index.coeff(dim) for dim in space},
         dep_device_coordinates=tuple(coords),
         device_size=sizes,
-        stride_map=[-1, -1, 1, 1] if feature_owned else [-1, -1],
+        stride_map=[0, 0, 1, 1] if feature_owned else [0, 0],
         device_stride_to_dim={1: 2} if feature_owned else {},
         is_matmul=True,
         **kwargs,
     )
     ownership = TensorWorkDivision(splits, slots, num_cores=32)
-    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
     view, partial, representable = pass_utils_module._per_core_view_from_prep(
         prep,
         splits,
@@ -992,10 +1104,12 @@ def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned
 
 
 def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
+    _ds = [1, 1, 8, 16, 64]
     device_layout = pass_utils_module.SpyreTensorLayout(
         [1, 1, 8, 16, 64],
-        [-1, -1, 64, 512, 1],
+        [0, 0, 64, 512, 1],
         DataFormats.SEN169_FP16,
+        {(0,): 1, (1,): 1, (2, 4): 512, (3,): 16},
         ElementArrangement.STANDARD,
     )
     layout = pass_utils_module.FixedTiledLayout(
@@ -1035,7 +1149,8 @@ def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
 
 
 @pytest.mark.parametrize("flat_split", [4, 8, 16, 32])
-def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
+@pass_utils_module.config.patch(lx_planner_relayout=True)
+def test_fused_view_keeps_sticks_whole(flat_split):
     head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
     prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
     splits = {head: 1, flat: flat_split}
@@ -1044,7 +1159,6 @@ def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
         {head: sympy.Integer(0), flat: sympy.Mod(_CORE_ID, flat_split)},
         flat_split,
     )
-    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
     view, partial, representable = pass_utils_module._per_core_view_from_prep(
         prep, splits, ownership=ownership
     )
@@ -1136,32 +1250,30 @@ def _attention_repack_view_prep(*, width=128, offset=0):
     ],
 )
 def test_attention_repack_maps_only_complete_head_shards(
-    monkeypatch, width, offset, relayout_enabled, representable
+    width, offset, relayout_enabled, representable
 ):
-    monkeypatch.setattr(
-        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
-    )
-    prep, row, head, feature = _attention_repack_view_prep(width=width, offset=offset)
-    coordinates = prep.dep_device_coordinates
-    view, partial, actual = pass_utils_module._per_core_view_from_prep(
-        prep, {row: 8, head: 4, feature: 1}
-    )
-    assert actual is representable
-    assert not partial
-    assert prep.dep_device_coordinates == coordinates
-    if representable:
-        assert view.num_cores == 32
-        assert dict(view.work_slice_dims) == {0: 4, 1: 8}
-        owners = dict(view.core_to_slot)
-        for core in range(32):
-            assert int(owners[0].subs(_CORE_ID, core)) == core // 8
-            assert int(owners[1].subs(_CORE_ID, core)) == core % 8
+    with pass_utils_module.config.patch(lx_planner_relayout=relayout_enabled):
+        prep, row, head, feature = _attention_repack_view_prep(
+            width=width, offset=offset
+        )
+        coordinates = prep.dep_device_coordinates
+        view, partial, actual = pass_utils_module._per_core_view_from_prep(
+            prep, {row: 8, head: 4, feature: 1}
+        )
+        assert actual is representable
+        assert not partial
+        assert prep.dep_device_coordinates == coordinates
+        if representable:
+            assert view.num_cores == 32
+            assert dict(view.work_slice_dims) == {0: 4, 1: 8}
+            owners = dict(view.core_to_slot)
+            for core in range(32):
+                assert int(owners[0].xreplace({_CORE_ID: core})) == core // 8
+                assert int(owners[1].xreplace({_CORE_ID: core})) == core % 8
 
 
 @pytest.mark.parametrize("relayout_enabled", [False, True])
-def test_reshape_changes_per_core_ownership_within_one_device_axis(
-    monkeypatch, relayout_enabled
-):
+def test_reshape_changes_per_core_ownership_within_one_device_axis(relayout_enabled):
     """A split of an inner term is not a contiguous split of the containing axis.
 
     This is the Gemma 4 decode geometry: the producer splits a flattened
@@ -1170,57 +1282,55 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis(
     The latter owns alternating pairs of sticks, not contiguous groups of four.
     """
     # Turning off movement must not turn off the physical-ownership guard.
-    monkeypatch.setattr(
-        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
-    )
-    producer_head, producer_flat = sympy.symbols(
-        "producer_head producer_flat", integer=True, nonnegative=True
-    )
-    producer_prep, _ = _prepare_compound_axis_view(
-        {producer_head: 16, producer_flat: 512},
-        512 * producer_head + producer_flat,
-    )
-    producer_view, _, producer_representable = (
-        pass_utils_module._per_core_view_from_prep(
-            producer_prep,
-            {producer_head: 16, producer_flat: 2},
+    with pass_utils_module.config.patch(lx_planner_relayout=relayout_enabled):
+        producer_head, producer_flat = sympy.symbols(
+            "producer_head producer_flat", integer=True, nonnegative=True
         )
-    )
+        producer_prep, _ = _prepare_compound_axis_view(
+            {producer_head: 16, producer_flat: 512},
+            512 * producer_head + producer_flat,
+        )
+        producer_view, _, producer_representable = (
+            pass_utils_module._per_core_view_from_prep(
+                producer_prep,
+                {producer_head: 16, producer_flat: 2},
+            )
+        )
 
-    consumer_head, consumer_outer, consumer_inner = sympy.symbols(
-        "consumer_head consumer_outer consumer_inner",
-        integer=True,
-        nonnegative=True,
-    )
-    consumer_index = 512 * consumer_head + 256 * consumer_outer + consumer_inner
-    consumer_prep, _ = _prepare_compound_axis_view(
-        {consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
-        consumer_index,
-    )
-    consumer_view, _, consumer_representable = (
-        pass_utils_module._per_core_view_from_prep(
+        consumer_head, consumer_outer, consumer_inner = sympy.symbols(
+            "consumer_head consumer_outer consumer_inner",
+            integer=True,
+            nonnegative=True,
+        )
+        consumer_index = 512 * consumer_head + 256 * consumer_outer + consumer_inner
+        consumer_prep, _ = _prepare_compound_axis_view(
+            {consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
+            consumer_index,
+        )
+        consumer_view, _, consumer_representable = (
+            pass_utils_module._per_core_view_from_prep(
+                consumer_prep,
+                {consumer_head: 16, consumer_outer: 1, consumer_inner: 2},
+            )
+        )
+
+        assert producer_representable
+        assert not consumer_representable
+        assert producer_view != consumer_view
+
+        # Splitting the outer term of the same compound coordinate is contiguous:
+        # each core group owns one four-stick half of the physical axis.
+        _, _, outer_split_representable = pass_utils_module._per_core_view_from_prep(
             consumer_prep,
-            {consumer_head: 16, consumer_outer: 1, consumer_inner: 2},
+            {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
         )
-    )
+        assert outer_split_representable
 
-    assert producer_representable
-    assert not consumer_representable
-    assert producer_view != consumer_view
+    # The inverse of the per-core view: given a producer's slicing of a buffer,
+    # rebuild the split map a consumer needs to read it the same way. Every case
+    # below verifies the answer by calling the forward map on it, which is the
+    # soundness argument -- a wrong inverse can only ever be a miss.
 
-    # Splitting the outer term of the same compound coordinate is contiguous:
-    # each core group owns one four-stick half of the physical axis.
-    _, _, outer_split_representable = pass_utils_module._per_core_view_from_prep(
-        consumer_prep,
-        {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
-    )
-    assert outer_split_representable
-
-
-# The inverse of the per-core view: given a producer's slicing of a buffer,
-# rebuild the split map a consumer needs to read it the same way. Every case
-# below verifies the answer by calling the forward map on it, which is the
-# soundness argument -- a wrong inverse can only ever be a miss.
 
 _HEAD_DOMAIN = [1, 2, 4, 8, 16]  # divisors of the 16-element outer host dim
 _FLAT_DOMAIN = [1, 2, 4, 8]  # divisors of the 8-stick inner host dim
@@ -1590,11 +1700,11 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
             assert division.physical_core_count == 32
             for core in range(32):
                 assert (
-                    int(division.core_id_to_work_slice[head].subs(_CORE_ID, core))
+                    int(division.core_id_to_work_slice[head].xreplace({_CORE_ID: core}))
                     == core // 8
                 )
                 assert (
-                    int(division.core_id_to_work_slice[row].subs(_CORE_ID, core))
+                    int(division.core_id_to_work_slice[row].xreplace({_CORE_ID: core}))
                     == core % 8
                 )
     assert prep.dep_device_coordinates == coordinates

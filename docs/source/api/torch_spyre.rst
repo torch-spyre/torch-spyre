@@ -332,11 +332,15 @@ FFDC (First Failure Data Capture)
    Retrieval does not require that variable, even if it was unset in a
    later session. The directory **does** have to match: if
    ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
-   and retrieval, pass the original ``output_dir`` explicitly.
+   and retrieval, pass the original **report** directory as
+   ``output_dir`` — ``<cache-root>/torch-spyre/ffdc_reports`` (or
+   ``<tempdir>/torch-spyre-ffdc`` on the fallback path), **not** the
+   cache or ``TMPDIR`` root. This function searches ``output_dir`` for
+   JSON files; it does not append ``torch-spyre/ffdc_reports``.
 
-   :param output_dir: Directory to search. If ``None``, uses
-       ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the cache
-       root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
+   :param output_dir: Directory containing FFDC JSON files. If ``None``,
+       uses ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the
+       cache root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
        ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
@@ -357,8 +361,9 @@ FFDC (First Failure Data Capture)
           print(report["_report_path"])
 
    The same function is also available as
-   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
-   report locations, and JSON triage, see
+   ``torch_spyre.profiler.get_diagnostic_report``. For the enable →
+   fail → retrieve → triage workflow, report schema, and
+   interpretation notes, see
    :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
@@ -523,6 +528,7 @@ manipulation of device tensor layouts. See
           device_size=[4, 2, 64],
           stride_map=[128, 64, 1],
           device_dtype=DataFormats.SEN169_FP16,
+          valid_elements={(0,): 4, (1, 2): 128},  # host [4, 128]
       )
 
    The ``dim_order`` parameter controls which logical dimension is
@@ -768,7 +774,8 @@ Environment Variables
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
        pass pipeline and per pass, with input/output graph sizes and
-       analysis-call counts (default ``0``)
+       analysis-call counts, plus PyTorch's own compile phases (default
+       ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
@@ -782,7 +789,8 @@ Environment Variables
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
    * - ``MAX_BUCKETS``
-     - Maximum number of work division buckets (default ``32``)
+     - Maximum number of buckets, ``max / granularity``, a declared dimension
+       may have (default ``256``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
@@ -791,7 +799,9 @@ Environment Variables
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore the compiler-generated span-overflow coarse-tiling hints.
        Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
-       automatic span-overflow coarse tiling.
+       automatic span-overflow coarse tiling. A tiling that nests more than
+       one loop level, which a very large matmul can need, raises
+       ``Unsupported`` (#6088).
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -799,6 +809,11 @@ Environment Variables
    * - ``SPYRE_VALIDATE_OP_SPECS``
      - Validate OpSpecs at pipeline stage boundaries to catch invariant
        violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_EVERY_PASS``
+     - Check the topological order of ``graph.operations`` after every
+       pre-scheduling pass, to name the pass that broke it. The check
+       after the last pass always runs (default ``0``; set ``1`` to
+       enable)
    * - ``SPYRE_CONV2D_DIRECT``
      - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
        unit) instead of the im2col + matmul decomposition. Off by default
@@ -815,10 +830,21 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``;
+       non-positive values disable the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT``
+     - Let a co-optimizing solver that decides LX relayouts (today only
+       CP-SAT) choose them (default ``1``). Set ``0`` to offer it no relayout
+       candidates, so an edge whose views differ spills to HBM and nothing
+       else about the plan changes. Unlike ``SPYRE_LX_PLANNER_RELAYOUT=0``,
+       restickify residency and fused-axis views stay on. Used by the
+       cost-model sweep to measure the spill side of an edge
    * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
      - Number of destination views the CP-SAT relayout enumeration keeps per
        (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
@@ -850,6 +876,20 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY``
+     - Reuse the kernel-cache key that codegen stored in the generated
+       wrapper, instead of building the SDSC JSON of every OpSpec again just
+       to compute the key when a cached wrapper is loaded (default ``0``; set
+       ``1``, ``true`` or ``yes`` to enable). Needs ``SPYRE_KERNEL_CACHE=1``.
+       The stored key is used only when its fingerprint (versions, config,
+       torch-spyre sources and ``_C`` file) matches the running process;
+       otherwise the key is computed as usual. Any edit under
+       ``torch_spyre/_inductor`` changes the fingerprint, so a build with
+       local edits computes its keys again. ``verify`` computes both and
+       raises ``PrecomputedKernelKeyMismatch`` if they differ. Any other value
+       warns and leaves it off. Generated wrappers now pass a
+       ``precomputed_key`` keyword to ``async_compile.sdsc()``, so code that
+       replaces ``sdsc`` must accept it
    * - ``TORCH_SPYRE_CACHE_SCAN``
      - Let the FX graph and AOTAutograd caches keep graphs that use the
        ``scan`` op, such as attention built on ``for_each_tile`` (default
@@ -864,6 +904,23 @@ Environment Variables
        count is derived from the cgroup v2 quota, then ``psutil``, then
        ``os.cpu_count()``. Not part of the compile cache key, so a cached
        compile is reused whatever the value
+   * - ``AUTO_COARSE_TILING``
+     - Let the co-optimizing solver choose coarse tiling for ops the search
+       deems tileable (default ``0``)
+   * - ``SPYRE_SINK_COLLECTIVE_WAITS``
+     - Schedule each collective wait as late as its consumers allow, so
+       compute that does not depend on the collective runs in its own bundle
+       rather than being fused behind the wait (default ``0``)
+   * - ``SPYRE_LX_EXTENDED_OWNERSHIP``
+     - Enable the optional ownership proofs and local reads added after prefix
+       support (default ``1``; set ``0`` to keep the earlier ownership and
+       prefix rules)
+   * - ``SPYRE_NDO_MATMUL_OUTPUT_REORDER``
+     - Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+       buffer in addition to its input buffers (default ``0``)
+   * - ``MIN_RESERVED_DIM_SIZE``
+     - Minimum size a reserved dimension is held to when reserving HBM for a
+       dynamic shape (default ``8``)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

@@ -15,9 +15,10 @@
 import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
+import collections
 import contextlib
 import functools
 import inspect
@@ -155,6 +156,133 @@ def _materialize_offset_view(x):
         return x
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
+    return x
+
+
+# Compiled view rebuilders by (base shape, base dtype, view geometry).  Bounded
+# like ``_layout_serves_view``: a workload with many shapes would otherwise keep
+# one compiled function per geometry forever.
+_VIEW_REBUILDER_CACHE_SIZE = 256
+_view_rebuilders: collections.OrderedDict = collections.OrderedDict()
+
+
+def _rebuild_view_on_device(x):
+    """Copy the Spyre view ``x`` into a fresh tensor with the canonical layout,
+    without leaving the device.
+
+    ``x.clone()``, ``copy_`` and ``contiguous()`` read the view through its base's
+    layout, which is the read that fails, so they cannot be used.  Compiling
+    ``base.as_strided(...)`` followed by a real pointwise op reads the BASE buffer,
+    as the compiled path does.  ``-(-t)`` flips the sign twice: it is exact in any
+    float format (``t * 2 * 0.5`` turns ``inf`` into ``nan`` on the device), and a
+    plain copy such as ``+ 0`` or ``* 1.0`` is folded away and fails like
+    ``clone()``.  ``bool`` has no ``neg``, so it uses ``logical_not`` twice.
+
+    One compiled function per geometry, each with its own code object so dynamo
+    gives it its own cache line (see ``_op_frame``).
+    """
+    base = x._base
+    size, stride, offset = tuple(x.shape), tuple(x.stride()), x.storage_offset()
+    key = (tuple(base.shape), base.dtype, size, stride, offset)
+    rebuild = _view_rebuilders.get(key)
+    if rebuild is not None:
+        _view_rebuilders.move_to_end(key)
+    else:
+        twice = torch.logical_not if x.dtype == torch.bool else torch.neg
+
+        def view_copy(b):
+            return twice(twice(b.as_strided(size, stride, offset)))
+
+        # Not a no-op: ``replace`` mints a distinct code object, so each geometry
+        # gets its own dynamo cache line and recompile budget instead of sharing
+        # one with every other ``view_copy`` closure (see ``_op_frame``). Keep it.
+        view_copy.__code__ = view_copy.__code__.replace(
+            co_varnames=view_copy.__code__.co_varnames
+        )
+        rebuild = torch.compile(view_copy, dynamic=False)
+        _view_rebuilders[key] = rebuild
+        if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
+            _view_rebuilders.popitem(last=False)
+    return rebuild(base)
+
+
+def _layout_serves_own_view(x) -> bool:
+    """Whether ``x``'s device layout can express reads of ``x``'s own host view.
+
+    A view shares its base's device layout.  ``x[8, 65].reshape(-1)`` or
+    ``x[1, 2, 4, 8, 7].reshape(1, 8, 56)`` keep a layout whose stick coordinate
+    for the new shape is ``Mod(Mod(c0, 65), 64)`` or ``Mod(d1, 7)``, which the
+    compiler cannot represent, so every op reading the view fails.
+
+    The answer depends only on the layout and the view's geometry, so it is
+    cached on them: a view seen before costs one dict lookup, not a coordinate
+    computation.
+    """
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    return _layout_serves_view(
+        get_spyre_tensor_layout(x),
+        tuple(x.shape),
+        tuple(x.stride()),
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _layout_serves_view(stl, size, stride) -> bool:
+    # Imported here: torch_spyre._inductor imports this module's package.
+    import sympy
+
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.pass_utils import _check_stick_expr_supported
+    from torch_spyre._inductor.views import compute_coordinates
+
+    syms = [
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(len(size))
+    ]
+    ranges = {s: n for s, n in zip(syms, size) if n > 1}
+    index = sum((s * st for s, st in zip(syms, stride) if s in ranges), sympy.S.Zero)
+    try:
+        coords = compute_coordinates(
+            list(stl.device_size), list(stl.stride_map), ranges, index
+        )
+        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    except Unsupported:
+        return False
+    return True
+
+
+def _materialize_unservable_view(x):
+    """Return a canonical-layout copy of a Spyre view whose inherited device
+    layout cannot serve its own shape; pass everything else through unchanged.
+
+    The eager op gets the view as a graph input with its base's layout, and the
+    restickify that ``insert_restickify`` adds has to read the input through that
+    same view, which ``device_coordinates`` rejects in ``insert_restickify_padding``.
+    The compiled path restickifies the base buffer, so the copy is made the same
+    way, on the device (``_rebuild_view_on_device``).
+
+    Inside a compiled graph's fallback (``_in_compiled_fallback``) the copy goes
+    through the host instead, as in ``_normalize_result_layout``: compiling again
+    from there nests ``torch.compile`` inside the kernel being compiled. That costs
+    a device-to-host and a host-to-device transfer, so it emits a
+    ``FallbackWarning``.
+    """
+    if isinstance(x, torch.Tensor):
+        if (
+            x.device.type == "spyre"
+            and x._base is not None
+            and x.dim() > 0
+            and not _layout_serves_own_view(x)
+        ):
+            if not _in_compiled_fallback():
+                return _rebuild_view_on_device(x)
+            warn_fallback("reading an unaligned view of a Spyre tensor")
+            out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+            out.copy_(x.to("cpu"))
+            return out
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_unservable_view(e) for e in x)
     return x
 
 
@@ -403,12 +531,15 @@ def _make_offset_safe_dispatch(op):
                 return type(x)(prep_write(e) for e in x)
             return x
 
+        def prep_read(x):
+            return _materialize_unservable_view(_materialize_offset_view(x))
+
         args = tuple(
-            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            prep_write(a) if i in write_positions else prep_read(a)
             for i, a in enumerate(args)
         )
         kwargs = {
-            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            k: (prep_write(v) if k in write_names else prep_read(v))
             for k, v in kwargs.items()
         }
 
@@ -462,6 +593,7 @@ COMPILED_OPS = [
     aten.bmm,
     aten.cat,
     aten.div,
+    aten.floor_divide,
     aten.exp,
     aten.floor,
     aten.trunc,
@@ -499,6 +631,7 @@ COMPILED_OPS = [
     aten.linalg_vector_norm,
     aten.where.self,
     aten.where.self_out,
+    aten.masked_fill,
     aten.clamp,
     aten.constant_pad_nd,
     aten._scaled_mm,
@@ -506,6 +639,7 @@ COMPILED_OPS = [
     aten.any.default,
     aten.any.dim,
     aten.any.dims,
+    aten.repeat,
 ]
 
 register_torch_compile_kernel(COMPILED_OPS)
@@ -627,6 +761,55 @@ def register_inplace_kernels(ops):
 
 register_inplace_kernels(COMPILED_OPS)
 
+# ``register_inplace_kernels`` cannot derive ``floor_divide_.Tensor``: it pairs
+# overloads by name, but the functional (Tensor, Tensor) overload is
+# ``floor_divide.default``, not ``floor_divide.Tensor``. Register it explicitly
+# so ``x //= tensor`` works (``floor_divide_.Scalar`` is derived normally).
+torch.library.register_kernel("aten::floor_divide_.Tensor", ["spyre"])(
+    _make_inplace_kernel(aten.floor_divide.default)
+)
+
+
+# cumsum's decomposition covers only aten.cumsum.default; out= and in-place
+# (cumsum_ reaches cumsum.out) run it and copy_ the result, like
+# _make_inplace_kernel.
+@torch.library.register_kernel("aten::cumsum.out", ["spyre"])  # type:ignore
+def spyre__cumsum_out(
+    self: torch.Tensor,
+    dim: int,
+    *,
+    dtype: torch.dtype | None = None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Functional cumsum + ``copy_`` into ``out``.
+
+    Without ``dtype`` the result takes ``out``'s dtype, as on CPU.
+    """
+    _check_same_device([(out, True), (self, False)])
+    if dtype is not None and dtype != out.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    result = torch.cumsum(self, dim, dtype=out.dtype)
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+@torch.library.register_kernel("aten::cumsum_", ["spyre"])  # type:ignore
+def spyre__cumsum_(
+    self: torch.Tensor, dim: int, *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Functional cumsum in ``self``'s dtype + ``copy_`` back into ``self``."""
+    if dtype is not None and dtype != self.dtype:
+        raise RuntimeError(
+            f"Bad in-place call: input tensor dtype {self.dtype} and output "
+            f"tensor dtype {dtype} should match"
+        )
+    self.copy_(torch.cumsum(self, dim, dtype=self.dtype))
+    return self
+
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
@@ -719,6 +902,94 @@ def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
     return self
 
 
+def _row_index(self, indices):
+    """The int32 Spyre row index for ``self[index]``, or raise for any other form.
+
+    Only one 1-D integer index on dim 0 is supported (row selection, e.g. the
+    sampled rows of a decoder's hidden states). The index is bounds-checked and
+    its negative entries wrapped on the host, as eager CPU indexing does, so an
+    index already on Spyre takes a D2H round trip, a host-side int32 cast and an
+    H2D back.
+    """
+    # Invalid on every device, so raise what CPU raises, before the scope check.
+    if any(
+        i is not None
+        and i.dtype not in (torch.int64, torch.int32, torch.uint8, torch.bool)
+        for i in indices
+    ):
+        raise IndexError(
+            "tensors used as indices must be long, int, byte or bool tensors"
+        )
+    if (
+        len(indices) != 1
+        or indices[0] is None
+        or indices[0].dim() != 1
+        or indices[0].dtype not in (torch.int32, torch.int64)
+    ):
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor supports only x[index] with a single 1-D "
+            "int32/int64 index tensor on dim 0"
+        )
+    if self.dtype == torch.bool:
+        # TODO(#6043): the device copy of a bool tensor drops its values, so a
+        # gather or a broadcast would return wrong rows without an error.
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor does not support bool source tensors"
+        )
+    index = indices[0]
+    if index.device.type != "cpu" and index.device != self.device:
+        raise RuntimeError(
+            "indices should be either on cpu or on the same device as the "
+            f"indexed tensor ({self.device})"
+        )
+    if self.dim() == 0:
+        raise IndexError("too many indices for tensor of dimension 0")
+    index = index.cpu()
+    rows = self.shape[0]
+    if index.numel() and (index.min() < -rows or index.max() >= rows):
+        raise IndexError(f"index out of range for dimension 0 with size {rows}")
+    index = torch.where(index < 0, index + rows, index)
+    # Spyre has no int64 index kernel.
+    return index.to(torch.int32).to(self.device)
+
+
+def _stick_runs_along_a_row(self):
+    """Whether the device stick of ``self`` lies along a non-singleton dim past 0.
+
+    Decided from the physical layout: the stride of a size-1 dim says nothing
+    about it, so equal views can carry different strides there.
+    """
+    stick_stride = self.device_tensor_layout().stride_map[-1]
+    return any(
+        self.shape[d] > 1 and self.stride(d) == stick_stride
+        for d in range(1, self.dim())
+    )
+
+
+@torch.library.register_kernel("aten::index.Tensor", ["spyre"])  # type:ignore
+def spyre__index_tensor(self, indices):
+    """``self[index]`` for a 1-D integer index, as an ``index_select`` on dim 0.
+
+    ``index_select`` compiles once per index length and source shape and layout
+    (``dynamic=False``), so a caller that sees many lengths should pad the index
+    onto a fixed set of them.
+
+    Eager only: the path choice reads the source's device layout, which a
+    FakeTensor does not have.
+    """
+    index = _row_index(self, indices)
+    if index.numel() == 0:
+        return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
+    if self.shape[0] == 1 and _stick_runs_along_a_row(self):
+        # Every in-range index of a one-row source is 0, so this is a broadcast.
+        # index_select on a one-row source whose stick runs along the row lowers
+        # to an op the backend can't schedule (identity for one index, stick
+        # mismatch for more). When the stick runs across rows instead (e.g. a
+        # transposed column), index_select works and the broadcast does not.
+        return self.expand(index.numel(), *self.shape[1:]).clone()
+    return torch.index_select(self, 0, index)
+
+
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
@@ -764,15 +1035,23 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         # copy_from_d2d requires torch.compile, which cannot run inside
-        # no_dispatch() (e.g. during FakeTensorMode constant propagation).
-        # Fall back to a CPU roundtrip copy in that case.
+        # no_dispatch() or 2.14's eager-on-nested-compile tracing regions
+        # (e.g. during FakeTensorMode constant propagation). Use a CPU
+        # roundtrip in those regions so the copy does not re-enter its kernel.
         #
         # Detecting "am I inside no_dispatch()" uses the private
         # ``torch._C._dispatch_tls_is_dispatch_key_excluded("Python")`` (no
         # public predicate exists — no_dispatch() excludes the Python dispatch
         # key). Revisit if upstream exposes a stable API; the alternative
         # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
-        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+        # Dynamo's private predicate covers the separate tracing flag added in
+        # 2.14; the Python dispatch key can remain enabled in that region.
+        from torch._dynamo.eval_frame import _is_eager_on_nested_compile
+
+        if (
+            torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
+            or _is_eager_on_nested_compile()
+        ):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Test identity: one row per (component, classname, name, identity tags).",
+  "properties": {
+    "classname": {},
+    "component": {
+      "minLength": 1
+    },
+    "name": {
+      "minLength": 1
+    },
+    "tags": {},
+    "test_case_id": {}
+  },
+  "required": [
+    "test_case_id",
+    "component",
+    "classname",
+    "name",
+    "tags"
+  ],
+  "title": "test_cases: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

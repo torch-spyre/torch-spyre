@@ -51,6 +51,7 @@ from torch_spyre._inductor.cost_features import (
     _stamped_advances,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
 
 
 class _FakeDep:
@@ -325,7 +326,9 @@ class SymbolicPriceTest(unittest.TestCase):
 
         symbolic = store(sym_is_lx).hbm_elems()
         self.assertFalse(isinstance(symbolic, int))  # genuinely symbolic, not cast
-        self.assertEqual(int(symbolic.subs(sym_is_lx, 0)), store(False).hbm_elems())
+        self.assertEqual(
+            int(symbolic.xreplace({sym_is_lx: 0})), store(False).hbm_elems()
+        )
         self.assertEqual(store(False).hbm_elems(), 65536)
 
 
@@ -1461,6 +1464,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[hidden // 64, _T, 64],
                     stride_map=[64, hidden, 1],
                     device_dtype=DataFormats.SEN169_FP16,
+                    valid_elements={(0, 2): hidden, (1,): _T},
                 ),
             ),
             "arg1": (
@@ -1469,6 +1473,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[_E, hidden, cols // 64, 64],
                     stride_map=[hidden * cols, cols, 64, 1],
                     device_dtype=bank_dtype,
+                    valid_elements={(0,): _E, (1,): hidden, (2, 3): cols},
                 ),
             ),
         }
@@ -1526,13 +1531,16 @@ def test_operand_geometry_declines_an_indirect_bank_index(monkeypatch):
     # not a for_each_tile offset that the geometry proof can pin per invocation.
     bank = dataclasses.replace(
         rw.reads[1],
-        index=rw.reads[1].index.subs(
-            u0, sympy.Symbol("idx", integer=True, nonnegative=True)
+        index=rw.reads[1].index.xreplace(
+            {u0: sympy.Symbol("idx", integer=True, nonnegative=True)}
         ),
     )
     op.get_read_writes = lambda: SimpleNamespace(
         reads=[rw.reads[0], bank], writes=rw.writes
     )
+    # The read set changed in place: drop the memoized one, as every mutator
+    # of an op's dependencies must (``invalidate_op_read_writes``).
+    invalidate_op_read_writes(op)
     feature = _features(monkeypatch, op, space, **kwargs)
     read = _read(feature, "arg1")
     with V.set_graph_handler(graph):
@@ -1653,13 +1661,13 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
             run = _read(symbolic, name).read_run_bytes
             assert (run is None) == (name in declined)
             assert run is None or sympy.sympify(run).free_symbols
-            assert (None if run is None else sympy.sympify(run).subs(at)) == _read(
+            assert (None if run is None else sympy.sympify(run).xreplace(at)) == _read(
                 concrete, name
             ).read_run_bytes
         expected = float(_requests_ns([concrete]))
         priced.append(expected)
-        assert float(term.subs(at)) == pytest.approx(expected, abs=1e-3)
-        assert float(objective.subs(at)) == pytest.approx(
+        assert float(term.xreplace(at)) == pytest.approx(expected, abs=1e-3)
+        assert float(objective.xreplace(at)) == pytest.approx(
             float(predict_ops([concrete], _COST_PARAMS)), rel=1e-9
         )
         assert _solve_pinned(term, pinned, i) == pytest.approx(expected, abs=2.0)

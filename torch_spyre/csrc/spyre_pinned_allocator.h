@@ -19,7 +19,7 @@
 #include <ATen/core/CachingHostAllocator.h>
 
 #include <cstddef>
-#include <flex/memory_interface/pinned_staging_cache.hpp>
+#include <flex/flex.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,7 +30,7 @@ namespace spyre {
 struct PinnedAllocationState;
 
 struct PinnedAllocation {
-  std::shared_ptr<flex::PinnedBuffer> buffer;
+  std::shared_ptr<flex::DmaStagingBuffer> buffer;
   size_t offset = 0;
   // Whole-buffer capacity from the requested address to the end of the
   // backing buffer, NOT the caller's logical allocation size: the staging

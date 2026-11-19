@@ -415,6 +415,35 @@ def test_same_ownership_in_two_spellings_is_not_a_relayout():
         )
 
 
+def test_unsupported_relayout_transition_reason_is_named_directly():
+    """_unsupported_relayout_transition_reason takes the two work divisions
+    the planner projected from the source and destination per-core views, not
+    the views themselves. When both spell the same owners (same_ownership),
+    the identity-copy emitter would lower the relayout as a plain identity
+    with no cross-core movement, so the planner refuses it with the
+    "collapse" reason; a genuinely different division is accepted. Named
+    directly here rather than only reached through the "collapsed" reader
+    case elsewhere."""
+
+    from torch_spyre._inductor.op_spec import TensorWorkDivision
+
+    x = Symbol("x")
+    same = TensorWorkDivision({x: 4}, {x: Mod(_CORE_ID, 4)}, num_cores=4)
+    same_again = TensorWorkDivision(
+        {x: 4}, {x: Mod(_CORE_ID + 4, 4)}, num_cores=4
+    )  # a different spelling of the same owners
+    different = TensorWorkDivision({x: 2}, {x: Mod(_CORE_ID, 2)}, num_cores=4)
+
+    assert same.same_ownership(same_again)
+    assert not same.same_ownership(different)
+    assert (
+        lx_relayout._unsupported_relayout_transition_reason(same, same_again)
+        == "cannot emit: distinct physical ownerships collapse to the same "
+        "logical work division"
+    )
+    assert lx_relayout._unsupported_relayout_transition_reason(same, different) is None
+
+
 def test_candidate_without_a_measured_span_is_rejected():
     """The committed path declines a relayout whose span it cannot measure
     (#3440); the solver path must not carry such a candidate into a solve,
@@ -634,6 +663,153 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
     assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
 
 
+def _consumer(name, data=None, carry_of=None, loop_info=None):
+    """An op for the consumer rule: its name, IR data, loop metadata and,
+    for a carry's storage or update, the carry record."""
+    from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+    op = SimpleNamespace(get_name=lambda: name, data=data, loop_info=loop_info)
+    if carry_of is not None:
+        op._loop_carry_record = LoopCarryRecord(
+            storage_name=carry_of, update_name="buf_update"
+        )
+    return op
+
+
+def _reduction(kind):
+    import torch
+    from torch._inductor.ir import Reduction, ReductionHint
+
+    return Reduction(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index, rindex: None,
+        ranges=[8],
+        reduction_ranges=[4],
+        reduction_type=kind,
+        src_dtype=torch.float16,
+        reduction_hint=ReductionHint.DEFAULT,
+    )
+
+
+def _pointwise(ranges=(8,)):
+    import torch
+    from torch._inductor.ir import Pointwise
+
+    return Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: None,
+        ranges=list(ranges),
+    )
+
+
+def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
+    """The sum after a counted loop reads every core group's part of the
+    loop's carry, so the solver may offer it a relayout copy. Another
+    reduction kind, a sum inside a loop and a sum of any other producer keep
+    the earlier answer (no relayout)."""
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+    matmul = _consumer("mm")
+    monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda o: o is matmul)
+    total = _consumer("sum", _reduction("sum"))
+    pointwise = _consumer("mul", _pointwise())
+    carry = _consumer("buf52", carry_of="buf52")
+    update = _consumer("buf_update", carry_of="buf52")  # the record's other end
+    plain = _consumer("buf7")
+    one_loop = CoarseTileInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]])
+    supported = lx_relayout._relayout_consumer_kind_supported
+    assert supported(carry, total)
+    assert not supported(plain, total)
+    assert not supported(update, total)
+    assert not supported(carry, _consumer("max", _reduction("max")))
+    in_loop = _consumer("in_loop", _reduction("sum"), loop_info=one_loop)
+    assert not supported(carry, in_loop)
+    for producer in (carry, plain):
+        assert supported(producer, pointwise)
+        assert supported(producer, matmul)
+    assert not supported(carry, _consumer("extern"))
+
+
+def test_a_sum_that_the_loop_facts_put_in_a_loop_takes_no_relayout(monkeypatch):
+    """The rule asks ``counted_loop_path`` (the loop-facts read API) whether
+    the sum runs in a loop, not ``loop_info``. A sum with no ``loop_info``
+    that the loop facts put in a loop, as they will when loop membership
+    moves off the op (#5863), takes no copy."""
+    carry = _consumer("buf52", carry_of="buf52")
+    in_loop = _consumer("in_loop", _reduction("sum"))
+    after = _consumer("after", _reduction("sum"))
+    assert in_loop.loop_info is None and after.loop_info is None
+    monkeypatch.setattr(
+        lx_relayout,
+        "counted_loop_path",
+        lambda op, include_extern=False: (0,) if op is in_loop else (),
+    )
+    supported = lx_relayout._relayout_consumer_kind_supported
+    assert not supported(carry, in_loop)
+    assert supported(carry, after)
+
+
+def test_an_edge_needs_an_fx_origin_at_both_ends(monkeypatch):
+    """GraphEditor puts the copy's FX node after the producer's and replaces
+    it in each consumer's. A compiler-made buffer has no node in the lowering
+    graph (the pre-loop copy of a caller-owned loop carry), so such an edge
+    stops before the consumer rule, which gets the producer and the consumer."""
+    import torch
+    from torch._inductor.ir import ComputedBuffer
+    from torch.fx import Graph
+    from torch.spyre import SpyreTensorLayout
+
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    fx_graph = Graph()
+    local = fx_graph.placeholder("local")
+    foreign = Graph().placeholder("foreign")
+    size = [8, 64]
+
+    def end(origins=(), origin_node=None):
+        layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            size,
+            [64, 1],
+            SpyreTensorLayout(size, torch.float16),
+        )
+        op = ComputedBuffer(name="buf0", layout=layout, data=_pointwise(size))
+        op.loop_info, op.origins, op.origin_node = None, list(origins), origin_node
+        return op
+
+    asked = []
+    monkeypatch.setattr(lx_relayout, "_single_write", lambda op, name: object())
+    monkeypatch.setattr(lx_relayout, "_is_activation_source", lambda *args: True)
+    monkeypatch.setattr(lx_relayout, "_supported_consumer_layout", lambda *args: True)
+    monkeypatch.setattr(
+        lx_relayout,
+        "_relayout_consumer_kind_supported",
+        lambda producer, consumer: asked.append((producer, consumer)),
+    )
+    graph = SimpleNamespace(graph=fx_graph)
+
+    def reaches_the_consumer_rule(producer, consumer):
+        asked.clear()
+        context = lx_relayout.solver_relayout_edge_context(
+            graph, producer, consumer, "buf0", {}
+        )
+        assert context is None  # the stub of the consumer rule declines
+        assert asked in ([], [(producer, consumer)])
+        return bool(asked)
+
+    assert reaches_the_consumer_rule(end([local]), end([local]))
+    # GraphEditor takes the producer's origin in this graph, and a consumer's
+    # origin_node as it is.
+    assert reaches_the_consumer_rule(end([foreign, local]), end(origin_node=foreign))
+    assert not reaches_the_consumer_rule(end(), end([local]))
+    assert not reaches_the_consumer_rule(end([foreign]), end([local]))
+    assert not reaches_the_consumer_rule(end([local]), end())
+    assert not reaches_the_consumer_rule(end([local]), end([foreign]))
+
+
 @pytest.mark.parametrize(
     "enabled,violation",
     [
@@ -665,8 +841,9 @@ def test_persistent_scatter_requires_independent_immutable_source(
     from types import SimpleNamespace
     from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
-    class Input(SimpleNamespace):
-        pass
+    import torch
+    from torch._inductor.ir import FixedLayout, InputBuffer, MutationLayoutSHOULDREMOVE
+    from torch._inductor.virtualized import V
 
     class Pointwise(SimpleNamespace):
         pass
@@ -679,11 +856,17 @@ def test_persistent_scatter_requires_independent_immutable_source(
             return self.indirect
 
     source = SimpleNamespace(layout=Fixed(), get_name=lambda: "value")
-    cache = Input(
-        get_name=lambda: "cache", get_layout=lambda: Fixed(allocation={"hbm": 0})
+    cache = InputBuffer(
+        name="cache",
+        layout=FixedLayout(device=torch.device("cpu"), dtype=torch.float16, size=[64]),
     )
+    mutated = []
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=mutated.append)):
+        mutation_layout = MutationLayoutSHOULDREMOVE(target=cache)
+    assert mutated == ["cache"]
+    cache.get_layout = lambda: Fixed(allocation={"hbm": 0})
     update = SimpleNamespace(
-        layout=SimpleNamespace(target=cache),
+        layout=mutation_layout,
         data=Pointwise(),
         get_name=lambda: "update",
     )
@@ -732,7 +915,6 @@ def test_persistent_scatter_requires_independent_immutable_source(
             raise NotImplementedError
 
         later.get_inputs_that_alias_output = unknown
-    monkeypatch.setattr(lx_relayout, "InputBuffer", Input)
     monkeypatch.setattr(lx_relayout, "Pointwise", Pointwise)
     monkeypatch.setattr(lx_relayout, "FixedTiledLayout", Fixed)
     monkeypatch.setattr(lx_relayout, "MemoryDep", Dep)
@@ -823,3 +1005,290 @@ def test_prefix_lx_contraction_requires_exact_backing_stride(invalid):
         assert lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1])
         graph.operations = [source, consumer, other]
         assert not lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1, 2])
+
+
+@pytest.mark.parametrize(
+    "violation",
+    [
+        None,
+        "source_alias",
+        "aliasing_reader",
+        "graph_output",
+        "partial_scatter_read",
+        "off",
+    ],
+)
+def test_pointwise_scatter_materializer_admission(monkeypatch, violation):
+    """A real pointwise producer must pass the new path and its safety guards."""
+    import torch
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        MutationLayoutSHOULDREMOVE,
+        Pointwise,
+        Scatter,
+    )
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V, ops
+    from torch.utils._ordered_set import OrderedSet
+    from torch_spyre._C import ElementArrangement
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    row, feature = [
+        Symbol(name, integer=True, nonnegative=True) for name in ("row", "feature")
+    ]
+    indirect = Symbol("tmp0", integer=True)
+    device, dtype = torch.device("cpu"), torch.float16
+
+    def layout(rows):
+        physical = SimpleNamespace(
+            device_size=[2, rows, 64],
+            stride_map=[64, 128, 1],
+            device_dtype=dtype,
+            element_arrangement=ElementArrangement.STANDARD,
+            elems_per_stick=lambda: 64,
+        )
+        return FixedTiledLayout(device, dtype, [rows, 128], [128, 1], physical)
+
+    parent = ComputedBuffer(
+        name="parent",
+        layout=layout(4),
+        data=Pointwise(
+            device=device, dtype=dtype, inner_fn=lambda index: 0, ranges=[4, 128]
+        ),
+    )
+    source = ComputedBuffer(
+        name="value",
+        layout=layout(2),
+        data=Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index: ops.load("parent", 128 * (index[0] + 1) + index[1]),
+            ranges=[2, 128],
+        ),
+    )
+    cache = InputBuffer(
+        name="cache", layout=FixedLayout(device, dtype, [4, 128], [128, 1])
+    )
+    indices = InputBuffer(
+        name="indices", layout=FixedLayout(device, torch.int64, [2], [1])
+    )
+    mutations = set()
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=mutations.add)):
+        update = ComputedBuffer(
+            name="update",
+            layout=MutationLayoutSHOULDREMOVE(cache),
+            data=Scatter(
+                device=device,
+                dtype=dtype,
+                ranges=[2, 128],
+                inner_fn=lambda index: ops.load("value", 128 * index[0] + index[1]),
+                output_indexer=lambda index: [
+                    ops.indirect_indexing(
+                        ops.load("indices", index[0]), 4, check=False
+                    ),
+                    index[1],
+                ],
+            ),
+        )
+    assert mutations == {"cache"}
+
+    def dependencies(reads, write):
+        return ReadWrites(OrderedSet(reads), OrderedSet([write]), OrderedSet())
+
+    # Use explicit pre-scheduling dependencies to isolate the admission predicate.
+    parent.get_read_writes = lambda: dependencies(
+        [], MemoryDep("parent", 128 * row + feature, (row, feature), (4, 128))
+    )
+    source.get_read_writes = lambda: dependencies(
+        [MemoryDep("parent", 128 * (row + 1) + feature, (row, feature), (2, 128))],
+        MemoryDep("value", 128 * row + feature, (row, feature), (2, 128)),
+    )
+    reads = [
+        MemoryDep("value", 128 * row + feature, (row, feature), (2, 128)),
+        MemoryDep("indices", row, (row,), (2,)),
+    ]
+    update.get_read_writes = lambda: dependencies(
+        reads,
+        MemoryDep("update", 128 * indirect + feature, (row, feature), (2, 128)),
+    )
+    buffers = {op.get_name(): op for op in (parent, source, update, cache, indices)}
+    graph = SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        operations=[parent, source, update],
+        graph_inputs={"cache": cache, "indices": indices},
+        get_buffer=buffers.__getitem__,
+        try_get_buffer=buffers.get,
+        get_output_names=lambda: [],
+    )
+    with (
+        V.set_graph_handler(graph),
+        config.patch(
+            lx_planner_relayout=True, lx_extended_ownership=True, ktir_emitter=False
+        ),
+    ):
+        assert not lx_relayout._is_matmul_op(source)
+        assert lx_relayout.local_lx_subrange_geometry(graph, parent, source) == (
+            (0, 1, 0),
+            (2, 2, 64),
+        )
+        assert lx_relayout._pointwise_scatter_materializer(
+            graph, source, update, "value"
+        )
+        assert lx_relayout._persistent_scatter_consumer(graph, source, update, "value")
+        if violation == "source_alias":
+            monkeypatch.setattr(
+                source, "get_inputs_that_alias_output", lambda: ("external",)
+            )
+        elif violation == "aliasing_reader":
+            other = ComputedBuffer(
+                name="other",
+                layout=layout(2),
+                data=Pointwise(
+                    device=device,
+                    dtype=dtype,
+                    ranges=[2, 128],
+                    inner_fn=lambda index: ops.load("value", 128 * index[0] + index[1]),
+                ),
+            )
+            other.get_read_writes = lambda: dependencies(
+                [MemoryDep("value", 128 * row + feature, (row, feature), (2, 128))],
+                MemoryDep("other", 128 * row + feature, (row, feature), (2, 128)),
+            )
+            graph.operations.append(other)
+            # An immutable second reader is safe. An aliasing reader is not.
+            assert lx_relayout._persistent_scatter_consumer(
+                graph, source, update, "value"
+            )
+            monkeypatch.setattr(
+                other, "get_inputs_that_alias_output", lambda: ("value",)
+            )
+        elif violation == "graph_output":
+            graph.get_output_names = lambda: ["value"]
+        elif violation == "partial_scatter_read":
+            reads[0] = MemoryDep("value", 128 * row + feature, (row, feature), (1, 128))
+            update.__dict__.pop("_ts_cached_read_writes", None)
+        with config.patch(lx_extended_ownership=violation != "off"):
+            assert lx_relayout._persistent_scatter_consumer(
+                graph, source, update, "value"
+            ) is (violation is None)
+
+
+@pytest.mark.parametrize(
+    "scheduled,violation",
+    [
+        (False, None),
+        (True, None),
+        (False, "extra_read"),
+        (False, "partial_write"),
+        (True, "unresolved_target"),
+    ],
+)
+def test_direct_cache_snapshot_scatter_geometry(scheduled, violation):
+    """Certify a real snapshot subrange without changing the cache mutation."""
+    import torch
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        MutationLayoutSHOULDREMOVE,
+        Pointwise,
+        Scatter,
+    )
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V, ops
+    from torch.utils._ordered_set import OrderedSet
+    from torch_spyre._C import ElementArrangement
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    row, feature = [
+        Symbol(name, integer=True, nonnegative=True) for name in ("row", "feature")
+    ]
+    indirect = Symbol("tmp0", integer=True)
+    device, dtype = torch.device("cpu"), torch.float16
+    physical = SimpleNamespace(
+        device_size=[2, 4, 64],
+        stride_map=[64, 128, 1],
+        device_dtype=dtype,
+        element_arrangement=ElementArrangement.STANDARD,
+        elems_per_stick=lambda: 64,
+    )
+    layout = FixedTiledLayout(device, dtype, [4, 128], [128, 1], physical)
+    source = ComputedBuffer(
+        name="snapshot",
+        layout=layout,
+        data=Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda idx: ops.load("cache", 128 * idx[0] + idx[1]),
+            ranges=[4, 128],
+        ),
+    )
+    cache = InputBuffer(
+        name="cache", layout=FixedLayout(device, dtype, [4, 128], [128, 1])
+    )
+    indices = InputBuffer(
+        name="indices", layout=FixedLayout(device, torch.int64, [2], [1])
+    )
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=lambda name: None)):
+        mutation = MutationLayoutSHOULDREMOVE(cache)
+    update = ComputedBuffer(
+        name="update",
+        layout=layout.unallocated_copy() if scheduled else mutation,
+        data=Scatter(
+            device=device,
+            dtype=dtype,
+            ranges=[2, 128],
+            inner_fn=lambda idx: ops.load("snapshot", 128 * (idx[0] + 1) + idx[1]),
+            output_indexer=lambda idx: [
+                ops.indirect_indexing(ops.load("indices", idx[0]), 4, check=False),
+                idx[1],
+            ],
+        ),
+    )
+
+    def dependencies(reads, write):
+        return ReadWrites(OrderedSet(reads), OrderedSet([write]), OrderedSet())
+
+    written_rows = 3 if violation == "partial_write" else 4
+    source.get_read_writes = lambda: dependencies(
+        [MemoryDep("cache", 128 * row + feature, (row, feature), (4, 128))],
+        MemoryDep("snapshot", 128 * row + feature, (row, feature), (written_rows, 128)),
+    )
+    reads = [
+        MemoryDep("snapshot", 128 * (row + 1) + feature, (row, feature), (2, 128)),
+        MemoryDep("indices", row, (row,), (2,)),
+    ]
+    if violation == "extra_read":
+        reads.append(MemoryDep("other_tensor", row, (row,), (2,)))
+    update.get_read_writes = lambda: dependencies(
+        reads, MemoryDep("update", 128 * indirect + feature, (row, feature), (2, 128))
+    )
+    buffers = {op.get_name(): op for op in (source, update, cache, indices)}
+    graph = SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        operations=[source, update],
+        graph_inputs={"cache": cache, "indices": indices},
+        get_buffer=buffers.__getitem__,
+        try_get_buffer=buffers.get,
+        get_output_names=lambda: [],
+        scheduler=SimpleNamespace(
+            mutation_real_name={
+                "update": "missing" if violation == "unresolved_target" else "cache"
+            }
+        ),
+    )
+    with V.set_graph_handler(graph):
+        if scheduled:
+            assert not update.get_mutation_names()
+        assert lx_relayout._persistent_scatter_storage_safe(
+            graph, source, update, "snapshot"
+        ) is (violation != "unresolved_target")
+        assert lx_relayout._local_lx_scatter_geometry(graph, source, update) == (
+            ((0, 1, 0), (2, 2, 64)) if violation is None else None
+        )
+        assert update.get_read_writes().reads == OrderedSet(reads)
+        assert graph.operations == [source, update]

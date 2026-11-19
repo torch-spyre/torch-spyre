@@ -133,4 +133,4 @@ When opening an issue, include:
 
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer

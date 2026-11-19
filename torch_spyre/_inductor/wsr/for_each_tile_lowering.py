@@ -67,7 +67,9 @@ does exactly:
     return tmp2
 
 i.e. `lt(iteration_sym, N)` with N a plain Python int/constant baked in by
-the tracer (for_each_tile.py's `_step_counter`/`count_mode` logic always
+the tracer, or, for a symbolic trip count, an `ops.index_expr` carrying the
+count expression in place of the constant (for_each_tile.py's
+`_step_counter`/`count_mode` logic always
 carries the trip counter as carried_inputs[0], and the cond subgraph's own
 first placeholder is that same carry positionally). `N` is not exposed as a
 separate symbolic node anywhere reachable from the IR level -- it only shows
@@ -86,6 +88,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -98,11 +101,15 @@ from torch._inductor.virtualized import V
 from .. import timing_recorder
 from ..deadcode_elimination import deadcode_elimination
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import identity_load, format_operations
+from ..pass_utils import (
+    format_operations,
+    identity_load,
+    invalidate_op_read_writes,
+)
 
 if TYPE_CHECKING:
     from torch._inductor import ir
-    from torch._inductor.dependencies import Dep
+    from torch._inductor.dependencies import Dep, ReadWrites
 
 logger = get_inductor_logger("wsr.for_each_tile_lowering")
 
@@ -117,7 +124,7 @@ class ProverResult:
 
 
 class _CondInnerFnRecorder(DefaultHandler):
-    """Records the loads/constants/comparison op a cond inner_fn issues.
+    """Records the loads/bounds/comparison op a cond inner_fn issues.
 
     Every other ops call (there should be none for the shape this prover
     recognizes) is routed through `_default` and answered with an opaque
@@ -127,16 +134,19 @@ class _CondInnerFnRecorder(DefaultHandler):
 
     def __init__(self) -> None:
         self.loads: list[tuple[str, Any]] = []
-        self.constants: list[Any] = []
+        self.bounds: list[Any] = []
         self.compare_ops: list[str] = []
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         if name == "load":
             self.loads.append((args[0], args[1]))
             return f"__load_{len(self.loads) - 1}__"
-        if name == "constant":
-            self.constants.append(args[0])
-            return f"__constant_{len(self.constants) - 1}__"
+        # A concrete trip count reaches the cond graph as `constant`, a symbolic
+        # one as `index_expr` carrying the sympy expression. Both are the loop's
+        # bound, so both land in one list and the caller checks it saw exactly one.
+        if name in ("constant", "index_expr"):
+            self.bounds.append(args[0])
+            return f"__bound_{len(self.bounds) - 1}__"
         if name in ("lt", "le", "gt", "ge", "eq", "ne"):
             self.compare_ops.append(name)
             return f"__cmp_{name}__"
@@ -155,6 +165,11 @@ class _CounterStepRecorder(DefaultHandler):
     Anything else is routed through ``_default`` and recorded as an
     unexpected op so the caller can decline with a useful reason, mirroring
     ``_CondInnerFnRecorder``.
+
+    This one records only ``constants``, where ``_CondInnerFnRecorder`` records
+    ``bounds`` from both ``constant`` and ``index_expr``. That is on purpose:
+    the trip count can be symbolic, but the counter's step is always the
+    literal 1, so an ``index_expr`` here is not a step and declines.
     """
 
     def __init__(self) -> None:
@@ -181,58 +196,78 @@ def _first_placeholder_name(cond_graph) -> str | None:
     return next(iter(graph_inputs), None)
 
 
-def _extract_trip_count(cond_graph) -> sympy.Expr | None:
+def _extract_trip_count(cond_graph) -> ProverResult:
     """Find the single lt(iteration_sym, N)-shaped comparison cond_graph computes.
 
     for_each_tile's cond_fn (after decompose_scan_to_while_loop) reduces to
     exactly one boolean scalar ComputedBuffer computing
-    `ops.load(<first placeholder>, 0) < ops.constant(N, ...)`. Returns N as a
-    sympy.Expr, or None if the shape does not match.
+    `ops.load(<first placeholder>, 0) < N`, where N is a constant for a concrete
+    trip count and an index_expr for a symbolic one.
+
+    Returns an accepted result carrying N, or a declined one whose reason names
+    what it saw instead. splice_while_loops refuses every declined loop with
+    Unsupported, so the reason is the error message a user sees.
     """
+
+    def declined(reason: str) -> ProverResult:
+        return ProverResult(accepted=False, reason=f"cond_subgraph {reason}")
+
     graph_outputs = getattr(cond_graph, "graph_outputs", None)
     if not graph_outputs or len(graph_outputs) != 1:
-        return None
+        return declined(
+            f"has {len(graph_outputs) if graph_outputs else 0} outputs, expected 1"
+        )
     operations = getattr(cond_graph, "operations", None)
     if not operations or len(operations) != 1:
-        return None
+        return declined(
+            f"has {len(operations) if operations else 0} operations, expected 1"
+        )
 
     op = operations[0]
     data = getattr(op, "data", None)
     inner_fn = getattr(data, "inner_fn", None)
     if inner_fn is None:
-        return None
+        return declined("operation has no inner_fn to replay")
     # The comparison is a scalar bool -- no output ranges to index over.
     get_size = getattr(data, "get_size", None)
     if get_size is None or list(get_size()) != []:
-        return None
+        return declined("operation is not a scalar, so it is not the comparison")
     if getattr(data, "dtype", None) != torch.bool:
-        return None
+        return declined(f"operation has dtype {getattr(data, 'dtype', None)}, not bool")
 
     first_placeholder = _first_placeholder_name(cond_graph)
     if first_placeholder is None:
-        return None
+        return declined("has no first placeholder to compare against")
 
     recorder = _CondInnerFnRecorder()
     with V.set_ops_handler(recorder):
         inner_fn(())
 
     if recorder.compare_ops != ["lt"]:
-        return None
-    if len(recorder.loads) != 1 or len(recorder.constants) != 1:
-        return None
+        return declined(f"issued comparisons {recorder.compare_ops}, expected ['lt']")
+    if len(recorder.loads) != 1:
+        return declined(f"issued {len(recorder.loads)} loads, expected 1")
+    if len(recorder.bounds) != 1:
+        return declined(
+            f"offered {len(recorder.bounds)} candidate bounds "
+            f"({recorder.bounds}), expected 1"
+        )
 
     (loaded_name, loaded_index) = recorder.loads[0]
     if loaded_name != first_placeholder:
-        return None
+        return declined(
+            f"loads {loaded_name!r}, not the first placeholder {first_placeholder!r}"
+        )
     if loaded_index != 0:
-        return None
+        return declined(f"loads at index {loaded_index}, expected 0")
 
-    bound = recorder.constants[0]
+    bound = recorder.bounds[0]
+    # bool before int: bool subclasses int, and `while True` is not a trip count.
     if isinstance(bound, bool):
-        return None
+        return declined("compares against a bool, which is not a trip count")
     if not isinstance(bound, (int, sympy.Expr)):
-        return None
-    return sympy.sympify(bound)
+        return declined(f"compares against a {type(bound).__name__}, not a number")
+    return ProverResult(accepted=True, trip_count=sympy.sympify(bound))
 
 
 def _unwrap_to_buffer(node: Any) -> Any:
@@ -283,10 +318,11 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
 
     The trip count ``N`` of ``lt(counter, N)`` is the number of iterations only
     if the counter starts at 0. The frontend's counter (``carried_inputs[0]``)
-    is always ``torch.zeros([], int64)``, which reaches the IR as a
-    ``MultiOutput`` of an ``aten.full.default`` ``FallbackKernel`` with no
-    tensor inputs. Anything else -- a caller-provided tensor, a different fill
-    value, a non-scalar -- is not proven.
+    is always ``torch.zeros([], int64)``, which reaches the IR as an
+    ``aten.full.default`` ``FallbackKernel`` with no tensor inputs. Before
+    PyTorch 2.14 its output was wrapped in a ``MultiOutput``; 2.14 returns the
+    kernel directly. Both representations must satisfy the same checks.
+    A caller-provided tensor, a different fill value, or a non-scalar is not proven.
     """
     from torch._inductor import ir
 
@@ -302,12 +338,15 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
         )
     if isinstance(init, ir.ComputedBuffer):
         return _pointwise_zero_failure(init)
-    if not isinstance(init, ir.MultiOutput):
+    if isinstance(init, ir.FallbackKernel):
+        kernel = init
+    elif isinstance(init, ir.MultiOutput):
+        kernel = init.inputs[0] if init.inputs else None
+    else:
         return (
             "counter init is a "
             f"{type(init).__name__}, not a constant fill the prover can read"
         )
-    kernel = init.inputs[0] if init.inputs else None
     if not isinstance(kernel, ir.FallbackKernel):
         return "counter init is not produced by a fallback kernel"
     if getattr(kernel, "op_overload", None) is not torch.ops.aten.full.default:
@@ -399,19 +438,13 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
     if cond_graph is None:
         return ProverResult(accepted=False, reason="no cond_subgraph.graph to inspect")
 
-    trip_count = _extract_trip_count(cond_graph)
-    if trip_count is None:
-        return ProverResult(
-            accepted=False,
-            reason=(
-                "cond_subgraph did not reduce to a single provable "
-                "lt(iteration_sym, N) comparison"
-            ),
-        )
+    result = _extract_trip_count(cond_graph)
+    if not result.accepted:
+        return result
     for failure in (_counter_init_failure(while_op), _counter_step_failure(while_op)):
         if failure is not None:
             return ProverResult(accepted=False, reason=failure)
-    return ProverResult(accepted=True, trip_count=trip_count)
+    return result
 
 
 def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
@@ -647,17 +680,27 @@ def _marker_axis_is_consumed(axis_coords: "list[sympy.Expr] | None") -> bool:
     return all(not c.free_symbols for c in axis_coords)
 
 
-def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
+def _delinearize_index(
+    index: sympy.Expr, size, stride, offset, *, fold_into_any_dim: bool = False
+) -> list[sympy.Expr]:
     """Invert a FixedLayout-style flat index back into per-dim coordinates.
 
     ``ops.load(name, index)`` receives ``index`` already flattened by the
     loaded buffer's own indexer into ``sum(idx[i] * stride[i]) + offset``;
     this undoes that. Every per-dim loop-index symbol appears in exactly
-    one additive term with coefficient ``stride[i]`` (the same one-symbol-
-    per-term linearity every coordinate-recovery helper in this package
-    already assumes), so dividing each matched term by its own stride
-    recovers ``idx[i]`` directly; a size-1 dim contributes no term, so its
-    coordinate is simply 0.
+    one additive term (the same one-symbol-per-term linearity every
+    coordinate-recovery helper in this package already assumes), usually
+    with coefficient ``stride[i]``, so dividing each matched term by its
+    own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
+    term, so its coordinate is simply 0. A coefficient can also be a
+    multiple of a stride: a reduction variable flattened through a
+    contiguous reshape of the marker enters as ``512*d2`` against the
+    marker's dim stride 64 (issue #6407). Such a term is folded into the
+    dim with the largest stride, which must divide it (``8*d2``). With
+    ``fold_into_any_dim`` -- the caller composes the coordinates through
+    these same strides, so any exact split gives the same address -- it is
+    folded into the largest stride that divides it, which may be an inner
+    dim's and leave that coordinate out of range.
 
     A dim's coordinate can also be a compile-time-constant integer rather
     than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
@@ -672,10 +715,12 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     mixed-radix approach ``tile.py``'s ``compute_tile_offset`` uses.
 
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
-    constant portion doesn't decompose evenly across the constant dims, or
-    if a recovered digit is out of bounds for its dim's size -- all three
-    indicate the one-symbol/one-stride-per-term assumption above doesn't
-    hold for this index.
+    constant portion doesn't decompose evenly across the constant dims, if
+    a recovered digit is out of bounds for its dim's size, or if a leftover
+    symbolic term is not an integer multiple of a single symbol or its
+    coefficient is not a multiple of a stride it may be folded into -- all
+    of which indicate the one-symbol/one-stride-per-term assumption above
+    doesn't hold for this index.
     """
     remaining = sympy.expand(index - offset)
     free_syms = remaining.free_symbols
@@ -748,7 +793,73 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
         f"_delinearize_index: unresolved coordinate for index {index!r} "
         f"(size {size!r}, stride {stride!r}, offset {offset!r})"
     )
+
+    # .coeff(st) only matches a term whose numeric factor is exactly st, so
+    # a term at a multiple of a stride (512*d2 against 64) is still missing
+    # from coords here. The largest-stride dim can take it: in a dense layout
+    # a valid flat index keeps that coordinate below its size whatever the
+    # loop variables' ranges, which the ops handler never receives. An inner
+    # dim can overflow (128*r into [2, 4, 64] gives b + 2*r, up to 7). That
+    # only matters if the caller composes the coordinates through other
+    # strides, so an inner dim takes a term only with fold_into_any_dim.
+    recovered = sum(
+        (coords[i] * stride[i] for i in range(len(coords)) if stride[i] != 0),
+        sympy.S.Zero,
+    )
+    leftover = sympy.expand(remaining - recovered)
+    if leftover == 0:
+        # S.Zero.as_ordered_terms() is [0], which would raise below for a
+        # layout with no foldable dim (all size-1 or broadcast).
+        return coords
+    live = [i for i in range(len(coords)) if stride[i] != 0 and size[i] != 1]
+    if not fold_into_any_dim:
+        # A symbolic stride hides which dim has the largest one.
+        live = (
+            [max(live, key=lambda i: int(stride[i]))]
+            if live and all(sympy.sympify(stride[i]).is_Integer for i in live)
+            else []
+        )
+    for term in leftover.as_ordered_terms():
+        coeff = term.as_coeff_Mul()[0]
+        # Only an integer times one bare symbol is folded. A product like
+        # 512*s0*d2 is a coordinate only if s0 is a size, which nothing here
+        # can tell, so it raises instead.
+        if not (coeff.is_Integer and (term / coeff).is_Symbol):
+            raise AssertionError(
+                f"_delinearize_index: leftover term {term!r} of index "
+                f"{index!r} is not an integer multiple of a single symbol "
+                f"(size {size!r}, stride {stride!r}, offset {offset!r}); "
+                "cannot fold it into a dim coordinate."
+            )
+        eligible = [i for i in live if coeff % stride[i] == 0]
+        if not eligible:
+            raise AssertionError(
+                f"_delinearize_index: term {term!r} of index {index!r} is "
+                f"not a multiple of a stride it may be folded into (size "
+                f"{size!r}, stride {stride!r}, offset {offset!r}); an inner "
+                "dim could put that coordinate out of bounds."
+            )
+        best = max(eligible, key=lambda i: stride[i])
+        coords[best] = coords[best] + term / stride[best]
     return coords
+
+
+@functools.lru_cache(maxsize=1024)
+def _reads_at_own_strides(read_index, var_names, size, stride) -> bool:
+    """True iff a marker reads its input at its own layout strides.
+
+    Then composing the consumer's coordinates into the marker's read gives
+    the consumer's flat index plus a var-free offset, so every exact split of
+    that index across the marker's dims, in range or not, reads the same
+    element. ``var_names`` align with the non-size-1 dims, as in
+    ``_InlineMarkerHandler.load``.
+    """
+    strides = [st for sz, st in zip(size, stride) if sz != 1]
+    if len(strides) != len(var_names):
+        return False
+    linear = sum((v * st for v, st in zip(var_names, strides)), sympy.S.Zero)
+    rest = sympy.expand(read_index - linear)
+    return not (rest.free_symbols & set(var_names))
 
 
 def _marker_substitution(
@@ -798,6 +909,73 @@ def _marker_substitution(
         )
     write_dep, read_dep = write_deps[0], read_deps[0]
     return read_dep.name, read_dep.index, write_dep.var_names, write_dep.size
+
+
+def _host_layout_key(node: Any) -> "tuple | None":
+    """Host size/stride/offset of ``node``'s layout, or None if it has none.
+
+    A node with no layout (a ``TorchBindObject``, or a ``Buffer`` whose output
+    spec is not a ``Layout``) has no key, so its marker is not cached. Any other
+    error from ``get_layout`` propagates.
+    """
+    get_layout = getattr(node, "get_layout", None)
+    if get_layout is None:
+        return None
+    try:
+        layout = get_layout()
+    except NotImplementedError:
+        return None
+    return (tuple(layout.size), tuple(layout.stride), layout.offset)
+
+
+def _buffer_host_layout_key(name: str) -> "tuple | None":
+    """``_host_layout_key`` of the current graph's buffer ``name``, or None."""
+    graph = V.graph
+    if not hasattr(graph, "try_get_buffer"):  # no graph installed
+        return None
+    buf = graph.try_get_buffer(name)
+    return None if buf is None else _host_layout_key(buf)
+
+
+def _cached_marker_substitution(
+    marker_op: "ir.Operation",
+) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+    """``_marker_substitution`` cached on the marker.
+
+    ``_InlineMarkerHandler`` is built on every trace of an inlined consumer's
+    ``inner_fn``, and each trace would otherwise re-extract the erased marker's
+    read/writes. The entry is reused only while what the extraction depends on
+    is unchanged: the marker's body object and ``inner_fn`` (a pass patches
+    ``inner_fn`` in place), its ``ranges`` (its write var names and size), its
+    host layout (its write index), and its input's host layout (its read index).
+    """
+    data = getattr(marker_op, "data", None)
+    inner_fn = getattr(data, "inner_fn", None)
+    layout_key = _host_layout_key(marker_op)
+    marker_key = (
+        None if layout_key is None else (layout_key, tuple(getattr(data, "ranges", ())))
+    )
+    cached = marker_op.__dict__.get("_ts_marker_substitution")
+    if cached is not None:
+        cached_data, cached_inner_fn, cached_keys, result = cached
+        input_key = _buffer_host_layout_key(result[0])
+        if (
+            cached_data is data
+            and cached_inner_fn is inner_fn
+            and cached_keys == (marker_key, input_key)
+            and input_key is not None
+        ):
+            return result
+    result = _marker_substitution(marker_op)
+    input_key = _buffer_host_layout_key(result[0])
+    if marker_key is not None and input_key is not None:
+        marker_op.__dict__["_ts_marker_substitution"] = (
+            data,
+            inner_fn,
+            (marker_key, input_key),
+            result,
+        )
+    return result
 
 
 class _InlineMarkerHandler(WrapperHandler):
@@ -853,11 +1031,22 @@ class _InlineMarkerHandler(WrapperHandler):
             self._marker_read_index,
             self._marker_var_names,
             self._marker_write_size,
-        ) = _marker_substitution(marker_op)
+        ) = _cached_marker_substitution(marker_op)
 
     def load(self, name, index):
         if name == self._marker_name:
-            coords = _delinearize_index(index, self._size, self._stride, self._offset)
+            coords = _delinearize_index(
+                index,
+                self._size,
+                self._stride,
+                self._offset,
+                fold_into_any_dim=_reads_at_own_strides(
+                    self._marker_read_index,
+                    tuple(self._marker_var_names),
+                    tuple(self._size),
+                    tuple(self._stride),
+                ),
+            )
             if (
                 self._capture is not None
                 and self._marker_dim is not None
@@ -892,16 +1081,12 @@ class _InlineMarkerHandler(WrapperHandler):
                     "substitute positionally."
                 )
             subs = dict(zip(self._marker_var_names, non_unit_coords))
-            # simultaneous=True is required: sympy.Expr.subs(dict) otherwise
-            # applies substitutions sequentially, one symbol at a time, so a
-            # dict like {d0: d1, d1: d2} first rewrites d0->d1 and THEN
-            # rewrites that same fresh d1 -> d2, silently merging two
-            # distinct coordinates into one wrong composed index (e.g.
-            # {d0: d1, d1: d2} applied sequentially to `d0 + 2*d1` yields
-            # `3*d1` instead of the correct `d1 + 2*d2`) whenever the
-            # substitution's target set overlaps its source set, which a
-            # coordinate permutation (e.g. a transposed tile read) does.
-            composed = self._marker_read_index.subs(subs, simultaneous=True)
+            # xreplace substitutes simultaneously, which is required: a
+            # sequential substitution of {d0: d1, d1: d2} applied to
+            # `d0 + 2*d1` yields `3*d1` instead of `d1 + 2*d2` whenever the
+            # target set overlaps the source set, which a coordinate
+            # permutation (e.g. a transposed tile read) does.
+            composed = self._marker_read_index.xreplace(subs)
             return super().load(self._marker_input_name, composed)
         return super().load(name, index)
 
@@ -934,6 +1119,7 @@ def _inline_marker_into_consumer(
 
     from torch_spyre._inductor.pass_utils import (
         _invalidate_body_caches,
+        invalidate_op_read_writes,
         replace_computed_buffer_body,
     )
 
@@ -960,6 +1146,9 @@ def _inline_marker_into_consumer(
 
         object.__setattr__(consumer_op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(consumer_op.data)
+    # As in redirect_computed_buffer_reads: the replacement starts unmemoized,
+    # but consumer_op already reads through the patched data.
+    invalidate_op_read_writes(consumer_op)
 
     result = replace_computed_buffer_body(
         consumer_op,
@@ -1078,9 +1267,8 @@ def _consume_tile_dim_markers(
     stable across such a reconstruction -- every rebuild-via-
     ``replace_computed_buffer_body`` site in this package (this one
     included) preserves the original name, and other Spyre metadata
-    (``PropagationPlan.outside_consumer_names``, etc.) already keys by name
-    for exactly this reason -- see that field's own docstring on name
-    stability. The returned map is keyed by ``(op.get_name(), dep)`` --
+    (the carry records' storage and update names, etc.) already keys by name
+    for exactly this reason. The returned map is keyed by ``(op.get_name(), dep)`` --
     ``lookup_marker_dim`` (the map's only reader) recomputes ``op.get_name()``
     itself, so callers never need the key's ``str`` half spelled out
     explicitly. For a StarDep-shaped consumer the dep stored is the StarDep
@@ -1098,6 +1286,19 @@ def _consume_tile_dim_markers(
 
     marker_map: dict[tuple[str, Dep], int] = {}
     group_op_ids = {id(op) for op in group_ops}
+
+    # Every marker scans every op's reads, so trace each op once. An entry holds
+    # its op, so the id cannot be reused while the entry lives; a consumer whose
+    # inner_fn is patched in place is evicted below.
+    read_writes_cache: dict[int, tuple[ir.Operation, ReadWrites]] = {}
+
+    def read_writes(op: "ir.Operation") -> ReadWrites:
+        entry = read_writes_cache.get(id(op))
+        if entry is not None and entry[0] is op:
+            return entry[1]
+        rw = op.get_read_writes()
+        read_writes_cache[id(op)] = (op, rw)
+        return rw
 
     for marker_op in list(group_ops):
         dim = _marker_dim(marker_op)
@@ -1118,7 +1319,7 @@ def _consume_tile_dim_markers(
             # or replaced -- see below -- just not during this scan.)
             if candidate is marker_op:
                 continue
-            rw = candidate.get_read_writes()
+            rw = read_writes(candidate)
             for dep in rw.reads:
                 if isinstance(dep, (MemoryDep, StarDep)) and dep.name == marker_name:
                     consumers.append((candidate, dep))
@@ -1166,9 +1367,7 @@ def _consume_tile_dim_markers(
         # tile_dim_marker op has exactly one MemoryDep read (the tile it
         # marks).
         marker_reads = [
-            dep
-            for dep in marker_op.get_read_writes().reads
-            if isinstance(dep, MemoryDep)
+            dep for dep in read_writes(marker_op).reads if isinstance(dep, MemoryDep)
         ]
         if len(marker_reads) != 1:
             raise AssertionError(
@@ -1207,12 +1406,14 @@ def _consume_tile_dim_markers(
                 # not exactly one in total.
                 pre_inline_reads = [
                     d
-                    for d in consumer_op.get_read_writes().reads
+                    for d in read_writes(consumer_op).reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
                 new_consumer, _marker_axis_consumed = _inline_marker_into_consumer(
                     consumer_op, marker_op, operations
                 )
+                # Its inner_fn now reads through the inlined marker.
+                read_writes_cache.pop(id(consumer_op), None)
                 # _inline_marker_into_consumer swaps `operations[op_idx]` in
                 # place but returns a new object whose reads no longer include
                 # `consumer_dep` at all -- the marker's own inner_fn (its
@@ -1228,7 +1429,7 @@ def _consume_tile_dim_markers(
                 # new_consumer's reads again).
                 new_reads = [
                     d
-                    for d in new_consumer.get_read_writes().reads
+                    for d in read_writes(new_consumer).reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
                 brand_new_reads = [d for d in new_reads if d not in pre_inline_reads]
@@ -1286,6 +1487,9 @@ def _consume_tile_dim_markers(
                 # no-op for any reference that already points at marker_op by
                 # identity, and safely repoints any reference that doesn't.
                 _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
+                # Edited in place; its read names do not change, but evict it
+                # anyway so no later scan relies on that.
+                read_writes_cache.pop(id(consumer_op), None)
                 new_consumer = consumer_op
                 # No object reconstruction happened (unlike the ComputedBuffer
                 # branch) -- consumer_op's own identity is unchanged, and its
@@ -1402,7 +1606,7 @@ def lookup_marker_dim(
     ExternKernelOut -- see _consume_tile_dim_markers). StarDep has no
     .index/.ranges (.index raises NotImplementedError) and no coordinate
     space to resolve a position in at all -- but this is moot, not a gap:
-    plan_coarse_tile_groups (coarse_tile.py, this function's only real
+    build_loop_tiling_plan (loop_tiling_lowering.py, this function's only real
     caller path) already skips every non-ComputedBuffer op before ever
     calling _hint_ranges_pos, and every StarDep-shaped consumer
     (ExternKernelOut and the rest of the InputsKernel family) has no
@@ -1423,15 +1627,18 @@ def lookup_marker_dim(
     from torch._inductor.ir import Reduction
     from torch._inductor.virtualized import V
 
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.pass_utils import op_out_coords
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _loop_var_to_ranges_pos,
-        op_out_coords,
         reduction_loop_vars,
     )
 
     rw = op.get_read_writes()
     op_name = op.get_name()
-    marker_map = _MARKER_MAPS.get(id(V.graph.operations))
+    # During a pass run against loop_node.OpsView, V.graph.operations is the
+    # view; the map is keyed by the real list it wraps.
+    operations = V.graph.operations
+    marker_map = _MARKER_MAPS.get(id(getattr(operations, "real", operations)))
     if marker_map is not None:
         for dep in rw.reads:
             if not isinstance(dep, Dep):
@@ -1518,10 +1725,8 @@ def _stamp_direct_loop_info(
     inference is unnecessary and unsafe -- one
     level's committed metadata (e.g. tiled_dims_per_read computed against a
     provisional buffer name) can go stale once a later-spliced nested level
-    renames or rewires the buffers it depended on. propagation is never
-    produced -- every CoarseTileInfo built here leaves it None -- because
-    PropagationPlan has zero consumers outside coarse_tile.py's own Pass
-    2/3, which while_loop groups skip entirely.
+    renames or rewires the buffers it depended on. no
+    per-group propagation record is produced for a while_loop group.
 
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
@@ -1559,9 +1764,9 @@ def _stamp_direct_loop_info(
     index carries a nonzero coefficient on loop_var that neither
     _extent_at_pos nor _structural_resolve could attribute to one of this
     op's own tiled dims (e.g. a point-shaped or already-resolved-elsewhere
-    read/write) -- mirroring coarse_tile.py's own
-    _point_splice_advance_for_dep, which records the identical
-    (coefficient, 1) shape for its own splice-only advances. This is
+    read/write) -- the same
+    (coefficient, 1) shape the span-overflow lowering derives from the index for a
+    splice-only advance. This is
     stamped explicitly here, at ground-truth time, specifically so
     SpyreKernel._general_tile_advance never needs to re-derive whether a
     splice symbol merely appearing in dep.index implies a real per-trip
@@ -1595,9 +1800,9 @@ def _stamp_direct_loop_info(
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.propagate_hints import DimHint
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.pass_utils import op_out_coords
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _loop_var_to_ranges_pos,
-        op_out_coords,
         reduction_loop_vars,
     )
 
@@ -1863,9 +2068,8 @@ def _stamp_direct_loop_info(
                     # nothing to record here), or -- the case this branch
                     # exists for -- a point-shaped or otherwise dim-less
                     # dependency where loop_var is the SOLE source of the
-                    # per-trip address step (mirrors coarse_tile.py's
-                    # _point_splice_advance_for_dep, which records the
-                    # identical shape for its own splice-only advances).
+                    # per-trip address step (the span-overflow
+                    # lowering reads the same shape off the index).
                     # Stamp that coefficient explicitly into
                     # squeezed_advance_per_read/output rather than leaving
                     # it for SpyreKernel._general_tile_advance to re-derive
@@ -2216,7 +2420,9 @@ class _IdentityChainLoadHandler(WrapperHandler):
                     parameter_symbols.update(sympy.sympify(expr).free_symbols)
                 iteration_symbols = local_index.free_symbols - parameter_symbols
             local_constant = sympy.simplify(
-                local_index.subs({symbol: sympy.S.Zero for symbol in iteration_symbols})
+                local_index.xreplace(
+                    {symbol: sympy.S.Zero for symbol in iteration_symbols}
+                )
             )
             if local_constant != 0:
                 # A flat offset in the identity's output layout cannot in
@@ -2392,6 +2598,24 @@ def _prune_unsafe_identity_selections(
             selected.pop(name, None)
 
 
+def _is_declared_carry_update(op: Any) -> bool:
+    """True for an op that is the update of a declared loop carry.
+
+    Until ``apply_loop_carries`` puts it in place, a carry update has a plain
+    ``FixedLayout``; before that pass existed it carried the mutation layout
+    from the splice on, and so no contraction pass below could pick it up. These
+    passes must still leave it alone: they remove or shrink ops, and the update
+    has to keep its full size and name for the pass that writes it in place.
+
+    No known graph reaches this check: it restores the earlier behaviour (a
+    carry update was never a candidate) and has no test that depends on it.
+    """
+    from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.update_name == op.get_name()
+
+
 def _contract_cross_scope_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2417,8 +2641,7 @@ def _contract_cross_scope_input_materializations(
         ReadCopyElisionRecord,
     )
     from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
-    from torch_spyre._inductor.wsr.coarse_tile import (
-        _LoopVarRebaseHandler,
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _rescale_index,
     )
 
@@ -2632,8 +2855,10 @@ def _contract_cross_scope_input_materializations(
             transforms = {}
             for name in chain_names:
                 op = graph.try_get_buffer(name)
-                if not isinstance(op, ir.ComputedBuffer) or not isinstance(
-                    op.layout, FixedLayout
+                if (
+                    not isinstance(op, ir.ComputedBuffer)
+                    or not isinstance(op.layout, FixedLayout)
+                    or _is_declared_carry_update(op)
                 ):
                     valid_chain = False
                     break
@@ -2643,7 +2868,7 @@ def _contract_cross_scope_input_materializations(
                     for index in identity_indices
                 ]
                 source_base = sympy.simplify(
-                    source_index.subs(
+                    source_index.xreplace(
                         {index: sympy.S.Zero for index in identity_indices}
                     )
                 )
@@ -2750,27 +2975,11 @@ def _contract_cross_scope_input_materializations(
                 # and the post-layout proof requires a nonzero loop advance.
                 continue
 
-            loop_var_zeros = {
-                loop_var: sympy.S.Zero for loop_var, _trip_count in loop_specs
-            }
-
-            def fallback_inner(
-                *args,
-                _inner=composed_inner,
-                _target=root_name,
-                _zeros=loop_var_zeros,
-            ):
-                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
-                    return _inner(*args)
-
-            def direct_inner(
-                *args,
-                _inner=direct_composed_inner,
-                _target=source_name,
-                _zeros=loop_var_zeros,
-            ):
-                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
-                    return _inner(*args)
+            # The loop term stays in these reads' indexes (stage 7.2b): the consumer
+            # lists the loop variable in its dim_hints, so per_trip_index pins it in
+            # the base coordinates and the step comes from the index.
+            fallback_inner = composed_inner
+            direct_inner = direct_composed_inner
 
             fallback_tiled, fallback_squeezed = fallback_metadata
             tiled_per_read = copy.deepcopy(final_info.tiled_dims_per_read)
@@ -2825,6 +3034,54 @@ def _contract_cross_scope_input_materializations(
             return
 
 
+def _split_loop_term(
+    source_index: sympy.Expr,
+    loop_vars: "set[sympy.Symbol]",
+) -> "tuple[sympy.Expr, sympy.Expr] | None":
+    """Split a staged copy's source index into (loop term, index without it).
+
+    The loop term is the part that depends on the loop variables ``loop_vars`` (and
+    only those): the direct read that replaces the copy adds it back to its own
+    source load. Returns ``None`` when the index is not of that shape, so the caller
+    keeps the staged copy:
+
+    * a symbol other than the copy's own iteration variables and the loop
+      variables (an indirect or unbacked symbol) stays in the index, so the
+      caller's pure-identity check fails on it as it did before the term was
+      carried in the index;
+    * the loop term must not contain the copy's own iteration variables (a cross
+      term such as ``c*i*u``): they do not exist in the consumer's frame, so adding
+      such a term there would be wrong code.
+    """
+    present = {s for s in source_index.free_symbols if s in loop_vars}
+    rest = sympy.simplify(source_index.xreplace({s: sympy.S.Zero for s in present}))
+    loop_term = sympy.simplify(source_index - rest)
+    # Anything in the loop term that is not a loop variable is refused: the copy's
+    # own iteration variables (a cross term c*i*u) and any other symbol alike.
+    if loop_term.free_symbols - loop_vars:
+        return None
+    return loop_term, rest
+
+
+class _ReadsCache:
+    """``op.get_read_writes().reads`` traced once per op for one scan window.
+
+    Unlike ``op_read_writes``, nothing is stored on the op: a cache lives only as
+    long as its caller can show that no op it covers is edited. Ops are keyed by
+    identity and held, so a rebuilt op is a miss and an id is never reused.
+    """
+
+    def __init__(self) -> None:
+        self._reads: dict[int, tuple[Any, Any]] = {}
+
+    def __call__(self, op: Any) -> Any:
+        entry = self._reads.get(id(op))
+        if entry is None:
+            entry = (op, op.get_read_writes().reads)
+            self._reads[id(op)] = entry
+        return entry[1]
+
+
 def _contract_exact_stride_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2851,13 +3108,12 @@ def _contract_exact_stride_input_materializations(
     from torch._inductor.ir import FixedLayout
 
     from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
-    from torch_spyre._inductor.wsr.coarse_tile import (
-        _LoopVarRebaseHandler,
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
+        _AddLoopTermHandler,
         _NameSwapHandler,
         _divide_ranges,
         _loop_var_hinted_ranges,
         _patch_retiled_load_indexes,
-        _splice_loop_vars,
     )
 
     _contract_cross_scope_input_materializations(graph, pending_levels)
@@ -2877,6 +3133,12 @@ def _contract_exact_stride_input_materializations(
         }
         if not identities:
             continue
+
+        # The consumer scan and the readers_by_source scan below trace the same
+        # ops, and nothing edits an op until the selected links are divided.
+        # Trace each op once for both; the divide and retile steps that follow
+        # change indexes, so they re-trace.
+        level_reads = _ReadsCache()
 
         # Every op carrying this level records its absolute group index in the
         # corresponding loop_group_id slot.  Different top-level HOPs can have
@@ -2904,11 +3166,7 @@ def _contract_exact_stride_input_materializations(
             consumer_info = getattr(consumer, "loop_info", None)
             if consumer_level is None or consumer_info is None:
                 continue
-            reads = [
-                dep
-                for dep in consumer.get_read_writes().reads
-                if isinstance(dep, MemoryDep)
-            ]
+            reads = [dep for dep in level_reads(consumer) if isinstance(dep, MemoryDep)]
             for dep_idx, dep in enumerate(reads):
                 producer = graph.try_get_buffer(dep.name)
                 if dep.name not in identities or not isinstance(
@@ -2937,6 +3195,7 @@ def _contract_exact_stride_input_materializations(
                     not has_level_advance
                     or coefficient == 0
                     or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(producer)
                 ):
                     continue
                 axes = [
@@ -3002,8 +3261,11 @@ def _contract_exact_stride_input_materializations(
                 source_axis = selected[source_name][0]
                 source_layout = getattr(source, "layout", None)
                 layout = getattr(op, "layout", None)
-                if not isinstance(source_layout, FixedLayout) or not isinstance(
-                    layout, FixedLayout
+                if (
+                    not isinstance(source_layout, FixedLayout)
+                    or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(op)
+                    or _is_declared_carry_update(source)
                 ):
                     continue
                 source_stride = source_layout.stride[source_axis]
@@ -3044,7 +3306,7 @@ def _contract_exact_stride_input_materializations(
 
         readers_by_source: dict[str, set[tuple[str, object]]] = {}
         for reader in operations:
-            for dep in reader.get_read_writes().reads:
+            for dep in level_reads(reader):
                 dependency_name = getattr(dep, "name", None)
                 if dependency_name in selected:
                     readers_by_source.setdefault(dependency_name, set()).add(
@@ -3117,6 +3379,22 @@ def _contract_exact_stride_input_materializations(
                     producer_info,
                     squeezed_advance_per_read=squeezed,
                 )
+                # The source read carries the step in its index too: ``source_step`` times
+                # the loop variable. Bound as defaults, because the wrapped inner_fn runs
+                # later, after this loop has moved on to the next producer.
+                _orig_inner = producer.data.inner_fn
+
+                def _inner_with_loop_term(
+                    *args,
+                    _o=_orig_inner,
+                    _src=identities[name][0],
+                    _term=source_step * loop_var,
+                ):
+                    with V.set_ops_handler(_AddLoopTermHandler(V.ops, _src, _term)):
+                        return _o(*args)
+
+                object.__setattr__(producer.data, "inner_fn", _inner_with_loop_term)
+                invalidate_op_read_writes(producer)
 
         if not contracted_level_names:
             continue
@@ -3171,14 +3449,25 @@ def _contract_exact_stride_input_materializations(
         for op in operations
         if (identity := identity_load(op)) is not None
     }
+    # Each root scans every op's reads. The loop only attaches
+    # _read_copy_elision_record, which no trace reads, so trace each op once.
+    final_reads = _ReadsCache()
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)
         identity = identities.get(copy_name)
         if not isinstance(copy_op, ir.ComputedBuffer) or identity is None:
             continue
         source_name, source_index, identity_indices = identity
+        # The staged copy's source read carries the loop term in its index (stage
+        # 7.2b). The shape check below is about the copy's own iteration variables,
+        # so set the loop term apart: it is what the direct read adds back to its
+        # source load, read from the copy's index and not from the record.
+        split = _split_loop_term(source_index, {lv for lv, *_ in pending_levels})
+        if split is None:
+            continue
+        loop_term, source_index = split
         source_base = sympy.simplify(
-            source_index.subs({index: sympy.S.Zero for index in identity_indices})
+            source_index.xreplace({index: sympy.S.Zero for index in identity_indices})
         )
         source_strides = [
             sympy.simplify(source_index.coeff(index)) for index in identity_indices
@@ -3203,7 +3492,7 @@ def _contract_exact_stride_input_materializations(
                 continue
             matching_reads = [
                 dep
-                for dep in op.get_read_writes().reads
+                for dep in final_reads(op)
                 if isinstance(dep, MemoryDep) and dep.name == copy_name
             ]
             if matching_reads:
@@ -3227,7 +3516,7 @@ def _contract_exact_stride_input_materializations(
         # offset.  A nonzero one would need coordinate decomposition rather
         # than stride substitution, so retain the staging fallback for it.
         copy_offset = sympy.simplify(
-            copy_dep.index.subs(
+            copy_dep.index.xreplace(
                 {symbol: sympy.S.Zero for symbol in copy_dep.index.free_symbols}
             )
         )
@@ -3235,30 +3524,25 @@ def _contract_exact_stride_input_materializations(
             continue
 
         copy_info = getattr(copy_op, "loop_info", None)
-        copy_reads = [
-            dep for dep in copy_op.get_read_writes().reads if isinstance(dep, MemoryDep)
-        ]
+        copy_reads = [dep for dep in final_reads(copy_op) if isinstance(dep, MemoryDep)]
         if copy_info is None or len(copy_reads) != 1:
             continue
         full_strides = list(copy_op.layout.stride)
         name_map = {copy_name: (source_name, full_strides, source_strides)}
-        loop_var_zeros = {
-            symbol: sympy.S.Zero for symbol in _splice_loop_vars(consumer)
-        }
         consumer_inner = consumer.data.inner_fn
 
         def direct_inner_fn(
             *args,
             _inner=consumer_inner,
             _map=name_map,
-            _source_name=source_name,
-            _loop_var_zeros=loop_var_zeros,
+            _loop_terms={copy_name: loop_term},
         ):
-            with V.set_ops_handler(
-                _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
-            ):
-                with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
-                    return _inner(*args)
+            # The swapped-in read keeps the staged copy's loop term in its index
+            # (stage 7.2b): the consumer's dim_hints list the loop variable, so
+            # per_trip_index pins it in the base coordinates, and the step comes
+            # from the index. Only the loads that were swapped get the term.
+            with V.set_ops_handler(_NameSwapHandler(V.ops, _map, _loop_terms)):
+                return _inner(*args)
 
         direct_tiled = copy_info.tiled_dims_per_read[0]
         direct_squeezed = (
@@ -3353,7 +3637,6 @@ def splice_while_loops(graph) -> None:
     from torch._inductor import ir
 
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.wsr.coarse_tile import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
@@ -3478,20 +3761,7 @@ def splice_while_loops(graph) -> None:
     # the complete K/V cache on each trip.
     _contract_exact_stride_input_materializations(graph, pending_levels)
 
-    # Read-side counterpart of the stamping above: _stamp_direct_loop_info
-    # records a point-shaped splice read's per-trip step in
-    # squeezed_advance_per_read (mirroring coarse_tile.py's own
-    # _point_splice_advance_for_dep -- see that function's docstring), but
-    # leaves the read's index itself unrebased (e.g. paged attention's
-    # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
-    # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
-    # splice groups never go through it -- see this function's own docstring.
-    # Without this call the raw indirect symbol survives into
-    # propagate_spyre_tensor_layouts, which rejects it (not an
-    # iteration_space key). Run once, after every level's stamping has been
-    # merged in above, so squeezed_advance_per_read reflects each op's final,
-    # fully-merged state rather than a partially-stamped intermediate.
-    _rebase_point_splice_reads(graph.operations)
+    # A point read keeps its loop term in the index (not rebased to iteration 0).
 
     if pending_levels:
         # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
@@ -3510,3 +3780,21 @@ def splice_while_loops(graph) -> None:
                 )
         else:
             logger.info("SPLICE_WHILE_LOOPS: no while_loops spliced")
+
+    # Final step: wrap each spliced loop's ops into a LoopNode (nested per
+    # level), so every later pass sees the loop as one structural unit. Built
+    # here, after the stamp phase, because only then does every op of every
+    # level exist and carry its complete loop_group_id (see the docstring).
+    # The loop variable of each level is the body's own counter symbol that
+    # the stamp phase consumed; the node keeps it. Later passes run against
+    # loop_node.OpsView and the nodes are expanded again before scheduling.
+    if pending_levels:
+        from torch_spyre._inductor.loop_node import collapse
+
+        collapse(
+            graph,
+            inductions={
+                level_group_idx: loop_var
+                for loop_var, _trip, level_group_idx, _names in pending_levels
+            },
+        )

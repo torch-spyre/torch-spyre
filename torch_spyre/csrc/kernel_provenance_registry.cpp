@@ -62,6 +62,19 @@ RegistryState& registryState() {
   return state;
 }
 
+// name-base → sdsc_bundle_dir_prefix registry, populated unconditionally
+// at prepare_kernel time so the activity handler can emit
+// sdsc_bundle_dir_prefix even when no provenance key is present on the event.
+struct BundleDirPrefixRegistry {
+  std::shared_mutex mutex;
+  std::unordered_map<std::string, std::string> entries;
+};
+
+BundleDirPrefixRegistry& bundleDirPrefixRegistry() {
+  static BundleDirPrefixRegistry state;
+  return state;
+}
+
 }  // namespace
 
 std::optional<std::string> extractKernelProvenanceKey(
@@ -109,6 +122,49 @@ std::optional<std::string> extractKernelProvenanceKey(
     }
   }
   return std::string(key);
+}
+
+std::string activityNameBase(const std::string& activity_name) {
+  const size_t sep = activity_name.rfind('#');
+  if (sep == std::string::npos) {
+    return activity_name;
+  }
+  // Only strip the suffix if what follows '#' is all decimal digits.
+  for (size_t i = sep + 1; i < activity_name.size(); ++i) {
+    if (!isDecimalCharacter(activity_name[i])) {
+      return activity_name;
+    }
+  }
+  return activity_name.substr(0, sep);
+}
+
+void registerBundleDirPrefix(const std::string& name_base,
+                             std::string sdsc_bundle_dir_prefix) {
+  auto& reg = bundleDirPrefixRegistry();
+  std::unique_lock<std::shared_mutex> lock(reg.mutex);
+  // Last registration wins i.e. an event resolves to the most recently prepared
+  // runner. The lookup happens when the trace is drained not when the kernel
+  // launches therefore launches from an earlier runner with the same name base
+  // (e.g. the same specs recompiled with caching off after dynamo.reset())
+  // resolve to the later runner's bundle directory. The bundles are expected
+  // to be identical but the event to directory match is not one-to-one in
+  // that case.
+  const auto it = reg.entries.find(name_base);
+  if (it != reg.entries.end() && it->second != sdsc_bundle_dir_prefix) {
+    TORCH_WARN_ONCE("Spyre sdsc_bundle_dir_prefix for event name base '",
+                    name_base, "' changed from '", it->second, "' to '",
+                    sdsc_bundle_dir_prefix,
+                    "'. Earlier launches of this event will report the new "
+                    "prefix in the profiler trace.");
+  }
+  reg.entries.insert_or_assign(name_base, std::move(sdsc_bundle_dir_prefix));
+}
+
+std::string lookupBundleDirPrefix(const std::string& name_base) {
+  auto& reg = bundleDirPrefixRegistry();
+  std::shared_lock<std::shared_mutex> lock(reg.mutex);
+  const auto it = reg.entries.find(name_base);
+  return it != reg.entries.end() ? it->second : std::string{};
 }
 
 bool registerKernelProvenance(const std::string& event_base_name,

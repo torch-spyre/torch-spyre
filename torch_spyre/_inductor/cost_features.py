@@ -14,8 +14,10 @@
 
 """Extract cost features without printing reports or recording dump state."""
 
+import contextlib
+import contextvars
 import math
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Sequence, TypeVar
 
 import sympy
 from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
@@ -33,11 +35,78 @@ from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
     apply_splits_from_index_coeff,
+    device_coordinates,
     iteration_space_from_op,
     loop_var_ranges_from_dim_hints,
+    op_read_writes,
+    trip_count_estimate,
 )
 
 logger = get_logger("cost_model")
+
+_T = TypeVar("_T")
+
+# A memo for the work-division-independent parts of feature extraction, live
+# only inside :func:`feature_memo`. Off by default, so every other caller
+# recomputes as before.
+_FEATURE_MEMO: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "_spyre_feature_memo", default=None
+)
+
+
+@contextlib.contextmanager
+def feature_memo() -> Iterator[None]:
+    """Reuse what feature extraction derives from an op's reads alone (device
+    coordinates, a read's contiguous axes) across the calls made inside.
+
+    For a caller that extracts the same op's features under many candidate
+    work divisions while nothing mutates the graph -- the relayout shortlist
+    pricing one consumer across its divisions. Only the parts that do not
+    depend on the division are reused, so every result is what an unscoped call
+    returns. A nested scope shares the outer one.
+
+    An op's reads need no scope: ``op_read_writes`` memoizes them for every
+    caller, the post-pass cost report included, under its own contract (an
+    in-place edit of an op's reads must call ``invalidate_op_read_writes``).
+    """
+    if _FEATURE_MEMO.get() is not None:
+        yield
+        return
+    token = _FEATURE_MEMO.set({})
+    try:
+        yield
+    finally:
+        _FEATURE_MEMO.reset(token)
+
+
+def _memoized(key: tuple, compute: Callable[[], _T]) -> _T:
+    """``compute()``, reused under ``key`` inside :func:`feature_memo`."""
+    memo = _FEATURE_MEMO.get()
+    if memo is None:
+        return compute()
+    if key not in memo:
+        memo[key] = compute()
+    return memo[key]
+
+
+def _read_device_coordinates(src, read, op):
+    """``device_coordinates(src, read, None, op=op)``, reused inside
+    :func:`feature_memo`: a function of the op and the read (``src`` is the
+    read buffer's layout, fixed while nothing mutates the graph).
+
+    ``compute_coordinates`` has a memo of its own, but it declines a symbolic
+    range or a dynamic size, and it sits below the index concretization and
+    the stick-expression check that every call here would repeat."""
+    # Outside a scope, exactly the plain call: the key needs the op's name,
+    # which only a scoped caller (the allocator, over real ops) promises.
+    if _FEATURE_MEMO.get() is None:
+        return device_coordinates(src, read, None, op=op)
+    return list(
+        _memoized(
+            ("device_coordinates", op.get_name(), read),
+            lambda: tuple(device_coordinates(src, read, None, op=op)),
+        )
+    )
 
 
 def _int(x, default: int = 1) -> int:
@@ -86,7 +155,7 @@ def _resolved_work_slices(op, work_slices=None) -> dict:
     """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
     the explicit candidate during LX planning, else the committed ownership."""
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -200,7 +269,7 @@ def _loop_features(op):
         return 1, False, False
     trip = 1
     for c in getattr(li, "loop_count", None) or []:
-        trip *= _int(c, 1)
+        trip *= trip_count_estimate(c)
     red_dims = getattr(li, "loop_tiled_reduction_dims", None) or []
     out_dims = getattr(li, "loop_tiled_dims", None) or []
     return (
@@ -272,7 +341,7 @@ def _tiled_symbols_per_level(op):
             p = red_map.get(_int(h, -1))
             if p is not None and p < len(it_syms):
                 syms.add(it_syms[p])
-        trip = max(1, _int(counts[lv], 1) if lv < len(counts) else 1)
+        trip = trip_count_estimate(counts[lv]) if lv < len(counts) else 1
         # ``declared`` is kept separate from ``syms`` so the two ways a level can end up
         # with no symbols are not conflated: an op that tiles NOTHING at this level
         # (declared == 0) is loop-invariant there and every arg repeats, whereas a level
@@ -447,7 +516,7 @@ def _candidate_tiling(op, tiling: Mapping):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )
-    write_index = next(iter(op.get_read_writes().writes)).index
+    write_index = next(iter(op_read_writes(op).writes)).index
     out_syms = write_index.free_symbols
     out_counts = [count for sym, count in tiling.items() if sym in out_syms]
     red_counts = [count for sym, count in tiling.items() if sym not in out_syms]
@@ -490,7 +559,7 @@ def _row_split(op, default: int, work_slices=None) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -512,6 +581,47 @@ def _contiguous_device_run(
     coords, dims, iteration_space, work_slices, *, stick_planes=False
 ):
     """Elements in a core's contiguous input run, or None if not provable.
+
+    The access's affine axes do not depend on the work division, only the run
+    does, so the axes are derived once per access inside :func:`feature_memo`
+    (:func:`_device_run_axes`).
+    """
+    found = _memoized(
+        (
+            "device_run_axes",
+            tuple(coords),
+            tuple(dims),
+            tuple(iteration_space.items()),
+            stick_planes,
+        ),
+        lambda: _device_run_axes(coords, dims, iteration_space, stick_planes),
+    )
+    if found is None:
+        return None
+    axes, renames = found
+    work_slices = dict(work_slices)
+    for symbol, plane in renames:
+        work_slices[plane] = work_slices.pop(symbol, 1)
+    run, extent = sympy.Integer(1), 1
+    inner_whole = sympy.true
+    for stride, symbol, size in axes:
+        if stride != extent:
+            break
+        split = work_slices.get(symbol, 1)
+        # Once an inner dimension is split, outer axes introduce gaps.
+        run = sympy.Piecewise(
+            (sympy.Integer(extent) * size / split, inner_whole), (run, True)
+        )
+        inner_whole = sympy.And(inner_whole, sympy.Eq(split, 1))
+        extent *= size
+    return run
+
+
+def _device_run_axes(coords, dims, iteration_space, stick_planes):
+    """The affine axes of a device access, innermost first, as ``(stride,
+    symbol, size)``, and the ``(dim, stick plane)`` symbol renames the work
+    slices need; ``None`` if the access is not provably affine with a
+    stride-one axis.
 
     Flatten the *device* access, not the host index. Adjacent stick-plane and
     stick coordinates cancel back into an affine index; a real transpose within
@@ -537,7 +647,7 @@ def _contiguous_device_run(
     # its stick still walks as two affine axes; a core's share of d is whole
     # sticks (deeptools rejects a partial-stick split), so the split lands on q.
     space = dict(iteration_space)
-    slices = dict(work_slices)
+    renames = []
     for symbol, size in iteration_space.items() if stick_planes else ():
         floors = {
             f.args[0] * symbol**-1
@@ -559,16 +669,16 @@ def _contiguous_device_run(
             sympy.Mod(symbol, stick), r
         )
         if symbol in index.free_symbols:
-            index = index.subs(symbol, stick * q + r)
+            index = index.xreplace({symbol: stick * q + r})
         position = list(space)
         at = position.index(symbol)
         items = list(space.items())
         space = dict(items[:at] + [(q, size // stick), (r, stick)] + items[at + 1 :])
-        slices[q] = slices.pop(symbol, 1)
+        renames.append((symbol, q))
     index = sympy.expand(
         index.replace(sympy.Mod, lambda a, b: a - b * sympy.floor(a / b))
     )
-    iteration_space, work_slices = space, slices
+    iteration_space = space
     axes = []
     remainder = index
     for symbol, size in iteration_space.items():
@@ -594,19 +704,7 @@ def _contiguous_device_run(
     axes.sort(key=lambda a: a[0])
     if not axes or axes[0][0] != 1:
         return None
-    run, extent = sympy.Integer(1), 1
-    inner_whole = sympy.true
-    for stride, symbol, size in axes:
-        if stride != extent:
-            break
-        split = work_slices.get(symbol, 1)
-        # Once an inner dimension is split, outer axes introduce gaps.
-        run = sympy.Piecewise(
-            (sympy.Integer(extent) * size / split, inner_whole), (run, True)
-        )
-        inner_whole = sympy.And(inner_whole, sympy.Eq(split, 1))
-        extent *= size
-    return run
+    return tuple(axes), tuple(renames)
 
 
 def _transport_read_geometry(op, work_slices=None):
@@ -620,15 +718,13 @@ def _transport_read_geometry(op, work_slices=None):
         from torch._inductor.virtualized import V
         from torch_spyre._C import DataFormats
 
-        from .pass_utils import device_coordinates
-
         if (
             work_slices is None
             and getattr(op, "iteration_space_ownership", None) is None
             and not getattr(op, "op_it_space_splits", None)
         ):
             return None, None
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         if len(rw.reads) != 1 or len(rw.writes) != 1:
             return None, None
         read, write = next(iter(rw.reads)), next(iter(rw.writes))
@@ -637,7 +733,7 @@ def _transport_read_geometry(op, work_slices=None):
         if any(dl.device_dtype != DataFormats.SEN169_FP16 for dl in (src, dst)):
             return None, None
         it_space = iteration_space_from_op(op)
-        src_coords = device_coordinates(src, read, None, op=op)
+        src_coords = _read_device_coordinates(src, read, op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
         run = _contiguous_device_run(src_coords, src.device_size, it_space, slices)
         if run is None:
@@ -713,7 +809,7 @@ def _split_stick_axes(coords, iteration_space, work_slices, candidates):
         coords = [
             c.xreplace(
                 {sympy.floor(symbol / stick): hi, sympy.Mod(symbol, stick): lo}
-            ).subs(symbol, stick * hi + lo)
+            ).xreplace({symbol: stick * hi + lo})
             for c in coords
         ]
         space[hi], space[lo] = planes, stick
@@ -732,8 +828,8 @@ def _operand_device_run(coords, dims, iteration_space, work_slices, candidates):
     product of the remaining symbols' extents.
     """
     present = set().union(*(sympy.sympify(c).free_symbols for c in coords))
-    unit = {s: 0 for s, size in iteration_space.items() if size == 1}
-    coords = [sympy.sympify(c).subs(unit) if unit else c for c in coords]
+    unit = {s: sympy.S.Zero for s, size in iteration_space.items() if size == 1}
+    coords = [sympy.sympify(c).xreplace(unit) if unit else c for c in coords]
     space = {
         s: size for s, size in iteration_space.items() if s in present and s not in unit
     }
@@ -763,8 +859,6 @@ def _operand_read_geometry(op, dep, work_slices, candidate_work_slices=None):
         from torch._inductor.virtualized import V
         from torch_spyre._C import DataFormats
 
-        from .pass_utils import device_coordinates
-
         if (
             work_slices is None
             and getattr(op, "iteration_space_ownership", None) is None
@@ -779,7 +873,7 @@ def _operand_read_geometry(op, dep, work_slices, candidate_work_slices=None):
         it_space = iteration_space_from_op(op)
         slices = _resolved_work_slices(op, work_slices)
         found = _operand_device_run(
-            device_coordinates(src, dep, None, op=op),
+            _read_device_coordinates(src, dep, op),
             src.device_size,
             it_space,
             slices,
@@ -807,13 +901,11 @@ def _read_run_bytes(op, read, work_slices=None):
     try:
         from torch._inductor.virtualized import V
 
-        from .pass_utils import device_coordinates
-
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write = next(iter(rw.writes))
         src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
         it_space = iteration_space_from_op(op)
-        coords = device_coordinates(src, read, None, op=op)
+        coords = _read_device_coordinates(src, read, op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
         run = _contiguous_device_run(
             coords, src.device_size, it_space, slices, stick_planes=True
@@ -882,7 +974,7 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -956,7 +1048,7 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
     "" -> ordinary contiguous access; the default bw_peak + turnaround applies.
     """
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         it_space = iteration_space_from_op(op)
 
@@ -1149,8 +1241,7 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
-    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
-    records.
+    the graph returns.
 
     ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
     "interior write", and unlike the input side an output arg has no naming-convention
@@ -1230,7 +1321,7 @@ def _indirect_write_elems(op, out_elems: int) -> int | None:
     try:
         if not isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
             return None
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         writes = list(rw.writes)
         if len(writes) != 1 or not writes[0].is_indirect():
             return None
@@ -1385,7 +1476,7 @@ def extract_op_features(
     _li = getattr(op, "loop_info", None)
     _rw = None
     try:
-        _rw = op.get_read_writes()
+        _rw = op_read_writes(op)
         _write_index = next(iter(_rw.writes)).index
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
@@ -1536,7 +1627,7 @@ def extract_op_features(
     # No dependencies change during feature extraction. Reuse the output snapshot,
     # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = (_rw if _rw is not None else op.get_read_writes()).reads
+        reads = (_rw if _rw is not None else op_read_writes(op)).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)

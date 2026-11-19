@@ -164,7 +164,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
@@ -340,14 +339,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="exp3du_x")
@@ -361,14 +352,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="exp4du_x")
@@ -516,7 +499,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -529,14 +511,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="imp3du_x")
@@ -549,14 +523,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="imp4du_x")
@@ -766,6 +732,52 @@ class TestImplicitPromotion(unittest.TestCase):
             return a + scalar_fp32
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_fp16_with_0dim_fp32_tensor_keeps_fp16(self):
+        """fp16 tensor (op) 0-dim fp32 tensor gives eager's dtype and values (#6061).
+
+        Torch keeps the result fp16 because a 0-dim tensor does not promote a
+        dimensioned one of the same category. The lowerings used to broadcast
+        first and return fp32, which was also read back permuted (#4393).
+        ``compare_with_cpu`` does not check dtype, so it is checked here.
+        """
+        ops = {
+            "add": torch.add,
+            "sub": torch.sub,
+            "mul": torch.mul,
+            "div": torch.div,
+            "floor_divide": torch.floor_divide,
+            "maximum": torch.maximum,
+            "minimum": torch.minimum,
+            "eq": torch.eq,
+            "ne": torch.ne,
+            "lt": torch.lt,
+            "le": torch.le,
+            "gt": torch.gt,
+            "ge": torch.ge,
+        }
+        # Whole numbers >= 1: exact in fp16 and never zero, so division is safe
+        # in either operand order and comparisons have no rounding edge cases.
+        x = (torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)) + 1).to(
+            torch.float16
+        )
+        s = torch.tensor(3.0, dtype=torch.float32)
+        for name, op in ops.items():
+            for order in ("tensor_first", "scalar_first"):
+
+                def fn(a, b, op=op, order=order):
+                    return op(a, b) if order == "tensor_first" else op(b, a)
+
+                expected = fn(x, s)
+                for mode in ("compiled", "eager"):
+                    with self.subTest(op=name, order=order, mode=mode):
+                        run = torch.compile(fn) if mode == "compiled" else fn
+                        got = run(x.to("spyre"), s.to("spyre")).cpu()
+                        self.assertEqual(got.dtype, expected.dtype)
+                        # Device fp16 division can be 1 ulp off; every other op is
+                        # exact. A permuted readback would be off by whole numbers.
+                        tol = 1e-2 if name == "div" else 0
+                        torch.testing.assert_close(got, expected, atol=tol, rtol=tol)
 
 
 class TestDataTransfer(unittest.TestCase):

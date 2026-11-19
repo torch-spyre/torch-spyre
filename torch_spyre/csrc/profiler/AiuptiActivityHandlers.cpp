@@ -280,6 +280,43 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
+
+    // ResponseWorker CBIDS (79-82)
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+
+    // CBIDS 83 to 84 are reserved
+    // P2P RDMA CBIDS (85 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
+
+    // Scheduler submit/barrier CBIDS (102-105)
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+      return "aiuSubmitDMA";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
+      return "aiuSubmitCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_FILL:
+      return "aiuSubmitFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      return "aiuIssueBarrier";
     default:
       break;
   }
@@ -440,6 +477,29 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("bytes", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      runtime_activity->addMetadata("fence_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      runtime_activity->addMetadata("num_sids", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      runtime_activity->addMetadata("num_dest_ranks", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
     default:
       break;
   }
@@ -463,7 +523,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   kernel_activity->id = activity->correlation_id;
-  kernel_activity->device = activity->device_id;
+  kernel_activity->device = activity->device_index;
   kernel_activity->resource = activity->stream_id;
   kernel_activity->threadId = activity->stream_id;
   kernel_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -480,6 +540,11 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
   addCollMetadata(kernel_activity, activity);
+  const std::string name_base = spyre::activityNameBase(activity->name);
+  const std::string bundle_prefix = spyre::lookupBundleDirPrefix(name_base);
+  if (!bundle_prefix.empty()) {
+    kernel_activity->addMetadataQuoted("sdsc_bundle_dir_prefix", bundle_prefix);
+  }
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
@@ -534,7 +599,7 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
   uint32_t overlap_offset = 0;
   uint32_t base_resource_id = getBaseResourceId(activity);
   const auto it =
-      activeThreadMap_.find({activity->device_id, base_resource_id});
+      activeThreadMap_.find({activity->device_index, base_resource_id});
   if (it != activeThreadMap_.end()) {
     std::vector<int64_t>& last_active_times = (*it).second;
     bool found_useable_thread = false;
@@ -550,10 +615,11 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
       last_active_times.push_back(activity->end);
       overlap_offset = last_active_times.size() - 1;
     }
-    activeThreadMap_[{activity->device_id, base_resource_id}][overlap_offset] =
-        activity->end;
+    activeThreadMap_[{activity->device_index, base_resource_id}]
+                    [overlap_offset] = activity->end;
   } else {
-    activeThreadMap_[{activity->device_id, base_resource_id}] = {activity->end};
+    activeThreadMap_[{activity->device_index, base_resource_id}] = {
+        activity->end};
   }
   return base_resource_id + overlap_offset;
 }
@@ -582,7 +648,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   memcpy_activity->id = activity->correlation_id;
-  memcpy_activity->device = activity->device_id;
+  memcpy_activity->device = activity->device_index;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
   memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -652,7 +718,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     // Memory management uses host timestamps, not calibrated device ticks.
     mem_activity->addMetadataQuoted("timestamp_source", "host");
     mem_activity->id = activity->correlation_id;
-    mem_activity->device = activity->device_id;
+    mem_activity->device = activity->device_index;
     mem_activity->resource = getResourceId(activity);
     mem_activity->threadId = activity->stream_id;
     mem_activity->flow.id = 0;
@@ -706,7 +772,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
   memory_event->addMetadata("Total Allocated", totalAllocatedBytes_);
   memory_event->addMetadata("Bytes", bytes);
   memory_event->addMetadata("Addr", activity->address);
-  memory_event->addMetadata("Device Id", activity->device_id);
+  memory_event->addMetadata("Device Id", activity->device_index);
   memory_event->addMetadata("Device Type", 1);
 
   memory_event->log(*logger);
@@ -727,7 +793,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   // Libaiupti represents host-timed allocations as MEMSET records.
   memset_activity->addMetadataQuoted("timestamp_source", "host");
   memset_activity->id = activity->correlation_id;
-  memset_activity->device = activity->device_id;
+  memset_activity->device = activity->device_index;
   // TODO(mcalman): investigate why memset activities are being processed out
   // of order This prevents us from using getResourceId which handles overlap
   memset_activity->resource = getBaseResourceId(activity);

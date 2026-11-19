@@ -32,9 +32,19 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    canonicalize_dim,
+    elementwise_dtypes,
+)
 
-from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .constants import (
+    DEVICE_NAME,
+    FP16_TOPK_MAX_DIM,
+    FP8_E4M3FN_MAX,
+    FP8_E4M3FN_MIN,
+)
+from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
@@ -1567,6 +1577,15 @@ spyre_decompositions_to_exclude = [
     # decomps and let the mm/bmm survive to mm_to_bmm_pass (2.11 behavior).
     torch.ops.aten.mm,
     torch.ops.aten.bmm,
+    # torch.max_pool2d / F.max_pool2d always trace to
+    # aten.max_pool2d_with_indices, which Inductor decomposes into a
+    # pointwise/reduction nest. Spyre lowers it directly to a native
+    # ``maxpoolfwd`` SDSC (see ``lower_max_pool2d_with_indices``), so the
+    # upstream decomposition must be dropped for that lowering to be reached at
+    # all. The lowering itself re-delegates to
+    # ``lowering.max_pool2d_with_indices`` for the cases maxpoolfwd cannot
+    # express (k==1 windows), so dropping the decomp loses no coverage.
+    torch.ops.aten.max_pool2d_with_indices,
 ]
 
 OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]
@@ -1824,6 +1843,16 @@ def spyre_topk(
         raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
+    # The index is counted in the input dtype, so a longer fp16 search dim returns
+    # wrong indices without an error (#5847). The way around it is to search in
+    # float32, but the device float16 to float32 cast is not reliable yet (it
+    # permutes elements within a stick pair, #5856), so reject instead.
+    n = input.size(dim)
+    if input.dtype == torch.float16 and n > FP16_TOPK_MAX_DIM:
+        raise Unsupported(
+            f"topk along a float16 dim of size {n}: the indices are held in float16, "
+            f"which is exact only up to {FP16_TOPK_MAX_DIM}; use a float32 input"
+        )
     # sorted=False is a no-op: our reduction always returns sorted output.
     # Index stays in the input dtype (not int64) all the way out; topkindex's
     # fake reports it so Dynamo traces it with no meta conflict.
@@ -2219,7 +2248,7 @@ def spyre__sdpa_overrideable(
 
         def sdpa_lk_body(carry, tiles):
             block_maximum, block_denominator, block_output = carry
-            _, k_blk, v_blk, *block_masks = tiles
+            q_blk, k_blk, v_blk, *block_masks = tiles
             if use_gqa:
                 k_blk = k_blk.unsqueeze(2)
                 v_blk = v_blk.unsqueeze(2)
@@ -2232,9 +2261,9 @@ def spyre__sdpa_overrideable(
                 k_blk = k_blk.contiguous()
             keys_T = k_blk.transpose(-1, -2).contiguous()
             scores = (
-                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                torch.ops.spyre.batched_matmul(q_blk, keys_T)
                 if use_gqa
-                else torch.matmul(q_scaled, keys_T)
+                else torch.matmul(q_blk, keys_T)
             )
             for block_mask in block_masks:
                 scores = scores + block_mask
@@ -2256,7 +2285,9 @@ def spyre__sdpa_overrideable(
             new_output = block_output * correction.unsqueeze(-1) + weighted
             return (new_max, new_denominator, new_output), None
 
-        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        # The body reads the scaled Q as an operand: for_each_tile traces it
+        # without Dynamo, so a closed-over tensor would not be lifted.
+        kv_operands = (q_scaled, k_tile, v_tile, *mask_tiles)
         kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
         initial = (running_max, denominator, output_tile)
         # One K/V block already returned through the stable body above.
@@ -2551,15 +2582,15 @@ def _windowed_attention(
 
             def swa_kv_body(carry, tiles):
                 running_max, denominator, output = carry
-                _, k_blk, v_blk, mask_blk = tiles
+                q_blk, k_blk, v_blk, mask_blk = tiles
                 # Match full SDPA: the scan walks K in cache order and
                 # materializes only the bounded, transposed tile required by
                 # the score matmul.
                 keys_t = k_blk.transpose(-1, -2).contiguous()
                 scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                    torch.ops.spyre.batched_matmul(q_blk, keys_t)
                     if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
+                    else torch.matmul(q_blk, keys_t)
                 )
                 scores = scores + mask_blk
 
@@ -2581,7 +2612,9 @@ def _windowed_attention(
                 new_output = output * correction.unsqueeze(-1) + weighted
                 return (new_max, new_denominator, new_output), None
 
-            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+            # The body reads the scaled Q as an operand: for_each_tile traces it
+            # without Dynamo, so a closed-over tensor would not be lifted.
+            kv_operands = (q_scaled, k_tile, v_tile, mask_tile)
             initial = (running_max, denominator, output_tile)
             if tiling.num_kv_blocks == 1:
                 (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
@@ -3087,6 +3120,77 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
                 torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
             )
         )
+
+
+# Spyre has no native scan op (#3388), so cumsum is decomposed by result dtype:
+# fp16/bf16 multiply by a triangular matrix of ones, fp32/int32/int64 run a
+# doubling prefix scan. Every other dtype falls back to CPU.
+#
+# Each path needs the scan dim in a particular position, so it swaps it there
+# and swaps the result back; a swap works on any input, where a reshape would
+# not. Both also copy their input into a plain dense buffer first, because
+# neither can read a sliced one.
+
+# Result dtypes whose scan is a matmul, and all result dtypes that scan on device.
+_CUMSUM_MATMUL_DTYPES = (torch.float16, torch.bfloat16)
+_CUMSUM_SCAN_DTYPES = _CUMSUM_MATMUL_DTYPES + (
+    torch.float32,
+    torch.int32,
+    torch.int64,
+)
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def spyre_cumsum(
+    x: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if dtype is None:
+        # torch.cumsum accumulates bool and integer inputs in int64.
+        dtype = x.dtype if x.dtype.is_floating_point else torch.int64
+    # A conversion runs on Spyre only if it is native and keeps the element width.
+    on_device = dtype in _CUMSUM_SCAN_DTYPES and (
+        x.dtype == dtype
+        or (
+            DtypeOpTable.is_supported(x.dtype, dtype)
+            and get_elem_in_stick(x.dtype) == get_elem_in_stick(dtype)
+        )
+    )
+    # Raise IndexError like torch.cumsum; eager reaches this decomposition
+    # without the op's own dim check.
+    dim = canonicalize_dim(x.dim(), dim)
+    # A 0-d input has no dim to scan; an empty one has nothing to scan.
+    if not on_device or x.dim() == 0 or x.numel() == 0:
+        return torch.ops.spyre.cumsum_cpu_fallback(x, dim, dtype)
+
+    n = x.shape[dim]
+
+    if dtype in _CUMSUM_MATMUL_DTYPES:
+        # matmul sums along the last dim, so the scan dim goes there and comes
+        # back. Both swaps do nothing when it is already last.
+        upper = torch.triu(torch.ones(n, n, dtype=dtype, device=x.device))
+        operand = torch.ops.aten.clone.default(
+            x.to(dtype).transpose(dim, -1), memory_format=torch.contiguous_format
+        )
+        return torch.ops.aten.matmul(operand, upper).transpose(dim, -1)
+
+    # Shifting only works off the innermost dim. A 1-D input has no other dim,
+    # so it gets one.
+    rank1 = x.dim() == 1
+    moved = x.unsqueeze(-1) if rank1 else x.transpose(dim, -2)
+    result = torch.ops.aten.clone.default(
+        moved.to(dtype), memory_format=torch.contiguous_format
+    )
+    # A shift of n already covers the whole scan, so stop there.
+    offset = 1
+    while offset < n:
+        sliced = torch.ops.aten.slice.Tensor(result, -2, 0, n - offset)
+        # pad takes two values per dim, innermost first; this left-pads dim -2.
+        shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0], 0)
+        result = result + shifted
+        offset *= 2
+    return result.squeeze(-1) if rank1 else result.transpose(dim, -2)
 
 
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
@@ -3744,7 +3848,7 @@ def scaled_mm_decomp(
     scale_b: torch.Tensor = None,
     bias: torch.Tensor = None,
     scale_result: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
@@ -3782,7 +3886,7 @@ def scaled_bmm_decomp(
     mat2: torch.Tensor,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
+    out_dtype: Optional[torch.dtype] = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
     """
@@ -3842,13 +3946,26 @@ def where_scalar_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
+def _quantize_fp8_clamped_input(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Compute clamped input scaled for FP8 quantization.
+
+    On Spyre hardware, reciprocal(0.0) produces NaN instead of +inf.
+    To prevent NaN propagation when scale=0, use safe reciprocal so that
+    scaled inputs remain finite and dequantization by scale=0 correctly
+    evaluates to 0.0 (see #3037).
+    """
+    safe_recip = torch.where(scale == 0, 1.0, torch.reciprocal(scale))
+    x_scaled = input * safe_recip
+    return torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+
+
 @register_spyre_decompositions([torch.ops.spyre.quantize_fp8_with_scale])
 def spyre_quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 
@@ -3856,9 +3973,7 @@ def spyre_quantize_fp8_with_scale(
 def spyre_quantize_weight_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    inv_scale = torch.reciprocal(scale)
-    x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    x_clamped = _quantize_fp8_clamped_input(input, scale)
     return torch.ops.spyre.qfp8wt(x_clamped)
 
 
@@ -4068,7 +4183,9 @@ def spyre_index_add(
     gathered = torch.index_select(self, dim, index)
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
-    return torch.index_put(self, indices, updated, accumulate=False)
+    # The aten overload takes the schema's ``Tensor?[]``; the torch.index_put
+    # binding demands a TensorList and rejects a None that selects a whole dim.
+    return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
