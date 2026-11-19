@@ -422,11 +422,6 @@ class TestReshapeRestickify:
 
         _compare_modes(execution_mode, fn, x)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="AssertionError: fp16 -> fp32 cast result read back to host has elements in wrong order, #6033",
-    )
     def test_restickify_reshape_then_dtype_cast(self, execution_mode):
         """Non-offset-free layout after reshape; dtype cast crosses stick-width boundary."""
         x = cached_randn(
