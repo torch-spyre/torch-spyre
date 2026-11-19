@@ -2295,6 +2295,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     1,
                 ),
+                # #5846 reported wrong values here at k=4 while k=1 and k=8 were fine.
+                "3d_k4_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    4,
+                    1,
+                ),
                 "3d_k4_dim0": (
                     unique_randn_along_dim((67, 71, 256), dim=0),
                     4,
