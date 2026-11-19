@@ -42,6 +42,11 @@ DECLARATION = {0: {"min": 70, "max": 630, "granularity": 70}}
 TILE = 70
 
 
+def reinterpret_tensor(*args):
+    # torch_spyre/_C.pyi does not declare reinterpret_tensor.
+    return torch_spyre._C.reinterpret_tensor(*args)
+
+
 def declared_tensor():
     """A 560-row tensor with dim 0 declared, and its host copy."""
     x = torch.rand(560, 1024, dtype=torch.float16)
@@ -116,6 +121,10 @@ class TestGetReservedDims(TestCase):
             # The flat view carries the map but is not intact; viewing back to
             # the original geometry makes it intact again.
             "round trip": x_dev.view(-1).view(x_dev.shape),
+            # What Inductor codegen emits to reuse a buffer.
+            "reinterpret_tensor": reinterpret_tensor(
+                x_dev, list(x_dev.shape), list(x_dev.stride()), 0
+            ),
         }
         for name, v in same.items():
             with self.subTest(view=name):
@@ -128,6 +137,9 @@ class TestGetReservedDims(TestCase):
             "reshape": x_dev.view(280, 2048),
             "slice": x_dev[1:],
             "as_strided": x_dev.as_strided((280, 1024), (1024, 1)),
+            "reinterpret_tensor": reinterpret_tensor(
+                x_dev, [559, 1024], list(x_dev.stride()), 1024
+            ),
         }
         for name, v in changed.items():
             with self.subTest(view=name):
@@ -186,6 +198,9 @@ class TestGetReservedDims(TestCase):
         self.assertEqual(tuple(v.shape), (630, 1024))
         self.assertEqual(v.cpu()[:140], x, atol=1e-3, rtol=0)
         self.assertEqual(tuple(x_dev.shape), (140, 1024))
+        # The data check alone also passes through the unreserved path, so
+        # check the view kept its reservation through the grow.
+        self.assertEqual(get_reserved_dims(v), DECLARATION)
 
 
 # One compiled function reused over these sizes: the kernel sees the whole range.

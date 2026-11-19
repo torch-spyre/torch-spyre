@@ -252,6 +252,9 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   if (stl == orig_stl) {
     spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+    // As in as_strided_with_layout: only here do dma_sizes/dma_strides still
+    // describe the original allocation, so the intact check stays meaningful.
+    spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   } else {
     spyre_tensor_impl_->dma_sizes = size.vec();
     spyre_tensor_impl_->dma_strides = stride.vec();
