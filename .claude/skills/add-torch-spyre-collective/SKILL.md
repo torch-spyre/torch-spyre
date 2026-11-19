@@ -123,7 +123,8 @@ should be mirrored there as well.
 
 ## Step 7 — Optional follow-ups (mention, do not do unprompted)
 
-- Eager backend: `csrc/distributed/spyre_ccl.cpp` / `spyre_ccl.hpp` (`SpyreCCLBackend::<op>`).
+- Eager backend (`SpyreCCLBackend::<op>`): a separate task; use the `add-torch-spyre-eager-collective`
+  skill.
 - Profiler names: `csrc/profiler/AiuptiActivityHandlers.cpp` maps `AIUPTI_RUNTIME_TRACE_CBID_COLL_*`
   to display names. The cbid itself lives in `libaiupti`; add a mapping only if the cbid exists.
 - Docs: `docs/source/user_guide/` and `docs/source/user_guide/examples/distributed/`.

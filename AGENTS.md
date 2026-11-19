@@ -173,6 +173,7 @@ in `.claude/skills/`; other tools reach them through a symlink (such as
 - **project-overview** — repo layout, Spyre architecture, compilation pipeline
 - **add-spyre-operation** — patterns for adding new ops
 - **add-torch-spyre-collective** — wiring a new collective through the compiled path
+- **add-torch-spyre-eager-collective** — enabling an eager `torch.distributed` collective in the spyreccl backend
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
