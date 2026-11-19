@@ -40,6 +40,7 @@ from torch._inductor.virtualized import V
 
 
 from .constants import (
+    BATCH_MATMUL_OP,
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
@@ -398,10 +399,15 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=False):
         # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
         # Spyre maps directly to fixed hardware ops via DtypeOpTable and
         # cannot honor compute-type promotion, so accept and ignore.
+        if src_dtype is None:
+            # OpsHandler.to_dtype declares src_dtype optional, and some upstream
+            # Inductor lowerings omit it. The hardware op is chosen from the
+            # (src_dtype, dtype) pair, so the conversion cannot be lowered (#5783).
+            raise Unsupported(f"type conversion to {dtype} without a source dtype")
         assert dtype != src_dtype
 
         if src_dtype == torch.bool:
@@ -1269,8 +1275,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     and arg.device_dtype
                     in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
                 )
+                or _is_sen1p5_bf16_matmul_input(op, arg)
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
+        _check_sen1p5_matmul_inputs(op, args)
 
         it_space = iteration_space(self.current_node)
 
@@ -1432,7 +1440,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # The registry is keyed by the inserted destination buffer (``buf3``),
         # while scheduler nodes have operation names (``op3``). Certify the
         # identity from its write, which is the stable link between them.
+        # Other writers of the destination, such as an LX context-switch
+        # restore from its HBM dump, do not read the plan's source.
         written = V.graph.scheduler.mutation_real_name
+        read_names = {
+            written.get(dep.name, dep.name)
+            for dep in self.current_node.read_writes.reads
+            if isinstance(dep, MemoryDep)
+        }
         relayout_plans = [
             plan
             for dep in self.current_node.read_writes.writes
@@ -1443,6 +1458,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
             is not None
+            and plan.source_name in read_names
         ]
         if len(relayout_plans) > 1:
             raise RuntimeError("one operation writes multiple LX relayout destinations")
@@ -2000,6 +2016,37 @@ def _indirect_syms_used(
     if dst_index is not None:
         syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
     return syms
+
+
+def _is_sen1p5_bf16_matmul_input(op: str, arg: TensorArg) -> bool:
+    """A BFLOAT16 matmul input on 1p5 (the output stays DLFloat16)."""
+    return (
+        _spyre_config.sen1p5
+        and op == BATCH_MATMUL_OP
+        and arg.is_input
+        and arg.device_dtype == DataFormats.BFLOAT16
+    )
+
+
+def _check_sen1p5_matmul_inputs(op: str, args: Sequence[TensorArg]) -> None:
+    """On 1p5 a matmul takes BFLOAT16 inputs only. An input that is already
+    BFLOAT16 on the device (a graph input or weight copied with
+    ``.to("spyre", device_layout=...)`` and a BFLOAT16 SpyreTensorLayout) is
+    used as it is. Any other input is refused here with a message, instead of
+    failing later in the backend compiler. The backend compiler does support
+    a DLFloat16-to-BFLOAT16 conversion op, but torch-spyre does not yet insert
+    it automatically before a 1p5 matmul."""
+    if not (_spyre_config.sen1p5 and op == BATCH_MATMUL_OP):
+        return
+    for arg in args:
+        if arg.is_input and arg.device_dtype != DataFormats.BFLOAT16:
+            raise Unsupported(
+                f"{op} on {arg.device_dtype} for sen1p5: matmul inputs must "
+                "be BFLOAT16 on the device; copy each operand with "
+                '.to("spyre", device_layout=...) and device_dtype '
+                "DataFormats.BFLOAT16 (an operand computed by another kernel "
+                "is not supported yet)"
+            )
 
 
 def _is_indirect_index_arg(
