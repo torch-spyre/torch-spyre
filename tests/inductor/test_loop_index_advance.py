@@ -32,7 +32,7 @@ What it pins:
 
 * every access in the corpus agrees, including the block-table reads of the
   ``paged_gather*`` fixtures. Those are POINT reads (no iteration variable) whose
-  index used to be rewritten to ``0`` by ``_rebase_point_splice_reads`` because
+  index used to be rewritten to ``0`` by a rebase step of the legacy transform because
   layout propagation was thought to reject the loop variable, so their advance
   survived only in the stored record. Stage 7.2 removed that rewrite (layout
   propagation accepts the variable: the three fixtures compile and give the same

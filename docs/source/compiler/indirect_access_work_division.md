@@ -134,9 +134,9 @@ work-division constraint framework
 `indirect_forbidden_split_syms(op)` to `allowed_splits={symbol: {1}}`.
 
 `allowed_splits` is the common hard-legality mechanism: it is intersected with
-other constraints and consumed by span reduction, default and cost-model
-planning, user hints, candidate enumeration, and split validation. A span-limit
-commitment outside the domain raises `Unsupported`; planner never splits a shared
+other constraints and consumed by the span floors, default and cost-model
+planning, user hints, candidate enumeration, and split validation. A span floor
+outside the domain raises `Unsupported`; the planner never splits a shared
 table dimension to satisfy span.
 
 ### 1. Forbid splitting the shared table's data dims — the correctness fix
@@ -311,5 +311,5 @@ correct-but-serial.
 
 ## See also
 
-* [Work Division Planning](work_division_planning.md) — the three-pass planner
+* [Work Division Planning](work_division_planning.md) — the two-pass planner
   this builds on.

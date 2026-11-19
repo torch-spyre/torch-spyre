@@ -2615,7 +2615,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             # a candidate-tiled arg keeps its full extent: drop the per-tile LX
             # size (`dump_cost_model._per_tile_elems`) so the count is concrete.
             if _is_sym(arg.is_lx):
-                payload = sympy.sympify(payload).subs(arg.is_lx, 0)
+                payload = sympy.sympify(payload).xreplace({arg.is_lx: 0})
             if payload <= 0:
                 continue
             requests = sympy.piecewise_fold(payload / sympy.sympify(run))

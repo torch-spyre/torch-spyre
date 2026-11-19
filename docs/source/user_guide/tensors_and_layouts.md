@@ -494,7 +494,17 @@ stay the same, otherwise `resize_` raises.
   integers, `min <= max`, and `max` is a multiple of `granularity`.
 - `min` must be at least `min_reserved_dim_size` (default 8), and
   `max / granularity` (the number of buckets) must not exceed `max_buckets`
-  (default 32). Both live in `torch_spyre/_inductor/config.py`.
+  (default 256, enough for a 32K context at 128 tokens per page with
+  granularity 1). Both live in `torch_spyre/_inductor/config.py` and are
+  process-wide: a consumer may set them through the `MIN_RESERVED_DIM_SIZE`
+  and `MAX_BUCKETS` environment variables, or on that module before its
+  first declaration. The floor protects a consumer whose compiled code
+  branches on a small row count, so lower it only for tensors that take no
+  such branch, page tables for example. The cap is the number of candidate
+  iterations of a loop over the declared dimension, one correction slot
+  each, and has no measured cost at the step up to 256. The compiled
+  program carries one slot per bucket, so compile work grows with the
+  count. Runs at 128 and 256 buckets compiled and ran (#6432).
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
@@ -556,6 +566,20 @@ wrong values after a `resize_`, which the documentation warned about. Now a
 compile and be silently wrong raises `Unsupported` at compile time. Code that
 compiled a plain op over a reserved tensor has to tile it, or move the op out of
 the compiled region.
+
+A `for_each_tile` body may also gather rows out of a pool that was itself moved
+with `dynamic=`, as in `pool.index_select(0, idx)`. The pool's length is
+resolved to its declared maximum at compile time. It never becomes a trip count
+or a bundle parameter, it only bounds the values the index may take, and the
+loop's own trip count still follows the walked tensor as above. Only a
+declaration counts for that bound: a pool made dynamic with
+`torch._dynamo.mark_dynamic` or bounded with `torch._check`, but not declared,
+is refused with an error naming the symbol. The declaration bounds the index
+values by the maximum, not by the pool's current size, so an index at or past
+the current size reads whatever the reserved rows hold at that moment and no
+error is raised. Keeping every index below the current size is the caller's
+contract. Only one declared dimension per pool is supported, since a tensor
+declares only dimension 0 today (see the reservation rules above).
 
 #### Data Semantics
 

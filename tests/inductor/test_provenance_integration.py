@@ -112,12 +112,6 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
         _observer_enter,
     )
 
-    # Defeat Inductor's on-disk FX graph cache so codegen (and therefore
-    # build_debug_handle) actually runs this process. Same pattern as the
-    # provenance audit tooling (audit.py): a cache hit silently skips
-    # create_op_spec/define_kernel, which would make this test flaky across
-    # repeated runs with identical dims rather than a genuine provenance signal.
-    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
     torch._dynamo.reset()
 
     model = model.half().to(DEVICE_NAME).eval()
@@ -131,7 +125,14 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     try:
         # The observer is opt-in like upstream provenance tracing; the handle
         # construction and forwarding assertions below remain unconditional.
-        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+        # Defeat Inductor's on-disk FX graph cache so codegen (and therefore
+        # build_debug_handle) actually runs this process. Same pattern as the
+        # provenance audit tooling (audit.py): a cache hit silently skips
+        # create_op_spec/define_kernel, which would make this test flaky across
+        # repeated runs with identical dims rather than a genuine provenance signal.
+        with torch._inductor.config.patch(
+            {"trace.provenance_tracking_level": 1, "force_disable_caches": True}
+        ):
             with torch.no_grad():
                 torch.compile(model)(x)
     finally:
@@ -196,6 +197,7 @@ def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
         prov_logger.setLevel(previous_level)
 
 
+@torch._inductor.config.patch(force_disable_caches=True)
 def test_split_multi_ops_records_history_during_real_compile(monkeypatch):
     import torch_spyre  # noqa: F401
 
@@ -215,7 +217,6 @@ def test_split_multi_ops_records_history_during_real_compile(monkeypatch):
         collected.extend(_orig_build(child) for child in news)
 
     monkeypatch.setattr(split, "decompose_provenance", _decompose)
-    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
     torch._dynamo.reset()
 
     def split_pointwise(x):
