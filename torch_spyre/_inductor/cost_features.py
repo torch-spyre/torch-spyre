@@ -35,6 +35,7 @@ from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
     apply_splits_from_index_coeff,
+    device_coordinates,
     iteration_space_from_op,
     loop_var_ranges_from_dim_hints,
     op_read_writes,
@@ -63,6 +64,10 @@ def feature_memo() -> Iterator[None]:
     pricing one consumer across its divisions. Only the parts that do not
     depend on the division are reused, so every result is what an unscoped call
     returns. A nested scope shares the outer one.
+
+    An op's reads need no scope: ``op_read_writes`` memoizes them for every
+    caller, the post-pass cost report included, under its own contract (an
+    in-place edit of an op's reads must call ``invalidate_op_read_writes``).
     """
     if _FEATURE_MEMO.get() is not None:
         yield
@@ -87,9 +92,11 @@ def _memoized(key: tuple, compute: Callable[[], _T]) -> _T:
 def _read_device_coordinates(src, read, op):
     """``device_coordinates(src, read, None, op=op)``, reused inside
     :func:`feature_memo`: a function of the op and the read (``src`` is the
-    read buffer's layout, fixed while nothing mutates the graph)."""
-    from .pass_utils import device_coordinates
+    read buffer's layout, fixed while nothing mutates the graph).
 
+    ``compute_coordinates`` has a memo of its own, but it declines a symbolic
+    range or a dynamic size, and it sits below the index concretization and
+    the stick-expression check that every call here would repeat."""
     # Outside a scope, exactly the plain call: the key needs the op's name,
     # which only a scoped caller (the allocator, over real ops) promises.
     if _FEATURE_MEMO.get() is None:
@@ -100,19 +107,6 @@ def _read_device_coordinates(src, read, op):
             lambda: tuple(device_coordinates(src, read, None, op=op)),
         )
     )
-
-
-def _read_writes(op):
-    """``op``'s read/write dependencies: the planner's per-op memo
-    (``op_read_writes``) inside :func:`feature_memo`, the real
-    ``get_read_writes()`` outside it.
-
-    Only the planner promises nothing rewrites an op's loads without
-    invalidating that memo; the post-pass report (``cost_model_pass``) and the
-    cost dump extract after every pass, so they re-derive the reads."""
-    if _FEATURE_MEMO.get() is None:
-        return op.get_read_writes()
-    return op_read_writes(op)
 
 
 def _int(x, default: int = 1) -> int:
@@ -161,7 +155,7 @@ def _resolved_work_slices(op, work_slices=None) -> dict:
     """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
     the explicit candidate during LX planning, else the committed ownership."""
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -565,7 +559,7 @@ def _row_split(op, default: int, work_slices=None) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -730,7 +724,7 @@ def _transport_read_geometry(op, work_slices=None):
             and not getattr(op, "op_it_space_splits", None)
         ):
             return None, None
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         if len(rw.reads) != 1 or len(rw.writes) != 1:
             return None, None
         read, write = next(iter(rw.reads)), next(iter(rw.writes))
@@ -907,7 +901,7 @@ def _read_run_bytes(op, read, work_slices=None):
     try:
         from torch._inductor.virtualized import V
 
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write = next(iter(rw.writes))
         src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
         it_space = iteration_space_from_op(op)
@@ -980,7 +974,7 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -1054,7 +1048,7 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
     "" -> ordinary contiguous access; the default bw_peak + turnaround applies.
     """
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         it_space = iteration_space_from_op(op)
 
@@ -1247,8 +1241,7 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
-    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
-    records.
+    the graph returns.
 
     ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
     "interior write", and unlike the input side an output arg has no naming-convention
@@ -1328,7 +1321,7 @@ def _indirect_write_elems(op, out_elems: int) -> int | None:
     try:
         if not isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
             return None
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         writes = list(rw.writes)
         if len(writes) != 1 or not writes[0].is_indirect():
             return None
@@ -1483,7 +1476,7 @@ def extract_op_features(
     _li = getattr(op, "loop_info", None)
     _rw = None
     try:
-        _rw = _read_writes(op)
+        _rw = op_read_writes(op)
         _write_index = next(iter(_rw.writes)).index
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
@@ -1634,7 +1627,7 @@ def extract_op_features(
     # No dependencies change during feature extraction. Reuse the output snapshot,
     # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = (_rw if _rw is not None else _read_writes(op)).reads
+        reads = (_rw if _rw is not None else op_read_writes(op)).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
