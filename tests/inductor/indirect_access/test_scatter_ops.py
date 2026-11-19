@@ -46,15 +46,24 @@ _MASKED_FILL_FP32 = rejection(
     "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA that is refused as Multi-arg pointwise with mixed EA.",
     r"Multi-arg pointwise with mixed EA",
 )
-_IR_OUT = rejection(
+_IR_DUP_EAGER = (
     4634,
-    "aten::index_reduce.out is not registered on Spyre.",
-    r"Could not run 'aten::index_reduce.out'",
+    "index_reduce_ with a repeated index returns wrong values: the decomposition "
+    "overwrites, so only one source row per destination row is kept (unique indices "
+    "are a documented precondition).",
+    r"eager spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_IR_MEAN_CONST = rejection(
-    4472,
-    "compile index_reduce_ mean stores a rank-0 Constant.",
-    r"store value of unexpected type <class '[\w.]*Constant'>",
+_IR_DUP_COMPILED = (
+    4634,
+    "compile index_reduce_ with a repeated index returns wrong values: the "
+    "decomposition overwrites, so only one source row per destination row is kept "
+    "(unique indices are a documented precondition).",
+    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
+)
+_IR_STICK_DIM = rejection(
+    4404,
+    "index_reduce along the stick (last) dim is rejected: its gather/scatter along the stick does not lower.",
+    r"index_reduce along the stick \(last\) dim",
 )
 _PUT_EAGER = rejection(
     4540,
@@ -66,6 +75,18 @@ _PUT_COMPILED = rejection(
     "compile put_: AssertionError restickify op_spec has 3 args.",
     r"restickify op_spec has 3 args",
 )
+_MUTATING_FALLBACK = r"upstream lowers this form to a mutating fallback"
+
+
+def _scatter_fallback(issue, what):
+    """Compiled scatter forms that upstream lowers to scatter_reduce_.two are rejected."""
+    return rejection(
+        issue,
+        f"compile {what} lowers to aten.scatter_reduce_.two, a mutating fallback with no Spyre kernel.",
+        _MUTATING_FALLBACK,
+    )
+
+
 _SR_TWO = rejection(
     4361,
     "aten::scatter_reduce.two_out is not registered on Spyre.",
@@ -93,14 +114,9 @@ class TestIndexReduceEagerCompile:
     def setup_method(self):
         torch.manual_seed(0xBEEF)
 
-    def _xfail_kernel(self, execution_mode):
+    def _xfail_duplicates(self, execution_mode):
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4634
-        _xfail_existing(execution_mode, eager=_IR_OUT, compiled=_IR_OUT)
-
-    def _xfail_mean(self, execution_mode):
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4634
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4472
-        _xfail_existing(execution_mode, eager=_IR_OUT, compiled=_IR_MEAN_CONST)
+        _xfail_existing(execution_mode, eager=_IR_DUP_EAGER, compiled=_IR_DUP_COMPILED)
 
     def _run(self, execution_mode, dst, src, idx, reduce_op, tol):
         def fn(dst, src, idx):
@@ -114,9 +130,10 @@ class TestIndexReduceEagerCompile:
         """index_reduce_ mean on dim=0; duplicate indices average rows into destination.
 
         PyTorch index_reduce_ does not accept reduce='sum' (use scatter_add for sum).
-        Eager is missing aten::index_reduce.out (#4634). Compiled mean is Constant (#4472).
+        The index repeats row 2, and the decomposition overwrites, so the result is wrong
+        in eager and compiled (#4634).
         """
-        self._xfail_mean(execution_mode)
+        self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_mean01", dtype=torch.float16)
         src = cached_randn(
             (3, 8), differentiation="irdc_mean01_src", dtype=torch.float16
@@ -126,7 +143,7 @@ class TestIndexReduceEagerCompile:
 
     def test_index_reduce_prod_dim0(self, execution_mode):
         """index_reduce_ prod on dim=0; duplicate indices multiply rows into destination."""
-        self._xfail_kernel(execution_mode)
+        self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_prod01", dtype=torch.float16)
         src = cached_randn(
             (3, 8), differentiation="irdc_prod01_src", dtype=torch.float16
@@ -136,7 +153,7 @@ class TestIndexReduceEagerCompile:
 
     def test_index_reduce_amax_dim0(self, execution_mode):
         """index_reduce_ amax on dim=0; duplicate indices take element-wise max across rows."""
-        self._xfail_kernel(execution_mode)
+        self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_amax01", dtype=torch.float16)
         src = cached_randn(
             (3, 8), differentiation="irdc_amax01_src", dtype=torch.float16
@@ -146,7 +163,7 @@ class TestIndexReduceEagerCompile:
 
     def test_index_reduce_amin_dim0(self, execution_mode):
         """index_reduce_ amin on dim=0; duplicate indices take element-wise min across rows."""
-        self._xfail_kernel(execution_mode)
+        self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_amin01", dtype=torch.float16)
         src = cached_randn(
             (3, 8), differentiation="irdc_amin01_src", dtype=torch.float16
@@ -156,7 +173,7 @@ class TestIndexReduceEagerCompile:
 
     def test_index_reduce_mean_float32(self, execution_mode):
         """index_reduce_ mean in float32; validates 4-byte word path for row accumulation."""
-        self._xfail_mean(execution_mode)
+        self._xfail_duplicates(execution_mode)
         dst = cached_randn((4, 8), differentiation="irdc_f32_01", dtype=torch.float32)
         src = cached_randn(
             (3, 8), differentiation="irdc_f32_01_src", dtype=torch.float32
@@ -166,13 +183,52 @@ class TestIndexReduceEagerCompile:
 
     def test_index_reduce_single_index(self, execution_mode):
         """index_reduce_ with a single-element index; boundary case — P=1 row update."""
-        self._xfail_kernel(execution_mode)
         dst = cached_randn((8, 16), differentiation="irdc_p1_01", dtype=torch.float16)
         src = cached_randn(
             (1, 16), differentiation="irdc_p1_01_src", dtype=torch.float16
         )
         idx = torch.tensor([3], dtype=torch.int64)
         self._run(execution_mode, dst, src, idx, "amax", _TOL_F16)
+
+    @pytest.mark.parametrize("reduce_op", ["mean", "prod", "amax", "amin"])
+    @pytest.mark.parametrize("include_self", [False, True])
+    def test_index_reduce_unique_indices(self, execution_mode, reduce_op, include_self):
+        """index_reduce_ with unique indices on dim=0: supported (#6187), matches CPU.
+
+        Every destination row receives at most one source row. Measured against CPU
+        fp16 the largest error is 2e-3, so _TOL_F16 leaves 5x margin.
+        """
+        dst = cached_randn((4, 8), differentiation="irdc_uniq", dtype=torch.float16)
+        src = cached_randn((3, 8), differentiation="irdc_uniq_src", dtype=torch.float16)
+        idx = torch.tensor([2, 0, 3], dtype=torch.int64)
+
+        def fn(dst, src, idx):
+            return dst.clone().index_reduce_(
+                0, idx, src, reduce=reduce_op, include_self=include_self
+            )
+
+        compare_mode(execution_mode, fn, dst, src, idx, atol=_TOL_F16, rtol=_TOL_F16)
+
+    def test_index_reduce_stick_dim_rejected(self, execution_mode):
+        """index_reduce_ along the last (stick) dim is rejected with Unsupported (#4404)."""
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4404
+        _xfail_existing(execution_mode, eager=_IR_STICK_DIM, compiled=_IR_STICK_DIM)
+        dst = cached_randn((4, 64), differentiation="irdc_stick", dtype=torch.float16)
+        src = cached_randn(
+            (4, 2), differentiation="irdc_stick_src", dtype=torch.float16
+        )
+        idx = torch.tensor([1, 5], dtype=torch.int64)
+        compare_mode(
+            execution_mode,
+            lambda d, s, i: d.clone().index_reduce_(
+                1, i, s, reduce="amax", include_self=False
+            ),
+            dst,
+            src,
+            idx,
+            atol=_TOL_F16,
+            rtol=_TOL_F16,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +528,7 @@ class TestPutFlatIndexWriteEagerCompile:
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 class TestScatterAddGroupedMmOffs:
-    """Gemma grouped_mm offs — int64 dest [128], T=192. #4395.
+    """Gemma grouped_mm offs — int64 dest [128], T=192. Eager #4396; compiled is rejected (#4396).
 
     Dest length 128 splits across cores; compiled runs at sencores=1 and chip-max.
     """
@@ -486,9 +542,8 @@ class TestScatterAddGroupedMmOffs:
 
     @gap_one_core
     def test_scatter_add_grouped_mm_offs_int64(self, execution_mode):
-        """scatter_add dim=0 int64 counts [128], T=192 — Gemma grouped_mm offs (#4395)."""
+        """scatter_add dim=0 int64 counts [128], T=192 — Gemma grouped_mm offs (#4396)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4396
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4395
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -496,11 +551,7 @@ class TestScatterAddGroupedMmOffs:
                 "aten::scatter_add.out is not registered on Spyre.",
                 r"Could not run 'aten::scatter_add.out'",
             ),
-            compiled=(
-                4395,
-                "compile scatter_add int64 grouped_mm offs mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
-            ),
+            compiled=_scatter_fallback(4396, "scatter_add int64"),
         )
         G, T = 128, 192
         counts = torch.zeros(G, dtype=torch.int64)
@@ -755,7 +806,7 @@ class TestScatter1DDestRestickify:
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 class TestScatterReduceLegacyGroupedMm:
-    """Legacy Tensor.scatter_(reduce=) on grouped_mm dest ranks. #4407.
+    """Legacy Tensor.scatter_(reduce=) on grouped_mm dest ranks. Eager and compiled: #4413.
 
     Dest length 128 splits across cores; compiled runs at sencores=1 and chip-max.
     """
@@ -769,9 +820,8 @@ class TestScatterReduceLegacyGroupedMm:
 
     @gap_one_core
     def test_scatter_reduce_add_grouped_mm_int64(self, execution_mode):
-        """scatter_(reduce='add') int64 dest [128], T=192 (#4407)."""
+        """scatter_(reduce='add') int64 dest [128], T=192 (#4413)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4413
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4407
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -779,11 +829,7 @@ class TestScatterReduceLegacyGroupedMm:
                 "aten::scatter.reduce_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.reduce_out'",
             ),
-            compiled=(
-                4407,
-                "compile scatter_(reduce=) grouped_mm mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
-            ),
+            compiled=_scatter_fallback(4413, "scatter_(reduce=)"),
         )
         G, T = 128, 192
         dst = torch.ones(G, dtype=torch.int64)
@@ -799,9 +845,8 @@ class TestScatterReduceLegacyGroupedMm:
 
     @gap_one_core
     def test_scatter_reduce_multiply_grouped_mm_fp16(self, execution_mode):
-        """scatter_(reduce='multiply') fp16 dest [128], T=192; dest starts at ones (#4407)."""
+        """scatter_(reduce='multiply') fp16 dest [128], T=192; dest starts at ones (#4413)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4413
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4407
         _xfail_existing(
             execution_mode,
             eager=rejection(
@@ -809,11 +854,7 @@ class TestScatterReduceLegacyGroupedMm:
                 "aten::scatter.reduce_out is not registered on Spyre.",
                 r"Could not run 'aten::scatter.reduce_out'",
             ),
-            compiled=(
-                4407,
-                "compile scatter_(reduce=) grouped_mm mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
-            ),
+            compiled=_scatter_fallback(4413, "scatter_(reduce=)"),
         )
         G, T = 128, 192
         dst = torch.ones(G, dtype=torch.float16)
@@ -830,7 +871,7 @@ class TestScatterReduceLegacyGroupedMm:
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 class TestScatterReduceTwoColliding:
-    """aten::scatter_reduce.two_out colliding dest — extra vs YAML reduce_out. #4351.
+    """aten::scatter_reduce.two_out colliding dest. Eager and compiled: #4361.
 
     dim=0 dest (32, 64) splits at chip-max; dim=1 dest (4, 64) stays single-config.
     """
@@ -840,20 +881,15 @@ class TestScatterReduceTwoColliding:
 
     def _xfail_colliding_dim0(self, execution_mode):
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4361
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4351
         _xfail_existing(
             execution_mode,
             eager=_SR_TWO,
-            compiled=(
-                4351,
-                "compile scatter_reduce colliding dim=0 mismatches CPU.",
-                r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
-            ),
+            compiled=_scatter_fallback(4361, "scatter_reduce with colliding indices"),
         )
 
     @gap_one_core
     def test_scatter_reduce_amax_colliding_dim0(self, execution_mode, patch_sencores):
-        """scatter_reduce amax dim=0 dest/src (32, 64) non-unique index (#4351)."""
+        """scatter_reduce amax dim=0 dest/src (32, 64) non-unique index (#4361)."""
         self._xfail_colliding_dim0(execution_mode)
         dst = torch.randn(32, 64, dtype=torch.float16)
         src = torch.randn(32, 64, dtype=torch.float16)
@@ -870,7 +906,7 @@ class TestScatterReduceTwoColliding:
 
     @gap_one_core
     def test_scatter_reduce_prod_colliding_dim0(self, execution_mode, patch_sencores):
-        """scatter_reduce prod dim=0 dest/src (32, 64) non-unique index (#4351)."""
+        """scatter_reduce prod dim=0 dest/src (32, 64) non-unique index (#4361)."""
         self._xfail_colliding_dim0(execution_mode)
         dst = torch.randn(32, 64, dtype=torch.float16).abs() + 0.5
         src = torch.randn(32, 64, dtype=torch.float16).abs() + 0.5
@@ -887,7 +923,7 @@ class TestScatterReduceTwoColliding:
 
     @gap_one_core
     def test_scatter_reduce_mean_colliding_dim0(self, execution_mode, patch_sencores):
-        """scatter_reduce mean dim=0 dest/src (32, 64) non-unique index (#4351)."""
+        """scatter_reduce mean dim=0 dest/src (32, 64) non-unique index (#4361)."""
         self._xfail_colliding_dim0(execution_mode)
         dst = torch.randn(32, 64, dtype=torch.float16)
         src = torch.randn(32, 64, dtype=torch.float16)
@@ -904,7 +940,7 @@ class TestScatterReduceTwoColliding:
 
     @gap_one_core
     def test_scatter_reduce_amin_must_write_dim0(self, execution_mode, patch_sencores):
-        """scatter_reduce amin dim=0 dest=100 so dest is not already the min (#4351)."""
+        """scatter_reduce amin dim=0 dest=100 so dest is not already the min (#4361)."""
         self._xfail_colliding_dim0(execution_mode)
         dst = torch.full((32, 64), 100.0, dtype=torch.float16)
         src = torch.randn(32, 64, dtype=torch.float16)
