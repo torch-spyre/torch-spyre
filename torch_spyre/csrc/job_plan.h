@@ -566,14 +566,24 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    * @param input_buffer Pinned host buffer used as input (Case 1); nullptr for
    *            Cases 2 and 3.
    * @param ishape used to discriminate case 2 (fake symbols)
+   * @param address_table_bytes Size of the address table that leads the
+   *            correction blob (the Hcm's second senconst), 0 when unknown.
+   * @param reads_input Per host-compute input slot, whether this step's
+   *            symbol definitions read it. Empty when the metadata did not
+   *            say. Together with address_table_bytes it lets the launch cut
+   *            a symbolic loop's upload to the iterations that run.
    */
   JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, size_t correction_size,
                          flex::CompositeAddress device_address,
-                         const void* input_buffer, std::vector<int64_t> ishape)
+                         const void* input_buffer, std::vector<int64_t> ishape,
+                         size_t address_table_bytes = 0,
+                         std::vector<bool> reads_input = {})
       : correction_size_(correction_size),
         device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
-        ishape_(std::move(ishape)) {
+        ishape_(std::move(ishape)),
+        address_table_bytes_(address_table_bytes),
+        reads_input_(std::move(reads_input)) {
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
@@ -604,13 +614,51 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       const std::vector<SymbolicArg>& symbolic_args);
 
  private:
+  /**
+   * @brief The bytes of this correction the device reads at this launch.
+   *
+   * A kernel with one symbolic loop level carries, in the loop's own
+   * correction step, the address table followed by one copy of the body's
+   * flits per candidate iteration, max_value / granularity copies. The device
+   * reads copy k at iteration k, so a launch running n iterations needs the
+   * table and the first n copies only. Returns true when this step is that
+   * loop correction (its definitions read the loop dimension input and its
+   * blob divides into stick-aligned copies) and sets *bytes to that prefix.
+   * Returns false, leaving *bytes alone, for every other correction.
+   */
+  bool loopCorrectionPrefix(const LaunchContext& ctx, size_t* bytes) const;
+
+  /**
+   * @brief Upload the first @p bytes of @p buffer to the correction region
+   * through a buffer from the pinned staging cache, so the DMA reads
+   * pre-mapped memory instead of going through flex's shadow copy of a raw
+   * host pointer.
+   */
+  void uploadPrefix(const SpyreStream& stream,
+                    const flex::HostComputeBuffer& buffer, size_t bytes) const;
+
   size_t correction_size_;  ///< byte count of the correction blob
   flex::CompositeAddress device_address_;  ///< device destination for H2D
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+  size_t address_table_bytes_ = 0;  ///< the table leading the blob, 0 unknown
+  std::vector<bool> reads_input_;   ///< input slots the definitions read
   std::unique_ptr<flex::HostComputeHandle>
       handle_;  ///< handle to the host compute operation
 };
+
+/**
+ * @brief Process-lifetime counters of the correction uploads made by
+ * JobPlanStepHostCompute, for tests and tuning.
+ */
+struct CorrectionUploadStats {
+  uint64_t launches = 0;    ///< host-compute steps constructed
+  uint64_t prefixed = 0;    ///< uploads cut to the current trip count
+  uint64_t bytes_full = 0;  ///< bytes the correction regions hold
+  uint64_t bytes_sent = 0;  ///< bytes uploaded
+};
+
+CorrectionUploadStats correction_upload_stats();
 
 /**
  * @brief A torch-spyre internal container for executing a unit of work

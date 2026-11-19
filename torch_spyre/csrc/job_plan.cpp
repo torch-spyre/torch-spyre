@@ -16,6 +16,9 @@
 
 #include "job_plan.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -25,9 +28,47 @@
 
 #include "spyre_composite_address.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_stream.h"
 
 namespace spyre {
+
+namespace {
+
+// Device sticks, and so flex's pinned DMA sizes, are 128-byte aligned.
+constexpr size_t kStickBytes = 128;
+
+struct CorrectionUploadCounters {
+  std::atomic<uint64_t> launches{0};
+  std::atomic<uint64_t> prefixed{0};
+  std::atomic<uint64_t> bytes_full{0};
+  std::atomic<uint64_t> bytes_sent{0};
+};
+
+CorrectionUploadCounters& correction_upload_counters() {
+  static CorrectionUploadCounters counters;
+  return counters;
+}
+
+// TORCH_SPYRE_FULL_CORRECTION_UPLOAD=1 keeps every correction upload whole and
+// on the path it took before the loop prefix, as an escape hatch and for
+// comparisons. Read per launch so a test can set it in process.
+bool full_correction_upload_forced() {
+  const char* value = std::getenv("TORCH_SPYRE_FULL_CORRECTION_UPLOAD");
+  return value != nullptr && value[0] == '1';
+}
+
+}  // namespace
+
+CorrectionUploadStats correction_upload_stats() {
+  const CorrectionUploadCounters& counters = correction_upload_counters();
+  CorrectionUploadStats stats;
+  stats.launches = counters.launches.load();
+  stats.prefixed = counters.prefixed.load();
+  stats.bytes_full = counters.bytes_full.load();
+  stats.bytes_sent = counters.bytes_sent.load();
+  return stats;
+}
 
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
@@ -201,9 +242,109 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
   return resolved;
 }
 
+bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
+                                                  size_t* bytes) const {
+  if (address_table_bytes_ == 0 || reads_input_.empty() ||
+      correction_size_ <= address_table_bytes_) {
+    return false;
+  }
+  // Exactly one loop dimension: nested symbolic levels multiply the slots in
+  // an order this step does not know.
+  int dimensions = 0;
+  size_t slot = 0;
+  int64_t count = 0;
+  int64_t max_count = 0;
+  for (size_t i = 0; i < ctx.symbolic_args.size(); ++i) {
+    const SymbolicArg& arg = ctx.symbolic_args[i];
+    if (arg.kind != SymbolicArgKind::kDimension) {
+      continue;
+    }
+    ++dimensions;
+    slot = i;
+    if (arg.granularity <= 0 || arg.max_value <= 0 || arg.tensor_id < 0 ||
+        static_cast<size_t>(arg.tensor_id) >= ctx.inputs_outputs.size()) {
+      return false;
+    }
+    const at::Tensor& tensor = ctx.inputs_outputs[arg.tensor_id];
+    if (arg.dim_index < 0 || arg.dim_index >= tensor.dim()) {
+      return false;
+    }
+    count = tensor.size(arg.dim_index) / arg.granularity;
+    max_count = arg.max_value / arg.granularity;
+  }
+  if (dimensions != 1 || count <= 0 || max_count <= 0 || count > max_count) {
+    return false;
+  }
+  // The loop's own correction is the step whose definitions read the loop
+  // dimension input, which the trip count is derived from. A kernel's other
+  // correction steps never read it.
+  if (slot >= reads_input_.size() || !reads_input_[slot]) {
+    return false;
+  }
+  // One stick-aligned copy per candidate iteration behind a stick-aligned
+  // table. Any other layout is left whole.
+  const size_t copies_bytes = correction_size_ - address_table_bytes_;
+  const size_t copies = static_cast<size_t>(max_count);
+  if (copies_bytes % copies != 0) {
+    return false;
+  }
+  const size_t stride = copies_bytes / copies;
+  if (stride == 0 || stride % kStickBytes != 0 ||
+      address_table_bytes_ % kStickBytes != 0) {
+    return false;
+  }
+  *bytes = address_table_bytes_ + static_cast<size_t>(count) * stride;
+  return true;
+}
+
+void JobPlanStepHostCompute::uploadPrefix(const SpyreStream& stream,
+                                          const flex::HostComputeBuffer& buffer,
+                                          size_t bytes) const {
+  TORCH_CHECK(device_address_.chunks().size() == 1,
+              "a correction region must be one chunk, got ",
+              device_address_.chunks().size());
+  auto* allocator =
+      static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+  c10::DataPtr staging = allocator->allocate(bytes);
+  std::memcpy(staging.get(), buffer.data(), bytes);
+  PinnedAllocation pinned = allocator->retain(staging.get());
+  TORCH_CHECK(pinned, "the pinned staging buffer is not registered");
+
+  // flex sizes a DMA from the address it is given, so the destination is a
+  // prefix-sized view of the region. As in the tensor copy path, the
+  // allocation state rides along as the host lifetime so the bytes outlive
+  // the transfer, and nothing else keeps a reference to the staging buffer,
+  // or the cache sees two owners at release. The address rides with it
+  // because flex keeps a pointer to it, not a copy.
+  const auto& region = device_address_.chunks()[0];
+  struct Lifetime {
+    std::shared_ptr<PinnedAllocationState> owner;
+    flex::CompositeAddress address;
+  };
+  auto lifetime = std::make_shared<Lifetime>(
+      Lifetime{pinned.owner, flex::CompositeAddress(flex::Chunk(
+                                 region.addr, bytes, region.domain_id))});
+  auto* dma_params = flex::createDmaParamsWithPinnedBuffer(
+      pinned.buffer, pinned.offset, pinned.capacity, bytes,
+      /*to_device=*/true, &lifetime->address,
+      /*dci=*/nullptr, /*use_compute_pipeline=*/false,
+      /*pipeline_barrier=*/pipeline_barrier_, /*skip_hazard=*/false,
+      std::static_pointer_cast<void>(lifetime));
+  pinned = PinnedAllocation{};
+  try {
+    stream.launchH2D(dma_params);
+  }
+  catch (...) {
+    flex::destroyDmaParams(dma_params);
+    throw;
+  }
+  flex::destroyDmaParams(dma_params);
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   std::vector<flex::HostComputeArg> args;
+  bool symbolic = false;
 
   // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
   // the distinction into HostComputeParams directly.
@@ -211,6 +352,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     if (!ctx.symbolic_args.empty()) {
       // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
       args = resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
+      symbolic = true;
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {
@@ -242,6 +384,24 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // Enforce that the host buffer correction size matches the expected device
   // allocation size.
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  // A symbolic loop's correction holds one slot per candidate iteration and
+  // the device reads slot k at iteration k only, so the upload stops after the
+  // slots this launch runs. The host compute above still fills every slot.
+  CorrectionUploadCounters& counters = correction_upload_counters();
+  counters.launches++;
+  counters.bytes_full += host_buffer->size();
+  size_t upload_bytes = host_buffer->size();
+  const bool loop_correction = symbolic && !full_correction_upload_forced() &&
+                               loopCorrectionPrefix(ctx, &upload_bytes);
+  counters.bytes_sent += upload_bytes;
+  if (loop_correction) {
+    if (upload_bytes < host_buffer->size()) {
+      counters.prefixed++;
+    }
+    uploadPrefix(stream, *host_buffer, upload_bytes);
+    return;
+  }
 
   if (ctx.batch_program_corrections) {
     ctx.program_corrections.push_back(

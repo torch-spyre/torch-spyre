@@ -276,6 +276,20 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
 
+Under a symbolic loop count (a `for_each_tile` loop over a dimension declared
+with `dynamic=`), the loop's correction holds one copy of the body's flits per
+candidate iteration, `max / granularity` of them, and the device reads copy
+`k` at iteration `k` only. The host still fills every copy on each launch, but
+the upload is cut to the address table plus the first `n` copies for the `n`
+iterations the launch runs, staged through the pinned allocator so the DMA
+reads pre-mapped memory instead of a shadow copy of the raw host buffer. The
+step recognises the loop's correction from the compiler's metadata (its symbol
+definitions read the loop dimension input and the blob divides into
+stick-aligned copies) and uploads every other correction whole, as before.
+`TORCH_SPYRE_FULL_CORRECTION_UPLOAD=1` restores the whole upload for every
+step, and `torch_spyre._C._correction_upload_stats()` reports the launches,
+the cut uploads and the bytes held and sent.
+
 The pinned host buffer is allocated once during `prepareKernel` and reused
 across launches. For tiled execution the same buffer cycles through every
 iteration. FIFO ordering guarantees each iteration's H2D consumes the buffer
