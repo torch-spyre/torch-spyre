@@ -1145,7 +1145,6 @@ class TestFfdcAsyncCompile:
         """Stub inductor/extension imports and return ``(mod, out_dir)``."""
         import logging
         import sys
-        import torch
 
         out_dir = str(tmp_path / "bundle")
 
@@ -1166,6 +1165,9 @@ class TestFfdcAsyncCompile:
                 from contextlib import nullcontext
 
                 return nullcontext()
+
+            def __getattr__(self, _name):
+                return lambda *_a, **_k: None
 
         inductor = _stub_module(
             monkeypatch,
@@ -1235,13 +1237,12 @@ class TestFfdcAsyncCompile:
         )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
-        # Run the process-local compiler and FFDC mocks inline.
-        monkeypatch.setattr(torch._inductor.config, "compile_threads", 1)
         monkeypatch.setattr(mod, "get_output_dir", lambda name, prefix=None: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
         return mod, out_dir
 
+    @torch._inductor.config.patch(compile_threads=1)
     def test_sdsc_dxp_failure_triggers_ffdc_collect(self, monkeypatch, tmp_path):
         """A backend-compiler failure must call try_collect then re-raise.
 
@@ -1284,6 +1285,7 @@ class TestFfdcAsyncCompile:
         assert calls[0]["kernel_name"] == "test_kernel"
         assert calls[0]["code_dir"] == out_dir
 
+    @torch._inductor.config.patch(compile_threads=1)
     def test_sdsc_dxp_failure_preserves_error_when_ffdc_raises(
         self, monkeypatch, tmp_path
     ):
