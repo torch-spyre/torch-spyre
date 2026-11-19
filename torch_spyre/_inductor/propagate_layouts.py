@@ -781,6 +781,11 @@ def _qfp8wt_stl(
         ElementArrangement.QFP8WT,
     )
     if unaligned > 0:
+        # c_size padded K to a full stick, so the constructor records 64 valid
+        # elements where the weight has stick_dim_size (e.g. 8).  Correct the
+        # count by rebuilding the layout: valid_elements is read-only on the
+        # object (Python gets a copy), so assigning to it would do nothing.
+        # test_2d_k8_small_m, test_2d_k8_large_m_uniform, test_zero_scale_weight.
         ve = stl.valid_elements
         stick_dim = len(stl.device_size) - 1
         stick_key = next(k for k in ve if stick_dim in k)
