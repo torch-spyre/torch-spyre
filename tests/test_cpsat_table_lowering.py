@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The table lowering of a CP-SAT cost objective: the base mechanics, one table per
-node, every value by lambdify. No device and no compile: each test builds its inputs
-by hand and solves the lowered model with CP-SAT.
+node, each node's list from its operands' lists by a function lambdified once per
+class. No device and no compile: each test builds its inputs by hand and solves the
+lowered model with CP-SAT.
 
 *Exact* means: every assignment of the inputs has exactly one solution, so each
 position and the cost are determined by the inputs, and that solution's cost is
@@ -21,6 +22,7 @@ COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
 import itertools
+import math
 
 import numpy as np
 import pytest
@@ -48,8 +50,10 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     TableLowering,
     TableLoweringError,
     UnitIndex,
-    values_on_grid,
 )
+from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
+from torch_spyre._inductor.scratchpad import cpsat_table_lowering as lowering
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 CAP = 8192
@@ -258,19 +262,26 @@ def test_a_node_realizes_itself_when_it_is_read():
         InputNode(a, (), CAP).realization
 
 
+def _count_evaluations(monkeypatch) -> list[sympy.Basic]:
+    """The nodes whose lists are computed from here on, in order: every list a node
+    makes goes through the lowering's _values, once."""
+    calls: list[sympy.Basic] = []
+    values = lowering._values
+
+    def counting(expr, count, compute):
+        calls.append(expr)
+        return values(expr, count, compute)
+
+    monkeypatch.setattr(lowering, "_values", counting)
+    return calls
+
+
 def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
-    calls: list[sympy.Basic] = []
-    lambdify = sympy.lambdify
-
-    def counting(args, expr, **kwargs):
-        calls.append(expr)
-        return lambdify(args, expr, **kwargs)
-
-    monkeypatch.setattr(sympy, "lambdify", counting)
+    calls = _count_evaluations(monkeypatch)
     root = TableLowering(case.inputs, cap=5).lower(a**0.5 * b)
     with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
         root.realization
@@ -385,34 +396,67 @@ def test_a_combined_position_is_row_major_at_every_assignment():
     assert sorted(position for _, _, position in rows) == list(range(12))
 
 
-# --------------------------------------------------------------- values_on_grid
+# ------------------------------------------------------------------- a node's list
 
 
-def test_values_on_grid_is_row_major_with_the_last_position_fastest():
+def _points(node: Node) -> tuple[list[sympy.Symbol], list[tuple[float, ...]]]:
+    """node's free symbols, sorted by sympy.default_sort_key, and their values at each
+    entry of its table: their positions in that order, row-major, the last fastest."""
+    columns = node.columns
+    symbols = sorted(columns, key=sympy.default_sort_key)
+    positions = list(dict.fromkeys(columns[s].index for s in symbols))
+    grid = np.indices(tuple(p.size for p in positions)).reshape(len(positions), -1)
+    axis = {p: k for k, p in enumerate(positions)}
+    arguments = [columns[s].values[grid[axis[columns[s].index]]] for s in symbols]
+    return symbols, list(zip(*arguments))
+
+
+def _stage_1(node: Node) -> np.ndarray:
+    """node's list as Stage 1 computed it: its whole expression lambdified with the
+    numpy module over its inputs, point by point when it takes scalars only."""
+    symbols, points = _points(node)
+    func = sympy.lambdify(symbols, node.expr, modules="numpy")
+    with np.errstate(all="ignore"):
+        try:
+            result = np.asarray(func(*np.array(points).T), dtype=float)
+        except (TypeError, ValueError):
+            result = np.array([func(*point) for point in points], dtype=float)
+    return np.broadcast_to(result, (len(points),))
+
+
+def _list(case: Case, expr: sympy.Basic) -> list[float]:
+    table = TableLowering(case.inputs, cap=CAP).lower(expr).realization
+    assert isinstance(table, TableRealization)
+    return list(table.values)
+
+
+def test_a_list_is_row_major_with_the_last_position_fastest():
+    """Each term is on one position, and the sum reads each at its own."""
     case = Case()
-    a = case.add_input("a", a=[0.0, 1.0])
-    b = case.add_input("b", b=[0.0, 1.0, 2.0])
-    c = case.add_input("c", c=[0.0, 1.0, 2.0, 3.0])
+    case.add_input("a", a=[0.0, 1.0])
+    case.add_input("b", b=[0.0, 1.0, 2.0])
+    case.add_input("c", c=[0.0, 1.0, 2.0, 3.0])
     sa, sb, sc = case.symbol("a"), case.symbol("b"), case.symbol("c")
-    values = values_on_grid(100 * sa + 10 * sb + sc, case.columns(), [a, b, c])
     expected = [
         100 * i + 10 * j + k for i in range(2) for j in range(3) for k in range(4)
     ]
-    assert list(values) == expected
+    assert _list(case, 100 * sa + 10 * sb + sc) == expected
 
 
-def test_values_on_grid_moves_two_symbols_of_one_position_together():
+def test_two_symbols_of_one_position_move_together():
     case = Case()
-    p = case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
+    case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
     d0, d1 = case.symbol("d0"), case.symbol("d1")
-    assert list(values_on_grid(d0 * d1, case.columns(), [p])) == [8.0, 8.0, 8.0]
+    assert _list(case, d0 * d1) == [8.0, 8.0, 8.0]
 
 
-def test_values_on_grid_broadcasts_a_constant():
+def test_a_constant_operand_is_read_at_every_entry():
+    """Max is lambdified as numpy.amax over its operands, which takes them only of one
+    length."""
     case = Case()
-    p = case.add_input("a", a=[1.0, 2.0, 4.0])
-    values = values_on_grid(sympy.Integer(5), case.columns(), [p])
-    assert list(values) == [5.0, 5.0, 5.0]
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    a = case.symbol("a")
+    assert _list(case, sympy.Max(a, 2)) == [2.0, 2.0, 4.0]
 
 
 def test_a_value_that_is_not_finite_is_refused():
@@ -431,7 +475,7 @@ def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root()
     reads a NaN as false, and an arm is never taken. The child that makes the value
     refuses it, be it an operation, a constant or a symbol."""
     case = Case()
-    position = case.add_input("a", a=[1.0, 2.0, 4.0], b=[1.0, np.inf, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0], b=[1.0, np.inf, 4.0])
     a, b = case.symbol("a"), case.symbol("b")
     infinite = 1 / (a - 2)
     nan = sympy.sqrt(a - 3)
@@ -441,27 +485,19 @@ def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root()
         (sympy.oo, sympy.Piecewise((sympy.oo, a > 4), (a, True))),
         (b, sympy.Min(a, b)),
     ):
-        assert np.all(np.isfinite(values_on_grid(expr, case.columns(), [position])))
+        root = TableLowering(case.inputs, cap=CAP).lower(expr)
+        assert np.all(np.isfinite(_stage_1(root)))
         with pytest.raises(TableLoweringError, match="not finite") as caught:
             case.lower(expr)
         assert caught.value.node == child
 
 
-def test_a_node_is_lambdified_once_and_only_when_its_realization_is_read(
-    monkeypatch,
-):
+def test_a_node_is_evaluated_once_and_only_when_its_realization_is_read(monkeypatch):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
-    calls: list[sympy.Basic] = []
-    lambdify = sympy.lambdify
-
-    def counting(args, expr, **kwargs):
-        calls.append(expr)
-        return lambdify(args, expr, **kwargs)
-
-    monkeypatch.setattr(sympy, "lambdify", counting)
+    calls = _count_evaluations(monkeypatch)
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
@@ -639,6 +675,167 @@ def test_the_naive_lowering_explodes_past_the_cap():
     plan, _ = case.lower(expr, cap=8192)
     index = plan.realization.index
     assert index.size == 4620
+
+
+# ----------------------------------------------------- one function for each class
+
+
+def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
+    """The expressions lambdified from here on, the lowering's functions forgotten."""
+    calls: list[sympy.Basic] = []
+    lambdify = sympy.lambdify
+
+    def counting(args, expr, **kwargs):
+        calls.append(expr)
+        return lambdify(args, expr, **kwargs)
+
+    monkeypatch.setattr(sympy, "lambdify", counting)
+    lowering._lambdified.cache_clear()
+    return calls
+
+
+def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
+    """Forty terms of one shape make hundreds of nodes and a few functions: every node
+    of one class and form of operands shares one."""
+    case = Case()
+    case.add_input("a", a=[float(v) for v in range(1, 65)])
+    case.add_input("b", b=[float(v) for v in range(1, 9)])
+    a, b = case.symbol("a"), case.symbol("b")
+    terms = [
+        (i + 1)
+        * sympy.Piecewise(
+            (sympy.floor((i + 64) / a) ** -0.25, a > i), (sympy.log(b + i), True)
+        )
+        + sympy.Max(a**0.5, b / (i + 1))
+        for i in range(40)
+    ]
+    expr = sympy.Add(*terms)
+    calls = _count_lambdify(monkeypatch)
+    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes[expr].cp_expr(case.model)
+    computed = [n for n in nodes.values() if type(n) is Node]
+    assert len(computed) > 300
+    assert len(calls) == len({str(c) for c in calls}) <= 12
+    np.testing.assert_allclose(
+        nodes[expr].realization.values, _stage_1(nodes[expr]), rtol=1e-12
+    )
+
+
+def test_a_quotient_is_divided_as_lambdify_prints_it():
+    """x/y is Mul(x, Pow(y, -1)), and from the lists of its children it would be
+    x*(1/y): 98*(1/49) is 1.9999999999999998, whose floor is 1. The Mul divides by
+    y, as lambdify prints it, and so for any negative rational exponent: 98/7**2."""
+    case = Case()
+    case.add_input("a", x=[98.0, 98.0, 49.0], y=[49.0, 7.0, 7.0])
+    x, y = case.symbol("x"), case.symbol("y")
+    assert math.floor(98 * (1 / 49)) == 1 and math.floor(98 * 7.0**-2) == 1
+    case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2))
+
+
+# Expressions over a, b and c, each node's list compared with Stage 1's.
+STAGE_1_LISTS = [
+    lambda a, b, c: a**2 * b + b**0.5 / a,
+    lambda a, b, c: sympy.sec(a / 4) + sympy.sinc(a),
+    lambda a, b, c: (a**0.5 + b) * a + sympy.log(a**0.5 + b),
+    lambda a, b, c: sympy.Piecewise((a**2, a > 1.5), (b, True)) + sympy.Max(a, b),
+    lambda a, b, c: sympy.Min(a + b, 3 * a) * sympy.floor(4 / a) + sympy.Abs(b - 2),
+    lambda a, b, c: sympy.Max(a * b, c) + sympy.floor(98 / a) + a / c**2,
+    lambda a, b, c: sympy.Piecewise(
+        (1 / b, sympy.Or(a >= 2, c < 3)), (sympy.ceiling(c / 3), True)
+    ),
+]
+
+
+@pytest.mark.parametrize("make", STAGE_1_LISTS)
+def test_every_list_is_stage_1s(make):
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0, 49.0])
+    case.add_input("b", b=[1.0, 3.0])
+    case.add_input("c", c=[1.0, 3.0, 7.0])
+    expr = make(case.symbol("a"), case.symbol("b"), case.symbol("c"))
+    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes[expr].cp_expr(case.model)
+    for node in nodes.values():
+        if type(node) is Node:
+            np.testing.assert_allclose(
+                node.realization.values,
+                _stage_1(node),
+                rtol=1e-12,
+                err_msg=str(node.expr),
+            )
+
+
+# A gate_up projection, as test_cost_model_replication.py builds it: symbolic M, N and
+# K splits and a weight's residency, priced by predict_ops.
+GU_K, GU_N = 4096, 25600
+SPLIT_M, SPLIT_N, SPLIT_K = sympy.symbols(
+    "split_m split_n split_k", integer=True, positive=True
+)
+WEIGHT_LX = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+MENU = [(4, 8, 1), (8, 4, 1), (2, 16, 1), (1, 16, 1), (8, 2, 2), (2, 4, 4), (1, 8, 4)]
+
+
+def _gate_up(rows: int) -> OpFeatures:
+    m, n, k = SPLIT_M, SPLIT_N, SPLIT_K
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        out_elems=rows * GU_N,
+        cores=m * n * k,
+        dtype_bytes=2,
+        reduction_cores=k,
+        args=[
+            ArgTraffic("buf0", "input", False, rows * GU_K, replication=n),
+            ArgTraffic(
+                "arg1_1", "input", WEIGHT_LX, GU_K * GU_N, broadcast=True,
+                is_boundary=True, replication=m,
+            ),
+            ArgTraffic("buf1", "output", False, rows * GU_N),
+        ],
+        is_matmul=True,
+        matmul_macs=rows * GU_K * GU_N,
+        matmul_a_bytes=2 * rows * GU_K,
+        matmul_b_bytes=2 * GU_K * GU_N,
+        matmul_rows_per_core=rows / m,
+        matmul_cols_per_core=GU_N / n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("rows", [8, 64], ids=["decode", "past-decode"])
+def test_the_cost_models_objective_has_the_annealers_values(rows):
+    """The objective predict_ops builds for the projection, its splits on one
+    candidate variable and the weight's residency on another: each entry of the root's
+    table is sympy.lambdify with the math module, the annealer's evaluator, at its
+    candidate and residency. At decode it holds the delivery-price functions, which
+    take scalars only."""
+    expr = sympy.sympify(predict_ops([_gate_up(rows)], _COST_PARAMS))
+    case = Case()
+    candidate = case.model.new_int_var(0, len(MENU) - 1, "division_mm")
+    lit = case.model.new_bool_var("is_lx")
+    for k, split in enumerate((SPLIT_M, SPLIT_N, SPLIT_K)):
+        case.inputs[split] = (candidate, [float(s[k]) for s in MENU])
+    case.inputs[WEIGHT_LX] = (lit, [0.0, 1.0])
+    root = TableLowering(case.inputs, cap=CAP).lower(expr)
+    prices = [f for f in expr.atoms(sympy.Function) if "delivery_price" in str(f)]
+    assert bool(prices) == (rows == 8)
+    symbols, points = _points(root)
+    annealer = sympy.lambdify(symbols, expr, modules="math")
+    values = root.realization.values
+    assert len(values) == 2 * len(MENU)
+    for value, point in zip(values, points):
+        assert value == pytest.approx(annealer(*point), rel=1e-9), point
+
+
+def test_the_projection_objective_differs_by_candidate():
+    """The test above reads a real objective: one that depends on the splits and the
+    weight's residency."""
+    expr = sympy.sympify(predict_ops([_gate_up(8)], _COST_PARAMS))
+    assert {SPLIT_M, SPLIT_N, SPLIT_K, WEIGHT_LX} <= expr.free_symbols
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K, WEIGHT_LX], expr, modules="math")
+    assert len({round(at(*split, 0), 3) for split in MENU}) > 1
+    assert at(4, 8, 1, 1) != at(4, 8, 1, 0)
 
 
 # ------------------------------------------ synthetic examples of later optimizations

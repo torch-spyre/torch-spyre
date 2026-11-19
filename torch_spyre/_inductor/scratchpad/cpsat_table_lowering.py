@@ -33,9 +33,12 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   the model (``TableRealization.cp_expr``), rounded onto ``COST_SCALE``, its position
   built by ``Index.cp_expr``. Only ``cp_expr`` methods touch the model.
 
-This is the base: one table per node, every value computed by ``sympy.lambdify`` over
-the node's inputs, and the root read as one lookup. It lowers an expression whose
-inputs fit the cap together and refuses anything wider. Nothing imports it yet.
+One table per node, and the root read as one lookup. A node's list is its function
+applied to its operands' lists, each read at every entry of the node's table. The
+function is the node's sympy class over placeholders, lambdified once for each class and
+form of operands and shared by every node of them (``_lambdified``). It lowers an
+expression whose inputs fit the cap together and refuses anything wider. Nothing imports
+it yet.
 """
 
 from __future__ import annotations
@@ -44,13 +47,14 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cached_property
-from typing import Any, TypeAlias
+from functools import cached_property, lru_cache
+from typing import Any, TypeAlias, cast
 
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
+from sympy.logic.boolalg import Boolean
 
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
@@ -100,6 +104,12 @@ class Index(ABC):
         a variable reads the variable. Each call builds anew, and a part reached twice
         is built twice: no step of this stage adds to the model."""
 
+    @abstractmethod
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        """The position at every point of a grid, from its parts' on_grid: what
+        cp_expr builds, computed. grid holds the coordinate of each input's position at
+        every point, and a leaf over a variable reads its own."""
+
 
 @dataclass(frozen=True)
 class InputIndex(Index):
@@ -114,6 +124,9 @@ class InputIndex(Index):
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
 
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        return grid[self]
+
 
 @dataclass(frozen=True)
 class UnitIndex(Index):
@@ -122,6 +135,9 @@ class UnitIndex(Index):
     size: int = field(default=1, init=False)
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        return 0
+
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return 0
 
 
@@ -140,6 +156,9 @@ class CombineIndex(Index):
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.left.cp_expr(model) * self.right.size + self.right.cp_expr(model)
 
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        return self.left.on_grid(grid) * self.right.size + self.right.on_grid(grid)
+
 
 UNIT = UnitIndex()
 
@@ -157,7 +176,7 @@ def _read_only(values: Any, index: Index) -> np.ndarray:
 class AbstractRealization(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
     it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
-    realization is a subclass: here a TableRealization, and from Stage 3 a
+    realization is a subclass: here a TableRealization, and from Stage 4 a
     LinearRealization too, what a sum is realized as."""
 
     @abstractmethod
@@ -213,52 +232,57 @@ Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
 Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
-# ----------------------------------------------------------- values by lambdify
+# --------------------------------------------------------------------------- values
 
 
-def _compile(expr: sympy.Basic) -> tuple[list[sympy.Symbol], Callable[..., Any]]:
-    symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-    return symbols, sympy.lambdify(symbols, expr, modules="numpy")
+# The form of an operand in its node's function: as it is (None), a condition
+# (CONDITION), or the base of a Mul's factor with a negative rational exponent, which
+# the function raises to that exponent (the exponent, a sympy.Rational).
+CONDITION = "condition"
+Form: TypeAlias = "str | sympy.Rational | None"
 
 
-def values_on_grid(
-    expr: sympy.Basic,
-    columns: Mapping[sympy.Symbol, TableRealization],
-    positions: Sequence[Index],
-) -> np.ndarray:
-    """expr at every joint assignment of positions, row-major, the last position
-    fastest: entry i1 * s1 + ... + im * sm, s_k the product of the sizes after k.
+@lru_cache(maxsize=1024)
+def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
+    """The function of a node of sympy class func whose operands take forms,
+    lambdified with the numpy module over one placeholder per operand. lambdify runs
+    once for each class and forms, and every node of them shares the function.
 
-    Each free symbol of expr is read from its column in columns, at its own position,
-    which must be one of positions; two symbols on one position move together. expr
-    is lambdified with the numpy module on each call: a node makes one call, when it
-    builds its table. A function that takes scalars only, as RelayoutCharge's
-    ``_imp_`` does, is evaluated point by point: on arrays it raises TypeError or,
-    where it tests a value with ``if``, ValueError. Raises TableLoweringError naming
-    expr when it has no numeric value, and for anything else evaluating it raises.
+    A condition is compared with 0, as a table holds it as 1.0 or 0.0. A Piecewise
+    pairs its operands, value then condition. A Mul raises the base of a factor with
+    a negative rational exponent to it, so a quotient is divided, as lambdify prints
+    it: 98/a, where 98*(1/a) is 1.9999999999999998 at a = 49."""
+    placeholders = [sympy.Dummy(f"operand{i}") for i in range(len(forms))]
+    args = [
+        p if form is None else sympy.Ne(p, 0) if form == CONDITION else p**form
+        for p, form in zip(placeholders, forms)
+    ]
+    if func is sympy.Piecewise:
+        expr = sympy.Piecewise(*zip(args[0::2], args[1::2]))
+    else:
+        expr = func(*args)
+    return sympy.lambdify(placeholders, expr, modules="numpy")
 
-    A value returned here need not be finite: a division by zero is infinite, and a
+
+def _apply(func: Callable[..., Any], arguments: Sequence[np.ndarray]) -> Any:
+    """func on its operands' lists, of one length. A function that takes scalars only,
+    as RelayoutCharge's ``_imp_`` does, is applied point by point: on arrays it raises
+    TypeError or, where it tests a value with ``if``, ValueError."""
+    try:
+        return np.asarray(func(*arguments), dtype=float)
+    except (TypeError, ValueError):
+        return np.array([func(*point) for point in zip(*arguments)], dtype=float)
+
+
+def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.ndarray:
+    """expr's list of count values, from compute(). Raises TableLoweringError naming
+    expr when it has no numeric value, and for anything else evaluating it raises. A
+    value returned here need not be finite: a division by zero is infinite, and a
     Piecewise with no arm true is NaN. The node that makes the list refuses it
-    (Node.realize).
-    """
-    shape = tuple(p.size for p in positions)
-    grid = np.indices(shape).reshape(len(shape), -1) if shape else np.zeros((0, 1), int)
-    count = grid.shape[1]
-    axis = {p: k for k, p in enumerate(positions)}
-    symbols, func = _compile(expr)
-    arguments = []
-    for symbol in symbols:
-        table = columns[symbol]
-        arguments.append(table.values[grid[axis[table.index]]])
+    (Node.realize)."""
     with np.errstate(all="ignore"):
         try:
-            try:
-                result = np.asarray(func(*arguments), dtype=float)
-            except (TypeError, ValueError):
-                result = np.array(
-                    [func(*(a[i] for a in arguments)) for i in range(count)],
-                    dtype=float,
-                )
+            result = np.asarray(compute(), dtype=float)
         except NameError as exc:
             raise TableLoweringError(expr, f"no numeric value ({exc})") from exc
         except Exception as exc:
@@ -266,6 +290,14 @@ def values_on_grid(
                 expr, f"no value ({type(exc).__name__}: {exc})"
             ) from exc
     return np.broadcast_to(result, (count,)).astype(float)
+
+
+def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
+    """Each position's coordinate at every joint assignment of positions, row-major,
+    the last position fastest: entry i1 * s1 + ... + im * sm, s_k the product of the
+    sizes after k."""
+    shape = tuple(p.size for p in positions)
+    return dict(zip(positions, np.indices(shape).reshape(len(shape), -1)))
 
 
 # ------------------------------------------------------------------------ the walk
@@ -282,6 +314,23 @@ def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
     return expr.args
 
 
+def _divides(expr: sympy.Basic, factor: sympy.Basic) -> bool:
+    """Whether factor is a factor of the Mul expr with a negative rational exponent,
+    which lambdify prints as a division."""
+    return (
+        isinstance(expr, sympy.Mul)
+        and isinstance(factor, sympy.Pow)
+        and bool(factor.exp.is_Rational)
+        and bool(factor.exp.is_negative)
+    )
+
+
+def _is_condition(expr: sympy.Basic) -> bool:
+    """Whether expr is a condition: a relational, a logical operation, true or false.
+    A symbol is not one."""
+    return isinstance(expr, Boolean) and not isinstance(expr, sympy.Symbol)
+
+
 @dataclass(eq=False)
 class Node:
     """The CP-SAT counterpart of one sympy node, which realizes itself.
@@ -291,8 +340,9 @@ class Node:
     as the sympy nodes: children holds the Nodes of children_of(expr), made before
     it, and a subexpression shared by two parents is one Node that both hold. A
     node reads only its children: the columns of its inputs are gathered from them,
-    and it reads their realizations when it is realized. cap bounds its table. No
-    model is involved until cp_expr.
+    and it reads their realizations when it is realized, a Mul the realization of the
+    base of a factor it divides by too (operands). cap bounds its table. No model is
+    involved until cp_expr.
 
     A node's realization, an AbstractRealization, is what a reader and the objective
     take of it: in this stage always its table, one TableRealization. Its columns and
@@ -328,7 +378,12 @@ class Node:
         the cap, one past the cap never evaluated, and when a value of it is not
         finite. Under the cap it reads its children's realizations first, so a child
         with a value that is not finite is refused at the child, naming it, whether
-        or not this node's value depends on it."""
+        or not this node's value depends on it.
+
+        Its list is its function (_lambdified) applied to its operands' lists, each
+        read at every entry of its table: an operand on the node's own position as it
+        is, one on fewer positions at its own position (Index.on_grid), and a constant
+        at every entry. Two symbols on one position move together."""
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
         entries = math.prod(p.size for p in positions)
@@ -344,8 +399,47 @@ class Node:
         index = positions[0]
         for position in positions[1:]:
             index = CombineIndex(index, position)
-        values = values_on_grid(self.expr, self.columns, positions)
+        grid = _grid(positions)
+        sources, forms = self.operands()
+        arguments = []
+        for source in sources:
+            if not isinstance(source, Node):
+                arguments.append(np.full(index.size, source))
+                continue
+            table = cast(TableRealization, source.realization)
+            if table.index == index:
+                arguments.append(table.values)
+            else:
+                at = table.index.on_grid(grid)
+                arguments.append(np.broadcast_to(table.values[at], (index.size,)))
+        values = _values(
+            self.expr,
+            index.size,
+            lambda: _apply(_lambdified(self.expr.func, forms), arguments),
+        )
         return self._finite(TableRealization(values=values, index=index))
+
+    def operands(self) -> tuple[list[Node | float], tuple[Form, ...]]:
+        """What the node's function reads, in order, and the form each takes in it
+        (_lambdified): the arguments, a Piecewise's arms' values and conditions, value
+        then condition, a RelayoutCharge's prices as constants, and in a Mul the base
+        of a factor with a negative rational exponent in its place, with the exponent.
+        Every other operand is a child, as it is or as a condition."""
+        children = dict(zip(children_of(self.expr), self.children))
+        parts = children_of(self.expr) if self.expr.is_Piecewise else self.expr.args
+        sources: list[Node | float] = []
+        forms: list[Form] = []
+        for part in parts:
+            if _divides(self.expr, part):
+                sources.append(children[part].children[0])
+                forms.append(part.exp)  # type: ignore[attr-defined]
+            elif part in children:
+                sources.append(children[part])
+                forms.append(CONDITION if _is_condition(part) else None)
+            else:
+                sources.append(_constant(part))
+                forms.append(None)
+        return sources, tuple(forms)
 
     def _finite(self, table: TableRealization) -> TableRealization:
         """table, refused naming the node when a value of it is not finite."""
@@ -383,7 +477,7 @@ class InputNode(Node):
         variable's lowest and highest values. Raises TableLoweringError naming the
         symbol, so a parent that reads it is refused by the symbol's name, when it has
         no input, when its variable is not an integer variable or its domain has gaps
-        (a position lookup for one comes with Stage 11), and when its values are not
+        (a position lookup for one comes with Stage 12), and when its values are not
         one number per value of its variable."""
         if self.input is None:
             raise TableLoweringError(self.expr, "a symbol with no input")
