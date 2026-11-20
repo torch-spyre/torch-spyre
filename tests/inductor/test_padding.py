@@ -968,57 +968,17 @@ class TestInsertPaddingIR(unittest.TestCase):
     def test_padded_read_step_shared_by_two_dims_is_rejected(self) -> None:
         """A per-trip step that two non-trivial dims of y could own is an error.
 
-        The stamped step is a stride of y's layout; when two dims of size above one
-        share it, there is no telling which one the loop walks, and re-striding the
+        The step is a stride of y's layout; when two dims of size above one share
+        it, there is no telling which one the loop walks, and re-striding the
         wrong one would read the wrong place after the first trip.  It must raise
         rather than leave the unpadded step in place (#5573).
         """
-        from torch._inductor.ir import FixedLayout
-
         from torch_spyre._inductor.errors import Unsupported
-        from torch_spyre._inductor.padding import (
-            _refresh_loop_advance_for_padded_read,
-        )
-
-        class _Buf:
-            def __init__(self, name, size, stride):
-                self._name = name
-                self._layout = FixedLayout(
-                    torch.device("cpu"), torch.float16, size, stride
-                )
-
-            def get_name(self):
-                return self._name
-
-            def get_layout(self):
-                return self._layout
+        from torch_spyre._inductor.padding import restride_loop_step
 
         # Two dims of size 2 and 3 share stride 4 (an overlapping view).
-        y = _Buf("y", [2, 3, 5], [4, 4, 1])
-        padded = _Buf("y_padded", [2, 3, 8], [24, 8, 1])
-
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
-
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[2],
-            loop_tiled_dims=[[]],
-            squeezed_advance_per_read=[[[(4, 1)]]],
-        )
-
-        class _Op:
-            loop_info = info
-
-            def get_read_writes(self):
-                from torch._inductor.dependencies import MemoryDep
-                import sympy
-
-                x = sympy.Symbol("d0")
-                dep = MemoryDep("y_padded", x, (x,), (6,))
-                return type("RW", (), {"reads": [dep]})()
-
         with self.assertRaisesRegex(Unsupported, "cannot tell which dim"):
-            _refresh_loop_advance_for_padded_read(_Op(), y, padded)
+            restride_loop_step(4, [2, 3, 5], [4, 4, 1], [24, 8, 1], "y")
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
@@ -1077,6 +1037,99 @@ class TestInsertPaddingIR(unittest.TestCase):
         )
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.5, rtol=0.05)
+
+    def _assert_pads_y_operand(
+        self, ops: list[Operation], k: int, padded_size: list[int]
+    ) -> None:
+        """One matmul over K, reading one padded copy of y at ``padded_size``."""
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), k)
+        padded = self._padded_buf_ops(self._ops_before(ops, mm))
+        self.assertEqual(len(padded), 1, "expected exactly one padded buffer")
+        self.assertEqual(
+            [int(s) for s in padded[0].get_size()],
+            padded_size,
+            "y is padded along its K in the operand's own shape",
+        )
+        self.assertIn(
+            padded[0].get_name(),
+            self.captured_read_names[mm.get_name()],
+            "the matmul must read the padded copy of y",
+        )
+
+    def test_y_view_folding_k_into_one_buffer_dim_pads_the_operand(self) -> None:
+        """y is ``b.view(B, G, N)`` of a ``[B, G * N]`` buffer, with K = G unaligned.
+
+        The view puts K inside one host dim of the buffer (coordinate ``n + N * k``),
+        so that dim is not K and cannot be padded to K_padded in place: it would be
+        "padded" from G * N down to K_padded.  The pass pads a copy of the operand
+        as the matmul reads it, ``[B, K_padded, N]``.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N = 4, 16, 2, 128
+        assert G % stick_size != 0
+
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        b_cpu = torch.randn(B, G * N, dtype=dtype)
+
+        def fn(e, b):
+            return torch.matmul(e, torch.nn.functional.silu(b).view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), b_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        # The one-hot e copies one fp16 SiLU value into each output element.
+        expected = fn(e_cpu.float(), b_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_view_of_a_slice_folding_k_pads_the_operand(self) -> None:
+        """As above, with y a slice of a wider buffer: the ``B`` part of an in_proj's
+        ``[x | B | C]`` output.  K's coordinate also carries the slice offset
+        (``n + N * k + INNER``).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        B, H, G, N, INNER = 4, 16, 2, 128, 1024
+        e_cpu = torch.zeros(H, G, dtype=dtype)
+        e_cpu[torch.arange(H), torch.arange(H) // (H // G)] = 1
+        xbc_cpu = torch.randn(B, INNER + 2 * G * N, dtype=dtype)
+
+        def fn(e, xbc):
+            _, b, _ = torch.nn.functional.silu(xbc).split([INNER, G * N, G * N], -1)
+            return torch.matmul(e, b.view(B, G, N))
+
+        ops, result = self.compile_and_run(fn, (e_cpu.to("spyre"), xbc_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, G, [B, stick_size, N])
+        expected = fn(e_cpu.float(), xbc_cpu.float())
+        torch.testing.assert_close(result.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_y_slice_along_k_pads_only_the_slice(self) -> None:
+        """``x @ w[:K]`` reads K rows of a weight with more than K_padded rows.
+
+        K's coordinate is K's own, but its host dim holds R > K_padded rows, so
+        padding that dim to K_padded would shrink it.  The pass pads a copy of the
+        ``[K, N]`` slice instead.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        M, K, R, N = 55, 67, 200, 128
+        k_padded = K + stick_size - K % stick_size
+        assert K % stick_size != 0 and R > k_padded
+
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(R, N, dtype=dtype)
+
+        def fn(x, w):
+            return x @ w[:K]
+
+        ops, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        self._assert_pads_y_operand(ops, K, [k_padded, N])
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
     def test_linear_unaligned_in_features(self) -> None:
         """``F.linear`` (bias included) compiles and is correct for unaligned

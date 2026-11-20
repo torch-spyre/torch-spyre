@@ -33,8 +33,9 @@ both ways compiles it twice (see :func:`dedup_key`).
 Options:
     --out DIR         where to write the scripts (default: ./captured)
     --kernel NAME     only emit kernels whose name contains NAME
-    --save-inputs     also dump recorded input values to a .pt beside each
-                      script, for byte-exact replay
+    --save-inputs     also dump each kernel's recorded inputs, and what its
+                      launch wrote, to a .pt beside its script, for byte-exact
+                      replay and for compare.py
     --no-execute      capture without a device or backend compiler (see below)
     --emitter EMITTER sdsc (default) or ktir: which backend the frontend targets
     --no-explain-header
@@ -42,15 +43,18 @@ Options:
 
 Exit status:
     0                 the target ran to completion and every kernel was written
-    3                 scripts were written, but the target raised partway through
-                      so later kernels are missing (see ``EXIT_PARTIAL``)
+    3                 scripts were written, but the target raised or exited with a
+                      non-zero status, so later kernels may be missing (see
+                      ``EXIT_PARTIAL``)
     1                 nothing was written
 """
 
 import argparse
-from collections.abc import Callable
+import atexit
+from collections.abc import Callable, Iterator
 import contextlib
 import dataclasses
+import itertools
 import os
 from pathlib import Path
 import runpy
@@ -70,7 +74,7 @@ from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.ktir import dialect_available
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
-from torch_spyre.execution.async_compile import SpyreAsyncCompile
+from torch_spyre.execution.async_compile import SpyreAsyncCompile, _safe_kernel_name
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -110,10 +114,10 @@ _ASYNC_COMPILE = "torch_spyre.execution.async_compile"
 _KTIR_PREREQUISITES = f"{_ASYNC_COMPILE}._check_ktir_device_prerequisites"
 _COMPILE_KTIR = f"{_ASYNC_COMPILE}.SpyreAsyncCompile._compile_ktir_with_dbo"
 
-# Scripts were written, but the target raised before it finished, so the capture
-# covers only the kernels compiled up to that point.  Distinct from 1 ("nothing
-# written") and from argparse's 2, so a caller can tell a partial capture from a
-# complete one without parsing stdout.
+# Scripts were written, but the target raised or exited with a non-zero status,
+# so the capture covers only the kernels compiled before it stopped.  Distinct
+# from 1 ("nothing written") and from argparse's 2, so a caller can tell a
+# partial capture from a complete one without parsing stdout.
 EXIT_PARTIAL = 3
 
 LICENSE_HEADER = "".join(
@@ -143,7 +147,12 @@ LICENSE_HEADER = "".join(
 
 @dataclasses.dataclass
 class ArgRecord:
-    """One tensor observed being passed to a kernel's .run()."""
+    """One tensor observed being passed to a kernel's .run().
+
+    With ``--save-inputs``, ``values`` is what it held going in and ``after``
+    what it held when the launch returned, or None if the launch left it as it
+    was: a weight would otherwise be held twice.
+    """
 
     shape: tuple
     dtype: torch.dtype
@@ -153,6 +162,7 @@ class ArgRecord:
     element_arrangement_name: str
     valid_elements: dict = dataclasses.field(default_factory=dict)
     values: object = None
+    after: object = None
 
 
 @dataclasses.dataclass
@@ -184,6 +194,10 @@ class KernelRecord:
     ktir_emitter: bool = False
     args: list = dataclasses.field(default_factory=list)
     observed_run: bool = False
+    # Order of its first launch among the capture's kernels, and whether that
+    # launch raised.
+    launch: int | None = None
+    raised: bool = False
 
 
 def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
@@ -216,20 +230,34 @@ class _RunRecorder:
     overwriting the inputs.
     """
 
-    def __init__(self, inner, rec: KernelRecord, save_inputs: bool):
+    def __init__(
+        self, inner, rec: KernelRecord, save_inputs: bool, launches: Iterator[int]
+    ):
         self._inner = inner
         self._rec = rec
         self._save_inputs = save_inputs
+        self._launches = launches
 
     def __getattr__(self, name):
         # Only reached for names the proxy itself does not define.
         return getattr(self._inner, name)
 
     def run(self, *args, **kwargs):
-        if not self._rec.observed_run:
-            _record_args(self._rec, args, self._save_inputs)
-            self._rec.observed_run = True
-        return self._inner.run(*args, **kwargs)
+        if self._rec.observed_run:
+            return self._inner.run(*args, **kwargs)
+        _record_args(self._rec, args, self._save_inputs)
+        self._rec.observed_run = True
+        self._rec.launch = next(self._launches)
+        try:
+            result = self._inner.run(*args, **kwargs)
+        except BaseException:
+            self._rec.raised = True
+            raise
+        if self._save_inputs:
+            for arg, tensor in zip(self._rec.args, args):
+                after = tensor.cpu()
+                arg.after = None if torch.equal(after, arg.values) else after
+        return result
 
 
 class _RunRecorderFuture(CodeCacheFuture):
@@ -240,16 +268,20 @@ class _RunRecorderFuture(CodeCacheFuture):
         inner: CodeCacheFuture,
         rec: KernelRecord,
         save_inputs: bool,
+        launches: Iterator[int],
     ) -> None:
         self._inner = inner
         self._rec = rec
         self._save_inputs = save_inputs
+        self._launches = launches
         self._runner: _RunRecorder | None = None
 
     def result(self, timeout: float | None = None):
         if self._runner is None:
             runner = self._inner.result(timeout=timeout)
-            self._runner = _RunRecorder(runner, self._rec, self._save_inputs)
+            self._runner = _RunRecorder(
+                runner, self._rec, self._save_inputs, self._launches
+            )
         return self._runner
 
 
@@ -272,6 +304,7 @@ def capture_kernels(
     flag, and one missed method is a silent empty capture.
     """
     records: list = []
+    launches = itertools.count()
     # ``Callable`` without a signature on purpose: the two methods differ in
     # arity, and an inferred union makes the pool_size call below unresolvable
     # statically.
@@ -283,7 +316,7 @@ def capture_kernels(
     def spy(method: str):
         real = originals[method]
 
-        def wrapper(self, kernel_name, specs, pool_size=0):
+        def wrapper(self, kernel_name, specs, pool_size=0, precomputed_key=None):
             rec = KernelRecord(
                 name=kernel_name,
                 specs=list(specs),
@@ -299,10 +332,16 @@ def capture_kernels(
             if method == "ktir":
                 runner = real(self, kernel_name, specs)
             else:
-                runner = real(self, kernel_name, specs, pool_size=pool_size)
+                runner = real(
+                    self,
+                    kernel_name,
+                    specs,
+                    pool_size=pool_size,
+                    precomputed_key=precomputed_key,
+                )
             if isinstance(runner, CodeCacheFuture):
-                return _RunRecorderFuture(runner, rec, save_inputs)
-            return _RunRecorder(runner, rec, save_inputs)
+                return _RunRecorderFuture(runner, rec, save_inputs, launches)
+            return _RunRecorder(runner, rec, save_inputs, launches)
 
         return wrapper
 
@@ -502,6 +541,7 @@ from torch_spyre._inductor.op_spec import (
     ProvenanceTransform,
     SourceLoc,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp,
     spyre_constant_tensor,
 )
@@ -514,6 +554,7 @@ KTIR_EMITTER = {rec.ktir_emitter}
 # name, and write_kernel disambiguates the scripts (name_1.py) -- so a
 # kernel-keyed .pt would be shared and the second capture would clobber the first.
 INPUTS_PT = os.path.splitext(os.path.abspath(__file__))[0] + ".inputs.pt"
+SAVED = torch.load(INPUTS_PT) if os.path.exists(INPUTS_PT) else None
 
 # Host (shape, dtype) per kernel arg, in arg_index order.
 SHAPES = [
@@ -534,10 +575,9 @@ def build_tensors():
     Integer args get zeros, not random values: they are usually indirect-access
     indices, where random data would be out of bounds.
     """
-    if os.path.exists(INPUTS_PT):
-        saved = torch.load(INPUTS_PT)
+    if SAVED is not None:
         print(f"inputs: replayed from {{INPUTS_PT}}")
-        return saved["tensors"]
+        return SAVED["tensors"]
     torch.manual_seed(0xAFFE)
     tensors = []
     for shape, dtype in SHAPES:
@@ -555,6 +595,16 @@ def build_tensors():
 {runner_template()}
 
 
+def observed_outputs():
+    """What each arg held once the captured launch returned, if it was saved."""
+    if SAVED is None or SAVED.get("outputs") is None or SAVED.get("raised"):
+        return None
+    # None marks an arg the launch left as it was. Its input is copied, since
+    # the replay writes its results into the tensors build_tensors returns.
+    pairs = zip(SAVED["tensors"], SAVED["outputs"])
+    return [t.clone() if o is None else o for t, o in pairs]
+
+
 if __name__ == "__main__":
     main(
         KERNEL_NAME,
@@ -564,6 +614,7 @@ if __name__ == "__main__":
         pool_size=POOL_SIZE,
         bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS,
         ktir_emitter=KTIR_EMITTER,
+        observed=observed_outputs(),
     )
 '''
 
@@ -572,18 +623,36 @@ def write_kernel(
     rec, out_dir, source, total, no_execute, save_inputs, explain_header=True
 ) -> str:
     """Write one kernel's script (and .pt) into out_dir; return the script path."""
-    path = os.path.join(out_dir, f"{rec.name}.py")
+    # A fused kernel name can fill NAME_MAX by itself. The compiler's trim keeps
+    # 24 bytes free; the longest file name below, <stem>_NN.inputs.pt, needs 13.
+    stem = _safe_kernel_name(rec.name)
+    path = os.path.join(out_dir, f"{stem}.py")
     suffix = 1
     while os.path.exists(path):
         # Two graphs in one program can produce the same fused kernel name.
-        path = os.path.join(out_dir, f"{rec.name}_{suffix}.py")
+        path = os.path.join(out_dir, f"{stem}_{suffix}.py")
         suffix += 1
     with open(path, "w") as f:
         f.write(emit_script(rec, source, total, no_execute, explain_header))
     if save_inputs and rec.observed_run:
+        read = {
+            arg.arg_index
+            for op in _iter_op_specs(rec.specs)
+            for arg in op.args
+            if isinstance(arg, TensorArg) and arg.is_input
+        }
         # Keyed on the script path, so a disambiguated script gets its own .pt.
         torch.save(
-            {"tensors": [a.values for a in rec.args]},
+            {
+                "name": rec.name,
+                "tensors": [a.values for a in rec.args],
+                "outputs": [a.after for a in rec.args],
+                "raised": rec.raised,
+                # A pure output's incoming contents are whatever was there.
+                "reads": [i in read for i in range(len(rec.args))],
+                "launch": rec.launch,
+                "arrangements": [a.element_arrangement_name for a in rec.args],
+            },
             os.path.splitext(path)[0] + ".inputs.pt",
         )
     return path
@@ -592,6 +661,17 @@ def write_kernel(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _stopped(failure: BaseException) -> str:
+    """How the target stopped, for the notes that report it."""
+    if isinstance(failure, SystemExit):
+        code = failure.code
+        # sys.exit("message") carries the message as its code (status 1).
+        if isinstance(code, int):
+            return f"exited with status {code}"
+        return f"exited with {code!r}"
+    return f"raised {type(failure).__name__} (traceback above)"
 
 
 def main(argv=None) -> int:
@@ -604,7 +684,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--save-inputs",
         action="store_true",
-        help="Dump recorded input values and pool bytes to a .pt for exact replay.",
+        help="Dump each kernel's recorded inputs, and what its launch wrote, to a .pt.",
     )
     parser.add_argument(
         "--no-execute",
@@ -643,20 +723,37 @@ def main(argv=None) -> int:
             "\n      still written. `tools/install-ktir.sh` installs the bindings."
         )
 
-    failure = None
+    failure: BaseException | None = None
     with capture_kernels(args.save_inputs, args.no_execute, args.emitter) as records:
+        capture = _Capture(args, script, records)
+        # A target can end the process itself once the exit handlers have run,
+        # as spyre-inference's pytest plugin does on a Spyre host, and never
+        # return here.
+        atexit.register(capture.write_at_exit)
         # Run as if invoked directly, so the target's __main__ block still fires.
         sys.argv = [script]
         try:
             runpy.run_path(script, run_name="__main__")
-        except Exception as exc:  # noqa: BLE001 -- a crash is a capture, not a stop
-            # The programs worth capturing are the ones that misbehave, and a
-            # kernel holding an UnimplementedOp raises on every launch. Whatever
-            # was recorded before the failure is still a valid reproducer, so
-            # write it out and report the exception at the end.
+        except SystemExit as exc:
+            # How a program ends, as in sys.exit(main()): it ran, so what it
+            # compiled is written, and only a non-zero status is a failure.
+            if exc.code not in (None, 0):
+                failure = exc
+        except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
+            # A crash is a capture, not a stop: the programs worth capturing are
+            # the ones that misbehave, and a kernel holding an UnimplementedOp
+            # raises on every launch. Whatever was recorded before the failure is
+            # still a valid reproducer, so write it out and report the exception
+            # at the end. Ctrl-C as well, so an interrupted capture reads as one.
             failure = exc
             traceback.print_exc()
 
+    atexit.unregister(capture.write_at_exit)
+    return capture.write(failure)
+
+
+def _write_capture(args, script: str, records: list, failure) -> int:
+    """Write the captured kernels; return capture.py's exit status."""
     if args.no_execute:
         # Said here as well as in the emitted header: by the time anyone reads
         # the header they have already seen the meaningless number.
@@ -668,8 +765,8 @@ def main(argv=None) -> int:
     if not records:
         if failure is not None:
             raise SystemExit(
-                f"no kernels captured: {script} raised "
-                f"{type(failure).__name__} before compiling anything (traceback above)."
+                f"no kernels captured: {script} {_stopped(failure)} before "
+                "compiling anything."
             )
         raise SystemExit(
             f"no kernels captured from {script}.\n"
@@ -718,13 +815,40 @@ def main(argv=None) -> int:
         raise SystemExit("nothing written")
     if failure is not None:
         print(
-            f"\nnote: {os.path.basename(script)} raised"
-            f" {type(failure).__name__} partway through (traceback above)."
-            "\n      The scripts above cover the kernels compiled before that"
-            f"\n      point; later kernels never compiled. Exit {EXIT_PARTIAL}."
+            f"\nnote: {os.path.basename(script)} {_stopped(failure)}."
+            "\n      The scripts above cover only the kernels it compiled before"
+            f"\n      it stopped. Exit {EXIT_PARTIAL}."
         )
         return EXIT_PARTIAL
     return 0
+
+
+@dataclasses.dataclass
+class _Capture:
+    """Writes a capture once: when the target returns, or from an exit handler if
+    the target ends the process itself. A target that runs the exit handlers and
+    then returns would otherwise get every kernel written twice."""
+
+    args: argparse.Namespace
+    script: str
+    records: list
+    written: bool = False
+    # What main() returns; stays 1 ("nothing written") if writing raises.
+    status: int = 1
+
+    def write(self, failure: BaseException | None) -> int:
+        if not self.written:
+            self.written = True
+            self.status = _write_capture(self.args, self.script, self.records, failure)
+        return self.status
+
+    def write_at_exit(self) -> None:
+        try:
+            self.write(None)
+        except SystemExit as exc:
+            print(exc.code, file=sys.stderr)
+        # The target may end the process with os._exit next, which flushes nothing.
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
