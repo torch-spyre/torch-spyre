@@ -896,18 +896,18 @@ def _split_host_dim_case():
     return case, d0
 
 
-def test_restickify_refuses_split_host_dim_by_default():
+@config.patch(allow_restickify_split_host_dim=False)
+def test_restickify_refuses_split_host_dim_when_not_allowed():
     (stl, host, ic, idc, arg), d0 = _split_host_dim_case()
-    assert not config.allow_restickify_split_host_dim
     result = pass_utils.compute_restickify_target_layout(
         stl, host, d0, ic, idc, arg=arg
     )
     assert result is None
 
 
-def test_size1_restickify_refuses_split_host_dim_by_default():
+@config.patch(allow_restickify_split_host_dim=False)
+def test_size1_restickify_refuses_split_host_dim_when_not_allowed():
     (stl, host, ic, idc, arg), _ = _split_host_dim_case()
-    assert not config.allow_restickify_split_host_dim
     result = pass_utils.compute_size1_restickify_layout(stl, host, ic, idc, arg=arg)
     assert result is None
 
