@@ -66,12 +66,84 @@ def test_source_run_matches_measured_dma_burst(sb, sx, expected):
     assert run_bytes(sb, sx) == expected
 
 
+@pytest.mark.parametrize("stick_planes", [False, True])
+def test_a_feature_memo_changes_no_device_run(stick_planes):
+    """Inside :func:`dcm.feature_memo` the division-independent axes are reused;
+    every run must still be what an unscoped call returns."""
+    access = (
+        [N, B, sympy.floor(X / 64), sympy.Mod(X, 64)],
+        [33280, 8, 2, 64],
+        {B: 8, X: 128, N: 1024},
+    )
+    divisions = [{B: sb, X: sx, N: 1} for sb in (1, 2, 4, 8) for sx in (1, 2)]
+    plain = [
+        dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+        for d in divisions
+    ]
+    with dcm.feature_memo():
+        scoped = [
+            dcm._contiguous_device_run(*access, d, stick_planes=stick_planes)
+            for d in divisions
+        ]
+    assert scoped == plain
+
+
+def test_a_feature_memo_derives_an_access_once_and_only_inside(monkeypatch):
+    """The axes of one access are derived once per scope however many
+    divisions ask, a nested scope shares the outer one, and outside any scope
+    nothing is kept."""
+    calls = []
+    real = dcm._device_run_axes
+
+    def counted(*args):
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(dcm, "_device_run_axes", counted)
+    with dcm.feature_memo():
+        run_bytes(8, 1)
+        run_bytes(4, 2)
+        with dcm.feature_memo():
+            run_bytes(2, 1)
+    assert len(calls) == 1
+    run_bytes(8, 1)
+    run_bytes(8, 1)
+    assert len(calls) == 3
+
+
+def test_reads_follow_the_shared_memo_outside_a_feature_memo(monkeypatch):
+    """Feature extraction reads an op's dependencies through ``op_read_writes``
+    with or without a :func:`dcm.feature_memo` scope, the post-pass report
+    included. An in-place edit of an op's reads therefore reaches it only once
+    the edit calls ``invalidate_op_read_writes``, as the memo's contract says."""
+    from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
+
+    class Op:
+        def __init__(self):
+            self.read = "first"
+
+        def get_read_writes(self):
+            dep = SimpleNamespace(index=self.read)
+            return SimpleNamespace(reads=[dep], writes=[dep])
+
+    monkeypatch.setattr(dcm, "iteration_space_from_op", lambda op: {})
+    monkeypatch.setattr(
+        dcm, "_work_slices", lambda op, write, read, space, slices: {"read": read}
+    )
+    op = Op()
+    assert dcm._resolved_work_slices(op) == {"read": "first"}
+    op.read = "rewritten"
+    assert dcm._resolved_work_slices(op) == {"read": "first"}
+    invalidate_op_read_writes(op)
+    assert dcm._resolved_work_slices(op) == {"read": "rewritten"}
+
+
 def test_geometry_keeps_symbolic_splits_and_physical_gaps():
     sb, sx = sympy.symbols("sb sx", integer=True, positive=True)
     expr = run_bytes(sb, sx)
     for b in (1, 2, 4, 8):
         for x in (1, 2):
-            assert expr.subs({sb: b, sx: x}) == run_bytes(b, x)
+            assert expr.xreplace({sb: b, sx: x}) == run_bytes(b, x)
     # Padding in X prevents coalescing across B, even though B is unsplit.
     assert (
         dcm._contiguous_device_run(
@@ -148,8 +220,8 @@ def test_residency_dtype_and_unknown_geometry():
     is_lx = sympy.Symbol("is_lx", integer=True)
     symbolic = replace(op, args=[replace(op.args[0], is_lx=is_lx), op.args[1]])
     expr = cm._transport_dma_excess_ns([symbolic], p)
-    assert expr.subs(is_lx, 1) == 0
-    assert expr.subs(is_lx, 0) == cm._transport_dma_excess_ns([op], p)
+    assert expr.xreplace({is_lx: 1}) == 0
+    assert expr.xreplace({is_lx: 0}) == cm._transport_dma_excess_ns([op], p)
     assert (
         cm._transport_dma_excess_ns([op], replace(p, transport_dma_ns_per_request={}))
         == 0
@@ -200,9 +272,9 @@ def test_compute_read_prices_a_stick_split_at_an_uncalibrated_count():
     # The solver sees the same choice through the symbolic core count.
     cores = sympy.Symbol("cores", integer=True, positive=True)
     expr = cm._transport_dma_excess_ns([replace(sticks22, cores=cores)], p)
-    assert float(expr.subs(cores, 22)) == pytest.approx(per_trip * trips)
-    assert expr.subs(cores, 16) == expr.subs(cores, 22)
-    assert 0 < expr.subs(cores, 32) < expr.subs(cores, 22)
+    assert float(expr.xreplace({cores: 22})) == pytest.approx(per_trip * trips)
+    assert expr.xreplace({cores: 16}) == expr.xreplace({cores: 22})
+    assert 0 < expr.xreplace({cores: 32}) < expr.xreplace({cores: 22})
 
 
 @pytest.mark.parametrize("cores", [16, 22])
@@ -271,8 +343,8 @@ def test_staging_copy_keeps_the_source_request_cost():
         direct, args=[direct.args[0], replace(direct.args[1], is_lx=is_lx)]
     )
     expr = sympy.sympify(cm._transport_dma_excess_ns([symbolic], p))
-    assert expr.subs(is_lx, 0) == expected
-    assert expr.subs(is_lx, 1) == expected
+    assert expr.xreplace({is_lx: 0}) == expected
+    assert expr.xreplace({is_lx: 1}) == expected
 
 
 @pytest.mark.parametrize(
@@ -343,7 +415,7 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     assert choices[solver.value(division)] == (2, 1)
     for i, (b, x) in enumerate(choices):
         expected = float(cm.predict_ops([restickify(b, x, n=n, trips=trips)]))
-        assert float(expr.subs({sb: b, sx: x})) == pytest.approx(expected)
+        assert float(expr.xreplace({sb: b, sx: x})) == pytest.approx(expected)
         fixed = model.clone()
         fixed.add(division == i)
         assert solver.solve(fixed) == cp_model.OPTIMAL
@@ -351,15 +423,19 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):
+    _src_ds = [33280, 8, 2, 64]
     src = SpyreTensorLayout(
-        device_size=[33280, 8, 2, 64],
+        device_size=_src_ds,
         stride_map=[1024, 128, 64, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 33280, (1,): 8, (2, 3): 128},
     )
+    _dst_ds = [8, 16, 128, 64]
     dst = SpyreTensorLayout(
-        device_size=[8, 16, 128, 64],
+        device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 8, (1, 3): 1024, (2,): 128},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -382,7 +458,7 @@ def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypa
 
 
 @pytest.fixture
-def staged_transport_graph():
+def staged_transport_graph(monkeypatch):
     from torch import fx
     from torch._inductor.graph import GraphLowering
     from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
@@ -390,11 +466,30 @@ def staged_transport_graph():
     from torch_spyre._inductor.ir import FixedTiledLayout
     from torch_spyre._inductor.loop_info import CoarseTileInfo, ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
+    from torch_spyre._inductor.propagate_hints import DimHint
 
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+
+    # TODO(#6509): the proof's local bound (``_affine_bounds``) does not tolerate a loop
+    # variable in the index, so on a real looped graph, where the direct read
+    # carries its loop term (stage 7.2b), it declines ("source element range is
+    # not statically provable") even though the advance bound is right. This
+    # fixture models the intended behaviour: the local bound is the index at
+    # loop trip zero.
+    local_bounds = rce._affine_bounds
+
+    def loop_aware_bounds(dep):
+        index = dep.index.xreplace({u0: sympy.S.Zero})
+        return local_bounds(MemoryDep(dep.name, index, dep.var_names, dep.size))
+
+    monkeypatch.setattr(rce, "_affine_bounds", loop_aware_bounds)
+    original_affine_bounds = local_bounds
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
-    def layout(shape, strides, device_size, stride_map):
+    def layout(shape, strides, device_size, stride_map, valid_elements):
         return FixedTiledLayout(
             device,
             torch.float16,
@@ -404,6 +499,7 @@ def staged_transport_graph():
                 device_size=device_size,
                 stride_map=stride_map,
                 device_dtype=DataFormats.SEN169_FP16,
+                valid_elements=valid_elements,
             ),
         )
 
@@ -411,18 +507,28 @@ def staged_transport_graph():
         source = InputBuffer(
             name="input",
             layout=layout(
-                [32768, 8, 128], [1024, 128, 1], [32768, 8, 2, 64], [1024, 128, 64, 1]
+                [32768, 8, 128],
+                [1024, 128, 1],
+                [32768, 8, 2, 64],
+                [1024, 128, 64, 1],
+                {(0,): 32768, (1,): 8, (2, 3): 128},
             ),
         )
         stage = ComputedBuffer(
             name="stage",
             layout=layout(
-                [1024, 8, 128], [1024, 128, 1], [8, 2, 1024, 64], [128, 64, 1024, 1]
+                [1024, 8, 128],
+                [1024, 128, 1],
+                [8, 2, 1024, 64],
+                [128, 64, 1024, 1],
+                {(0,): 8, (1, 3): 128, (2,): 1024},
             ),
             data=Pointwise(
                 device=device,
                 dtype=torch.float16,
-                inner_fn=lambda i: ops.load("input", 1024 * i[0] + 128 * i[1] + i[2]),
+                inner_fn=lambda i: ops.load(
+                    "input", 1024 * i[0] + 128 * i[1] + i[2] + 1048576 * u0
+                ),
                 ranges=list(map(sympy.Integer, [1024, 8, 128])),
             ),
         )
@@ -433,6 +539,7 @@ def staged_transport_graph():
                 [131072, 1024, 1],
                 [8, 16, 128, 64],
                 [131072, 64, 1024, 1],
+                {(0,): 8, (1, 3): 1024, (2,): 128},
             ),
             data=Pointwise(
                 device=device,
@@ -450,26 +557,49 @@ def staged_transport_graph():
         for op in (stage, consumer):
             op.operation_name = op.get_name()
             commit_iteration_space_ownership(op, {})
-        stage.loop_info = CoarseTileInfo(
-            (0,),
-            [sympy.Integer(32)],
-            [[]],
-            tiled_dims_per_read=[[[(0, sympy.Integer(1024))]]],
+        # The loop walks the source 1024 rows (1048576 elements) per trip; the
+        # staged copy carries the term in its read of the input, the consumer
+        # reads the copy at a fixed address.
+        hint = DimHint(
+            dim_names=[],
+            split_count=1,
+            loop_var=u0,
+            is_reduction=False,
+            loop_var_range=sympy.Integer(32),
         )
-        consumer.loop_info = CoarseTileInfo(
-            (0,), [sympy.Integer(32)], [[]], tiled_dims_per_read=[[[]]]
-        )
+        for op in (stage, consumer):
+            op.dim_hints = [hint]
+        stage.loop_info = CoarseTileInfo((0,), [sympy.Integer(32)], [[]])
+        consumer.loop_info = CoarseTileInfo((0,), [sympy.Integer(32)], [[]])
         consumer._read_copy_elision_record = ReadCopyElisionRecord(
             consumer_name="consumer",
             copy_name="stage",
             source_name="input",
             direct_inner_fn=lambda i: ops.load(
-                "input", 1024 * i[2] + 128 * i[0] + i[1]
+                "input", 1024 * i[2] + 128 * i[0] + i[1] + 1048576 * u0
             ),
-            direct_tiled_dims_per_level=(((2, sympy.Integer(1024)),),),
-            direct_squeezed_advance_per_level=((),),
         )
+        graph.original_affine_bounds = original_affine_bounds
         yield graph, stage, consumer
+
+
+def test_a_looped_direct_read_is_declined_while_the_local_bound_ignores_the_loop_term(
+    staged_transport_graph, monkeypatch
+):
+    """Pins today's behaviour (#6509): with the production ``_affine_bounds`` the
+    direct read of a looped consumer, which carries its loop term in the index, is
+    declined, although its advance bound is right. The fixture patches the local bound
+    so the other tests can reach the pricing; fixing #6509 turns this test into the
+    positive one."""
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    graph, stage, consumer = staged_transport_graph
+    monkeypatch.setattr(rce, "_affine_bounds", graph.original_affine_bounds)
+    direct, reason = rce._prove_matmul_direct_read(
+        consumer, stage, consumer._read_copy_elision_record
+    )
+    assert direct is None
+    assert reason == "source element range is not statically provable"
 
 
 def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_graph):
@@ -498,14 +628,13 @@ def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_grap
     sb, sx = sympy.symbols("sb sx", positive=True, integer=True)
     feats = dcm.extract_op_features(priced[0], {b: sb, x: sx, n: 1})
     cost = cm._transport_dma_excess_ns([feats], cm.CostParams())
-    assert float(cost.subs({sb: 2, sx: 1})) < float(cost.subs({sb: 8, sx: 2}))
+    assert float(cost.xreplace({sb: 2, sx: 1})) < float(cost.xreplace({sb: 8, sx: 2}))
 
 
 @pytest.mark.parametrize(
     "failure",
     [
         "one_candidate",
-        "validation",
         "disabled",
         "shared",
         "graph_output",
@@ -525,32 +654,34 @@ def test_projection_declines_without_a_universal_proof(
     divisions = {"consumer": splits}
     relayout_sources = ()
     proof = rce._prove_matmul_direct_read
-    if failure == "one_candidate":
+    overrides = {"read_copy_elision": False} if failure == "disabled" else {}
+    with config.patch(**overrides):
+        if failure == "one_candidate":
 
-        def prove(op, *args):
-            if op.iteration_space_ownership.work_slices[x] == 2:
-                return None, "unsupported candidate"
-            return proof(op, *args)
+            def prove(op, *args):
+                if op.iteration_space_ownership.work_slices[x] == 2:
+                    return None, "unsupported candidate"
+                return proof(op, *args)
 
-        monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-    elif failure == "validation":
-        monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
-    elif failure == "disabled":
-        monkeypatch.setattr(config, "read_copy_elision", False)
-    elif failure == "source_placement":
-        divisions["input"] = [{}]
-    elif failure == "relayout":
-        relayout_sources = ("stage",)
-    elif failure == "graph_output":
-        graph.graph_outputs = [stage]
-    else:
-        monkeypatch.setattr(rce, "_copy_readers", lambda *args: [consumer, consumer])
-    assert rce.project_transport_read_copies(
-        graph, divisions, relayout_sources=relayout_sources
-    ) == [
-        stage,
-        consumer,
-    ]
+            monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
+        elif failure == "disabled":
+            pass  # read_copy_elision=False, patched above
+        elif failure == "source_placement":
+            divisions["input"] = [{}]
+        elif failure == "relayout":
+            relayout_sources = ("stage",)
+        elif failure == "graph_output":
+            graph.graph_outputs = [stage]
+        else:
+            monkeypatch.setattr(
+                rce, "_copy_readers", lambda *args: [consumer, consumer]
+            )
+        assert rce.project_transport_read_copies(
+            graph, divisions, relayout_sources=relayout_sources
+        ) == [
+            stage,
+            consumer,
+        ]
 
 
 def test_real_allocator_keeps_proven_priced_direct_read_candidates(
@@ -626,82 +757,91 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
     commit_iteration_space_ownership(consumer, {b: 8, x: 2, n: 1})
-    if failure in ("disabled_pricing", "core_budget"):
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
-        )
+    overrides = {
+        "core_budget": {"sencores": 8},
+        "disabled_elision": {"read_copy_elision": False},
+        "hint": {"ignore_work_division_hints": False},
+    }.get(failure, {})
+    with config.patch(**overrides):
+        if failure in ("disabled_pricing", "core_budget"):
+            monkeypatch.setattr(
+                am,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
+            )
+        elif failure == "unsupported_core_count":
+            rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
+            del rates[2]
+            monkeypatch.setattr(
+                am,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
+            )
+        elif failure == "unknown_geometry":
+            monkeypatch.setattr(
+                dcm, "_transport_read_geometry", lambda *args: (None, None)
+            )
+        elif failure == "one_candidate":
+            proof = rce._prove_matmul_direct_read
+
+            def prove(op, *args):
+                if op.iteration_space_ownership.work_slices.get(b, 1) == 2:
+                    return None, "unsupported candidate"
+                return proof(op, *args)
+
+            monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
+        elif failure == "graph_output":
+            graph.graph_outputs = [stage]
+        elif failure == "shared_reader":
+            other = ComputedBuffer(
+                name="other", layout=consumer.layout, data=consumer.data
+            )
+            other.operation_name = "other"
+            other.loop_info = consumer.loop_info
+            commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
+            graph.operations.append(other)
+            graph.name_to_buffer[other.name] = other
+        elif failure == "disabled_elision":
+            pass  # read_copy_elision=False, patched above
+        elif failure == "hint":
+            monkeypatch.setattr(
+                am, "has_resolved_work_div_hint", lambda op: op is consumer
+            )
+        allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
+        if failure in ("source_clone", "relayout"):
+            from torch_spyre._inductor.scratchpad.plan_solver import (
+                CoreDivision,
+                CoreDivisionBuffer,
+                RelayoutCopyBuffer,
+            )
+
+            build = allocator._build_cd_bound_buffers
+
+            def with_allocation_choice(*args):
+                buffers = build(*args)
+                # Inject only the allocation-dependent choice, not divisions or
+                # the proof. Preparation must use the same context as pricing.
+                if failure == "source_clone":
+                    extra = CoreDivisionBuffer(
+                        "input", 128, [0, 1], core_divisions=[CoreDivision()]
+                    )
+                else:
+                    extra = RelayoutCopyBuffer(
+                        "shuffle",
+                        128,
+                        [0, 1],
+                        core_divisions=[CoreDivision()],
+                        relayout_parent=stage.name,
+                    )
+                return [*buffers, extra]
+
+            monkeypatch.setattr(
+                allocator, "_build_cd_bound_buffers", with_allocation_choice
+            )
         if failure == "core_budget":
-            monkeypatch.setattr(config, "sencores", 8)
-    elif failure == "unsupported_core_count":
-        rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
-        del rates[2]
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
-        )
-    elif failure == "unknown_geometry":
-        monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *args: (None, None))
-    elif failure == "one_candidate":
-        proof = rce._prove_matmul_direct_read
-
-        def prove(op, *args):
-            if op.iteration_space_ownership.work_slices.get(b, 1) == 2:
-                return None, "unsupported candidate"
-            return proof(op, *args)
-
-        monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-    elif failure == "graph_output":
-        graph.graph_outputs = [stage]
-    elif failure == "shared_reader":
-        other = ComputedBuffer(name="other", layout=consumer.layout, data=consumer.data)
-        other.operation_name = "other"
-        other.loop_info = consumer.loop_info
-        commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
-        graph.operations.append(other)
-        graph.name_to_buffer[other.name] = other
-    elif failure == "disabled_elision":
-        monkeypatch.setattr(config, "read_copy_elision", False)
-    elif failure == "hint":
-        monkeypatch.setattr(config, "ignore_work_division_hints", False)
-        monkeypatch.setattr(am, "has_resolved_work_div_hint", lambda op: op is consumer)
-    allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    if failure in ("source_clone", "relayout"):
-        from torch_spyre._inductor.scratchpad.plan_solver import (
-            CoreDivision,
-            CoreDivisionBuffer,
-            RelayoutCopyBuffer,
-        )
-
-        build = allocator._build_cd_bound_buffers
-
-        def with_allocation_choice(*args):
-            buffers = build(*args)
-            # Inject only the allocation-dependent choice, not divisions or
-            # the proof. Preparation must use the same context as pricing.
-            if failure == "source_clone":
-                extra = CoreDivisionBuffer(
-                    "input", 128, [0, 1], core_divisions=[CoreDivision()]
-                )
-            else:
-                extra = RelayoutCopyBuffer(
-                    "shuffle",
-                    128,
-                    [0, 1],
-                    core_divisions=[CoreDivision()],
-                    relayout_parent=stage.name,
-                )
-            return [*buffers, extra]
-
-        monkeypatch.setattr(
-            allocator, "_build_cd_bound_buffers", with_allocation_choice
-        )
-    if failure == "core_budget":
-        with pytest.raises(AssertionError, match="fixed direct-read division over"):
-            allocator._prepare_buffers(graph)
-        return
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == [am._fixed_core_division(consumer)]
+            with pytest.raises(AssertionError, match="fixed direct-read division over"):
+                allocator._prepare_buffers(graph)
+            return
+        buffers = allocator._prepare_buffers(graph)
+        actual = next(buf for buf in buffers if buf.name == consumer.name)
+        assert actual.core_divisions == [am._fixed_core_division(consumer)]

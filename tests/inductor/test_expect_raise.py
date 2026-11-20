@@ -86,6 +86,27 @@ class TestExpectRaise(unittest.TestCase):
         _run(cls, "test_f_a_c")  # raises, as expected
         _run(cls, "test_f_b_c")  # an ordinary test; does not raise
 
+    def test_float_case_name_keeps_op_specific_rejection(self):
+        def base(self, op, value):
+            if op == "a":
+                raise RuntimeError(f"Unsupported: alpha {value}")
+            self.assertEqual(value, 0.5)
+
+        cls = _make(
+            {
+                "ops_dict": {"a": "a", "b": "b"},
+                "param_sets": {"alpha_0.5": (0.5,)},
+                "expect_raise": {"a_alpha_0.5": r"Unsupported: alpha 0\.5"},
+            },
+            base,
+        )
+        self.assertEqual(
+            unittest.TestLoader().getTestCaseNames(cls),
+            ["test_f_a_alpha_0p5", "test_f_b_alpha_0p5"],
+        )
+        _run(cls, "test_f_a_alpha_0p5")
+        _run(cls, "test_f_b_alpha_0p5")
+
     def test_generated_raise_tests_are_tagged(self):
         cls = _make(
             {

@@ -204,8 +204,9 @@ def test_benchmarks_are_stamped_with_the_callers_component(
     monkeypatch.setattr(
         ingest,
         "insert_benchmarks",
-        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
-        or len(entries),
+        lambda client, db, comp, run_id, entries, **kw: (
+            written.append(comp) or len(entries)
+        ),
     )
     _run_main(
         ingest,
@@ -290,12 +291,19 @@ class FakeClient:
             return _Result([[self.already_ingested]])
         if "FROM test_runs" in sql:
             return _Result([[0]])
+        if "SELECT count() FROM test_cases" in sql or "FROM run_properties" in sql:
+            return _Result([[self._stored(sql)]])
         raise AssertionError(f"unexpected query: {sql}")
+
+    def _stored(self, sql):
+        """Rows a batch-failure probe would count: what this fake has inserted so far."""
+        table = "test_cases" if "FROM test_cases" in sql else "run_properties"
+        return sum(len(rows) for t, rows, _ in self.inserts if t == table)
 
     def command(self, sql):
         self.commands.append(sql)
 
-    def insert(self, table, rows, column_names=None):
+    def insert(self, table, rows, column_names=None, **kw):
         self.inserts.append((table, rows, column_names))
 
 

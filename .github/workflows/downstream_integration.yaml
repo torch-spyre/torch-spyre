@@ -1,0 +1,114 @@
+name: downstream_integration
+
+# Pre-queue stand-in for Jenkins' downstream fan-out: once auto-merge is enabled on a PR, or
+# anyone comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
+# (informational) integration suites on their main against this PR's torch-spyre head. Inert unless
+# GHA_DOWNSTREAM_INTEGRATION is "true".
+run-name: downstream-integration
+
+on:
+  pull_request:
+    types: [auto_merge_enabled]
+  issue_comment:
+    types: [created]
+
+# Only PR events share a group. Comments always get their own, so no commenter can cancel another run;
+# a repeated /spyre-test is superseded downstream through the PR-keyed pr_url_hash.
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  resolve:
+    name: Resolve PR
+    # Fork PRs get no secrets on pull_request; they can still be run with /spyre-test.
+    # Any commenter may run /spyre-test: no PR code or PR-authored input reaches this workflow, only the head SHA it dispatches.
+    if: >-
+      vars.GHA_DOWNSTREAM_INTEGRATION == 'true' && (
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (
+      github.event.issue.pull_request != null && (github.event.comment.body == '/spyre-test' || startsWith(github.event.comment.body, '/spyre-test '))))
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      sha: ${{ steps.pr.outputs.sha }}
+      url: ${{ steps.pr.outputs.url }}
+    steps:
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          {
+            echo "number=${PR_NUMBER}"
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"sha=" + .head.sha, "url=" + .html_url'
+          } >> "$GITHUB_OUTPUT"
+
+  downstream-integration:
+    name: Integration (${{ matrix.repo }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    continue-on-error: ${{ matrix.wait != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: hf-adapters
+            wait: 'true'
+            extra_inputs: '{}'
+          # Informational: dispatched and linked in the run summary, never awaited, so a slow or hung run cannot hold this workflow open or leave a pending status.
+          - repo: spyre-inference
+            wait: 'false'
+            extra_inputs: '{"image_rpms":"true"}'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATUS_SHA: ${{ needs.resolve.outputs.sha }}
+      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}
+    steps:
+      - name: Report pending
+        if: matrix.wait == 'true'
+        continue-on-error: true
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state=pending -f context="$STATUS_CONTEXT" \
+            -f description="Running" -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+      # Default branch: on /spyre-test the dispatch action is never taken from the PR.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          owner: torch-spyre
+          repositories: ${{ matrix.repo }}
+          permission-actions: write
+      - uses: ./.github/actions/dispatch-downstream-integration
+        id: dispatch
+        with:
+          repository: torch-spyre/${{ matrix.repo }}
+          extra_inputs: ${{ matrix.extra_inputs }}
+          wait: ${{ matrix.wait }}
+          token: ${{ steps.app-token.outputs.token }}
+          torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
+          hash_source: ${{ needs.resolve.outputs.url }}
+          pr_number: ${{ needs.resolve.outputs.number }}
+      - name: Report result
+        if: always() && matrix.wait == 'true'
+        continue-on-error: true
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          case "$JOB_STATUS" in success) state=success ;; cancelled) state=error ;; *) state=failure ;; esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="Downstream run ${state}" \
+            -f target_url="${RUN_URL:-${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}}"

@@ -1058,3 +1058,52 @@ def test_validate_reduction_dims_raises_on_mismatch():
             return x.amin(dim=0)
 
     _compile_expecting_error(fn, x, "expected_reduction_dims")
+
+
+@torch._inductor.config.patch(force_disable_caches=True)
+def test_names_do_not_arm_an_unrelated_compilation():
+    """Naming a tensor runs the pass only for compilations that take it.
+
+    name_tensor_dims used to set a module-global flag that the next compilation
+    consumed. A call served from the compile cache consumes nothing, so naming a
+    tensor before such a call left the flag set, and the next, unrelated
+    compilation ran the pass (a depthwise conv then failed its one-reduction-
+    variable check).
+    """
+    ran = []
+    real_impl = _pnd._propagate_named_dims_impl
+
+    def spy(graph):
+        ran.append(tuple(graph.graph_input_names))
+        real_impl(graph)
+
+    def named_fn(t):
+        return torch.abs(t)
+
+    def unrelated_fn(t):
+        return torch.neg(t)
+
+    _pnd.declare_tensor_dim("A", 256)
+    _pnd.declare_tensor_dim("B", 256)
+    try:
+        with (
+            patch.object(_pnd, "_propagate_named_dims_impl", spy),
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            mock_backend_compiler(),
+        ):
+            compiled = torch.compile(named_fn)
+            x = torch.randn(256, 256, dtype=torch.float16, device=DEVICE)
+            compiled(_pnd.name_tensor_dims(x, ["A", "B"]))
+            assert len(ran) == 1, "the named compilation did not run the pass"
+
+            # Same shape: served from the compile cache, so nothing compiles.
+            y = torch.randn(256, 256, dtype=torch.float16, device=DEVICE)
+            compiled(_pnd.name_tensor_dims(y, ["A", "B"]))
+            assert len(ran) == 1
+
+            z = torch.randn(256, 256, dtype=torch.float16, device=DEVICE)
+            torch.compile(unrelated_fn)(z)
+            assert len(ran) == 1, f"the pass ran on an unnamed compilation: {ran}"
+    finally:
+        _pnd.reset()

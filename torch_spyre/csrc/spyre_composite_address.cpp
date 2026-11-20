@@ -53,11 +53,21 @@ CompositeAddressHandle::CompositeAddressHandle(const at::Tensor& tensor)
     : storage_(tensor.storage()), composite_addr_([&]() {
         TORCH_CHECK(tensor.is_contiguous(),
                     "get_composite_address: tensor must be contiguous");
-        return &resolve_owner_ctx(tensor)->composite_addr;
+        // Same fail-closed rule as get_composite_address: sharded storage is
+        // several independently placed chunks, not one device allocation.
+        return get_composite_address(tensor);
       }()) {}
 
 flex::CompositeAddress* get_composite_address(const at::Tensor& tensor) {
-  return &resolve_owner_ctx(tensor)->composite_addr;
+  auto* ctx = resolve_owner_ctx(tensor);
+  // Sharded storage is a set of independently placed chunks, not one device
+  // allocation. Kernels, fills, and device-to-device copies that take a single
+  // CompositeAddress cannot consume it; fail here rather than let them address
+  // only part of the tensor. Host copies go through per-shard views instead.
+  TORCH_CHECK(!ctx->sharding.has_value(),
+              "this operation does not support sharded Spyre tensors yet "
+              "(sharded storage can only be copied to or from the CPU)");
+  return &ctx->composite_addr;
 }
 
 size_t CompositeAddressHandle::total_size() const {

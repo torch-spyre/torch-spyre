@@ -115,15 +115,21 @@ class TestConcreteBehaviourUnchanged(unittest.TestCase):
 
     def test_a_non_contiguous_leading_axis_falls_back_and_is_still_correct(self):
         # as_strided would take the strides on trust here and be wrong, so the
-        # contiguity test has to send this down the flatten path. The log line
-        # proves the fallback was taken, not just that the values agree.
+        # contiguity test has to send this down the flatten path. The copy and
+        # the log record prove the fallback was taken, not just that the values
+        # agree. The record is checked by level and arguments, not by its wording.
         ys = _not_foldable_by_view()
 
         with self.assertLogs(fold_logger, level="DEBUG") as captured:
             folded = _stacked_to_full(ys, 0)
 
         torch.testing.assert_close(folded, ys.flatten(0, 1))
-        self.assertTrue(any("folding with flatten" in m for m in captured.output))
+        self.assertNotEqual(
+            folded.untyped_storage().data_ptr(), ys.untyped_storage().data_ptr()
+        )
+        (record,) = captured.records
+        self.assertEqual(record.levelname, "DEBUG")
+        self.assertEqual(record.args, (tuple(ys.shape), tuple(ys.stride())))
 
     def test_the_view_path_logs_nothing(self):
         ys = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)

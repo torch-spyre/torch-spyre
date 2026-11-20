@@ -19,7 +19,10 @@ end of ``splice_while_loops``, every later pass against ``OpsView``, ``expand``
 before the cost model) and with ``loop_node.BUILD_LOOP_NODES`` off, which is the
 pipeline as it was before nodes existed.  The IR at the end of pre-scheduling
 and the generated code must be identical, with only LX allocation offsets
-masked.  The test also checks that the nodes really were in the graph while the
+masked.  Both compiles expand the nodes after the pass loop
+(``loop_scheduler.SCHEDULE_LOOP_NODES`` off): this file pins the pass loop.
+Handing the nodes to the scheduler is compared in
+``test_loop_scheduler_equivalence.py``.  The test also checks that the nodes really were in the graph while the
 passes ran, so it cannot pass by never building them.
 """
 
@@ -38,7 +41,7 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
-from torch_spyre._inductor import loop_node
+from torch_spyre._inductor import loop_node, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.loop_node import LoopNode
 from torch_spyre._inductor.pass_utils import format_operations
@@ -226,6 +229,9 @@ def _compile(fn, args, extra_patch, *, nodes: bool):
             mock.patch.object(ts_passes, "_flat_operations", _recording_flat_operations)
         )
         stack.enter_context(mock.patch.object(loop_node, "BUILD_LOOP_NODES", nodes))
+        stack.enter_context(
+            mock.patch.object(loop_scheduler, "SCHEDULE_LOOP_NODES", False)
+        )
         stack.enter_context(torch._inductor.config.patch(force_disable_caches=True))
         # The co-optimizing LX planner's CP-SAT solve is time-bounded
         # (cpsat_time_limit_seconds) and runs several search workers, so on a
@@ -256,14 +262,17 @@ def test_loop_nodes_change_nothing_downstream(case):
 
     # The nodes really existed while the passes ran: the pass right after the
     # splice (deadcode_elimination) saw at least one node in the real list.
+    # Per-pass counts are a pre-pass snapshot, so splice_while_loops's own
+    # entry still reads 0 (looked up by name, not assumed to be first, since
+    # apply_reserved_dims_contract now runs ahead of it).
     names = [name for name, _, _ in with_nodes["per_pass"]]
-    assert names[0] == "splice_while_loops"
-    first_after_splice = with_nodes["per_pass"][1]
+    splice_idx = names.index("splice_while_loops")
+    first_after_splice = with_nodes["per_pass"][splice_idx + 1]
     assert first_after_splice[1] > 0, (
         f"no LoopNode in graph.operations at {first_after_splice[0]}"
     )
     # Every pass after the splice saw them (none removes a whole loop here).
-    assert all(count > 0 for _, count, _ in with_nodes["per_pass"][1:])
+    assert all(count > 0 for _, count, _ in with_nodes["per_pass"][splice_idx + 1 :])
     # ...and none were built with the switch off.
     assert all(count == 0 for _, count, _ in flat["per_pass"])
     # expand left none behind.

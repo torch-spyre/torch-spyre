@@ -65,6 +65,7 @@ class SpyreStream {
   // flex::RuntimeStream::launchOperation(FillAsyncParams*) wrapper, which
   // performs the value->pattern conversion internally.
   void launchFillAsync(flex::FillAsyncParams* params) const;
+  void launchCopyRaw(flex::CopyRawParams* params) const;
   // Host-side compute for deeptools host compute calls.
   flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
 
