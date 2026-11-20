@@ -8584,6 +8584,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A mean pool over each sequence's tokens: the staggered sum is divided by a
+        # per-sequence fp32 length broadcast across the stick dim, then cast back.
+        (
+            "test_ea_reduction_dl16tofp32_mean_pool",
+            "test_ea_reduction_dl16tofp32_mean_pool_cpu",
+        ): {
+            "param_sets": {
+                "2x64x384": (
+                    cached_randn((2, 64, 384), dtype=torch.float16),
+                    torch.tensor([[5.0], [64.0]], dtype=torch.float32),
+                ),
+                "4x8x128": (
+                    cached_randn((4, 8, 128), dtype=torch.float16),
+                    torch.tensor([[1.0], [3.0], [8.0], [8.0]], dtype=torch.float32),
+                ),
+            },
+        },
         (
             "test_round_trip_to_dtype_implicit_invalid",
             "test_round_trip_to_dtype_implicit_invalid_cpu",
@@ -13708,6 +13725,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.float().sum(0) + y
 
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_dl16tofp32_mean_pool_cpu(self, x, lens):
+        def fn(x, lens):
+            return (x.to(torch.float32).sum(dim=1) / lens).to(torch.float16)
+
+        self.compare_with_cpu(fn, x, lens, cpu_compile=False, run_eager=False)
 
     def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
         # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
