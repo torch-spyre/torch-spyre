@@ -43,7 +43,7 @@ from torch._inductor.virtualized import V
 from . import config
 from .errors import Unsupported
 from .pass_utils import op_read_writes
-from torch_spyre.sharding import _require_exact_int
+from torch_spyre.sharding import _require_exact_int, _require_int_list
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,9 +97,17 @@ def check_sharded_input(
     name: str, tensor: torch.Tensor, placement: ShardedPlacement, stl
 ) -> None:
     """A sharded graph input must be a base tensor in its own shard layout."""
+    from torch_spyre import _C
+
     size = list(tensor.shape)
     ok = (
         tensor._base is None
+        # A detached block view (x[:8].detach()) has no _base; only the
+        # whole tensor has the shape the storage was allocated for.
+        and size
+        == _require_int_list(
+            "global_shape", _C._spyre_sharding_info(tensor)["global_shape"]
+        )
         and tensor.is_contiguous()
         and tensor.storage_offset() == 0
         and 0 <= placement.shard_dim < len(size)
