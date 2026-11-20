@@ -1250,8 +1250,6 @@ def _insert_mutation_relayout_copy(
                 loop_count=list(loop_info.loop_count),
                 loop_tiled_dims=[[] for _ in range(depth)],
                 loop_tiled_reduction_dims=[[] for _ in range(depth)],
-                tiled_dims_per_read=[[[] for _ in range(depth)]],
-                output_tiled_dims=[[] for _ in range(depth)],
             )
 
     logger.info(

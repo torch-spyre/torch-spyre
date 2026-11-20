@@ -80,12 +80,6 @@ class ReadCopyElisionRecord:
     copy_name: str
     source_name: str
     direct_inner_fn: object
-    direct_tiled_dims_per_level: (
-        tuple[tuple[tuple[int, sympy.Expr], ...], ...] | None
-    ) = None
-    direct_squeezed_advance_per_level: (
-        tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
-    ) = None
     # Intermediate copies that become dead only if the deferred proposal is
     # accepted, ordered from the replacement consumer back toward the source.
     orphaned_copy_names: tuple[str, ...] = ()
@@ -93,7 +87,10 @@ class ReadCopyElisionRecord:
 
 @dataclass
 class CoarseTileInfo:
-    """Loop metadata stamped on a ``ComputedBuffer`` by the coarse-tiling pass.
+    """Loop metadata stamped on a ``ComputedBuffer`` by the ``for_each_tile`` lowering.
+
+    It holds the loop's own facts only. An access's per-trip advance is the loop
+    variable's coefficient in the access's index (``loop_facts.read_advance``).
 
     Attributes
     ----------
@@ -113,82 +110,12 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
-    tiled_dims_per_read:
-        One entry per read dependency in ``op.get_read_writes().reads`` (in
-        that iteration order, filtered to ``MemoryDep`` -- same positional
-        convention the deleted ``tile_advance_exprs`` used). Each entry is a
-        list of per-nesting-level ``(op_dim_index, extent)`` pairs,
-        outermost level first (matching ``loop_count``/``loop_tiled_dims``):
-        the host-range positional dims (or ``n_output_dims + reduction_pos``
-        for reduction dims, matching ``loop_tiled_dims``'s own numbering)
-        tiled *for this dependency* at that level, paired with that level's
-        own tile extent: for a dim tiled at more than one level, an outer
-        level's extent equals the final (innermost) extent times the
-        product of every more-inner level's own count that also tiles that
-        dim.
-        An empty per-level list means this read's address does not advance at
-        that level. It does not by itself prove value invariance: a producer
-        may rewrite fixed-address scratch on every trip. This is a tiling
-        *decision*, not a substituted index expression -- deferred
-        substitution into the dependency's actual
-        (possibly later-rewritten) index expression happens in
-        spyre_kernel.py at OpSpec/TensorArg construction time, when the
-        index is guaranteed final.
-    output_tiled_dims:
-        The analogous per-level ``(op_dim_index, extent)`` list for this
-        op's own write dependency. Defaults to ``[]`` (no levels tiled).
-    squeezed_advance_per_read:
-        One entry per read dependency, parallel to ``tiled_dims_per_read``.
-        Each entry is a list of per-nesting-level ``(host_stride, extent)``
-        pairs for dims tiled down to extent 1 in this dep's own iteration
-        space -- Inductor's ``SqueezeView.squeezer`` unconditionally drops
-        any such dim from ``dep.index`` (called via
-        ``ComputedBuffer.get_read_writes()`` -> ``extract_read_writes`` ->
-        ``index_vars_squeeze``), so no ``d{i}`` symbol survives for
-        ``_host_dim_to_index_symbol`` to substitute into -- unlike a dim
-        merely absent from one read among several (genuine broadcast),
-        which ``tiled_dims_per_read`` already handles correctly via
-        substitution. ``host_stride`` is the dim's canonical index
-        coefficient in the *squeezed* iteration space of the op whose
-        ``data.ranges`` sizes this dim (product of that op's own
-        ``data.ranges`` sizes strictly to the dim's right) -- the same units
-        every surviving ``d{i}`` symbol in ``dep.index`` already carries,
-        since Inductor mints those coefficients over the unsqueezed
-        ``data.ranges`` and squeeze only renumbers/drops symbols, never
-        rescales them. This is deliberately NOT the buffer's real PyTorch
-        memory stride (``full_buf.layout.stride``) -- that is a different
-        unit system that ``tiling_expr_to_device_expr``'s ``stride_map``-
-        based dimension selection cannot be compared against, and picking
-        the wrong device axis when the two happen to diverge silently
-        advances the wrong dimension (see issue surfaced by
-        ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
-        ``SpyreKernel._general_tile_advance`` can add its device-address
-        contribution as an extra term via ``tiling_expr_to_device_expr``
-        rather than by substitution. An empty per-read list means that read
-        has no such dims. The outer list may also be empty when no read in the
-        operation needs squeezed-dimension metadata; that is complete "none
-        needed" metadata, not a missing entry for every read.
-    squeezed_advance_output:
-        The analogous per-level ``(host_stride, extent)`` list for this op's
-        own write dependency, parallel to ``output_tiled_dims`` the same way
-        ``squeezed_advance_per_read`` is parallel to ``tiled_dims_per_read``.
-        Defaults to ``[]`` (no levels tiled).
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
-    tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = field(
-        default_factory=list
-    )
-    output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
-    squeezed_advance_per_read: list[list[list[tuple[sympy.Expr, sympy.Expr]]]] = field(
-        default_factory=list
-    )
-    squeezed_advance_output: list[list[tuple[sympy.Expr, sympy.Expr]]] = field(
-        default_factory=list
-    )
 
 
 # ---------------------------------------------------------------------------

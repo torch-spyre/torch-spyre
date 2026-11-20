@@ -27,6 +27,7 @@ test_suite_config:
 
         - names:
             - TestUnsupportedGates::test_h2d_copy_fp64_raises_error
+            - TestUnsupportedGates::test_kernel_to_dtype_without_src_dtype_raises_unsupported
           mode: mandatory_success
 
   global:

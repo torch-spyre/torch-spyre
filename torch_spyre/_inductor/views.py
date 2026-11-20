@@ -1463,7 +1463,7 @@ def tiling_expr_to_device_expr(
     for var in vars:
         # step must be var's own coefficient, not index's value at var=1 --
         # those only coincide when index has zero constant term. `index` can
-        # legitimately carry one here: _general_tile_advance builds it from
+        # legitimately carry one here: _index_tile_advance builds it from
         # dep.index, which bakes in literal offsets from Python-level slicing
         # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
         # constant +start*row_stride term alongside the tiled-dim symbol).
