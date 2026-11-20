@@ -19,6 +19,7 @@ import torch._dynamo
 import torch._higher_order_ops.effects
 from torch._inductor.fx_passes.reinplace import InplaceableOp, inplaceable_ops
 
+from torch_spyre.ops.bisect_exemption import suspended as _bisect_suspended
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
@@ -135,7 +136,9 @@ def rms_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.compile(torch.ops.spyre.rms_norm)(x, normalized_shape, weight, eps)
+    # A nested compile of an eager op: see ``compile_once``.
+    with _bisect_suspended():
+        return torch.compile(torch.ops.spyre.rms_norm)(x, normalized_shape, weight, eps)
 
 
 @rms_norm.register_fake

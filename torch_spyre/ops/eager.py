@@ -15,6 +15,7 @@
 import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
+from .bisect_exemption import suspended as _bisect_suspended
 from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
@@ -103,12 +104,18 @@ def compile_once(op, **compile_kwargs):
         def wrapper(*args, **kwargs):
             nonlocal compiled
             nonlocal op
-            if compiled is None:
-                if isinstance(op, str):
-                    op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(_op_frame(op), **compile_kwargs)
-            with _guard_reentry(op):
-                return fn(*args, compiled=compiled, **kwargs)
+            # This kernel is the device's eager mode, not part of a program a
+            # compiler bisection is testing. The exemption has to cover the
+            # ``torch.compile`` call (the bisector overrides its backend) and
+            # the kernel's execution (it compiles on first call, and that is
+            # when the bisector's subsystem counters are read).
+            with _bisect_suspended():
+                if compiled is None:
+                    if isinstance(op, str):
+                        op = operator.attrgetter(op)(torch.ops)
+                    compiled = torch.compile(_op_frame(op), **compile_kwargs)
+                with _guard_reentry(op):
+                    return fn(*args, compiled=compiled, **kwargs)
 
         # We remove the `compiled` arg from the signature to have
         # a clean signature.
@@ -199,11 +206,15 @@ def _rebuild_view_on_device(x):
         view_copy.__code__ = view_copy.__code__.replace(
             co_varnames=view_copy.__code__.co_varnames
         )
-        rebuild = torch.compile(view_copy, dynamic=False)
+        # A nested kernel like ``compile_once``'s, not part of a program under
+        # bisection: exempt its ``torch.compile`` call here and its run below.
+        with _bisect_suspended():
+            rebuild = torch.compile(view_copy, dynamic=False)
         _view_rebuilders[key] = rebuild
         if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
             _view_rebuilders.popitem(last=False)
-    return rebuild(base)
+    with _bisect_suspended():
+        return rebuild(base)
 
 
 def _layout_serves_own_view(x) -> bool:

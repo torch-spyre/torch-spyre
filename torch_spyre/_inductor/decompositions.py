@@ -70,6 +70,7 @@ from .logging_utils import get_inductor_logger
 from . import customops  # noqa: F401
 from .wsr import for_each_tile
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
+from torch_spyre.ops.bisect_exemption import suspended as _bisect_suspended
 import torch_spyre._inductor.customops  # noqa: F401
 
 logger = get_inductor_logger("decompositions")
@@ -1683,14 +1684,16 @@ class _OPWrapper:
             )
         if torch.compiler.is_compiling():
             return self._fn(*args, **kwargs)
-        if self._compiled_fn is None:
-            self._compiled_fn = torch.compile(self._fn, dynamic=False)
-        # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
-        # scalar induction variable with ``item()``.  Eager PrivateUse1
-        # dispatch reaches that rewrite through this lazy compilation path,
-        # outside Dynamo's usual scalar-capture setup.
-        with torch._dynamo.config.patch(capture_scalar_outputs=True):
-            return self._compiled_fn(*args, **kwargs)
+        # A nested compile of an eager op: see ``compile_once``.
+        with _bisect_suspended():
+            if self._compiled_fn is None:
+                self._compiled_fn = torch.compile(self._fn, dynamic=False)
+            # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
+            # scalar induction variable with ``item()``.  Eager PrivateUse1
+            # dispatch reaches that rewrite through this lazy compilation path,
+            # outside Dynamo's usual scalar-capture setup.
+            with torch._dynamo.config.patch(capture_scalar_outputs=True):
+                return self._compiled_fn(*args, **kwargs)
 
 
 def _register_spyre_dispatchkey_kernels_permanently():
