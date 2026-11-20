@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`spool [list | drop TOKEN]`: look at and clear batches parked in CH_WRITE_SPOOL.
+"""`spool [list [--fail-if-pending] | drop TOKEN]`: look at and clear batches parked in CH_WRITE_SPOOL.
 
 A parked batch is one a write could not land. Nothing sends it again: check the table, send the
 rows yourself if they are missing (the file is plain JSON), then `drop` it.
+
+`list` exits 0 whatever the spool holds, unless `--fail-if-pending` is given: then it exits 75
+(EX_TEMPFAIL) when any batch is parked or any quarantined, unreadable or leftover temp file exists.
 """
 
 import json
@@ -24,6 +27,8 @@ import sys
 from pathlib import Path
 
 from .resilience import Spool
+
+PENDING_EXIT = 75
 
 
 def main(argv=None) -> int:
@@ -34,10 +39,17 @@ def main(argv=None) -> int:
         return 2
     spool = Spool(where)
     cmd, rest = (argv[0] if argv else "list"), argv[1:]
-    if cmd == "list" and not rest:
-        for item in spool.items():
+    if cmd == "list" and rest in ([], ["--fail-if-pending"]):
+        items = spool.items()
+        for item in items:
             print(json.dumps(item))
-        return 0
+        bad = {k: v for k, v in spool.problems().items() if v}
+        for kind, names in bad.items():
+            print(
+                f"spool: {len(names)} {kind} file(s): {', '.join(names)}",
+                file=sys.stderr,
+            )
+        return PENDING_EXIT if rest and (items or bad) else 0
     if cmd == "drop" and len(rest) == 1:
         try:
             n = spool.drop(rest[0])
@@ -46,7 +58,7 @@ def main(argv=None) -> int:
             return 2
         print(f"drop: {n} item(s)")
         return 0 if n else 1
-    print("usage: spool [list | drop TOKEN]", file=sys.stderr)
+    print("usage: spool [list [--fail-if-pending] | drop TOKEN]", file=sys.stderr)
     return 2
 
 
