@@ -57,6 +57,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
@@ -78,6 +79,8 @@ from for_each_tile_fixtures import (
     COLS,
     ROWS,
     D,
+    EMBED_TILE,
+    EMBED_TOKENS,
     K,
     LK,
     LQ,
@@ -100,6 +103,8 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
+    embedding_restickify_inputs,
+    embedding_restickify_table_fn,
     fill_add_tiled_fn,
     matmul_x_yt_nested_fn,
     matmul_x_yt_tile_m_fn,
@@ -1666,6 +1671,73 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         x, y = shaped_randn(256, 128), shaped_randn(256, 128, seed=1)
         ref = x.float().t() @ y.float()
         self._check(restickify_matmul_xt_y_fn, (x, y), ref, trips=2, atol=0.5)
+
+    def test_embedding_restickify_table_no_span_overflow(self):
+        """Regression test for issue #6277.
+
+        F.embedding(ids, table) inside a for_each_tile loop, with `table` a
+        (49216, 4096) fp16 gather source (~403 MB) and only `ids` tiled. The
+        indirect-access layout the embedding needs forces insert_restickify
+        to build a full, untiled relayout copy of `table` inside the loop
+        body -- a copy whose per-core span (403 MB) only clears the 256 MB
+        hardware limit if the work-division planner is free to split its row
+        dim across cores. Before the fix, _transfer_loop_info left the
+        embedding consumer's own loop_tiled_dims on that copy's deep-copied
+        CoarseTileInfo, which coarse_tile_local_dim_split_domains misread as
+        "the copy's row dim is loop-tiled" and pinned its core split to 1,
+        making every split attempt fail with "per-core tensor span 384.500
+        MB ... exceeds hardware limit of 256.00 MB" -- reproduced by
+        temporarily reverting the two-line fix in insert_restickify.py's
+        `elif hasattr(op, "loop_info")` branch. The sibling non-looped case
+        (same bug class, no loop involved) is covered by
+        test_embedding_large_vocab_table_no_span_overflow in
+        test_indirect_access_gather.py.
+
+        atol/rtol are tighter than this class's matmul-oriented 0.1 default:
+        embedding is a pure index copy with no arithmetic, so device output
+        must match the CPU reference up to fp16 round-trip only, the same
+        tolerance indirect_access_common.run_e2e uses by default for the
+        gather-op family.
+
+        Written against run_and_get_code directly rather than this class's
+        shared ``_check`` helper: ``_check``'s ``ops=`` check looks for a
+        literal ``op='ReStickifyOpHBM'`` in the generated SDSC source, which
+        is how restickify shows up for the *other* tests in this class (a
+        per-trip relayout handled by ``_transfer_loop_info``'s first
+        branch). The copy this test exercises is the *loop-invariant*
+        full-table case handled by that function's ``elif hasattr(op,
+        "loop_info")`` branch -- the one the fix touches -- which SDSC
+        lowers to a plain ``op='identity'`` whose ``debug_handle.ir_chain``
+        names the restickify IR node (``'restickify_default'``) instead.
+        """
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        table, ids = embedding_restickify_inputs()
+        ref = F.embedding(ids.flatten().long(), table)
+
+        compiled = torch.compile(
+            embedding_restickify_table_fn, backend="inductor", fullgraph=True
+        )
+        out, code = run_and_get_code(
+            compiled, table.to(DEVICE_NAME), ids.to(DEVICE_NAME)
+        )
+        src = "\n".join(code)
+
+        self.assertIn("LoopSpec(", src)
+        counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
+        self.assertEqual(
+            counts,
+            [EMBED_TOKENS // EMBED_TILE],
+            f"unexpected loop trip counts in:\n{src}",
+        )
+        self.assertIn(
+            "restickify_default",
+            src,
+            f"expected the gather table's restickify copy in:\n{src}",
+        )
+
+        torch.testing.assert_close(out.cpu().float(), ref.float(), atol=0.01, rtol=0.01)
 
     def test_restickify_add_nested_tiles(self):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)

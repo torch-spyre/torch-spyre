@@ -508,12 +508,9 @@ def coarse_tile_local_dim_split_domains(
     ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
-    ``loop_tiled_dims`` is the primary source (not
-    ``tiled_dims_per_read``/``output_tiled_dims``): those are deliberately
-    zeroed for per-tile scratch that "must not advance", which is correct for building
-    ``device_tile_advance_expr`` but leaves them carrying no "is this op's
-    own dim tiled" signal at all for such an op, exposing its dims to the
-    greedy search's independent, unpinned choice.
+    ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
+    loop-variable coefficient) says nothing about whether the op's own dim is
+    tiled, so it could not be used to keep a tiled dim whole.
     ``loop_tiled_dims`` has no such caveat where it is *computed* (both the
     self-planning path and generated-copy construction derive it from the
     op's own ranges), but it can be *inherited* un-remapped by nodes inserted
@@ -1016,8 +1013,8 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 
     A gather value table and scatter destination have one shared base on every
     core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    also stays unsplit. Other index-entry dims remain available for multicore
+    work.
     """
     return ConstraintResult(
         allowed_splits={

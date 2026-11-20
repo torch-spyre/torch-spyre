@@ -498,6 +498,26 @@ def remove_op(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> N
     del lst[i]
 
 
+def top_level_entry(
+    operations: "list[ir.Operation] | OpsView", op: ir.Operation
+) -> ir.Operation:
+    """The entry of the top-level list that holds ``op``: ``op`` itself when it is
+    there, otherwise the outermost :class:`LoopNode` it sits in (at any depth).
+
+    An op that must run once, outside every loop of an anchor (a clone hoisted
+    before a loop, a drain after one), is placed beside this entry, not beside the
+    anchor, which may be the loop's first or last member. Raises ``ValueError`` if
+    ``op`` is not in ``operations``.
+    """
+    real = operations.real if isinstance(operations, OpsView) else operations
+    for entry in real:
+        if entry is op or (
+            isinstance(entry, LoopNode) and owning_list(entry.body, op) is not None
+        ):
+            return entry
+    raise ValueError(f"{op!r} is not in the operations list")
+
+
 def _move(
     operations: "list[ir.Operation] | OpsView",
     anchor: ir.Operation,

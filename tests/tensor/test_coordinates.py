@@ -1164,7 +1164,7 @@ class TestTilingExprToDeviceExpr(TestCase):
         # sympy.Integer(1)) rather than the usual sympy numeric type -- the
         # degenerate case that used to make the function's second .xreplace
         # call crash with AttributeError: 'int' object has no attribute
-        # 'xreplace'. This mirrors the real _general_tile_advance call shape
+        # 'xreplace'. This mirrors the real _tile_advance call shape
         # when a tiled dim's extent is 1 and no other term survives
         # substitution.
         index = p0
