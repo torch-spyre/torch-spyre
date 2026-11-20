@@ -81,7 +81,7 @@ torch-spyre/
 │
 ├── examples/                    # Usage examples (softmax, gelu, mul, etc.)
 ├── setup.py                     # Build: C++ extension compilation
-├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.13.0)
+├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.14.0)
 └── tools/                       # Developer tooling (lint, format, mypy)
 ```
 
@@ -153,7 +153,8 @@ PyTorch `size+stride` cannot represent tiled tensors.
   IEEE_FP32, etc.)
 
 Example: `(5, 100, 150)` float16 →
-`SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map=[150, 64, 15000, 1], device_dtype=SEN169_FP16)`
+`SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map=[150, 64, 15000, 1], device_dtype=SEN169_FP16,
+valid_elements={(0,): 100, (1, 3): 150, (2,): 5})`
 where 64 = elements per 128-byte stick for fp16.
 
 ### KernelSpec
@@ -194,7 +195,7 @@ Two separate pybind11 modules:
    against `sendnn`, `flex`
 2. **Entry point**: `torch.backends` → `torch_spyre = torch_spyre:_autoload`
 
-Key external deps: `torch~=2.13.0`, `sendnn`, `flex`, `dbo-opt` (deeptools)
+Key external deps: `torch~=2.14.0`, `sendnn`, `flex`, `dbo-opt` (deeptools)
 
 ---
 

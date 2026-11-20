@@ -23,6 +23,7 @@ from torch._inductor.virtualized import V
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
+from .loop_node import OpsView, remove_op
 from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance
 
@@ -68,7 +69,7 @@ def _patch_inner_fn(consumer: ComputedBuffer, name_map: dict[str, str]) -> None:
     object.__setattr__(consumer.data, "inner_fn", _new_inner)
     ComputedBuffer.get_default_sizes_body.clear_cache(consumer)
     # consumer's reads changed (D -> C): drop any memoized op_read_writes so
-    # later passes (e.g. work_division.span_reduction) re-trace instead of
+    # later passes (e.g. work_division.work_distribution) re-trace instead of
     # reading a stale pre-redirect dependency on the now-dropped duplicate.
     invalidate_op_read_writes(consumer)
 
@@ -176,7 +177,7 @@ def _drop_constant(
         pass_name="dedup_and_promote_constants",
         reason="duplicate constant",
     )
-    operations.remove(dup)
+    remove_op(operations, dup)
     V.graph.removed_buffers.add(D)
     V.graph.name_to_buffer.pop(D, None)
     V.graph.name_to_op.pop(op_name, None)
@@ -210,7 +211,7 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
     workload). This implementation performs the same get_read_writes
     calls at most once per op, in a single sweep, and consults the
     precomputed reverse index per duplicate. The remaining
-    ``operations.remove(dup)`` in ``_drop_constant`` still runs once per
+    ``remove_op`` in ``_drop_constant`` still runs once per
     duplicate; its measured cost is negligible relative to the
     consumer-discovery term and is intentionally not batched in this
     change.
@@ -289,10 +290,16 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
     constants = [op for op in operations if isinstance(op, SpyreConstantFallback)]
     if not constants:
         return
-    non_constants = [
-        op for op in operations if not isinstance(op, SpyreConstantFallback)
-    ]
-    operations[:] = constants + non_constants
+    if isinstance(operations, OpsView):
+        # A constant in a loop body leaves it: its key is a scalar, a dtype and a
+        # device, so it cannot depend on the iteration. A flat
+        # ``operations[:] = ...`` would only move it to the head of its own body.
+        operations.hoist_to_front(constants)
+    else:
+        non_constants = [
+            op for op in operations if not isinstance(op, SpyreConstantFallback)
+        ]
+        operations[:] = constants + non_constants
     logger.debug(
         "dedup_and_promote_constants: %d constant(s) promoted to front of operations",
         len(constants),

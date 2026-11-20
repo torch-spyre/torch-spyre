@@ -8,6 +8,7 @@
 -- Append-only and best-effort: the job archives ops-result.json whether or not the insert lands, and
 -- inserts with input_format_skip_unknown_fields=1, so the two audit columns below are filled by
 -- their DEFAULTs rather than by the writer.
+-- `status` is the one column changed after insert: queued at launch, then an ALTER UPDATE sets the build's outcome.
 CREATE TABLE IF NOT EXISTS ops_requests
 (
     requested_at     DateTime64(3, 'UTC'),
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS ops_requests
     orchestrator_job String DEFAULT '',
     params           Map(String, String),                -- the exact orchestrator params; never secrets
     state            LowCardinality(String),             -- dry_run | launched | rejected | failed | denied
+    status           LowCardinality(String) DEFAULT if(state = 'launched', 'queued', ''),  -- queued | passed | failed | error; '' = not launched, or launched before it was recorded
     error            String DEFAULT '',                  -- audit_row() truncates to 500 chars
     approved_by      String DEFAULT '',                  -- the admin-run approver, who is never the requester
     build_url        String DEFAULT '',                  -- the orchestrator build it launched
@@ -35,7 +37,9 @@ CREATE TABLE IF NOT EXISTS ops_requests
     audit_timestamp  DateTime64(3) DEFAULT now64(3),
 
     -- ops_trigger.AUDIT_STATES; the writer rejects any other state before it inserts.
-    CONSTRAINT chk_state CHECK state IN ('dry_run', 'launched', 'rejected', 'failed', 'denied')
+    CONSTRAINT chk_state CHECK state IN ('dry_run', 'launched', 'rejected', 'failed', 'denied'),
+    -- A CHECK guards inserts only, so the ALTER UPDATE that sets the outcome must keep to this list.
+    CONSTRAINT chk_status CHECK status IN ('', 'queued', 'passed', 'failed', 'error')
 )
 ENGINE = MergeTree()
 ORDER BY (requested_at, requested_by)

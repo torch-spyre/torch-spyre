@@ -473,7 +473,9 @@ def duration_s(rows: list[dict[str, Any]]) -> float:
     return sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time")
 
 
-def write_benchmarks(client, db: str, rows, run_id: str) -> int:
+def write_benchmarks(
+    client, db: str, rows, run_id: str, row_props=None, append=False
+) -> int:
     """benchmarks + benchmark_runs for one leg; 0 when the tables are absent or the leg's
     rows already landed. Raises on a write error: the caller decides what it costs."""
     if not tables_present(client, db, tables=_BENCH_TABLES):
@@ -481,7 +483,18 @@ def write_benchmarks(client, db: str, rows, run_id: str) -> int:
             "benchmarks/benchmark_runs absent or stale in %s — v2 perf rows skipped", db
         )
         return 0
-    if benchmarks_already_ingested(client, db, run_id, BENCH_COMPONENT, REPORT_KIND):
+    if append:
+        # A round adds to rows the run already holds; only its own earlier attempt is skipped.
+        landed = (row_props or {}).get("upload_id") and schema.BenchmarkRuns.count_rows(
+            client, db,
+            "component = {c:String} AND run_id = {r:UUID} AND props['upload_id'] = {u:String}",
+            {"c": BENCH_COMPONENT, "r": run_id, "u": row_props["upload_id"]},
+        )  # fmt: skip
+    else:
+        landed = benchmarks_already_ingested(
+            client, db, run_id, BENCH_COMPONENT, REPORT_KIND
+        )
+    if landed:
         log.info("v2 perf rows already present for run_id=%s — skipping", run_id)
         return 0
     n = insert_benchmarks(
@@ -491,6 +504,7 @@ def write_benchmarks(client, db: str, rows, run_id: str) -> int:
         run_id,
         bench_entries(rows),
         report_kind=REPORT_KIND,
+        row_props=row_props,
     )
     log.info("Inserted %d benchmark_runs row(s) under run_id=%s", n, run_id)
     return n

@@ -31,7 +31,10 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    FP16_MAX,
+    FP16_MIN,
     FP32TOINT32_OP,
+    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -50,6 +53,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -92,6 +96,12 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
+    non_unified_shard_bytes: int = 0
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -263,8 +273,11 @@ class SDSCSpec:
 # padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
 # finite fp16 values, so they lose (max)/win (min) against any real fp16 score
 # while still encoding correctly.
-_FP16_MAX = 65504.0
-_FP16_MIN = -65504.0
+# Aliases for the shared definitions in constants.py, which the pool lowering
+# also needs (it cannot import codegen).  See the rationale for the finite
+# extremes recorded alongside them there.
+_FP16_MAX = FP16_MAX
+_FP16_MIN = FP16_MIN
 
 # 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
 # value. 0.0 (used for sum/mean) already satisfies this requirement.
@@ -371,7 +384,7 @@ def _unambiguous_physical_axis(
     positions = [
         index
         for index, coordinate in enumerate(arg.device_coordinates[:-1])
-        if dim in coordinate.subs(symbol_mapping).free_symbols
+        if dim in coordinate.xreplace(symbol_mapping).free_symbols
     ]
     return positions[0] if len(positions) == 1 else None
 
@@ -409,7 +422,7 @@ def _get_device_dim_order(
     - Explicitly includes kernel dimensions (ki, kj) even if they don't appear in device_coordinates
       (e.g., when kernel_size=1, they don't iterate naturally but are still structural dimensions).
     """
-    last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
+    last_coord = arg.device_coordinates[-1].xreplace(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
     stick_dim = free[0] if free else None
 
@@ -428,7 +441,7 @@ def _get_device_dim_order(
                         if sym not in dim_order:
                             dim_order.append(sym)
             continue
-        expr = coord.subs(symbol_mapping)
+        expr = coord.xreplace(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
         for sym in sorted(expr.free_symbols, key=str):
@@ -890,7 +903,9 @@ def _align_conv2d_dim_labels(
     return [label for idx, (label, _) in enumerate(candidates) if idx not in dropped]
 
 
-def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
+def _avgpool_sdsc_fields(
+    iteration_space: dict, pool_params: dict, dim_splits: dict | None = None
+) -> dict:
     """Compute the pool-specific SDSC field values for an avgpool op.
 
     Returns plain data that is threaded onto ``SDSCSpec`` and consumed
@@ -928,10 +943,22 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
         if Symbol(window) not in iteration_space:
             continue
         out = int(iteration_space.get(Symbol(spatial), 1))
-        in_size = (out - 1) * s + k
+        span = (out - 1) * s + k
+        # totalSize_ is the real input extent, which the window span only equals
+        # when the windows tile it exactly.  With stride > kernel the span
+        # UNDERRUNS the input (k=4 s=6 on 8: span 4 of 8), and the unread
+        # remainder must be declared as unneededPad_ (there: totalSize_=8,
+        # unneededPad_=4).  Fall back to the span when the lowering supplied no
+        # extent (older callers, conv paths).
+        in_declared = pool_params.get(f"in_{'h' if spatial == 'i' else 'w'}")
+        in_size = span
+        if isinstance(in_declared, int) and in_declared > span:
+            in_size = in_declared
+        unneeded = in_size - span
         padding_sizes[spatial] = {
             "padFront_": p,
             "padBack_": p,
+            **({"unneededPad_": unneeded} if unneeded else {}),
             "totalSize_": in_size,
             "stride_": s,
             "dilation_": 1,
@@ -941,8 +968,43 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
         input_coord_padding[spatial] = fullspan
         input_coord_sizes[spatial] = in_size
 
+    # Per-core variant.  ``dataStageParam_[*].ss_/el_.paddingSizes_`` describes ONE
+    # core's slice, so totalSize_ there must be that core's input extent, not the
+    # whole axis: e.g. a 22-wide axis split so each core owns 7 outputs of a k=9
+    # s=1 window carries totalSize_ 22 globally but 15 ((7-1)*1+9) per core.
+    # Emitting the full extent per core makes the descriptor internally
+    # inconsistent with the per-core output count and the elem_arr factor derived
+    # from it.
+    padding_sizes_per_core: dict = {}
+    if dim_splits and any(
+        int(dim_splits.get(Symbol(sp), 1)) > 1 for sp in padding_sizes
+    ):
+        for spatial, entry in padding_sizes.items():
+            nsplit = int(dim_splits.get(Symbol(spatial), 1))
+            if nsplit <= 1:
+                padding_sizes_per_core[spatial] = dict(entry)
+                continue
+            out_pc = int(iteration_space.get(Symbol(spatial), 1)) // nsplit
+            s_ = int(entry["stride_"])
+            k_ = int(iteration_space.get(Symbol(entry["windowDim_"]), 1))
+            span_pc = (out_pc - 1) * s_ + k_
+            # A split strided pool (e.g. 1x64x16x16 k4 s5, i split 3 ways) gives
+            #   pc i: padFront_=-1 padBack_=-1 totalSize_=6 unneededPad_=2
+            # The slack is CARRIED per core, not zeroed, and totalSize_ is the
+            # span PLUS that slack (4 + 2 = 6) -- not the bare span.  The -1
+            # front/back sentinels mark an interior slice whose halo comes from
+            # its neighbours; a real 0 would claim this slice starts the axis.
+            unneeded = int(entry.get("unneededPad_", 0))
+            per_core = dict(entry)
+            per_core["padFront_"] = -1
+            per_core["padBack_"] = -1
+            per_core["totalSize_"] = span_pc + unneeded
+            per_core["unneededPad_"] = unneeded
+            padding_sizes_per_core[spatial] = per_core
+
     return {
         "padding_sizes": padding_sizes,
+        "padding_sizes_per_core": padding_sizes_per_core,
         "pds_reuse": True,
         "stick_replication": True,
         "window_dims": frozenset(window_dims),
@@ -1197,16 +1259,10 @@ def _get_data_format(op, device_dtype):
 
     This is metadata relabeling only; the underlying 32-bit data is unchanged.
     Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
-    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
+    tensor descriptors in the SDSC DDL.
     """
-    if device_dtype == DataFormats.IEEE_INT32:
-        if op in SPYRE_INT32_OPS:
-            return DataFormats.SENUINT32
-        if op == IDENTITY_OP:
-            # In the long term, SDSC should accept int32 as the data format.
-            # Such re-labeling will become unnecessary.
-            # See backend issue deeptools#4307.
-            return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32 and op in SPYRE_INT32_OPS:
+        return DataFormats.SENUINT32
     return device_dtype
 
 
@@ -1214,9 +1270,8 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     """Return the SDSC compute format for an operation.
 
     dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
-    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
-    all other ops pass the tensor format through unchanged.
-    See backend issue deeptools#4307.
+    muli32toi32) are bound to IEEE_FP32.  All other ops pass the tensor
+    format through unchanged.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
@@ -1256,7 +1311,7 @@ def _collect_index_tensor_layouts(
             stick_dim = index_stick_syms[i]
             dim_order = dim_order + [stick_dim]
         index_tensor_layouts[i] = (dim_order, stick_dim)
-        active_dims = {d for d in dim_order if d is not stick_dim}
+        active_dims = {d for d in dim_order if d != stick_dim}
         index_active_dims[i] = active_dims
         logger.debug(
             f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
@@ -1264,6 +1319,42 @@ def _collect_index_tensor_layouts(
         )
 
     return index_tensor_layouts, index_active_dims
+
+
+# A QFP8WT 2D stick packs 2 K rows x 64 N columns into 128 bytes, so a K row is
+# 64 bytes, while dim_device_stride counts 128. A K start offset is therefore
+# halved; K is device coordinate -2, directly outside the stick.
+_QFP8WT_ROWS_PER_STICK = 2
+
+
+def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
+    """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
+    return (
+        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
+    )
+
+
+def _check_qfp8wt_offset(arg: TensorArg) -> None:
+    """Reject a QFP8WT offset that cannot be addressed.
+
+    An odd K start falls inside a stick, and offsets on other axes (column
+    slices) are not modelled; either would read the wrong data.
+    """
+    origin = [
+        c.xreplace({s: Integer(0) for s in c.free_symbols})
+        for c in arg.device_coordinates
+    ]
+    k_axis = len(origin) - 2
+    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+        raise Unsupported(
+            f"a column offset into a QFP8WT weight (device origin {origin}); "
+            "only a row slice of a QFP8WT weight is supported"
+        )
+    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
+        raise Unsupported(
+            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
+            f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
+        )
 
 
 def _create_sdsc_tensors(
@@ -1279,6 +1370,15 @@ def _create_sdsc_tensors(
         injected_dims = {}
     mb_sym = injected_dims.get("mb_sym")
     index_stick_syms = injected_dims.get("index_stick_syms")
+    unit_spatial_dims: list[Symbol] = injected_dims.get("unit_spatial_dims") or []
+    # Spatial dims of a pool that carry a paddingSizes_ window entry; their
+    # device-vs-iteration gap is described by totalSize_/unneededPad_, so they
+    # must not also get a backGap (see the emit site below).
+    pool_window_spatial_dims: set[str] = (
+        set(injected_dims.get("pool_window_spatial_dims") or ())
+        if _is_pool(op_spec.op)
+        else set()
+    )
     layouts: dict = {}
     # matmul and conv share the two-input tensor treatment: each arg keeps its
     # own natural (per-tensor) dim order and the weight gets the KERNEL layout
@@ -1313,6 +1413,9 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
+        is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
+        if is_qfp8wt_2d_stick:
+            _check_qfp8wt_offset(arg)
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1327,7 +1430,7 @@ def _create_sdsc_tensors(
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
-        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # advance, stamped by loop_tiling_lowering.lower_loop_tiling (host-stride
         # terms) and substituted to device-stride terms, per-arg, by
         # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
         # levels is handled later, in compute_ops.generate_sdsc's
@@ -1361,7 +1464,7 @@ def _create_sdsc_tensors(
                         axis
                         for axis, coordinate in enumerate(arg.device_coordinates[:-1])
                         if int(arg.device_size[axis]) > 1
-                        and not coordinate.subs(symbol_mapping).free_symbols
+                        and not coordinate.xreplace(symbol_mapping).free_symbols
                         and math.prod(arg.device_size[axis + 1 :]) == element_advance
                     ]
                     if len(candidates) == 1:
@@ -1376,7 +1479,7 @@ def _create_sdsc_tensors(
         gap_factor_by_inner_axis: dict[int, int] = {}
         for tiled_axis in tiled_constant_axes:
             for inner_axis in range(tiled_axis + 1, len(arg.device_coordinates) - 1):
-                coordinate = arg.device_coordinates[inner_axis].subs(symbol_mapping)
+                coordinate = arg.device_coordinates[inner_axis].xreplace(symbol_mapping)
                 if coordinate.free_symbols:
                     gap_factor_by_inner_axis[inner_axis] = gap_factor_by_inner_axis.get(
                         inner_axis, 1
@@ -1390,6 +1493,21 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
 
+        # Reinstated unit output-spatial dims (see the pool 1x1 block in
+        # parse_op_spec) are absent from the tensor's device_coordinates because
+        # the buffer genuinely has no extent > 1 there.  They must still appear in
+        # layoutDimOrder_: each window dim is mapped through its spatial dim's
+        # paddingSizes_ entry, so a spatial dim missing from the layout leaves its
+        # window dim unmappable.  They are ordinary size-1 data dims (scale_ 1),
+        # NOT reductions, so insert them here, ahead of Step 2, rather than letting
+        # them fall into reduced_dims (scale -1).
+        if unit_spatial_dims and not (
+            has_indirect_access and i in index_tensor_indices
+        ):
+            for _usd in unit_spatial_dims:
+                if _usd not in dim_order:
+                    dim_order = [_usd] + dim_order
+
         # Step 2: Handle reduced dimensions — skip for index tensors.
         if (
             use_op_dims
@@ -1399,7 +1517,7 @@ def _create_sdsc_tensors(
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
-                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                    d for d in op_dim_order if d not in dim_order and d != mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
 
@@ -1452,7 +1570,11 @@ def _create_sdsc_tensors(
                     if stick_dim not in dim_order:
                         dim_order = dim_order + [stick_dim]
 
-        if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
+        # layernormscale is unary on one value per stick. For fp32 the stick dim
+        # is reduced on the input and on the output; otherwise only on the input.
+        if op_spec.op == "layernormscale" and (
+            arg.device_dtype == DataFormats.IEEE_FP32 or len(sdsc_args) == 0
+        ):
             reduced_dims = [stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
@@ -1464,7 +1586,7 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            if dim == stick_dim and physical_axis not in gap_factor_by_inner_axis:
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
@@ -1477,9 +1599,9 @@ def _create_sdsc_tensors(
             ):
                 scales[dim] = 1
             elif dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                scales[dim] = -2 if (stick_dim is None and dim == op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
-                scales[dim] = -2 if (dim is stick_dim) else -1
+                scales[dim] = -2 if (dim == stick_dim) else -1
             else:
                 scales[dim] = 1
 
@@ -1506,7 +1628,7 @@ def _create_sdsc_tensors(
                 dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
             offsets[dim] = 0
 
-            if dim is stick_dim and dim in sdsc_dim_advance:
+            if dim == stick_dim and dim in sdsc_dim_advance:
                 # Authoritative fact from coarse_tile.py: the stick dim's
                 # iteration-0 tile is tile_size elements out of
                 # supertile_count tiles total (supertile_count already folds
@@ -1586,6 +1708,9 @@ def _create_sdsc_tensors(
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
+                n_coords = len(arg.device_coordinates)
+                if is_qfp8wt_2d_stick and coord_idx % n_coords == n_coords - 2:
+                    dim_offset //= _QFP8WT_ROWS_PER_STICK
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
@@ -1593,13 +1718,26 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
+                # The same holds for a pool's windowed spatial dims: their
+                # paddingSizes_ entry declares totalSize_ (the real extent) and
+                # unneededPad_ (the unread slack), so the device-vs-iteration gap
+                # is already described.  A 1x1 pool output made this visible --
+                # dev extent 8 against iteration extent 1 emitted a spurious
+                # backGap 7 on both axes, where none belongs.  Only the
+                # dims that actually carry a window entry are suppressed; a pool's
+                # other dims (mb/out) keep the normal backGap.
+                _pool_window_dim = str(dim) in pool_window_spatial_dims
+                if (
+                    not _is_conv(op_spec.op)
+                    and not _pool_window_dim
+                    and dev_dim_size > it_dim_size
+                ):
                     backGap[dim] = dev_dim_size - it_dim_size
                 elif (
-                    dim is not stick_dim
+                    dim != stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
-                    and coord_without_offset.subs(symbol_mapping) == dim
+                    and coord_without_offset.xreplace(symbol_mapping) == dim
                     and coord_without_offset in op_spec.iteration_space
                     and -(
                         -it_dim_size
@@ -1708,7 +1846,7 @@ def _create_sdsc_tensors(
             # weight (from the matmul's reduction variable), and
             # qfp8wt_dim_order does by default otherwise.
             companion = None
-            k_syms = arg.device_coordinates[-2].subs(symbol_mapping).free_symbols
+            k_syms = arg.device_coordinates[-2].xreplace(symbol_mapping).free_symbols
             if len(k_syms) == 1:
                 companion = next(iter(k_syms))
             if (
@@ -1744,7 +1882,7 @@ def _create_sdsc_tensors(
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
-        # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).
+        # the backend's gather index conversion requires SENUINT32.
         arg_data_format = (
             DataFormats.SENUINT32
             if (has_indirect_access and i in index_tensor_indices)
@@ -1782,6 +1920,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            non_unified_shard_bytes=arg.non_unified_shard_bytes,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -1850,6 +1989,11 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     codegen time from ShapeEnv, serialized as plain ints into the generated
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
+
+    The symbolic branch is deprecated: only the symbolic-SDSC route reaches it.
+    The explicit-loop route that supersedes that one puts no dimension symbol in
+    an SDSC, so every size here is already concrete and takes the fallback.
+    TODO(issue#5890): drop the symbolic branch with the symbolic-SDSC route.
     """
     # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
     # answer for a single-symbol expression; a multi-symbol one falls through to
@@ -1864,11 +2008,31 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
-def _ref_arg(op_spec):
-    if op_spec.is_reduction:
-        return op_spec.args[0]
+def _merged_reduction_dim_order(op_spec, symbol_mapping):
+    """Union op_dim_order/op_stick_dim across every reduction operand.
 
-    return op_spec.args[-1]
+    A broadcast operand (e.g. an expand()'d reduction input) collapses the
+    dims it does not vary over to a constant, dropping them from its own
+    dim_order; a reduction's destination/accumulator likewise elides its own
+    stick to a constant. Basing op_dim_order on a single operand can
+    therefore miss dims that only appear on another operand, so this merges
+    the per-operand dim orders instead, keeping the first non-None stick
+    symbol seen.
+
+    Operands are visited in op_spec.args order. A dim shared by two operands
+    is assumed to appear in the same relative order in both; if they
+    disagree, the order from the first operand to mention it wins.
+    """
+    merged_order: list[Symbol] = []
+    merged_stick: Symbol | None = None
+    for arg in op_spec.args:
+        order, stick = _get_device_dim_order(arg, symbol_mapping)
+        if merged_stick is None:
+            merged_stick = stick
+        for sym in order:
+            if sym not in merged_order:
+                merged_order.append(sym)
+    return merged_order, merged_stick
 
 
 def _round_up_to_stick(
@@ -2187,14 +2351,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
     )
-    # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
-    # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
-    # loop-nesting-level markers -- so they have no dim label to rename to.
+    # Tile-advance symbols (see spyre_kernel.py's _get_or_mint_level_symbol) are
+    # not iteration-space dimensions -- they are loop-nesting-level markers -- so
+    # they have no dim label to rename to. They are a loop's own induction
+    # variable (`u{n}`) or, for an op with no loop variable (span-overflow, the
+    # allocator's tiling), a minted `_tile_adv_{op_name}_lvl{n}`.
     # Register each as an identity mapping instead, so compile_op_spec's
     # `symbol_mapping[s]` lookup for op_spec.tiled_symbols does not silently
     # drop them. setdefault never overwrites a real-symbol entry above, and
-    # collides with none: minted names (`_tile_adv_{op_name}_lvl{n}`) can
-    # never equal a dim label or a real Inductor `d{i}` symbol name.
+    # collides with none: neither form can equal a dim label or a real Inductor
+    # `d{i}` symbol name.
     for level in op_spec.tiled_symbols:
         for sym in level:
             symbol_mapping.setdefault(sym, sym)
@@ -2237,6 +2403,47 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         for sym, expression in op_spec.core_id_to_work_slice.items()
     }
 
+    reinstated_unit_spatial: list[Symbol] = []
+    # Reinstate pool output-spatial dims that the pipeline squeezed away.
+    #
+    # Inductor drops statically size-1 dims from ``ir_node.data.ranges`` before
+    # codegen sees them, so a pool whose output is 1x1 -- which happens when
+    # stride > kernel, e.g. k=4 s=6 on an 8x8 input gives H_out=W_out=1 -- loses
+    # ``i`` and/or ``j`` while ``ki``/``kj`` survive (they are the kernel
+    # extents).  ``_align_pool_dim_labels`` faithfully reports that, but the SDSC
+    # still needs the spatial dims: ``paddingSizes_`` keys its window entries by
+    # them, and each window dim is mapped through its spatial dim's
+    # ``paddingSizes_`` entry, so compilation aborts with "[Error in
+    # dimension-mapping] Unknown primary dimension kind found for a window
+    # dimension" when it is absent.  Keep them as ``i_: 1, j_: 1`` with full
+    # paddingSizes_.
+    #
+    # Restored in canonical POOL_DIM_LABELS order so the SDSC dim order stays
+    # ``mb, i, j, out, ki, kj``; unsplit and owned at slice 0, like every other
+    # injected unit dim (see the mb_sym injection below).
+    if is_pool:
+        for _spatial, _window in (("i", "ki"), ("j", "kj")):
+            _sp, _wd = Symbol(_spatial), Symbol(_window)
+            if _wd not in sdsc_iteration_space or _sp in sdsc_iteration_space:
+                continue
+            _rebuilt: dict = {}
+            for _lbl in POOL_DIM_LABELS:
+                _cand = Symbol(_lbl)
+                if _cand == _sp:
+                    _rebuilt[_sp] = 1
+                elif _cand in sdsc_iteration_space:
+                    _rebuilt[_cand] = sdsc_iteration_space[_cand]
+            # Preserve any dim not covered by the canonical label list.
+            for _k, _v in sdsc_iteration_space.items():
+                _rebuilt.setdefault(_k, _v)
+            sdsc_iteration_space = _rebuilt
+            dim_splits[_sp] = 1
+            work_slices[_sp] = 1
+            core_id_to_work_slice[_sp] = Integer(0)
+            # _create_sdsc_tensors must also add it to every pool tensor's
+            # dim_order so it reaches layoutDimOrder_ (see the block there).
+            reinstated_unit_spatial.append(_sp)
+
     # Inject implicit kernel dimensions for conv2d when kernel_size=1. This is
     # the depthwise-conv (#3510) path only: forward conv2d (#3284) sources its
     # kernel dims from the node's live ranges via the CONV2D_FWD_OP branch and
@@ -2249,8 +2456,24 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    if op_spec.is_reduction:
+        if (
+            not (is_matmul or is_pool or has_indirect_access)
+            and not is_conv
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
+            op_dim_order, op_stick_dim = _merged_reduction_dim_order(
+                op_spec, symbol_mapping
+            )
+        else:
+            op_dim_order, op_stick_dim = _get_device_dim_order(
+                op_spec.args[0], symbol_mapping
+            )
+    else:
+        op_dim_order, op_stick_dim = _get_device_dim_order(
+            op_spec.args[-1], symbol_mapping
+        )
 
     # A dtype conversion that changes the elements per stick (DL16TOFP32,
     # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
@@ -2372,33 +2595,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
-
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
+    if reinstated_unit_spatial:
+        injected_dims["unit_spatial_dims"] = reinstated_unit_spatial
+    if is_pool:
+        # Which spatial dims will carry a paddingSizes_ window entry.  Mirrors the
+        # axis filter in _avgpool_sdsc_fields (an axis is described only when its
+        # window dim survives); that runs after tensor creation, so the condition
+        # is restated rather than shared.  Consumed by _create_sdsc_tensors to
+        # suppress the double-counted backGap on those dims.
+        injected_dims["pool_window_spatial_dims"] = [
+            spatial
+            for spatial, window in (("i", "ki"), ("j", "kj"))
+            if Symbol(window) in sdsc_iteration_space
+            and Symbol(spatial) in sdsc_iteration_space
+        ]
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
     if _is_topk(op_spec.op):
@@ -2490,7 +2701,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]
             for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
-                mapped_coord = coord.subs(symbol_mapping)
+                mapped_coord = coord.xreplace(symbol_mapping)
                 dim_sym = next(
                     (
                         s
@@ -2520,15 +2731,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     conv_params = (
         dict(op_spec.op_info.get("conv_params", {})) if op_spec.op_info else {}
     )
-    pool_params_out: dict = {}
-    if is_pool and op_spec.op_info:
-        pool_params_out = dict(op_spec.op_info.get("constants", {}))
-        scaling_factor = pool_params_out.get("scaling_factor", 1.0)
-        constants = {"nmap": scaling_factor}
-    else:
-        constants = (
-            dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
-        )
+    # Pool geometry lives under pool_params (like conv_params); "constants"
+    # carries only the SDSC-level op constants, as for every other op.
+    pool_params_out: dict = (
+        dict(op_spec.op_info.get("pool_params", {}))
+        if is_pool and op_spec.op_info
+        else {}
+    )
+    constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(
         sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
     )
@@ -2607,7 +2817,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # Pool-specific SDSC field values (#3510).  Empty for non-pool ops.
     pool_sdsc_fields = (
-        _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}
+        _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out, work_slices)
+        if is_pool
+        else {}
     )
     # Forward-conv2d windowed SDSC fields (#3284): the windowed-input half is the
     # same sliding-window pattern as pool (dilation==1 guaranteed by the
@@ -2616,7 +2828,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # the two field dicts never both populate the same keys.
     if op_spec.op == CONV2D_FWD_OP and op_spec.op_info:
         window_sdsc_fields = _avgpool_sdsc_fields(
-            sdsc_iteration_space, op_spec.op_info.get("conv_params", {})
+            sdsc_iteration_space,
+            op_spec.op_info.get("conv_params", {}),
         )
     else:
         window_sdsc_fields = {}

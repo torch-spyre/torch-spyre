@@ -15,11 +15,15 @@
 import inspect
 import json
 import math
+import os
+import tempfile
 import unittest
 
 import pytest
 import torch
 import torch.nn.functional as F
+
+from torch_spyre._inductor import config as spyre_config
 from torch.profiler import ProfilerActivity, _memory_profiler, profile
 from torch.testing._internal.common_utils import (
     TemporaryFileName,
@@ -503,8 +507,14 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(
     pending_captures = []
     original_sdsc = SpyreAsyncCompile.sdsc
 
-    def capture_sdsc(self, kernel_name, specs, pool_size=0):
-        result = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
+    def capture_sdsc(self, kernel_name, specs, pool_size=0, precomputed_key=None):
+        result = original_sdsc(
+            self,
+            kernel_name,
+            specs,
+            pool_size=pool_size,
+            precomputed_key=precomputed_key,
+        )
         handles = []
 
         def collect(spec_list):
@@ -519,125 +529,131 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(
         return result
 
     monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture_sdsc)
-    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
-    monkeypatch.setattr(torch._inductor.config, "compile_threads", compile_threads)
-    torch._dynamo.reset()
+    with torch._inductor.config.patch(
+        force_disable_caches=True, compile_threads=compile_threads
+    ):
+        torch._dynamo.reset()
 
-    model = _ProfilerMLP().half().to("spyre").eval()
-    x = torch.randn(2, 128, dtype=torch.float16, device="spyre")
-    compiled = torch.compile(model, fullgraph=True)
+        model = _ProfilerMLP().half().to("spyre").eval()
+        x = torch.randn(2, 128, dtype=torch.float16, device="spyre")
+        compiled = torch.compile(model, fullgraph=True)
 
-    with torch.no_grad():
-        compiled(x)
-        torch.spyre.synchronize()
-
-        # The generated wrapper has now waited for all compile jobs. Inspect
-        # resolved runners here so capturing does not serialize compilation.
-        captures = []
-        for result, handles in pending_captures:
-            assert isinstance(result, CodeCacheFuture) == (compile_threads > 1)
-            runner = result.result() if isinstance(result, CodeCacheFuture) else result
-            if runner.kernel_provenance is not None:
-                captures.append(
-                    (runner.kernel_provenance, runner.profiler_event_name, handles)
-                )
-
-        assert captures, "compilation produced no provenance-aware Spyre runners"
-
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
-        ) as prof:
-            result = compiled(x)
+        with torch.no_grad():
+            compiled(x)
             torch.spyre.synchronize()
 
-    assert result.shape == (2, 128)
+            # The generated wrapper has now waited for all compile jobs. Inspect
+            # resolved runners here so capturing does not serialize compilation.
+            captures = []
+            for result, handles in pending_captures:
+                assert isinstance(result, CodeCacheFuture) == (compile_threads > 1)
+                runner = (
+                    result.result() if isinstance(result, CodeCacheFuture) else result
+                )
+                if runner.kernel_provenance is not None:
+                    captures.append(
+                        (runner.kernel_provenance, runner.profiler_event_name, handles)
+                    )
 
-    with TemporaryFileName(mode="w+") as fname:
-        prof.export_chrome_trace(fname)
-        with open(fname) as f:
-            trace = json.load(f)
+            assert captures, "compilation produced no provenance-aware Spyre runners"
 
-    events = trace["traceEvents"]
-    for descriptor, event_name, handles in captures:
-        assert event_name is not None
-        expected_ids = tuple(dict.fromkeys(str(handle.id) for handle in handles))
-        assert descriptor.debug_handle_ids == expected_ids
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+            ) as prof:
+                result = compiled(x)
+                torch.spyre.synchronize()
 
-        matching_events = [
-            event
-            for event in events
-            if extract_kernel_provenance_key(event.get("name", "")) == descriptor.key
-        ]
-        assert matching_events, (
-            f"no device event contained kernel provenance key {descriptor.key}"
-        )
-        assert all(
-            event.get("cat") == "kernel" and event.get("ph") == "X"
-            for event in matching_events
-        )
-        assert all(
-            event["name"].startswith(f"{event_name}#")
-            and event["name"].rsplit("#", 1)[1].isdecimal()
-            for event in matching_events
-        )
-        assert all(
-            len(event["name"].encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
-            for event in matching_events
-        )
-        for event in matching_events:
-            args = event.get("args", {})
-            assert args.get("provenance_key") == descriptor.key
-            debug_handles = args.get("debug_handles")
-            assert isinstance(debug_handles, list), (
-                "args.debug_handles must be a JSON array, not a quoted string"
+        assert result.shape == (2, 128)
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                trace = json.load(f)
+
+        events = trace["traceEvents"]
+        for descriptor, event_name, handles in captures:
+            assert event_name is not None
+            expected_ids = tuple(dict.fromkeys(str(handle.id) for handle in handles))
+            assert descriptor.debug_handle_ids == expected_ids
+
+            matching_events = [
+                event
+                for event in events
+                if extract_kernel_provenance_key(event.get("name", ""))
+                == descriptor.key
+            ]
+            assert matching_events, (
+                f"no device event contained kernel provenance key {descriptor.key}"
             )
-            assert all(isinstance(handle_id, str) for handle_id in debug_handles)
-            assert debug_handles == list(descriptor.debug_handle_ids)
-            # Raw 32-bit device timestamps TS1..TS5. Raw ordering is not
-            # asserted: the counter wraps and unfilled slots read 0.
-            cycles_ts = args.get("cycles_ts")
-            assert isinstance(cycles_ts, list), (
-                "args.cycles_ts must be a JSON array, not a quoted string"
-            )
-            assert len(cycles_ts) == 5
             assert all(
-                isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts
+                event.get("cat") == "kernel" and event.get("ph") == "X"
+                for event in matching_events
             )
-            assert any(cycles_ts), "all-zero kernel cycles_ts: counters failed"
+            assert all(
+                event["name"].startswith(f"{event_name}#")
+                and event["name"].rsplit("#", 1)[1].isdecimal()
+                for event in matching_events
+            )
+            assert all(
+                len(event["name"].encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
+                for event in matching_events
+            )
+            for event in matching_events:
+                args = event.get("args", {})
+                assert args.get("provenance_key") == descriptor.key
+                debug_handles = args.get("debug_handles")
+                assert isinstance(debug_handles, list), (
+                    "args.debug_handles must be a JSON array, not a quoted string"
+                )
+                assert all(isinstance(handle_id, str) for handle_id in debug_handles)
+                assert debug_handles == list(descriptor.debug_handle_ids)
+                # Raw 32-bit device timestamps TS1..TS5. Raw ordering is not
+                # asserted: the counter wraps and unfilled slots read 0.
+                cycles_ts = args.get("cycles_ts")
+                assert isinstance(cycles_ts, list), (
+                    "args.cycles_ts must be a JSON array, not a quoted string"
+                )
+                assert len(cycles_ts) == 5
+                assert all(
+                    isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts
+                )
+                assert any(cycles_ts), "all-zero kernel cycles_ts: counters failed"
 
-    def lineage(handle):
-        yield handle
-        for constituent in handle.fused_from:
-            yield from lineage(constituent)
+        def lineage(handle):
+            yield handle
+            for constituent in handle.fused_from:
+                yield from lineage(constituent)
 
-    source_line = inspect.getsourcelines(_ProfilerMLP.forward)[1] + 1
-    source_handles = [
-        candidate
-        for _, _, handles in captures
-        for handle in handles
-        for candidate in lineage(handle)
-        if candidate.source is not None
-    ]
-    captured_lineage = [
-        (
-            handle.source.file,
-            handle.source.start_line,
-            handle.aten_op,
+        source_line = inspect.getsourcelines(_ProfilerMLP.forward)[1] + 1
+        source_handles = [
+            candidate
+            for _, _, handles in captures
+            for handle in handles
+            for candidate in lineage(handle)
+            if candidate.source is not None
+        ]
+        captured_lineage = [
+            (
+                handle.source.file,
+                handle.source.start_line,
+                handle.aten_op,
+            )
+            for handle in source_handles
+        ]
+        assert any(
+            handle.source.file.endswith("test_spyre_profiler.py")
+            and handle.source.start_line == source_line
+            and handle.aten_op == "aten.linear.default"
+            for handle in source_handles
+        ), (
+            "the captured provenance did not contain the model's linear source line; "
+            f"captured lineage: {captured_lineage}"
         )
-        for handle in source_handles
-    ]
-    assert any(
-        handle.source.file.endswith("test_spyre_profiler.py")
-        and handle.source.start_line == source_line
-        and handle.aten_op == "aten.linear.default"
-        for handle in source_handles
-    ), (
-        "the captured provenance did not contain the model's linear source line; "
-        f"captured lineage: {captured_lineage}"
-    )
-    assert any(
-        len(handle.fused_from) >= 2 for _, _, handles in captures for handle in handles
-    ), "the compiled kernel did not retain its fused provenance constituents"
+        assert any(
+            len(handle.fused_from) >= 2
+            for _, _, handles in captures
+            for handle in handles
+        ), "the compiled kernel did not retain its fused provenance constituents"
 
 
 @pytest.mark.requires_spyre_profiler
@@ -766,6 +782,138 @@ def test_non_collective_activities_have_no_coll_args():
         leaked = [key for key in COLL_ARG_KEYS if key in e.get("args", {})]
         assert not leaked, (
             f"non-collective {e['cat']} event {e.get('name')!r} carries {leaked}"
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+@spyre_config.patch(spyre_kernel_cache=True)
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_with_cache(monkeypatch, tmp_path):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is enabled.
+
+    The warm-up run compiles the kernel and commits it to tmp_path/<cache_key>/.
+    The profiled run is a cache hit; the runner receives sdsc_bundle_dir_prefix=cache_key[:16].
+    We verify that prefix appears in every kernel event's args.
+    """
+    import torch_spyre.execution.kernel_cache as kc
+
+    # Redirect the cache root to an isolated tmp_path so parallel runs don't collide.
+    monkeypatch.setattr(kc, "get_cache_root_dir", lambda: str(tmp_path))
+    torch._dynamo.reset()
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    # Warm-up: compiles and commits the kernel to tmp_path/<cache_key>/
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        # Profiled run: cache hit — runner gets sdsc_bundle_dir_prefix=cache_key[:16]
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    # Collect the first 16 characters of every committed cache-key directory name.
+    # Committed directories are named <cache_key> (a base32-encoded SHA-256 digest); .tmp. dirs are in-progress
+    # and are excluded. The runner receives cache_key[:16] as sdsc_bundle_dir_prefix.
+    sdsc_bundle_dir_prefixes = [
+        entry.name[:16]
+        for entry in os.scandir(str(tmp_path))
+        if entry.is_dir() and ".tmp." not in entry.name and entry.name != "failed"
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+@spyre_config.patch(spyre_kernel_cache=False)
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_without_cache(
+    monkeypatch, tmp_path
+):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is disabled"""
+    import torch_spyre.execution.async_compile as ac
+
+    sdsc_bundle_dir_path = str(tmp_path)
+
+    def patched_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+        # Mirrors ac.get_output_dir but creates the directory under tmp_path.
+        return tempfile.mkdtemp(
+            dir=sdsc_bundle_dir_path,
+            prefix=f"{sdsc_bundle_dir_prefix}_{ac._safe_kernel_name(kernel_name)}_",
+        )
+
+    monkeypatch.setattr(ac, "get_output_dir", patched_get_output_dir)
+    torch._dynamo.reset()
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    # Directory names are "<prefix>_<kernel>_<random suffix>". On the no-cache path, the prefix
+    # is the first 8 hex characters of UUID which never contains the '_' delimiter.
+    # If the prefix format changes to include it, update the parsing that recover the prefixes
+    # in order to avoid the test failure.
+    sdsc_bundle_dir_prefixes = [
+        os.path.basename(entry.path).split("_")[0]
+        for entry in os.scandir(sdsc_bundle_dir_path)
+        if entry.is_dir()
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
         )
 
 

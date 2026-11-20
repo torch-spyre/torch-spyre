@@ -22,11 +22,16 @@ only this module changes, not its readers.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import sympy
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, Operation
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+
+from .errors import Unsupported
+from .loop_info import LoopShim
 
 
 @dataclass(frozen=True)
@@ -123,3 +128,178 @@ def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
             if loop_info is not None:
                 return _levels(loop_info)
     return ()
+
+
+# ---------------------------------------------------------------------------
+# Per-read and output advance (read from the index)
+# ---------------------------------------------------------------------------
+
+
+def _memory_reads(op) -> list[MemoryDep]:
+    return [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+
+
+def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
+    """The coefficient of the loop variable ``variable`` in ``index``.
+
+    (The lowering computes the step it writes into the index separately, as the delta
+    of the undivided index over one trip: ``wsr.loop_tiling_lowering._tile_step``. This
+    reads that term back from the final index.)
+
+    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
+    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
+    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
+    advance", those would be silently wrong once the stored record, which makes such
+    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
+
+    * it must be affine in the variable (the second difference is zero), and
+    * the step must be a number (a symbolic step cannot be projected to device
+      elements),
+
+    otherwise this raises ``Unsupported``. A variable that does not occur in the
+    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
+    ``8*u0`` and has coefficient 8.
+
+    Lives here (``spyre_kernel`` imports it) because the advance accessors below
+    read a shim op's advances with it.
+    """
+    if variable not in index.free_symbols:
+        return sympy.S.Zero
+    at = [sympy.expand(index.xreplace({variable: k})) for k in (0, 1, 2)]
+    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
+        raise Unsupported(
+            f"the loop variable {variable} is used non-affinely in the index "
+            f"{index}; a per-trip advance cannot be read from it"
+        )
+    step = sympy.simplify(at[1] - at[0])
+    if not step.is_number:
+        raise Unsupported(
+            f"the loop variable {variable} has the symbolic step {step} in the "
+            f"index {index}; it cannot be projected to device elements"
+        )
+    return step
+
+
+def _depth(loop_info) -> int:
+    return len(_group_path(loop_info))
+
+
+def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
+    """An op's advance per level: the coefficient of each loop variable in
+    ``dep.index``, in host elements. The loop variables are the ``dim_hints``
+    entries that carry a ``loop_var_range``, outermost first; an ordinary
+    iteration-symbol hint is not one.
+
+    An op of a ``for_each_tile`` loop that lists no loop variable has none in its
+    index, so nothing it reads or writes moves with the loop: zero at every level.
+    (The loop's fill and other once-only members are like that.) An op the
+    loop-tiling lowering made (``LoopShim``) always lists the variable of every
+    level, so one that lists none is a compiler bug, not a zero: that raises, as it
+    did before part A. Otherwise the count must equal the loop depth, else the
+    pairing of variable to level is unknown and nothing here can guess it.
+    """
+    variables = [
+        h.loop_var
+        for h in getattr(op, "dim_hints", None) or ()
+        if h.loop_var is not None and h.loop_var_range is not None
+    ]
+    depth = _depth(op.loop_info)
+    if not variables:
+        if isinstance(op.loop_info, LoopShim):
+            raise RuntimeError(
+                f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
+                f"is made by the loop-tiling lowering but lists none of its {depth} "
+                "loop variable(s): its advances cannot be read from the index"
+            )
+        return (sympy.S.Zero,) * depth
+    if len(variables) != depth:
+        raise RuntimeError(
+            f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
+            f"has {depth} loop level(s) but {len(variables)} loop variable "
+            "hint(s): its advances cannot be read from the index"
+        )
+    return tuple(_loop_coefficient(dep.index, v) for v in variables)
+
+
+def _first_memory_write(op) -> MemoryDep | None:
+    return next(
+        (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)), None
+    )
+
+
+def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
+    """Host-element advance per trip of read ``dep``, one per level, outermost first.
+
+    ``sympy.S.Zero`` for a level at which the read does not advance; ``()`` when
+    ``op`` has no ``loop_info`` or ``dep`` is not one of its ``MemoryDep`` reads.
+    The value is in host elements: projecting it to the device
+    (``views.tiling_expr_to_device_expr``) needs a concrete layout and stays with
+    the caller. Read from the index: the coefficient of the level's loop variable
+    (``_loop_coefficient``, which refuses a non-affine use).
+    """
+    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
+        return ()
+    if dep not in _memory_reads(op):
+        return ()
+    return _index_advance(op, dep)
+
+
+def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
+    """Host-element advance per trip of ``op``'s write, one per level.
+
+    The write is ``op``'s first ``MemoryDep`` write, as in the kernel.  ``()``
+    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.
+    """
+    if getattr(op, "loop_info", None) is None:
+        return ()
+    dep = _first_memory_write(op)
+    if dep is None:
+        return ()
+    return _index_advance(op, dep)
+
+
+def read_advances_anywhere(
+    op: Operation, dep: MemoryDep, *, reads: Sequence[MemoryDep] | None = None
+) -> bool:
+    """True if read ``dep`` of ``op`` advances at any level.
+
+    ``reads`` is ``op``'s ``MemoryDep`` reads in order, for a caller that already
+    holds them (e.g. from ``pass_utils.op_read_writes``); without it they are
+    re-derived from ``op.get_read_writes()``.
+    """
+    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
+        return False
+    if dep not in (_memory_reads(op) if reads is None else reads):
+        return False
+    return any(a != 0 for a in _index_advance(op, dep))
+
+
+def output_advances_anywhere(op: Operation) -> bool:
+    """True if ``op``'s write advances at any level (``False`` for an op with no
+    ``MemoryDep`` write).
+
+    The loop fact of ``scratchpad.utils._is_tiled_advancing``, without its
+    ``FixedTiledLayout`` gate (a layout question, not a loop fact).
+    """
+    if getattr(op, "loop_info", None) is None:
+        return False
+    dep = _first_memory_write(op)
+    return dep is not None and any(a != 0 for a in _index_advance(op, dep))
+
+
+def advancing_levels(op: Operation) -> frozenset[int]:
+    """The loop levels at which any read or the write of ``op`` moves.
+
+    The kernel names a loop-level symbol for a level only if something at that
+    level advances; the answer comes from the index. Empty for an op that is in no
+    loop.
+    """
+    if getattr(op, "loop_info", None) is None:
+        return frozenset()
+    levels: set[int] = set()
+    for dep in _memory_reads(op):
+        levels.update(i for i, a in enumerate(_index_advance(op, dep)) if a != 0)
+    write = _first_memory_write(op)
+    if write is not None:
+        levels.update(i for i, a in enumerate(_index_advance(op, write)) if a != 0)
+    return frozenset(levels)

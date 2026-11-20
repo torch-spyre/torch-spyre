@@ -44,9 +44,35 @@ from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolve
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
 
+# An opaque FallbackKernel, which LX context switching brackets. The body
+# round-trips through the host so it compiles no Spyre graph of its own.
+_OPAQUE_LIB = torch.library.Library("test_solver_relayout_e2e", "FRAGMENT")
+if not hasattr(getattr(torch.ops, "test_solver_relayout_e2e", None), "opaque_clone"):
+    _OPAQUE_LIB.define("opaque_clone(Tensor x) -> Tensor")
+    _OPAQUE_LIB.impl(
+        "opaque_clone",
+        lambda x: x.cpu().to(x.device),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _OPAQUE_LIB._register_fake("opaque_clone", lambda x: torch.empty_like(x))
+
+
+@pytest.fixture(params=["cpsat", "simulated_annealing"])
+def coopt(request):
+    """Co-optimizing planning under each layout solver that decides relayouts."""
+    return {"co_optimizing_lx_planning": True, "layout_solver": request.param}
+
 
 def _no_matches(self, edges, *args, **kwargs):
-    return {parent: [] for parent in edges}
+    """No division pair matches on any edge, for every engine: an empty pair
+    table, which is what CP-SAT reads, and no per-candidate residency edges,
+    which is what the annealer reads instead where both ends generate their
+    divisions (``SaCoOptimizingSolver._edge_relation``) -- without them it
+    falls back to the empty table. ``edges`` is the very dict the allocator
+    then hands the buffer as ``residency_edges``."""
+    matches = {parent: [] for parent in edges}
+    edges.clear()
+    return matches
 
 
 class _Observed:
@@ -87,6 +113,8 @@ class _Observed:
         self.source_layouts: dict = {}
         self.copy_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
+        # The plans whose source is the storage of a counted-loop carry.
+        self.carry_plans: list = []
         real_materialize = alloc_mod.materialize_lx_relayouts
 
         def spy_materialize(graph, plans):
@@ -95,8 +123,14 @@ class _Observed:
                 collect_lx_relayout_plans,
                 materialized_lx_relayouts,
             )
+            from torch_spyre._inductor.scratchpad.utils import is_loop_carry_storage
 
             self.plans.extend(plans)
+            self.carry_plans.extend(
+                plan
+                for plan in plans
+                if is_loop_carry_storage(graph.get_buffer(plan.source_name))
+            )
             # Divisions are committed by now and nothing is materialized yet:
             # exactly the state the committed collector expects.
             self.committed.extend(collect_lx_relayout_plans(graph))
@@ -211,8 +245,25 @@ class _Observed:
         eligible edge on economics or capacity.) A solver segment's consumers
         are a subset of the committed plan's, which groups every consumer of a
         destination view together.
+
+        One source is outside this parity: the storage of a counted-loop
+        carry. The committed path never keeps a carry in LX (there it is a
+        mutation target), and its collector rejects a source that an in-place
+        update reads. So only the solver can fire such an edge, and for it
+        this asserts that the collector certifies nothing from that source.
         """
         for plan in self.plans:
+            if any(plan is carry_plan for carry_plan in self.carry_plans):
+                certified = [
+                    (c.source_name, c.consumer_names)
+                    for c in self.committed
+                    if c.source_name == plan.source_name
+                ]
+                assert not certified, (
+                    f"the committed collector now certifies the loop carry "
+                    f"{plan.source_name}: {certified}; give it the ordinary parity"
+                )
+                continue
             twins = [
                 c
                 for c in self.committed
@@ -249,7 +300,7 @@ def _arm_forced(monkeypatch) -> _Observed:
     return _Observed(monkeypatch, force=True)
 
 
-def test_solver_relayout_materializes_and_runs(monkeypatch):
+def test_solver_relayout_materializes_and_runs(monkeypatch, coopt):
     observed = _arm_forced(monkeypatch)
     recorded = observed.plans
 
@@ -259,12 +310,7 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(x)
 
     # The solver fired the neg -> relu edge, the commit path handed
@@ -310,7 +356,7 @@ def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
 
-def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
+def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch, coopt):
     """The measurement harness's own graph, un-forced: neg hinted {B:4, M:2}
     feeding relu hinted {B:2, M:4}. Co-opt candidates honor work_div hints
     (user hints take ownership of the split decision), so the two ops are
@@ -335,12 +381,7 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     for name, size in (("B", 8), ("M", 256), ("K", 512)):
         _pnd.declare_tensor_dim(name, size)
     x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_emitted_in_lx(expected_plans=1)
@@ -406,8 +447,144 @@ def test_relayout_off_spills_the_hinted_edge(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
+def _run_grouped_carry_sum(
+    monkeypatch, coopt, *, group=4, caller_init=False, **options
+):
+    """Compile ``grouped_carry_group_sum_fn`` for 32 cores under the
+    co-optimizing solve of ``coopt`` (CP-SAT or the annealer) and run it.
+
+    Returns the relayout observations, the device result, the expected result
+    and the op summaries of the generated kernels. The slabs are small
+    integers, so each partial sum is exact in the device fp16 format. Each
+    carry part and each 8-row block (the rows of one core of the sum) has its
+    own value pattern: a part that is lost, read twice or taken from another
+    block changes the result.
+    """
+    from torch._inductor.utils import run_and_get_code
+
+    from for_each_tile_fixtures import grouped_carry_group_sum_fn
+    from utils_inductor import opspec_summaries
+
+    observed = _Observed(monkeypatch, force=False)
+    cores, tokens, width = 32, 256, 512
+    experts = 2 * group
+    e = torch.arange(experts).reshape(experts, 1, 1)
+    t = torch.arange(tokens).reshape(1, tokens, 1)
+    c = torch.arange(width).reshape(1, 1, width)
+    slabs = ((e % 4 + 1) * (t % 7 + 1) + (t // 8) % 5 + c % 3).to(torch.float16)
+    expected = slabs.float().sum(0)
+    args = [slabs.to("spyre")]
+    first = None
+    if caller_init:
+        first = (
+            torch.arange(1, group + 1, dtype=torch.float16)
+            .reshape(group, 1, 1)
+            .expand(group, tokens, width)
+            .contiguous()
+        )
+        expected = expected + first.float().sum(0)
+        args.append(first.to("spyre"))
+
+    def fn(values, init=None):
+        return grouped_carry_group_sum_fn(values, group, cores, init)
+
+    with config.patch({**coopt, "sencores": cores, **options}):
+        out, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, fullgraph=True), *args
+        )
+    if first is not None:
+        assert torch.equal(args[1].cpu(), first), "the caller's first value changed"
+    return observed, out.cpu().float(), expected, opspec_summaries("\n".join(code))
+
+
+def _accumulate_allocations(ops):
+    """Where the in-loop accumulate's tensors live. It reads and writes the
+    carry in place, so two ``lx`` entries or more mean a carry in LX."""
+    return [op["allocations"] for op in ops if op["op"] == "add"]
+
+
+def test_post_loop_sum_reads_a_relayout_of_a_grouped_carry(monkeypatch, coopt):
+    """A loop adds four slabs per trip into a carry split {G: 4, T: 8}; the sum
+    over G after the loop is split {T: 32}. Each core of the sum needs its
+    rows from all four parts of the carry, which are on four cores, so the
+    two divisions do not match. The solver takes one copy after the loop, and
+    the carry stays in LX through its in-loop updates."""
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert observed.carry_plans == [plan]
+    assert plan.num_cores == 32
+    # The carry [G, T, C] is [T, C / 64, G, 64] on device: dim 0 <- T, dim 2 <- G.
+    assert dict(plan.source_view.work_slice_dims) == {0: 8, 2: 4}
+    assert dict(plan.destination_view.work_slice_dims) == {0: 32}
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") >= 2 for a in adds), adds
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # The solver is offered no relayout.
+        {"lx_solver_relayout": False},
+        # Sixteen parts per core of the sum: above the shuffle fan-in budget.
+        {"group": 16},
+        # The carry is a compiler-made copy, with no FX origin for the clone.
+        {"caller_init": True},
+    ],
+    ids=["relayout_off", "fan_in_16", "caller_owned_init"],
+)
+def test_grouped_carry_without_a_copy_spills_and_keeps_its_values(
+    monkeypatch, case, coopt
+):
+    """Where the sum after the loop gets no copy, the carry spills as before."""
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt, **case)
+
+    observed.assert_nothing_emitted()
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") <= 1 for a in adds), adds
+    assert torch.equal(out, expected)
+
+
+def test_grouped_carry_keeps_its_values_when_its_copy_is_demoted(monkeypatch, coopt):
+    """Kernel preparation can still reject the copy. The carry then leaves LX
+    with its relayout group, each kernel is prepared again, and the in-loop
+    update follows its storage to HBM."""
+    import torch_spyre._inductor.scheduler as sched_mod
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        materialized_lx_relayouts,
+    )
+
+    real_prepare = sched_mod.SuperDSCScheduling.prepare_kernel
+    rejected = []
+
+    def prepare(backend, bundle, kernel):
+        if not rejected:
+            copies = {name for name, _ in materialized_lx_relayouts(V.graph).values()}
+            for node in sched_mod._all_scheduler_nodes([bundle]):
+                if any(dep.name in copies for dep in node.read_writes.writes):
+                    rejected.append(node.get_name())
+                    kernel.failed_node = node
+                    raise ValueError("test: reject the LX finalization of the copy")
+        return real_prepare(backend, bundle, kernel)
+
+    monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, coopt)
+
+    assert rejected, "the fixture did not reach the copy's kernel"
+    (plan,) = observed.plans
+    assert observed.carry_plans == [plan]
+    assert plan.source_name in {source for source, _ in observed.demotions}
+    assert not observed.emitted and not observed.emitted_ops
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") <= 1 for a in adds), adds
+    assert torch.equal(out, expected)
+
+
 @pytest.mark.parametrize("fragments", [8, 10])
-def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
+def test_gather_respects_shuffle_register_budget(monkeypatch, fragments, coopt):
     """Keep an eight-way LX gather; replan a ten-way gather through HBM.
 
     Gemma's row/column producer feeding a row-only matmul operand used to
@@ -433,7 +610,7 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
         _pnd.declare_tensor_dim(name, size)
     x = _pnd.name_tensor_dims(hx.to("spyre"), ["M", "K"])
     w = _pnd.name_tensor_dims(hw.to("spyre"), ["K", "N"])
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         out = torch.compile(fn, fullgraph=True, dynamic=False)(x, w)
 
     if fragments == 8:
@@ -445,7 +622,7 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
 
 
 @pytest.mark.parametrize("kind", ["gather", "broadcast"])
-def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
+def test_grouped_relayout_fires(monkeypatch, kind, coopt):
     """#3440's grouped fixtures decided by the solver instead of the greedy
     collector (see ``relayout_fixtures.grouped_relayout_graph``). Hints pin both
     divisions, so no slicing match exists and the solver either buys the
@@ -477,7 +654,7 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
 
     observed = _Observed(monkeypatch, force=False)
     fn, args, reference, expect = grouped_relayout_graph(kind)
-    with config.patch({**_COOPT, "sencores": 32}):
+    with config.patch({**coopt, "sencores": 32}):
         out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
             *args
         )
@@ -497,7 +674,7 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     torch.testing.assert_close(out.cpu().float(), reference, rtol=2e-2, atol=2e-1)
 
 
-def test_relayout_into_a_matmul_x_operand(monkeypatch):
+def test_relayout_into_a_matmul_x_operand(monkeypatch, coopt):
     """The edge gate admits a matmul consumer; the destination view must then
     satisfy the matmul's own division rules. Pointwise producer feeding x."""
     forced = _arm_forced(monkeypatch)
@@ -509,7 +686,7 @@ def test_relayout_into_a_matmul_x_operand(monkeypatch):
     torch.manual_seed(0)
     ht = torch.randn(8, 256, 512, dtype=torch.float16)
     hw = torch.randn(512, 128, dtype=torch.float16) * 0.05
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(ht.to("spyre"), hw.to("spyre"))
 
     forced.assert_emitted_in_lx(expected_plans=1)
@@ -563,7 +740,7 @@ def test_permutation_past_split_8_fires(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
-def test_two_relayout_edges_into_one_consumer(monkeypatch):
+def test_two_relayout_edges_into_one_consumer(monkeypatch, coopt):
     """add(neg(a), abs(b)) with both edges forced: two destination rectangles
     at the consumer's tick, and two clones inserted before one consumer."""
     forced = _arm_forced(monkeypatch)
@@ -575,7 +752,7 @@ def test_two_relayout_edges_into_one_consumer(monkeypatch):
     torch.manual_seed(0)
     ha = torch.randn(8, 256, 512, dtype=torch.float16)
     hb = torch.randn(8, 256, 512, dtype=torch.float16)
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(ha.to("spyre"), hb.to("spyre"))
 
     into_add = [p for p in recorded if len(p.consumer_names) == 1]
@@ -585,15 +762,19 @@ def test_two_relayout_edges_into_one_consumer(monkeypatch):
         f"expected both producer edges into the single add: {recorded}"
     )
     # Two destinations live at the same tick: they must not overlap in LX.
-    a, b = recorded
-    per_core = 8 * 256 * 512 * 2 // a.num_cores
-    lo, hi = sorted((a.destination_address, b.destination_address))
-    assert lo + per_core <= hi, "the two destinations overlap in LX"
+    # Each holds its measured per-core span (#3440): not the source's share,
+    # which a destination broadcast onto more cores than its source is smaller
+    # than (``plan.num_cores`` is the source's count).
+    lo, hi = sorted(recorded, key=lambda plan: plan.destination_address)
+    assert (
+        lo.destination_address + lo.destination_footprint_bytes
+        <= hi.destination_address
+    ), "the two destinations overlap in LX"
     ref = (torch.neg(ha.float()) + torch.abs(hb.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
 
-def test_one_source_two_consumers_share_one_relayout(monkeypatch):
+def test_one_source_two_consumers_share_one_relayout(monkeypatch, coopt):
     """relu(h) and abs(h) from one h with both edges forced. Both consumers
     want the same destination view of h, so they form one relayout GROUP: one
     shuffle, one LX destination spanning both consumers' ticks, one plan read
@@ -608,7 +789,7 @@ def test_one_source_two_consumers_share_one_relayout(monkeypatch):
 
     torch.manual_seed(0)
     ht = torch.randn(8, 256, 512, dtype=torch.float16)
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         o1, o2 = torch.compile(fn, dynamic=False)(ht.to("spyre"))
 
     forced.assert_emitted_in_lx(expected_plans=1)
@@ -630,7 +811,7 @@ def test_one_source_two_consumers_share_one_relayout(monkeypatch):
     )
 
 
-def test_chained_relayouts(monkeypatch):
+def test_chained_relayouts(monkeypatch, coopt):
     """neg -> relu -> abs with every edge forced: a consumer that read through a
     relayout is itself the source of the next one. Three plans, one per edge,
     and the chain computes the right numbers."""
@@ -642,7 +823,7 @@ def test_chained_relayouts(monkeypatch):
 
     torch.manual_seed(0)
     ht = torch.randn(8, 256, 512, dtype=torch.float16)
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(ht.to("spyre"))
 
     edges = [(p.source_name, p.consumer_names) for p in recorded]
@@ -657,7 +838,7 @@ def test_chained_relayouts(monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_relayout_on_other_dtypes(monkeypatch, dtype):
+def test_relayout_on_other_dtypes(monkeypatch, dtype, coopt):
     """The fitted law was measured on fp16; fp32 (32 elems/stick) and bf16 go
     through the same enumeration and materialization and must be correct.
     Prices for these dtypes are extrapolations of the law, not measurements."""
@@ -668,7 +849,7 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
 
     torch.manual_seed(0)
     ht = torch.randn(8, 256, 512, dtype=dtype)
-    with config.patch(_COOPT):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False)(ht.to("spyre"))
 
     forced.assert_emitted_in_lx(expected_plans=1)
@@ -677,7 +858,7 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
     )
 
 
-def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
+def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
     """Relayouts must stay within one coarse-tile scope.
 
     The two for_each_tile bodies tile different axes to retain distinct
@@ -773,12 +954,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     hb = torch.randn(512, 256, dtype=torch.float16)
     a = ha.to("spyre")
     b = hb.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(coopt):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
     assert len(groups_seen) >= 2, "fixture did not retain distinct coarse-tile scopes"
@@ -928,14 +1104,54 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
-def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):
-    """The simulated-annealing engine does not decide relayouts yet, so the
-    allocator must hand it neither candidates nor copies, and its objective
-    must carry no relayout term: with one it cannot bind, the annealer would
-    silently drop the WHOLE cost objective and fall back to memory-only
-    scoring (the regression this guards). Same hinted graph as the natural
+def test_sibling_pins_leave_an_untiled_edge_capped(monkeypatch):
+    """Outside a coarse-tiling loop no consumer division counts as pinned by a
+    sibling parent, so the per-edge cap holds there. On this fanout graph the
+    sum's other parent matches most of each add's divisions, so pinning them
+    would leave most edges uncapped."""
+    kept_per_edge = []
+    orig_cap = alloc_mod.CoOptimizingAllocator._cap_relayout_groups
+
+    def spy_cap(*args):
+        out = orig_cap(*args)
+        kept_per_edge.append(len({c.group for c in out}))
+        return out
+
+    monkeypatch.setattr(
+        alloc_mod.CoOptimizingAllocator, "_cap_relayout_groups", staticmethod(spy_cap)
+    )
+
+    def fn(x):
+        producer = torch.relu(x)
+        total = producer * 1.0
+        for i in range(2, 9):
+            total = total + producer * float(i)
+        return total
+
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    host = torch.randn(256, 1024, dtype=torch.float16)
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(host.to("spyre"))
+
+    assert kept_per_edge, "no relayout edge reached the cap"
+    assert max(kept_per_edge) <= config.lx_solver_relayout_groups_per_edge
+    # Each op rounds to dl16 (9 fraction bits, unit roundoff 2**-10). Input
+    # conversion, one multiply and up to 7 adds give a relative error near
+    # 9 * 2**-10, under rtol.
+    ref = torch.relu(host.float()) * sum(range(1, 9))
+    torch.testing.assert_close(out.cpu().float(), ref, rtol=1e-2, atol=1e-2)
+
+
+def test_sa_cooptimizer_binds_the_relayout_terms_it_is_handed(monkeypatch):
+    """The simulated-annealing engine decides relayouts, so its objective
+    carries the copies' price terms, and it must bind every one of them: with a
+    symbol it cannot bind, the annealer would silently drop the WHOLE cost
+    objective and fall back to memory-only scoring, under which no relayout is
+    ever decided (the regression this guards). Same hinted graph as the natural
     firing test above, under the annealer: it compiles, computes the right
-    numbers, fires nothing, and scores with the real cost expression."""
+    numbers, fires the relayout, and scores with the real cost expression."""
     import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
     from torch_spyre._inductor import spyre_hint
     from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_mod
@@ -970,16 +1186,16 @@ def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch)
     ):
         out = torch.compile(fn, dynamic=False)(x)
 
-    observed.assert_nothing_emitted()
+    observed.assert_emitted_in_lx(expected_plans=1)
     assert score_fns, "the annealer never built a score function"
+    assert any(
+        str(sym).startswith("is_lx___spyre_lx_relayout__")
+        for cost_expr, _score_fn in score_fns
+        if cost_expr is not None
+        for sym in cost_expr.free_symbols
+    ), "no relayout price term reached the annealer"
     for cost_expr, score_fn in score_fns:
         assert cost_expr is not None, "the allocator produced no cost expression"
-        assert not any(
-            str(sym).startswith(("is_lx___spyre_lx_relayout__", "relayout"))
-            for sym in cost_expr.free_symbols
-        ), (
-            f"relayout term handed to an engine that cannot decide relayouts: {cost_expr}"
-        )
         assert score_fn is not None, (
             "the annealer fell back to the memory-only objective: a symbol in the "
             "cost expression could not be bound"
@@ -1634,6 +1850,7 @@ def test_v_projection_cache_handoff_preserves_persistent_alias(
         device_size=[1024, 2, 2, 1, 64],
         stride_map=[128, 1024 * 128, 64, 2 * 1024 * 128, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0,): 1024, (1,): 2, (2, 4): 128, (3,): 1},
     )
     cache = cache_host.to("spyre", device_layout=cache_layout)
     alias = cache
@@ -1767,6 +1984,125 @@ def test_gate_up_full_parent_repartition(monkeypatch):
         c: {0: c // 8, 1: c % 8} for c in range(32)
     }
     assert _core_slices(plan.destination_view, 32) == {c: {1: c} for c in range(32)}
+
+
+def test_gate_up_halves_read_the_matmul_output_in_place(monkeypatch):
+    """TP4 gemma-4 GeluAndMul: the readers share the matmul's row split, so no
+    relayout is planned and both halves read the matmul's own LX output. Kernel
+    preparation must decode a reduction producer's division, not demote it."""
+    import torch_spyre._inductor.spyre_kernel as sk_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+    offsets = []
+    normalize = sk_mod.normalize_local_lx_subrange
+
+    def capture(contract, name, argument, iteration_space, **kwargs):
+        result = normalize(contract, name, argument, iteration_space, **kwargs)
+        if result is not argument:
+            offsets.append(result.allocation["lx"] - argument.allocation["lx"])
+        return result
+
+    monkeypatch.setattr(sk_mod, "normalize_local_lx_subrange", capture)
+    rows, inner, half = 512, 128, 576
+
+    def fn(x, weight):
+        with spyre_hint(work_div={"R": 32}):
+            fused = torch.nn.functional.linear(x, weight)
+        with spyre_hint(work_div={"R": 32}):
+            d = fused.shape[-1] // 2
+            gelu = torch.nn.functional.gelu(fused[..., :d], approximate="tanh")
+            return -(gelu * fused[..., d:])
+
+    host = ((torch.arange(rows * inner).reshape(rows, inner) % 33) - 16).to(
+        torch.float16
+    ) / 8
+    columns = torch.arange(2 * half) % inner
+    scales = torch.where(torch.arange(2 * half) < half, 1.0, 0.5).to(torch.float16)
+    weight = torch.zeros(2 * half, inner, dtype=torch.float16)
+    weight[torch.arange(2 * half), columns] = scales
+    for name, size in (("R", rows), ("K", inner), ("F", 2 * half)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["F", "K"])
+    gate, up = (host[:, columns] * scales).chunk(2, dim=-1)
+    expected = -(
+        torch.nn.functional.gelu(gate.float(), approximate="tanh") * up.float()
+    )
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(x, w)
+    torch.testing.assert_close(out.cpu().float(), expected, rtol=0.01, atol=0.01)
+    observed.assert_emitted_in_lx(expected_plans=0)
+    # Per core: 16 rows of 9 sticks precede the up half.
+    assert sorted(offsets) == [0, (half // 64) * (rows // 32) * 64 * 2]
+
+
+def test_relayout_destination_restored_across_an_opaque_kernel(monkeypatch):
+    """TP gemma-4 decode: the residual's relayout copy is read before and after
+    the opaque moe_forward, so LX context switching restores it from an HBM
+    dump. That restore writes the destination but is not the certified copy."""
+    import torch_spyre._inductor.scratchpad.lx_context_switching as ctx_mod
+    import torch_spyre._inductor.spyre_kernel as sk_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+    restores = {}
+    certified = {}
+    restore = ctx_mod._restore_buffers
+    certify = sk_mod.is_lx_relayout_identity
+
+    def spy_restore(graph, editor, target_op, target_fx_node, at_risk_bufs, dumped):
+        restored = restore(
+            graph, editor, target_op, target_fx_node, at_risk_bufs, dumped
+        )
+        for buf, restored_buf in zip(at_risk_bufs, restored):
+            restores[buf.get_name()] = restored_buf.get_name()
+        return restored
+
+    def spy_certify(op, args, op_info=None):
+        result = certify(op, args, op_info)
+        certified[V.kernel.current_node.node.get_name()] = (op, result)
+        return result
+
+    monkeypatch.setattr(ctx_mod, "_restore_buffers", spy_restore)
+    monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_certify)
+    rows, inner, width = 512, 128, 6400
+
+    def fn(x, weight, y):
+        with spyre_hint(work_div={"R": 8, "F": 4}):
+            fused = torch.nn.functional.linear(x, weight)
+        with spyre_hint(work_div={"R": 32}):
+            before = -fused
+        opaque = torch.ops.test_solver_relayout_e2e.opaque_clone(y)
+        with spyre_hint(work_div={"R": 32}):
+            return fused * 0.5 + before, opaque
+
+    host = ((torch.arange(rows * inner).reshape(rows, inner) % 33) - 16).to(
+        torch.float16
+    ) / 8
+    weight = torch.zeros(width, inner, dtype=torch.float16)
+    weight[torch.arange(width), torch.arange(width) % inner] = 1.0
+    for name, size in (("R", rows), ("K", inner), ("F", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["F", "K"])
+    y = torch.ones(64, 64, dtype=torch.float16)
+    fused = host.float() @ weight.float().T
+    with config.patch({**_COOPT, "sencores": 32}):
+        out, opaque = torch.compile(fn, dynamic=False, fullgraph=True)(
+            x, w, y.to("spyre")
+        )
+    torch.testing.assert_close(out.cpu().float(), fused * 0.5 - fused)
+    torch.testing.assert_close(opaque.cpu(), y)
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    copy_name = observed.copies[plan.edge]
+    # The restore is emitted, as a plain copy into the destination's LX.
+    assert copy_name in restores, restores
+    assert certified[restores[copy_name]] == ("identity", False), certified
 
 
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
@@ -1971,6 +2307,7 @@ def _run_prefix_linear_case(monkeypatch, *, mode):
         device_size=[physical // eps, rows, eps],
         stride_map=[eps, physical, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0, 2): physical, (1,): rows},
     )
     compiled = torch.compile(fn, dynamic=False, fullgraph=True)
     options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}

@@ -17,6 +17,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch  # noqa: F401
 import sympy
 from torch._inductor.ir import ExternKernel
@@ -30,6 +31,7 @@ from torch_spyre._inductor.loop_facts import (
     scheduler_enclosing_loops,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.scheduler import _loop_count, _loop_group_id
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 
 
@@ -152,3 +154,94 @@ def test_agrees_with_existing_readers():
             assert [lvl.tiled_dims for lvl in levels] == [
                 tuple(d) for d in info.loop_tiled_dims
             ] + [()] * (len(levels) - len(info.loop_tiled_dims))
+
+
+def _sched_node(info):
+    node = MagicMock()
+    node.get_nodes.return_value = [_snode(info)]
+    node.get_name.return_value = "buf0"
+    return node
+
+
+def test_scheduler_readers_well_formed():
+    node = _sched_node(_info((3, 0), [2, 8]))
+    assert _loop_group_id(node) == (3, 0)
+    assert _loop_count(node, 0) == 2
+    assert _loop_count(node, 1) == 8
+    assert _loop_group_id(_sched_node(None)) is None
+
+
+def test_scheduler_readers_malformed_ids_read_as_no_loop():
+    # A bare-int or empty id used to raise TypeError / return () from
+    # _loop_group_id; it now reads as "no loop", like the other accessors.
+    for gid in (3, ()):
+        assert _loop_group_id(_sched_node(_info(gid, [4]))) is None
+
+
+def test_scheduler_loop_count_missing_depth_is_loud():
+    node = _sched_node(_info((0,), [4]))
+    with pytest.raises(AssertionError, match="no loop_count for depth 1"):
+        _loop_count(node, 1)
+    # A loop_count shorter than the id reads as "no loop" for both readers.
+    short = _sched_node(_info((0, 1), [4]))
+    assert _loop_group_id(short) is None
+    with pytest.raises(AssertionError, match="no loop_count for depth 0"):
+        _loop_count(short, 0)
+
+
+class TestBroadcastBatchVars:
+    """``pass_utils.broadcast_batch_vars`` reads the tiled dims through the
+    accessors.
+
+    It is kept on purpose, and so is this test. ``find_matmul_generated_var``
+    calls it when given ``op`` (``propagate_layouts`` and ``read_copy_elision``
+    both pass it) as a second line of defence for when
+    ``coarse_tile._check_matmul_broadcast_batch_tiling``, which rejects its input
+    first, is loosened or bypassed. No compiled test reaches it (265 matmul,
+    attention and loop tests never called it), so it is pinned here on stand-in
+    deps: a ``SimpleNamespace`` index cannot tell a real ``MemoryDep`` from a stub.
+    """
+
+    @staticmethod
+    def _op(loop_info):
+        return SimpleNamespace(
+            loop_info=loop_info,
+            data=SimpleNamespace(ranges=[sympy.Integer(8), sympy.Integer(16)]),
+        )
+
+    @staticmethod
+    def _info(tiled):
+        return CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[tiled],
+            loop_tiled_reduction_dims=[[]],
+        )
+
+    @staticmethod
+    def _deps(x_vars):
+        d0, d1 = sympy.symbols("d0 d1")
+        out = SimpleNamespace(var_names=[d0, d1], index=d0 * 16 + d1)
+        x = SimpleNamespace(index=sum(x_vars, sympy.Integer(0)))
+        return x, out, d0, d1
+
+    def test_a_tiled_dim_x_is_broadcast_over_is_returned(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        d0, d1 = sympy.symbols("d0 d1")
+        x, out, _, _ = self._deps([d1])  # x has no d0: broadcast over dim 0
+        assert broadcast_batch_vars(self._op(self._info([0])), x, out) == {d0}
+
+    def test_a_tiled_dim_x_also_carries_is_not_returned(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        d0, d1 = sympy.symbols("d0 d1")
+        x, out, _, _ = self._deps([d0, d1])
+        assert broadcast_batch_vars(self._op(self._info([0])), x, out) == set()
+
+    def test_an_untiled_op_returns_nothing(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        x, out, _, _ = self._deps([sympy.Symbol("d1")])
+        assert broadcast_batch_vars(self._op(self._info([])), x, out) == set()
+        assert broadcast_batch_vars(self._op(None), x, out) == set()
