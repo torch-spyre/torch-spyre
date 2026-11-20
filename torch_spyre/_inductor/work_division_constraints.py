@@ -505,7 +505,7 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
+    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``LoopInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
     ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
@@ -775,13 +775,11 @@ def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
 
 
 def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict TopK search-space and result dims to supported factors.
+    """Restrict TopK K-splits to factors within the per-core result limit.
 
-    TopK hardware requires at most ``TOPK_MAX_K_PER_CORE`` result rows per
-    core. Although larger divisors also meet that limit, the 4D ``k=32``
-    result-axis regression showed they produce incorrect output mapping. Keep
-    only the smallest sufficient K split until larger factors have codegen
-    support and regression coverage.
+    The reduction/search axes stay unsplit. Expose every divisor of the output
+    K axis that fits within ``SENCORES`` and leaves at most
+    ``TOPK_MAX_K_PER_CORE`` results per core.
     """
     if (
         not isinstance(ctx.op.data, Reduction)
@@ -805,7 +803,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
+    allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
@@ -1013,8 +1011,8 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 
     A gather value table and scatter destination have one shared base on every
     core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    also stays unsplit. Other index-entry dims remain available for multicore
+    work.
     """
     return ConstraintResult(
         allowed_splits={

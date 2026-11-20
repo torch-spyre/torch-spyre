@@ -106,9 +106,7 @@ from .loop_node import (
     all_ops,
     build_pending_loop_nodes,
     expand,
-    expanded,
     has_loop_nodes,
-    peel_non_members,
     request_loop_nodes,
 )
 from . import loop_scheduler
@@ -465,33 +463,20 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
-# Passes the flat view cannot run as they run today, so they run on the
-# expanded list and the nodes are rebuilt after them. None at present: the only
-# one was ``dedup_and_promote_constants``, which hoists every constant to the head
-# of the whole graph, and now does so across node boundaries itself
-# (``OpsView.hoist_to_front``). The mechanism stays, with ``expanded()``, until the
-# flat view is deleted.
-_PASSES_RUN_EXPANDED: frozenset[str] = frozenset()
-
-
 @contextlib.contextmanager
 def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
     """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
     (and the observer, timing and logging around it) a flat view of them.
 
-    No pass is node-aware yet. While the pass runs, ``graph.operations`` is a
-    ``loop_node.OpsView`` over the real nested list: it iterates the leaf ops
-    in program order and forwards each edit to the list that owns the op. The
-    real list is put back afterwards. A pass that rebinds ``graph.operations``
+    While the pass runs, ``graph.operations`` is a ``loop_node.OpsView`` over
+    the real nested list: it iterates the leaf ops in program order and refuses
+    edits (a pass edits with the ``loop_node`` helpers, which find the owning
+    list). The real list is put back afterwards. A pass that rebinds ``graph.operations``
     to a new list would silently drop the nodes, so that raises.
     """
     real = graph.operations
     if not has_loop_nodes(real):
         yield
-        return
-    if pass_name in _PASSES_RUN_EXPANDED:
-        with expanded(graph):
-            yield
         return
     view = OpsView(real)
     graph.operations = view
@@ -533,9 +518,6 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
         raise loop_scheduler.refuse_release()
-    # A pass may have put an op that belongs before (or after) a loop at the
-    # edge of its body; the scheduler runs a node's whole body every trip.
-    peel_non_members(graph)
 
 
 class CustomPreSchedulingPasses:
@@ -638,7 +620,7 @@ class CustomPreSchedulingPasses:
             # `loop_info` stamped, to decide whether the per-trip advance
             # belongs on the restickify stage or stays on the consumer.
             # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's CoarseTileInfo in one deferred final
+            # for_each_tile level's LoopInfo in one deferred final
             # phase, so by the time insert_restickify runs, every tiled
             # stage's loop_info is already in place. If this pass ever
             # moved ahead of splice_while_loops' stamping, that check would

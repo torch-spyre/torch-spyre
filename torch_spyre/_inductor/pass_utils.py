@@ -87,8 +87,7 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
-from .loop_info import copy_op_metadata
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopNode, all_ops, replace_op
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -102,6 +101,76 @@ from .views import (
     build_alignment_inputs,
     compute_coordinates,
 )
+
+
+_SPYRE_METADATA_ATTRS = (
+    "dim_hints",
+    "work_div_loop_info",
+    "iteration_space_ownership",
+    "loop_info",
+    "_restickify_plan",
+    "_input_layout_overrides",
+    "_emit_set_layout",
+    # Links a tiled reduction op to its accumulation buffer; set by
+    # loop_tiling_lowering.lower_loop_tiling, read by finalize_layouts in
+    # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
+    "_tiled_reduction_accum_name",
+    # One immutable record shared by a for_each_tile carry's persistent
+    # storage and its in-loop update operation.
+    "_loop_carry_record",
+    # Ground-truth tiled-dim tag stamped by lower_tile_dim_marker
+    # (lowering.py) on a for_each_tile tile read; consumed and erased by
+    # _consume_tile_dim_markers (for_each_tile_lowering.py). Must survive
+    # while_loop_bridge.splice_while_loop's own redirect_computed_buffer_
+    # reads calls (e.g. "redirect while_loop carry/tile reads to persistent
+    # scratch"), which reconstruct the marker op before
+    # _consume_tile_dim_markers ever sees it -- confirmed empirically: the
+    # marker attribute was silently dropped there before this attr was
+    # added to this tuple, because copy_op_metadata only copies attrs
+    # listed here.
+    "tile_marker_dim",
+    # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
+    # since that module imports this one (through pass_utils).
+    "_work_division_chosen_with_tiling",
+)
+
+
+# Per-op layout state set by propagate_spyre_tensor_layouts and
+# nonstick_dim_order.  It describes ``src``'s own output and inputs, so it is
+# only valid on a rebuild of ``src`` that keeps its name, layout and body
+# (``copy_op_metadata(..., layout_state=True)``).  A new op built from another
+# op (a drain, a restore, an inserted copy) must not inherit it.
+_SPYRE_LAYOUT_STATE_ATTRS = (
+    "layouts",
+    "restick_cost_fn",
+    "committed_stl",
+)
+
+
+def copy_op_metadata(
+    src: "ComputedBuffer", dst: "ComputedBuffer", *, layout_state: bool = False
+) -> None:
+    """Copy non-provenance Spyre pass metadata from src to dst.
+
+    Call this whenever a pass reconstructs a ComputedBuffer to ensure
+    dim_hints, work-division hint metadata, and coarse-tiling attrs are not
+    silently dropped. Source provenance is owned by the helpers in
+    ``provenance.py`` and is deliberately excluded from this bulk copy.
+
+    Pass ``layout_state=True`` only when ``dst`` replaces ``src`` with the same
+    name, layout and body semantics (a name-swap or body-wrap rebuild): it also
+    copies the layout-propagation results in ``_SPYRE_LAYOUT_STATE_ATTRS``.
+    Without it, a rebuild after ``propagate_spyre_tensor_layouts`` loses them
+    and later passes fail (``KeyError`` in optimize_restickify,
+    ``FixedLayout`` without ``device_layout`` in insert_restickify).
+    """
+    attrs: tuple[str, ...] = _SPYRE_METADATA_ATTRS
+    if layout_state:
+        attrs = attrs + _SPYRE_LAYOUT_STATE_ATTRS
+    for attr in attrs:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
 _SHAPE_ENV_DEFAULT_LOWER = 2
@@ -2198,97 +2267,6 @@ def try_device_coordinates(
         return None
 
 
-def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
-    """Locate a gather's index-entry dim on the output; the one coordinate search.
-
-    The entry dim is the index tensor's STICK dim (its rows are selected at
-    runtime), which on the gather output is a NON-stick dim (the row selector).
-    Multi-core work division splits this dim in whole index sticks, so a split
-    is only legal when the output can hold a stick-aligned slice -- i.e. when the
-    output extent is a whole multiple of the index ``eps``.
-
-    Returns ``(eps, out_pos, out_extent)`` -- the index elems_per_stick, the
-    entry dim's device position in the output layout, and the output
-    device_size there -- or ``None`` when ``op`` is not a gather-style indirect
-    access, the output layout is not yet a committed ``FixedTiledLayout``, or the
-    entry dim coincides with the output's own stick dim (a geometry the
-    stick-alignment padding does not cover). Valid from
-    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
-    committed.
-    """
-    subs = indirect_access_subs_from_op(op)
-    if not subs:
-        return None
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-
-    rw = op.get_read_writes()
-    out_dep = next(iter(rw.writes), None)
-    if out_dep is None:
-        return None
-
-    # Fail safe: callers use this only to *enable* a split / pad a paddable
-    # gather output. If the output can't be analysed (e.g. a scatter writes its
-    # destination indirectly, so device_coordinates can't resolve the entry
-    # coord), return None so the caller stays conservative rather than erroring.
-    try:
-        out_stl = _fixed_read_layout(op).device_layout
-        out_coords = device_coordinates(out_stl, out_dep, None)
-        for d in rw.reads:
-            if not (isinstance(d, MemoryDep) and d.name in index_names):
-                continue
-            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
-            stick_expr = device_coordinates(idx_stl, d, None)[-1]
-            if len(stick_expr.free_symbols) != 1:
-                continue
-            stick_var = next(iter(stick_expr.free_symbols))
-            eps = idx_stl.elems_per_stick()
-            # The entry dim must be a NON-stick dim of the output (exclude the
-            # last, stick, coordinate). On a scatter the entry coord is an
-            # IndirectAccess (its free symbol is the index buffer, not the
-            # iteration stick var), so no match -> None -> partial scatter stays
-            # forbidden, which is correct: its in-place dest can't be padded.
-            for pos, coord in enumerate(out_coords[:-1]):
-                if coord.free_symbols == {stick_var}:
-                    return eps, pos, int(out_stl.device_size[pos])
-    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
-        return None
-    return None
-
-
-def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
-    """The gather output's device layout grown so the entry dim is a whole stick.
-
-    The padding pass applies this returned layout; the coordinate search and the
-    size math both stay here. Returns ``None`` when there is nothing to do -- not
-    a paddable gather entry, or the entry dim is already stick-aligned. The
-    logical size is unchanged: only the physical ``device_size`` grows, and the
-    D2H copy extracts the logical view from the larger allocation.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return None
-    eps, out_pos, out_extent = found
-    if out_extent % eps == 0:
-        return None
-    out_stl = _fixed_read_layout(op).device_layout
-    device_size = list(out_stl.device_size)
-    device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
-    logger.info(
-        "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
-        "stick-aligned multi-core split",
-        op.get_name(),
-        out_pos,
-        out_extent,
-        device_size[out_pos],
-    )
-    return SpyreTensorLayout(
-        device_size,
-        list(out_stl.stride_map),
-        out_stl.device_dtype,
-        forward_valid_elements(out_stl),
-    )
-
-
 def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     """Device-coordinate lists for tensors shared across cores with runtime rows.
 
@@ -3798,8 +3776,7 @@ def replace_computed_buffer_body(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     _invalidate_body_caches(new_data)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
@@ -3915,8 +3892,7 @@ def redirect_computed_buffer_reads(
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf, layout_state=True)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
 

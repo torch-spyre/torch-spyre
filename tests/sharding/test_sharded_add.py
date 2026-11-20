@@ -627,6 +627,21 @@ def test_mixed_dtypes_fail_at_compile():
 
 @_requires_emulation
 @expects_raise
+def test_multi_output_op_with_conversion_fails_at_compile():
+    """argsort (through aten.sort, a multi-output op) feeding a dtype-converting
+    consumer is rejected by the sharding checks, not by a crash in
+    split_multi_ops ("'tuple' object has no attribute 'to'", #5831)."""
+    n = _num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+    b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+
+    with pytest.raises(RuntimeError, match="every operand sharded with the same"):
+        torch.compile(lambda x, y: torch.argsort(x, dim=1) + 0 * y, dynamic=False)(a, b)
+
+
+@_requires_emulation
+@expects_raise
 def test_dynamic_shapes_fail_at_compile():
     """torch.compile(dynamic=True) is refused before lowering, so a sharded
     operand never reaches the non-unified static-shape check."""

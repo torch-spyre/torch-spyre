@@ -1,0 +1,29 @@
+example_case	producer	component	name	tags	disc_keys	disc	benchmark_id
+ingest-demo/op_matmul_m4096-n4096-k4096	perf-kernel-op	ingest-demo	op-matmul		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","input_shapes":"4096_4096_4096","run_mode":"op_benchmark"}	bdfb599b-c59a-59e2-b5cf-f48649f6a1b1
+ingest-demo/op_matmul_m1-n4096-k4096	perf-kernel-op	ingest-demo	op-matmul		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","input_shapes":"1_4096_4096","run_mode":"op_benchmark"}	e3325046-1aa3-5044-9b47-10701d2f4ecb
+ingest-demo/op_softmax_fp16	perf-kernel-model	ingest-demo	softmax		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"model","config_name":"fp16","input_shapes":"1_512_4096","run_mode":"inference"}	4c3dd087-b4a2-53fb-9def-fc4dae48478a
+	perf-kernel-kernel	ingest-demo	op-matmul		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"fused_add@1","is_total":0}	91980d70-0132-5a34-8b70-447e314c73f5
+	perf-kernel-total	ingest-demo	op-matmul		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"Total","is_total":1}	f1613379-9715-588e-ac08-3d8349e48aaf
+ingest-demo/op_latency_fp16	vllm	ingest-demo	latency_demo_tp1_in128_out16		record_type,run_mode,tensor_parallel,input_len,output_len	{"record_type":"model","run_mode":"latency","tensor_parallel":"1","input_len":"128","output_len":"16"}	bbbd0a9c-c4b8-5e59-8447-ab2b8411bb18
+	vllm-sweep	ingest-demo	serving_demo_c8_n64_len2048_seqs16_tp1_in128_out16		record_type,run_mode,tensor_parallel,input_len,output_len,concurrency,num_prompts,max_model_len,max_num_seqs	{"record_type":"model","run_mode":"serving","tensor_parallel":"1","input_len":"128","output_len":"16","concurrency":"8","num_prompts":"64","max_model_len":"2048","max_num_seqs":"16"}	d1a51b70-6d17-50d9-a00b-9d09421cc7b2
+ingest-demo/op_generic_add	generic	ingest-demo	op-generic	domain__demo-ops	iterations,op	{"iterations":"128","op":"add"}	1c84d949-7c18-5e6d-8626-a40bf7a02319
+	vllm-sweep-model	ingest-demo	serving_demo_c8_n64_len2048_seqs16_tp1_in128_out16		record_type,run_mode,tensor_parallel,input_len,output_len,concurrency,num_prompts,max_model_len,max_num_seqs	{"record_type":"model","run_mode":"serving","tensor_parallel":"1","input_len":"128","output_len":"16","concurrency":"8","num_prompts":"64","max_model_len":"2048","max_num_seqs":"16"}	d1a51b70-6d17-50d9-a00b-9d09421cc7b2
+	generic-unsorted-props	ingest-demo	op-generic		batch,iterations,op	{"batch":"4","iterations":"128","op":"add"}	a46cdbfd-c2b4-5ccf-be31-f2856bfed43b
+	generic-bool-none	ingest-demo	op-generic		flag,gap	{"flag":"True","gap":"None"}	21a9d7d3-99a5-51ce-a338-81421542c721
+	manual-unsorted-props	ingest-demo	op-generic		a,z	{"a":"2","z":"1"}	1893fe26-7f25-55b4-b056-907b5d684f8c
+	generic-empty-props	ingest-demo	op-generic			{}	f8442ce0-d7ae-5506-a672-14fafe78c917
+	manual	ingest-demo	op-generic		op	{"op":"add"}	98bf1087-14cc-5057-9b21-c0e45442db8e
+	manual-name-only	ingest-demo	op-generic			{}	f8442ce0-d7ae-5506-a672-14fafe78c917
+	probe	ingest-demo	softmax		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"MODEL","config_name":"FP16","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"","is_total":""}	0aa736c8-1f41-5153-9c5d-46f037d09b25
+	probe	ingest-demo	op-matmul	domain__demo-ops,domain__other	record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","config_name":"","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"","is_total":""}	a3189272-b969-56ff-bb55-b123615b7d4e
+	probe	ingest-demo	op-matmul	domain__other,domain__demo-ops,domain__other	record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","config_name":"","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"","is_total":""}	a3189272-b969-56ff-bb55-b123615b7d4e
+	probe	Ingest-Demo	Op-Matmul	domain__demo-ops	record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","config_name":"","input_shapes":"4096_4096_4096","run_mode":"op_benchmark","kernel_name":"","is_total":""}	ef5d3d3f-a521-5298-a43f-1f8f45a7daf3
+	probe	ingest-demo	op-matmul	domain__demo-ops	record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","input_shapes":"4096_4096_4096","run_mode":"op_benchmark"}	ef5d3d3f-a521-5298-a43f-1f8f45a7daf3
+	probe	ingest-demo	op-matmul	domain__demo-ops	record_type,input_shapes	{"record_type":"op","input_shapes":"4096_4096_4096"}	16111267-f952-5e65-bcd6-eece8e4bbdc5
+	probe	ingest-demo	op-matmul			{}	16b64f1a-87ef-53fe-8883-05736d212fbb
+	probe	ingest-demo		domain__demo-ops	record_type	{"record_type":"op"}	
+	probe	ingest-demo	x		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","config_name":"p,input_shapes=q","input_shapes":"r"}	4d12d25d-882b-5d23-a0c6-e9aa70a14df8
+	probe	ingest-demo	x		record_type,config_name,input_shapes,run_mode,kernel_name,is_total	{"record_type":"op","config_name":"p","input_shapes":"q,input_shapes=r"}	4d12d25d-882b-5d23-a0c6-e9aa70a14df8
+	probe	ingest-demo	op-generic	domain__demo-ops,cadence__nightly	iterations,op	{"iterations":"128","op":"add"}	c60123da-e792-58a7-95dc-62e1e47513ae
+	probe	ingest-demo	op-generic	nightly,refcoverage__x,Domain__A, Domain__a 	iterations,op	{"iterations":"128","op":"add"}	3abf333d-a225-5210-ade4-b557e5592540
+	probe	ingest-demo	op-generic		Zeta,alpha	{"Zeta":"ß  Ａb ","alpha":"1"}	cbdef12a-a550-5765-ad9d-0009dbff81ba

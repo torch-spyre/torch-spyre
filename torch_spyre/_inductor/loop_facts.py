@@ -31,7 +31,6 @@ from torch._inductor.ir import ExternKernel, Operation
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 
 from .errors import Unsupported
-from .loop_info import LoopShim
 
 
 @dataclass(frozen=True)
@@ -193,7 +192,7 @@ def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     An op of a ``for_each_tile`` loop that lists no loop variable has none in its
     index, so nothing it reads or writes moves with the loop: zero at every level.
     (The loop's fill and other once-only members are like that.) An op the
-    loop-tiling lowering made (``LoopShim``) always lists the variable of every
+    loop-tiling lowering made (``strict_loop_vars``) always lists the variable of every
     level, so one that lists none is a compiler bug, not a zero: that raises, as it
     did before part A. Otherwise the count must equal the loop depth, else the
     pairing of variable to level is unknown and nothing here can guess it.
@@ -205,7 +204,7 @@ def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     ]
     depth = _depth(op.loop_info)
     if not variables:
-        if isinstance(op.loop_info, LoopShim):
+        if getattr(op.loop_info, "strict_loop_vars", False):
             raise RuntimeError(
                 f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
                 f"is made by the loop-tiling lowering but lists none of its {depth} "
