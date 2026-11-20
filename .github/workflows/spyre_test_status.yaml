@@ -4,6 +4,8 @@ name: spyre_test_status
 # cannot read repo variables, so ownership is decided here, in the base repo, from GHA_FULL_MERGE_QUEUE_TESTS. No PR code
 # runs here: the only input taken from the run is a "<verdict> <attempt>" artifact, checked against a fixed list and
 # against the run's own attempt number. Same-repo PRs are skipped: their gate job already posts the check run itself.
+# The status is one mutable value per SHA, so this never guesses: only a verdict recorded by THIS attempt writes it.
+# Anything else -- an API error, a lost artifact -- fails the step loudly rather than inventing a verdict or going quiet.
 run-name: spyre-test-status
 
 on:
@@ -32,23 +34,46 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
+          artifact="spyre-test-verdict-${ATTEMPT}"
+          post() {
+            for try in 1 2 3; do
+              if gh api --silent "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                   -f state="$1" -f context="Spyre Test (amd64)" -f description="$2" -f target_url="$RUN_URL"; then
+                echo "posted Spyre Test (amd64)=$1 on ${HEAD_SHA}"
+                return 0
+              fi
+              # Bounded: a 5xx or a rate limit may clear, a 403 will not, and three tries cost 15s either way.
+              echo "could not post the status (try ${try} of 3)"
+              [ "$try" = 3 ] || sleep "$((try * 5))"
+            done
+            echo "::error::could not post Spyre Test (amd64)=$1 for ${HEAD_SHA}"
+            return 1
+          }
+          if ! names=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --jq '.artifacts[].name'); then
+            echo "::error::could not list the artifacts of run ${RUN_ID}"
+            exit 1
+          fi
+          # No verdict for this attempt is never a verdict of its own: whose check this is cannot be told from here.
+          if ! grep -qx "$artifact" <<<"$names"; then
+            echo "::error::run ${RUN_ID} attempt ${ATTEMPT} (${CONCLUSION}) recorded no verdict; Spyre Test (amd64) left untouched"
+            exit 1
+          fi
           dir=$(mktemp -d)
-          if ! gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name spyre-test-verdict --dir "$dir"; then
-            echo "no verdict artifact on run ${RUN_ID}; not posting"
-            exit 0
+          if ! gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir "$dir"; then
+            echo "::error::${artifact} is listed on run ${RUN_ID} but could not be downloaded"
+            exit 1
           fi
           read -r verdict attempt _ < "$dir/verdict.txt" || true
           if [ "${attempt:-}" != "$ATTEMPT" ]; then
-            echo "verdict is from attempt '${attempt:-?}', run is attempt ${ATTEMPT}; not posting"
-            exit 0
+            echo "::error::${artifact} records attempt '${attempt:-?}', not ${ATTEMPT}"
+            exit 1
           fi
           case "$verdict" in
-            success) description="Test suites passed" ;;
-            failure) description="Test suites failed or did not run" ;;
-            *) echo "verdict '${verdict}': suites did not run for this PR; not posting"; exit 0 ;;
+            success) post success "Test suites passed" ;;
+            failure) post failure "Test suites failed or did not run" ;;
+            # Not this workflow's verdict to give: the suite did not run for this PR and Jenkins posts its own status.
+            *) echo "verdict '${verdict}': suites did not run for this PR; not posting" ;;
           esac
-          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-            -f state="$verdict" -f context="Spyre Test (amd64)" -f description="$description" -f target_url="$RUN_URL"
-          echo "posted Spyre Test (amd64)=${verdict} on ${HEAD_SHA}"

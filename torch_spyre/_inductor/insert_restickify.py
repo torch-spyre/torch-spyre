@@ -32,9 +32,12 @@ from .loop_node import insert_after
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    declared_max_or_none,
     invalidate_op_read_writes,
     loop_induction_symbols,
+    loop_var_ranges_from_dim_hints,
     patch_env,
+    undeclared_maximum_message,
 )
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
@@ -258,29 +261,22 @@ def _moved_loop_term(
 ) -> sympy.Expr | None:
     """The loop term the restickify copy takes over from ``op``'s read, or None.
 
-    ``_transfer_loop_info`` hands the advance of the swapped read to the copy in
-    the record. The index must follow: the copy's read gains the term and the
-    consumer's read of the new buffer, which sits at a fixed address, loses it.
+    When the swapped read advances with a loop the copy shares with the consumer,
+    the copy's read gains the term and the consumer's read of the new buffer, which
+    sits at a fixed address, loses it.
 
-    Only when every level of the consumer's loop transfers (``shared_loop_depth ==
+    Only when every level of the consumer's loop is shared (``shared_loop_depth ==
     n_levels``) is every loop term in the read the copy's, so no level-to-variable
-    mapping is needed. In any other shape the index is left as it was, which is
-    what happened before the index carried the advance.
+    mapping is needed. When only some levels are shared the term of a shared level
+    cannot be moved without that mapping, which raises ``Unsupported`` rather than
+    leave a fixed-address read advancing. With no shared level the consumer keeps
+    its term.
     """
     consumer_li = getattr(op, "loop_info", None)
     copy_li = getattr(restick_buff, "loop_info", None)
-    if consumer_li is None or copy_li is None or copy_li is consumer_li:
+    if consumer_li is None or copy_li is None:
         return None
-    if not n_levels or shared_loop_depth != n_levels:
-        return None
-    transferred = any(
-        any(level for level in per_read)
-        for per_read in [
-            *copy_li.tiled_dims_per_read,
-            *copy_li.squeezed_advance_per_read,
-        ]
-    )
-    if not transferred:
+    if not n_levels or shared_loop_depth == 0:
         return None
     deps = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     dep_idx = _restickify_dep_index(deps, restick_arg_info)
@@ -288,6 +284,18 @@ def _moved_loop_term(
         return None
     index = sympy.sympify(deps[dep_idx].index)
     symbols = loop_induction_symbols(index, set())
+    if shared_loop_depth != n_levels:
+        hinted = list(loop_var_ranges_from_dim_hints(op))
+        shared = (
+            set(hinted[:shared_loop_depth]) if len(hinted) == n_levels else set(symbols)
+        )
+        if shared & set(symbols):
+            raise Unsupported(
+                f"insert_restickify: the read of {restick_arg_info.arg_name} advances "
+                f"with a loop the restickify copy shares with {op.get_name()} but "
+                "the consumer's loop is deeper, so its loop term cannot be moved"
+            )
+        return None
     term = sympy.S.Zero
     for symbol in symbols:
         term += index.coeff(symbol) * symbol
@@ -493,102 +501,148 @@ def _transfer_loop_info(
 
     When coarse-tiling has already annotated the consumer op with loop_info,
     the restickify node must also carry loop_info to remain contiguous in
-    build_loop_scheduler_nodes. The assignment depends on whether old_name_buf
-    shares any loop-nest levels with op (has_shared_loop_scope):
+    build_loop_scheduler_nodes: it gets a copy of the consumer's. Which accesses
+    advance is the index's business (``_moved_loop_term`` moves the loop term to
+    the copy when the copy takes over the swapped read's advance).
 
-    Shared scope: restickify takes over the consumer's per-read advance for
-    shared levels; the consumer retains the advance for deeper levels. Sharing
-    one CoarseTileInfo object would apply the advance twice (issue #4008).
-
-    No shared scope (or old_name_buf has no loop_info): restickify gets a copy
-    of op's loop_info with all advances zeroed out; the consumer keeps its own.
+    No shared loop scope (``old_name_buf`` is not itself a tiled stage): the copy
+    reads a fixed full copy of ``old_name_buf``, made once, and its output is
+    consumed at a fixed address by every trip, so its extent is pinned.
     """
     source_li = getattr(old_name_buf, "loop_info", None)
     consumer_li = getattr(op, "loop_info", None)
+    if consumer_li is None:
+        return
+    restick_buff.loop_info = copy.deepcopy(consumer_li)
     has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+    if not has_shared_loop_scope:
+        # Also clear loop_tiled_dims/loop_tiled_reduction_dims: left as the
+        # consumer's (e.g. a per-tile token dim), they get misread against this
+        # copy's own unrelated dim at the same index. work_division_constraints.py
+        # reads them to pin a dim's split to 1, so a stale entry here blocks the
+        # split this full, untiled copy needs to fit the per-core span limit
+        # (issue #6277).
+        # TODO(#5863 8.3): this fixed full copy sits inside the loop body and runs on
+        # every trip. Once insert_restickify is node-aware, place it before the node
+        # (insert_before) so it runs once; an op outside every loop cannot carry a
+        # stale loop_tiled_dims. Stage 9 needs another source for the dims
+        # coarse_tile_local_dim_split_domains pins once loop_tiled_dims is deleted;
+        # test_embedding_restickify_table_no_span_overflow is the acceptance case.
+        levels = len(getattr(consumer_li, "loop_count", []) or [])
+        restick_buff.loop_info = dataclasses.replace(
+            restick_buff.loop_info,
+            loop_tiled_dims=[[] for _ in range(levels)],
+            loop_tiled_reduction_dims=[[] for _ in range(levels)],
+        )
+        # Only this case needs the pin: a tiled-stage copy advances per trip and
+        # takes its extent from the tile, while this fixed copy takes the whole
+        # operand's, which may be symbolic (a reserved pool).
+        _pin_fixed_copy_extent_to_declared_max(restick_buff)
 
-    if consumer_li is not None and has_shared_loop_scope:
-        n_levels = len(getattr(consumer_li, "loop_count", []) or [])
-        reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
-        if n_levels and reads_per_dim is not None:
-            mem_deps = [
-                d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-            ]
-            dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
-            if dep_idx is not None and dep_idx >= len(reads_per_dim):
-                raise AssertionError(
-                    f"restickify metadata index {dep_idx} is outside "
-                    f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
+
+def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:
+    """Size a loop-invariant whole-operand restickify at the declared maximum.
+
+    A restickify that makes a FIXED full copy inside a loop (its source is not a
+    tiled stage, so neither its read nor its write advances per trip) copies the
+    whole operand on every trip. When that operand has a symbolic extent, e.g. a
+    gathered page pool reserved with ``.to("spyre", dynamic=...)``, the copy
+    would carry the symbol into the loop body, where every extent must be
+    static: the body is one compiled tile, and the symbol may live only in a
+    loop trip count.
+
+    So the symbolic extent is replaced by its declared maximum. That is valid at
+    every runtime size because the source buffer is reserved at that maximum:
+    the copy reads rows past the logical extent, which exist in the reservation,
+    and its consumer (a gather) only ever indexes rows below the real size. So
+    only a declared dimension is pinned: a ``mark_dynamic(max=...)`` or
+    ``torch._check`` bound reserves nothing, and the copy would read past it.
+
+    Mutated in place because ``restick_buff`` was created by this pass a moment
+    ago and nothing else holds a reference to it yet. Changing ``ranges``
+    changes the iteration space itself, so every cache derived from it is
+    dropped, and the list below is complete, not just sufficient. The derived
+    state lives in three places:
+
+    - the ``@cache_on_self`` methods of the two mutated objects. On the
+      ``Pointwise`` data those are ``get_free_symbol_uses``, ``inner_fn_str``
+      and ``inner_fn_opcount`` (all from ``Loops``); on the ``ComputedBuffer``
+      they are ``get_free_symbol_uses`` and ``get_default_sizes_body``. That is
+      every cached method either class has, all five are cleared, and
+      ``TestPinFixedCopyExtent.test_clears_every_cached_method`` in
+      ``tests/inductor/test_symbolic_gather.py`` derives the set from the IR
+      classes, so a cached method added upstream fails it instead of going
+      stale here;
+    - the memoized read/writes (``invalidate_op_read_writes``);
+    - the layout, which is rebuilt rather than mutated and so carries no cache.
+
+    This is the same list the loop tiling clears after its own ``ranges``
+    rewrite (``loop_tiling_common._divide_ranges``), the other place that
+    rewrites a ``Loops``' ranges in place. A stale entry would surface as a wrong extent in the
+    emitted copy rather than as an error.
+
+    Raises:
+        Unsupported: an extent is symbolic and not a declared dimension.
+    """
+    # Deferred import: coarse_tile and this module avoid importing each other
+    # at load time (see coarse_tile._NameSwapHandler).
+    from .wsr.coarse_tile import (
+        _COMPUTED_BUF_FREE_SYMS_KEY,
+        _COMPUTED_BUF_SIZES_KEY,
+        _LOOPS_FREE_SYMS_KEY,
+        _LOOPS_INNER_FN_OPCOUNT_KEY,
+        _LOOPS_INNER_FN_STR_KEY,
+        _clear_cache,
+    )
+
+    ranges = list(restick_buff.data.ranges)
+    syms = set()
+    for r in ranges:
+        syms |= set(getattr(r, "free_symbols", ()) or ())
+    if not syms:
+        return
+    subs: dict = {}
+    for sym in syms:
+        upper = declared_max_or_none(sym)
+        if upper is None:
+            raise Unsupported(
+                undeclared_maximum_message(
+                    f"restickify {restick_buff.get_name()}, a fixed copy inside a "
+                    f"loop with extent {ranges},",
+                    sym,
                 )
-            dep_advance = (
-                copy.deepcopy(reads_per_dim[dep_idx])
-                if dep_idx is not None
-                else [[] for _ in range(n_levels)]
             )
-            transferred_advance = [
-                level if level_idx < shared_loop_depth else []
-                for level_idx, level in enumerate(dep_advance)
-            ]
-            retained_advance = [
-                [] if level_idx < shared_loop_depth else level
-                for level_idx, level in enumerate(dep_advance)
-            ]
-            # squeezed_advance_per_read is the second, independent channel
-            # for the same per-read advance (see CoarseTileInfo), also
-            # matched to reads positionally, so it must be handed over the
-            # same way. Left shared, the stage inherits the consumer's whole
-            # list and its single read picks up whatever advance sat at
-            # index 0 -- for an in-body page gather that is the block
-            # table's per-trip step, applied to the staged pages copy.
-            adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
-            dep_squeezed = (
-                copy.deepcopy(adv_per_read[dep_idx])
-                if dep_idx is not None and adv_per_read and dep_idx < len(adv_per_read)
-                else []
-            )
-            transferred_squeezed = [
-                level if level_idx < shared_loop_depth else []
-                for level_idx, level in enumerate(dep_squeezed)
-            ]
-            retained_squeezed = [
-                [] if level_idx < shared_loop_depth else level
-                for level_idx, level in enumerate(dep_squeezed)
-            ]
-            if restick_arg_info.occurrence != 0 and (
-                any(transferred_advance) or any(transferred_squeezed)
-            ):
-                raise Unsupported(
-                    f"restickify edge {restick_arg_info.arg_name}[{restick_arg_info.dep_index}] "
-                    f"occurrence {restick_arg_info.occurrence} cannot "
-                    "transfer advancing read metadata independently"
-                )
-            restick_li = copy.deepcopy(consumer_li)
-            restick_li.tiled_dims_per_read = [transferred_advance]
-            restick_li.squeezed_advance_per_read = (
-                [transferred_squeezed] if any(transferred_squeezed) else []
-            )
-            restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-            restick_buff.loop_info = restick_li
-            if dep_idx is not None:
-                consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
-                consumer_li.tiled_dims_per_read[dep_idx] = retained_advance
-                if adv_per_read:
-                    consumer_li.squeezed_advance_per_read = copy.deepcopy(adv_per_read)
-                    consumer_li.squeezed_advance_per_read[dep_idx] = retained_squeezed
-        else:
-            restick_buff.loop_info = consumer_li
-    elif hasattr(op, "loop_info"):
-        # old_name_buf is not itself a tiled stage: restickify still needs a
-        # copy of loop_info to stay contiguous in build_loop_scheduler_nodes,
-        # but neither its read (a fixed full copy of old_name_buf, made once)
-        # nor its output (consumed at a fixed address by every trip) advance —
-        # the consumer keeps whatever per-trip advance it already had.
-        restick_li = copy.deepcopy(op.loop_info)
-        n_levels = len(getattr(restick_li, "loop_count", []) or [])
-        restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
-        restick_li.squeezed_advance_per_read = []
-        restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-        restick_buff.loop_info = restick_li
+        subs[sym] = sympy.Integer(upper)
+
+    def pinned(exprs):
+        return [sympy.sympify(e).xreplace(subs) for e in exprs]
+
+    object.__setattr__(restick_buff.data, "ranges", pinned(ranges))
+    _clear_cache(restick_buff.data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_FREE_SYMS_KEY)
+    invalidate_op_read_writes(restick_buff)
+    layout = restick_buff.layout
+    if isinstance(layout, FixedTiledLayout):
+        pinned_layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            pinned(layout.size),
+            pinned(layout.stride),
+            layout.device_layout,
+            offset=layout.offset,
+        )
+        pinned_layout.allocation = layout.allocation
+        restick_buff.layout = pinned_layout
+    logger.info(
+        "[symbolic-gather] fixed in-loop copy %s sized at the declared maximum: "
+        "%s -> %s",
+        restick_buff.get_name(),
+        ranges,
+        list(restick_buff.data.ranges),
+    )
 
 
 def insert_restickify_on_node_inputs(
@@ -877,7 +931,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - the copy-back elision optimization (propagate_layouts.py),
                 #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
                 #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-                #    (_insert_reduction_copy_op), which mutates directly into a
+                #    (_lower_reduction), which mutates directly into a
                 #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
                 #    in-group consumer (e.g. the next outer-tile iteration's
                 #    copy-in) reads that copy op's own output the same way an
@@ -885,7 +939,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE
                 #    op whose target is a locally-created graph-output buffer
                 #    (e.g. copy_forced(src, c) where c is returned directly) --
-                #    _insert_copy_op's inserted coarse_tile_copy_* op reads the
+                #    _insert_copy_out's inserted coarse_tile_copy_* op reads the
                 #    mutation op's own output the same way. The mutation target
                 #    there is an ordinary ComputedBuffer, not a SpyreEmptyFallback,
                 #    so this case is recognized by layout alone.
