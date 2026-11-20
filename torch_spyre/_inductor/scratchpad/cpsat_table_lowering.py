@@ -233,7 +233,7 @@ Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
 Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
-# --------------------------------------------------------------------------- values
+# --------------------------------------------------------------------- a node's list
 
 
 # The form of an operand in its node's function: as it is (None), a condition
@@ -334,11 +334,10 @@ class Node:
     is, and gives its arguments and its free symbols. The Nodes make the same graph
     as the sympy nodes: children holds the Nodes of its children, printed before it
     (TableLowering), and a subexpression shared by two parents is one Node that both
-    hold. A
-    node reads only its children: the columns of its inputs are gathered from them,
-    and it reads their realizations when it is realized, a Mul the realization of the
-    base of a factor it divides by too (operands). cap bounds its table. No model is
-    involved until cp_expr.
+    hold. A node reads only its children: the columns of its inputs are gathered from
+    them, and it reads their realizations when it is realized, a Mul the realization
+    of the base of a factor it divides by too (operands). cap bounds its table. No
+    model is involved until cp_expr.
 
     A node's realization, an AbstractRealization, is what a reader and the objective
     take of it: in this stage always its table, one TableRealization. Its columns and
@@ -530,7 +529,9 @@ class TableLowering(Printer):
     symbol's InputNode; cap bounds the entries of one table, the length of its list,
     and is handed to every node. A printer keeps the Nodes it has made, by their sympy
     node: a subexpression shared by two parents, or by two calls of lower, is printed
-    once.
+    once. So inputs and cap are read when a node is first printed: a printer is made
+    for one set of inputs, and a change to them afterwards does not reach a Node it
+    has kept.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:

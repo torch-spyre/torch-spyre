@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The table lowering of a CP-SAT cost objective: the base mechanics, one table per
-node, each node's list from its operands' lists by a function lambdified once per
-class. No device and no compile: each test builds its inputs by hand and solves the
-lowered model with CP-SAT.
+node, each node's list computed from its operands' lists. No device and no compile:
+each test builds its inputs by hand and solves the lowered model with CP-SAT.
 
 *Exact* means: every assignment of the inputs has exactly one solution, so each
 position and the cost are determined by the inputs, and that solution's cost is
-COST_SCALE times the expression evaluated by sympy, within the rounding bound.
+COST_SCALE times the expression evaluated by sympy, within the rounding bound. A list
+is computed in floating point and rounded once, where it enters CP-SAT: it is held to
+the expression's value, not to the bits of another evaluator.
 """
 
 import inspect
@@ -94,11 +95,6 @@ class Case:
         self.variables.append(var)
         self.values[var] = list(domain)
         return InputIndex(var, size=size, lo=lo)
-
-    def columns(self) -> dict[sympy.Symbol, TableRealization]:
-        """Each symbol's column, as its InputNode makes it."""
-        nodes = {s: InputNode(s, (), CAP, input=self.inputs[s]) for s in self.inputs}
-        return {s: node.columns[s] for s, node in nodes.items()}
 
     def symbol(self, name: str) -> sympy.Symbol:
         (symbol,) = (s for s in self.inputs if s.name == name)
@@ -781,6 +777,20 @@ def test_a_function_takes_its_operands_by_their_own_names():
     assert func(*np.arange(35.0, 0.0, -1.0)) == 1.0
 
 
+def test_a_constant_is_read_as_the_double_it_is():
+    """A list is the expression's value in floating point, rounded once where it
+    enters CP-SAT, and is not held to another evaluator's bits. lambdify prints a
+    Float to 15 digits, 2/3 as 0.666666666666667, above the double, so its
+    ceiling(2/3 * c) is one high at c = 3, 6 and 9. A node reads the constant as the
+    double it is."""
+    case = Case()
+    case.add_input("c", c=[1.0, 3.0, 6.0, 7.0, 9.0])
+    c = case.symbol("c")
+    expr = sympy.ceiling(sympy.Float(2) / 3 * c)
+    root = case.assert_exact(expr)
+    assert list(root.realization.values) == [1.0, 2.0, 4.0, 5.0, 6.0]
+
+
 def test_a_quotient_is_divided_as_lambdify_prints_it():
     """x/y is Mul(x, Pow(y, -1)), and from the lists of its children it would be
     x*(1/y): 98*(1/49) is 1.9999999999999998, whose floor is 1. The Mul divides by
@@ -921,8 +931,8 @@ def _refused(reason):
 
 # One example per optimization of a later stage: an objective whose one table is past
 # its cap, which no stage before that one can lower and that stage's optimization can.
-# Each is refused today; the stage that lowers it drops its mark, so the marks show
-# what each stage adds. Stage 3's caching and Stage 4's numpy steps change no lowering,
+# Each is refused today, for the reason its mark gives; the stage that lowers it drops
+# its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's numpy steps change no lowering,
 # so they have none, and the fold's example comes with Stage 10, since whether it fits
 # where the switch and Stage 9's rungs do not depends on the fold's own counts. The
 # first example lowers today, so the check below runs end to end on every stage.
@@ -951,7 +961,9 @@ EXAMPLES = [
         CAP,
         id="linear_sum",
         marks=_refused(
-            "Stage 5, linear sums: four terms on a buffer each, one table of 10^4"
+            "a sum is one table over every input of its terms: four terms on a buffer "
+            "each need 10^4 entries, past the cap of 8192, and a sum read term by "
+            "term is not built"
         ),
     ),
     pytest.param(
@@ -965,7 +977,9 @@ EXAMPLES = [
         CAP,
         id="switch",
         marks=_refused(
-            "Stage 6, the switch: a factor of 3 values times a sum, one table of 12288"
+            "a product is one table over every input of its factors: a factor of 3 "
+            "values times a sum over three buffers needs 12288 entries, past the cap "
+            "of 8192, and switching the sum on the factor's value is not built"
         ),
     ),
     pytest.param(
@@ -977,8 +991,9 @@ EXAMPLES = [
         40,
         id="gate",
         marks=_refused(
-            "Stage 7, the gate: a 0/1 literal whose rest reads it, 80 entries under a "
-            "cap of 40 until the rest is read with the literal fixed"
+            "a term a 0/1 literal gates is one table over the literal and the rest's "
+            "inputs, 80 entries under a cap of 40, and reading the rest with the "
+            "literal fixed, which halves it, is not built"
         ),
     ),
     pytest.param(
@@ -990,8 +1005,9 @@ EXAMPLES = [
         CAP,
         id="ranks",
         marks=_refused(
-            "Stage 8, ranks and pairs: a product under a power, one table of 16384, "
-            "45 entries as a pair of ranks"
+            "a product under a power is one table over both buffers, 16384 entries, "
+            "past the cap of 8192, and a table over the factors' distinct values, 45 "
+            "entries, is not built"
         ),
     ),
     pytest.param(
@@ -1004,8 +1020,9 @@ EXAMPLES = [
         CAP,
         id="rung",
         marks=_refused(
-            "Stage 9, a Min/Max by rung: a Max over three buffers of distinct values, "
-            "one table of 8640"
+            "a Max is one table over every input of its operands: three buffers need "
+            "8640 entries, past the cap of 8192, and a Max read from the order of its "
+            "operands' values is not built"
         ),
     ),
     pytest.param(
@@ -1019,8 +1036,9 @@ EXAMPLES = [
         CAP,
         id="lin_min",
         marks=_refused(
-            "Stage 11, a Min kept linear: a Min of two sums of 15 residency literals, "
-            "one table of 32768 and no operand that fits"
+            "a Min of two sums of 15 residency literals is one table of 32768 "
+            "entries, past the cap of 8192, neither sum fits a table either, and a "
+            "Min kept as a linear constraint is not built"
         ),
     ),
 ]
