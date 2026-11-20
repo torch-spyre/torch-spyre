@@ -20,8 +20,9 @@ The adapter in `coarse_tile_span_overflow.py` converts that plan into the same
 ```text
 span_overflow_hint_analysis
   -> coarse_tile_span_overflow.span_overflow_groups
-  -> coarse_tile
-  -> CountedLoopSchedulerNode
+  -> loop_tiling_lowering.tile_groups
+  -> loop_node.request_loop_nodes (LoopNode)
+  -> LoopSchedulerNode
   -> LoopSpec codegen
 ```
 
@@ -375,7 +376,8 @@ and accumulated in rounds.  This is supported for:
   `max`, `min` **and** which has exactly one reduction range
   (`_supports_reduction_range_tiling`).  These recombine associatively through
   coarse tiling's identity-fill + per-tile combine + drain path
-  (`coarse_tile._reduction_identity_value` / `_insert_combine_op`).
+  (`coarse_tile._reduction_identity_value` / `_make_combine_buffer`, used by
+  `loop_tiling_lowering._lower_reduction`).
 
 The planner emits a `SpanOverflowTileLevel(selected_host_dim=0,
 is_reduction=True)` -- `selected_host_dim` is the reduction-range position,
@@ -387,7 +389,7 @@ Code flow:
 ```text
 _input_span_candidates
   -> _supports_reduction_range_tiling(op) == True
-  -> _bmm_k_span_infos  (name retained; now covers sum/prod/max/min too)
+  -> _bmm_k_span_infos  (also covers sum/prod/max/min)
        -> reduction-only coordinate span > MAX_SPAN_BYTES
        -> SpanOverflowCandidate(is_reduction=True)
   -> _search_min_cost_tile_plan
@@ -403,7 +405,7 @@ silently dropping the overflow -- `_has_untileable_reduction_span`):
 
 `xor_sum` / `any` / welford (no Spyre kernel lowering) are outside this raise's
 scope (`_REDUCTION_RANGE_FAMILY`) entirely -- a reduction-only overflow on one
-of these is still silently skipped, the same as before this feature existed.
+of these is silently skipped.
 
 ### 9. Coordinate Jointly Controlled by Two Output Symbols
 
@@ -811,8 +813,10 @@ SpanOverflowTilePlan(
 ```
 
 Levels are emitted outer-to-inner by host dimension.  The adapter creates one
-synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
-`CoarseTileInfo` and scheduler/codegen lower it as nested counted loops.
+synthetic `DimHint` per level.  `tile_groups` lowers one loop level per group,
+so `_maybe_coarse_tile_span_overflow` refuses a group with more than one level:
+`reject_nested_loops` (`wsr/coarse_tile.py`) raises `Unsupported` for it
+([#6088](https://github.com/torch-spyre/torch-spyre/issues/6088)).
 
 ## Adapter and Coarse Tiling
 
@@ -875,14 +879,20 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups`/`coarse_tile_post_stickify` run.
+   `validate_coarse_tile_groups`, `reject_nested_loops` and `tile_groups` run.
 
-From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
+`_maybe_coarse_tile_span_overflow` then lowers the groups:
 
-- rewrite `op.data.ranges` and `op.layout.size` per tile;
-- stamp `CoarseTileInfo`;
-- wrap scheduled nodes in `CountedLoopSchedulerNode`;
-- emit `LoopSpec` in codegen.
+- `tile_groups` (`wsr/loop_tiling_lowering.py`) builds a `LoopTilingPlan` and
+  lowers it with `lower_loop_tiling`, which divides the tiled ops, drains each
+  tile that something outside the loop reads into a full buffer, and gives every
+  op the loop variable and every advancing access its term. Each op carries a
+  `LoopShim`, not a `CoarseTileInfo`;
+- `request_loop_nodes` (`loop_node.py`) records the loops, and the pass loop
+  wraps each one in a `LoopNode` after the pass returns;
+- the `LoopNode` reaches the scheduler as a `LoopSchedulerNode` (a
+  `CountedLoopSchedulerNode` subclass);
+- codegen emits a `LoopSpec`.
 
 ## Configuration
 
@@ -952,21 +962,19 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   that family entirely -- a reduction-only overflow on one of these is still
   silently skipped, not raised.
 - Combined output+reduction plans are emitted as nested levels only (outer
-  output, inner reduction) -- never a single mixed level.
+  output, inner reduction) -- never a single mixed level.  A plan with more
+  than one level is refused at lowering by `reject_nested_loops`
+  ([#6088](https://github.com/torch-spyre/torch-spyre/issues/6088)).
 - Scalar/full reductions are skipped.
 - Indirect/gather/scatter-style Pointwise and Reduction ops are skipped because
   they require the indirect-access SDSC path.
 - The combo search is bounded by `_MAX_TILE_DIMS`, `_MAX_SPLITS_PER_DIM`, and
   `_MAX_TILE_COMBOS`; very high-rank overflow cases can raise `Unsupported`.
 - Automatic split counts are additionally capped by
-  `_MAX_AUTO_TILE_SPLIT_COUNT`.  This is a lowering/codegen safety limit, not a
-  mathematical span limit: current automatic coarse tiling can unroll a large
-  tile count into many generated SDSC specs, which is expensive and can appear
-  to hang compilation.  For example, an automatic split of `769` may emit 769
-  per-tile specs.  A user-written `for_each_tile` loop is explicit and may be able
-  to use the compact loop lowering more effectively; automatic
-  span-overflow should grow producer-consumer/grouped loop lowering before this
-  cap is relaxed.
+  `_MAX_AUTO_TILE_SPLIT_COUNT` (64).  This is a lowering/codegen safety limit, not a
+  mathematical span limit: the `LoopSpec` lowering emits an `scf.for` loop per
+  coarse-tile split, so automatic plans are kept conservative.  A user-written
+  `for_each_tile` loop or `spyre_hint` is explicit and can request larger counts.
 - Reduction auto-tiling rejects splits that shrink the selected output dim's
   per-tile extent to `1`, because the reduction lowering/DDC template path can
   drop unit-size iteration dims before fixed-arity template matching.  This
@@ -1002,10 +1010,8 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
     mechanical: Reduction auto-tiling has rules Pointwise does not, such as
     rejecting splits that shrink the selected output dim's per-tile extent
     to `1`. Tracked in
-    [#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) and tagged
-    `TODO(span-overflow-reduction-conform)`, so this limitation and the
-    `matmul -> matmul` "n/a" row in the coverage matrix below can be found and
-    retired together;
+    [#3625](https://github.com/torch-spyre/torch-spyre/issues/3625), together
+    with the `matmul -> matmul` "n/a" row in the coverage matrix below;
   - a producer whose tiled dim lands on a Reduction consumer's reduction
     (`k`) range — tile `t` would be a partial-result slice
     (`_consumer_shares_group_tiled_dim` rejects it);
@@ -1096,7 +1102,7 @@ Current coverage includes:
   same symbol at different moduli, and fail safe (return `None`) for a `Mod`
   whose argument is not the bare symbol;
 - post-tile validation using per-tile output ranges;
-- adapter and `coarse_tile` stamping;
+- the adapter and the loop-tiling lowering;
 - the LM-head pattern where an auto-tiled restickify producer's group is
   **joined** by an auto-tiled BMM consumer tiling the same shared output dim,
   and rejection when the tiled dims don't actually correspond
@@ -1109,7 +1115,7 @@ Current coverage includes:
   `test_non_matmul_reduction_join_rejected_when_tiled_dim_not_shared`);
 - a reduction-range tile (`is_reduction=True`) never joins even when split
   counts and read correspondence would otherwise qualify
-  (`test_reduction_range_tile_never_joins`);
+  (`test_reduction_range_tile_rejects_tiled_producer_conflict`);
 - a second consumer reading a producer already joined by another reduction is
   rejected with a distinct message
   (`test_second_reduction_consumer_of_joined_producer_rejected`);
@@ -1153,9 +1159,8 @@ accumulation noise is not mistaken for a tiling bug.
 
 `matmul -> matmul` is marked n/a rather than xfail because it is refused by
 design -- a Reduction consumer has no conform path, so both plans must
-independently agree (`TODO(span-overflow-reduction-conform)`,
-[#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) — the same tag
-as the `can_conform_reduction_tile` limitation above; retire both together).
+independently agree ([#3625](https://github.com/torch-spyre/torch-spyre/issues/3625),
+the same issue as the missing `can_conform_reduction_tile` limitation above).
 
 Rejection behaviour is covered too: a consumer whose tiled loop var does not
 index the producer's tiled dim, a producer whose tiled dim is the consumer's
@@ -1172,7 +1177,8 @@ terminating its group.
 |---|---|
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Coarse-tile IR stamping (`coarse_tile`, `CoarseTileInfo`) |
+| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Loop-tiling lowering (`tile_groups`, `lower_loop_tiling`): divides the tiled ops and gives each a `LoopShim` |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Helpers shared with the `for_each_tile` lowering: range division, consumer patching, `validate_coarse_tile_groups`, `reject_nested_loops` |
 | `torch_spyre/_inductor/passes.py` | Wires `splice_while_loops` (`for_each_tile`) and automatic span-overflow tiling into the pipeline |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |

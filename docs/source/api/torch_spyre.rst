@@ -14,12 +14,20 @@ on first use of ``torch`` and the public API is available under
    torch.spyre.is_available()
    torch.spyre.device_count()
 
+The ``torch.spyre`` module is built by ``make_spyre_module()`` in
+``torch_spyre/__init__.py``. An attribute that the module does not define is
+looked up on ``torch_spyre._C``, so a ``torch_spyre._C`` function documented
+below is also reachable as ``torch.spyre.<name>`` (for example
+``torch.spyre.set_downcast_warning``).
+
 Device Management
 -----------------
 
 .. function:: torch.spyre.is_available() -> bool
 
-   Returns ``True`` if at least one Spyre device is available.
+   Returns ``True`` if at least one Spyre device is available. Returns
+   ``False`` in a process that does not own the device: a forked child, or a
+   process started with ``IS_INDUCTOR_SPAWNED_SUBPROCESS=1``.
 
    .. code-block:: python
 
@@ -46,7 +54,9 @@ Device Management
 
 .. function:: torch.spyre.set_device(idx)
 
-   Sets the current Spyre device.
+   Sets the current Spyre device. Before the runtime starts, the index is
+   recorded and applied when the runtime starts. After that, it is also set
+   on the C++ side immediately.
 
    :param int idx: Device index to set as current.
 
@@ -184,15 +194,20 @@ Streams allow overlapping execution of operations. The API mirrors
 
       The stream ID (read-only). ``0`` is the default stream, ``1`` to
       ``32`` are the low-priority streams, and ``33`` to ``64`` are the
-      high-priority streams.
+      high-priority streams. IDs ``65`` and above belong to the host-compute
+      pool used by program correction (see
+      ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``).
 
    .. attribute:: priority
       :type: int
 
-      The stream priority class (read-only). Reports ``0`` for low-priority
-      streams (IDs 0--32) and ``-1`` for high-priority streams (IDs 33--64),
-      matching the convention used by ``torch.cuda.Stream.priority``. The
-      attribute does not echo the integer passed to the constructor.
+      The stream priority class (read-only). Reports ``0`` for stream IDs
+      0--32 and ``-1`` for every ID above 32, matching the convention used by
+      ``torch.cuda.Stream.priority``. The attribute does not echo the integer
+      passed to the constructor.
+
+   Two ``Stream`` objects compare equal when their ``id`` and ``device()``
+   are equal, and their hash is computed from the same pair.
 
 .. function:: torch.spyre.stream(stream)
 
@@ -260,6 +275,13 @@ Supported collectives, the list of process-group entries that raise
 ``SpyreCCLBackend`` in the runtime stack are documented in
 :doc:`../runtime/index`.
 
+``SpyreCCLBackend::shutdown()`` releases the backend's reference on
+``spyre_comms`` by calling ``spyre_comms::finalize_library()``. Only the first
+call finalizes, whether it comes from ``dist.destroy_process_group()`` or from
+the backend destructor. ``dist.destroy_process_group()`` therefore finalizes
+the library even while other Python references (compile caches, device
+meshes) keep the process group object alive.
+
 Memory
 ------
 
@@ -273,6 +295,48 @@ standard accelerator memory API is available against Spyre devices:
    torch.spyre.memory.reset_peak_memory_stats()
 
 A worked example is in :doc:`../user_guide/profiling/index`.
+
+Sharded Tensors
+---------------
+
+These functions are defined in ``torch_spyre/_sharded_api.py`` and exposed on
+``torch.spyre``. See :doc:`../compiler/sharded_tensors` for the storage model
+and the operations that accept sharded tensors.
+
+.. function:: torch.spyre.to_sharded(tensor, placement, *, num_shards=None) -> torch.Tensor
+
+   Copies a CPU tensor into a Spyre tensor whose storage is split into equal
+   shards across the device's cores. The result is a plain ``torch.Tensor``
+   on the ``spyre`` device with the global shape and dtype of ``tensor``;
+   ``.cpu()`` gathers every shard back.
+
+   :param torch.Tensor tensor: The CPU source tensor.
+   :param placement: ``Shard(dim)`` or the single-element list
+       ``[Shard(dim)]``, with ``Shard`` from ``torch.distributed.tensor``.
+   :param num_shards: Number of shards. Must be ``8`` or ``16`` and equal
+       the active core count (``SENCORES``). If ``None``, the active core
+       count is used.
+   :type num_shards: int, optional
+
+   .. code-block:: python
+
+      from torch.distributed.tensor import Shard
+
+      y = torch.spyre.to_sharded(x, Shard(0))
+      x_back = y.cpu()
+
+.. function:: torch.spyre.is_sharded(tensor) -> bool
+
+   Returns ``True`` if ``tensor`` is a sharded Spyre tensor. Returns
+   ``False`` for any object that is not a Spyre tensor.
+
+.. function:: torch.spyre.sharding_info(tensor) -> ShardedTensorInfo
+
+   Returns the sharding record of a sharded Spyre tensor: a frozen dataclass
+   with the fields ``placement``, ``num_shards``, ``shard_device_bytes``, and
+   ``receipt``.
+
+   :raises TypeError: if ``tensor`` is not a sharded Spyre tensor.
 
 Profiler
 --------
@@ -333,7 +397,7 @@ FFDC (First Failure Data Capture)
    later session. The directory **does** have to match: if
    ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
    and retrieval, pass the original **report** directory as
-   ``output_dir`` — ``<cache-root>/torch-spyre/ffdc_reports`` (or
+   ``output_dir``: ``<cache-root>/torch-spyre/ffdc_reports`` (or
    ``<tempdir>/torch-spyre-ffdc`` on the fallback path), **not** the
    cache or ``TMPDIR`` root. This function searches ``output_dir`` for
    JSON files; it does not append ``torch-spyre/ffdc_reports``.
@@ -385,6 +449,84 @@ Spyre tensors are created using the ``device="spyre"`` argument:
 The default dtype for Spyre is ``torch.float16``. See
 :doc:`../user_guide/tensors_and_layouts` for details on how tensors are
 laid out in device memory.
+
+At import time torch-spyre replaces ``torch.Tensor.to`` and ``torch.empty``
+with wrappers that accept the extra keyword arguments below, and adds
+``torch.Tensor.device_tensor_layout`` (``_patch_tensor_for_spyre`` in
+``torch_spyre/_monkey_patch.py``). Calls without the extra arguments behave as
+the PyTorch originals.
+
+.. method:: torch.Tensor.to(*args, device_layout=None, dynamic=None, **kwargs) -> torch.Tensor
+
+   ``Tensor.to`` with two Spyre-specific keyword arguments.
+
+   :param device_layout: Allocate the destination with this device layout
+       instead of the one derived from the tensor's shape. For a Spyre to
+       Spyre call with ``copy`` not set, the tensor itself is returned when
+       its layout and device already match.
+   :type device_layout: SpyreTensorLayout, optional
+   :param dynamic: Reserve the destination buffer for a dimension whose size
+       changes at run time. The value maps one dimension to a dict with the
+       required keys ``min`` and ``max`` and the optional key
+       ``granularity`` (default ``1``). Only dimension ``0`` can be
+       reserved. The buffer is allocated for ``max``, the tensor keeps its
+       current size, and ``torch._dynamo.mark_dynamic`` is applied to the
+       dimension. ``dynamic=`` is accepted only for an eager CPU to
+       ``"spyre"`` transfer. With ``device_layout=`` also given, the layout
+       describes the buffer at ``max``.
+   :type dynamic: dict[int, dict[str, int]], optional
+   :raises ValueError: if the ``dynamic=`` declaration is invalid or the call
+       is not a CPU to ``"spyre"`` transfer.
+
+   The declaration rules (``min`` and ``max`` multiples of ``granularity``,
+   ``min`` at least ``MIN_RESERVED_DIM_SIZE``, ``max / granularity`` at most
+   ``MAX_BUCKETS``) are checked by ``reservation_violations`` in
+   ``torch_spyre/_inductor/config.py``.
+
+   .. code-block:: python
+
+      x = torch.rand(560, 1024, dtype=torch.float16)
+      y = x.to("spyre", dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
+      y.resize_((140, 1024))  # within the reservation, no reallocation
+
+   See :doc:`../user_guide/tensors_and_layouts` for resizing, explicit
+   layouts with ``dynamic=``, and compiled graphs over a declared dimension.
+
+.. method:: torch.Tensor.device_tensor_layout() -> SpyreTensorLayout | None
+
+   Returns the ``SpyreTensorLayout`` of a Spyre tensor, or ``None`` for a
+   tensor on another device or a ``FakeTensor``.
+
+.. function:: torch.empty(*size, device_layout=None, **kwargs) -> torch.Tensor
+
+   ``torch.empty`` with an optional ``device_layout``. When
+   ``device_layout`` is given, the tensor is allocated through
+   ``torch_spyre._C.empty_with_layout`` with that layout.
+
+.. function:: torch_spyre._C.get_reserved_dims(tensor) -> dict[int, dict[str, int]] | None
+
+   Returns ``{dim: {"min": ..., "max": ..., "granularity": ...}}`` for a
+   tensor created with ``.to("spyre", dynamic=...)``, or ``None``. Does not
+   raise for a non-Spyre tensor.
+
+Declared-range checks
+~~~~~~~~~~~~~~~~~~~~~
+
+Two checks report when a range declared with ``dynamic=`` is not served by
+one compiled program. Each is configured by an environment variable, and an
+unknown value falls back to ``warn`` with a logged warning.
+
+- ``TORCH_SPYRE_NARROWING_CHECK`` (``torch_spyre/_inductor/narrowing_check.py``)
+  runs after each Spyre compile and reports guards that reject some declared
+  sizes. ``warn`` (default) issues a
+  ``torch_spyre.ops.warning_types.DeclaredRangeNarrowedWarning``, ``error``
+  raises ``DeclaredRangeNarrowedError``, and ``off`` skips the check.
+- ``TORCH_SPYRE_RECOMPILE_CHECK`` (``torch_spyre/_inductor/recompile_check.py``)
+  reports a recompile while a declared input has one of its declared sizes.
+  ``warn`` (default) issues a
+  ``torch_spyre.ops.warning_types.RecompileWarning``, ``error`` raises
+  ``RecompileError``, ``all`` warns on every recompile of user code, and
+  ``off`` reports nothing.
 
 Compilation
 -----------
@@ -544,8 +686,10 @@ manipulation of device tensor layouts. See
    .. attribute:: stride_map
       :type: list[int]
 
-      Host stride for each device dimension. A value of -1 indicates a
-      synthetic or padded dimension with no corresponding host stride.
+      Host stride for each device dimension. A value of ``0`` marks a device
+      dimension that walks no host dimension (synthetic, size-1, or
+      broadcast). A ``-1`` passed to the constructor is accepted and stored
+      as ``0`` (``normalize_stride_map`` in ``spyre_tensor_impl.h``).
 
    .. attribute:: device_dtype
       :type: DataFormats
@@ -557,6 +701,12 @@ manipulation of device tensor layouts. See
 
       How elements are packed within a stick. Defaults to ``STANDARD``
       and appears in the ``repr`` only when it is non-standard.
+
+   .. attribute:: valid_elements
+      :type: dict[tuple[int, ...], int]
+
+      Maps groups of device dimensions to the number of elements in the
+      group that hold data (not padding). Read-only.
 
    .. method:: elems_per_stick() -> int
 
@@ -637,18 +787,23 @@ manipulation of device tensor layouts. See
 Warnings
 --------
 
-.. function:: torch_spyre._C.get_downcast_warning() -> bool
+.. function:: torch.spyre.get_downcast_warning() -> bool
 
-   Returns whether int64 → int32 downcast warnings are enabled.
+   Returns whether int64 → int32 downcast warnings are enabled. The same
+   function is ``torch_spyre._C.get_downcast_warning``.
 
-.. function:: torch_spyre._C.set_downcast_warning(enabled)
+.. function:: torch.spyre.set_downcast_warning(enabled)
 
-   Enable or disable int64 → int32 downcast warnings.
+   Enable or disable int64 → int32 downcast warnings for this process. The
+   same function is ``torch_spyre._C.set_downcast_warning``.
 
    :param bool enabled: ``True`` to enable warnings, ``False`` to suppress.
 
-   Can also be controlled via the ``TORCH_SPYRE_DOWNCAST_WARN`` environment
-   variable.
+   Warnings are enabled by default. The ``TORCH_SPYRE_DOWNCAST_WARN``
+   environment variable is read once when the runtime starts
+   (``init_from_env`` in ``csrc/module.cpp``): ``0``, ``false``, or ``off``
+   (case-insensitive) disables the warnings, and any other value enables
+   them.
 
 Constants
 ---------
@@ -676,23 +831,51 @@ Environment Variables
    * - Variable
      - Purpose
    * - ``TORCH_SPYRE_DEBUG=1``
-     - Build-time: enable C++ debug logging and ``-O0`` builds.
-       Runtime: deprecated, use ``TORCH_LOGS='+torch_spyre'`` instead
+     - Build-time: build the C++ extension with ``-O0`` (``setup.py``).
+       Runtime: deprecated; sets every ``spyre`` logger to DEBUG and issues
+       a ``DeprecationWarning``. Use ``TORCH_LOGS='+torch_spyre'`` instead
        (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
-     - Suppress int64 → int32 downcast warnings
+     - Suppress int64 → int32 downcast warnings. ``0``, ``false``, and
+       ``off`` disable them; read once at runtime start
    * - ``TORCH_SPYRE_FFDC=1``
      - Enable first-failure data capture at write time. Retrieve the report
        with :func:`torch.spyre.get_diagnostic_report`
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
-       (default ``4``, maximum ``8``)
+       (default ``4``; values above ``8`` are capped at ``8``; a value below
+       ``1``, including a non-numeric value, raises)
    * - ``SPYRE_HAZARD_TRACKER``
      - Split the program-correction triple across the ``S_prep`` and
        ``S_dev`` streams and let flex insert the cross-stream H2D-to-compute
        edge, overlapping the two stages. Off by default, which keeps the
-       single-stream FIFO ordering. On values match flex's grammar exactly:
-       ``1``, ``true``, ``t``, ``yes``, ``y``
+       single-stream FIFO ordering. On values match flex's grammar exactly
+       (case-sensitive): ``1``, ``true``, ``t``, ``yes``, ``y``. Read once
+       at runtime start; query the value with
+       ``torch_spyre._C.get_hazard_tracker_enabled()``
+   * - ``TORCH_SPYRE_DIST_ENFORCE_WAIT``
+     - Set ``1`` to make ``spyre_wait_work_impl`` wait on a pending collective even when
+       the current stream is the default stream that ``spyre_comms`` uses.
+       By default that wait is skipped on the default stream and kept on any
+       other stream
+   * - ``TORCH_SPYRE_NARROWING_CHECK``
+     - After each Spyre compile, report guards that reject some sizes of a
+       range declared with ``.to("spyre", dynamic=...)``: ``warn``
+       (default), ``error``, ``off``. See `Declared-range checks`_
+   * - ``TORCH_SPYRE_RECOMPILE_CHECK``
+     - Report a recompile while a declared input has a declared size:
+       ``warn`` (default), ``error``, ``all`` (every recompile of user code),
+       ``off``. See `Declared-range checks`_
+   * - ``TORCH_SPYRE_FFT_DIRECT_MAX``
+     - Largest FFT length computed as one direct ``(2n, 2n)`` matmul
+       (``torch_spyre/ops/_fft.py``); longer transforms use the four-step
+       factorization (default ``32768``; a non-integer or non-positive value
+       warns and uses the default)
+   * - ``TORCH_SPYRE_FFT_W_CACHE_BYTES``
+     - Byte budget of the LRU cache of fp16 DFT matrices
+       (``torch_spyre/ops/_fft.py``). Default: room for the forward and
+       inverse matrices at the default direct-matmul ceiling; an invalid or
+       non-positive value uses the default
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -792,7 +975,8 @@ Environment Variables
      - Maximum number of buckets, ``max / granularity``, a declared dimension
        may have (default ``256``)
    * - ``MIN_DEFAULT_GRANULARITY``
-     - Minimum default granularity for work division (default ``4``)
+     - Soft floor on the granularity derived for a dynamic dimension when
+       ``mark_dynamic(min=...)`` is not given (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
      - Ignore ``spyre_hint(work_div={...})`` work-division hints and use
        the automatic work-distribution planner (default ``0``)
@@ -887,7 +1071,7 @@ Environment Variables
        ``torch_spyre/_inductor`` changes the fingerprint, so a build with
        local edits computes its keys again. ``verify`` computes both and
        raises ``PrecomputedKernelKeyMismatch`` if they differ. Any other value
-       warns and leaves it off. Generated wrappers now pass a
+       warns and leaves it off. Generated wrappers pass a
        ``precomputed_key`` keyword to ``async_compile.sdsc()``, so code that
        replaces ``sdsc`` must accept it
    * - ``TORCH_SPYRE_CACHE_SCAN``
@@ -912,17 +1096,31 @@ Environment Variables
        compute that does not depend on the collective runs in its own bundle
        rather than being fused behind the wait (default ``0``)
    * - ``SPYRE_LX_EXTENDED_OWNERSHIP``
-     - Enable the optional ownership proofs and local reads added after prefix
-       support (default ``1``; set ``0`` to keep the earlier ownership and
-       prefix rules)
+     - Enable the optional LX ownership proofs and local reads (default
+       ``1``; set ``0`` to disable them)
    * - ``SPYRE_NDO_MATMUL_OUTPUT_REORDER``
      - Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
        buffer in addition to its input buffers (default ``0``)
    * - ``MIN_RESERVED_DIM_SIZE``
-     - Minimum size a reserved dimension is held to when reserving HBM for a
-       dynamic shape (default ``8``)
+     - Smallest ``min`` accepted in a ``.to("spyre", dynamic=...)``
+       declaration (default ``8``)
+   * - ``SENARCH``
+     - Set ``sen1p5`` to compile for Spyre 1p5, whose matmul accepts only
+       ``BFLOAT16`` device inputs (default empty). The backend compiler reads
+       the same variable
+   * - ``SPYRE_LX_SAME_TILE_GROUP_RELAYOUT``
+     - Price LX relayout candidates on edges whose coarse-tiled producer and
+       consumer share one ``loop_group_id`` (default ``0``). Enabling it can
+       increase compile time on graphs with many such edges
+   * - ``SPYRE_LX_COLLECTIVE_OUTPUT_STAGING``
+     - Allow post-solve LX staging of a matmul output before an all-reduce's
+       HBM copy (default ``1``; set ``0`` to disable this step alone)
 
-**Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
+**Device enumeration and selection.** ``AIU_WORLD_SIZE``, ``SPYRE_DEVICES``,
+and ``FLEX_DEVICE`` are read by the flex library when
+``torch_spyre/csrc/spyre_device_enum.cpp`` calls ``flex::getNumDevices()``.
+``LOCAL_RANK`` is read by torch-spyre (``parse_local_rank`` in
+``torch_spyre/csrc/spyre_guard.h``):
 
 .. list-table::
    :header-rows: 1
@@ -951,7 +1149,22 @@ Environment Variables
    * - Variable
      - Purpose
    * - ``IS_INDUCTOR_SPAWNED_SUBPROCESS``
-     - Marker set by Inductor when spawning compile subprocesses
+     - Set to ``1`` in a subprocess that must not open the device. The
+       process is treated as not owning the device, and
+       ``torch.spyre.is_available()`` returns ``False``
+   * - ``TORCH_SPYRE_CHECK_LOOPS``
+     - Run structural checks on the loop tree between pre-scheduling passes
+       (``torch_spyre/_inductor/loop_checker.py``). On by default under
+       pytest, off otherwise. Accepts ``1``/``true``/``yes``/``on`` and
+       ``0``/``false``/``no``/``off``; any other value raises
+   * - ``SPYRE_ENABLE_UNIQUENESS_CHECK``
+     - After an optimal CP-SAT solve, run a second solve with no time limit
+       to check whether the optimum is fully priced (default ``0``). Not for
+       production compiles
+   * - ``TORCH_SPYRE_POOL_UNSAFE``
+     - Set ``1`` to skip the ``Unsupported`` rejection of a pooling op with
+       batch greater than 1 and a size-1 spatial output. That case reads from
+       the wrong batch, so the result is incorrect
 
 **Useful PyTorch knobs (not defined by torch-spyre):**
 

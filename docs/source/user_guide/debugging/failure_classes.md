@@ -15,7 +15,7 @@ assignment ahead of time.
 
 | Symptom | Class | Confirm with |
 |---|---|---|
-| Zeros or stale values past the first stick | [Layout and stick alignment](#layout-and-stick-alignment) | `copy_range` and layout in the `sdsc` artifact |
+| Zeros or stale values past the first stick | [Layout and stick alignment](#layout-and-stick-alignment) | iteration range and layout in the `sdsc` artifact |
 | `NaN` where CPU gives a finite number | [Special values, inf and NaN](#special-values-inf-and-nan) | print the mask or identity constant |
 | A warning, a slower run, and a changed dtype | [Silent CPU fallback](#silent-cpu-fallback) | promote `FallbackWarning` to an error |
 | An `Unsupported(...)` error on a float32 op, or an int64 downcast warning | [dtype and downcast](#dtype-and-downcast) | dtypes in `fx_graph_readable.py` |
@@ -48,8 +48,9 @@ A point to keep in mind while reading such a result: a `float16` tensor spans
 two sticks with a nonzero offset into the second, yet `is_contiguous()` still
 returns true, so a stride-based check does not describe the device layout.
 
-To localize one of these, read the `copy_range` and `device_size` in the
-kernel's `sdsc` artifact and compare them against the padded size. See
+To localize one of these, read the iteration range and the tensor layouts
+(`device_size`, `stride_map`) in the kernel's `sdsc` artifact and compare them
+against the padded size. See
 [Inductor Artifacts](inductor_artifacts.md) for how to read the artifact, and
 the worked example in the [debugging overview](index.md). For the layout model
 itself, see [Tensor Layouts](../tensors_and_layouts.md).
@@ -62,10 +63,10 @@ pattern rather than the fp16 infinity encoding. The masked position therefore
 holds `NaN`, and that `NaN` propagates through the entire reduction or `exp()`
 that reads it, not only the masked positions. The symptom is a `NaN` where CPU
 produces a finite number, often appearing only as the masked region grows.
-The encoder still behaves this way;
-[PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234) worked around
-it by switching the padding and reduction masks to the finite constants below,
-so an `-inf` mask is not safe to reintroduce.
+For this reason the compiler's padding and reduction masks use the finite
+constants below
+([PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234)), and an
+`-inf` mask is not safe to reintroduce.
 
 :::{figure} ../../_static/images/mask-nan.svg
 :alt: With a -inf mask, the masked position encodes to NaN and the reduction output is NaN at every position. With a -1e4 mask, the output stays finite.

@@ -263,11 +263,15 @@ the consumer's required STL, a restickify is recorded in
 
 Consumes `graph.restickify_plan` and splices the required restickify ops into
 `graph.operations` before their consumers. Each restickify is lowered as a
-real `spyre.restickify` IR node. The consumer op's `inner_fn` is then patched
-via `NameSwapHandler` — a `WrapperHandler` subclass that intercepts buffer
-loads and redirects them to the new restickified buffer, without touching any
-index expressions. The consumer `ComputedBuffer` is reconstructed as a fresh
-object to invalidate any cached size/body derived from the old inputs.
+real `spyre.restickify` IR node. The consumer op's `inner_fn` is then wrapped
+by `make_per_edge_inner_fn` with `InputEdgeSwapHandler`, a `WrapperHandler`
+subclass that intercepts each buffer load and redirects it, by
+`(dep_index, occurrence)`, to the restickified buffer for that read site,
+without touching any index expressions. The same buffer can be read at several
+index expressions that need different restickified buffers, so the redirection
+is per edge rather than per name. The wrapped `inner_fn` is set on the existing
+`ComputedBuffer`, and `invalidate_op_read_writes` drops its memoized
+read/write extraction, which still names the old inputs.
 
 ---
 
@@ -280,8 +284,17 @@ Analogous to `insert_post_mutation_restickify`: mutation op targets must retain 
 ## Pass 6 — Post-mutation Restickify (`insert_post_mutation_restickify`)
 
 A mutation op (`MutationLayoutSHOULDREMOVE`) writes its output directly into
-an existing target buffer rather than allocating a new one — it is an in-place
-write.  These need to be handled separately because `insert_restickify` pass runs before scheduling, but inductor requires an mutation ops to have their `FixedLayout` (rather than `FixedTiledLayout`) during scheduling. The solution is to have a separate pass, `insert_post_mutation_restickify`, handle mutation ops after scheduling has run.
+an existing target buffer rather than allocating a new one: it is an in-place
+write. When a slice mutation needs a stick offset that the target's layout
+cannot express, `propagate_layouts` picks an alternate layout and records
+`op._restickify_plan = (target_name, orig_stl, alt_stl)`.
+`insert_post_mutation_restickify` consumes that record. For an internal
+buffer, which is already allocated in the alternate layout, it only rebinds
+the write onto the alternate-layout buffer. For a graph input, which must keep
+its address and surrounding data, it inserts a restickify of the input into a
+temporary buffer in the alternate layout, points the mutation at that
+temporary, inserts a copy-back into the input, and stamps
+`_emit_set_layout` so codegen emits `set_spyre_tensor_layout` for the input.
 
 ---
 
@@ -304,13 +317,13 @@ finalize_layouts(graph)
 
 insert_restickify(graph)
     → splices restickify ComputedBuffers before affected consumer ops
-    → patches consumer inner_fn via NameSwapHandler
+    → wraps consumer inner_fn via make_per_edge_inner_fn (InputEdgeSwapHandler)
 
 reorder_nonstick_dims_mutation(graph)
     → executes graph.nonstick_deferred entries (copy nodes or producer rewrites)
 
 insert_post_mutation_restickify(graph)
-    → inserts pre/post ops for offset-mutation edge cases
+    → consumes op._restickify_plan; inserts restickify and copy-back ops for offset mutations of graph inputs
 ```
 
 ---

@@ -13,7 +13,7 @@ definition of a specific term, see the [glossary](glossary.md).
 
 ---
 
-## 1. Execution model
+## Execution model
 
 A GPU executes thousands of threads in lock-step on different data, the
 Single Instruction, Multiple Threads (SIMT) model. Spyre executes a
@@ -50,7 +50,7 @@ for the full treatment.
 
 ---
 
-## 2. Hardware
+## Hardware
 
 A Spyre card has 32 cores. Each core has 2 corelets that share a 2 MB
 LX scratchpad. Inside each corelet is an 8×8 PE array (systolic, used
@@ -73,7 +73,7 @@ Default dtype is `torch.float16`.
 
 ---
 
-## 3. Memory hierarchy
+## Memory hierarchy
 
 Spyre has two memory tiers. LPDDR5 is 128 GB of off-chip device memory,
 equivalent in role to a GPU's HBM. The LX scratchpad is 2 MB of on-core
@@ -105,10 +105,11 @@ device memory in general. Spyre's device memory is LPDDR5, not HBM.
 
 ---
 
-## 4. Sticks and tiled tensors
+## Sticks and tiled tensors
 
 The unit of memory transfer on Spyre is a stick: 128 B aligned, 64 fp16
-elements (`BYTES_IN_STICK = 128`). A stick matches the granularity of a
+elements. The number of elements per stick for a data type comes from
+`elems_per_stick()`. A stick matches the granularity of a
 load between LPDDR5 and LX, so each transfer moves a full stick of
 contiguous data.
 
@@ -144,16 +145,19 @@ For the full reference, see [Tensor Layouts](../user_guide/tensors_and_layouts.m
 
 ---
 
-## 5. Eager vs compiled path
+## Eager vs compiled path
 
 A PyTorch program reaches Spyre on one of two paths. Which path a given
 line of code takes determines its performance.
 
 **Eager path.** When you write `x.to("spyre")` or `torch.add(x, y)` on
-Spyre tensors, PyTorch's dispatcher routes each op to a Torch-Spyre C++
-kernel registered against the `PrivateUse1` device key. Each op runs
-immediately. The result is correct but slow: there is no fusion, no
-shared scratchpad reuse across ops, and many ops fall back to CPU.
+Spyre tensors, PyTorch's dispatcher routes each op to a Torch-Spyre
+kernel registered for the `spyre` device (the `PrivateUse1` device key).
+Many of these kernels compile the single op through the Spyre backend the
+first time it runs at a given shape (`torch_spyre/ops/eager.py`), and ops
+with no Spyre kernel run on the CPU (`torch_spyre/ops/fallbacks.py`). Each op
+runs immediately. The result is correct but slow: there is no fusion and no
+shared scratchpad reuse across ops.
 
 :::{figure} ../_static/images/pytorch-dispatcher.png
 :alt: PyTorch dispatcher routing a Spyre tensor op to the registered Spyre kernel
@@ -187,7 +191,7 @@ are implemented there.
 
 ---
 
-## 6. Graph breaks
+## Graph breaks
 
 Inside a `torch.compile`-d region, anything Inductor cannot lower forces
 a **graph break**: the compiled graph stops, the partial result
@@ -216,8 +220,8 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    sequence of native or custom ops (e.g. `aten.addmm` →
    `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
    plus a Taylor polynomial).
-4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `tril`, ...). Transparent, but
+4. **CPU fallback**: auto-transfer for the long tail (`arange`,
+   `isin`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
@@ -228,7 +232,7 @@ to enable a new one.
 
 ---
 
-## 7. Compilation pipeline
+## Compilation pipeline
 
 The compiled path runs the standard PyTorch pipeline (FX capture,
 AOTAutograd, Inductor scheduler) and inserts three Spyre-specific
@@ -295,7 +299,7 @@ For the full pipeline reference, see
 
 ---
 
-## 8. Dtype defaults and casting
+## Dtype defaults and casting
 
 Spyre's default compute dtype is `torch.float16`, so tensors created
 without an explicit dtype are fp16. The dtype that is silently narrowed
@@ -314,7 +318,7 @@ for that op's dtype coverage.
 
 ---
 
-## 9. Running models today: FMS vs stock HuggingFace
+## Running models today: FMS vs stock HuggingFace
 
 Today the production path for LLM inference on Spyre is through IBM's
 **Foundation Model Stack (FMS)**, which provides Spyre-aware model
@@ -341,7 +345,7 @@ for the current state.
 
 ---
 
-## 10. Hardware constraints checklist
+## Hardware constraints checklist
 
 Constraints that show up as compile-time errors or unexpected behavior:
 
@@ -350,14 +354,14 @@ Constraints that show up as compile-time errors or unexpected behavior:
 | **128-byte alignment** | Inner dimensions are padded up to a multiple of 64 fp16 elements (a stick). |
 | **No HW scalar immediates** | Scalar constants in the FX graph are rewritten to size-1 tensors via `spyre::constant`. |
 | **Indivisible reduction dims** | Some reduction dimensions cannot be split across cores; work distribution honors this. |
-| **Static shapes** | Dynamic shapes are work-in-progress. Shape-polymorphic models may recompile per shape. |
+| **Static shapes by default** | `torch.compile(dynamic=True)` is refused. A dimension that varies at run time is declared with `.to("spyre", dynamic=...)` and consumed by a `for_each_tile` loop; see [Tensor Layouts](../user_guide/tensors_and_layouts.md#reserving-memory-for-a-dynamic-dimension). Other shape changes recompile per shape. |
 | **Per-core memory span (256 MB)** | Each core's contiguous device-memory footprint must fit within 256 MB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
 | **fp16 default** | int64 is down-cast to int32 with a warning. Set `TORCH_SPYRE_DOWNCAST_WARN=0` to suppress. |
 | **`SENCORES=32`** | Default core count; lowering it for debugging changes work-division decisions. |
 
 ---
 
-## 11. Streams
+## Streams
 
 Each Spyre device exposes asynchronous execution through stream
 primitives that match the `torch.cuda.Stream` API:
@@ -381,7 +385,7 @@ Full reference: [Runtime — Streams](../runtime/index.md).
 
 ---
 
-## 12. Distributed execution
+## Distributed execution
 
 Multiple Spyre cards on the same host coordinate through the
 `spyreccl` torch.distributed backend:
@@ -400,7 +404,10 @@ dist.broadcast(x, src=0)
 The model is one-device-per-process. Each rank attaches to a single
 Spyre device. Implemented synchronous collectives include `send`,
 `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, and
-`allreduce`. The underlying transport library is closed-source IBM
+`allreduce`. Inside a `torch.compile` region, reduce-scatter and the
+coalesced allreduce and all-gather are also lowered; the
+`distributed/compiled/` scripts on the
+[Examples](../user_guide/examples/index.md) page show each one. The underlying transport library is closed-source IBM
 code. Only the public adapter (`SpyreCCLBackend` in
 `csrc/distributed/`) is in-tree.
 

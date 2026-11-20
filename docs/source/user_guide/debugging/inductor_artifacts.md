@@ -25,8 +25,11 @@ python my_script.py
 Inductor will reuse cached compilation results and no new artifacts
 are written.
 
-Artifacts land under `/tmp/torchinductor_<user>/` or
-`./torch_compile_debug/` depending on the PyTorch version.
+The `TORCH_COMPILE_DEBUG` artifacts land under `./torch_compile_debug/` in
+the working directory. The Spyre kernel bundles (`sdsc_<index>.json` and
+`bundle.mlir`) are written separately, to a per-kernel directory under
+`inductor-spyre/` in the Inductor cache directory
+(`$TORCHINDUCTOR_CACHE_DIR` when set, else `/tmp/torchinductor_<user>/`).
 
 ## Directory layout
 
@@ -44,8 +47,13 @@ torch_compile_debug/
             ├── inductor_provenance_tracking_node_mappings.json ← IR ↔ source mapping
             ├── ir_pre_fusion.txt                               ← LoopLevelIR before fusion
             ├── ir_post_fusion.txt                              ← LoopLevelIR after fusion
-            ├── output_code.py                                  ← generated host code
-            └── sdsc_<index>.json                               ← per-kernel specs fed to DeepTools backend
+            └── output_code.py                                  ← generated host code
+
+/tmp/torchinductor_<user>/
+└── inductor-spyre/
+    └── <prefix>_<kernel name>_<suffix>/
+        ├── bundle.mlir                                         ← bundle passed to the DeepTools back-end
+        └── sdsc_<index>.json                                   ← per-kernel specs fed to DeepTools backend
 ```
 
 ## What each layer tells you
@@ -136,14 +144,14 @@ reference.
 ```bash
 # Dump everything for a minimal reproducer
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 \
-TORCH_SPYRE_DEBUG=1 \
+TORCH_LOGS="+torch_spyre" \
 TORCH_COMPILE_DEBUG=1 \
 INDUCTOR_PROVENANCE=1 \
 python my_reproducer.py
 
 # Locate the artifacts
-find . -name "sdsc_*.json" 2>/dev/null
-find /tmp -name "fx_graph_readable.py" 2>/dev/null
+find /tmp/torchinductor_$USER/inductor-spyre -name "sdsc_*.json" 2>/dev/null
+find ./torch_compile_debug -name "fx_graph_readable.py" 2>/dev/null
 ```
 
 ## See also

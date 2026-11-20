@@ -10,8 +10,9 @@ document exists.
 The solver's code lives in `torch_spyre/_inductor/scratchpad/`,
 which contains the following files.
 
-- **`plan_solver.py`** — the shared `LifetimeBoundBuffer`
-  data type, the `MemoryPlanSolver` ABC, and a simple `GreedyLayoutSolver`.
+- **`plan_solver.py`**: the shared `LifetimeBoundBuffer`
+  data type and the `MemoryPlanSolver` ABC. The simple `GreedyLayoutSolver` is in
+  `greedy_solver.py`.
 - **`torch_spyre/csrc/perm_layout_native.cpp`** — the core, and the only packer that ships. A
   *permutation* is an allocation order; `NativePermutationLayoutSolver` places each buffer on top of
   the earlier-placed buffers it overlaps in time (with in-place reuse) and re-places under
@@ -30,10 +31,7 @@ a first-fit vs simulated-annealing quality comparison, and an in-place convergen
 study — live in
 [`docs/source/user_guide/examples/scratchpad/`](../user_guide/examples/index.md).
 
-**Native packer.** The packer is C++ only. A Python implementation was the original one and
-served as the canonical spec until the C++ port took over as the default; it was measured at
-roughly 14× slower end-to-end on mid-sized problems at representative capacity (see
-[Native packer performance](native_packer_performance.md)) and has since been removed. Because the
+**Native packer.** The packer is C++ only. Because the
 `_C` extension is required for torch-spyre to function at all, a missing native packer means a
 stale or incomplete build and raises rather than falling back.
 
@@ -79,10 +77,7 @@ stacking order), moves no address and returns a zero delta after updating the or
 does the same for an ineligible buffer.
 
 None of this changes the asymptotics: both the packer and the naive placer are quadratic in the
-worst case, and the shortcuts buy constants — which is the whole of the win, and enough of it that
-porting the genuinely sub-quadratic algorithm the original Python packer used was judged not worth
-the roughly 2.5× more C++ it would take (see
-[Native packer performance](native_packer_performance.md)).
+worst case, and the shortcuts reduce constant factors only.
 
 `ReferencePermutationBasedLayoutSolver` in `tests/inductor/reference_perm_layout.py` is the
 obviously-correct counterpart: it scans all earlier-placed overlapping buffers for each placement and

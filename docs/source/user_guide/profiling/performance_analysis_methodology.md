@@ -9,7 +9,7 @@ reading the result alongside `aiu-smi` telemetry. Bottleneck
 classification and multi-rank analysis will follow as the
 [RFC 0601][rfc-0601] tooling matures. Contributions welcome.
 
-## 1. Bound the measured region
+## Step 1: Bound the measured region
 
 Use `torch.profiler`'s `schedule` + `record_function` to avoid
 measuring compile/warmup cost and to make iterations easy to select
@@ -33,7 +33,7 @@ prof.export_chrome_trace("spyre_trace.json")
 See the upstream [PyTorch profiler documentation][torch-profiler-docs]
 for the full `schedule` / `record_function` API.
 
-## 2. Extract kernel and transfer time from the trace
+## Step 2: Extract kernel and transfer time from the trace
 
 A trace captured with `ProfilerActivity.PrivateUse1` is written in the
 Chrome Trace Event Format, where every event carries a category (`cat`)
@@ -68,7 +68,7 @@ result is per-iteration milliseconds. A high transfer fraction relative
 to kernel time points to host-device movement on the critical path
 rather than device compute.
 
-## 3. PT-active utilization
+## Step 3: PT-active utilization
 
 PT-active utilization compares the theoretical minimum time for a kernel
 against its measured execution time. It answers how close a kernel runs
@@ -94,7 +94,7 @@ memset entries from the compute total, for a whole-model figure.
 torch-spyre setting, so the availability and exact format of
 `ideal_cycles.json` follow the compiler build in use.
 
-## 4. Pair the trace with `aiu-smi`
+## Step 4: Pair the trace with `aiu-smi`
 
 Run `aiu-smi` in a second shell during the profiling window (see
 [Device monitoring](device_monitoring.md)). Both timestamps are
@@ -110,7 +110,7 @@ For post-processing the captured trace (additional statistics, trace
 enrichment), see [`aiu-trace-analyzer`](trace_analysis.md#aiu-trace-analyzer)
 ([public repository][ata]).
 
-## 5. Filing a performance report
+## Step 5: Filing a performance report
 
 When opening an issue, include:
 

@@ -22,7 +22,7 @@ end_to_end_example
 Torch-Spyre provides tooling to measure the performance of PyTorch
 workloads running on the Spyre accelerator. The full design of the
 planned toolkit is in
-[RFC 0601 — Spyre Profiling Toolkit][rfc-0601].
+[RFC 0601: Spyre Profiling Toolkit][rfc-0601].
 
 The in-tree `torch_spyre.profiler` package is importable and exports
 FFDC retrieval (`get_diagnostic_report`). Device presence is
@@ -36,10 +36,13 @@ in-tree profiling APIs will land with RFC 0601.
 | Capability | Status | Where |
 |---|---|---|
 | Compiler pipeline logs | Available | [Environment variables](environment_variables.md) |
+| Frontend compile timing records | Available (`TORCH_SPYRE_TIMING=1`, written to the path in `TORCH_SPYRE_TIMING_OUT` at process exit) | [Environment variables](environment_variables.md) |
+| Frontend-only compile measurement, with the backend compiler skipped | Available (`TORCH_SPYRE_FRONTEND_ONLY=1`; the compile produces no runnable kernel) | [Environment variables](environment_variables.md) |
+| Predicted runtime per kernel from the analytical cost model | Available (`SPYRE_DUMP_COST=1`, printed after pre-scheduling) | [Cost model](../../compiler/cost_model.md) |
 | FFDC diagnostic reports on Spyre compile/runtime/unimplemented failures | Available (`TORCH_SPYRE_FFDC=1`) | [FFDC user guide](ffdc.md) · [API: `get_diagnostic_report`](../../api/torch_spyre.rst) · [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
 | Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
-| Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Merged and built by default ([#1856][pr-1856]) via upstream Kineto and `libaiupti` | [PyTorch Profiler](pytorch_profiler.md) |
+| Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Available, built by default (`USE_SPYRE_PROFILER=1`, [#1856][pr-1856]) via upstream Kineto and `libaiupti` | [PyTorch Profiler](pytorch_profiler.md) |
 | Trace post-processing (aiu-trace-analyzer) | Available, known gaps | [Trace analysis](trace_analysis.md) |
 | `torch.spyre.memory.memory_allocated()` / `max_memory_allocated()` | Available — delegates to [`torch.accelerator.memory`][accelerator-memory] (PR [#770][pr-770]) | [Quick example](#memory-api-quick-example) |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
@@ -98,7 +101,7 @@ The module also exposes `reset_accumulated_memory_stats()` and
 | Layer | Tool | Granularity |
 |---|---|---|
 | Application / PyTorch | `torch.profiler` + upstream Kineto | Kernel-level |
-| Compiler frontend | Inductor logging | Pass-level |
+| Compiler frontend | Inductor logging, `TORCH_SPYRE_TIMING` records | Pass-level |
 | Compiler backend | IR instrumentation *(planned)* | Intra-kernel |
 | Runtime | `libaiupti` kernel + memory events | Kernel + memory |
 | Device / HW | `aiu-smi` | Device-level telemetry |

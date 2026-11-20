@@ -67,7 +67,7 @@ flowchart TD
 These steps work from the outside in. Run them in order; most bugs are
 localized before you reach the last one.
 
-### Step 1 — Create a Minimal Reproducer
+### Step 1: Create a Minimal Reproducer
 
 Before investigating, reduce the failing model or script to the smallest
 possible program that still shows the wrong behaviour. This makes the
@@ -77,24 +77,24 @@ compiler artifacts much easier to read.
 import torch
 
 # Minimal reproducer — replace with the failing op
-x = torch.arange(65, dtype=torch.float16)
+x = torch.arange(65, dtype=torch.float16).to("spyre")
 result = x.clone().to("cpu")
 print(result)
 ```
 
 ---
 
-### Step 2 — Enable Debug Environment Variables
+### Step 2: Enable Debug Environment Variables
 
 The following environment variables control the level of diagnostic output:
 
 | Variable | Effect |
 |----------|--------|
 | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` | Forces full recompilation on every run; ensures you see fresh artifacts, not cached ones |
-| `TORCH_SPYRE_DEBUG=1` | Logs all CPU↔Spyre data transfers, including tensor shapes, layouts, and raw values |
+| `TORCH_LOGS="+torch_spyre"` | Sets every Spyre log component to DEBUG. The `spyre.runtime` records include the shape and `SpyreTensorLayout` of each device allocation and the `DataConversionInfo` of each host-device copy. `TORCH_SPYRE_DEBUG=1` is a deprecated alias that emits a `DeprecationWarning` |
 | `TORCH_COMPILE_DEBUG=1` | Writes intermediate compiler artifacts to a local directory for offline inspection |
 | `TORCH_SPYRE_FFDC=1` | Captures an [FFDC](../profiling/ffdc.md) JSON report on frontend-compile / backend-compile / runtime / unimplemented failures. Separate from `USE_SPYRE_PROFILER` (profiler build flag); not set by default on pods. |
-| `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Redirect Spyre Inductor log output to a file |
+| `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Redirect the output of the top-level `spyre` logger to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
 | `SPYRE_VALIDATE_EVERY_PASS=1` | Check that `graph.operations` is topologically ordered after every pre-scheduling pass, and name the pass that broke the order. The check after the last pass always runs; when it fails, its error asks for this. Off by default because it re-extracts every operation's read set after every pass |
@@ -135,18 +135,21 @@ Run your reproducer with FFDC plus the main debug flags enabled:
 ```bash
 TORCH_SPYRE_FFDC=1 \
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 \
-TORCH_SPYRE_DEBUG=1 \
+TORCH_LOGS="+torch_spyre" \
 TORCH_COMPILE_DEBUG=1 \
 python my_reproducer.py
 ```
 
-`TORCH_COMPILE_DEBUG` writes artifacts to a subdirectory under
-`/tmp/torchinductor_<user>/` (or `torch_compile_debug/` in the current
-directory, depending on your PyTorch version).
+`TORCH_COMPILE_DEBUG` writes artifacts to `torch_compile_debug/` in the
+current directory. The Spyre kernel bundles (`sdsc_<index>.json` and
+`bundle.mlir`) are written to a per-kernel directory under `inductor-spyre/`
+in the Inductor cache directory (`$TORCHINDUCTOR_CACHE_DIR` when set, else
+`/tmp/torchinductor_<user>/`). See
+[Inductor Debug Artifacts](inductor_artifacts.md) for both layouts.
 
 ---
 
-### Step 3 — Capture FFDC Report
+### Step 3: Capture FFDC Report
 
 If the failure is a compile error, runtime launch error, or
 unimplemented operation, FFDC can preserve the exception context and
@@ -177,7 +180,7 @@ report schema, per-category triage, and pod/CI usage.
 
 ---
 
-### Step 4 — Examine Compiler Artifacts
+### Step 4: Examine Compiler Artifacts
 
 `TORCH_COMPILE_DEBUG` preserves one subdirectory per compiled function.
 Inside you will find the intermediate representation at each stage of
@@ -226,26 +229,18 @@ Consider a `float16` tensor of size `[65]`. The default Spyre layout
 pads the stick dimension to 128 bytes (64 elements per stick), so the
 tensor is laid out on device as shape `[2, 64]` — two sticks.
 
-`TORCH_SPYRE_DEBUG=1` output confirming the CPU→Spyre transfer is
-correct:
+The `spyre.runtime` DEBUG log (`TORCH_LOGS="+torch_spyre"`) shows the layout
+of the device allocation, which confirms that the CPU to Spyre transfer used
+the expected two-stick layout:
 
 ```
-[TORCH_SPYRE_DEBUG] copy_to_device: shape=[65] dtype=float16
-  device_layout: SpyreTensorLayout(device_size=[2, 64], stride_map=[64, 1], ...)
-  transfer OK
+SpyreTensorLayout: SpyreTensorLayout(device_size=[2, 64], stride_map =[64, 1], ...)
 ```
 
 Inspecting the `sdsc_<index>.json` for the clone kernel (locate it via
-`output_code.py`, which maps each launched kernel to its index) then
-revealed:
-
-```
-{
-  "op": "clone",
-  "input_layout": { "device_size": [2, 64], ... },
-  "copy_range": [1, 64]   // ← only copying the first stick, should be [2, 64]
-}
-```
+`output_code.py`, which maps each launched kernel to its index) then showed
+an input layout with `device_size` `[2, 64]` but an iteration range that
+covered only `[1, 64]`.
 
 The bug: the codegen only emitted a copy for the first stick (`[1, 64]`)
 instead of both sticks (`[2, 64]`). The second stick — which holds
@@ -263,7 +258,7 @@ When opening an issue, include:
 - [ ] Full error output or incorrect value observed
 - [ ] PyTorch version (`python -c "import torch; print(torch.__version__)"`)
 - [ ] Torch-Spyre version or commit SHA
-- [ ] Output of `TORCH_SPYRE_DEBUG=1` showing the data transfer log
+- [ ] Output of `TORCH_LOGS="+torch_spyre"` showing the data transfer log
 - [ ] Relevant excerpts from `fx_graph_readable.py` and the affected
   `sdsc_<index>.json`
 - [ ] FFDC report path / `failure.category` when `TORCH_SPYRE_FFDC=1` was set
@@ -276,13 +271,13 @@ When opening an issue, include:
 # Full debug run
 TORCH_SPYRE_FFDC=1 \
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 \
-TORCH_SPYRE_DEBUG=1 \
+TORCH_LOGS="+torch_spyre" \
 TORCH_COMPILE_DEBUG=1 \
 python my_reproducer.py
 
 # Find the generated artifacts
-find . -name "sdsc_*.json" 2>/dev/null
-find /tmp -name "fx_graph_readable.py" 2>/dev/null
+find /tmp/torchinductor_$USER/inductor-spyre -name "sdsc_*.json" 2>/dev/null
+find ./torch_compile_debug -name "fx_graph_readable.py" 2>/dev/null
 ```
 
 ---

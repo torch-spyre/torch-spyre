@@ -34,6 +34,13 @@ We define Spyre-specific decompositions in [decompositions.py](https://github.co
 using the `@register_spyre_decompositions` decorator.  Decompositions are graph transformations
 that are performed before the graph is lowered to loop level IR.
 
+Registering a decomposition for an `aten` operation also gives it an eager
+path. At runtime initialization, `_register_spyre_dispatchkey_kernels_permanently`
+installs a PrivateUse1 kernel for every `aten` operation in the Spyre
+decomposition table that has no other Spyre kernel. That kernel compiles the
+decomposition on its first eager call and reuses the compiled function on later
+calls. Decompositions of `spyre` custom ops receive no eager kernel.
+
 ## Spyre-specific lowerings
 
 We define Spyre-specific lowerings from ATen operations to Inductor's
@@ -56,9 +63,13 @@ In addition, when defining a custom op, you will also need to do one of:
   add a method to `SpyreOpFuncs` in [spyre_kernel.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/spyre_kernel.py).
   A canonical example is `spyre.clamp`.
 + register a decomposition for the custom op in [decompositions.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/decompositions.py)
-  that removes the custom op from the graph before lowering. We currently do not have any custom ops that use this option.
-+ define a `CustomPrePass` or `CustomPostPass` that implements a more general graph
-  rewrite that removes the custom op from the graph before lowering. We currently do not have any custom ops that use this option.
+  that removes the custom op from the graph before lowering. Canonical examples are
+  `spyre.linear_attention`, `spyre.sliding_window_attention`, and `spyre.scaled_bmm`
+  (which decomposes to `spyre.bmm_fp8` followed by the scale multiplies).
++ add a graph pass to `CustomPrePasses` or `CustomPostPasses` in
+  [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py)
+  that implements a more general graph rewrite that removes the custom op from
+  the graph before lowering. We currently do not have any custom ops that use this option.
 
 ## Custom ops as CPU fallbacks
 
@@ -69,15 +80,19 @@ unsupported cases to a CPU fallback. The pattern is:
 1. Define a custom op in
    [customops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/customops.py)
    with `@torch.library.custom_op` and a `register_fake` that returns the
-   expected output shape/dtype. The implementation body raises `RuntimeError`
-   (it is never called directly).
+   expected output shape/dtype. The implementation body computes the result
+   with the ATen operation: PyTorch routes a call whose inputs are not Spyre
+   tensors (for example, a CPU reference run in a test) to this body, so it must
+   not raise.
 2. Register a Spyre-specific decomposition in
    [decompositions.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/decompositions.py)
    that dispatches to either a native Spyre path or the custom fallback op
    based on dtype or other conditions.
 3. Register a CPU fallback for the custom op in
    [fallbacks.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py)
-   using `@register_fallback`.
+   using `@register_fallback`. This installs the kernel for Spyre-tensor inputs,
+   which copies the inputs to the CPU, runs the operation there, and copies the
+   result back.
 
 Canonical examples are `spyre::max_dim_int64_fallback` and
 `spyre::min_dim_int64_fallback`, which fall back to CPU for int64 reductions
@@ -145,6 +160,8 @@ def new_inner_fn(*args, _orig=orig_inner):
 ```
 
 Canonical implementations: `NameSwapHandler` in
+[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py),
+`InputEdgeSwapHandler` in
 [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py),
 `_SplitOpsHandler` and `_IntermediateOpHandler` in
 [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py).

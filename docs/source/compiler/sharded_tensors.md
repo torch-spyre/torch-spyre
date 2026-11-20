@@ -258,13 +258,20 @@ The Inductor side is led by
 whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 `Unsupported`. Its checks, in order:
 
-1. Only same-shape pointwise ops are admitted (the op-kind check is
+1. An in-place write into a sharded tensor is rejected.
+2. Only same-shape pointwise ops are admitted (the op-kind check is
    generic — not limited to `add`); mixed dtypes, dynamic shapes, and
-   views of sharded inputs are rejected with specific messages.
-2. Every sharded input must agree with the others on placement (shard dim,
+   views of sharded inputs are rejected with specific messages. Each
+   operand must be read element for element (no broadcast or reindexing),
+   the shard dim must divide evenly, and the kernel needs
+   `BUNDLE_SYMBOLIC_ARGS=1`, because every core's start address is a bundle
+   `input_arg`.
+3. Every sharded input must agree with the others on placement (shard dim,
    count) — an operand-vs-operand check; each operand's own storage was
    already validated against its receipt when the tensor was created.
-3. Only pinned ops may read sharded storage, including
+4. Every sharded result must be a graph output; a sharded intermediate is
+   rejected.
+5. Only pinned ops may read sharded storage, including
    non-`ComputedBuffer` consumers (fallback kernels), which a separate
    loop catches.
 

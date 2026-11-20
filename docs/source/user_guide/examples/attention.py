@@ -14,10 +14,8 @@
 """Scaled dot-product attention assembled from matmul and softmax.
 
 This script computes a single attention block as q @ k^T scaled, softmax, then
-@ v, and compares the compiled Spyre result against a CPU reference. It is
-compile-only: the eager matmul path is unsupported here because mm on Spyre
-tensors needs the hardware session that torch.compile sets up. It requires a
-Spyre device to run.
+@ v, and compares the compiled Spyre result against a CPU reference. It runs
+the function under torch.compile only. It requires a Spyre device to run.
 """
 
 import torch

@@ -57,7 +57,7 @@ nothing in the repository reads one. Do not add a version field or a
 producer for the object above. If that storage is added later, it
 belongs entirely to the Multi-AIU proposal.
 
-## 1. Architecture and device identity
+## Architecture and device identity
 
 Required for every regression-grade run.
 
@@ -70,7 +70,7 @@ Required for every regression-grade run.
 Public text names architecture and device **class** only.
 
 (card-count-and-topology)=
-## 2. Card count and topology
+## Card count and topology
 
 The steps below are the procedure. The only skip is an explicit intended
 0. The job is card-using when the selected intended count is greater than
@@ -146,7 +146,7 @@ variable is a separate mechanism, documented in the
 [runtime guide](../runtime/index.md). This gate does not change that
 variable and does not require the property on the report.
 
-## 3. Required software state
+## Required software state
 
 Required for every regression-grade run.
 
@@ -162,14 +162,14 @@ recorded. A missing mandatory stack commit makes the observation ineligible
 and can also fail this section when the environment cannot attest it.
 
 (resource-isolation)=
-## 4. Resource isolation
+## Resource isolation
 
 Required for every regression-grade run.
 
 Exclusive card lock is not restated here. For a card-using job, lock
 absence is `ENV_NO_CARD_LOCK` and a short allocation is
 `ENV_CARD_COUNT_MISMATCH`, both defined in
-[section 2](card-count-and-topology).
+[Card count and topology](card-count-and-topology).
 
 | Check | Pass | Fail |
 | --- | --- | --- |
@@ -182,7 +182,7 @@ must not run more than one regression-grade performance set at the same time
 on the same cards. One image reference and one product-test at a time is the
 interim isolation rule until a second qualified environment exists.
 
-## 5. Environment provenance
+## Environment provenance
 
 Required for every regression-grade run.
 
@@ -199,7 +199,7 @@ caller has no id to join. That result is `ENV_ID_MISSING`, not a pass. A
 private inventory map may support ops triage. It does not satisfy this
 public gate, and it must not be copied into this page.
 
-## 6. Repeatability and noise
+## Repeatability and noise
 
 Required. Reuse [#5181][pr-5181]. Do not re-implement regression noise in
 Python, and do not add a stricter node-only floor.
@@ -231,7 +231,7 @@ Re-check after a driver or firmware change by letting the next `perf` runs
 flow through the same views. This page does not define a second cadence or
 a second numeric floor.
 
-## 7. Failover equivalence
+## Failover equivalence
 
 Required only when a failover environment is used for the series.
 
@@ -242,7 +242,7 @@ Required only when a failover environment is used for the series.
 | Tagging | Failover runs carry an environment id so series logic can split or merge on purpose | `ENV_FAILOVER_UNTAGGED` |
 
 Recorded Flex mode may be compared when both sides have it. A missing Flex
-value still does not, by itself, fail section 2 or this section.
+value still does not, by itself, fail the card count and topology checks or this section.
 
 An environment outside the program's Spyre CI agent class is not
 failover-equivalent by default.
@@ -253,7 +253,7 @@ Do not copy that inventory into this page.
 ## Reason codes
 
 Each `ENV_*` code is defined once here. The sections above say when the
-check passes. `ENV_NO_CARD_LOCK` is the section 2 step 4 failure.
+check passes. `ENV_NO_CARD_LOCK` is the failure of step 4 in [Card count and topology](card-count-and-topology).
 [Resource isolation](resource-isolation) does not define it again.
 
 | Code | Where | When |

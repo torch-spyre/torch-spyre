@@ -49,9 +49,9 @@ them, showing which runtime knobs control which subsystems.
 - Pan by dragging the background; zoom with the scroll wheel.
 - **Click a node** to highlight its connections and see its source
   file, line number, and neighbors in the panel below.
-- **Follow the source link** — the file:line shown in the panel is a
-  clickable link straight to the defining code on GitHub, pinned to the
-  commit the graph was built from.
+- **Follow the source link**: the file:line shown in the panel is a
+  link to the defining code on GitHub, pinned to the commit the graph was
+  built from.
 - **Double-click a node** to jump directly to that code in a new tab.
 - **Click a neighbor name** in the "Connected to" list to hop to that
   node without leaving the graph.
@@ -62,8 +62,8 @@ them, showing which runtime knobs control which subsystems.
   the current selection.
 - Type in the search box to filter nodes by name.
 - **Deep links:** selecting a node updates the page URL (for example
-  `…/explorer/index.html#ops/op::mm`). Copy that URL to link a
-  teammate straight to a specific node and view.
+  `…/explorer/index.html#ops/op::aten.mm.default`). Copy that URL to link
+  to a specific node and view.
 
 For a deeper walkthrough of *why* this is useful and how each persona
 gets value from it, see {doc}`using_the_explorer`.
@@ -78,9 +78,11 @@ are required.
 
 The extractors cover:
 
-- Op registration decorators (`@register_spyre_decomposition`,
+- Op registrations: `@register_spyre_decomposition`,
   `@register_spyre_lowering`, `@torch.library.custom_op`,
-  `register_fallback_default`, `register_torch_compile_kernel`)
+  `@register_fallback`, `register_fallback_default`, `fallback_ops.append`,
+  `register_torch_compile_kernel`, `register_inplace_kernels`, and
+  `torch.library.register_kernel` calls for the `spyre` device
 - `Custom*Passes` class definitions and their pass function lists
 - Class definitions with base classes
 - `@dataclass`-decorated structs and their typed fields

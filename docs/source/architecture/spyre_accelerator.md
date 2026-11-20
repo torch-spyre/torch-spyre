@@ -5,7 +5,7 @@ This document provides an overview of the Spyre device.
 ## What is Spyre
 
 The Spyre AI Card, also known as the IBM Spyre Accelerator, is a high-performance, energy-efficient
-AI accelerator. Currently, it is generally available for IBM Z, LinuxONE, and Power systems.
+AI accelerator. It is generally available for IBM Z, LinuxONE, and Power systems.
 
 Spyre Accelerators are engineered to support the development of higher-accuracy AI techniques, enabling real-time generative asset creation, customer data ingestion and interpretation for outreach, cross-selling, and risk assessments.
 
@@ -21,10 +21,10 @@ The IBM Spyre AI Card. *Image credit: [IBM Research](https://research.ibm.com/bl
 
 Some of the key features of the Spyre device are listed below:
 
-* It is equipped with 32 AI accelerator cores, capable of handling matrix operations and low‑precision workloads for high throughput.
+* It is equipped with 32 AI accelerator cores, capable of handling matrix operations and low-precision workloads for high throughput.
 * It is manufactured using advanced 5nm node technology.
-* Each card supports up to 128 GB of LPDDR5 memory, with ensembles of up to eight cards delivering 1 TB memory and massive AI performance.
-* It delivers exceptional AI compute, exceeding 300 TOPS per card, while consuming just 75W.
+* Each card supports up to 128 GB of LPDDR5 memory, and an ensemble of up to eight cards provides 1 TB of memory.
+* Each card delivers more than 300 TOPS at 75 W.
 * PCIe gen5 x16 host interface (PCIe form factor card).
 * Each core has a 2 MB LX scratchpad (SRAM), shared between the two corelets within the core.
 * Each core has a 256 MB limit on the contiguous device-memory span it can address. This is a hardware constraint on the addressable range, distinct from the 2 MB LX scratchpad capacity.
@@ -33,21 +33,15 @@ Some of the key features of the Spyre device are listed below:
 
 Each Spyre core is built from two corelets that share a single 2 MB LX scratchpad (SRAM). Inside each corelet there is an 8 × 8 systolic Processing Element (PE) array, used for matrix-style compute on the PT execution unit, plus a 1D Special Function Unit (SFU) for non-linear activations such as GELU and softmax.
 
-Cores talk to each other over a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's research-stage RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
+Cores are connected by a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's research-stage RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
 
 ### Memory and tiling constants
 
-The runtime, compiler, and tensor-layout code all share one tiling constant:
-
-```
-BYTES_IN_STICK = 128
-```
-
-A *stick* is a 128-byte aligned memory chunk, which works out to 64 elements at fp16. The size matches the natural granularity of data transfers between LPDDR5 device memory and the per-core LX scratchpad, so the hardware can pull in a full stick of contiguous elements in a single transfer.
+A *stick* is a 128-byte aligned memory chunk. The number of elements in a stick depends on the device data format: 64 elements at fp16 and 32 at fp32. The runtime, compiler, and tensor-layout code obtain this count from `SpyreTensorLayout.elems_per_stick()`, which reads the stick size for each data format from DeepTools. The stick size matches the granularity of data transfers between LPDDR5 device memory and the per-core LX scratchpad, so a full stick of contiguous elements moves in a single transfer.
 
 ### Production deployments
 
-As of 2025, Spyre is shipping in two production systems. IBM z17 mainframes support up to 48 Spyre cards, each delivering 300+ TOPS (see the [IBM Z press release](https://newsroom.ibm.com/ai-on-z)). IBM Power11 servers run the same silicon as a 75W PCIe gen5 x16 card with 128 GB of LPDDR5 memory (see the [IBM Power11 press release](https://newsroom.ibm.com/2025-07-08-ibm-power11-raises-the-bar-for-enterprise-it)). The Torch-Spyre integration described in these docs targets that PCIe card configuration.
+Spyre is available in two IBM production systems. IBM z17 mainframes support up to 48 Spyre cards, each delivering 300+ TOPS (see the [IBM Z press release](https://newsroom.ibm.com/ai-on-z)). IBM Power11 servers run the same silicon as a 75W PCIe gen5 x16 card with 128 GB of LPDDR5 memory (see the [IBM Power11 press release](https://newsroom.ibm.com/2025-07-08-ibm-power11-raises-the-bar-for-enterprise-it)). The Torch-Spyre integration described in these docs targets that PCIe card configuration.
 
 ## Use cases
 
@@ -71,9 +65,9 @@ Refer to the official product pages and IBM Research blogs to learn more about t
 * [IBM Spyre Accelerator for Z and LinuxONE](https://www.ibm.com/support/z-content-solutions/spyre-accelerator-z-and-linuxone/)
 
 **IBM Research blogs**
-* [Lifting the cover on the IBM Spyre Accelerator](https://research.ibm.com/blog/lifting-the-cover-on-the-ibm-spyre-accelerator) — architecture deep-dive and full-stack approach
-* [Enhancing enterprise AI with the IBM Spyre Accelerator](https://research.ibm.com/blog/spyre-for-z) — Spyre for IBM Z mainframe AI inference
-* [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community) — Spyre in the PyTorch ecosystem
+* [Lifting the cover on the IBM Spyre Accelerator](https://research.ibm.com/blog/lifting-the-cover-on-the-ibm-spyre-accelerator): architecture deep-dive and full-stack approach
+* [Enhancing enterprise AI with the IBM Spyre Accelerator](https://research.ibm.com/blog/spyre-for-z): Spyre for IBM Z mainframe AI inference
+* [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community): Spyre in the PyTorch ecosystem
 
 **See also**
 * [Dataflow Architecture Reference](dataflow_architecture.md)

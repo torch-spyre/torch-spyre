@@ -44,7 +44,9 @@ Specify an `op name`, for example `torch_add`. Note that the op name must use `_
 ## Fix failures
 
 Fix failures at least for float16 and float32 if you saw the failures.
-Integer types and bfloat16 are not supported now. So, you do not have to take care of these failures.
+Support for integer types and bfloat16 depends on the operation, so a failure
+for one of those dtypes does not have to be fixed in the same PR. Report it as
+a bug Issue, as described below.
 
 ## Submit a PR
 
@@ -57,7 +59,7 @@ For each known failing test that is not fixed:
 - Create a new bug Issue, or link to an existing relevant Issue
 - Set the Issue type to "Bug"
 - Include error logs, reproduction steps, and any relevant context
-- Use IBM Bob to help summarize and organize the issues
+- Use [IBM Bob](https://www.ibm.com/products/ai-coding-agent) to help summarize and organize the issues
 
 ## Assign Classification Labels
 

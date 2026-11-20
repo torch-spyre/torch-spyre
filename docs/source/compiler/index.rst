@@ -69,5 +69,4 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    co_optimizer
    simulated_annealing_layout
    sa_co_optimization
-   native_packer_performance
    hbm_pool_planning

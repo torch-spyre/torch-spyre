@@ -72,8 +72,8 @@ swapped:
 In both cases the `IndirectAccess(name)` node (see `op_spec.IndirectAccess`)
 marks the shared table's **indirect axis** — the dimension whose row is selected
 at runtime by the index. That axis has **no iteration-space symbol**; its address
-is resolved on the device via `SEGMENT_OFFSETS`, with `maxDimSizes == 1` for that
-dimension.
+is resolved on the device via `SEGMENT_OFFSETS`, with `maxDimSizes_` set to 1 for that
+dimension (`compute_indirect_max_dim_sizes` in `indirect_access.py`).
 
 Work division splits the op's iteration space across cores. For a gather over
 `x : [M, K, N]` with `i : [Q]`, the iteration space is `{d0 = Q, d1 = K,
@@ -290,10 +290,10 @@ correct-but-serial.
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | indirect load/store discovery; partial-stick helpers; shared-table and partial-stick detection (`indirect_forbidden_split_syms`); overwrite-scatter entry detection (`indirect_store_entry_syms`); `first_non_indirect_read_index` |
+| `_inductor/pass_utils.py` | indirect load/store discovery; partial-stick helpers; shared-table and partial-stick detection (`indirect_forbidden_split_syms`); overwrite-scatter entry detection (`indirect_store_entry_syms`); `select_work_division_transport_indexes` takes the first read that is not indirect as the split-recovery reference |
 | `_inductor/work_division_constraints.py` | `indirect_access_split_domains` maps hard indirect restrictions to `allowed_splits={symbol: {1}}` |
 | `_inductor/work_division.py` | consumes generic legal split domains; `prioritize_indirect_scatter_dimensions` promotes overwrite-scatter entry dims; split encoding and recovery use direct-read reference |
-| `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
+| `_inductor/spyre_kernel.py` | `create_op_spec` skips the dtype check for the indirect index operand (`_is_indirect_index_arg`) |
 
 ## See also
 

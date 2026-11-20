@@ -155,7 +155,7 @@ multiple of 32, use a `SpyreTensorLayout` with
 interleaved layout such as `[rows // 32, trips, 32]` inserts other trips between
 the row's sticks and is unsupported when both outer axes have extent greater
 than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
-code generation; it previously could produce incorrect rows without an error.
+code generation.
 
 An accumulator carry is declared, not rewritten, by `splice_while_loop`: a
 `LoopCarryRecord` on the carry's storage (its initial buffer, or the pre-loop
@@ -391,12 +391,12 @@ which covers everything past "a run of ops carries a `loop_info:
 CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
 and the `LoopSpec` codegen tree (Layer 3).
 
-`splice_while_loops` runs in `CustomPreSchedulingPasses`, before dead-code
-elimination, since it must resolve every `for_each_tile`-shaped
+`splice_while_loops` runs in `CustomPreSchedulingPasses`, after
+`apply_reserved_dims_contract` and before dead-code elimination, since it must resolve every `for_each_tile`-shaped
 `ir.WhileLoop` down to a `loop_info`-carrying group before later passes see
 a flat op list. Work-division and scratchpad planning run after, consuming
 the resulting tiled iteration spaces. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#groups-derivation-and-placement-in-custompreschedulingpasses)
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md#pass-placement)
 for the full pass ordering.
 
 ### Transformation

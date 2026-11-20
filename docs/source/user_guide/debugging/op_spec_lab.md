@@ -23,7 +23,7 @@ If you would rather learn these by using them, skip to the
 field reference when a line in one of them does not make sense.
 
 This picks up where [Step 4 of the debugging
-workflow](index.md#step-4--examine-compiler-artifacts) leaves off: once the
+workflow](index.md#step-4-examine-compiler-artifacts) leaves off: once the
 artifacts show what the compiler produced, replaying one OpSpec tells you which
 side of the boundary is wrong, with no model, Dynamo or Inductor left in it.
 
@@ -31,7 +31,7 @@ side of the boundary is wrong, with no model, Dynamo or Inductor left in it.
 
 ## The workflow
 
-### 1. Capture
+### Step 1: Capture
 
 Your script runs unmodified. It does not have to call `torch.compile` — many
 eager Spyre ops are themselves implemented by compiling, so eager code produces
@@ -72,12 +72,12 @@ still writes the kernels compiled before it, telling you the later ones are
 missing. So a program that crashes on the kernel you are chasing is still
 capturable.
 
-### 2. Read it
+### Step 2: Read it
 
 Every emitted file opens with provenance and a decoded explanation of its own
 spec, embedded at capture time so the file self-documents on a machine with no
 torch-spyre installed. This is the header of
-[example 01](#01--elementwise-add), so you can reproduce it exactly:
+[Example 1](#example-1-elementwise-add), so you can reproduce it exactly:
 
 ```
 # Captured OpSpec kernel: sdsc_fused_add_0
@@ -130,7 +130,7 @@ not when the file was written — a program that builds its specs inside a
 allocations were baked under it, so a replay has to bundle under the same value.
 If your environment disagrees, the script says so and uses the captured one.
 
-### 3. Run it
+### Step 3: Run it
 
 ```bash
 python captured/sdsc_fused__softmax_0.py                 # compile and launch
@@ -185,7 +185,7 @@ Two things follow from `--emitter ktir` being a *capture-time* choice:
   as `Unimplemented` with a label naming the capability, which is the emitter
   telling you what it does not build yet — not a broken capture.
 
-### 4. Interpret
+### Step 4: Interpret
 
 | Captured script's result | Where the bug is |
 |---|---|
@@ -241,7 +241,7 @@ python replay/sdsc_fused_cat_0.py
 
 A replay prints `max|got - observed|` for every arg, here against the good outputs.
 The cat's output is 19.7 off, so the bad kernel is wrong on correct inputs, and
-the table in [4. Interpret](#4-interpret) applies with the good run as the expected
+the table in [Step 4: Interpret](#step-4-interpret) applies with the good run as the expected
 answer. That 19.7 is absolute, while `compare.py`'s numbers are relative: it is the
 0.857 above times 23, the good output's largest value. Diffing the two captures'
 scripts, and their SDSC (`--stage bundle` on each), shows what changed: with the
@@ -373,7 +373,7 @@ beside the first, so you keep both to diff rather than losing one. Example 4
 captures the same program twice, so its second capture passes its own `--out` to
 keep the filenames quoted below matching what you see.
 
-### 01 — Elementwise add
+### Example 1: Elementwise add
 
 `x + y` over two 128x256 fp16 tensors. The floor: one OpSpec, three args, no
 reduction, nothing in the scratchpad or the pool.
@@ -406,7 +406,7 @@ captured 1 kernel(s); writing 1
 ```
 
 **3. Read the header.** `captured/sdsc_fused_add_0.py` opens with the provenance
-block shown under [Read it](#2-read-it) above — that example *is* this kernel — and
+block shown under [Read it](#step-2-read-it) above (that example is this kernel) and
 then the op itself:
 
 ```
@@ -443,7 +443,7 @@ same unit, same single layout class.
   three.
 - Work division is per-dimension: `c0` splits over 32 cores, `c1` does not split.
 
-### 02 — Softmax: one op becomes six
+### Example 2: Softmax, where one op becomes six
 
 `softmax(x, dim=-1)` over a 64x256 fp16 tensor. One `aten._softmax.default`
 becomes `identity, max, sub, exp, sum, realdiv` in a single kernel — back-end op
@@ -514,7 +514,7 @@ the *stick* dim, not the row dim, and halving the rows shows you which is which.
 - A negative scale is the reduction. `out=-2` specifically means *reduced along
   the stick dim*; any other negative value is an ordinary reduced dimension.
 
-### 03 — Matmul: a different unit, and the *other* label lists
+### Example 3: Matmul, a different unit, and the *other* label lists
 
 `a @ b`, `(64, 128) @ (128, 256)`, fp16. Still one OpSpec, and almost nothing
 else matches 01.
@@ -592,7 +592,7 @@ predict from the shape, which is exactly why it is worth looking at.
 - Per-dim work division is not the kernel's core count: `c2` splits over 2 while
   the kernel still uses 32.
 
-### 04 — Spilling to the HBM pool
+### Example 4: Spilling to the HBM pool
 
 `softmax(a @ b) @ c`. An intermediate that has to survive across the kernel, and
 is too large or too long-lived for the scratchpad, cannot be `lx`.

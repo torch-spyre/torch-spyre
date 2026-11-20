@@ -86,7 +86,9 @@ The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_ti
 solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
 `config.auto_coarse_tiling` (off by default; see its comment).
 
-Three move types:
+Three structural and layout move types are described here; the fourth, **relayout** (weight
+0.2, offered only on a graph with a relayout copy), is described under
+[LX relayouts](#lx-relayouts). The weights are `_MOVE_WEIGHTS` in `sa_cooptimizer.py`.
 
 * **reorder** (weight 0.5) — a best-first reinsertion sweep. Lift one buffer out, probe every
   legal reinsertion position, and try them in descending packer-`quality()` order, accepting the
@@ -224,19 +226,18 @@ expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles 
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
 symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
 from whether its owning buffer's name is in `resident`, a split symbol's value from the config
-`chosen[idx]` itself. The compiled formula is evaluated fresh every step; unlike the
-`BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
-tracking, and so nothing to invalidate on a rejected move.
+`chosen[idx]` itself. The compiled formula is evaluated fresh every step; there is no incremental
+per-bundle memoization or dirty tracking, and so nothing to invalidate on a rejected move.
 
 **Memory-only** is the fallback, taken when `cost_expr` is `None` (the normal case for anything
 driving serialized captures, including the tests) or when it can't be compiled here — an
 unrecognized free symbol (e.g. a dynamic-shape symbol the allocator's build left in), or a
 construction error `_build_score_fn` catches. It counts the HBM traffic a spill adds over
 residency, converted once to fixed-point microseconds. Being *differential*, a resident buffer
-contributes exactly zero and only spilled buffers are summed. Its weakness is why the cost model
-replaced it: a core division only matters through what it lets fit, so on a graph where
-everything fits, every division scores the same and the search has nothing to optimize. The
-engine logs which objective it took.
+contributes exactly zero and only spilled buffers are summed. Its weakness is that a core
+division only matters through what it lets fit, so on a graph where everything fits, every
+division scores the same and the search has nothing to optimize. The engine logs which objective
+it took.
 
 :::{warning}
 Building `cost_expr` symbolically shares a real limitation with the CP-SAT path: a few cost-model
@@ -244,8 +245,7 @@ code paths (`_is_broadcast_op`, `_transport_kind`, and the standalone-reduction/
 decide their branch by reading `ArgTraffic.mem`, which raises on a symbolic `is_lx` — so any op
 whose special bandwidth rate depends on residency (a broadcast, `cat0`/`cat1`, `transpose_outer`,
 or a `sumcol`-style reduction) either drops that rate silently or, if the read raises, sinks the
-whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
-the way `BundleCostObjective`'s concrete `predict_ops` calls had.
+whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this.
 :::
 
 **Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
@@ -290,7 +290,7 @@ same compile: every Inductor graph names its buffers `buf0..`, so names collide 
 graphs without lining up. Regenerating it requires a Spyre machine, since the feature extractor
 reads live Inductor IR.
 
-One contract is worth stating because it was wrong for a while. The allocator sets
+One contract is worth stating explicitly. The allocator sets
 `parents = info["op_inputs"]` without intersecting the solver's buffer set, so an op's graph
 inputs, constants and extern outputs appear there. The solver **skips** parents it does not own
 rather than asserting on them — a buffer the solver does not own is never LX-resident, so the

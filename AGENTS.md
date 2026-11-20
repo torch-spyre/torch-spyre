@@ -121,10 +121,10 @@ them with `PARAMS`, and `pr-review` checks them.
 
 | Variable | Purpose |
 |---|---|
-| `TORCH_SPYRE_DEBUG=1` | Enable C++ debug logging and `-O0` builds |
+| `TORCH_SPYRE_DEBUG=1` | Build time: build the C++ extension with `-O0`. Runtime: deprecated alias that sets every `spyre` logger to DEBUG; use `TORCH_LOGS="+torch_spyre"` |
 | `SENCORES` | Number of Spyre cores (1–32, default 32) |
-| `LX_PLANNING=1` | Enable LX scratchpad memory planning |
-| `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
+| `LX_PLANNING` | LX scratchpad memory planning (default `1`; `0` disables) |
+| `HBM_POOL_PLANNING` | HBM-pool planning for intermediates not in LX (default `1`; `0` disables) |
 | `LAYOUT_SOLVER` | LX layout solver: `greedy`, `firstfit`, `bestfit`, `cpsat` (default), `simulated_annealing` |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
@@ -134,10 +134,11 @@ them with `PARAMS`, and `pr-review` checks them.
 | `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
 | `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS` | Seconds allowed for each `dbo-opt` invocation (default 60; non-positive disables) |
 | `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before the backend compiler; no runnable kernel, measurement only |
-| `TORCH_SPYRE_FFT_DIRECT_MAX` | Largest FFT length run as one direct `(2n, 2n)` matmul (`torch_spyre.ops.fft`); longer lengths use the four-step factorization (default 32768) |
-| `TORCH_SPYRE_FFT_W_CACHE_BYTES` | Byte budget for the cached fp16 DFT matrices (`torch_spyre.ops.fft`); LRU-evicted when exceeded (default: forward+inverse at the direct ceiling) |
+| `TORCH_SPYRE_FFT_DIRECT_MAX` | Largest FFT length run as one direct `(2n, 2n)` matmul (`torch_spyre/ops/_fft.py`); longer lengths use the four-step factorization (default 32768) |
+| `TORCH_SPYRE_FFT_W_CACHE_BYTES` | Byte budget for the cached fp16 DFT matrices (`torch_spyre/ops/_fft.py`); LRU-evicted when exceeded (default: forward+inverse at the direct ceiling) |
 | `TORCH_SPYRE_NARROWING_CHECK` | Guards that split a `dynamic=` range: `warn` (default), `error`, `off` |
 | `TORCH_SPYRE_RECOMPILE_CHECK` | Recompiles that break a `dynamic=` range: `warn` (default), `error`, `all`, `off` |
+| `TORCH_SPYRE_CHECK_LOOPS` | Loop-tree structural checks between pre-scheduling passes (on under pytest, off otherwise; `0`/`1` override) |
 
 ## Spyre Hardware Basics
 
@@ -165,7 +166,8 @@ with `V.set_ops_handler(handler)` inside the original `inner_fn`. Do NOT
 rebuild `inner_fn` from scratch by re-creating index expressions — those
 expressions are symbolic and become stale as soon as the pass runs,
 causing silent wrong-code bugs (see issue #2797). Canonical examples of the
-correct pattern: `NameSwapHandler` in `insert_restickify.py`,
+correct pattern: `NameSwapHandler` in `pass_utils.py`,
+`InputEdgeSwapHandler` in `insert_restickify.py`,
 `_SplitOpsHandler`/`_IntermediateOpHandler` in `split_multi_ops.py`.
 
 ## Skills

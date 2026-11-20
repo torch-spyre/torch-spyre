@@ -93,8 +93,8 @@ and fusion have already run:
 
 ```
 CustomPreSchedulingPasses:
-  work_division
-  scratchpad_planning                  # LX allocation (phase 1)
+  _distribute_work                     # work division
+  _maybe_scratchpad_planning           # LX allocation (phase 1)
 
 ... Inductor scheduler construction ...
 
@@ -126,13 +126,17 @@ For each top-level entry (bundle) in the post-fusion node list:
    - Written and read (not only written or only read).
    - Not graph inputs or outputs.
    - Not already claimed by LX planning.
-   - Not read by CPU-fallback nodes.
+   - Not read by CPU-fallback nodes, and not sharing an allocation with a
+     buffer that a CPU-fallback node reads.
    - Fully contained within the bundle (same bundle writes and reads them).
    - Written by exactly one bundle. A buffer written by two or more bundles
      (e.g. an in-place accumulator update that Inductor's `mutation_renames`
      maps to the same buffer name as an earlier initializing write) is
      excluded unconditionally, even if all its reads happen to lie within
      the last-writing bundle.
+   Besides the written-and-read buffers of `ComputedBuffer` nodes, the
+   candidates include the `SpyreEmptyFallback` full buffers that
+   `coarse_tile.py` creates, which are not graph outputs.
 3. For each bundle's local candidate set, compute live ranges: a buffer's
    live range is the interval from its producer op to its last consumer op
    within that bundle.
@@ -143,7 +147,13 @@ For each top-level entry (bundle) in the post-fusion node list:
    - Before allocating a new buffer, free any previously-allocated blocks
      whose live range ended before this buffer's start step.
    - Assign each buffer an offset within the bundle's dedicated pool.
-6. Record the pool's final extent (total bytes needed) in
+6. When a pooled allocation is shared with a `NopKernelSchedulerNode` output,
+   as the output buffer of `cat` or `constant_pad_nd` is, add that nop's
+   name to `V.graph.removed_buffers`. The nop's storage has moved into the
+   pool, so the wrapper emits neither its standalone allocation nor a `del`
+   for it. A pooled `SpyreEmptyFallback` name is added to
+   `V.graph.removed_buffers` for the same reason.
+7. Record the pool's final extent (total bytes needed) in
    `V.graph.hbm_pool_sizes[bundle_name]`.
 
 Only bundles with at least one pool-eligible buffer get an entry in
@@ -153,19 +163,20 @@ allocation and no allocation overhead.
 ## Integration with code generation
 
 During code generation, the scheduler looks up each bundle's pool size from
-`V.graph.hbm_pool_sizes` and passes it to `SpyreKernel`'s constructor. Unlike
-LX scratchpad buffers, the pool is never materialized as a Python-side
-tensor: `pool_size` is threaded through `define_kernel()` into the
-generated `async_compile.sdsc(...)` call, and from there into
-`generate_bundle()`, which emits the pool allocation as a single MLIR op
-inside the bundle's own function body:
+`V.graph.hbm_pool_sizes` and sets it as the prepared kernel's
+`SpyreKernel.pool_size`. With `config.frontend_pool_allocation` off (the
+default, environment variable `FRONTEND_POOL_ALLOCATION`), the pool is never
+materialized as a Python-side tensor: `pool_size` is threaded through
+`define_kernel()` into the generated `async_compile.sdsc(...)` call, and from
+there into `generate_bundle()`, which emits the pool allocation as a single
+MLIR op inside the bundle's own function body:
 
 ```none
 %pool = sdscbundle.device_mem_allocate {pool_size_bytes} bytes : index
 ```
 
 Every pool-allocated buffer's address is then computed relative to `%pool`
-via `arith.addi`, deduplicated by offset (unchanged from before). Because
+via `arith.addi`, deduplicated by offset. Because
 the allocation is a single MLIR op scoped to the bundle's own function body,
 its lifetime is implicitly limited to that bundle's execution -- there is no
 explicit free op, and no Python-side tensor to allocate or delete.

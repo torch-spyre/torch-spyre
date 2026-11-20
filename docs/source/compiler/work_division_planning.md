@@ -35,8 +35,18 @@ tensor within the 256 MB per-core span limit.
 Every eligible op is finalised by either Pass 1 or Pass 2. The two passes
 are implemented in
 [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)
-and dispatched from `CustomPreSchedulingPasses` in
-[passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
+and dispatched by `_distribute_work` in `CustomPreSchedulingPasses`
+([passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py)).
+
+When `solve_decides_work_division()` is true (co-optimizing LX planning with
+the simulated-annealing solver, or with a CP-SAT solver that chooses core
+divisions), neither pass runs up front. `defer_work_division` records the
+`Pointwise` and `Reduction` ops instead, and the LX planning solve chooses
+their splits. The allocator divides an op on demand when it pins the op
+(`divide_deferred_op`) and divides the ops the solve leaves
+(`divide_deferred_ops`). `plan_sharded_hbm`, which runs before
+`_distribute_work`, pins the split of an op on sharded operands to its shard
+plan; see [Sharded Tensors](sharded_tensors.md).
 
 The span floors are not a pass of their own. Whatever chooses an op's
 split computes them at that point, from the op as it is then (see
@@ -159,7 +169,7 @@ A card has 32 cores connected by a bi-directional ring.
 | Cores per card | 32 (configurable down to 1 via `SENCORES`) | Total core budget Pass 2 distributes |
 | PT rows per corelet | 8 | Pass 1's compute term and M tie-break |
 | Per-core memory span | 256 MB | The span floors, which every split must meet |
-| Stick size | 128 B (`BYTES_IN_STICK`); element count from `device_dtype.elems_per_stick()` | Stick-aligned splits across all passes |
+| Stick size | 128 B (`_STICK_BYTES` in `work_division.py`); element count from `device_dtype.elems_per_stick()` | Stick-aligned splits across all passes |
 
 For the full hardware overview see
 [Spyre Accelerator](../architecture/spyre_accelerator.md).
@@ -248,7 +258,8 @@ least as many cores as the default Pass 2 split would. Otherwise the
 op goes to Pass 2 unchanged.
 
 The pass runs on ops whose data is a `Reduction` with
-`reduction_type == BATCH_MATMUL_OP`. Every other op falls through.
+`reduction_type` `BATCH_MATMUL_OP` or `BATCH_MATMUL_FP8_OP`. Every other op
+falls through.
 
 ### When the cost model declines
 
@@ -265,18 +276,24 @@ Any "no" exits to Pass 2.
 :::
 
 - The op must be a matmul or bmm (`Reduction` with
-  `reduction_type == BATCH_MATMUL_OP`).
+  `reduction_type` `BATCH_MATMUL_OP` or `BATCH_MATMUL_FP8_OP`).
 - The op's span floors must not require any split. When they do,
   Pass 1 declines and Pass 2 distributes the remaining cores on top of
   the floors.
 - The output must have exactly one stickified dim (`N`) and at least
   one row dim, so `N` is unambiguous.
-- Of the row dims, exactly one must appear in a single input (this is
-  `M`). A bmm with a shared 2D weight produces two such candidates and
-  the planner declines.
+- At least one row dim must appear in a single input; that dim is `M`.
+  A bmm with a shared 2D weight produces several such candidates, because
+  the stride-0 batch dims of the broadcast weight leave its device
+  coordinates. The planner then takes as `M` the candidate with the
+  smallest nonzero coefficient in the output index
+  (`_pick_innermost_output_dim`) and prices the weight as loaded once. It
+  declines when no candidate appears in the output index.
 - The op must have exactly one reduction dim (`K`).
 - As a final safety check, if the cost-model split would use fewer
-  cores than the default Pass 2 split, the planner declines.
+  cores than the default Pass 2 split, the planner declines. An op with a
+  `QFP8WT` tensor keeps the cost-model split in that case, with the K split
+  forced to 1.
 
 When all checks pass, the planner enumerates the Cartesian product of
 divisors of `B`, `M`, `n_sticks`, `k_sticks`, prices each feasible
@@ -312,7 +329,9 @@ compute = (B·M·N·K / (b·m·n·k)) / (peak_MACs_per_core × pt_eff)
 streams M in passes of `_PT_ROWS = 8` rows, and `pt_passes = (M/m) / 8`.
 Below the `_TARGET_PT_PASSES = 5` target, startup and drain overhead is
 amortised over too little work, so effective throughput falls off as
-`(pt_passes / 5) ** 0.25`.
+`(pt_passes / 5) ** 0.25`, held at its one-pass value when the per-core
+M slice is 8 rows or fewer. A K-split doubles the compute term, because
+the backend runs an op that needs a cross-core reduction on one corelet.
 
 **HBM time** is bytes moved divided by aggregate LPDDR5 bandwidth,
 scaled by a cohort penalty:
@@ -322,11 +341,20 @@ hbm = (B·M·K + W·K·N + B·M·N) × 2 bytes / 204.8 GB/s × cohort_penalty
 ```
 
 `W` is `1` for a shared 2D weight and `B` for a true bmm (the weight is
-not replicated across batch). Each operand is broadcast to the cores
+not replicated across batch). The element sizes come from each operand's
+`elems_per_stick()`; the formula above shows the fp16 case. Each operand is broadcast to the cores
 that split the orthogonal dim; up to `_COHORT_LIMIT = 8` cores share a
 broadcast for free. Past that, contention makes effective bandwidth
 fall off as `cohort_penalty = (fanout / 8) ** 0.75`, where `fanout` is
 `n` for a true bmm and `max(m, n)` for a shared weight.
+
+A small-M decode projection (a shared fp16 weight, `B = 1`, and
+`2 <= M <= 32`) uses a measured weight-delivery rate instead
+(`_decode_weight_delivery_us`). Its activation and output move at the peak
+rate, and the weight streams at
+`min(_DECODE_CAP_GBPS[m, k], (cores / m) × _DECODE_SLICE_GBPS[m])`: the `m`
+cores that split M share one slice of the weight, and the cap models the
+bus once the slices saturate it.
 
 **PSUM time** is the cost of a K-split reduction:
 
@@ -348,7 +376,9 @@ shapes the codegen handles poorly:
 - The M-lane underuse term adds `10 µs` per log2 step when the M split
   exposes fewer M lanes than the target.
 - The M-tile underfill term adds `30 µs` per log2 step when per-core rows
-  fall below `_M_TILE_UNDERFILL_TARGET = 16`.
+  fall below `_M_TILE_UNDERFILL_TARGET = 16`. It is zero for a decode
+  projection, whose measured weight-delivery rate already charges short
+  per-core M tiles.
 - The wide-N term adds `25 µs` per log2 step when the per-core N tile
   exceeds `_TARGET_N_TILE_ELEMS = 512` elements.
 - The value-matmul and shared-projection shape terms penalize splitting a
@@ -750,10 +780,6 @@ dimensions are not pinned.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.
-- The cost-model planner declines on bmms with a shared 2D weight,
-  because pricing the broadcast of the shared weight needs weight-rank
-  awareness the current cost function does not have. Those bmms fall
-  through to Pass 2.
 - Padding is approximated rather than retrieved from the layout (FIXME
   in `adjust_it_space_for_sticks`). Improved padding handling is being
   added in [#2359](https://github.com/torch-spyre/torch-spyre/pull/2359).
@@ -762,8 +788,6 @@ dimensions are not pinned.
 
 - Extend optimisation across operations to take data reuse and the
   wider memory hierarchy into account.
-- Make the cost model bmm-aware so it can price shared-weight bmms
-  correctly instead of declining.
 - Validate the cost-model constants against more matmul shape sweeps
   and re-tune them as new Spyre hardware revisions are released.
 

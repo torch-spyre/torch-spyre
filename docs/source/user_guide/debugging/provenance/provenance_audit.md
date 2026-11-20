@@ -1,4 +1,4 @@
-# Example Audit: `SimpleMLP` — Source-to-Kernel Provenance
+# Example Audit: Source-to-Kernel Provenance of `SimpleMLP`
 
 > Generated: 2026-07-15 14:22 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
 
@@ -110,7 +110,7 @@ The **Layer** column marks whether a field lives on the FX node (`FX`), the IR `
 | IR | `get_stack_traces` | – | – | ◐ 3/5 | ◐ 3/5 | – | – |
 | Spyre | `debug_handle` | – | – | – | – | ✓ | ✓ |
 
-## Stage 2a — FX Graph (pre-grad): 3 compute nodes
+## Stage 2a: FX Graph (pre-grad), 3 compute nodes
 
 Dynamo traces the model into an FX graph; each node still carries its Python-source metadata.
 
@@ -124,7 +124,7 @@ All observed `node.meta` keys: `['example_value', 'mutation_region_id', 'nn_modu
 | `x_1` | `<built-in method relu of type object at 0x7fc0e64078a0>` | `str` | ✗ | `list` | ✗ | ✗ | `x = torch.relu(x)` |
 | `x_2` | `<built-in function linear>` | `str` | `dict` | `list` | ✗ | ✗ | `x = self.fc2(x)` |
 
-## Stage 2b — FX Graph (post-grad): 7 compute nodes
+## Stage 2b: FX Graph (post-grad), 7 compute nodes
 
 AOTAutograd/Inductor lower and decompose the graph (e.g. `linear` → `permute` + `mm` + `add`); synthesized nodes keep only part of the metadata.
 
@@ -142,7 +142,7 @@ All observed `node.meta` keys: `['from_node', 'mutation_region_id', 'nn_module_s
 | `mm_default` | `aten.mm.default` | ✗ | ✗ | ✗ | `OpOverload` | ✗ | — |
 | `add_tensor` | `aten.add.Tensor` | ✗ | ✗ | ✗ | `OpOverload` | ✗ | — |
 
-## Stage 3 — LoopLevelIR (pre-pass): 5 operations
+## Stage 3: LoopLevelIR (pre-pass), 5 operations
 
 FX nodes lower into LoopLevelIR `ComputedBuffer`s entering the Spyre pre-scheduling passes.
 
@@ -158,7 +158,7 @@ All observed `ComputedBuffer` attributes: `['annotations', 'data', 'layout', 'na
 | `op3` | `mm_default`, `permute_1` | `mm_default` | ✗ | ✓ |
 | `op4` | `add_tensor` | `add_tensor` | ✗ | ✗ |
 
-## Stage 4 — LoopLevelIR (post-pass): 5 operations
+## Stage 4: LoopLevelIR (post-pass), 5 operations
 
 The same IR after the pre-scheduling passes mutate it in place.
 
@@ -174,7 +174,7 @@ All observed `ComputedBuffer` attributes: `['annotations', 'data', 'dim_hints', 
 | `op3` | `mm_default`, `permute_1` | `mm_default` | ✗ | ✓ |
 | `op4` | `add_tensor` | `add_tensor` | ✗ | ✗ |
 
-## Stage 5 — OpSpec: 5 ops
+## Stage 5: OpSpec, 5 ops
 
 Each scheduled `ComputedBuffer` becomes an `OpSpec` (the device op); `debug_handle` carries source provenance onto it, while the `origins` / `origin_node` shown here are read from the input buffer (not stored on `OpSpec`).
 
@@ -190,7 +190,7 @@ Tracked fields: `origins` (FX nodes that lowered into this buffer), `origin_node
 | `batchmatmul` | `op3` | `mm_default`, `permute_1` | `mm_default` | `4917498687135836649` | `reference_mlp.py:27` |
 | `add` | `op4` | `add_tensor` | `add_tensor` | `6208522288796453179` | — |
 
-## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (1 kernel)
+## Stage 6: SuperDSC, 5 `sdsc_*.json` files (1 kernel)
 
 Each `OpSpec` is serialized to a `sdsc_*.json` kernel spec; the `debug_handle` travels with it (JSON key `debug_handle_`), resolving each kernel back to source.
 

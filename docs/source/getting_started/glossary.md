@@ -9,12 +9,6 @@ Other pages can reference any entry here with the MyST `term` role:
 below.
 
 :::{glossary}
-BYTES_IN_STICK
-  The 128-byte alignment constant used by the runtime, compiler, and
-  tensor-layout code. One stick at fp16 holds 64 elements. The size
-  matches the natural granularity of LPDDR5 ↔ LX scratchpad transfers
-  on Spyre. See [Key concepts §4](key_concepts.md#4-sticks-and-tiled-tensors).
-
 corelet
   One of two execution units inside a Spyre core. Each corelet contains
   an 8×8 systolic PE array (the {term}`PT` execution unit) and a 1D
@@ -38,7 +32,7 @@ decomposition
   Spyre-native or custom ops. Example: `aten.addmm` decomposes into
   `matmul + scale + add`. Decompositions are how Torch-Spyre covers
   ATen ops that have no single hardware-level equivalent. See
-  [Key concepts §6](key_concepts.md#6-graph-breaks).
+  [Key concepts: Graph breaks](key_concepts.md#graph-breaks).
 
 Deeptools
   IBM's proprietary backend compiler that consumes the {term}`SuperDSC`
@@ -75,7 +69,7 @@ graph break
   the unsupported op runs there, and the data comes back. A single
   graph break in the hot path can wipe out the performance gains from
   surrounding compiled code. See
-  [Key concepts §6](key_concepts.md#6-graph-breaks).
+  [Key concepts: Graph breaks](key_concepts.md#graph-breaks).
 
 HBM
   In SuperDSC field names (e.g. `memOrg_.hbm`), `hbm` is a legacy
@@ -103,7 +97,7 @@ LX planning
 LX scratchpad
   The 2 MB SRAM scratchpad on each Spyre core. Compiler-managed —
   there is no hardware cache. Both corelets in a core share the same
-  scratchpad. See [Key concepts §3](key_concepts.md#3-memory-hierarchy).
+  scratchpad. See [Key concepts: Memory hierarchy](key_concepts.md#memory-hierarchy).
 
 OpFunc
   A {term}`Deeptools` primitive that implements one hardware operation
@@ -180,7 +174,9 @@ SpyreTensorLayout
 stick
   A 128-byte aligned memory chunk on Spyre, equal to 64 fp16 elements.
   The unit of LPDDR5 ↔ LX transfer and the basic granularity of the
-  tiled tensor layout. Defined by the {term}`BYTES_IN_STICK` constant.
+  tiled tensor layout. The number of elements per stick for a data type
+  comes from `elems_per_stick()` (`torch_spyre/csrc/spyre_tensor_impl.cpp`,
+  also exposed as `SpyreTensorLayout.elems_per_stick()`).
 
 stickification
   The transformation from a host-strided PyTorch layout to a tiled
@@ -194,7 +190,7 @@ SuperDSC
   artifact per scheduled kernel; encodes the per-core schedule, tensor
   descriptors, memory addresses, and the compute op. Cached through
   the standard `torch.compile` artifact system. The successor is
-  {term}`KTIR`. See [Key concepts §7](key_concepts.md#7-compilation-pipeline).
+  {term}`KTIR`. See [Key concepts: Compilation pipeline](key_concepts.md#compilation-pipeline).
 
 tile
   A contiguous sub-tensor assigned to a single core. On Spyre, a tile
