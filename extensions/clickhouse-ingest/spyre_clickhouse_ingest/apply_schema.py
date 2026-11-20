@@ -40,6 +40,14 @@ class SchemaDrift(RuntimeError):
     """A live table or MV differs from its file; only a migration may change one."""
 
 
+class NotReplicated(SchemaDrift):
+    """Cluster mode found a table of a Replicated family stored on a plain engine."""
+
+
+class DDLUnsettled(RuntimeError):
+    """A cluster DDL statement's outcome on some host is unknown; no ledger row was written."""
+
+
 class SchemaApplier:
     """Plans and applies schema/*.sql and schema/migrations/*.sql against one database."""
 
@@ -87,6 +95,15 @@ class SchemaApplier:
     ADDS_CONSTRAINT = re.compile(
         r"\bADD\s+CONSTRAINT\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
     )
+    NOT_REPLICATED_MSG = (
+        "cluster mode needs every table converted to a Replicated engine first (ON CLUSTER DDL "
+        "on a plain table changes each server alone); not Replicated: "
+    )
+    DEFAULT_PATH_NOTE = (
+        "  [note] new tables get the default keeper path, which has no generation suffix: dropping and "
+        "recreating one at the same path collides if a replica missed its DROP ... SYNC. Set "
+        "CLICKHOUSE_KEEPER_PATH with a suffix (e.g. .../{table}/g2) to keep paths distinct."
+    )
     LEDGER = "schema_migrations"
     LEDGER_DDL = (
         "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
@@ -101,15 +118,17 @@ class SchemaApplier:
         "SummingMergeTree": "ReplicatedSummingMergeTree",
         "AggregatingMergeTree": "ReplicatedAggregatingMergeTree",
     }
-    # Where a table made by the applier keeps its replication metadata: CLICKHOUSE_KEEPER_PATH, a
-    # template with {shard}, else /clickhouse/<cluster>/tables/{shard}/<db>/<table>.
-    KEEPER_PATH = "/clickhouse/%s/tables/{shard}/%s/%s"
-    # The stored form of a Replicated engine: 'path', 'replica' and then the plain engine's own arguments.
-    REPLICATED_ENGINE = re.compile(
-        r"\bENGINE\s*=\s*Replicated(\w*MergeTree)\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*(?:,\s*([^()]*?))?\s*\)"
-    )
-    # A conversion marks its table with a comment; it is not part of the file's definition.
-    COMMENT = re.compile(r"\s+COMMENT\s+'[^']*'\s*$")
+    KEEPER_PATH = "/clickhouse/{cluster}/tables/{shard}/{db}/{table}"
+    # The head of a stored Replicated engine; its 'path', 'replica' and then the plain engine's own
+    # arguments are read by balanced parentheses (an argument may itself be a tuple).
+    REPLICATED_HEAD = re.compile(r"\bENGINE\s*=\s*Replicated(\w*MergeTree)\b")
+    # A conversion marks its table `ha-twin` (or `ha-twin | <original comment>`); only that marker
+    # is dropped, so a COMMENT the file itself declares still counts.
+    COMMENT = re.compile(r"\s+COMMENT\s+'ha-twin(?: \| ((?:[^'\\]|\\.)*))?'\s*$")
+    # Where a table made by the applier keeps its replication metadata when CLICKHOUSE_KEEPER_PATH
+    # is unset; with it, a path built from these placeholders.
+    KEEPER_FIELDS = {"cluster", "db", "table", "shard", "uuid"}
+    KEEPER_PATH_OK = re.compile(r"/[A-Za-z0-9_./{}-]+")
     # Statements in a migration that change structure on every replica, and the ones that only move data.
     MIGRATION_DDL = re.compile(
         r"^(ALTER\s+TABLE|DROP\s+TABLE|DROP\s+VIEW|TRUNCATE\s+TABLE|CREATE\s+(?:MATERIALIZED\s+)?VIEW|"
@@ -133,9 +152,11 @@ class SchemaApplier:
         re.IGNORECASE | re.DOTALL,
     )
     LITERAL = re.compile(r"'(?:[^'\\]|\\.|'')*'")
-    # Long enough for a large table to catch up; the default (180 s) fails the migration while
-    # the sync carries on in the background.
-    SYNC_SETTINGS = {"distributed_ddl_task_timeout": 3600}
+    # Every ON CLUSTER statement and replica sync waits this long (the default, 180 s, fails a
+    # statement the slow replica is still running); the client's read timeout must be longer.
+    DDL_TIMEOUT = 3600
+    SYNC_SETTINGS = {"distributed_ddl_task_timeout": DDL_TIMEOUT}
+    DDL_ENTRY = re.compile(r"\bquery-\d+\b")
     CREATE_AS_SELECT = re.compile(r"\bAS\s+(?:SELECT|WITH)\b", re.IGNORECASE)
 
     @classmethod
@@ -149,24 +170,41 @@ class SchemaApplier:
     @classmethod
     def plain_engine(cls, sql: str) -> str:
         """`sql` with a Replicated*MergeTree engine written as its plain engine, so the two compare equal."""
+        mk = cls.mask(sql)
         out, last = [], 0
-        for m in cls.REPLICATED_ENGINE.finditer(sql):
-            if cls._in_literal(sql, m.start()):
+        for m in cls.REPLICATED_HEAD.finditer(mk):
+            if m.start() < last:
                 continue
-            args = m.group(2)
+            k = m.end()
+            while mk[k : k + 1].isspace():
+                k += 1
+            args, end = "", m.end()
+            if mk[k : k + 1] == "(":
+                depth, commas, close = 0, [], -1
+                for i in range(k, len(mk)):
+                    c = mk[i]
+                    depth += c == "("
+                    depth -= c == ")"
+                    if c == "," and depth == 1:
+                        commas.append(i)
+                    if depth == 0:
+                        close = i
+                        break
+                if close < 0 or len(commas) == 0 and sql[k + 1 : close].strip():
+                    continue
+                if commas:
+                    args = sql[commas[1] + 1 : close].strip() if len(commas) > 1 else ""
+                end = close + 1
             out.append(sql[last : m.start()])
-            out.append(f"ENGINE = {m.group(1)}" + (f"({args.strip()})" if args else ""))
-            last = m.end()
+            out.append(f"ENGINE = {m.group(1)}" + (f"({args})" if args else ""))
+            last = end
         out.append(sql[last:])
         text = "".join(out)
-        # The conversion marker is only dropped from a converted table, so a plain table's
-        # COMMENT still counts as drift.
-        return cls.COMMENT.sub("", text) if last else text
-
-    @staticmethod
-    def _in_literal(sql: str, pos: int) -> bool:
-        """True when `pos` falls inside a single-quoted string literal."""
-        return len(re.findall(r"(?<!\\)'", sql[:pos])) % 2 == 1
+        if not last:
+            return text
+        return cls.COMMENT.sub(
+            lambda c: f" COMMENT '{c.group(1)}'" if c.group(1) else "", text
+        )
 
     @classmethod
     def mask(cls, sql: str) -> str:
@@ -228,6 +266,39 @@ class SchemaApplier:
         )
 
     @classmethod
+    def keeper_template(cls) -> str:
+        """CLICKHOUSE_KEEPER_PATH, validated, or '' when unset (the default path applies)."""
+        path = os.environ.get("CLICKHOUSE_KEEPER_PATH", "").strip()
+        if not path:
+            return ""
+        fields = set(re.findall(r"\{(\w*)\}", path))
+        if (
+            not cls.KEEPER_PATH_OK.fullmatch(path)
+            or fields - cls.KEEPER_FIELDS
+            or path.count("{") != path.count("}")
+        ):
+            raise ValueError(
+                f"CLICKHOUSE_KEEPER_PATH {path!r} must be a path of letters, digits and _ . / - with "
+                f"only the placeholders {sorted(cls.KEEPER_FIELDS)}"
+            )
+        if "{table}" not in path and "{uuid}" not in path:
+            raise ValueError(
+                "CLICKHOUSE_KEEPER_PATH must contain {table} (or {uuid}), else every table shares one path"
+            )
+        return path
+
+    @classmethod
+    def keeper_path(cls, cluster: str, db: str, table: str) -> str:
+        """The keeper path a new Replicated table gets; {shard} and {uuid} stay for the server."""
+        path = (cls.keeper_template() or cls.KEEPER_PATH).replace("{cluster}", cluster)
+        path = path.replace("{db}", db).replace("{table}", table)
+        if not cls.KEEPER_PATH_OK.fullmatch(path):
+            raise ValueError(
+                f"{table}: keeper path {path!r} has characters ClickHouse macros do not allow"
+            )
+        return path
+
+    @classmethod
     def clustered(cls, sql: str, kind: str, cluster: str, db: str, name: str) -> str:
         """A schema file's CREATE for cluster mode: ON CLUSTER, and a Replicated engine for a table.
 
@@ -274,16 +345,7 @@ class SchemaApplier:
             )
         start, end, engine, span = eng
         args = sql[span[0] + 1 : span[1]].strip() if span else ""
-        path = os.environ.get("CLICKHOUSE_KEEPER_PATH", "").strip()
-        if path and "{table}" not in path and "{uuid}" not in path:
-            raise ValueError(
-                "CLICKHOUSE_KEEPER_PATH must contain {table} (or {uuid}), else every table shares one path"
-            )
-        path = (
-            path.replace("{db}", db).replace("{table}", name)
-            if path
-            else cls.KEEPER_PATH % (cluster, db, name)
-        )
+        path = cls.keeper_path(cluster, db, name)
         new = f"'{path}', '{{replica}}'" + (f", {args}" if args else "")
         tail = sql[end:]
         return (
@@ -460,10 +522,7 @@ class SchemaApplier:
             unsynced,
             lambda t: client.command(f"EXISTS TABLE {t}"),
         ):
-            if settings is None:
-                client.command(sql)
-            else:
-                client.command(sql, settings=settings)
+            cls.execute(client, sql, cluster, settings)
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
@@ -578,6 +637,83 @@ class SchemaApplier:
                 "hide a refreshable MV; fix that and rerun"
             )
         return {n for r in rows for n in r[3]}
+
+    @classmethod
+    def execute(cls, client, sql: str, cluster: str = "", settings=None) -> None:
+        """Send `sql`; in cluster mode with the DDL timeout, and an ON CLUSTER statement that raises
+        is settled against system.distributed_ddl_queue before the run goes on."""
+        if not cluster:
+            if settings is None:
+                client.command(sql)
+            else:
+                client.command(sql, settings=settings)
+            return
+        try:
+            client.command(sql, settings={**cls.SYNC_SETTINGS, **(settings or {})})
+        except Exception as e:
+            if not re.search(r"\bON\s+CLUSTER\b", cls.mask(sql), re.I):
+                raise
+            cls.settle(client, cluster, sql, e)
+
+    @classmethod
+    def settle(cls, client, cluster: str, sql: str, err: Exception) -> None:
+        """Return only if the task `err` names finished without error on every host; else raise."""
+        head = sql.strip().splitlines()[0][:100]
+        m = cls.DDL_ENTRY.search(str(err))
+        if not m:
+            raise DDLUnsettled(
+                f"{head}: {err} -- no distributed DDL task id in the error, so its state on the "
+                f"replicas is unknown; check system.distributed_ddl_queue for cluster {cluster} "
+                "before rerunning. No ledger row was written."
+            ) from err
+        entry = m.group(0)
+        try:
+            rows = client.query(
+                "SELECT host, status, exception_code FROM system.distributed_ddl_queue "
+                "WHERE cluster = %(c)s AND entry = %(e)s",
+                parameters={"c": cluster, "e": entry},
+            ).result_rows
+            hosts = client.query(
+                "SELECT count() FROM system.clusters WHERE cluster = %(c)s",
+                parameters={"c": cluster},
+            ).result_rows[0][0]
+        except Exception as e2:
+            raise DDLUnsettled(
+                f"{head}: {err} -- could not read task {entry} ({e2}). No ledger row was written; "
+                f"check system.distributed_ddl_queue before rerunning."
+            ) from err
+        if (
+            hosts
+            and len(rows) >= hosts
+            and all(st == "Finished" and not code for _, st, code in rows)
+        ):
+            print(f"  [info] {entry} finished on all {hosts} hosts after: {err}")
+            return
+        state = (
+            ", ".join(
+                f"{h}={st}" + (f"({code})" if code else "") for h, st, code in rows
+            )
+            or "no rows"
+        )
+        raise DDLUnsettled(
+            f"{head}: task {entry} is not finished on all {hosts} hosts of {cluster} ({state}); "
+            f"the statement may still run on some. No ledger row was written. Wait until "
+            f"system.distributed_ddl_queue shows {entry} finished or failed everywhere, then check "
+            "each replica by hand: CREATE ... IF NOT EXISTS and ADD ... IF NOT EXISTS migrations are "
+            "safe to rerun, INSERT migrations are not."
+        ) from err
+
+    @classmethod
+    def not_replicated(cls, live: dict, objs: list) -> list:
+        """Names of tables in `objs` stored on a plain engine of a family that has a Replicated form."""
+        out = []
+        for o in objs:
+            if o.kind != "table" or o.name not in live:
+                continue
+            eng = cls.engine_span(cls.mask(live[o.name]))
+            if eng and eng[2] in cls.REPLICATED:
+                out.append(o.name)
+        return out
 
     @classmethod
     def require_replicated(cls, client, db: str, names) -> None:
@@ -745,7 +881,10 @@ class SchemaApplier:
             for stmt in cls.statements(p.read_text())
             if (m := cls.CREATE.match(stmt))
         }
-        steps = []
+        steps = [
+            ("not-replicated", n, cls.NOT_REPLICATED_MSG.rstrip(": "))
+            for n in (cls.not_replicated(live, objs) if cluster else [])
+        ]
         for o in objs:
             if o.kind == "view" or (o.kind == "refresh" and o.name not in live):
                 continue
@@ -798,21 +937,27 @@ class SchemaApplier:
         if cluster:
             cls.require_replicated(client, db, [cls.LEDGER])
             done = cls.applied(client, db, cluster)
+            live0 = cls.live(client, db)
             cls.validate_cluster(
                 client,
                 objs,
-                cls.live(client, db),
+                live0,
                 [p for p in migrations if p.name not in done],
                 cluster,
                 db,
             )
-        client.command(cls.ledger_ddl(cluster, db))
+            plain = cls.not_replicated(live0, objs)
+            if plain:
+                raise NotReplicated(cls.NOT_REPLICATED_MSG + ", ".join(plain))
+        cls.execute(client, cls.ledger_ddl(cluster, db), cluster)
         unsynced: dict = {}
         cls.refresh_mvs_on_cluster(client, db, cluster)
         live = cls.live(client, db)
         for o in objs:
             if o.kind in ("table", "mv") and o.name not in live:
-                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
+                cls.execute(
+                    client, cls.clustered(o.sql, o.kind, cluster, db, o.name), cluster
+                )
                 steps.append(("create", o.name, o.file))
         done = cls.applied(client, db, cluster)
         for path in migrations:
@@ -846,13 +991,17 @@ class SchemaApplier:
             if o.kind != "view":
                 continue
             if o.name not in live:
-                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
+                cls.execute(
+                    client, cls.clustered(o.sql, o.kind, cluster, db, o.name), cluster
+                )
                 steps.append(("create", o.name, o.file))
             elif cls.differs(client, o, live[o.name], db):
                 # A plain view holds no data; the server rejects CREATE OR REPLACE.
                 oc = f" ON CLUSTER {cluster}" if cluster else ""
-                client.command(f"DROP VIEW IF EXISTS {o.name}{oc}")
-                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
+                cls.execute(client, f"DROP VIEW IF EXISTS {o.name}{oc}", cluster)
+                cls.execute(
+                    client, cls.clustered(o.sql, o.kind, cluster, db, o.name), cluster
+                )
                 steps.append(("recreate", o.name, o.file))
         elsewhere = cls.refresh_mvs_on_cluster(client, db, cluster)
         for o in objs:
@@ -948,6 +1097,10 @@ def main() -> None:
     from .client import ClickHouse, ClickHouseEnv
 
     db = args.database or ClickHouseEnv.target_database() or ClickHouseEnv.database()
+    if cluster:
+        os.environ.setdefault(
+            "CLICKHOUSE_SEND_RECEIVE_TIMEOUT", str(SchemaApplier.DDL_TIMEOUT + 300)
+        )
     client = ClickHouse.connect(database=db)
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
@@ -966,15 +1119,21 @@ def main() -> None:
     if args.check:
         steps = SchemaApplier.plan(client, db, files, migrations, cluster)
         for action, name, detail in steps:
-            print(f"  {action:8} {name}" + (f"\n{detail}" if action == "drift" else ""))
+            show = action in ("drift", "not-replicated")
+            print(f"  {action:8} {name}" + (f"\n{detail}" if show else ""))
+        if cluster and not SchemaApplier.keeper_template():
+            if any(a == "create" for a, _, _ in steps):
+                print(SchemaApplier.DEFAULT_PATH_NOTE)
         print(f"[check] {len(steps)} change(s) pending")
-        if any(action == "drift" for action, _, _ in steps):
+        if any(action in ("drift", "not-replicated") for action, _, _ in steps):
             sys.exit(2)
         sys.exit(1 if steps else 0)
 
+    if cluster and not SchemaApplier.keeper_template():
+        print(SchemaApplier.DEFAULT_PATH_NOTE)
     try:
         steps = SchemaApplier.apply(client, db, files, migrations, cluster)
-    except SchemaDrift as e:
+    except (SchemaDrift, DDLUnsettled) as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)
     for action, name, _ in steps:

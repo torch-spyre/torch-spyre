@@ -136,9 +136,19 @@ Off by default: with no cluster set the applier sends exactly the SQL it always 
   `SummingMergeTree`, `AggregatingMergeTree`; any other engine raises), including the
   `schema_migrations` ledger and tables a migration creates;
 - keeps the table in Keeper at `/clickhouse/<cluster>/tables/{shard}/<db>/<table>`, or at
-  `CLICKHOUSE_KEEPER_PATH` if set: a template with `{table}` (or `{uuid}`), and optionally `{db}`
-  and `{shard}`; a template without `{table}`/`{uuid}` raises, since all tables would share a path;
-- treats a Replicated table as equal to its plain file, so a converted table is never drift.
+  `CLICKHOUSE_KEEPER_PATH` if set: an absolute path of letters, digits and `_ . / -` with the
+  placeholders `{table}` (or `{uuid}`; required), `{db}`, `{cluster}` and `{shard}` only, anything
+  else raises. The default has no generation suffix, unlike a converted table's path (`.../g<N>`):
+  dropping and recreating a table at the same path collides in Keeper if a replica missed its
+  `DROP ... SYNC`. Set `CLICKHOUSE_KEEPER_PATH=/clickhouse/<cluster>/tables/{shard}/{db}/{table}/g2`
+  (or the next generation) to keep paths distinct; `--check` and `apply` print a note while the
+  default is in use;
+- treats a Replicated table as equal to its plain file, so a converted table is never drift. Only
+  the engine's path and replica, and a conversion comment `ha-twin` (or `ha-twin | <original>`),
+  are ignored; a `COMMENT` written in the file still counts;
+- reports a table of a Replicated family that is still on a plain engine as `not-replicated`:
+  `--check` exits 2 (like drift) and `apply` stops before any write, because its `ON CLUSTER`
+  DDL would otherwise change each server alone. Without a cluster this is not checked.
 
 Data statements in a migration (`INSERT`) run once on the connected server and reach the others by
 replication; before a later statement reads a table the migration inserted into, the applier runs
@@ -175,6 +185,15 @@ inserts into a table and then reads it only through a view is not synced in betw
 unsynced when the last migration finishes (for example `010` into `run_case_counters`, `019` into
 `artifact_subscription_versions`) reach the other replicas by ordinary replication, so a view read
 on another replica right after an apply can lag.
+
+Every cluster statement waits up to an hour (`distributed_ddl_task_timeout`, and the client's read
+timeout is raised to match unless `CLICKHOUSE_SEND_RECEIVE_TIMEOUT` is set). If an `ON CLUSTER`
+statement still raises, the applier reads its task in `system.distributed_ddl_queue`: it goes on only
+when the task has finished without error on every host, and otherwise stops with the task id and the
+per-host state. It does not wait further, and it never writes the ledger row for a statement it
+could not confirm. A rerun is safe only for statements that tolerate repetition: `CREATE ... IF NOT
+EXISTS` and `ADD ... IF NOT EXISTS`/`DROP ... IF EXISTS` are idempotent; an `INSERT` migration is not
+(a timed-out insert may have landed), and the applier cannot tell, so check the rows first.
 
 If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
 keep running on the other replicas, and its ledger row is not written. Migrations marked
@@ -216,8 +235,7 @@ INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<migration-stem>
 ```
 
 `<migration-stem>` is the file name without `.sql` (for example `006_case_id_without_run_context`);
-`--rerun` takes the full name `<migration.sql>`. Syncs wait up to an hour
-(`distributed_ddl_task_timeout`).
+`--rerun` takes the full name `<migration.sql>`.
 
 What it does not do: convert an existing plain table to Replicated, lock against two appliers
 running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on

@@ -282,7 +282,9 @@ def test_cluster_migrations_run_ddl_on_every_replica_and_the_ledger_once(tmp_pat
 def test_cluster_recreated_view_is_dropped_and_created_on_every_replica(tmp_path):
     old = "CREATE VIEW v AS SELECT 0 AS x"
     server, steps = _apply(
-        tmp_path, {"10-a.sql": T + ";\n" + V + ";"}, live={"a": T, "v": old}
+        tmp_path,
+        {"10-a.sql": T + ";\n" + V + ";"},
+        live={"a": replicated(T, DB, "a"), "v": old},
     )
     assert ("recreate", "v", "10-a.sql") in steps
     assert f"DROP VIEW IF EXISTS v ON CLUSTER {CLUSTER}" in server.log
@@ -474,7 +476,7 @@ def test_a_refreshable_mv_in_a_migration_stays_on_the_connected_server():
 
 def test_a_refreshable_mv_another_replica_owns_is_not_created_again(tmp_path):
     files = {"10-a.sql": T + ";\n" + R + ";"}
-    server = FakeServer({"a": T})
+    server = FakeServer({"a": replicated(T, DB, "a")})
     server.elsewhere = {"r"}
     d = _schema(tmp_path, files)
     f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
@@ -569,7 +571,7 @@ def test_quoted_and_qualified_names_get_on_cluster_in_the_right_place(stmt, want
 
 
 def test_a_quoted_create_table_gets_on_cluster_and_a_replicated_engine():
-    for name, bare in [("`db`.t", "t"), ("`my-t`", "my-t"), ('"my t"', "my t")]:
+    for name, bare in [("`db`.t", "t"), ("`my-t`", "my-t"), ('"my_t"', "my_t")]:
         sql = (
             f"CREATE TABLE IF NOT EXISTS {name} (a UInt8) ENGINE = MergeTree ORDER BY a"
         )
@@ -983,9 +985,9 @@ def test_a_comment_only_change_is_still_drift_without_a_cluster():
     )
 
 
-def test_a_comment_on_a_converted_table_is_still_ignored():
+def test_the_marker_comment_on_a_converted_table_is_ignored():
     plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
-    conv = replicated(plain, "db", "t") + " COMMENT 'converted'"
+    conv = replicated(plain, "db", "t") + " COMMENT 'ha-twin'"
     assert SchemaApplier.differs(FormatOnly(), _obj(plain), conv, "db") == ""
 
 
@@ -1136,3 +1138,283 @@ def test_the_readme_rerunnable_lists_match_the_migrations():
         re.search(r"unmarked ones that insert rows \(((?:`\d+`,? ?)+)\)", readme)
     )
     assert got_marked == marked and got_unmarked == unmarked_inserting
+
+
+# ---- cluster mode: plain tables of a Replicated family ------------------------------------
+
+from spyre_clickhouse_ingest.apply_schema import DDLUnsettled, NotReplicated  # noqa: E402
+
+
+def _files(tmp_path, files, migrations=None):
+    d = _schema(tmp_path, files, migrations)
+    return d, SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+
+
+def test_a_plain_table_is_reported_in_cluster_mode_and_apply_writes_nothing(tmp_path):
+    server = FakeServer({"a": T})
+    _, f, m = _files(tmp_path, {"10-a.sql": T + ";"})
+    steps = SchemaApplier.plan(server, DB, f, m, CLUSTER)
+    assert [s[:2] for s in steps if s[0] == "not-replicated"] == [
+        ("not-replicated", "a")
+    ]
+    with pytest.raises(NotReplicated, match="not Replicated: a"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not any(c.startswith(("CREATE", "ALTER")) for c in server.log)
+    assert not server.ledger
+
+
+def test_a_plain_table_is_not_reported_without_a_cluster(tmp_path):
+    server = FakeServer({"a": T})
+    _, f, m = _files(tmp_path, {"10-a.sql": T + ";"})
+    assert SchemaApplier.plan(server, DB, f, m, "") == []
+    assert SchemaApplier.apply(server, DB, f, m, "") == []
+
+
+def test_a_replicated_table_and_a_plain_engine_outside_the_families(tmp_path):
+    log = "CREATE TABLE a (x UInt8) ENGINE = Log"
+    live = {"a": replicated(T, DB, "a")}
+    assert SchemaApplier.not_replicated(live, [_obj_named("a", T)]) == []
+    assert SchemaApplier.not_replicated({"a": log}, [_obj_named("a", log)]) == []
+
+
+def _obj_named(name, ddl):
+    from spyre_clickhouse_ingest.apply_schema import SchemaObject
+
+    return SchemaObject("table", name, ddl, "x.sql")
+
+
+def test_check_exits_2_on_a_plain_table_in_cluster_mode_and_0_without(
+    tmp_path, monkeypatch, capsys
+):
+    from spyre_clickhouse_ingest import apply_schema as mod
+    from spyre_clickhouse_ingest.client import ClickHouse
+
+    d, _, _ = _files(tmp_path, {"10-a.sql": T + ";"})
+    server = FakeServer({"a": T})
+    monkeypatch.setattr(ClickHouse, "connect", classmethod(lambda c, **k: server))
+    monkeypatch.setenv("CLICKHOUSE_CLUSTER", "")
+    monkeypatch.setenv("CLICKHOUSE_SEND_RECEIVE_TIMEOUT", "300")
+    argv = ["x", "--check", "--schema-dir", str(d), "--database", DB]
+    monkeypatch.setattr("sys.argv", argv + ["--cluster", CLUSTER])
+    with pytest.raises(SystemExit) as e:
+        mod.main()
+    assert e.value.code == 2 and "not-replicated a" in capsys.readouterr().out
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setenv("CLICKHOUSE_CLUSTER", "")
+    with pytest.raises(SystemExit) as e:
+        mod.main()
+    assert e.value.code == 0
+
+
+def test_check_in_cluster_mode_says_a_new_table_gets_the_default_keeper_path(
+    tmp_path, monkeypatch, capsys
+):
+    from spyre_clickhouse_ingest import apply_schema as mod
+    from spyre_clickhouse_ingest.client import ClickHouse
+
+    d, _, _ = _files(tmp_path, {"10-a.sql": T + ";"})
+    monkeypatch.setattr(ClickHouse, "connect", classmethod(lambda c, **k: FakeServer()))
+    monkeypatch.delenv("CLICKHOUSE_KEEPER_PATH", raising=False)
+    monkeypatch.setenv("CLICKHOUSE_CLUSTER", "")
+    monkeypatch.setenv("CLICKHOUSE_SEND_RECEIVE_TIMEOUT", "300")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "x",
+            "--check",
+            "--schema-dir",
+            str(d),
+            "--database",
+            DB,
+            "--cluster",
+            CLUSTER,
+        ],
+    )
+    with pytest.raises(SystemExit):
+        mod.main()
+    assert "no generation suffix" in capsys.readouterr().out
+    monkeypatch.setenv("CLICKHOUSE_KEEPER_PATH", "/ch/{shard}/{db}/{table}/g2")
+    with pytest.raises(SystemExit):
+        mod.main()
+    assert "no generation suffix" not in capsys.readouterr().out
+
+
+# ---- cluster mode: DDL timeout and unsettled tasks -------------------------------------
+
+
+class Spy(FakeServer):
+    """Records each command's settings; fails ON CLUSTER statements matching `fail_on`."""
+
+    def __init__(self, live=None, fail_on=None, error="", queue=(), hosts=2):
+        super().__init__(live)
+        self.calls, self.fail_on, self.error = [], fail_on, error
+        self.queue, self.hosts = list(queue), hosts
+
+    def command(self, sql, **kw):
+        self.calls.append((sql, kw))
+        if self.fail_on and self.fail_on in sql:
+            raise RuntimeError(self.error)
+        return super().command(sql, **kw)
+
+    def query(self, sql, parameters=None):
+        if "distributed_ddl_queue" in sql:
+            rows = self.queue
+        elif "system.clusters" in sql:
+            rows = [(self.hosts,)]
+        else:
+            return super().query(sql, parameters)
+
+        class R:
+            result_rows = rows
+
+        return R()
+
+
+ALTER_MIG = {"001-x.sql": "ALTER TABLE a ADD COLUMN IF NOT EXISTS y UInt8;"}
+TASK = "Code: 159. Watching task /clickhouse/task_queue/ddl/query-0000000007 is executing longer than distributed_ddl_task_timeout"
+
+
+def _spy_apply(tmp_path, server, cluster=CLUSTER):
+    _, f, m = _files(tmp_path, {"10-a.sql": T + ";"}, ALTER_MIG)
+    return SchemaApplier.apply(server, DB, f, m, cluster)
+
+
+def test_every_cluster_statement_carries_the_ddl_timeout(tmp_path):
+    server = Spy({"a": replicated(T, DB, "a")})
+    _spy_apply(tmp_path, server)
+    ddl = [kw for sql, kw in server.calls if "ON CLUSTER" in sql]
+    assert ddl and all(
+        kw == {"settings": {"distributed_ddl_task_timeout": 3600}} for kw in ddl
+    )
+
+
+def test_without_a_cluster_no_settings_are_sent(tmp_path):
+    server = Spy({"a": T})
+    _spy_apply(tmp_path, server, "")
+    assert all(kw == {} for _, kw in server.calls)
+
+
+def test_a_timeout_on_a_task_finished_everywhere_goes_on_and_records_the_row(tmp_path):
+    q = [("h1", "Finished", 0), ("h2", "Finished", 0)]
+    server = Spy({"a": replicated(T, DB, "a")}, "ALTER TABLE a ON CLUSTER", TASK, q)
+    _spy_apply(tmp_path, server)
+    assert list(server.ledger) == ["001-x.sql"]
+
+
+@pytest.mark.parametrize(
+    "queue",
+    [
+        [("h1", "Finished", 0), ("h2", "Active", 0)],
+        [("h1", "Finished", 0), ("h2", "Finished", 60)],
+        [("h1", "Finished", 0)],
+        [],
+    ],
+)
+def test_a_timeout_on_a_task_not_finished_everywhere_stops_with_no_ledger_row(
+    tmp_path, queue
+):
+    server = Spy({"a": replicated(T, DB, "a")}, "ALTER TABLE a ON CLUSTER", TASK, queue)
+    with pytest.raises(DDLUnsettled, match="query-0000000007") as e:
+        _spy_apply(tmp_path, server)
+    assert "No ledger row" in str(e.value) and "INSERT migrations are not" in str(
+        e.value
+    )
+    assert not server.ledger
+
+
+def test_an_error_with_no_task_id_stops_with_no_ledger_row(tmp_path):
+    server = Spy({"a": replicated(T, DB, "a")}, "ALTER TABLE a ON CLUSTER", "boom")
+    with pytest.raises(DDLUnsettled, match="no distributed DDL task id"):
+        _spy_apply(tmp_path, server)
+    assert not server.ledger
+
+
+def test_a_failed_data_statement_is_raised_unchanged(tmp_path):
+    server = Spy({"a": replicated(T, DB, "a")}, "INSERT INTO a", "bad insert")
+    _, f, m = _files(
+        tmp_path, {"10-a.sql": T + ";"}, {"001-x.sql": "INSERT INTO a SELECT 1;"}
+    )
+    with pytest.raises(RuntimeError, match="bad insert"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not server.ledger
+
+
+# ---- keeper path template and plain_engine --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/ch/{shard}/{table}'; DROP",
+        "/ch/{shard}/{tabel}",
+        "/ch/{shard}/{table",
+        "ch/{shard}/{table}",
+        "/ch/ {table}",
+        "/ch/{shard}/x",
+        "/ch/{shard}/\\{table}",
+    ],
+)
+def test_a_bad_keeper_path_is_refused(monkeypatch, path):
+    monkeypatch.setenv("CLICKHOUSE_KEEPER_PATH", path)
+    with pytest.raises(ValueError, match="KEEPER_PATH"):
+        SchemaApplier.clustered(T, "table", CLUSTER, "db", "a")
+
+
+def test_a_keeper_path_template_substitutes_cluster_db_table(monkeypatch):
+    monkeypatch.setenv(
+        "CLICKHOUSE_KEEPER_PATH", "/ch/{cluster}/{shard}/{db}/{table}/g2"
+    )
+    out = SchemaApplier.clustered(T, "table", CLUSTER, "db", "a")
+    assert f"'/ch/{CLUSTER}/{{shard}}/db/a/g2', '{{replica}}'" in out
+
+
+def test_a_database_name_with_a_quote_cannot_reach_the_keeper_path():
+    with pytest.raises(ValueError, match="keeper path"):
+        SchemaApplier.clustered(T, "table", CLUSTER, "d'b", "a")
+
+
+@pytest.mark.parametrize(
+    "stored,plain",
+    [
+        (
+            "ENGINE = ReplicatedSummingMergeTree('/p', 'r', (a, b)) ORDER BY a",
+            "ENGINE = SummingMergeTree((a, b)) ORDER BY a",
+        ),
+        ("ENGINE = ReplicatedMergeTree ORDER BY a", "ENGINE = MergeTree ORDER BY a"),
+        ("ENGINE = ReplicatedMergeTree() ORDER BY a", "ENGINE = MergeTree ORDER BY a"),
+        (
+            "ENGINE = ReplicatedMergeTree('/p', 'r') ORDER BY a",
+            "ENGINE = MergeTree ORDER BY a",
+        ),
+        (
+            "ENGINE = ReplicatedReplacingMergeTree('/p', 'r', v) ORDER BY a",
+            "ENGINE = ReplacingMergeTree(v) ORDER BY a",
+        ),
+    ],
+)
+def test_plain_engine_handles_tuple_arguments_and_bare_engines(stored, plain):
+    assert SchemaApplier.plain_engine("CREATE TABLE t (a UInt8) " + stored) == (
+        "CREATE TABLE t (a UInt8) " + plain
+    )
+
+
+def test_only_the_conversion_marker_comment_is_dropped():
+    rep = "CREATE TABLE t (a UInt8) ENGINE = ReplicatedMergeTree('/p', 'r') ORDER BY a"
+    plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
+    assert SchemaApplier.plain_engine(rep + " COMMENT 'ha-twin'") == plain
+    assert (
+        SchemaApplier.plain_engine(rep + " COMMENT 'ha-twin | mine'")
+        == plain + " COMMENT 'mine'"
+    )
+    assert (
+        SchemaApplier.plain_engine(rep + " COMMENT 'mine'") == plain + " COMMENT 'mine'"
+    )
+
+
+def test_a_real_file_comment_is_drift_against_a_converted_table_without_it():
+    plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
+    conv = replicated(plain, "db", "t") + " COMMENT 'ha-twin'"
+    commented = _obj(plain + " COMMENT 'mine'")
+    assert SchemaApplier.differs(FormatOnly(), commented, conv, "db") != ""
+    conv2 = replicated(plain, "db", "t") + " COMMENT 'ha-twin | mine'"
+    assert SchemaApplier.differs(FormatOnly(), commented, conv2, "db") == ""
