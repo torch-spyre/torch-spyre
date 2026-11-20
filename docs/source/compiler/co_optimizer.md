@@ -292,11 +292,12 @@ term drops out entirely. This fallback is weaker — on a graph where everything
 every division scores identically and the search has nothing left to optimize on. On the CP-SAT
 side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
-remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
-that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
-in tile size and cut count). With `cpsat_table_lowering` on, an expression the tables cannot
-lower raises `TableLoweringError` instead of taking the ladder.
+remaining ties by cut count, parallelism, division balance and tile count; with the printer,
+CP-SAT also takes that ladder when `cost_expr_to_cpsat` cannot lower the expression, and
+whenever `auto_coarse_tiling` is on, since the allocator then withholds the expression (the
+model is flat in tile size and cut count). With `cpsat_table_lowering` on it does neither: the
+tables lower the expression under `auto_coarse_tiling` too, and an expression they cannot lower
+raises `TableLoweringError`.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*

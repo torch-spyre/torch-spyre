@@ -3000,6 +3000,7 @@ class SolveStatsTest(TestCase):
                     mock.patch.object(module, name, never),
                 ):
                     solver.plan_layout_and_core_divisions(priced(solver))
+                    self.assertEqual(CpSatLayoutSolver.linear_cost_only(), not flag)
                 self.assertEqual(solver.last_solve_stats["status"], "OPTIMAL")
                 self.assertTrue(solver.last_solve_stats["objective_used"])
 

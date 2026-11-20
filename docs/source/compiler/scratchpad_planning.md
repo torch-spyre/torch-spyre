@@ -649,12 +649,13 @@ Those two modes minimize two different objectives:
   lowers it instead: every cost value is computed in floating point before
   the solve, and CP-SAT reads it from `element` tables, linear constraints
   and `lin_max`. When there is no usable expression -- symbolic shapes, a
-  serialized capture, `auto_coarse_tiling` on (the allocator withholds it,
-  the model being flat in tile size), or the printer's lowering raising --
-  the solve falls back to the ladder above, which knows no relayout price
-  and therefore pins every relayout copy out. The table lowering does not
-  fall back when it cannot lower an objective: it raises
-  `TableLoweringError`. See
+  serialized capture, or, with the printer, `auto_coarse_tiling` on (the
+  allocator withholds it, the model being flat in tile size) or the
+  lowering raising -- the solve falls back to the ladder above, which
+  knows no relayout price and therefore pins every relayout copy out. The
+  table lowering has no such fallback: an objective it cannot lower raises
+  `TableLoweringError`, and it takes the expression under
+  `auto_coarse_tiling` too. See
   [The co-optimizer](co_optimizer.md#cost-model) for how both production
   solvers consume the same expression, and
   [Analytical Cost Model](cost_model.md) for the pricing itself.

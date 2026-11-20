@@ -734,7 +734,8 @@ Environment Variables
    * - ``CPSAT_TABLE_LOWERING``
      - Lower the CP-SAT cost objective from exact tables instead of with the
        printer (default ``1``). An objective the tables cannot lower raises
-       ``TableLoweringError``.
+       ``TableLoweringError``; with the tables, CP-SAT also takes the cost
+       expression under ``AUTO_COARSE_TILING``.
    * - ``CPSAT_TABLE_CAP``
      - The most entries one table of the table lowering may hold
        (default ``8192``)
