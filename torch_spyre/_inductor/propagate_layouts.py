@@ -2924,6 +2924,16 @@ def _scan_mutation_layout_inputs(
         target_layout = target_buffer.get_layout()
         if not isinstance(target_layout, FixedLayout):
             continue
+        # A zero-sized target has no stick to write, so its stick expression is
+        # meaningless (it comes out as e.g. ``8*d0``). Reject it here rather than
+        # let _find_alt_target_stl fail with an opaque stick-expression error.
+        # TODO: a missing feature (#4929); lower a write into an empty tensor to
+        # a no-op instead.
+        if any(_concrete_int(s) == 0 for s in target_layout.size):
+            raise Unsupported(
+                f"zero-sized tensor {name} (size={list(target_layout.size)}) as "
+                f"the target of a mutation such as index_copy_/index_put_"
+            )
         # A sliced target's own layout describes the slice, not the allocation,
         # so synthesizing an STL from it would under-count its sticks.
         target_stl = _target_device_layout(group[0].layout.target, name)

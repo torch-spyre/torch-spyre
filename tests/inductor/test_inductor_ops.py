@@ -14757,6 +14757,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         src = torch.randn(4, 2)
         self.compare_with_cpu(fn, dst, 1, index, src, run_compile=False, run_eager=True)
 
+    @expects_raise
+    def test_index_copy_zero_sized_rejected(self):
+        # TODO(#4929): a missing feature. When a write into an empty tensor lowers
+        # to a no-op this stops raising, and the test has to become a positive one.
+        def fn(dst, index, src):
+            out = dst.clone()
+            out.index_copy_(1, index, src)
+            return out
+
+        dst = torch.zeros(4, 8, 0)
+        index = torch.tensor([1, 4])
+        src = torch.zeros(4, 2, 0)
+        with pytest.raises(InductorError, match="zero-sized tensor"):
+            self.compare_with_cpu(fn, dst, index, src, run_eager=False)
+
     def test_index_copy_compiled_cpu(self):
         """torch.compile'd index_copy / index_copy_ / index_copy(out=) match CPU.
 
