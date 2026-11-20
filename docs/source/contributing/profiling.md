@@ -18,7 +18,7 @@ several:
 
 | Layer | Where it lives | Typical change |
 |---|---|---|
-| Python API | `torch_spyre/profiler/` | `profile_spyre()` wrapper, `torch.spyre.memory_*` |
+| Python API | `torch_spyre/profiler/`, `torch_spyre/memory/` | FFDC retrieval (`get_diagnostic_report`), `torch.spyre.memory` queries |
 | C++ registration | `torch_spyre/csrc/profiler/` | PrivateUse1 observer, kineto wiring |
 | Build | `setup.py` | Guarded by the `USE_SPYRE_PROFILER` env var; links `libaiupti` and Kineto headers bundled with PyTorch itself |
 | Tests | `tests/profiler/` | Skip-marked when `USE_SPYRE_PROFILER` is off |

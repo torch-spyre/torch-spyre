@@ -6,15 +6,15 @@ context for Torch-Spyre developers and as a general reference for the
 dataflow accelerator design pattern.
 
 :::{note}
-**Key Concepts** — terms used throughout this page:
+**Key Concepts**: terms used throughout this page:
 
-- **Tile** — a contiguous sub-tensor assigned to a single core.
-- **Scratchpad** — fast on-core SRAM. The compiler manages it directly; there is no hardware cache.
-- **DMA** — Direct Memory Access. On Spyre this is the PCIe path that carries tensor data between host memory and the device's LPDDR5.
-- **Load/store** — the compiler-emitted instructions used by the on-core load/store units to move tiles between LPDDR5 and the LX scratchpad.
-- **SPMD** — Single Program, Multiple Data. Every core runs the same program on its own slice of the data, picked by core ID.
-- **SuperDSC** — the Spyre-specific kernel descriptor format. A single JSON describes one scheduled kernel operation across all cores.
-- **DCI** — Data Conversion Information. The `DataConversionInfo` struct (built by `generate_dci()` in `spyre_mem.cpp`) that bundles loop ranges, host and device strides, and dtype info; the runtime feeds it to `copyAsync` to drive a host ↔ LPDDR5 DMA transfer.
+- **Tile**: a contiguous sub-tensor assigned to a single core.
+- **Scratchpad**: fast on-core SRAM. The compiler manages it directly; there is no hardware cache.
+- **DMA**: Direct Memory Access. On Spyre this is the PCIe path that carries tensor data between host memory and the device's LPDDR5.
+- **Load/store**: the compiler-emitted instructions used by the on-core load/store units to move tiles between LPDDR5 and the LX scratchpad.
+- **SPMD**: Single Program, Multiple Data. Every core runs the same program on its own slice of the data, picked by core ID.
+- **SuperDSC**: the Spyre-specific kernel descriptor format. A single JSON describes one scheduled kernel operation across all cores.
+- **DCI**: Data Conversion Information. The `DataConversionInfo` struct (built by `generate_dci()` in `spyre_mem.cpp`) that bundles loop ranges, host and device strides, and dtype info; the runtime feeds it to `copyAsync` to drive a host ↔ LPDDR5 DMA transfer.
 :::
 
 ## What is a Dataflow Accelerator?
@@ -23,7 +23,7 @@ Traditional von Neumann processors execute instructions sequentially,
 fetching data from memory on demand. **Dataflow accelerators** invert
 this model: computation is expressed as a directed acyclic graph (DAG)
 of operations, and each node fires as soon as all its input operands
-are ready. There is no program counter — the data itself drives
+are ready. There is no program counter: the data itself drives
 execution order. This eliminates most control-flow overhead and enables
 deeply pipelined, high-throughput execution
 \[[Dennis 1974](#ref-dennis1974), [Veen 1986](#ref-veen1986)\].
@@ -39,7 +39,7 @@ Key characteristics:
 :width: 680px
 :align: center
 
-Dataflow execution of two independent branches (Linear + LayerNorm) that merge at a Concat node. **Green (solid border) = ready** — all inputs available, fires immediately. **Yellow (dashed border) = waiting** — blocked on upstream output. Both MatMuls fire in parallel because their inputs are independent. No program counter controls execution order — data availability does.
+Dataflow execution of two independent branches (Linear + LayerNorm) that merge at a Concat node. **Green (solid border) = ready**: all inputs available, fires immediately. **Yellow (dashed border) = waiting**: blocked on upstream output. Both MatMuls fire in parallel because their inputs are independent. No program counter controls execution order; data availability does.
 :::
 
 ### Dataflow Firing Rule
@@ -66,11 +66,11 @@ resident there.
 There are two major variants of dataflow execution
 \[[Veen 1986](#ref-veen1986)\]:
 
-- **Static dataflow** — dependencies are fixed at compile time. The
+- **Static dataflow**: dependencies are fixed at compile time. The
   hardware executes a pre-determined graph with known shapes and
   scheduling. This is simpler and more efficient for regular workloads.
 
-- **Dynamic dataflow** — uses tagged tokens to track dependencies at
+- **Dynamic dataflow**: uses tagged tokens to track dependencies at
   runtime, supporting multiple concurrent instances of the same
   operation. This is more flexible but significantly more complex in
   hardware.
@@ -105,11 +105,11 @@ Deep neural networks exhibit properties that are particularly
 well-suited to dataflow execution
 \[[Chen 2017](#ref-chen2017), [Sze 2017](#ref-sze2017)\]:
 
-- **Regular computation patterns** — operations like GEMM, convolution,
+- **Regular computation patterns**: operations like GEMM, convolution,
   and element-wise activations are highly predictable
-- **High data reuse opportunities** — weights and activations are
+- **High data reuse opportunities**: weights and activations are
   accessed repeatedly across layers and batches
-- **Static execution graphs** — during inference (and often training),
+- **Static execution graphs**: during inference (and often training),
   the operator graph is fixed and shapes are known
 
 Dataflow architectures exploit these properties by:
@@ -121,7 +121,7 @@ Dataflow architectures exploit these properties by:
   runtime allocation overhead low (though execution timing of the
   staged transfers still depends on runtime conditions)
 
-**Data movement — not compute — is often the dominant cost** in DNN
+**Data movement, not compute, is often the dominant cost** in DNN
 execution \[[Sze 2017](#ref-sze2017)\]. This has been dramatically
 demonstrated in the transformer era by FlashAttention
 \[[Dao 2022](#ref-dao2022)\], which achieved large speedups purely by
@@ -134,8 +134,8 @@ data close to compute units and minimizing DDR round-trips.
 implications for how PyTorch operations are lowered. Because all data
 movement is explicit and compiler-managed, the backend has to fix the
 tiling strategy, the load/store schedule that stages tiles into
-scratchpad, and the kernel descriptors (SuperDSC) at compile time —
-there is no runtime fallback to a hardware cache. See
+scratchpad, and the kernel descriptors (SuperDSC) at compile time,
+because there is no hardware cache to fall back on at runtime. See
 [Compiler Architecture](../compiler/architecture.md) and
 [Work Division Planning](../compiler/work_division_planning.md) for
 details.
@@ -177,7 +177,7 @@ The IBM Spyre Accelerator PCIe card (reverse side), showing the physical form fa
 Spyre implements a **hybrid dataflow** architecture: dataflow execution
 drives the compute kernels, while control-flow mechanisms handle host
 interaction, kernel sequencing, and device orchestration. This is
-consistent with the design of most modern accelerators — pure dataflow
+consistent with the design of most modern accelerators. Pure dataflow
 machines were largely unsuccessful historically
 \[[Veen 1986](#ref-veen1986)\], and practical systems combine the
 efficiency of dataflow execution with the flexibility of control flow
@@ -188,11 +188,11 @@ for coordination.
 Spyre exposes two levels of memory visible to the compiler.
 Understanding this hierarchy is critical for performance: LX Scratchpad
 is significantly lower-latency than DDR, so minimizing DDR round-trips
-through effective tiling is the primary lever for optimizing kernel
+through effective tiling is the primary means of optimizing kernel
 throughput.
 
-1. **DDR (device DRAM)** — large, off-core storage for full tensors.
-2. **LX Scratchpad** — fast, on-core storage for tiles actively being
+1. **DDR (device DRAM)**: large, off-core storage for full tensors.
+2. **LX Scratchpad**: fast, on-core storage for tiles actively being
    processed. The compiler emits load/store instructions to stage
    tiles between DDR and the scratchpad; there is no hardware cache
    to fall back on.
@@ -202,7 +202,7 @@ throughput.
 :width: 600px
 :align: center
 
-Spyre memory hierarchy. Full tensors live in off-chip LPDDR5 — 128 GB physical, of which 16 GB is reserved for ECC, leaving roughly 112 GB usable. Before a kernel runs, the compiler issues load/store instructions to stage the tiles it needs into the on-core LX Scratchpad. The PCIe link between the host and LPDDR5 is the DMA path. Tiling that keeps traffic on-chip is the main lever for performance.
+Spyre memory hierarchy. Full tensors live in off-chip LPDDR5: 128 GB physical, of which 16 GB is reserved for ECC, leaving roughly 112 GB usable. Before a kernel runs, the compiler issues load/store instructions to stage the tiles it needs into the on-core LX Scratchpad. The PCIe link between the host and LPDDR5 is the DMA path. Tiling that keeps traffic on-chip is the main means of improving performance.
 :::
 
 The end-to-end data path is:
@@ -215,28 +215,29 @@ The compiler generates two kinds of artifacts to drive this pipeline:
 
 - **Load/store instructions** that move tiles between DDR and the LX
   scratchpad at the right time.
-- **SuperDSC** — JSON kernel descriptors that specify the computation
-  performed on each tile once it arrives in scratchpad. SuperDSC is
-  being superseded by KTIR, a tile-based MLIR intermediate
-  representation. The specification is published as RFC 0682, and a
-  reference CPU interpreter is available at
+- **SuperDSC**: JSON kernel descriptors that specify the computation
+  performed on each tile once it arrives in scratchpad. KTIR, a
+  tile-based MLIR intermediate representation, is the planned successor
+  to SuperDSC; the production compilation path uses SuperDSC. The KTIR
+  specification is published as RFC 0682, and a reference CPU
+  interpreter is available at
   [torch-spyre/ktir-cpu](https://github.com/torch-spyre/ktir-cpu).
   See [the KTIR page](../compiler/ktir.md) for details.
 
 ## Execution Model
 
-Each Spyre core executes a **kernel** — a self-contained computation
+Each Spyre core executes a **kernel**, a self-contained computation
 on a **tile** (a contiguous sub-tensor region) of data. All three of
-the following are determined **at compile time** — there is no global
+the following are determined **at compile time**; there is no global
 instruction scheduler. Execution is driven by compile-time planning
 and data readiness, with only minimal runtime control for transfer
 sequencing and resource arbitration:
 
-1. **Work division** — how to split a tensor operation across cores
+1. **Work division**: how to split a tensor operation across cores
    (see [Work Division Planning](../compiler/work_division_planning.md))
-2. **Data staging** — when, and with what load/store instructions, to
+2. **Data staging**: when, and with what load/store instructions, to
    move tiles between LPDDR5 and the LX scratchpad
-3. **Kernel specification** — the SuperDSC (Spyre kernel descriptor)
+3. **Kernel specification**: the SuperDSC (Spyre kernel descriptor)
    JSON that fully describes the operation: operand shapes, data
    types, tiling parameters, and the sequence of compute instructions
    for the PT array.
@@ -251,7 +252,7 @@ core ID.
 :width: 50%
 :align: center
 
-Spyre core microarchitecture. Each Spyre core contains two corelets (Corelet 0 and Corelet 1) that share a single 2 MB LX scratchpad (SRAM). A corelet is built from an 8 × 8 systolic Processing Element (PE) array, used for matrix-style compute on the PT execution unit, plus a 1D Special Function Unit (SFU) vector unit that handles non-linear activations such as GELU and softmax. Compiler-emitted load/store instructions move tiles between the LX scratchpad and off-chip LPDDR5; there is no hardware cache. Cores talk to each other over a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
+Spyre core microarchitecture. Each Spyre core contains two corelets (Corelet 0 and Corelet 1) that share a single 2 MB LX scratchpad (SRAM). A corelet is built from an 8 × 8 systolic Processing Element (PE) array, used for matrix-style compute on the PT execution unit, plus a 1D Special Function Unit (SFU) vector unit that handles non-linear activations such as GELU and softmax. Compiler-emitted load/store instructions move tiles between the LX scratchpad and off-chip LPDDR5; there is no hardware cache. Cores are connected by a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
 :::
 
 ## Comparison with GPU and Other Accelerators
@@ -295,7 +296,7 @@ Spyre is part of a broader trend of dataflow-inspired AI accelerators:
 
 Each makes different trade-offs in programmability, scalability, and
 hardware complexity, but all share the principle of optimizing data
-movement as the primary lever for performance and energy efficiency.
+movement as the primary means of improving performance and energy efficiency.
 For a comprehensive survey of hardware accelerators in the LLM era, see
 \[[Kachris 2025](#ref-kachris2025)\].
 
@@ -304,22 +305,22 @@ For a comprehensive survey of hardware accelerators in the LLM era, see
 While dataflow architectures offer strong parallelism and efficiency
 for regular workloads, they face several challenges:
 
-- **Compiler complexity** — extracting, scheduling, and mapping
+- **Compiler complexity**: extracting, scheduling, and mapping
   dataflow graphs to hardware requires sophisticated compilation
   passes. The compiler must handle tiling, data layout, memory
-  allocation, and multi-core scheduling — all at compile time.
+  allocation, and multi-core scheduling, all at compile time.
 
-- **Irregular workloads** — dynamic control flow (e.g., variable-length
+- **Irregular workloads**: dynamic control flow (e.g., variable-length
   sequences, conditional branching) and variable tensor shapes reduce
   the effectiveness of static dataflow scheduling. Operations that
   cannot be pre-planned may require fallback mechanisms (e.g., host
   execution or alternative kernels).
 
-- **Placement and scheduling** — efficiently mapping large operator
+- **Placement and scheduling**: efficiently mapping large operator
   graphs onto a fixed number of cores with limited scratchpad memory
   remains a hard optimization problem, especially as model sizes grow.
 
-- **Synchronization and backpressure** — operations that require
+- **Synchronization and backpressure**: operations that require
   multiple inputs (e.g., concatenation, residual additions) act as
   synchronization points where all upstream paths must complete before
   execution can proceed. The Torch-Spyre compiler mitigates this
@@ -327,13 +328,13 @@ for regular workloads, they face several challenges:
   idle time at synchronization boundaries (see
   [Work Division Planning](../compiler/work_division_planning.md)).
 
-- **Data movement overhead** — dataflow cuts down on redundant
+- **Data movement overhead**: dataflow cuts down on redundant
   movement, but every tile that has to come from DDR still costs
   latency on the way into and out of the scratchpad. At scale the
-  communication network is the bottleneck, especially for ops with
-  poor data locality.
+  communication network can become the bottleneck, especially for ops
+  with poor data locality.
 
-- **Limited general-purpose adoption** — dataflow architectures have
+- **Limited general-purpose adoption**: dataflow architectures have
   been most successful in domain-specific applications (AI inference,
   signal processing) where computation patterns are predictable. They
   are not well-suited for general-purpose workloads with irregular

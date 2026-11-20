@@ -20,7 +20,7 @@ still reachable only through a Python cyclic reference will not be freed until
 Python's cyclic GC runs `PyGC_Collect()`.
 
 Calling `PyGC_Collect()` under memory pressure breaks those cycles, drops the
-Python reference, and lets the `shared_ptr` refcount fall to zero — releasing
+Python reference, and lets the `shared_ptr` refcount fall to zero, releasing
 the underlying device allocation back to flex.
 
 ## The Two Locks
@@ -42,7 +42,7 @@ section for how this plays out in practice.
 
 ## Execution Paths
 
-### Path 1 — Python thread allocation (bridge path)
+### Path 1: Python thread allocation (bridge path)
 
 **Entry**: Python code calls `torch.randn(..., device='spyre')`.
 
@@ -55,11 +55,11 @@ section for how this plays out in practice.
 
 **Lock order**: `GIL → allocator_mutex_`
 
-**Why it is safe**: The GIL is *already held on entry* — it is never acquired
+**Why it is safe**: The GIL is *already held on entry*; it is never acquired
 while the mutex is held. If memory pressure fires, the callback releases the
 mutex before touching the GIL (Path 2 below).
 
-### Path 2 — Memory pressure callback
+### Path 2: Memory pressure callback
 
 **Entry**: `FlexAllocator::allocateInDomain()` exhausts all regions.
 
@@ -67,18 +67,18 @@ mutex before touching the GIL (Path 2 below).
 |------|-------|
 | `allocateInDomain()` holds `allocator_mutex_` | mutex ✓ |
 | Callback `memory_pressure_callback_(lock)` is invoked | mutex ✓ |
-| `lock.unlock()` — mutex released | — |
-| `PyGILState_Ensure()` — GIL acquired | GIL ✓ |
+| `lock.unlock()`: mutex released | — |
+| `PyGILState_Ensure()`: GIL acquired | GIL ✓ |
 | `PyGC_Collect()` runs | GIL ✓ |
-| `PyGILState_Release()` — GIL released | — |
-| `lock.lock()` — mutex re-acquired | mutex ✓ |
+| `PyGILState_Release()`: GIL released | — |
+| `lock.lock()`: mutex re-acquired | mutex ✓ |
 | Returns to `allocateInDomain()`; allocation retried | mutex ✓ |
 
 **Lock order**: `allocator_mutex_ → (release) → GIL → (release) → allocator_mutex_`
 
 **Why it is safe**: The mutex is *not held* when the GIL is acquired.
 
-### Path 3 — C++ direct allocation (off-GIL path)
+### Path 3: C++ direct allocation (off-GIL path)
 
 **Entry**: C++ code calls `FlexAllocator::allocate()` without holding the GIL.
 
@@ -93,26 +93,26 @@ The lock sequence is identical to Path 2 when memory pressure fires:
 4. `PyGC_Collect()` runs.
 5. GIL released; `allocator_mutex_` re-acquired.
 
-**Safety**: same as Path 2 — mutex is not held while acquiring the GIL.
+**Safety**: same as Path 2: the mutex is not held while acquiring the GIL.
 
 ## Deadlock Scenarios
 
 ### What prevents deadlock
 
-**Scenario 1 — Python thread vs memory pressure**
+**Scenario 1: Python thread vs memory pressure**
 
 - T1 (Python): holds GIL, acquires `allocator_mutex_` → allocation succeeds.
 - T2 (allocator): holds `allocator_mutex_`, hits pressure → **releases mutex**,
   then acquires GIL.
 - No deadlock: T2 releases the mutex before it needs the GIL.
 
-**Scenario 2 — Two Python threads**
+**Scenario 2: Two Python threads**
 
 - T1: holds GIL, acquires mutex.
 - T2: blocked on GIL; cannot even attempt to acquire mutex.
 - No deadlock: the GIL serialises Python threads before they reach the allocator.
 
-**Scenario 3 — C++ thread vs Python thread**
+**Scenario 3: C++ thread vs Python thread**
 
 - T1 (C++): acquires mutex, hits pressure → releases mutex, acquires GIL.
 - T2 (Python): holds GIL, waits for mutex.
@@ -121,7 +121,7 @@ The lock sequence is identical to Path 2 when memory pressure fires:
 ### What causes deadlock
 
 ```cpp
-// WRONG — will deadlock!
+// WRONG: will deadlock!
 PyGILState_STATE gstate = PyGILState_Ensure();        // Acquire GIL first
 std::lock_guard<std::mutex> lock(allocator_mutex_);   // Then try for mutex
 // If another thread holds mutex and is waiting for the GIL → deadlock.
@@ -141,8 +141,10 @@ lock.lock();                                   // Re-acquire mutex
 
 The callback is implemented in
 [`torch_spyre/csrc/spyre_allocator.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp).
-It is registered with `FlexAllocator` during `SpyreAllocator` construction and
-follows the contract above exactly.
+`SpyreAllocator::getFlexAllocator()` registers
+`SpyreAllocator::memoryPressureCallback` with `FlexAllocator` through
+`registerMemoryPressureCallback`, once per process (`std::call_once`), on its
+first call. The callback follows the contract above exactly.
 
 ## Callback Requirements Checklist
 
@@ -180,22 +182,22 @@ Any memory-pressure callback that acquires the GIL must:
    ```
 
 7. **Exception safety**: the `unique_lock` destructor handles an already-unlocked
-   mutex correctly if the callback throws — no double-unlock or missed re-lock.
+   mutex correctly if the callback throws, with no double-unlock or missed re-lock.
 
 ## Call-site Rules
 
 | Call-site context | Action required |
 |---|---|
-| From Python (GIL already held) | None — GIL is already held on entry; callback will release the mutex before re-acquiring the GIL. |
-| From C++ without GIL | None — callback acquires and releases the GIL internally. |
+| From Python (GIL already held) | None. The GIL is already held on entry; callback will release the mutex before re-acquiring the GIL. |
+| From C++ without GIL | None. The callback acquires and releases the GIL internally. |
 | From C++ with GIL explicitly held | Ensure `allocator_mutex_` is not held when acquiring the GIL elsewhere in the same frame. |
 
 ## Free-Threaded Python (≥ 3.13 `--disable-gil`, 3.14+)
 
 On free-threaded Python builds `PyGILState_Ensure()` is a no-op and the GIL no
-longer exists as a single global lock. The specific deadlock this page describes
-— one thread holding `allocator_mutex_` while blocked on the GIL, another
-holding the GIL while blocked on `allocator_mutex_` — cannot occur on these
+longer exists as a single global lock. The specific deadlock this page describes,
+in which one thread holds `allocator_mutex_` while blocked on the GIL and another
+holds the GIL while blocked on `allocator_mutex_`, cannot occur on these
 builds.
 
 The mutex-release contract around `PyGC_Collect()` remains correct and useful:
@@ -228,5 +230,5 @@ The implementation uses the **hold-mutex-during-callback** approach:
 ## References
 
 - **C++ callback contract**: `flex/docs/lock_ordering.md`
-- **SpyreAllocator memory model**: [Runtime — Memory Model](index.md#memory-model)
+- **SpyreAllocator memory model**: [Runtime: Memory Model](index.md#memory-model)
 - **Implementation**: [`torch_spyre/csrc/spyre_allocator.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp)

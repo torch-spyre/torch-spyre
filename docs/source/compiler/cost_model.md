@@ -11,7 +11,7 @@ This page documents the **standalone reporting pass** in `cost_model_pass.py`, r
 estimate is also returned as a value, so a pass or a tool can read it during compilation and
 choose between two plans; see
 [Using it as an API during compilation](#using-it-as-an-api-during-compilation). Nothing in the
-compiler consumes that report yet.
+compiler consumes that report.
 
 The `cost_model.py` *module* is a different matter: the co-optimizer builds a symbolic
 `cost_expr` out of `predict_by_bundle`/`predict_bundles` and minimizes it, so the pricing this
@@ -373,11 +373,12 @@ replication-aware model needs a measured multicast rate. Coarse loops are exclud
 from this delivery estimate because their delivery was not measured and they have
 separate re-read pricing.
 
-### DMA requests of a loop matmul's operand reads
+### Load requests of a loop matmul's operand reads
 
-A core reads its slice of an operand as contiguous runs, and each run is one DMA request.
+A core reads its slice of an operand as contiguous runs, and each run is one load request.
 A request has a fixed cost, so a slice cut into many tiny runs is slow even when its bytes
-are few. The transport term already prices this with a calibrated request law. The same
+are few. The transport term already prices this with a calibrated request law
+(`transport_dma_ns_per_request` in `CostParams`). The same
 law prices each HBM input of a matmul inside a loop (`loop_trip > 1`):
 
 - requests per trip = the read's own footprint per trip / one core's contiguous run (a
@@ -445,13 +446,13 @@ by 22–31 % on the mean across every matmul family, because part of the shorter
 hide behind the longer and nothing charges for it. Adding the two instead over-predicts by a
 similar margin. Neither form is right, and no mechanism is known for what sits between them —
 a fitted fraction closes the gap numerically but its value is unstable across populations, so
-it was removed rather than shipped.
+the model carries no such term.
 
 This is the largest single source of error in the model. It is confined to matmul — it is why
 `matmul, split` reads 29.8 % and `bmm` up to 40.0 % above, while pointwise, broadcast,
-reduction and transport all sit under 10 %. (Softmax's 21.1 % has a different cause: a
-per-core throughput floor that used to cover partial-machine runs was removed for the same
-reason, having no settled mechanism.) The bias runs one way, so a predicted time for a
+reduction and transport all sit under 10 %. (Softmax's 21.1 % has a different cause: the
+model carries no per-core throughput floor for partial-machine runs, for the same reason:
+no mechanism for one is settled.) The bias runs one way, so a predicted time for a
 matmul-heavy graph is a lower bound rather than an estimate. Ranking is unaffected — see the
 note under [Accuracy](#accuracy).
 
@@ -483,7 +484,7 @@ that fails to hide behind the longer. Ordering survives it — rank correlation 
 runs +0.875 to +0.998 across every category — so the model is usable for choosing between
 plans and not for predicting a wall-clock number.
 
-Two op families are excluded from these figures because nothing models them: flash attention, and the `write` outer product (`b[1,C] + c[R,1]`), whose fitted surface was removed as an unexplained black box.
+Two op families are excluded from these figures because nothing models them: flash attention, and the `write` outer product (`b[1,C] + c[R,1]`), for which the model carries no fitted surface, because none has an explained mechanism.
 
 ## Measuring, scoring and refreshing the model
 
@@ -508,10 +509,8 @@ BENCH_OP=softmax_row_tiling BENCH_ROWS=4096 BENCH_COLS=2048 BENCH_TILES=8 \
 
 **Generate the measurement database yourself.** It is measured device time, so it belongs to
 the machine and toolchain that produced it, and the compiler is under active development —
-kernel performance moves with it. A spot-check while preparing this feature measured 261 µs
-for a configuration the reference database has at 390 µs, on the same shape and core count,
-because an upstream change now pins a shared graph input into LX. Numbers taken on another
-build describe that build.
+kernel performance moves with it. One spot-check measured 261 µs for a configuration the reference database has at 390 µs,
+on the same shape and core count. Numbers taken on another build describe that build.
 
 The sweep needs nothing but hardware. What to measure is the **sweep plan**,
 `tools/cost_model/sweep_plan.json`, which ships with the repository — a list of

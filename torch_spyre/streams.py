@@ -27,12 +27,12 @@ class Stream:
 
     Example:
         >>> dev = torch.device("spyre")
-        >>> stream = torch.Stream(dev) //modern use
-        >>> with torch.stream(stream):
+        >>> stream = torch.Stream(dev)
+        >>> with stream:
         ...     x = torch.randn(100, device='spyre')
 
-        >>> stream = torch_spyre.Stream()
-        >>> with torch_spyre.stream(stream):
+        >>> stream = torch.spyre.Stream()
+        >>> with torch.spyre.stream(stream):
         ...     x = torch.randn(100, device='spyre')
     """
 
@@ -123,8 +123,8 @@ def stream(stream: Stream):
         stream (Stream): The stream to use
 
     Example:
-        >>> s = torch_spyre.Stream()
-        >>> with torch.stream(s):
+        >>> s = torch.spyre.Stream()
+        >>> with torch.spyre.stream(s):
         ...     x = torch.randn(100, device='spyre')
     """
     return stream  # Stream class already has __enter__/__exit__

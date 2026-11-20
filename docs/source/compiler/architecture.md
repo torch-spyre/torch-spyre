@@ -61,13 +61,23 @@ complex operations into a smaller core ATen set of operations.
 that will be compiled by the backend compiler into device binaries and the host code that will
 orchestrate their execution.
 
-:::{figure} ../_static/images/codegen.png
-:alt: Torch-Spyre codegen decision flowchart
-:width: 100%
-:align: center
+The following diagram shows how a scheduled kernel becomes a device binary.
 
-Decision flowchart for the Torch-Spyre front-end code generation pipeline. Each operation in the FX Graph is evaluated against compatibility checks, schema lookup, dtype mapping, and output shape inference before a SuperDSC template is rendered.
-:::
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TD
+    A["SpyreKernel<br/>(spyre_kernel.py)"] --> B["OpSpec list<br/>(op_spec.py)"]
+    A --> W["SpyrePythonWrapperCodegen<br/>host code that calls the kernel<br/>(wrapper.py)"]
+    B --> C["SpyreAsyncCompile<br/>_compile_to_dir<br/>(execution/async_compile.py)"]
+    C --> D["generate_bundle<br/>(codegen/bundle.py)"]
+    D --> E["compile_op_spec<br/>(codegen/superdsc.py)"]
+    E --> F["generate_sdsc<br/>(codegen/compute_ops.py)"]
+    F --> G["sdsc_*.json and bundle.mlir<br/>in the inductor-spyre cache directory"]
+    G --> H["dbo-opt<br/>(backend compiler)"]
+    H --> I["Device binary"]
+    I --> R["SpyreSDSCKernelRunner<br/>(execution/kernel_runner.py)"]
+    W --> R
+```
 
 Some key entry points to the front-end compiler are:
 + [\_\_init\_\_.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/__init__.py) registers the compiler and customizes the configuration of Inductor.

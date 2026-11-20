@@ -83,7 +83,7 @@ deterministic. There is no thread scheduling jitter and no dynamic dispatch over
 no warps, no thread blocks, and no shared memory in the CUDA sense.
 
 **Tiled memory instead of strided memory.** The tiled layout was chosen to match the hardware.
-The 128-byte aligned sticks of 64 fp16 elements (a constant we call `BYTES_IN_STICK=128`) match
+The 128-byte aligned sticks of 64 fp16 elements (elements per stick from `elems_per_stick()`) match
 the natural granularity of data transfers between DDR and scratchpad on the internal datapaths.
 This lets the hardware load a full stick of contiguous elements in a single transfer, so each
 memory access delivers as much useful data as possible. The tradeoff is that PyTorch's
@@ -726,7 +726,7 @@ collectives (`scatter`, `reduce_scatter`, `alltoall`) in the eager process group
 compiled graphs already lower `reduce_scatter_tensor` to spyre-comms. See
 [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
-**Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
+**Profiling.** The `AIUActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
 device-side timing is in the tree (`torch_spyre/csrc/profiler/`) and builds by default. It uses
 upstream Kineto, which integrates with `libaiupti` through the PrivateUse1 profiler registration
 macros, so `torch.profiler` captures device-side kernel and transfer events without a separate
@@ -776,7 +776,7 @@ used. The tables are organized by the challenge that each hook addresses.
 | `torch._register_device_module("spyre", ...)` | PrivateUse1 | Attaches the Python device module | Provides `torch.spyre.*` namespace |
 | `SpyreGuardImpl` | `DeviceGuardImplInterface` | Device context management | Registered via `C10_REGISTER_GUARD_IMPL(PrivateUse1, SpyreGuardImpl)`; uses thread-local storage; supports 10+ dtypes including fp8 variants |
 | `SpyreAllocator` | `REGISTER_ALLOCATOR` | Custom device memory allocator | Registered for `c10::DeviceType::PrivateUse1`; wraps flex runtime memory in `SharedOwnerCtx` without exposing raw pointers (IBM Z security requirement) |
-| `SpyreTensorImpl` | `at::TensorImpl` | Carries tiled layout metadata alongside the PyTorch tensor | Adds `SpyreTensorLayout` with device-side tiled size, a stride map from host dims to device dims, and device dtype. `BYTES_IN_STICK=128` (64 fp16 elements) |
+| `SpyreTensorImpl` | `at::TensorImpl` | Carries tiled layout metadata alongside the PyTorch tensor | Adds `SpyreTensorLayout` with device-side tiled size, a stride map from device dims to host strides, and device dtype. Sticks are 128 bytes (64 fp16 elements, from `elems_per_stick()`) |
 | `SpyreHooksInterface` | `PrivateUse1HooksInterface` | Reports device availability and primary context status | Queried by PyTorch runtime during device enumeration |
 | `SpyreStream` | `torch.cuda.Stream` semantics | Asynchronous execution and CPU↔Spyre overlap | Implements `torch.spyre.Stream`, `current_stream()`, `synchronize()`; enables pipelining batch N+1's input transfer behind batch N's compute |
 | `SpyreCCLBackend` | `c10d::Backend` (registered as `"spyreccl"`) | Multi-card collective communication via `torch.distributed` | `init_process_group(backend="spyreccl")`. Implements synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, `allreduce`. Reuses the rank's flex runtime instance and default stream. |
@@ -822,7 +822,7 @@ would require invasive core changes. Deferring to codegen is too late.
 | `torch.spyre.memory.*` | `torch.accelerator.memory` re-export | Per-device memory queries | `memory_allocated`, `max_memory_allocated`, `reset_peak_memory_stats`, `memory_stats` — all available today. |
 | `aiu-smi` | Standalone CLI / sampler | Power, thermal, PT-utilisation, DDR / PCIe / RDMA bandwidth | Available in PF and VF mode (Z/LinuxONE rollout in progress for VF). Public release tracked in [#1335](https://github.com/torch-spyre/torch-spyre/issues/1335). |
 | `aiu-trace-analyzer` | Trace post-processor | Adds derived metrics (PT-Util %) to Chrome / Perfetto traces | Available with some known gaps. |
-| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Merged in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default via upstream Kineto and `libaiupti`. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
+| `AIUActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Added in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default (`USE_SPYRE_PROFILER=1`) via upstream Kineto and `libaiupti`. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
 
 ---
 

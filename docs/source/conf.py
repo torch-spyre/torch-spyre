@@ -26,7 +26,7 @@ extensions = [
     "knowledge_graph_ext",  # auto-generate operation explorer graph
 ]
 
-# MyST-Parser settings — allow RST-style cross-refs inside .md files
+# MyST-Parser extensions enabled for .md files
 myst_enable_extensions = [
     "colon_fence",  # ::: fenced directives
     "deflist",  # definition lists
@@ -57,10 +57,7 @@ source_suffix = {
 master_doc = "index"
 
 # -- Intersphinx mapping -----------------------------------------------------
-# The PyTorch docs site moved its inventory and the canonical URL now 404s
-# under -W. None of our pages use :py:class:`torch.X` style cross-references
-# (links to pytorch.org are written as plain Markdown links instead), so we
-# drop the torch entry until the upstream URL stabilizes.
+# No PyTorch inventory: no page uses :py: references to torch.
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
 }

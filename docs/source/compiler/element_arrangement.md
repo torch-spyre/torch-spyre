@@ -86,22 +86,23 @@ laid out over its device dims. So batch and row dims need no special handling.
 
 #### Stick tiling facts
 
-The restore does not guess the stick loop from the DCSI strides. The tile map
+The shuffle does not guess the stick loop from the DCSI strides. The tile map
 that `get_device_stride_infos` already computes says how each host dim is
-split over the device dims, and the following facts are taken from it as local
-variables and passed to `ea_restore` as plain arguments:
+split over the device dims. `get_device_stride_infos` reads these facts from
+it as local variables and passes them to `ea_shuffle` as plain arguments:
 
 | Fact | Meaning |
 | :--- | :--- |
-| `stick_host_extent` | Host extent (in elements) of the stick dim, after folding leading host dims that are not in the tile map. |
-| `stick_count_dim` | Index in the DCSI of the device dim that counts sticks (innermost first), or -1 if there is none. Device dims of size 1 count no sticks and are ignored. |
+| `stick_host_dim` | Index of the host dim that is tiled into the innermost device dim (the elements of a stick). |
+| `stick_count_dev_dim` | Index of the other device dim that the stick host dim is tiled into, which counts the sticks, or -1 if there is none. |
 | `allocated_sticks` | Number of sticks allocated along the stick dim (`device_size` of the stick-count dim, 1 if none). |
-| `is_stick_tail` | For each DCSI, whether it is the remainder DCSI for the partial last stick of the stick dim. |
+| `outer_count` | Product of the host sizes outside the stick host dim. |
 
 The stick dim is the host dim that is tiled into the innermost device dim (the
 elements of a stick). If more than one non-trivial device dim counts its
-sticks, the stick dim is ambiguous and `DL16_TO_FP32` raises
-`Unable to determine the stick dimension for DL16_TO_FP32 D2H`.
+sticks, the stick dim is ambiguous and the copy raises
+`Unable to determine the stick dimension for DL16_TO_FP32` (or
+`FP32_TO_DL16`).
 
 Because the stick-count dim comes from the tile map, it can be at any position
 of the device layout. For example a `(2, 4, 64)` fp16 tensor converted to FP32
@@ -112,9 +113,16 @@ dim and the rows are folded in front of it.
 
 The permutation covers the **allocated** extent of the stick dim
 (`allocated_sticks * elems_per_stick`), not the host extent. A partial last
-stick, or a partial last stick pair, therefore needs no special case: the
-columns that exist on the host are mapped by the same `p(c)`, and the padding
-columns are never read or written.
+stick therefore needs no special case: the columns that exist on the host are
+mapped by the same `p(c)`, and the padding columns are never read or written.
+
+A `DL16_TO_FP32` stick dim whose real width needs an odd number of sticks has
+a last stick pair that holds real data in one stick and only padding in the
+other. For this case `ea_shuffle` fills an `EaPairBoundary`: the shuffle runs
+over the padded, pair-aligned width, and one extra DCSI moves data between
+that padded width and the real host width. A D2H copy slices the padded
+result down to the real width (`post_slice_dcsi_`); an H2D copy expands the
+real host data to the padded width with zero fill (`pre_expand_dcsi_`).
 
 ### EA DL16_TO_FP32
 
@@ -231,7 +239,8 @@ allocated and `dimShape_ = 128`. Host column 96 is in the second pair
 
 * **Stick pairs must be allocated:** the stick dim must be allocated as whole
   stick pairs (`allocated_sticks` is even). A stick dim of 96 uses 3 FP32
-  sticks of data but 4 are allocated, so it is supported.
+  sticks of data but 4 are allocated, so it is supported through the pair
+  boundary described in *Padding and partial sticks*.
 * **Stick dims narrower than 64:** a 16-bit stick dim narrower than 64 elements
   (for example 16, 32 or 44) is converted to a single FP32 stick, so half of
   each pair has nowhere to go. These tensors are rejected instead of being
@@ -376,6 +385,12 @@ apply on H2D): the stick dim is the last dim and the other dims get an
 identity entry.
 
 ### Known limitations
+
+* **Host storage offset:** a copy whose host storage offset is not a whole
+  number of stick pairs (`DL16_TO_FP32`) or sticks (`FP32_TO_DL16`) is
+  rejected with `Staggered EA does not support a host storage offset that is
+  not aligned to a stick pair boundary` (`... to a stick boundary` for
+  `FP32_TO_DL16`).
 
 * **Slices of a staggered tensor:** the shuffle assumes that the copy starts at
   the beginning of a stick pair. A copy of a slice that starts on a stick

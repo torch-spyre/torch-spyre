@@ -11,7 +11,7 @@ running models on Spyre. The second is for people working on the backend.
 
 ## What it is for
 
-Torch-Spyre is a few hundred Python modules plus a C++ runtime. Most of
+Torch-Spyre consists of more than a hundred Python modules and a C++ runtime. Most of
 the useful facts are relationships: a PyTorch op is handled by a lowering,
 that lowering is part of a pass group, and the pass group reads an
 environment variable. These relationships are spread across decorators,
@@ -69,8 +69,8 @@ happens and what runs before it, before adding or reordering a pass.
 ### Architecture
 
 Class nodes carry `inherits_from` edges to their base classes, for example
-`CustomPreFusionPasses` inherits from `_SpyreNodePassPipeline`, which in turn
-inherits from `CustomSchedulerPass`. Module nodes carry `imports` edges to the
+`AllReduceKernel` inherits from `SpyreCollectiveKernel`, which in turn
+inherits from the Inductor class `ir._CollectiveKernel`. Module nodes carry `imports` edges to the
 modules they import, and dataclass nodes carry `contains_field` edges to the
 dataclasses they reference.
 
@@ -82,7 +82,7 @@ the reach of a refactor before starting it.
 ### Configuration
 
 An environment-variable node such as `LX_PLANNING` is connected by a
-`reads_env` edge to each module that reads it, for example the `config` module.
+`reads_env` edge to each module that reads it, for example `_inductor.config`.
 
 Pick the variable, follow `reads_env` to the module, then open the source link
 to see the accepted values and the default. For a user this is the fastest way
@@ -108,8 +108,9 @@ handles it:
 - Lowering: the op maps to a Spyre kernel during compilation.
 - Custom op: a hand-written Spyre operator implements it.
 - CPU fallback (dashed red edge): the op runs on the host instead of the
-  accelerator. Fallbacks cause graph breaks and slowdowns, so check this
-  view when a model is slower than you expect.
+  accelerator. Its inputs are copied to the host and its result is copied
+  back to the device, so check this view when a model is slower than you
+  expect.
 - Eager kernel: the op has a direct implementation that also works outside
   `torch.compile`.
 
@@ -128,7 +129,7 @@ reads it, where you can see the accepted values and the default.
 ### Sharing a node in a bug report
 
 Selecting a node writes a link into the page URL. You can paste that link,
-for example `.../explorer/index.html#ops/op::embedding`, into an issue,
+for example `.../explorer/index.html#ops/op::aten.embedding.default`, into an issue,
 and it opens on that node and view.
 
 ## For developers
@@ -167,8 +168,8 @@ When you add an operation, the Operations view shows the ops already
 implemented with each pattern. Filter to the op family you are working on
 and open the existing decomposition, lowering, or custom-op definitions.
 Use this with the {doc}`../compiler/adding_operations` guide: the guide
-explains the three patterns, and the graph shows every op that uses each
-one, with a link to its code.
+explains the registration patterns, and the graph shows every op that uses
+each one, with a link to its code.
 
 ### Viewing the compiler pipeline
 

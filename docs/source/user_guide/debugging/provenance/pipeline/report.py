@@ -529,7 +529,7 @@ def render(
 
     # Header --------------------------------------------------------------
     L += [
-        f"# Example Audit: `{model_name}` — Source-to-Kernel Provenance",
+        f"# Example Audit: Source-to-Kernel Provenance of `{model_name}`",
         "",
         f"> Generated: {now} &nbsp;|&nbsp; Issue: "
         "[torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)",
@@ -658,7 +658,7 @@ def render(
     ]:
         meta_keys = sorted({k for n in nodes for k in n.get("all_meta_keys", [])})
         L += [
-            f"## Stage {slabel} — FX Graph ({plabel}): {len(nodes)} "
+            f"## Stage {slabel}: FX Graph ({plabel}), {len(nodes)} "
             f"compute {_plural(len(nodes), 'node')}",
             "",
             transition,
@@ -686,20 +686,20 @@ def render(
     # Two tables because the pre-scheduling passes can change the op set.
     for stage_label, transition, ops_list in [
         (
-            "Stage 3 — LoopLevelIR (pre-pass)",
+            "Stage 3: LoopLevelIR (pre-pass)",
             "FX nodes lower into LoopLevelIR `ComputedBuffer`s entering the "
             "Spyre pre-scheduling passes.",
             prepass_ops,
         ),
         (
-            "Stage 4 — LoopLevelIR (post-pass)",
+            "Stage 4: LoopLevelIR (post-pass)",
             "The same IR after the pre-scheduling passes mutate it in place.",
             postpass_ops,
         ),
     ]:
         ir_attrs = sorted({a for o in ops_list for a in o.get("all_attrs", [])})
         L += [
-            f"## {stage_label}: {len(ops_list)} {_plural(len(ops_list), 'operation')}",
+            f"## {stage_label}, {len(ops_list)} {_plural(len(ops_list), 'operation')}",
             "",
             transition,
             "",
@@ -730,7 +730,7 @@ def render(
     # Stage 5 detail ------------------------------------------------------
     total_ops = len(opspec_ops)
     L += [
-        f"## Stage 5 — OpSpec: {total_ops} {_plural(total_ops, 'op')}",
+        f"## Stage 5: OpSpec, {total_ops} {_plural(total_ops, 'op')}",
         "",
         "Each scheduled `ComputedBuffer` becomes an `OpSpec` (the device op); "
         "`debug_handle` carries source provenance onto it, while the `origins` / "
@@ -792,7 +792,7 @@ def render(
         + (f" ({unparsed} unparsed, excluded)." if unparsed else ".")
     )
     L += [
-        f"## Stage 6 — SuperDSC: {total_files} "
+        f"## Stage 6: SuperDSC, {total_files} "
         f"`sdsc_*.json` {_plural(total_files, 'file')} "
         f"({len(kernels)} {_plural(len(kernels), 'kernel')})",
         "",

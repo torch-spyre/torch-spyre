@@ -30,7 +30,7 @@
   <!-- ROW 1 — PyTorch extension points -->
   <rect x="52"  y="70" width="136" height="52" rx="3" fill="#374151"/>
   <text x="120" y="92" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">DeviceGuard</text>
-  <text x="120" y="105" text-anchor="middle" font-size="10.5" fill="#e8edf2">C10_REGISTER_GUARD_IMPL</text>
+  <text x="120" y="105" text-anchor="middle" font-size="8.5" fill="#e8edf2">C10_REGISTER_GUARD_IMPL</text>
 
   <rect x="197" y="70" width="136" height="52" rx="3" fill="#374151"/>
   <text x="265" y="92" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">Device Allocator</text>
@@ -48,7 +48,7 @@
 
   <rect x="632" y="70" width="136" height="52" rx="3" fill="#374151"/>
   <text x="700" y="92" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">Stream API</text>
-  <text x="700" y="105" text-anchor="middle" font-size="10.5" fill="#e8edf2">torch.cuda.Stream semantics</text>
+  <text x="700" y="105" text-anchor="middle" font-size="8.5" fill="#e8edf2">torch.cuda.Stream semantics</text>
 
   <!-- Arrows row1 → row2 -->
   <line x1="120" y1="122" x2="120" y2="142" stroke="#CCCCCC" stroke-width="1.2" marker-end="url(#arr)"/>
@@ -74,10 +74,10 @@
   <text x="410" y="172" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">SpyreTensorImpl</text>
   <text x="410" y="186" text-anchor="middle" font-size="11" fill="#ffffff">Tiled layout metadata</text>
   <text x="410" y="198" text-anchor="middle" font-size="11" fill="#ffffff">SpyreTensorLayout</text>
-  <text x="410" y="212" text-anchor="middle" font-size="10.5" fill="#ffe8d8">BYTES_IN_STICK=128</text>
+  <text x="410" y="212" text-anchor="middle" font-size="10.5" fill="#ffe8d8">128-byte sticks</text>
 
   <rect x="487" y="152" width="136" height="76" rx="3" fill="#E55B15"/>
-  <text x="555" y="172" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">SpyreHooksIface</text>
+  <text x="555" y="172" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">SpyreHooksInterface</text>
   <text x="555" y="186" text-anchor="middle" font-size="11" fill="#ffffff">Device availability</text>
   <text x="555" y="198" text-anchor="middle" font-size="11" fill="#ffffff">Primary context</text>
   <text x="555" y="212" text-anchor="middle" font-size="10.5" fill="#ffe8d8">Lazy init reporting</text>
@@ -85,7 +85,7 @@
   <rect x="632" y="152" width="136" height="76" rx="3" fill="#E55B15"/>
   <text x="700" y="172" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">SpyreStream</text>
   <text x="700" y="186" text-anchor="middle" font-size="11" fill="#ffffff">Async execution</text>
-  <text x="700" y="198" text-anchor="middle" font-size="11" fill="#ffffff">Stream(), sync()</text>
+  <text x="700" y="198" text-anchor="middle" font-size="11" fill="#ffffff">Stream(), synchronize()</text>
   <text x="700" y="212" text-anchor="middle" font-size="10.5" fill="#ffe8d8">CPU↔Spyre overlap</text>
 
   <!-- Arrows row2 → row3 -->
@@ -95,7 +95,7 @@
   <!-- ROW 3 — Hardware -->
   <rect x="52"  y="260" width="358" height="40" rx="3" fill="#374151"/>
   <text x="231" y="276" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">flex Runtime</text>
-  <text x="231" y="291" text-anchor="middle" font-size="10.5" fill="#e8edf2">RuntimeContext::create() · runJobPlan()</text>
+  <text x="231" y="291" text-anchor="middle" font-size="10.5" fill="#e8edf2">RuntimeContext::create() · launchOperation()</text>
 
   <rect x="420" y="260" width="370" height="40" rx="3" fill="#374151"/>
   <text x="605" y="276" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">Spyre Accelerator</text>
@@ -108,5 +108,5 @@
 
   <!-- execution path label -->
   <rect x="30" y="330" width="740" height="22" rx="3" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
-  <text x="400" y="344" text-anchor="middle" font-size="11.5" fill="#1d4ed8">Execution path: model.to("spyre") → PrivateUse1 → SpyreGuardImpl / SpyreHooksIface → flex Runtime → Spyre hardware</text>
+  <text x="400" y="344" text-anchor="middle" font-size="11.5" fill="#1d4ed8">Execution path: model.to("spyre") → PrivateUse1 → SpyreGuardImpl / SpyreHooksInterface → flex Runtime → Spyre hardware</text>
 </svg>

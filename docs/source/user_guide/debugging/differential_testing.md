@@ -86,7 +86,7 @@ which kind of bug you have.
 
 | What you see | Likely cause | What to do |
 |---|---|---|
-| Almost every element wrong, absolute difference far above the floor | Structural: a wrong index, reshape, layout, or dispatch | Inspect the layout and copy range in the `sdsc` artifact. See [Common Failure Classes](failure_classes.md) |
+| Almost every element wrong, absolute difference far above the floor | Structural: a wrong index, reshape, layout, or dispatch | Inspect the layout and iteration range in the `sdsc` artifact. See [Common Failure Classes](failure_classes.md) |
 | A few elements off by a small amount near the floor | `float16` accumulation order differs from CPU | Accept it, or raise the tolerance only after ruling out a structural cause |
 
 Raising the tolerance to make a test pass is the most common debugging
@@ -143,7 +143,7 @@ test by construction.
 
 - [Common Failure Classes](failure_classes.md) to recognize the bug once a
   run diverges.
-- [Inductor Artifacts](inductor_artifacts.md) to read the layout and copy
+- [Inductor Artifacts](inductor_artifacts.md) to read the layout and iteration
   range that a structural mismatch points to.
 - [The OpSpec Lab](op_spec_lab.md) to replay the failing kernel on its own
   and decide whether the backend or the front-end produced it.

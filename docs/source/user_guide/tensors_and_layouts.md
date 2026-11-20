@@ -146,9 +146,9 @@ Two common cases:
   sum.
 
 The compiler enforces these constraints during layout propagation and
-inserts `restickify` operations or padding nodes (`insert_padding` in
-`CustomPostPasses`) wherever an operand's natural layout would not
-satisfy them.
+inserts `restickify` operations or padding (the pre-scheduling padding
+passes in `torch_spyre/_inductor/padding.py`) wherever an operand's natural
+layout would not satisfy them.
 
 ## Spyre Tensor Layouts
 
@@ -267,7 +267,7 @@ A worked end-to-end example. The same data shows up two ways: PyTorch sees a 3D 
 :width: 680px
 :align: center
 
-Device (DDR) memory layout of the same tiled tensor. Sticks are stored in device-rank row-major order: all sticks from the first tile row appear before sticks from the second, enabling efficient DMA transfers of contiguous tile slices. *Source: [Tiled Tensor RFC](https://github.com/torch-spyre/rfcs/blob/main/0047-TiledTensors/0047-TiledTensorsRFC.md).*
+Device (DDR) memory layout of the same tiled tensor. Sticks are stored in device-rank row-major order: all sticks from the first tile row appear before sticks from the second, so the sticks of a tile slice are contiguous in device memory. *Source: [Tiled Tensor RFC](https://github.com/torch-spyre/rfcs/blob/main/0047-TiledTensors/0047-TiledTensorsRFC.md).*
 :::
 
 Dimensions in device_size may be padded. For example a Spyre tensor layout with
@@ -306,7 +306,8 @@ for i in range(4):       # 4 tiles per row
 ```
 
 These DCI (Data Conversion Information) specs are generated automatically by
-the compiler from the `SpyreTensorLayout` stored in `SpyreTensorImpl`.
+the runtime from the `SpyreTensorLayout` stored in `SpyreTensorImpl` each time
+a tensor is copied between host memory and device memory.
 
 ## Access Patterns
 
@@ -377,13 +378,13 @@ The `valid_elements` map, elided as `{...}` above, records the valid
 (non-padded) element count for each group of device dimensions, which is how
 the padded stick dimension keeps its logical extent of `150`.
 
-### Specifiying Alternate Layouts
+### Specifying Alternate Layouts
 
 The minimal constructor for a `SpyreTensorLayout` takes a `size` and `dtype` and
-builds a instance that encodes the default layout.  This constructor
+builds an instance that encodes the default layout.  This constructor
 is what is used behind the scenes when the user does not specify a layout.
 
-As an example, we can explictly request the default layout in a `to` by doing:
+As an example, we can explicitly request the default layout in a `to` by doing:
 
 ```
 import torch
@@ -624,14 +625,6 @@ What is refused, with an error naming `for_each_tile`:
   size is a new allocation and a new layout, so there is no one binary to build,
   and the loop is refused with the declaration named as the fix.
 
-What changed: before the compile half landed (PR #6066), a compiled graph over a
-reserved tensor was built for the size it was first compiled at and could return
-wrong values after a `resize_`, which the documentation warned about. Now a
-`for_each_tile` loop is right at every size, and the plain-op case that used to
-compile and be silently wrong raises `Unsupported` at compile time. Code that
-compiled a plain op over a reserved tensor has to tile it, or move the op out of
-the compiled region.
-
 A `for_each_tile` body may also gather rows out of a pool that was itself moved
 with `dynamic=`, as in `pool.index_select(0, idx)`. The pool's length is
 resolved to its declared maximum at compile time. It never becomes a trip count
@@ -701,17 +694,17 @@ reconcile incompatible layouts between adjacent operations.
 
 ## Generating DCIs and SuperDSCs
 
-For each `torch.compile`d function, the front-end compiler generates:
+A **DCI (Data Conversion Information)** is a host-side descriptor for a DMA
+transfer that moves a tensor between host memory and device memory. The
+runtime derives it from the `SpyreTensorLayout` of the device tensor each time
+the tensor is copied to or from the host, so it is not part of a compiled
+artifact.
 
-1. **DCI (Data Conversion Information)** — host-side descriptors for DMA transfers that
-   move tensor tiles between host memory and device DDR. These are
-   derived directly from the `SpyreTensorLayout` of each graph input
-   and output.
-
-2. **SuperDSC JSON** — the per-kernel specification passed to the
-   DeepTools back-end compiler. Each SuperDSC encodes the op name,
-   input/output tensor layouts (device sizes, stride maps, dtypes), work
-   division, and scratchpad allocations.
+For each `torch.compile`d function, the front-end compiler generates a
+**SuperDSC JSON** for every kernel: the specification passed to the DeepTools
+back-end compiler. Each SuperDSC encodes the op name, input/output tensor
+layouts (device sizes, stride maps, dtypes), work division, and scratchpad
+allocations.
 
 The code generator uses `FixedTiledLayout` to determine accurate device
 tensor sizes for memory allocation calls in the host code, and to

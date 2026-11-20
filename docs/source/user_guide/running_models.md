@@ -54,11 +54,14 @@ Valid values: 1–32 (default: 32). See
 
 Full working examples are listed on the [Examples](examples/index.md)
 page. It has single-op scripts (`tensor_allocate.py`, `softmax.py`,
-`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `for_each_tile.py`), a
-`distributed/` set covering the collective ops (allgather, allreduce,
-broadcast, gather, reduce, barrier) plus a multi-rank broadcast
-walkthrough, and a `scratchpad/` set that models the LX layout solver in
-isolation. The scripts are under
+`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `for_each_tile.py`),
+model building blocks (`attention.py`, `flash_attention.py`,
+`linear_attention.py`, `mlp.py`, `rms_norm.py`, `embedding.py`, `fp8.py`,
+`fft.py`), a `distributed/` set covering the collective ops (allgather,
+allreduce, broadcast, gather, reduce, barrier) plus multi-rank
+`torch.compile` walkthroughs under `distributed/compiled/` (broadcast,
+all-gather, allreduce, reduce-scatter, and the coalesced variants), and a
+`scratchpad/` set that models the LX layout solver in isolation. The scripts are under
 [examples/](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples).
 
 ## Troubleshooting
@@ -68,7 +71,7 @@ resources cover the common cases:
 
 - [Debugging](debugging/index.md) explains how to enable compiler logging,
   dump Inductor artifacts, and inspect intermediate representations with
-  `TORCH_LOGS`, `TORCH_COMPILE_DEBUG`, and `TORCH_SPYRE_DEBUG`.
+  `TORCH_LOGS` and `TORCH_COMPILE_DEBUG`.
 - [Supported Operations](supported_operations.md) lists which operations run on
   Spyre and which fall back to the CPU. An unsupported operation in the model
   forces a graph break or a CPU fallback.

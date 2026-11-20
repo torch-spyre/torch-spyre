@@ -1,4 +1,4 @@
-# Restickify: DMA requests and transpose throughput
+# Restickify: load requests and transpose throughput
 
 The [cost model](cost_model.md) prices proven DL16 transports using their physical
 source access, including stick-axis swaps and staging copies. A core split can
@@ -129,7 +129,7 @@ operations and representative model workloads.
 
 - No exact-size, repetition or preferred-split gate. Payload is the work visited
   per invocation, not the size of the KV backing allocation.
-- DL16 source DMA calibration. Fully local transports and other device formats
+- DL16 source request calibration. Fully local transports and other device formats
   remain unchanged. HBM-to-LX uses the same source-request estimate, not a
   separate absolute-latency model.
 - Non-affine/sub-stick accesses are not calibrated. For a plain copy, unsupported

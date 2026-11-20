@@ -56,7 +56,71 @@ def _normalize_op_name(raw):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
+    # Schema strings (``"aten::cumsum.out"``) name the same op as attribute
+    # chains (``torch.ops.aten.cumsum.out``); use one id for both.
+    return raw.replace("::", ".", 1)
+
+
+def _module_op_aliases(tree):
+    """Map module-level ``NAME = torch.ops.<ns>`` assignments to the namespace."""
+    aliases = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            value = _resolve_attr(stmt.value)
+            if value and value.startswith(("torch.ops.", "torch._ops.ops.")):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        aliases[target.id] = _normalize_op_name(value)
+    return aliases
+
+
+def _apply_alias(raw, aliases):
+    """Replace a leading alias name in a dotted op reference."""
+    if not raw:
+        return raw
+    head, sep, rest = raw.partition(".")
+    if head in aliases:
+        return aliases[head] + sep + rest
     return raw
+
+
+def _factory_packets(func):
+    """Map ``V = getattr(torch.ops.<ns>, PARAM)`` in ``func`` to (ns, PARAM index)."""
+    params = [a.arg for a in func.args.args]
+    packets = {}
+    for stmt in ast.walk(func):
+        if not (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+            and _resolve_attr(stmt.value.func) == "getattr"
+            and len(stmt.value.args) == 2
+            and isinstance(stmt.value.args[1], ast.Name)
+            and stmt.value.args[1].id in params
+        ):
+            continue
+        ns = _normalize_op_name(_resolve_attr(stmt.value.args[0]))
+        if not ns:
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                packets[target.id] = (ns, params.index(stmt.value.args[1].id))
+    return packets
+
+
+def _factory_call_literals(tree, func_name, index):
+    """String literals passed at ``index`` in module-level calls to a function."""
+    literals = []
+    for stmt in tree.body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Call)
+                and _resolve_attr(node.func) == func_name
+                and len(node.args) > index
+                and isinstance(node.args[index], ast.Constant)
+                and isinstance(node.args[index].value, str)
+            ):
+                literals.append(node.args[index].value)
+    return literals
 
 
 # Module-level calls that register eager kernels for a list of ops.
@@ -182,7 +246,7 @@ def _extract_list_ops(list_node, list_bindings=None):
         return ops
     for elt in list_node.elts:
         if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-            ops.append(elt.value)
+            ops.append(_normalize_op_name(elt.value))
         else:
             name = _resolve_attr(elt)
             normalized = _normalize_op_name(name)
@@ -292,48 +356,79 @@ def extract_decompositions(filepath):
 
 
 def extract_lowerings(filepath):
-    """Parse @register_spyre_lowering decorators."""
+    """Parse @register_spyre_lowering decorators, expanding factory-registered ones
+    (``_register_cmp_lowerings("eq", ...)``) once per call site."""
     nodes = []
     edges = []
     source = Path(filepath).read_text()
     tree = ast.parse(source)
     rel_path = str(filepath)
+    aliases = _module_op_aliases(tree)
+
+    # (lowering FunctionDef, op name, lowering id suffix) for every
+    # registration, with factory-registered lowerings expanded per call site.
+    registrations = []
+    factory_inner = set()
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        packets = _factory_packets(stmt)
+        if not packets:
+            continue
+        for inner in ast.walk(stmt):
+            if inner is stmt or not isinstance(inner, ast.FunctionDef):
+                continue
+            for dec in inner.decorator_list:
+                dec_name = _get_decorator_name(dec)
+                if not (
+                    dec_name
+                    and "register_spyre_lowering" in dec_name
+                    and isinstance(dec, ast.Call)
+                    and dec.args
+                ):
+                    continue
+                raw = _resolve_attr(dec.args[0])
+                head, _, overload = (raw or "").partition(".")
+                if head not in packets:
+                    continue
+                factory_inner.add(id(inner))
+                ns, index = packets[head]
+                for literal in _factory_call_literals(tree, stmt.name, index):
+                    op = ".".join(p for p in (ns, literal, overload) if p)
+                    registrations.append((inner, op, f"{inner.name}[{literal}]"))
 
     for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
+        if not isinstance(node, ast.FunctionDef) or id(node) in factory_inner:
             continue
         for dec in node.decorator_list:
             dec_name = _get_decorator_name(dec)
             if dec_name and "register_spyre_lowering" in dec_name:
                 if isinstance(dec, ast.Call) and dec.args:
-                    raw = _resolve_attr(dec.args[0])
+                    raw = _apply_alias(_resolve_attr(dec.args[0]), aliases)
                     op = _normalize_op_name(raw)
                     if op:
-                        lowering_id = f"lowering::{node.name}"
-                        op_id = f"op::{op}"
-                        nodes.append(
-                            {
-                                "id": lowering_id,
-                                "label": node.name,
-                                "type": "lowering",
-                                "source_file": rel_path,
-                                "line": node.lineno,
-                            }
-                        )
-                        nodes.append(
-                            {
-                                "id": op_id,
-                                "label": op,
-                                "type": "op",
-                            }
-                        )
-                        edges.append(
-                            {
-                                "source": op_id,
-                                "target": lowering_id,
-                                "relationship": "lowered_by",
-                            }
-                        )
+                        registrations.append((node, op, node.name))
+
+    for node, op, lowering_name in registrations:
+        lowering_id = f"lowering::{lowering_name}"
+        op_id = f"op::{op}"
+        nodes.append(
+            {
+                "id": lowering_id,
+                "label": lowering_name,
+                "type": "lowering",
+                "source_file": rel_path,
+                "line": node.lineno,
+            }
+        )
+        nodes.append({"id": op_id, "label": op, "type": "op"})
+        edges.append(
+            {
+                "source": op_id,
+                "target": lowering_id,
+                "relationship": "lowered_by",
+            }
+        )
     return nodes, edges
 
 
@@ -434,7 +529,13 @@ def extract_fallbacks(filepath):
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             func = _resolve_attr(call.func)
-            if func == "fallback_ops.append" and call.args:
+            # A bare name (``fallback_ops.append(op)`` inside
+            # ``register_fallback``) is a loop variable, not an op reference.
+            if (
+                func == "fallback_ops.append"
+                and call.args
+                and not isinstance(call.args[0], ast.Name)
+            ):
                 raw = _resolve_attr(call.args[0])
                 op = _normalize_op_name(raw)
                 if op:
@@ -504,43 +605,54 @@ def extract_eager_kernels(filepath):
                         }
                     )
 
-        if isinstance(node, ast.FunctionDef):
-            for dec in node.decorator_list:
-                dec_name = _get_decorator_name(dec)
-                if dec_name and "register_kernel" in dec_name:
-                    if isinstance(dec, ast.Call) and dec.args:
-                        first_arg = dec.args[0]
-                        if isinstance(first_arg, ast.Constant) and isinstance(
-                            first_arg.value, str
-                        ):
-                            op_name = first_arg.value
-                            eager_id = f"eager::{op_name}"
-                            op_id = f"op::{op_name}"
-                            nodes.append(
-                                {
-                                    "id": eager_id,
-                                    "label": f"{op_name} (eager)",
-                                    "type": "eager_kernel",
-                                    "source_file": rel_path,
-                                    "line": node.lineno,
-                                }
-                            )
-                            nodes.append(
-                                {
-                                    "id": op_id,
-                                    "label": op_name,
-                                    "type": "op",
-                                }
-                            )
-                            edges.append(
-                                {
-                                    "source": op_id,
-                                    "target": eager_id,
-                                    "relationship": "eager_via",
-                                }
-                            )
+        # ``torch.library.register_kernel("ns::op", ["spyre"])``, used either
+        # as a decorator or called directly. Only Spyre-device registrations
+        # are eager kernels; ``["cpu"]`` registrations (the CPU reference
+        # kernels of custom ops) are not.
+        if isinstance(node, ast.Call):
+            func_name = _resolve_attr(node.func)
+            if (
+                func_name
+                and func_name.split(".")[-1] == "register_kernel"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and _names_spyre_device(node.args[1])
+            ):
+                op_name = _normalize_op_name(node.args[0].value)
+                eager_id = f"eager::{op_name}"
+                op_id = f"op::{op_name}"
+                nodes.append(
+                    {
+                        "id": eager_id,
+                        "label": f"{op_name} (eager)",
+                        "type": "eager_kernel",
+                        "source_file": rel_path,
+                        "line": node.lineno,
+                    }
+                )
+                nodes.append({"id": op_id, "label": op_name, "type": "op"})
+                edges.append(
+                    {
+                        "source": op_id,
+                        "target": eager_id,
+                        "relationship": "eager_via",
+                    }
+                )
 
     return nodes, edges
+
+
+def _names_spyre_device(arg):
+    """Whether a ``register_kernel`` device argument includes ``"spyre"``."""
+    values = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
+    return any(
+        isinstance(v, ast.Constant)
+        and v.value == "spyre"
+        or isinstance(v, ast.Name)
+        and v.id == "DEVICE_NAME"
+        for v in values
+    )
 
 
 def extract_passes(filepath):
@@ -706,24 +818,36 @@ def extract_classes(filepath):
     return nodes, edges
 
 
+def _dotted_module_name(filepath):
+    """Dotted module name for a file under the ``torch_spyre`` package."""
+    parts = list(Path(filepath).with_suffix("").parts)
+    start = len(parts) - 1 - parts[::-1].index("torch_spyre")
+    parts = parts[start:]
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
 def extract_config(filepath):
-    """Extract environment variable declarations from config module."""
+    """Extract the environment variables a module reads, as ``reads_env`` edges."""
     nodes = []
     edges = []
     source = Path(filepath).read_text()
     tree = ast.parse(source)
     rel_path = str(filepath)
 
-    module_id = f"module::{rel_path}"
-    nodes.append(
-        {
-            "id": module_id,
-            "label": "config",
-            "type": "module",
-            "source_file": rel_path,
-            "line": 1,
-        }
-    )
+    module_id = f"module::{_dotted_module_name(filepath)}"
+
+    str_constants = {}
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            str_constants[stmt.targets[0].id] = stmt.value.value
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -738,12 +862,12 @@ def extract_config(filepath):
         if not node.args:
             continue
         first_arg = node.args[0]
-        if not (
-            isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)
-        ):
+        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+            env_name = first_arg.value
+        elif isinstance(first_arg, ast.Name) and first_arg.id in str_constants:
+            env_name = str_constants[first_arg.id]
+        else:
             continue
-
-        env_name = first_arg.value
         default_val = None
         if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
             default_val = node.args[1].value
@@ -839,15 +963,20 @@ def extract_codegen_structures(filepath):
     tree = ast.parse(source)
     rel_path = str(filepath)
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
-
-        is_dataclass = any(
+    def _is_dataclass(cls):
+        return any(
             _get_decorator_name(d) in ("dataclass", "dataclasses.dataclass")
-            for d in node.decorator_list
+            for d in cls.decorator_list
         )
-        if not is_dataclass:
+
+    local_dataclasses = {
+        n.name
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and _is_dataclass(n)
+    }
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or not _is_dataclass(node):
             continue
 
         class_id = f"class::{node.name}"
@@ -896,9 +1025,18 @@ def extract_codegen_structures(filepath):
             "UnimplementedOp",
         }
         for item in node.body:
-            if isinstance(item, ast.AnnAssign) and item.annotation:
-                ann = _resolve_attr(item.annotation)
-                if ann and ann in known_types:
+            if not (isinstance(item, ast.AnnAssign) and item.annotation):
+                continue
+            # Collect every type named in the annotation, so container and
+            # optional fields (``list[SDSCArgs]``, ``DebugHandle | None``)
+            # count as well as bare ones.
+            referenced = {
+                _resolve_attr(sub).split(".")[-1]
+                for sub in ast.walk(item.annotation)
+                if isinstance(sub, (ast.Name, ast.Attribute)) and _resolve_attr(sub)
+            }
+            for ann in sorted(referenced & (known_types | local_dataclasses)):
+                if ann != node.name:
                     ref_id = f"class::{ann}"
                     nodes.append(
                         {
@@ -1032,21 +1170,16 @@ def build_graph(torch_spyre_root):
             all_nodes.extend(n)
             all_edges.extend(e)
 
-    # --- Configuration / environment variables ---
+    # config.py first, so its line wins the dedup for a variable read elsewhere too.
     config_path = root / "_inductor" / "config.py"
-    if config_path.exists():
-        n, e = _run_file_extractor(extract_config, config_path, repo_root)
-        all_nodes.extend(n)
-        all_edges.extend(e)
-    for extra_config in [
-        root / "__init__.py",
-        root / "logging_config.py",
-        root / "profiler" / "_ffdc.py",
-        root / "_inductor" / "dump_common.py",
-        root / "_inductor" / "dump_cost_model.py",
-    ]:
-        if extra_config.exists():
-            n, e = _run_file_extractor(extract_config, extra_config, repo_root)
+    env_files = [config_path] + sorted(
+        p
+        for p in root.rglob("*.py")
+        if p != config_path and "__pycache__" not in p.parts
+    )
+    for env_file in env_files:
+        if env_file.exists():
+            n, e = _run_file_extractor(extract_config, env_file, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 

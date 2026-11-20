@@ -8,26 +8,26 @@
   - [Table of Contents](#table-of-contents)
   - [What unified logging is](#what-unified-logging-is)
   - [Quick Start](#quick-start)
-  - [1. Overview](#1-overview)
+  - [Overview](#overview)
     - [Deprecated Environment Variables](#deprecated-environment-variables)
-  - [2. TORCH\_LOGS Syntax for Spyre Components](#2-torch_logs-syntax-for-spyre-components)
+  - [TORCH\_LOGS Syntax for Spyre Components](#torch_logs-syntax-for-spyre-components)
     - [Syntax Forms](#syntax-forms)
     - [Namespace Normalization](#namespace-normalization)
     - [Hierarchy Rules](#hierarchy-rules)
     - [Common Recipes](#common-recipes)
-  - [3. Component Names](#3-component-names)
+  - [Component Names](#component-names)
     - [The Naming Rule](#the-naming-rule)
     - [Why torch\_spyre.\* in TORCH\_LOGS and spyre.\* Internally](#why-torch_spyre-in-torch_logs-and-spyre-internally)
-  - [4. Available Components](#4-available-components)
+  - [Available Components](#available-components)
     - [Predefined Components](#predefined-components)
     - [Dynamic Loggers](#dynamic-loggers)
-  - [5. Python Usage](#5-python-usage)
+  - [Python Usage](#python-usage)
     - [Getting a Logger](#getting-a-logger)
     - [Adding Logging to New Code](#adding-logging-to-new-code)
     - [Log Format](#log-format)
     - [Enabling multiple components](#enabling-multiple-components)
     - [File Output](#file-output)
-  - [6. C++ Usage](#6-c-usage)
+  - [C++ Usage](#c-usage)
     - [Architecture {#architecture-c}](#architecture-architecture-c)
     - [Include Files](#include-files)
     - [Available Macros](#available-macros)
@@ -37,11 +37,11 @@
     - [Performance: Level-Gated Logging](#performance-level-gated-logging)
     - [Log Format (C++)](#log-format-c)
     - [File Output (C++)](#file-output-c)
-  - [7. Python–C++ Synchronization](#7-pythonc-synchronization)
+  - [Python–C++ Synchronization](#pythonc-synchronization)
     - [Initialization Flow](#initialization-flow)
     - [Runtime Reconfiguration](#runtime-reconfiguration)
     - [Generation Counter and Thread-Local Cache](#generation-counter-and-thread-local-cache)
-  - [8. Troubleshooting](#8-troubleshooting)
+  - [Troubleshooting](#troubleshooting)
   - [Appendix A: Python Programmatic API](#appendix-a-python-programmatic-api)
     - [Setting Levels](#setting-levels)
     - [Per-Pass Logging](#per-pass-logging)
@@ -56,7 +56,7 @@
     - [Output Sink Management](#output-sink-management)
     - [Thread Safety](#thread-safety)
   - [Appendix C: C++ LogLevel Enum Reference](#appendix-c-c-loglevel-enum-reference)
-  - [Appendix D: Design Rationale — Naming](#appendix-d-design-rationale--naming)
+  - [Appendix D: Design Rationale for Naming](#appendix-d-design-rationale-for-naming)
 
 ---
 
@@ -74,7 +74,7 @@ all of it, through the same mechanism PyTorch already uses for its own logs.
 Subsystems form a hierarchy, so one setting on a parent reaches all of its
 children.
 
-The rest of this guide is how to use it. Section 1 describes the component
+The rest of this guide is how to use it. The Overview describes the component
 model and how it replaces the legacy variables, and the later sections cover
 the Python API, the C++ macros, and how the two stay in sync.
 
@@ -103,7 +103,7 @@ See [Common Recipes](#common-recipes) for more configuration patterns.
 
 ---
 
-## 1. Overview
+## Overview
 
 The **Unified Logging Framework (ULF)** consolidates all torch-spyre logging
 (Python and C++) behind a hierarchical component system configured via the
@@ -142,7 +142,7 @@ on use. Migrate to their `TORCH_LOGS` equivalents:
 
 ---
 
-## 2. TORCH_LOGS Syntax for Spyre Components
+## TORCH_LOGS Syntax for Spyre Components
 
 ### Syntax Forms
 
@@ -260,7 +260,7 @@ export TORCH_LOGS="-torch_spyre"
 
 ---
 
-## 3. Component Names
+## Component Names
 
 ### The Naming Rule
 
@@ -300,7 +300,7 @@ etc.) exist solely to pass this validation.
 
 ---
 
-## 4. Available Components
+## Available Components
 
 ### Predefined Components
 
@@ -358,35 +358,60 @@ The full list of dynamic loggers in the codebase:
 
 | `get_inductor_logger()` arg | Internal logger name | Source file |
 | --- | --- | --- |
+| `"codegen.ktir"` | `spyre.inductor.codegen.ktir` | `_inductor/codegen/ktir.py` |
+| `"codegen.superdsc"` | `spyre.inductor.codegen.superdsc` | `_inductor/codegen/superdsc.py` |
 | `"compile_fx_wrapper"` | `spyre.inductor.compile_fx_wrapper` | `_inductor/__init__.py` |
-| `"model_utils"` | `spyre.inductor.model_utils` | `model_utils.py` |
+| `"cost_model_pass"` | `spyre.inductor.cost_model_pass` | `_inductor/cost_model_pass.py` |
+| `"decompositions"` | `spyre.inductor.decompositions` | `_inductor/decompositions.py` |
+| `"dedup_constants"` | `spyre.inductor.dedup_constants` | `_inductor/dedup_constants.py` |
+| `"dump_cost_model"` | `spyre.inductor.dump_cost_model` | `_inductor/cost_features.py` |
 | `"enforce_indirect_access_layout"` | `spyre.inductor.enforce_indirect_access_layout` | `_inductor/enforce_indirect_access_layout.py` |
 | `"HBM_POOL_PLANNING"` | `spyre.inductor.HBM_POOL_PLANNING` | `_inductor/hbm_pool_planning.py` |
-| `"optimize_restickify"` | `spyre.inductor.optimize_restickify` | `_inductor/optimize_restickify.py` |
 | `"insert_restickify"` | `spyre.inductor.insert_restickify` | `_inductor/insert_restickify.py` |
-| `"propagate_hints"` | `spyre.inductor.propagate_hints` | `_inductor/propagate_hints.py` |
-| `"dedup_constants"` | `spyre.inductor.dedup_constants` | `_inductor/dedup_constants.py` |
-| `"split_multi_ops"` | `spyre.inductor.split_multi_ops` | `_inductor/split_multi_ops.py` |
 | `"ir"` | `spyre.inductor.ir` | `_inductor/ir.py` |
+| `"kernel_cache"` | `spyre.inductor.kernel_cache` | `execution/kernel_cache.py` |
+| `"kernel_runner"` | `spyre.inductor.kernel_runner` | `execution/kernel_runner.py` |
+| `"loop_carries"` | `spyre.inductor.loop_carries` | `_inductor/loop_carries.py` |
+| `"loop_checker"` | `spyre.inductor.loop_checker` | `_inductor/loop_checker.py` |
+| `"lx_context_switching"` | `spyre.inductor.lx_context_switching` | `_inductor/scratchpad/lx_context_switching.py` |
+| `"lx_relayout"` | `spyre.inductor.lx_relayout` | `_inductor/scratchpad/lx_relayout.py` |
+| `"model_utils"` | `spyre.inductor.model_utils` | `_monkey_patch.py`, `model_utils.py` |
+| `"narrowing_check"` | `spyre.inductor.narrowing_check` | `_inductor/narrowing_check.py` |
+| `"nonstick_dim_order"` | `spyre.inductor.nonstick_dim_order` | `_inductor/nonstick_dim_order.py` |
+| `"op_spec_validation"` | `spyre.inductor.op_spec_validation` | `_inductor/op_spec_validation.py` |
+| `"optimize_restickify"` | `spyre.inductor.optimize_restickify` | `_inductor/optimize_restickify.py` |
 | `"padding"` | `spyre.inductor.padding` | `_inductor/padding.py` |
-| `"scheduler"` | `spyre.inductor.scheduler` | `_inductor/scheduler.py` |
+| `"parallel_precompile"` | `spyre.inductor.parallel_precompile` | `_inductor/parallel_precompile.py` |
 | `"pass_utils"` | `spyre.inductor.pass_utils` | `_inductor/pass_utils.py` |
-| `"sdsc_compile"` | `spyre.inductor.sdsc_compile` | `_inductor/codegen/bundle.py` |
-| `"codegen.superdsc"` | `spyre.inductor.codegen.superdsc` | `_inductor/codegen/superdsc.py` |
-| `"kernel_runner"` | `spyre.inductor.kernel_runner` | `_inductor/execution/kernel_runner.py` |
+| `"patches"` | `spyre.inductor.patches` | `_inductor/patches.py` |
+| `"propagate_hints"` | `spyre.inductor.propagate_hints` | `_inductor/propagate_hints.py` |
+| `"propagate_layouts"` | `spyre.inductor.propagate_layouts` | `_inductor/propagate_layouts.py` |
+| `"provenance"` | `spyre.inductor.provenance` | `_inductor/provenance.py` |
+| `"read_copy_elision"` | `spyre.inductor.read_copy_elision` | `_inductor/read_copy_elision.py` |
+| `"recompile_check"` | `spyre.inductor.recompile_check` | `_inductor/recompile_check.py` |
+| `"reserved_dims_contract"` | `spyre.inductor.reserved_dims_contract` | `_inductor/reserved_dims_contract.py` |
+| `"scheduler"` | `spyre.inductor.scheduler` | `_inductor/scheduler.py` |
+| `"sdsc_compile"` | `spyre.inductor.sdsc_compile` | `_inductor/codegen/bundle.py`, `execution/async_compile.py` |
+| `"split_multi_ops"` | `spyre.inductor.split_multi_ops` | `_inductor/split_multi_ops.py` |
+| `"spyre_kernel"` | `spyre.inductor.spyre_kernel` | `_inductor/spyre_kernel.py` |
+| `"timing"` | `spyre.inductor.timing` | `_inductor/timing_recorder.py`, `_inductor/torch_phases.py` |
+| `"work_division"` | `spyre.inductor.work_division` | `_inductor/temp_passes.py`, `_inductor/work_division.py` |
+| `"work_division_constraints"` | `spyre.inductor.work_division_constraints` | `_inductor/work_division_constraints.py` |
 | `"scratchpad.allocator"` | `spyre.inductor.scratchpad.allocator` | `_inductor/scratchpad/allocator.py` |
-| `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
+| `"scratchpad.coarse_tiling"` | `spyre.inductor.scratchpad.coarse_tiling` | `_inductor/scratchpad/coarse_tiling.py` |
+| `"scratchpad.exhaustive_search"` | `spyre.inductor.scratchpad.exhaustive_search` | `_inductor/scratchpad/exhaustive_search.py` |
 | `"scratchpad.greedy_solver"` | `spyre.inductor.scratchpad.greedy_solver` | `_inductor/scratchpad/greedy_solver.py` |
+| `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
+| `"scratchpad.sa_cooptimizer"` | `spyre.inductor.scratchpad.sa_cooptimizer` | `_inductor/scratchpad/sa_cooptimizer.py` |
 | `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/propagate_named_dims.py` |
-| `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile.py`, `_inductor/wsr/coarse_tile_span_overflow.py` |
+| `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile_span_overflow.py` |
+| `"wsr.enumerate_tilings"` | `spyre.inductor.wsr.enumerate_tilings` | `_inductor/wsr/enumerate_tilings.py` |
+| `"wsr.for_each_tile"` | `spyre.inductor.wsr.for_each_tile` | `_inductor/wsr/for_each_tile.py` |
+| `"wsr.for_each_tile_lowering"` | `spyre.inductor.wsr.for_each_tile_lowering` | `_inductor/wsr/for_each_tile_lowering.py` |
 | `"wsr.propagate_named_dims"` | `spyre.inductor.wsr.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
 | `"wsr.span_overflow_hint_analysis"` | `spyre.inductor.wsr.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |
+| `"wsr.tile_prediction"` | `spyre.inductor.wsr.tile_prediction` | `_inductor/wsr/tile_prediction.py` |
 | `"wsr.while_loop_bridge"` | `spyre.inductor.wsr.while_loop_bridge` | `_inductor/wsr/while_loop_bridge.py` |
-| `"wsr.enumerate_tilings"` | `spyre.inductor.wsr.enumerate_tilings` | `_inductor/wsr/enumerate_tilings.py` |
-| `"wsr.for_each_tile_lowering"` | `spyre.inductor.wsr.for_each_tile_lowering` | `_inductor/wsr/for_each_tile_lowering.py` |
-| `"propagate_layouts"` | `spyre.inductor.propagate_layouts` | `_inductor/propagate_layouts.py` |
-| `"spyre_kernel"` | `spyre.inductor.spyre_kernel` | `_inductor/spyre_kernel.py` |
-| `"work_division"` | `spyre.inductor.work_division` | `_inductor/work_division.py` |
 
 All of these respond to `TORCH_LOGS="+torch_spyre.inductor"` (parent inheritance).
 
@@ -405,7 +430,7 @@ export TORCH_LOGS="+torch_spyre.inductor,-torch_spyre.inductor.wsr"
 
 ---
 
-## 5. Python Usage
+## Python Usage
 
 ### Getting a Logger
 
@@ -472,7 +497,7 @@ to the same file.
 
 ---
 
-## 6. C++ Usage
+## C++ Usage
 
 ### Architecture {#architecture-c}
 
@@ -643,7 +668,7 @@ timezone.
 C++ log output follows the file path configured from Python. There is no
 separate C++ file configuration — call `logging_config.set_log_file("/path")`
 from Python and C++ output goes to the same file.
-See [File Output in section 5](#file-output).
+See [File Output](#file-output) under Python Usage.
 
 Internally, `LoggingConfig::set_log_file()` opens the file in append mode
 and atomically swaps the sink pointer. When no file is configured, output
@@ -651,7 +676,7 @@ goes to `std::cerr`.
 
 ---
 
-## 7. Python–C++ Synchronization
+## Python–C++ Synchronization
 
 ### Initialization Flow
 
@@ -714,7 +739,7 @@ no locking, no memory allocation.
 
 ---
 
-## 8. Troubleshooting
+## Troubleshooting
 
 **Logs don't appear:**
 
@@ -749,7 +774,7 @@ no locking, no memory allocation.
 **Deprecated env var warnings:**
 
 - See [Deprecated Environment Variables](#deprecated-environment-variables) in
-  section 1 for the equivalent `TORCH_LOGS` settings.
+  the Overview for the equivalent `TORCH_LOGS` settings.
 
 **File output not working:**
 
@@ -866,7 +891,7 @@ test modifies environment variables.
 ## Appendix B: C++ Direct API
 
 The C++ logging API is defined in `torch_spyre/csrc/logging_config.h`. Most
-developers will use the `SPYRE_LOG` / `SPYRE_RUNTIME_*` macros (section 6).
+developers will use the `SPYRE_LOG` / `SPYRE_RUNTIME_*` macros (see C++ Usage).
 The direct API below is for advanced use cases.
 
 ### LoggingConfig Singleton
@@ -981,7 +1006,7 @@ LogLevel string_to_log_level(const std::string& level_str);
 
 ---
 
-## Appendix D: Design Rationale — Naming
+## Appendix D: Design Rationale for Naming
 
 This appendix explains why ULF uses `torch_spyre.*` in `TORCH_LOGS` and
 `spyre.*` internally.

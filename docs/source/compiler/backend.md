@@ -23,7 +23,7 @@ artifacts:
 | Artifact | Consumer | Purpose |
 |----------|----------|---------|
 | **SuperDSC JSON** | DeepTools | Per-kernel operation specification: tensor layouts, work division, OpFunc selection. DeepTools turns each SuperDSC into a device binary that includes both compute and the load/store sequence that stages tiles from LPDDR5 into the LX scratchpad. |
-| **DCI (Data Conversion Information)** | Runtime (`copyAsync`) | The `DataConversionInfo` struct, built by `generate_dci()` in `spyre_mem.cpp` from a tensor's `SpyreTensorLayout`. It carries loop ranges, host and device strides, and dtype info, and drives the host ↔ LPDDR5 DMA transfer for each graph input and output. |
+| **DCI (Data Conversion Information)** | Runtime (`copyAsync`) | The `DataConversionInfo` struct, built by `generate_dci()` in `spyre_mem.cpp` from a tensor's `SpyreTensorLayout`. It carries loop ranges, host and device strides, and dtype info, and drives the host ↔ LPDDR5 DMA transfer for each graph input and output. For a tensor with a staggered element arrangement (`DL16_TO_FP32` or `FP32_TO_DL16`), the DCI also carries the stick-dim permutation between the host `STANDARD` order and the device order, in `input_dimwise_ea_` for a device-to-host copy and in `output_dimwise_ea_` for a host-to-device copy, so the copy engine applies or restores the arrangement during the transfer. See [Element Arrangement](element_arrangement.md). |
 
 ## SuperDSC Format
 
@@ -139,8 +139,13 @@ SuperDSC is an IR that closely matches the hardware model. KernelTile IR (KTIR) 
 DeepTools runs as an out-of-process subprocess. During scheduling, the
 generated host code calls `async_compile.sdsc(...)`
 ([`execution/async_compile.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/execution/async_compile.py)),
-which runs `dbo-opt --export-dir=<output_dir> -kEmitSpyreCode <output_dir>/bundle.mlir`
-to turn the SuperDSC JSON into a device binary. An SDSC bundle is dbo-opt's
+which runs `dbo-opt [--device=<KTIR_DEVICE_MLIR>] --enable-loop-unroll=<0|1> --export-dir=<output_dir> -kEmitSpyreCode <output_dir>/bundle.mlir`
+to turn the SuperDSC JSON into a device binary. `--device` is passed only when
+`KTIR_DEVICE_MLIR` is set. `--enable-loop-unroll` is always passed, from
+`config.backend_loop_unroll` (`SPYRE_BACKEND_LOOP_UNROLL`, default `1`), so the
+compile matches the kernel cache key. Each invocation is limited to
+`config.backend_compile_timeout_seconds` (`SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS`,
+default 60; a non-positive value disables the limit). An SDSC bundle is dbo-opt's
 default input, so no `--from-ktir` is passed; that flag selects the KTIR
 frontend instead. (The bundle itself is produced
 earlier, in Python, by `generate_bundle(...)`.) Each kernel gets its own output

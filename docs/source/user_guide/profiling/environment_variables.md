@@ -66,6 +66,9 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+The full list of compiler and runtime variables is in the
+[API reference](../../api/torch_spyre.rst) under "Environment Variables".
+
 ## Declared-range checks
 
 Report when a size range declared with `tensor.to("spyre", dynamic=...)` is not
@@ -292,7 +295,7 @@ torch-spyre's device-enumeration code:
 | Variable | Effect |
 |---|---|
 | `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container; consumed by [`tests/oot_framework/run_test.sh`](https://github.com/torch-spyre/torch-spyre/blob/main/tests/oot_framework/run_test.sh) |
-| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N`; not consumed in-tree — it is scraped back out of pod logs after the fact by [`.github/scripts/parse_hw_failures.py`](https://github.com/torch-spyre/torch-spyre/blob/main/.github/scripts/parse_hw_failures.py) |
+| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N`; not consumed in-tree. It is read from pod logs by [`.github/scripts/parse_hw_failures.py`](https://github.com/torch-spyre/torch-spyre/blob/main/.github/scripts/parse_hw_failures.py) |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)
 
@@ -302,7 +305,7 @@ torch-spyre's device-enumeration code:
 | `DTCOMPILER_KEEP_EXPORT=true` | Keep compiler export directories around after a run; required for `aiu-smi` to report `rsvmem` and for `aiu-trace-analyzer` post-processing |
 | `DEEPRT_EXPORT_DIR=<dir>` | Where the runtime / compiler write export artifacts; set to the same path in the workload and monitoring shells |
 | `DTCOMPILER_EXPORT_DIR=<dir>` | Override the compiler export location (defaults to CWD when unset) |
-| `DT_DEEPRT_VERBOSE=0` | Quiet runtime logs when capturing traces for `aiu-trace-analyzer` |
+| `DT_DEEPRT_VERBOSE=0` | Quiet runtime logs when capturing traces for `aiu-trace-analyzer`. When the variable is unset, torch-spyre sets it to `-1` at import (`os.environ.setdefault` in `torch_spyre/__init__.py`) |
 
 ## Quick-reference recipes
 

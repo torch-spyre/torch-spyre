@@ -30,26 +30,29 @@ via the `_marker_resolution` accessor -- same attribute-on-op pattern as
 | `INLINE_ERASED` | The marker's single consumer is a `ComputedBuffer` (or gets inlined) | Fused directly into the consumer's `inner_fn`; removed from `operations` and `group_ops` |
 | `STAR_DEP_KEPT` | The consumer reaches the marker via a `StarDep`, not an ordinary read dependency | Stays live as a real, addressable buffer -- required both for the StarDep consumer to read it, and to satisfy `coarse_tile.py`'s `_validate_contiguous` gapless-block invariant |
 
-## Why the distinction matters (issue #4581)
+## How later passes tell the two kinds apart (issue #4581)
 
-Several sites test for "is this a marker" via `_marker_dim(op) is not None`:
-`coarse_tile.py`'s coarse-tile planning site correctly means "any marker,
-either kind" (a kept marker has nothing for that pass to do).
-`_synthesize_dim_hints_for_group`
-(`for_each_tile_lowering.py`) means something narrower -- "skip only a
-marker whose transform has already been fused elsewhere" -- but used the
-same broad test, silently starving a `STAR_DEP_KEPT` marker's own upstream
-read of the synthesized `DimHint` a nesting level above it needs to resolve
-provenance. `marker_resolution` lets that site ask the narrower question
-directly.
+A pass that only needs to know whether an op is a marker tests
+`_marker_dim(op) is not None`. `_marker_resolution(op)` returns the finer
+`INLINE_ERASED`/`STAR_DEP_KEPT` value. Only a `STAR_DEP_KEPT` marker stays in
+`operations`, so it is the only kind a later pass sees. Its own write does not
+carry the loop variable (only its read of the underlying tensor does), and the
+marker map that `lookup_marker_dim` reads is keyed by the consumer's name, so
+the map cannot resolve the marker's own tiled dim. `_stamp_direct_loop_info`
+(`for_each_tile_lowering.py`) and `_hint_ranges_pos`
+(`torch_spyre/_inductor/wsr/loop_tiling_common.py`) therefore take that
+position from `tile_marker_dim`, which `lower_tile_dim_marker`
+(`torch_spyre/_inductor/lowering.py`) stamps on the marker op.
 
 ## Where this fits in the pipeline
 
-`splice_while_loops` is the pipeline's first `CustomPreSchedulingPasses`
-pass. Marker consumption happens inside it, immediately after each
-`WhileLoop` body is spliced. The synthesized `DimHint`s this produces feed
-`coarse_tile.py`'s `_hint_ranges_pos`/`lookup_marker_dim`, several passes
-later.
+`splice_while_loops` is the second `CustomPreSchedulingPasses` pass, after
+`apply_reserved_dims_contract`. Marker consumption happens inside it,
+immediately after each `WhileLoop` body is spliced, and records the marker map
+in `_MARKER_MAPS`. `_stamp_direct_loop_info` resolves each op's tiled dim
+through `lookup_marker_dim` and appends a minimal `DimHint` (the loop variable
+and its trip count) to the op's `dim_hints`. `_hint_ranges_pos` resolves those
+hints in later passes.
 
 ## Open areas (not yet in this doc)
 
