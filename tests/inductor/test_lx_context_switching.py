@@ -333,6 +333,115 @@ class TestCollectivesAreNotBracketed(unittest.TestCase):
             self.assertEqual(lcs._select_bracket_targets(V.graph), [])
 
 
+class TestBracketPlacement(unittest.TestCase):
+    """The dump goes right before its target op and the restore right after it, in the
+    list that holds the target (stage 8.1). Driven with stubs: no compile, no device.
+
+    Placing by flat index put a restore after a body's LAST target op just past the
+    body; naming the target puts it in the body, beside the target.
+    """
+
+    class _Layout:
+        def unallocated_copy(self):
+            return object()
+
+    class _Buf:
+        """Stands in for ComputedBuffer: the passes only name it, store it, and
+        read a few attributes."""
+
+        def __init__(self, name=None, layout=None, data=None):
+            self.name = name
+            self.layout = (
+                layout if layout is not None else TestBracketPlacement._Layout()
+            )
+            self.origins = {mock.MagicMock()}
+            self.data = mock.Mock(origins=set())
+
+        def get_name(self):
+            return self.name
+
+        def get_operation_name(self):
+            return self.name
+
+        def __repr__(self):
+            return f"_Buf({self.name})"
+
+    def _run(self, real, call):
+        """Run ``call(lcs, graph, editor, buf)`` with the buffer machinery stubbed.
+        New ops are appended at the top level, as ``register_operation`` does."""
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.loop_node import OpsView
+        from torch_spyre._inductor.scratchpad import lx_context_switching as lcs
+
+        graph = SimpleNamespace(
+            operations=OpsView(real), register_buffer=lambda b: b.get_name()
+        )
+        editor = SimpleNamespace(fx_graph=mock.MagicMock(), clone_aten_op=None)
+        with (
+            patch.object(lcs, "ComputedBuffer", self._Buf),
+            patch.object(lcs, "FixedTiledLayout", self._Layout),
+            patch.object(
+                lcs,
+                "clone_lowering",
+                lambda b: SimpleNamespace(data=SimpleNamespace(data=object())),
+            ),
+            patch.object(lcs, "MutationLayoutSHOULDREMOVE", lambda b: object()),
+            patch.object(lcs, "copy_op_metadata", lambda *a, **k: None),
+            patch.object(
+                lcs, "register_operation_after_graph_edit", lambda g, b: real.append(b)
+            ),
+        ):
+            return call(lcs, graph, editor, self._Buf("buf"))
+
+    @staticmethod
+    def _node(body):
+        from torch_spyre._inductor.loop_node import LoopNode
+
+        return LoopNode("loop", body, induction=None, trip_count=4)
+
+    def test_the_restore_stays_in_the_body_when_its_target_is_the_last_op(self):
+        x, target, after = (self._Buf(n) for n in ("x", "target", "after"))
+        node = self._node([x, target])
+        real = [node, after]
+
+        def call(lcs, graph, editor, buf):
+            fx = mock.MagicMock()
+            return lcs._restore_buffers(
+                graph, editor, target, fx, [buf], {"buf": (fx, self._Buf("dump"))}
+            )
+
+        (restore,) = self._run(real, call)
+        self.assertEqual(node.body, [x, target, restore])
+        self.assertEqual(real, [node, after])
+
+    def test_the_restore_follows_a_top_level_target(self):
+        a, target, z = (self._Buf(n) for n in ("a", "target", "z"))
+        real = [a, target, z]
+
+        def call(lcs, graph, editor, buf):
+            fx = mock.MagicMock()
+            return lcs._restore_buffers(
+                graph, editor, target, fx, [buf], {"buf": (fx, self._Buf("dump"))}
+            )
+
+        (restore,) = self._run(real, call)
+        self.assertEqual(real, [a, target, restore, z])
+
+    def test_the_dump_stays_in_the_body_when_its_target_is_the_first_op(self):
+        target, y, before = (self._Buf(n) for n in ("target", "y", "before"))
+        node = self._node([target, y])
+        real = [before, node]
+
+        def call(lcs, graph, editor, buf):
+            return lcs._dump_buffers(graph, editor, target, mock.MagicMock(), [buf])
+
+        dumped = self._run(real, call)
+        (_fx, dump_buf) = dumped["buf"]
+        self.assertEqual(node.body, [dump_buf, target, y])
+        self.assertEqual(real, [before, node])
+
+
 class TestIsCpuOnlyFallback(unittest.TestCase):
     def test_matches_registered_fallback_ops(self):
         # Sampled from the registry instead of naming an op: entries graduate

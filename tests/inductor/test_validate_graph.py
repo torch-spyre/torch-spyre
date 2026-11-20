@@ -189,13 +189,40 @@ class TestLowerFxNodeOrder:
 
         node = graph.graph.create_node("placeholder", "n")
         with patch.object(graph, "run_node", run_node):
-            buf, count = smo._lower_fx_node(node, graph, graph.operations, 1)
+            buf = smo._lower_fx_node(node, graph, graph.operations, consumer)
 
         kernel, out = registered
         assert buf is out
-        assert count == 2
         assert graph.operations == [before, kernel, out, consumer]
         check_operation_order(graph.operations, "split_multi_ops")
+
+    def test_the_new_ops_join_the_body_of_the_op_being_split(self, graph):
+        """As the pass runs it: ``graph.operations`` is the flat view, the op being
+        split is in a loop body, and what its lowering registers lands in that body,
+        right before it, not at the top level."""
+        from torch_spyre._inductor.loop_node import LoopNode, OpsView
+
+        x = _input("x")
+        before = _pointwise("before", x)
+        member = _pointwise("member", x)
+        consumer = _pointwise("consumer", x)
+        node = LoopNode("loop", [member, consumer], induction=None, trip_count=4)
+        real = [before, node]
+        graph.operations = OpsView(real)
+        registered = []
+
+        def run_node(fx_node):
+            kernel, out = _fallback_with_output(x)
+            registered.extend([kernel, out])
+            return TensorBox(StorageBox(out))
+
+        fx_node = graph.graph.create_node("placeholder", "n")
+        with patch.object(graph, "run_node", run_node):
+            smo._lower_fx_node(fx_node, graph, graph.operations, consumer)
+
+        kernel, out = registered
+        assert node.body == [member, kernel, out, consumer]
+        assert real == [before, node]
 
 
 def _out_of_order_pass(graph):

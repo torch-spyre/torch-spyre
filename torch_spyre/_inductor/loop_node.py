@@ -397,11 +397,34 @@ def in_building_loop() -> bool:
 # The plan names six points; they are these four calls. Before and after "the
 # loop" and before and after "a given node" are the same call on a
 # :class:`LoopNode` anchor; "start of each iteration" and "the back edge" are
-# ``insert_at_start`` and ``insert_on_back_edge``. None has a caller outside the
-# tests yet: the allocator's ``lower_before`` / ``lower_anchor`` still go through
-# the flat view and ``peel_non_members``. An op that carries its own index
-# expression is the caller's: it may use the variable of any enclosing loop,
-# and ``loop_checker`` rule 2 verifies that between passes.
+# ``insert_at_start`` and ``insert_on_back_edge``. An op that carries its own
+# index expression is the caller's: it may use the variable of any enclosing
+# loop, and ``loop_checker`` rule 2 verifies that between passes.
+#
+# Passes are handed a flat :class:`OpsView`, and these functions accept it (and
+# drop its cached order): that is how a pass says WHERE an op belongs without
+# going through ``view.insert``, which puts the op beside whatever op sits at a
+# flat position. The placement rule is the anchor's:
+#
+#   * ``insert_before(view, node, op)`` / ``insert_after(view, node, op)``: the op
+#     is outside the loop, in the list that holds the node, and runs once;
+#   * ``insert_before(view, body_op, op)`` / ``insert_after(view, body_op, op)``:
+#     the op is in that body and runs every trip;
+#   * ``move_before`` / ``move_after`` take an op that is already in the graph (a
+#     freshly lowered op was appended at the top level by
+#     ``GraphLowering.register_operation``) out of its list and apply the same rule;
+#   * ``remove_op`` removes an op from whichever list holds it.
+#
+# ``OpsView.append`` stays for the one caller that cannot choose, op registration.
+
+
+def _real_list(operations: "list[ir.Operation] | OpsView") -> list[ir.Operation]:
+    """The nested list behind ``operations``, with a view's cached order dropped
+    (the caller is about to edit the lists it holds)."""
+    if isinstance(operations, OpsView):
+        operations._changed()
+        return operations.real
+    return operations
 
 
 def _enclosing_chain(
@@ -428,19 +451,25 @@ def _holder(
 
 
 def insert_before(
-    operations: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+    operations: "list[ir.Operation] | OpsView",
+    anchor: ir.Operation,
+    op: ir.Operation,
 ) -> None:
     """Insert ``op`` immediately before ``anchor``, in the list that holds it.
 
     ``anchor`` may be an ordinary op or a :class:`LoopNode`. Before a node, the
     op runs once, outside the loop; before a body op, it runs every trip.
+
+    ``operations`` may be the flat :class:`OpsView` a pass is handed. Unlike
+    ``view.insert(view.index(x), op)``, naming a node puts the op outside it even
+    when the node's first member is the next flat op.
     """
-    lst, i = _holder(operations, anchor)
+    lst, i = _holder(_real_list(operations), anchor)
     lst.insert(i, op)
 
 
 def insert_after(
-    operations: list[ir.Operation] | OpsView,
+    operations: "list[ir.Operation] | OpsView",
     anchor: ir.Operation,
     op: ir.Operation,
 ) -> None:
@@ -454,11 +483,85 @@ def insert_after(
     puts an op inserted past the last flat position at the top level, outside the
     loop it was meant for.
     """
-    if isinstance(operations, OpsView):
-        operations._changed()
-        operations = operations.real
-    lst, i = _holder(operations, anchor)
+    lst, i = _holder(_real_list(operations), anchor)
     lst.insert(i + 1, op)
+
+
+def remove_op(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> None:
+    """Remove ``op`` (by identity) from whichever list holds it.
+
+    ``op`` may be a :class:`LoopNode`. Removing a body's last member leaves the
+    node, empty: nothing here decides what an empty node means. Raises
+    ``ValueError`` if ``op`` is not in ``operations``.
+    """
+    lst, i = _holder(_real_list(operations), op)
+    del lst[i]
+
+
+def top_level_entry(
+    operations: "list[ir.Operation] | OpsView", op: ir.Operation
+) -> ir.Operation:
+    """The entry of the top-level list that holds ``op``: ``op`` itself when it is
+    there, otherwise the outermost :class:`LoopNode` it sits in (at any depth).
+
+    An op that must run once, outside every loop of an anchor (a clone hoisted
+    before a loop, a drain after one), is placed beside this entry, not beside the
+    anchor, which may be the loop's first or last member. Raises ``ValueError`` if
+    ``op`` is not in ``operations``.
+    """
+    real = operations.real if isinstance(operations, OpsView) else operations
+    for entry in real:
+        if entry is op or (
+            isinstance(entry, LoopNode) and owning_list(entry.body, op) is not None
+        ):
+            return entry
+    raise ValueError(f"{op!r} is not in the operations list")
+
+
+def _move(
+    operations: "list[ir.Operation] | OpsView",
+    anchor: ir.Operation,
+    op: ir.Operation,
+    after: bool,
+) -> None:
+    if op is anchor:
+        raise ValueError(f"cannot move {op!r} relative to itself")
+    real = _real_list(operations)
+    # Find both before touching either list, so a missing one changes nothing.
+    _holder(real, op)
+    _holder(real, anchor)
+    if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
+        # Taking the node out would take the anchor with it.
+        raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
+    remove_op(real, op)
+    (insert_after if after else insert_before)(real, anchor, op)
+
+
+def move_before(
+    operations: "list[ir.Operation] | OpsView",
+    anchor: ir.Operation,
+    op: ir.Operation,
+) -> None:
+    """Move ``op``, already in the graph, to immediately before ``anchor``.
+
+    The usual case is a freshly lowered op (``GraphLowering.register_operation``
+    appended it at the top level) that a pass relocates next to its consumer. The
+    placement rule is :func:`insert_before`'s: before a node the op is outside the
+    loop, before a body op it is in that body. ``op`` may come from any list, and
+    may be a :class:`LoopNode` (it moves with its body) as long as ``anchor`` is not
+    inside it.
+    """
+    _move(operations, anchor, op, after=False)
+
+
+def move_after(
+    operations: "list[ir.Operation] | OpsView",
+    anchor: ir.Operation,
+    op: ir.Operation,
+) -> None:
+    """Move ``op``, already in the graph, to immediately after ``anchor``
+    (:func:`insert_after`'s placement rule)."""
+    _move(operations, anchor, op, after=True)
 
 
 def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
@@ -502,6 +605,7 @@ def _wrap(
     prefix: tuple[int, ...],
     inductions: Mapping[int, sympy.Symbol],
     counter: list[int],
+    only: frozenset[int] | None = None,
 ) -> list[ir.Operation]:
     """Wrap runs of ``ops`` sharing a ``loop_group_id`` prefix of length
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
@@ -517,7 +621,11 @@ def _wrap(
     i = 0
     while i < len(ops):
         path = _group_path(ops[i])
-        if len(path) <= depth or path[:depth] != prefix:
+        if (
+            len(path) <= depth
+            or path[:depth] != prefix
+            or (only is not None and depth == 0 and path[0] not in only)
+        ):
             out.append(ops[i])
             i += 1
             continue
@@ -534,11 +642,58 @@ def _wrap(
             trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
-        node.body = _wrap(run, depth + 1, key, inductions, counter)
+        node.body = _wrap(run, depth + 1, key, inductions, counter, only)
         node.carries = _carries_of(node.body)
         out.append(node)
         i = last + 1
     return out
+
+
+_PENDING_ATTR = "pending_loop_inductions"
+
+
+def request_loop_nodes(graph: Any, inductions: Mapping[int, sympy.Symbol]) -> None:
+    """Ask for the loops whose group index is in ``inductions`` to become nodes.
+
+    A lowering that builds a loop in the middle of the pass pipeline records it
+    here instead of wrapping it: the pass that called it may still be iterating
+    ``graph.operations`` (a flat view, or the real list), and a node wrapped under
+    it would change what the rest of the pass sees. The pass loop calls
+    :func:`build_pending_loop_nodes` once the pass has returned.
+    """
+    if inductions:
+        pending = getattr(graph, _PENDING_ATTR, None) or {}
+        pending.update(inductions)
+        setattr(graph, _PENDING_ATTR, pending)
+
+
+def build_pending_loop_nodes(graph: Any) -> None:
+    """Wrap the loops :func:`request_loop_nodes` named, leaving every other op
+    (existing nodes, flat loops no lowering has converted yet) where it is.
+
+    Called with the real list, after the pass that built the loops has returned.
+    Node names continue after the nodes already present.
+    """
+    pending = getattr(graph, _PENDING_ATTR, None)
+    if not pending:
+        return
+    setattr(graph, _PENDING_ATTR, None)
+    if not BUILD_LOOP_NODES:
+        return
+    operations = graph.operations
+    assert not isinstance(operations, OpsView), "needs the real list"
+    existing = sum(1 for _ in _nodes_in(operations))
+    with building_loop():
+        operations[:] = _wrap(
+            list(operations), 0, (), pending, [existing], frozenset(pending)
+        )
+
+
+def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
+    for op in operations:
+        if isinstance(op, LoopNode):
+            yield op
+            yield from _nodes_in(op.body)
 
 
 def collapse(
