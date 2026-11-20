@@ -801,8 +801,8 @@ def _with_input_ea(
     An output stick with no host dim (a broadcast stick), or only size-1 ones,
     holds a lone element that no arrangement moves, and the D2H restore has no
     stick dim to identify ("Unable to determine the stick dimension"), so it stays
-    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as the
-    typecast path does (#5566).
+    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as
+    ``_typecast_layouts`` does.
     """
     coords = try_device_coordinates(out_stl, output_dep, None)
     stick_vars = coords[-1].free_symbols if coords else ()

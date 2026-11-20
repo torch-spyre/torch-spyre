@@ -8490,6 +8490,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float16)),
                 "3d_dim0": (0, cached_randn((4, 8, 128), dtype=torch.float16)),
                 "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float16)),
+                # Several dims at once: reducing the stick dim among them gives a
+                # STANDARD output, reducing only non-stick dims keeps the EA.
+                "3d_dims01": ((0, 1), cached_randn((4, 8, 128), dtype=torch.float16)),
+                "3d_dims12": ((1, 2), cached_randn((4, 8, 128), dtype=torch.float16)),
+                "3d_dims02": ((0, 2), cached_randn((4, 8, 128), dtype=torch.float16)),
             },
         },
         # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph (x.to(fp16)).
@@ -8512,6 +8517,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float32)),
                 "3d_dim0": (0, cached_randn((4, 8, 128), dtype=torch.float32)),
                 "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float32)),
+                # Several dims at once, as for DL16_TO_FP32 above.
+                "3d_dims01": ((0, 1), cached_randn((4, 8, 128), dtype=torch.float32)),
+                "3d_dims12": ((1, 2), cached_randn((4, 8, 128), dtype=torch.float32)),
+                "3d_dims02": ((0, 2), cached_randn((4, 8, 128), dtype=torch.float32)),
             },
         },
         # Case A row 4/5 and Case B row 4/5: staggered EA with stick on a
