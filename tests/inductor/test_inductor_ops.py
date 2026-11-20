@@ -5151,20 +5151,197 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_softmax", "test_dim_op_cpu_eager"): {
+        ("test_softmax", "test_softmax_cpu_eager"): {
             "ops_dict": {
                 "softmax": lambda dim, x: torch.softmax(x, dim=dim),
             },
             "param_sets": {
+                "1d_aligned": (-1, cached_randn((256,), dtype=torch.float16)),
+                "1d_unaligned": (-1, cached_randn((68,), dtype=torch.float16)),
+                "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float16)),
+                "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float16)),
+                "2d_dim0_unaligned": (0, cached_randn((67, 129), dtype=torch.float16)),
+                "2d_dim1_unaligned": (1, cached_randn((67, 129), dtype=torch.float16)),
+                "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim0_unaligned": (
+                    0,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "3d_dim1_unaligned": (
+                    1,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "3d_dim2_unaligned": (
+                    2,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "4d_dim0": (0, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim1": (1, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim2": (2, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim3": (3, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim0_aligned": (
+                    0,
+                    cached_randn((6, 32, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim1_aligned": (
+                    1,
+                    cached_randn((6, 32, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim2_aligned": (
+                    2,
+                    cached_randn((6, 32, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim3_aligned": (
+                    3,
+                    cached_randn((6, 32, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim0_unaligned": (
+                    0,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float16),
+                ),
+                "4d_dim1_unaligned": (
+                    1,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float16),
+                ),
+                "4d_dim2_unaligned": (
+                    2,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float16),
+                ),
+                "4d_dim3_unaligned": (
+                    3,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_softmax_fp32", "test_softmax_fp32_cpu_eager"): {
+            "ops_dict": {
+                "softmax_fp32": lambda dim, x: torch.softmax(
+                    x, dim=dim, dtype=torch.float32
+                ),
+            },
+            "param_sets": {
+                # fp32 -> fp32 softmax
+                "1d_aligned": (-1, cached_randn((256,), dtype=torch.float32)),
+                "1d_unaligned": (-1, cached_randn((68,), dtype=torch.float32)),
+                "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float32)),
+                "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float32)),
+                "2d_dim0_unaligned": (0, cached_randn((67, 100), dtype=torch.float32)),
+                "2d_dim1_unaligned": (1, cached_randn((67, 100), dtype=torch.float32)),
+                "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float32)),
+                "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float32)),
+                "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float32)),
+                "3d_dim0_unaligned": (
+                    0,
+                    cached_randn((3, 7, 100), dtype=torch.float32),
+                ),
+                "3d_dim1_unaligned": (
+                    1,
+                    cached_randn((3, 7, 100), dtype=torch.float32),
+                ),
+                "3d_dim2_unaligned": (
+                    2,
+                    cached_randn((3, 7, 100), dtype=torch.float32),
+                ),
+                "4d_dim0": (0, cached_randn((6, 32, 32, 64), dtype=torch.float32)),
+                "4d_dim1": (1, cached_randn((6, 32, 32, 64), dtype=torch.float32)),
+                "4d_dim2": (2, cached_randn((6, 32, 32, 64), dtype=torch.float32)),
+                "4d_dim3": (3, cached_randn((6, 32, 32, 64), dtype=torch.float32)),
+                "4d_dim0_unaligned": (
+                    0,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float32),
+                ),
+                "4d_dim1_unaligned": (
+                    1,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float32),
+                ),
+                "4d_dim2_unaligned": (
+                    2,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float32),
+                ),
+                "4d_dim3_unaligned": (
+                    3,
+                    cached_randn((6, 17, 32, 100), dtype=torch.float32),
+                ),
+            },
+        },
+        ("test_softmax_h2f", "test_softmax_h2f_cpu_eager"): {
+            # h2f: fp16 input -> fp32 output softmax
+            "ops_dict": {
+                "softmax_h2f": lambda dim, x: torch.softmax(
+                    x, dim=dim, dtype=torch.float32
+                ),
+            },
+            "param_sets": {
+                "1d_aligned": (-1, cached_randn((256,), dtype=torch.float16)),
                 "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float16)),
                 "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float16)),
                 "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float16)),
                 "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float16)),
                 "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float16)),
-                "4d_dim0": (0, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
-                "4d_dim1": (1, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
-                "4d_dim2": (2, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
-                "4d_dim3": (3, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim0": (0, cached_randn((6, 32, 32, 64), dtype=torch.float16)),
+                "4d_dim1": (1, cached_randn((6, 32, 32, 64), dtype=torch.float16)),
+                "4d_dim2": (2, cached_randn((6, 32, 32, 64), dtype=torch.float16)),
+                "4d_dim3": (3, cached_randn((6, 32, 32, 64), dtype=torch.float16)),
+                "1d_unaligned": (-1, cached_randn((68,), dtype=torch.float16)),
+                "2d_dim0_unaligned": (0, cached_randn((67, 129), dtype=torch.float16)),
+                "2d_dim1_unaligned": (1, cached_randn((67, 129), dtype=torch.float16)),
+                "3d_dim0_unaligned": (
+                    0,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "3d_dim1_unaligned": (
+                    1,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "3d_dim2_unaligned": (
+                    2,
+                    cached_randn((3, 7, 100), dtype=torch.float16),
+                ),
+                "4d_dim0_unaligned": (
+                    0,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim1_unaligned": (
+                    1,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim2_unaligned": (
+                    2,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim3_unaligned": (
+                    3,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+            },
+            # softmax over a stick dim of size 100 (not a multiple of the stick
+            # width) on a DL16_TO_FP32 tensor: 3.7% of the elements are off by up
+            # to 1.2e-2 (15.6% relative). The same shape passes for fp16->fp16 and
+            # fp32->fp32. The pattern over N matches #4014 (sum/amax over the stick
+            # dim are wrong for N=70, 96, 100 and right for N=66, 129); the link
+            # to softmax is by that match, not traced.
+            "expect_fail": {
+                "3d_dim2_unaligned": "#4014: reduction over the stick dim of a "
+                "staggered (DL16_TO_FP32) tensor with a stick-unaligned size",
+            },
+        },
+        ("test_softmax_consumer", "test_softmax_consumer_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((64, 128), dtype=torch.float16), 8),
+                "2d_unaligned": (cached_randn((64, 100), dtype=torch.float16), 8),
+                "3d": (cached_randn((4, 64, 128), dtype=torch.float16), 8),
+                "3d_unaligned": (cached_randn((4, 64, 100), dtype=torch.float16), 8),
+                "4d": (cached_randn((2, 4, 64, 128), dtype=torch.float16), 8),
+                "4d_unaligned": (cached_randn((2, 4, 64, 100), dtype=torch.float16), 8),
+            },
+            # topk of a DL16_TO_FP32 input (the h2f softmax output) returns the
+            # rows in staggered order: from row 4 up each row holds another row's
+            # top-k. Without the fp16->fp32 cast the rows are in place.
+            "expect_fail": {
+                "2d": "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
+                "2d_unaligned": "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
             },
         },
         (
@@ -12655,6 +12832,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Simple dim ops (softmax, squeeze, unsqueeze, sum+squeeze) work in eager
         self.compare_with_cpu(fn, *args)
 
+    # Softmax outputs lie in [0, 1], so the default atol=0.1 of compare_with_cpu
+    # would hide a wrong row. The bounds below are about 1.5-2x the largest error
+    # measured against the CPU result (fp16 output: 3.4e-3 abs / 1.6% rel; fp32
+    # output: 2.2e-4 abs / 9e-4 rel; fp16 -> fp32: 1.0e-3 abs / 5.7e-3 rel).
+    def test_softmax_cpu_eager(self, op, dim, *args):
+        self.compare_with_cpu(lambda *a: op(dim, *a), *args, atol=5e-3, rtol=2e-2)
+
+    def test_softmax_fp32_cpu_eager(self, op, dim, *args):
+        self.compare_with_cpu(lambda *a: op(dim, *a), *args, atol=5e-4, rtol=2e-3)
+
+    def test_softmax_h2f_cpu_eager(self, op, dim, *args):
+        self.compare_with_cpu(lambda *a: op(dim, *a), *args, atol=2e-3, rtol=1e-2)
+
     def test_attention_cpu(self, *args):
         def fn(q, k, v, sm_scale):
             qk = q @ k.transpose(-1, -2).contiguous()
@@ -12664,6 +12854,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # mm/bmm on Spyre tensors segfaults in libsenlib without the torch.compile
         # execution context that normally initialises the hardware session
         self.compare_with_cpu(fn, *args, run_eager=False)
+
+    def test_softmax_consumer_cpu(self, x, k):
+        # h2f softmax (fp16 -> fp32) whose result is consumed by topk (Gemma MoE
+        # router style: softmax(expert_scores, dim=-1, dtype=fp32) then topk). The
+        # softmax output is not the graph result, so its layout must be agreed with
+        # the topk consumer.
+        def fn(x2, k2):
+            p = torch.softmax(x2, dim=-1, dtype=torch.float32)
+            # Only the top-k values are compared: the top-k indices returned by the
+            # Spyre compiled backend come back as float32 rather than int64 (a
+            # separate backend dtype quirk), so comparing indices would fail on
+            # dtype, not on value correctness. The values are what the downstream
+            # router consumes.
+            return torch.topk(p, k2, dim=-1).values
+
+        self.compare_with_cpu(fn, x, k, run_eager=False)
 
     def test_layernorm_cpu(self, input, weight, bias):
         def fn(input, weight, bias):
