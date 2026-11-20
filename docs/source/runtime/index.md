@@ -136,6 +136,88 @@ Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` di
 
 A copy between host memory and LPDDR5 is driven by one `DataConversionInfo`. `generate_dci()` fills its loop ranges and strides (`dcsi_`), the source and destination data formats, and the optional pre-expand and post-slice steps. For a layout with a staggered element arrangement it also fills the per-dimension element-arrangement shuffle: `output_dimwise_ea_` for an H2D copy, which applies the arrangement, and `input_dimwise_ea_` for a D2H copy, which restores `STANDARD` order. A DCI with neither field set and no conversion, expansion, or slicing is an identity copy (`dci_is_identity_copy`). See [Element Arrangement](../compiler/element_arrangement.md) for the arrangements themselves.
 
+The following sequence shows the calls made for `x.to("spyre")` on a CPU tensor that is not sharded.
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+sequenceDiagram
+    participant Py as Python
+    participant ATen as ATen dispatch
+    participant Mem as spyre_mem.cpp
+    participant Alloc as SpyreAllocator
+    participant Stream as SpyreStream
+    participant Pin as SpyrePinnedAllocator
+    participant Flex as flex runtime
+    participant Dev as LPDDR5
+
+    alt device_layout and dynamic not given
+        Py->>ATen: spyre_to calls orig_to, aten::_to_copy
+        ATen->>Mem: empty_strided (spyre_empty_strided)
+        Mem->>Mem: SpyreTensorLayout(size, stride, dtype), set dma_sizes and dma_strides
+        Mem->>Alloc: SpyreStorageImpl calls allocate(nbytes)
+        Alloc->>Flex: getFlexAllocator() then allocate(nbytes, directive)
+        Flex-->>Alloc: flex::CompositeAddress
+        ATen->>Py: copy_ dispatches aten::_copy_from to spyre__copy_from
+        Py->>Mem: copy_tensor(self, dst)
+    else device_layout or dynamic given
+        Py->>Mem: spyre_empty_with_layout, spyre_empty_reserved, or spyre_empty_reserved_with_layout
+        Mem->>Alloc: SpyreStorageImpl calls allocate(nbytes)
+        Py->>Mem: copy_tensor(src, dst, non_blocking=False)
+    end
+    Mem->>Mem: spyre_copy_from calls getCurrentStream(dst.device())
+    Mem->>Stream: copyAsync(src, dst)
+    Stream->>Mem: get_spyre_tensor_layout, generate_dci(cpu_tensor, dev_tensor, stl, host2device)
+    opt layout has a staggered element arrangement
+        Mem->>Mem: fill output_dimwise_ea_, and pre_expand_dcsi_ for a padded stick dim
+    end
+    Mem-->>Stream: DataConversionInfo
+    opt dci_is_identity_copy and both extents equal the allocation total_size()
+        Stream->>Stream: pass no DCI (dci_arg is nullptr)
+    end
+    Stream->>Pin: copyAsyncImpl calls retain(cpu_ptr)
+    alt source allocated by SpyrePinnedAllocator
+        Pin-->>Stream: PinnedAllocation holding a flex::DmaStagingBuffer
+        Stream->>Flex: flex::createDmaParamsWithPinnedBuffer
+    else pageable source
+        Pin-->>Stream: empty PinnedAllocation
+        Stream->>Flex: flex::createDmaParamsWithHostCapacity
+    end
+    Stream->>Flex: launchH2D(params) calls launchOperation(params)
+    Flex->>Dev: DMA from host memory, converted by the DCI when one is passed
+    Mem->>Stream: synchronize()
+```
+
+A device-to-host copy, such as `x.cpu()`, enters through the same `spyre__copy_from` and `copy_tensor` calls with a CPU destination. It allocates no device memory and differs in the steps below.
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+sequenceDiagram
+    participant Mem as spyre_mem.cpp
+    participant Stream as SpyreStream
+    participant Flex as flex runtime
+    participant Dev as LPDDR5
+
+    Mem->>Mem: spyre_copy_from calls getCurrentStream(self.device())
+    opt view is expanded, or is a slice the DCI cannot describe
+        Mem->>Mem: alloc_view from dma_sizes and dma_strides, cpu_alloc on the host
+    end
+    Mem->>Stream: copyAsync(copy_from, copy_to)
+    Stream->>Mem: generate_dci(cpu_tensor, dev_tensor, stl, host2device)
+    opt layout has a staggered element arrangement
+        Mem->>Mem: fill input_dimwise_ea_, and post_slice_dcsi_ for a padded stick dim
+    end
+    Mem-->>Stream: DataConversionInfo
+    opt DCI kept and narrowD2HRange returns a range
+        Stream->>Stream: transfer only the sticks that cover the view
+    end
+    Stream->>Flex: launchD2H(params) calls launchOperation(params)
+    Dev-->>Flex: DMA to host memory, converted by the DCI when one is passed
+    Mem->>Stream: synchronize()
+    opt alloc_view was used
+        Mem->>Mem: dst.copy_ from the logical view of cpu_alloc
+    end
+```
+
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
 :::{figure} ../_static/images/spyre-tensor-impl-anatomy.png

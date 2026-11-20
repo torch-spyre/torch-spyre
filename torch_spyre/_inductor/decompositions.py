@@ -1704,7 +1704,7 @@ def _register_spyre_dispatchkey_kernels_permanently():
     """Install PrivateUse1 / AutogradPrivateUse1 kernels for every aten op
     that has a Spyre decomposition and no pre-existing PrivateUse1 kernel.
 
-    Idempotent; called from ``_SpyreImpl._lazy_init`` after eager ops and
+    Idempotent; called from ``_autoload_impl`` after eager ops and
     custom ops have been imported, so the existing-kernel check sees the final
     set of registered backends.
     """

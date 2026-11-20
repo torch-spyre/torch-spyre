@@ -112,6 +112,69 @@ once its enclosing body has been spliced. A `WhileLoop` that does not prove
 out as a tile scan is left for the upstream default path.
 :::
 
+The following diagram shows the order of the pre-scheduling steps, grouped by purpose, together with the pass pipelines that run before and after them. A parenthesized variable marks a step that runs only under that setting.
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TB
+    PRE["CustomPrePasses"] --> POST["CustomPostPasses"]
+    POST --> PL
+    subgraph PS ["CustomPreSchedulingPasses"]
+        direction TB
+        subgraph PL ["Pass list in order"]
+            direction TB
+            subgraph G1 ["Inputs and for_each_tile loops"]
+                direction LR
+                P1["apply_reserved_dims_contract"] --> P2["splice_while_loops"] --> P3["deadcode_elimination"]
+            end
+            subgraph G2 ["Named dimensions"]
+                direction LR
+                P4["propagate_named_dims"] --> P5["validate_named_dims"] --> P6["assign_dim_hints"]
+            end
+            subgraph G3 ["Pre-stickification rewrites"]
+                direction LR
+                P7["insert_bmm_padding"] --> P8["split_multi_ops"] --> P9["apply_loop_carries"]
+            end
+            subgraph G4 ["Layout propagation"]
+                direction LR
+                P10["propagate_spyre_tensor_layouts"] --> P11["validate_ops"] --> P12["optimize_restickify_locations"] --> P13["reorder_nonstick_dims"] --> P14["finalize_layouts"]
+            end
+            subgraph G5 ["Restickify"]
+                direction LR
+                P15["insert_restickify"] --> P16["validate_no_restickify_on_mutation_targets"] --> P17["enforce_indirect_access_layout"] --> P18["reorder_nonstick_dims_mutation"] --> P19["insert_post_mutation_restickify"]
+            end
+            subgraph G6 ["Padding and constants"]
+                direction LR
+                P20["insert_restickify_padding"] --> P21["insert_staggered_ea_padding"] --> P22["dedup_and_promote_constants"]
+            end
+            subgraph G7 ["Working-set reduction"]
+                direction LR
+                P23["_maybe_coarse_tile_span_overflow<br/>(SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0)"]
+            end
+            subgraph G8 ["Work division"]
+                direction LR
+                P24["plan_sharded_hbm"] --> P25["_distribute_work"]
+            end
+            subgraph G9 ["Memory planning"]
+                direction LR
+                P26["_maybe_scratchpad_planning<br/>(LX_PLANNING=1)"] --> P27["elide_proven_read_copies"]
+            end
+            G1 --> G2 --> G3 --> G4 --> G5 --> G6 --> G7 --> G8 --> G9
+        end
+        subgraph EACH ["After each pass"]
+            direction LR
+            E1["check_operation_order<br/>(SPYRE_VALIDATE_EVERY_PASS=1)"] --> E2["build_pending_loop_nodes"] --> E3["check_loops<br/>(TORCH_SPYRE_CHECK_LOOPS)"]
+        end
+        subgraph FIN ["After the pass list"]
+            direction LR
+            F1["_hand_off_loop_nodes"] --> F2["check_final_operation_order"] --> F3["cost_model_pass<br/>(SPYRE_DUMP_COST)"] --> F4["dump_cost_model<br/>(SPYRE_DUMP_COST)"] --> F5["finalize_work_division_for_scheduler"]
+        end
+        PL -.-> EACH
+        PL --> FIN
+    end
+    FIN --> PF["CustomPreFusionPasses"] --> PO["CustomPostFusionPasses"]
+```
+
 | # | Pass | Module | Notes |
 |---|---|---|---|
 | 1 | `apply_reserved_dims_contract` | [reserved_dims_contract.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/reserved_dims_contract.py) | Applies each graph input dimension declared with `tensor.to("spyre", dynamic=...)` to the compile's `ShapeEnv`, so the passes after it see the declared range. |

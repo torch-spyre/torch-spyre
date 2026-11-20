@@ -179,9 +179,11 @@ kernel. A `@register_spyre_lowering` or a custom-op lowering is the
 `torch.compile` path only. When an op has just a lowering, it is
 Compiled = Y and the Eager column stays blank. This is the single most
 repeated error in doc PRs: seeing a registration and assuming it means
-eager. `torch.nn.functional.gelu` is the standing example: the
-`spyre::gelu` custom op has a lowering but no eager kernel, so it is
-compiled-only. (Pick a currently compiled-only op when citing an example
+eager. `torch.nn.functional.avg_pool2d` is the standing example: it has
+only `@register_spyre_lowering`, no decomposition, eager kernel or
+fallback, and `test_avg_pool2d_base` runs it with `run_eager=False`
+because `aten::avg_pool2d` has no Spyre kernel. (Pick a currently
+compiled-only op when citing an example
 here; an op can gain an eager path later, as `torch.trunc` did once it
 joined `COMPILED_OPS`.)
 

@@ -531,6 +531,34 @@ Key points:
 
 ## Layer 1: Pre-scheduling IR pass
 
+The flowchart below shows how the `for_each_tile` path and the span-overflow
+path each produce a `LoopNode` and reach the scheduler and the kernel as the
+same `LoopSchedulerNode`.
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TD
+    subgraph L1["Layer 1: pre-scheduling IR passes"]
+        FET["for_each_tile"] --> SWL["splice_while_loops"]
+        SWL --> SDLI["_stamp_direct_loop_info<br/>(CoarseTileInfo)"]
+        SOG["span_overflow_groups"] --> VAL["validate_coarse_tile_groups<br/>reject_nested_loops"]
+        VAL --> TG["tile_groups<br/>build_loop_tiling_plan"]
+        TG --> LLT["lower_loop_tiling<br/>(LoopShim)"]
+        LLT --> RLN["request_loop_nodes<br/>build_pending_loop_nodes"]
+        SDLI --> LN["LoopNode"]
+        RLN --> LN
+    end
+    VAL -. "more than one level" .-> UNS["Unsupported"]
+    subgraph L2["Layer 2: scheduler"]
+        LSN["LoopSchedulerNode"]
+    end
+    subgraph L3["Layer 3: codegen"]
+        SK["SpyreKernel<br/>(device_tile_advance_expr)"] --> LS["LoopSpec"]
+    end
+    LN --> LSN
+    LSN --> SK
+```
+
 ### Attribute contract on `ir.Operation`
 
 Each `ir.Operation` inside a counted loop carries a `loop_info` attribute that

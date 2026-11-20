@@ -41,6 +41,28 @@ decomposition table that has no other Spyre kernel. That kernel compiles the
 decomposition on its first eager call and reuses the compiled function on later
 calls. Decompositions of `spyre` custom ops receive no eager kernel.
 
+The following flowchart shows how an operation called on a Spyre tensor
+outside `torch.compile` reaches an implementation, and so whether it has an
+eager path.
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TD
+    A["Operation called on a Spyre tensor<br/>outside torch.compile"] --> B{"PrivateUse1 kernel<br/>registered for it?"}
+    B -- yes --> C{"Which registration<br/>installed it?"}
+    C -- "torch.library.register_kernel" --> D["Explicit eager kernel<br/>ops/eager.py"]
+    C -- "listed in COMPILED_OPS" --> E["Single-op compiled kernel<br/>register_torch_compile_kernel<br/>ops/eager.py"]
+    C -- "register_fallback or<br/>register_fallback_default" --> F["CPU fallback: inputs to host,<br/>result back to Spyre<br/>ops/fallbacks.py"]
+    C -- "TORCH_LIBRARY_IMPL" --> G["C++ view kernel<br/>csrc/spyre_views.cpp"]
+    C -- "custom_op with<br/>device_types spyre" --> H["Custom op body<br/>_inductor/customops.py"]
+    B -- no --> I{"aten operation with a<br/>Spyre decomposition?"}
+    I -- yes --> J["Lazily compiled decomposition<br/>_register_spyre_dispatchkey_kernels_permanently<br/>_inductor/decompositions.py"]
+    I -- no --> K{"CompositeImplicitAutograd<br/>operation?"}
+    K -- yes --> L["Decomposes into other aten operations,<br/>each dispatched again"]
+    L --> A
+    K -- no --> M["No eager path: Could not run error<br/>A register_spyre_lowering serves torch.compile only<br/>Example: aten::avg_pool2d"]
+```
+
 ## Spyre-specific lowerings
 
 We define Spyre-specific lowerings from ATen operations to Inductor's
