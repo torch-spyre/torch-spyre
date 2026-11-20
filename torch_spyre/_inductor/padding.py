@@ -76,6 +76,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_facts import read_advances_anywhere
+from .loop_node import move_before
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -127,10 +128,7 @@ def _move_ops_before(
     topological order is preserved.
     """
     for o in new_ops:
-        operations.remove(o)
-    idx = operations.index(anchor)
-    for i, o in enumerate(new_ops):
-        operations.insert(idx + i, o)
+        move_before(operations, anchor, o)
 
 
 def restride_loop_step(

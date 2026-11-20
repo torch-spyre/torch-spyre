@@ -511,6 +511,13 @@ def seconds(text):
     return float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)] if m else None
 
 
+def max_age_seconds(text):
+    secs = seconds(text)
+    if not secs:
+        raise PlanError(f"reuse max_age {text!r}: use a positive duration such as 7d, 12h or 30m")
+    return secs
+
+
 def canon_workload(wl):
     """Durations to seconds and SLO bounds to base units, so 10m == 600s and 2000ms == 2s in identity."""
     wl = copy.deepcopy(wl)
@@ -2880,7 +2887,7 @@ def _plan_case(cat, c, env_name, env, request, ov, s, leg, existing, invalidatio
                 "floor": effective_floor(
                     cat.policy_of(c).spec if cat.policy_of(c) else None, request.get("purpose"), env
                 ),
-                "max_age": seconds(cfg["max_age"]) if cfg.get("max_age") else None,
+                "max_age": max_age_seconds(cfg["max_age"]) if cfg.get("max_age") is not None else None,
                 "prefer": cfg["mode"] == "prefer",
             }
             row, why = reuse_lookup(existing, invalidations, want, now)
@@ -2932,17 +2939,23 @@ def placement_id(p):
     )
 
 
+def per_repeat_values(ok, statistic="median"):
+    """{metric: one value per repeat}; a metric seen in warm repeats never mixes in its cold ones (cache: both)."""
+    by = {}
+    for r in ok:
+        cold = (r.get("props") or {}).get("run.cache") == "cold"
+        for m, samples in r["samples"].items():
+            by.setdefault(m, {True: [], False: []})[cold].append(
+                statistics.median(samples) if statistic == "median" else statistics.fmean(samples)
+            )
+    return {m: g[False] or g[True] for m, g in by.items()}
+
+
 def aggregate(repeats, units, statistic="median", outliers="none"):
     """Derived from the valid repeats and recorded with its spec: one value per repeat, then the statistic across repeats."""
     ok = [r for r in repeats if r.get("status", "ok") == "ok"]
-    per = {}
-    for r in ok:
-        for m, samples in r["samples"].items():
-            per.setdefault(m, []).append(
-                statistics.median(samples) if statistic == "median" else statistics.fmean(samples)
-            )
     out = {}
-    for m, vals in per.items():
+    for m, vals in per_repeat_values(ok, statistic).items():
         if outliers == "mad" and len(vals) > 2:
             med = statistics.median(vals)
             mad = statistics.median(abs(v - med) for v in vals) or 1e-12

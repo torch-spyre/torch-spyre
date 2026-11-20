@@ -1735,5 +1735,26 @@ class Verbs(unittest.TestCase):
             self.assertEqual(cliutil.paths(["z"], "BENCH_PACK"), ["z"])
 
 
+class CacheBothStatsTests(unittest.TestCase):
+    def reps(self):
+        def rep(cache, v, warm):
+            return {"status": "ok", "samples": {"m": [v]}, "props": {"run.cache": cache}, "warmup_discarded": warm}
+
+        return [rep("cold", 100.0, 0), rep("cold", 140.0, 0), rep("warm", 10.0, 2), rep("warm", 10.0, 1)]
+
+    def test_cv_and_aggregate_ignore_cold_when_warm_exists(self):
+        from spyre_bench import engine, run
+
+        reps = self.reps()
+        self.assertEqual(run.cv_pct(reps), 0.0)
+        self.assertEqual(engine.aggregate(reps, {})["metrics"]["m"]["value"], 10.0)
+
+    def test_cold_only_metric_still_aggregates(self):
+        from spyre_bench import engine
+
+        cold = [r for r in self.reps() if r["props"]["run.cache"] == "cold"]
+        self.assertEqual(engine.aggregate(cold, {})["metrics"]["m"]["value"], 120.0)
+
+
 if __name__ == "__main__":
     unittest.main()
