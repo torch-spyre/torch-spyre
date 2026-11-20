@@ -46,6 +46,7 @@ from torch_spyre._inductor.deadcode_elimination import (
 from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
     enclosing_loops,
+    is_looped,
     node_levels,
     stamped_levels,
 )
@@ -865,6 +866,37 @@ class TestNodeFacts(unittest.TestCase):
         )
         record_loop_info(late)
         self.assertEqual(node.tiling["late"], ((2,), ()))
+
+    def test_an_unstamped_op_in_a_body_still_answers_not_looped(self):
+        """Node membership is not yet the truth for an op with no loop_info (stage
+        9.4 makes it so): it answers as it always did, though a helper put it in the
+        body and ``node_levels`` sees the node."""
+        graph, node, a, b = self._tiled_pair()
+        once = _Op("once")
+        insert_before(graph.operations, b, once)
+        self.assertEqual(once._loop_chain, (node,))
+        self.assertEqual(len(node_levels(once)), 1)
+        self.assertEqual(enclosing_loops(once), ())
+        self.assertFalse(is_looped(once))
+        self.assertTrue(is_looped(a))
+
+    def test_replace_op_takes_the_new_ops_tiling(self):
+        graph, node, a, b = self._tiled_pair()
+        new = _Op("a", (0,), [4])
+        new.loop_info.loop_tiled_dims = [[0, 2]]
+        replace_op(graph.operations, a, new)
+        self.assertEqual(new._loop_chain, (node,))
+        self.assertEqual(node.tiling["a"], ((0, 2), ()))
+
+    def test_remove_op_forgets_the_op_but_a_move_keeps_it(self):
+        graph, node, a, b = self._tiled_pair()
+        move_before(graph.operations, a, b)
+        self.assertEqual(node.tiling["b"], ((), (0,)))
+        self.assertEqual(b._loop_chain, (node,))
+        remove_op(graph.operations, a)
+        self.assertNotIn("a", node.tiling)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node.tiling["b"], ((), (0,)))
 
     def test_hoist_to_front_clears_the_chain(self):
         graph, node, a, b = self._tiled_pair()

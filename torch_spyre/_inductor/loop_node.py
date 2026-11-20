@@ -125,6 +125,11 @@ class LoopNode(ir.Operation):
         # is not recoverable from the op's own index (the range is already divided
         # and an access need not move with the loop), so the lowering that divided
         # it records it here.
+        # INVARIANT (stage 9.3a): ``tiling`` is written only by ``_fill_tiling`` /
+        # ``record_loop_info`` (from the op's ``loop_info``), and each leaf op's
+        # ``_loop_chain`` only by ``_set_chain``, which the node builder (``_wrap``),
+        # the edit helpers below and ``expand`` call. A new edit site calls one of
+        # those helpers; it never assigns either directly.
         self.group_id = group_id
         # False on a node built by hand (unit tests), whose facts nothing recorded.
         self.facts_recorded = False
@@ -537,6 +542,16 @@ def remove_op(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> N
     node, empty: nothing here decides what an empty node means. Raises
     ``ValueError`` if ``op`` is not in ``operations``.
     """
+    _detach(operations, op)
+    for leaf in all_ops([op]):
+        for node in getattr(leaf, "_loop_chain", ()):
+            node.tiling.pop(leaf.get_name(), None)
+        leaf._loop_chain = ()  # type: ignore[attr-defined]
+
+
+def _detach(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> None:
+    """Take ``op`` out of the list that holds it, keeping its recorded facts (a
+    move puts it back)."""
     lst, i = _holder(_real_list(operations), op)
     del lst[i]
 
@@ -552,7 +567,9 @@ def replace_op(
     lst, i = _holder(real, old)
     lst[i] = new
     _set_chain(new, tuple(getattr(old, "_loop_chain", ())))
-    _fill_tiling(new)
+    # ``new`` may reuse ``old``'s name (replace_computed_buffer_body does) with a
+    # different stamp; its stamp is the authority.
+    _fill_tiling(new, overwrite=True)
 
 
 def top_level_entry(
@@ -590,7 +607,7 @@ def _move(
     if isinstance(op, LoopNode) and owning_list(op.body, anchor) is not None:
         # Taking the node out would take the anchor with it.
         raise ValueError(f"cannot move {op!r} relative to {anchor!r}, which it holds")
-    remove_op(real, op)
+    _detach(real, op)
     (insert_after if after else insert_before)(real, anchor, op)
 
 

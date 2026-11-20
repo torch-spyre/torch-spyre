@@ -71,11 +71,11 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
     path = _group_path(loop_info)
     if not path:
         return ()
-    counts = loop_info.loop_count
+    counts = getattr(loop_info, "loop_count", None) or ()
     if len(counts) < len(path):
         return ()
-    tiled = loop_info.loop_tiled_dims
-    tiled_red = loop_info.loop_tiled_reduction_dims
+    tiled = getattr(loop_info, "loop_tiled_dims", None) or ()
+    tiled_red = getattr(loop_info, "loop_tiled_reduction_dims", None) or ()
 
     def at(lists, i):
         return tuple(lists[i]) if i < len(lists) else ()
@@ -100,10 +100,14 @@ def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
 
 
 def _in_built_node(op: Operation) -> bool:
+    # An op with no loop_info answers "not looped" as it always did, even when a
+    # helper put it in a body (a once-op extern the scheduler hoists, say): node
+    # membership becomes the truth only when the stamp is gone (stage 9.4).
     chain = getattr(op, "_loop_chain", ())
     return (
         isinstance(chain, tuple)
         and bool(chain)
+        and getattr(op, "loop_info", None) is not None
         and all(node.facts_recorded for node in chain)
     )
 

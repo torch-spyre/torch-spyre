@@ -1285,7 +1285,12 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
         q1 = sympy.Symbol("q1")
         consumer = _make_consumer_with_ranges([4, 256])
-        consumer.loop_info = object()
+        consumer.loop_info = LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[]],
+        )
 
         result = _retile_load_index("buf", q1, info, consumer)
 
