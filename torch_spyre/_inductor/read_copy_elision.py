@@ -40,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .loop_facts import read_advance
 from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
+from .loop_node import remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -536,7 +537,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             del replacement._read_copy_elision_record  # type: ignore[attr-defined]
         V.graph.name_to_buffer[replacement.get_name()] = replacement
         graph.removed_buffers.add(copy_op.get_name())
-        operations.remove(copy_op)
+        remove_op(operations, copy_op)
         for orphan_name in record.orphaned_copy_names:
             orphan = next(
                 (
@@ -552,7 +553,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 and not _copy_readers(operations, orphan_name)
             ):
                 graph.removed_buffers.add(orphan_name)
-                operations.remove(orphan)
+                remove_op(operations, orphan)
         logger.info(
             "removed read copy %s; %s reads %s directly",
             copy_op.get_name(),
