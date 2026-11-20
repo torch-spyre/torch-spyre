@@ -33,6 +33,7 @@ so deferring the import only moves the failure later without avoiding it.
 errors still work with no torch-spyre present.
 """
 
+import dataclasses
 import warnings
 from typing import Optional, Sequence
 
@@ -44,6 +45,7 @@ from torch_spyre._C import (
     get_spyre_tensor_layout,
     spyre_empty_with_layout,
 )
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.kernel_launchspec import (
     LaunchSpec,
     UnboundSymbol,
@@ -84,6 +86,27 @@ def load_kernelspec(path):
     """
     raw = load_launch_spec(str(path))
     return None if raw is None else LaunchSpec.from_dict(raw)
+
+
+def _symbol_kinds_from_spec(spec) -> list:
+    """The bundle's runtime-slot descriptors, in the form the runner takes.
+
+    They are what ``generate_bundle`` returned for this kernel, so a launch from
+    the folder builds the same per-slot payload inductor builds in-process.
+    Without them the runtime fills one address per tensor, in order, which only
+    fits a kernel whose slots are exactly that: a dimension slot, a pool or a
+    per-core address makes the count or the meaning disagree.
+
+    Fields this build does not know are dropped, so a spec written by a newer
+    build still loads.
+    """
+    known = {f.name for f in dataclasses.fields(SymbolKind)}
+    return [
+        sk
+        if isinstance(sk, SymbolKind)
+        else SymbolKind(**{k: v for k, v in sk.items() if k in known})
+        for sk in spec.symbol_kinds
+    ]
 
 
 def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:

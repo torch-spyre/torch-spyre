@@ -15,8 +15,13 @@
 from pathlib import Path
 
 
-def _launch(path, tensors):
+def _launch(path, tensors, symbol_kinds=None):
     """Launch the bundle and return the runner.
+
+    ``symbol_kinds`` are the bundle's runtime-slot descriptors, read from the
+    folder's launch spec. With them the runner resolves each slot by its kind,
+    as an in-process launch does; without them the runtime writes one address
+    per tensor, which is wrong for any slot that is not a tensor address.
 
     The returned runner MUST be kept alive until the outputs have been read
     back. Dropping it frees the JobPlan, and with it the device allocation and
@@ -27,7 +32,7 @@ def _launch(path, tensors):
 
     # this is the magic line
     # should have already compiled at this point
-    runner = SpyreSDSCKernelRunner("spyre-cli", str(path))
+    runner = SpyreSDSCKernelRunner("spyre-cli", str(path), symbol_kinds=symbol_kinds)
     runner.run(*tensors)
     return runner
 
@@ -85,6 +90,7 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
     # Deferred, like the other torch-spyre imports here: launch_spec imports
     # torch at module level, and `spyre --help` must work without it.
     from .launch_spec import (
+        _symbol_kinds_from_spec,
         check_tensors_against_spec,
         default_tensors,
         load_kernelspec,
@@ -151,7 +157,9 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
                     + "\n\nOmit -i/-o to build them from the spec instead."
                 )
 
-    runner = _launch(path, tensors)
+    runner = _launch(
+        path, tensors, _symbol_kinds_from_spec(spec) if spec is not None else None
+    )
 
     # Every output, not just the last: reading them all back is also what makes
     # a failed launch visible, since .cpu() is where a dead kernel surfaces.
@@ -171,6 +179,16 @@ def launch(*tensors, path="."):
     the outputs have been read back. Calling this as a bare statement frees the
     JobPlan while the launch is still in flight, and the device then faults
     with what looks like a hardware error.
+
+    The tensors are taken as given. Only the slot descriptors are read from
+    the folder's launch spec, when it has one, so the runtime knows which slots
+    are addresses and which are, say, a dimension size read off a tensor.
     """
     path = Path(path)
-    return _launch(path, tensors)
+    # Deferred, like the other torch-spyre imports here.
+    from .launch_spec import _symbol_kinds_from_spec, load_kernelspec
+
+    spec = load_kernelspec(path)
+    return _launch(
+        path, tensors, _symbol_kinds_from_spec(spec) if spec is not None else None
+    )
