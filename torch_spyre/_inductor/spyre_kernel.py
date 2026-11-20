@@ -978,6 +978,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             replicated_scalar=replicated_scalar,
             non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
             stride_map=list(tensor.layout.device_layout.stride_map),
+            valid_elements=dict(tensor.layout.device_layout.valid_elements) or None,
         )
         if (
             _spyre_config.lx_planner_relayout
@@ -2062,6 +2063,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                     "device_tile_advance_expr="
                                     f"{sympy_str(arg.device_tile_advance_expr)},"
                                 )
+                            if arg.valid_elements:
+                                buf.writeline(f"valid_elements={arg.valid_elements!r},")
                             if arg.element_arrangement != ElementArrangement.STANDARD:
                                 buf.writeline(
                                     f"element_arrangement={arg.element_arrangement},"

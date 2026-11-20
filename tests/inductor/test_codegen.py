@@ -46,6 +46,9 @@ from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
+    _apply_layout_extents,
+    _layout_extents,
+    _stick_extent_from_valid,
     compile_op_spec,
     parse_op_spec,
 )
@@ -1497,3 +1500,112 @@ class TestStaggeredFp32Consumer(InductorTestCase):
         sdsc_spec, _ = parse_op_spec(spec)
         sizes = sorted(int(size) for size in sdsc_spec.iteration_space.values())
         self.assertEqual(sizes, [4, 64])
+
+
+class TestStickExtentFromValid(InductorTestCase):
+    """_stick_extent_from_valid reads one arg's own layout."""
+
+    def _arg(self, device_size, valid_elements):
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 64), row, sympy.Mod(lane, 64)]
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=device_size,
+            device_coordinates=coords,
+            allocation={"hbm": 0},
+            valid_elements=valid_elements,
+        )
+        return arg, lane
+
+    def test_padded_stick_extent(self):
+        # [7, 100] fp16: 2 sticks of 64 -> valid 100, padded 128.
+        arg, lane = self._arg([2, 7, 64], {(0, 2): 100, (1,): 7})
+        self.assertEqual(_stick_extent_from_valid(arg, lane, {}, 64), (100, 128))
+
+    def test_view_device_size_is_capped(self):
+        # A view of a wider buffer reports 4 sticks; extent stays at 128.
+        arg, lane = self._arg([4, 7, 64], {(0, 2): 100, (1,): 7})
+        self.assertEqual(_stick_extent_from_valid(arg, lane, {}, 64), (100, 128))
+
+    def test_unknown_valid_elements_falls_back(self):
+        arg, lane = self._arg([2, 7, 64], None)
+        self.assertIsNone(_stick_extent_from_valid(arg, lane, {}, 64))
+
+    def test_row_axis_extent(self):
+        # Matmul-y style: K=100 rows padded to 128 by the padding pass; the
+        # row-like group is read with stick_axis=False.
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 64), row, sympy.Mod(lane, 64)]
+        arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[1, 128, 64],
+            device_coordinates=coords,
+            allocation={"hbm": 0},
+            valid_elements={(0, 2): 64, (1,): 100},
+        )
+        self.assertEqual(
+            _stick_extent_from_valid(arg, row, {}, 64, stick_axis=False), (100, 128)
+        )
+        self.assertIsNone(_stick_extent_from_valid(arg, row, {}, 64))
+
+
+class TestLayoutExtents(InductorTestCase):
+    """_layout_extents decides an extent only when every tensor agrees."""
+
+    _VE = {(0, 2): 100, (1,): 7}
+
+    def _arg(self, device_size, valid_elements, eps_dtype=DataFormats.SEN169_FP16):
+        row, lane = sympy.symbols("c0 c1")
+        stick = eps_dtype.elems_per_stick()
+        coords = [sympy.floor(lane / stick), row, sympy.Mod(lane, stick)]
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=eps_dtype,
+            device_size=device_size,
+            device_coordinates=coords,
+            allocation={"hbm": 0},
+            valid_elements=valid_elements,
+        )
+
+    def _spec(self, *args):
+        return SimpleNamespace(args=list(args))
+
+    def test_all_tensors_agree(self):
+        row, lane = sympy.symbols("c0 c1")
+        spec = self._spec(
+            self._arg([2, 7, 64], self._VE), self._arg([2, 7, 64], self._VE)
+        )
+        space = {row: 7, lane: 100}
+        decided = _layout_extents(spec, {}, space)
+        self.assertEqual(decided, {lane: (100, 128)})
+        self.assertEqual(_apply_layout_extents(decided, space), {lane: 28})
+        self.assertEqual(space[lane], 128)
+
+    def test_view_device_size_is_capped(self):
+        row, lane = sympy.symbols("c0 c1")
+        spec = self._spec(
+            self._arg([4, 7, 64], self._VE), self._arg([2, 7, 64], self._VE)
+        )
+        self.assertEqual(
+            _layout_extents(spec, {}, {row: 7, lane: 100}), {lane: (100, 128)}
+        )
+
+    def test_missing_valid_elements_is_undecided(self):
+        row, lane = sympy.symbols("c0 c1")
+        spec = self._spec(self._arg([2, 7, 64], self._VE), self._arg([2, 7, 64], None))
+        self.assertEqual(_layout_extents(spec, {}, {row: 7, lane: 100}), {})
+
+    def test_valid_differs_from_logical_extent(self):
+        row, lane = sympy.symbols("c0 c1")
+        spec = self._spec(self._arg([2, 7, 64], self._VE))
+        self.assertEqual(_layout_extents(spec, {}, {row: 7, lane: 90}), {})
+
+    def test_device_size_below_valid_is_undecided(self):
+        row, lane = sympy.symbols("c0 c1")
+        spec = self._spec(self._arg([1, 7, 64], self._VE))
+        self.assertEqual(_layout_extents(spec, {}, {row: 7, lane: 100}), {})

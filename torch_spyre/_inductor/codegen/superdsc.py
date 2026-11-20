@@ -519,12 +519,161 @@ def _get_layout_label(
     return label
 
 
+def _stick_extent_from_valid(
+    arg: TensorArg,
+    sym: Symbol,
+    symbol_mapping: dict,
+    stick_size: int,
+    stick_axis: bool = True,
+) -> tuple[int, int] | None:
+    """Return ``(valid, padded)`` extents of ``sym`` on ``arg``.
+
+    Read from the arg's own layout: ``valid`` is the ``valid_elements`` count of
+    the device-dim group indexed by ``sym``, and ``padded`` is that group's
+    ``device_size`` product, capped at ``valid`` rounded up to ``stick_size`` so a
+    view whose ``device_size`` reflects a larger underlying buffer cannot
+    over-extend the iteration space.  Only this arg's layout is consulted, so
+    padding on one arg never grows another arg's extent.  ``None`` also when
+    ``device_size`` is below ``valid`` (e.g. shrunk by tiling).
+
+    ``stick_axis`` selects the group holding the arg's within-stick (last) device
+    dim; otherwise the group must not contain it (a row-like dim such as matmul K).
+
+    Returns ``None`` (caller falls back to rounding the logical extent) when the
+    arg has no ``valid_elements``, or no group maps onto exactly ``sym``.
+    """
+    valid_elements = arg.valid_elements
+    if not valid_elements or not arg.device_coordinates:
+        return None
+    last = len(arg.device_coordinates) - 1
+    for group, valid in valid_elements.items():
+        if (last in group) != stick_axis:
+            continue
+        syms: set = set()
+        for d in group:
+            coord = arg.device_coordinates[d]
+            if hasattr(coord, "xreplace"):
+                syms |= coord.xreplace(symbol_mapping).free_symbols
+        if syms != {sym}:
+            continue
+        padded = math.prod(int(arg.device_size[d]) for d in group)
+        rounded = -(-int(valid) // stick_size) * stick_size
+        if padded < valid:
+            return None
+        return int(valid), min(padded, rounded)
+    return None
+
+
+def _layout_extents(
+    op_spec: OpSpec,
+    symbol_mapping: dict,
+    sdsc_iteration_space: dict,
+) -> dict:
+    """Return ``{sym: (valid, padded)}`` for stick-axis symbols every tensor agrees on.
+
+    For each iteration symbol, every tensor that indexes it contributes the
+    ``valid_elements`` count of the device-dim group holding it and that group's
+    ``device_size`` product (capped at ``valid`` rounded up to the tensor's stick
+    so a view of a larger buffer cannot over-extend it).  A symbol is *decided*
+    only if
+
+    * it is the within-stick axis of at least one tensor,
+    * every tensor that indexes it describes it (has ``valid_elements`` and one
+      group maps onto exactly that symbol, so no coordinate is left unexplained),
+    * all tensors agree on both ``valid`` and ``padded``,
+    * ``valid`` equals the current logical extent, and
+    * ``padded`` is at least ``valid`` and a whole number of sticks.
+
+    Padding on a single tensor therefore never grows the space.  Undecided
+    symbols are left to the stick-rounding fallback.
+    """
+    per_sym: dict = {}
+    undecided: set = set()
+    stick_syms: set = set()
+    for arg in op_spec.args:
+        coords = list(arg.device_coordinates)
+        carried: set = set()
+        for coord in coords:
+            if not hasattr(coord, "xreplace") or coord.has(IndirectAccess):
+                continue
+            carried |= coord.xreplace(symbol_mapping).free_symbols
+        carried &= set(sdsc_iteration_space)
+        if not arg.valid_elements:
+            undecided |= carried
+            continue
+        eps = arg.device_dtype.elems_per_stick()
+        last = len(coords) - 1
+        covered: set = set()
+        for group, valid in arg.valid_elements.items():
+            syms: set = set()
+            indirect = False
+            for d in group:
+                coord = coords[d]
+                if not hasattr(coord, "xreplace") or coord.has(IndirectAccess):
+                    indirect = True
+                    break
+                syms |= coord.xreplace(symbol_mapping).free_symbols
+            if indirect:
+                continue
+            syms &= set(sdsc_iteration_space)
+            if len(syms) != 1:
+                undecided |= syms
+                continue
+            (sym,) = syms
+            padded = math.prod(int(arg.device_size[d]) for d in group)
+            padded = min(padded, -(-int(valid) // eps) * eps)
+            on_stick = last in group
+            if padded < valid or (on_stick and padded % eps):
+                undecided.add(sym)
+                continue
+            per_sym.setdefault(sym, []).append((int(valid), padded))
+            covered.add(sym)
+            if on_stick:
+                stick_syms.add(sym)
+        undecided |= carried - covered
+
+    decided: dict = {}
+    for sym, items in per_sym.items():
+        if sym in undecided or sym not in stick_syms:
+            continue
+        if len(set(items)) != 1:
+            logger.debug("layouts disagree on %s: %s; using stick rounding", sym, items)
+            continue
+        valid, padded = items[0]
+        if sdsc_iteration_space[sym] != valid:
+            logger.debug(
+                "valid_elements %d != iteration extent %s for %s; using stick rounding",
+                valid,
+                sdsc_iteration_space[sym],
+                sym,
+            )
+            continue
+        decided[sym] = (valid, padded)
+    return decided
+
+
+def _apply_layout_extents(
+    layout_extents: dict, sdsc_iteration_space: dict, only: set | None = None
+) -> dict:
+    """Grow decided symbols to their agreed padded extent; return dim -> padding."""
+    padding: dict = {}
+    for sym, (_, padded) in layout_extents.items():
+        if only is not None and sym not in only:
+            continue
+        current = sdsc_iteration_space[sym]
+        if current < padded:
+            sdsc_iteration_space[sym] = padded
+            padding[sym] = padded - current
+    return padding
+
+
 def _get_padded_iteration_space(
     op_spec_args: list[TensorArg],
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
     dim_order,
+    layout_extents: dict | None = None,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -533,15 +682,20 @@ def _get_padded_iteration_space(
     Returns a mapping of dim -> padding amount, measured from the dim's extent
     before any arg padded it: args of different stick widths can each round
     the same dim up in turn.
+
+    Dims in ``layout_extents`` (see ``_layout_extents``) take the padded extent
+    every tensor's layout agrees on.  Every other stick dim of the given args is
+    rounded up to its stick width.
     """
-    padding: dict = {}
+    layout_extents = layout_extents or {}
     unpadded_extent = dict(sdsc_iteration_space)
+    padding: dict = _apply_layout_extents(layout_extents, sdsc_iteration_space)
     for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
         for dim in dim_order:
-            if dim not in stick_dim_order:
+            if dim not in stick_dim_order or dim in layout_extents:
                 continue
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
@@ -2053,6 +2207,7 @@ def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
+    layout_extents: dict | None = None,
 ) -> None:
     """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
 
@@ -2098,6 +2253,11 @@ def _extend_matmul_k_to_padded(
     # allocation's K extent, not the slice's logical K, so it can be larger
     # than the matmul's actual K and would over-extend the iteration space.
     stick_size = y_arg.device_dtype.elems_per_stick()
+    # When every tensor's layout agrees on K's padded extent (x holds K on its
+    # stick axis, y on a row dim grown by the padding pass), use it.
+    if layout_extents and k_sym in layout_extents:
+        _apply_layout_extents(layout_extents, sdsc_iteration_space, only={k_sym})
+        return
     _round_up_to_stick(
         sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
     )
@@ -2139,6 +2299,7 @@ def _extend_restickify_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
+    layout_extents: dict | None = None,
 ) -> None:
     """Round sdsc_iteration_space[stick_sym] up to a stick boundary for each
     restickify arg.  Both input (old stick) and output (new stick) may carry
@@ -2155,6 +2316,11 @@ def _extend_restickify_to_padded(
         if stick_sym is None or stick_sym not in sdsc_iteration_space:
             continue
         stick_size = arg.device_dtype.elems_per_stick()
+        if layout_extents and stick_sym in layout_extents:
+            _apply_layout_extents(
+                layout_extents, sdsc_iteration_space, only={stick_sym}
+            )
+            continue
         _round_up_to_stick(
             sdsc_iteration_space, stick_sym, stick_size, "_extend_restickify_to_padded"
         )
@@ -2590,10 +2756,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         dim_splits[stick_sym] = 1
         op_stick_fallback_sym = stick_sym
 
+    # Padded extents every tensor's layout agrees on, taken before any growth.
+    layout_extents = _layout_extents(op_spec, symbol_mapping, sdsc_iteration_space)
     if is_matmul:
-        _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+        _extend_matmul_k_to_padded(
+            op_spec, sdsc_iteration_space, symbol_mapping, layout_extents
+        )
     elif is_restickify:
-        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+        _extend_restickify_to_padded(
+            op_spec, sdsc_iteration_space, symbol_mapping, layout_extents
+        )
 
     # Grow a core-split index-entry iteration to the padded output device_size.
     # The output's entry-dim device_size was rounded up to the index stick
@@ -2620,8 +2792,23 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                         if c.free_symbols == {entry_c}
                     )
                     idx_eps = idx_arg.device_dtype.elems_per_stick()
-                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
-                    dev = min(int(out_arg.device_size[pos]), idx_extent)
+                    # entry_c is a raw device_coordinates symbol, so no symbol_mapping.
+                    idx_ext = _stick_extent_from_valid(idx_arg, entry_c, {}, idx_eps)
+                    if (
+                        idx_ext is not None
+                        and idx_ext[0] == sdsc_iteration_space.get(entry_mb)
+                        and idx_ext[1] % idx_eps == 0
+                    ):
+                        idx_extent = idx_ext[1]
+                    else:
+                        if idx_ext is None:
+                            logger.debug(
+                                "indirect access: no usable valid_elements for %s",
+                                entry_c,
+                            )
+                        idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
+                    out_extent = int(out_arg.device_size[pos])
+                    dev = min(out_extent, idx_extent)
                     if (
                         entry_mb in sdsc_iteration_space
                         and dim_splits[entry_mb] > 1
@@ -2726,7 +2913,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[-1].dim_order],
         )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
+        pad_args,
+        pad_sdsc_args,
+        sdsc_iteration_space,
+        layouts,
+        dim_order,
+        layout_extents,
     )
 
     # For restickify, update backGaps based on the padded iteration space,
