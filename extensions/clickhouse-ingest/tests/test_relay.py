@@ -1,3 +1,17 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """relay.py against an in-memory Artifactory and a scripted `results --from-bundle`."""
 
 import json
@@ -653,6 +667,24 @@ def test_backfill_skips_what_the_ingest_does_not_know_as_recorded(
         _dir(f"{ROOT}/processed/{AID}/b-fvt"), tmp_path, report, code
     )
     assert entries[0]["outcome"] == "skipped" and ch.rows == []
+
+
+@pytest.mark.parametrize(
+    "extra_writer, want",
+    [("someone-else", "external"), ("", "external"), ("jdoe", "ci")],
+)
+def test_backfill_records_the_lowest_trust_of_every_account_that_wrote_the_folder(
+    tmp_path, extra_writer, want
+):
+    folder = f"{ROOT}/processed/{AID}/b-fvt"
+    files = {
+        **_dir(folder),
+        f"{folder}/attachments/logs.tgz": (b"x", "2026-10-09T11:00:00Z", extra_writer),
+    }
+    _, _, ch, calls = _backfill(files, tmp_path, ci_account=["jdoe"])
+    argv = calls[0]
+    assert ch.rows[0]["props"]["trust"] == want
+    assert argv[argv.index("--channel-trust") + 1] == want
 
 
 def test_backfill_reads_a_tgz_and_survives_a_bad_row(tmp_path):

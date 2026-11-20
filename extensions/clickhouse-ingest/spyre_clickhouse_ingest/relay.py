@@ -485,10 +485,11 @@ class Relay:
                 "reason": f"path names no artifact_id or sha256-<digest>: {b['rel']!r}",
             }
         if b["kind"] == "dir":
+            items = self.folder_items(b["path"])
             b["files"] = [
-                f"{it['path']}/{it['name']}"[len(b["path"]) + 1 :]
-                for it in self.folder_items(b["path"])
+                f"{it['path']}/{it['name']}"[len(b["path"]) + 1 :] for it in items
             ]
+            b["uploaders"] = sorted({it.get("created_by", "") for it in items})
         local = self.fetch(b, work)
         url = self.art.url(b["path"])
         argv = [
