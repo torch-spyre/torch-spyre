@@ -2577,7 +2577,9 @@ def test_unsqueeze_broadcast_dense_pointwise():
     """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
+    # The optimizer restickifies the 1-D `a` to a sparse (one element per stick)
+    # layout; its target is S host elements. Restickifying `b` would cost S * S.
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
@@ -2600,7 +2602,8 @@ def test_unsqueeze_expand_broadcast_dense_pointwise():
     """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
+    # Same as above: the sparse restickify of `a` (S host elements) beats S * S.
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
@@ -2674,6 +2677,38 @@ def test_broadcast_expand_both():
         optimal_cost=2 * acs.numel(),
         check_strides=False,
     )
+
+
+def test_broadcast_outer_mul_fp32():
+    """pos[..., None] * inv: fp32 [1, N] times fp32 [64] -> [1, N, 64].
+
+    Each input is broadcast along the other's stick dim, so neither output stick
+    candidate has a dense restickify target for both inputs. One input must be
+    restickified onto a size-1 (sparse) stick.
+    """
+    pos = torch.randn((1, S * 3), dtype=torch.float32)
+    inv = torch.randn((64,), dtype=torch.float32)
+    _compare(lambda pos, inv: pos[..., None] * inv, pos, inv)
+
+
+def test_broadcast_unsqueeze_gather_weighted_sum():
+    """Issue #6390: gather rows, multiply by weights.unsqueeze(-1), sum over dim 1.
+
+    The gathered [4, 2, 64] tensor has its stick on d2 while the unsqueezed
+    [4, 2, 1] weights have theirs on d1, so each is broadcast along the other's
+    stick dim. Run eagerly, as in the issue.
+    """
+    w = torch.randn((8, 64), dtype=torch.float16)
+    ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int64)
+    wt = torch.tensor(
+        [[0.4, 0.6], [0.3, 0.7], [0.5, 0.5], [0.2, 0.8]], dtype=torch.float16
+    )
+    expected = (w[ids.flatten()].view(4, 2, 64) * wt.unsqueeze(-1)).sum(dim=1)
+
+    w_d, ids_d, wt_d = w.to(DEVICE), ids.to(DEVICE), wt.to(DEVICE)
+    selected = w_d[ids_d.flatten()].view(4, 2, 64)
+    out = (selected * wt_d.unsqueeze(-1)).sum(dim=1).cpu()
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
 
 
 # ------- Single-arg op with a size-1 interior dim ---------

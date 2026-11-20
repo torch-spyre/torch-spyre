@@ -3909,6 +3909,25 @@ def compute_restickify_needed(
     target = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+    if (
+        target is None
+        and sparse_target is None
+        and in_stick_offset_free
+        and not is_sparse_stl(in_stl)
+        # Matmul is excluded as a precaution: its edges target the input's own
+        # dep, so this case is not expected, and none was found to reach it.
+        and not _is_matmul_op(op)
+    ):
+        # No dense target: the output's stick var is not a coordinate of this
+        # input (it is broadcast along that dim), so no device dim of the input
+        # can take it. Put the input's stick on a size-1 dim instead: every
+        # lane of the output stick then reads the same input element. Use it
+        # only if it is stick-compatible with the output.
+        size1 = compute_size1_restickify_target(in_stl, in_host, in_dep, op)
+        if size1 is not None:
+            size1_idc = try_device_coordinates(size1, in_dep, ind_sizes, op=op)
+            if size1_idc is not None and stick_compatible([size1_idc, out_idc]):
+                target = size1
     return True, sparse_target if target is None else target
 
 
