@@ -150,8 +150,8 @@ class Recording(TableLowering):
         super().__init__(inputs, cap=cap)
         self.printed: dict[sympy.Basic, AbstractRealization] = {}
 
-    def _print(self, expr: sympy.Basic, **kwargs) -> AbstractRealization:
-        realization = super()._print(expr, **kwargs)
+    def print(self, expr: sympy.Basic) -> AbstractRealization:
+        realization = super().print(expr)
         self.printed.setdefault(expr, realization)
         return realization
 
@@ -191,7 +191,7 @@ def test_the_printer_prints_operands_first_and_a_shared_subexpression_once(monke
             assert order.index(operand) < order.index(node)
     assert order[-1] == expr and printer.printed[expr] is root
     assert calls.count(shared) == 1  # two parents read one realization
-    assert printer.lower(shared) is printer.printed[shared]
+    assert printer.print(shared) is printer.printed[shared]
     assert sympy.srepr(expr) == before
 
 
@@ -232,10 +232,11 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
 
 
 def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
-    """A node is printed by the print method of the nearest class along its MRO that
-    has one, so a Dummy, a subclass of Symbol, is its column, and a class with none
-    goes to emptyPrinter. A printer keeps what it has printed: what two calls of lower
-    share is one realization."""
+    """print is the printer's public method. A node is printed by the print method of
+    the nearest class along its MRO that has one, so a Dummy, a subclass of Symbol, is
+    its column, and a class with none goes to emptyPrinter. A printer keeps what it
+    has printed: what two calls of print share is one realization, and lower is print
+    of the root."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
@@ -243,16 +244,16 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     case.inputs[dummy] = case.inputs[a]
     printer = TableLowering(case.inputs, cap=CAP)
     assert isinstance(printer, Printer)
-    column = printer.lower(dummy).table()
+    column = printer.print(dummy).table()
     assert column.index == position and list(column.values) == [1.0, 2.0, 4.0]
-    logs = printer.lower(sympy.log(a)).table()
+    logs = printer.print(sympy.log(a)).table()
     assert logs.index == position
     assert list(logs.values) == pytest.approx([0.0, math.log(2), math.log(4)])
-    constant = printer.lower(sympy.log(sympy.Integer(2)) + sympy.pi).table()
+    constant = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi).table()
     assert constant.index == UNIT
     root = printer.lower(sympy.log(a) + dummy)
-    assert root is printer.lower(sympy.log(a) + dummy)
-    assert printer.lower(sympy.log(a)) is logs
+    assert root is printer.print(sympy.log(a) + dummy)
+    assert printer.print(sympy.log(a)) is logs
 
 
 def test_the_printer_makes_a_symbols_position_on_its_variable():

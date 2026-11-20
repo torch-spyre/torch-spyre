@@ -367,18 +367,19 @@ def _is_condition(expr: sympy.Basic) -> bool:
 
 class TableLowering(Printer):
     """Lowers cost expressions to tables: a sympy Printer whose print of a node is the
-    node's realization, an AbstractRealization. A Printer dispatches on the node's
-    sympy class, the nearest class along its MRO that has a print method, and falls
-    back to emptyPrinter. A print method prints the node's operands first, which
-    returns their realizations, asks each for its table, and returns the node's own
-    realization to the node's parent: in this stage always one table over the node's
-    inputs. The printer makes the positions itself: an InputIndex on a symbol's
-    variable, and for an operation its inputs' positions combined.
+    node's realization, an AbstractRealization. print, its public method, prints any
+    node. A Printer dispatches on the node's sympy class, the nearest class along its
+    MRO that has a print method, and falls back to emptyPrinter. A print method prints
+    the node's operands first, which returns their realizations, asks each for its
+    table, and returns the node's own realization to the node's parent: in this stage
+    always one table over the node's inputs. The printer makes the positions itself:
+    an InputIndex on a symbol's variable, and for an operation its inputs' positions
+    combined.
 
     inputs gives each symbol's variable and values; cap bounds the entries of one
     table, the length of its list. The printer holds no model, so lowering cannot
     write to one. It keeps the realization of each node it has printed, by the sympy
-    node: a subexpression shared by two parents, or by two calls of lower, is printed
+    node: a subexpression shared by two parents, or by two calls of print, is printed
     once, and its parents read one realization. So inputs and cap are read when a node
     is first printed: a printer is made for one set of inputs, and a change to them
     afterwards does not reach a realization it has kept.
@@ -394,15 +395,17 @@ class TableLowering(Printer):
         """root's realization, with every node under root realized on the way; root
         is not changed. Raises TableLoweringError, naming the node, for a node that
         cannot be lowered. Its cp_expr builds it into a model."""
-        return self._print(root)
+        return self.print(root)
 
-    def _print(self, expr: sympy.Basic, **kwargs: Any) -> AbstractRealization:
-        """expr's realization, printed the first time expr is met and kept."""
+    def print(self, expr: sympy.Basic) -> AbstractRealization:
+        """expr's realization: printed the first time expr is met, by the print
+        method of its sympy class, and kept. A print method prints its node's
+        operands with it, and a caller any node."""
         if expr not in self._realizations:
-            self._realizations[expr] = super()._print(expr, **kwargs)
+            self._realizations[expr] = self._print(expr)
         return self._realizations[expr]
 
-    def _print_Symbol(self, expr: sympy.Symbol) -> TableRealization:
+    def _print_Symbol(self, expr: sympy.Symbol) -> AbstractRealization:
         """A symbol's column: its values on its variable's position, an InputIndex
         made here from the variable's lowest and highest values, so the caller makes
         no position. Raises TableLoweringError naming the symbol when it has no input,
@@ -434,12 +437,12 @@ class TableLowering(Printer):
             ) from exc
         return self._finite(expr, column)
 
-    def _print_Piecewise(self, expr: sympy.Piecewise) -> TableRealization:
+    def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Its operands are its arms' values and conditions, value then condition: an
         arm's ExprCondPair is not printed."""
         return self._operation(expr, [part for pair in expr.args for part in pair.args])
 
-    def emptyPrinter(self, expr: sympy.Basic) -> TableRealization:
+    def emptyPrinter(self, expr: sympy.Basic) -> AbstractRealization:
         """Any other node, over its arguments."""
         return self._operation(expr, expr.args)
 
@@ -469,7 +472,7 @@ class TableLowering(Printer):
             value = TableRealization(values=[_constant(expr)], index=UNIT)
             return self._finite(expr, value)
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-        columns = [self._print(symbol).table() for symbol in symbols]
+        columns = [self.print(symbol).table() for symbol in symbols]
         positions = list(dict.fromkeys(column.index for column in columns))
         entries = math.prod(position.size for position in positions)
         if entries > self.cap:
@@ -486,10 +489,10 @@ class TableLowering(Printer):
         forms: list[Form] = []
         for operand in operands:
             # prints the operand, which refuses its own value that is not finite
-            table = self._print(operand).table()
+            table = self.print(operand).table()
             form: Form = CONDITION if _is_condition(operand) else None
             if _divides(expr, operand):
-                table, form = self._print(operand.base).table(), operand.exp  # type: ignore[attr-defined]
+                table, form = self.print(operand.base).table(), operand.exp  # type: ignore[attr-defined]
             if table.index == index:
                 arguments.append(table.values)
             else:
