@@ -479,6 +479,59 @@ class _Pool:
         self.wait()
 
 
+def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
+    """Whether the local FX graph cache already holds this inner compile's graph.
+
+    Mirrors the key ``compile_fx_inner`` computes, after the rebinding of
+    ``get_decomp_fn`` that ``_spyre_inner_compile`` applies. A key-less or
+    uncacheable graph, or anything unexpected, counts as a miss.
+    """
+    try:
+        from torch._inductor import config
+        from torch._inductor.codecache import FxGraphCache
+        from torch._inductor.compile_fx import get_input_idxs_to_check
+        from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+
+        if config.force_disable_caches or not config.fx_graph_cache:
+            return False
+        gm = kwargs["gm"] if "gm" in kwargs else args[0]
+        example_inputs = (
+            kwargs["example_inputs"] if "example_inputs" in kwargs else args[1]
+        )
+        graph_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("gm", "example_inputs", "compile_region_name")
+        }
+        graph_kwargs["get_decomp_fn"] = get_spyre_decomp_table
+        # The defaults compile_fx_inner fills in; they are part of the key.
+        for name, default in (
+            ("cudagraphs", None),
+            ("static_input_idxs", ()),
+            ("is_backward", False),
+            ("graph_id", None),
+            ("cpp_wrapper", False),
+            ("fx_wrapper", False),
+            ("is_inference", False),
+            ("boxed_forward_device_index", None),
+            ("layout_opt", None),
+            ("extern_node_serializer", None),
+        ):
+            graph_kwargs.setdefault(name, default)
+        inputs_to_check = get_input_idxs_to_check(
+            example_inputs, graph_kwargs["static_input_idxs"]
+        )
+        key_info, _ = FxGraphCache.prepare_key(
+            gm, example_inputs, graph_kwargs, inputs_to_check, False
+        )
+        if key_info is None:
+            return False
+        key_dir = FxGraphCache._get_tmp_dir_for_key(key_info[0])
+        return os.path.isdir(key_dir) and any(True for _ in os.scandir(key_dir))
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def fork_inner_compiles(
     workers: int, timeout_s: float = 300.0, placeholders: bool = False
@@ -495,7 +548,12 @@ def fork_inner_compiles(
     original = spyre_inductor._spyre_inner_compile
     pool = _Pool(max(1, workers), timeout_s)
 
-    def inner_compile(*args: Any, **kwargs: Any) -> _StandIn:
+    def inner_compile(*args: Any, **kwargs: Any) -> Any:
+        if _fx_cache_holds(*args, **kwargs):
+            # A graph AOTAutograd would not cache (it bypasses graphs that call
+            # torch-spyre's Tensor.to) reaches the inner compile on every start, and
+            # the FX graph cache answers it in place faster than a fork.
+            return original(*args, **kwargs)
         if not placeholders:
             pool.submit(lambda: original(*args, **kwargs))
             return _StandIn(pool)

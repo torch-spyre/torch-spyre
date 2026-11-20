@@ -313,6 +313,29 @@ def test_output_specs_tell_fresh_buffers_from_views_of_inputs():
     del GraphLowering, V
 
 
+def test_a_graph_the_fx_cache_holds_compiles_in_place(monkeypatch):
+    """An AOT-cache bypass reaches the inner compile on a warm start; a fork for a
+    cache hit would cost a child and turn the warm start into a second pass."""
+    calls = []
+    monkeypatch.setattr(
+        spyre_inductor,
+        "_spyre_inner_compile",
+        lambda *a, **k: calls.append(k) or "code",
+    )
+    monkeypatch.setattr(pp, "_fx_cache_holds", lambda *a, **k: k.get("x") == "hit")
+    with pp.fork_inner_compiles(2, placeholders=True) as pool:
+        hit = spyre_inductor._spyre_inner_compile("gm", [], x="hit")
+        miss = spyre_inductor._spyre_inner_compile(
+            torch.fx.symbolic_trace(torch.nn.Identity()), [torch.empty(1)], x="miss"
+        )
+    assert hit == "code" and calls == [{"x": "hit"}]
+    assert isinstance(miss, pp._StandIn) and pool.submitted == 1
+
+
+def test_the_cache_probe_never_raises():
+    assert pp._fx_cache_holds("not a graph", x=1) is False
+
+
 def test_without_placeholders_nothing_changes(monkeypatch):
     monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", lambda *a, **k: None)
     with pp.fork_inner_compiles(1) as pool:
