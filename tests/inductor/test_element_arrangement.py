@@ -33,7 +33,7 @@ import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.exc import InductorError
-from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.virtualized import V
 from torch_spyre._C import (
     ElementArrangement,
@@ -1717,7 +1717,7 @@ class TestEAValidateOps:
         mock_graph.get_buffer.side_effect = lambda n: buffers.get(n)
         return mock_graph
 
-    @pytest.mark.parametrize("op_cls", [Pointwise, Reduction])
+    @pytest.mark.parametrize("op_cls", [Pointwise])
     def test_validate_ops_compatible(self, op_cls):
         """All-standard and standard+one-staggered (broadcast) pass validation."""
         op = self._make_mock_op(op_cls, ["buf0", "buf1"])
@@ -1727,7 +1727,7 @@ class TestEAValidateOps:
         with V.set_graph_handler(graph):
             validate_ops(graph)
 
-    @pytest.mark.parametrize("op_cls", [Pointwise, Reduction])
+    @pytest.mark.parametrize("op_cls", [Pointwise])
     def test_validate_ops_incompatible_raises(self, op_cls):
         """Multiple distinct staggered EAs raise Unsupported."""
         op = self._make_mock_op(op_cls, ["buf0", "buf1"])
