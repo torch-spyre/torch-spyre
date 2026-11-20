@@ -22,8 +22,8 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import ReadWrites
 from torch._inductor.graph import GraphLowering
 
-from .loop_info import LoopCarryRecord
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopCarryRecord
+from .loop_node import LoopNode, all_ops, remove_op
 
 
 def live_operations(graph: GraphLowering) -> frozenset[str]:
@@ -193,4 +193,4 @@ def deadcode_elimination(graph: GraphLowering) -> None:
             rw = leaf.get_read_writes()
             for dep in rw.writes:
                 graph.removed_buffers.add(dep.name)
-        operations.remove(op)
+        remove_op(operations, op)

@@ -59,7 +59,7 @@ from ..lx_read_contracts import (
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback
 from ..loop_facts import counted_loop_path
-from ..loop_info import COUNTED_LOOP_INFO
+from ..loop_info import LoopInfo
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
@@ -945,8 +945,8 @@ def solver_relayout_edge_context(
     consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (
         config.lx_same_tile_group_relayout
-        and isinstance(producer_loop_info, COUNTED_LOOP_INFO)
-        and isinstance(consumer_loop_info, COUNTED_LOOP_INFO)
+        and isinstance(producer_loop_info, LoopInfo)
+        and isinstance(consumer_loop_info, LoopInfo)
         and counted_loop_path(producer, include_extern=True)
         == counted_loop_path(consumer, include_extern=True)
         and not (
@@ -1465,7 +1465,7 @@ def local_lx_subrange_source(graph, name: str, uses: list[int]) -> bool:
 
 
 def _local_lx_emission_view(op, dep, name):
-    """Use the pointwise division transported to the scheduler at emission.
+    """Use the division transported to the scheduler at emission.
 
     Scheduler finalization removes iteration_space_ownership. Decode its
     existing coefficient transport exactly as create_op_spec does; retain all
@@ -1473,7 +1473,9 @@ def _local_lx_emission_view(op, dep, name):
     """
     ownership = getattr(op, "iteration_space_ownership", None)
     if ownership is None:
-        if not isinstance(op.data, Pointwise) or not hasattr(op, "op_it_space_splits"):
+        if not isinstance(op.data, (Pointwise, Reduction)) or not hasattr(
+            op, "op_it_space_splits"
+        ):
             raise ValueError(f"{name}: local LX emission lacks a committed division")
         transported = iteration_space_with_splits(
             op, op_read_writes(op), iteration_space_from_op(op)

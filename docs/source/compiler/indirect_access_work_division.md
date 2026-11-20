@@ -184,42 +184,30 @@ This is gated on the [uniqueness condition](#the-scatter-only-correctness-condit
 
 Enabling the index-entry split (fixes #1–2) exposes a second hazard when the
 entry count is **not a whole multiple of the index stick** (32 int32 entries per
-128-byte stick). Work division splits the entry dim in whole sticks, so an
-*even* per-core slice of a partial last stick — e.g. `Q = 40` = one full stick +
-8 — hands the second core a slice that **straddles the index stick boundary**.
-The backend cannot step a sticked dimension across a stick boundary *within* a core,
-so the entries past the boundary are read from the wrong device addresses.
-
-The fix pads the **gather output**'s entry-dim `device_size` up to the next stick
-multiple (e.g. `40 → 64`), leaving the logical size unchanged.
-`pass_utils.padded_entry_output_stl` owns this — the single coordinate search
-(`_find_entry_output_dim`) plus the size math — and returns the grown device
-layout (or `None` when there is nothing to pad); the pre-scheduling pass
-`enforce_indirect_access_layout._pad_output_for_stick_aligned_split` just applies
-it. The physical allocation grows, so the per-core base becomes stick-aligned —
-matching the index tensor, whose device layout is already stick-padded — and the
-D2H copy extracts the logical rows from the larger allocation (its
-`physical_exceeds_logical` path). To keep the per-core base stride consistent,
-`superdsc` grows the SDSC iteration of a split entry dim to the padded size
-**before** `_create_sdsc_tensors` computes strides; otherwise the base lands
-element-aligned (mid-stick) and the split still miscompiles. An unsplit entry
-dim keeps its logical count, and the padded output rows become a back gap.
-
-A stick-aligned split still leaves a hazard: the last core iterates the whole
-last index stick, padding lanes included, and uses whatever those lanes hold as
-table rows. A padding lane holds whatever the index's producer left there (a
-device `arange` ramp continues past the logical end, for example), and an
-invalid row faults the card.
+128-byte stick), e.g. `Q = 40` = one full stick + 8. Work division splits the
+entry dim in whole sticks, so the last core iterates the whole last index stick,
+padding lanes included, and uses whatever those lanes hold as table rows. A
+padding lane holds whatever the index's producer left there (a device `arange`
+ramp continues past the logical end, for example), and an invalid row faults
+the card.
 
 `indirect_forbidden_split_syms`
 ([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
 therefore forbids a partial-last-stick entry dim outright, reading the index's
-*unpadded* logical count (`d.ranges`), which the output padding never changes.
-The output padding no longer enables a split. A partial-stick gather or scatter
-stays on a single core: correct-but-serial rather than faulting.
+logical count (`d.ranges`). A partial-stick gather or scatter stays on a single
+core: correct-but-serial rather than faulting.
 
-Stick-aligned counts (a multiple of 32) are unaffected: no padding, the
-forbiddance never fires, and they split exactly as before.
+An unsplit entry dim has no per-core output base to stick-align, so the gather
+output keeps its logical entry extent. It used to be padded to the next index
+stick multiple for a stick-aligned split, and once that split was forbidden the
+padding only leaked out of the compiled graph: the returned tensor reported the
+padded `device_size` and failed the layout guard of every consumer compiled for
+a fresh tensor of the same shape. Relabeling the returned tensor cannot hide
+such padding, because device strides are contiguous over `device_size`:
+shrinking the padded entry dim moves every stick column after the first.
+
+Stick-aligned counts (a multiple of 32) are unaffected: the forbiddance never
+fires, and they split exactly as before.
 
 ## Detection: load side vs. store side
 
@@ -305,8 +293,6 @@ correct-but-serial.
 | `_inductor/pass_utils.py` | indirect load/store discovery; partial-stick helpers; shared-table and partial-stick detection (`indirect_forbidden_split_syms`); overwrite-scatter entry detection (`indirect_store_entry_syms`); `first_non_indirect_read_index` |
 | `_inductor/work_division_constraints.py` | `indirect_access_split_domains` maps hard indirect restrictions to `allowed_splits={symbol: {1}}` |
 | `_inductor/work_division.py` | consumes generic legal split domains; `prioritize_indirect_scatter_dimensions` promotes overwrite-scatter entry dims; split encoding and recovery use direct-read reference |
-| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — applies the grown output layout from `pass_utils.padded_entry_output_stl` to a partial-stick gather output (fix #5) |
-| `_inductor/codegen/superdsc.py` | grow a core-split index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned; an unsplit entry dim keeps its logical count (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 
 ## See also

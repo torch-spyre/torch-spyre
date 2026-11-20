@@ -55,7 +55,7 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
     Produced by build_loop_scheduler_nodes from SchedulerNodes whose
     underlying ir.Operation has been stamped with a ``loop_info``
-    (``CoarseTileInfo``) attribute by the coarse-tiling IR pass.
+    (``LoopInfo``) attribute by the coarse-tiling IR pass.
 
     loop_count is the trip count of the loop that directly contains this
     group's operations.  For nested loops, the snodes may themselves
@@ -278,7 +278,7 @@ def build_loop_scheduler_nodes(
 ) -> list[BaseSchedulerNode]:
     """Pre-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
 
-    Reads the ``loop_info`` (``CoarseTileInfo``) attribute stamped on
+    Reads the ``loop_info`` (``LoopInfo``) attribute stamped on
     ir.Operation objects by the coarse-tiling IR pass.  Nodes without these attributes
     are passed through unchanged.
 
