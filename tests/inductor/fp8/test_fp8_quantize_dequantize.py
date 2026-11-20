@@ -177,19 +177,34 @@ class TestQuantizeFP8:
         torch.testing.assert_close(out.cpu().float(), new.float(), atol=0.0, rtol=0.0)
 
     @expects_raise
-    def test_activation_quantize_h2d_copy_into_partial_stick_slice_raises(self):
-        """copy_ into a slice that covers only part of a QFP8CH stick is rejected.
+    @pytest.mark.parametrize("host2device", [True, False], ids=["h2d", "d2h"])
+    @pytest.mark.parametrize(
+        "shape,index",
+        [
+            ((4, 128), (slice(1, 3),)),
+            ((4, 128), (slice(None), slice(0, 64))),
+            ((4, 256), (slice(None), slice(128, 256))),
+            ((2, 3, 128), (1,)),
+        ],
+        ids=["rows", "part_of_stick", "whole_sticks", "int_index"],
+    )
+    def test_activation_quantize_slice_copy_raises(self, shape, index, host2device):
+        """Copies of a slice of an activation FP8 (QFP8CH) tensor are rejected.
 
-        Its chunks are not contiguous on the device and flex cannot write a run
-        that starts inside a 128-byte flit, while padding the stick would
-        overwrite the columns outside the slice.
+        The copy reorders elements with the DCI's dimwise_ea, which describes
+        the whole device tensor rather than the slice.
+
+        TODO: once the EA shuffle supports slices, make this a positive test.
         """
-        x = _make_arange_fp16((4, 128))
+        x = _make_arange_fp16(shape)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         out = _compile(_quantize_fn)(x, scale)
-        new = (x.cpu()[:, :64].to(FP32) * 2).to(E4M3)
-        with pytest.raises(RuntimeError, match="covers only columns 0 to 64"):
-            out[:, :64].copy_(new)
+        view = out[index]
+        with pytest.raises(RuntimeError, match="Copying a slice of a device tensor"):
+            if host2device:
+                view.copy_(torch.zeros(view.shape, dtype=E4M3))
+            else:
+                view.cpu()
 
     @pytest.mark.parametrize("op_name", _RAW_QUANTIZE_PARAMS)
     @pytest.mark.parametrize(

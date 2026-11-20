@@ -264,20 +264,13 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // DCI offsets are relative to storage, so pass the storage base and its
     // complete accessible extent rather than the tensor's logical view.
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
-    size_t host_capacity = cpu_tensor->storage().nbytes();
+    const size_t host_capacity = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    // Some H2D copies are described against a padded copy of the host data
-    // rather than cpu_tensor itself (see generate_dci); DMA from that one.
-    at::Tensor h2d_staging;
     DataConversionInfo dci =
-        generate_dci(cpu_tensor, dev_tensor, stl, host2device, &h2d_staging);
-    if (h2d_staging.defined()) {
-      cpu_ptr = h2d_staging.storage().mutable_data();
-      host_capacity = h2d_staging.storage().nbytes();
-    }
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     // A DCI that describes a dense same-format copy is a no-op conversion.
     // Dropping it skips flex's host-side staging (deeptools::ConvertData runs
@@ -353,12 +346,6 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     std::shared_ptr<void> host_lifetime;
     if (device2host || dci_arg == nullptr) {
       host_lifetime = std::make_shared<c10::Storage>(cpu_tensor->storage());
-    }
-    // Flex stages an H2D conversion on this thread, so the padded buffer is
-    // read before launchOperation returns; hold it anyway, as for the
-    // DCI-less case above, in case that staging ever moves off this thread.
-    if (h2d_staging.defined()) {
-      host_lifetime = std::make_shared<c10::Storage>(h2d_staging.storage());
     }
     copyAsyncImpl(cpu_ptr, host_capacity, allocation, dci_arg, host2device,
                   std::move(host_lifetime));
