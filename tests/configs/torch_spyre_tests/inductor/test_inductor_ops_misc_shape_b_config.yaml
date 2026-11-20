@@ -60,6 +60,7 @@ test_suite_config:
             - TestOps::test_ea_reduction_fp32todl16.*
             - TestOps::test_ea_reduction_dl16tofp32_nonstick.*
             - TestOps::test_ea_reduction_fp32todl16_nonstick.*
+            - TestOps::test_ea_reduction_dl16tofp32_then_standard_add.*
             - TestOps::test_float32_to_int_(truncates|saturates).*
             - TestOps::test_float16_to_int_.*
             - TestOps::test_int_to_(float16|bool)_.*

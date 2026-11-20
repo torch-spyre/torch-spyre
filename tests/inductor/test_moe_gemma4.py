@@ -229,6 +229,15 @@ TOPK_FLOAT_IDS = _xfail(
     "#5847: topk returns float32 indices",
     r"'dtype' do not match: torch\.float32 != torch\.int64",
 )
+# topk of a DL16_TO_FP32 input (the FP32 softmax of a BF16 [12, 128] input) puts the
+# stick on the row dim, and the result is tagged STANDARD, so the D2H copy does not
+# restore the staggered row order: every row from row 4 up holds another row's top-k.
+# #5495 does not help, it shuffles Pointwise ops only.
+TOPK_STAGGERED_INPUT = _xfail(
+    AssertionError,
+    "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
+    "Tensor-likes are not close",
+)
 # An FP32 softmax of a BF16 [12, 128] input, or a .float() of its [12, 8] top-k
 # mask, stages a DL16_TO_FP32 operand whose stick pair is on no single dim. This
 # fails before #4639 (wrong compiled / tied topk values) can be observed.
@@ -805,7 +814,9 @@ def _f32(tensors):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS,
+        compiled=TOPK_STAGGERED_INPUT,
+        decode_compiled=TOPK_FLOAT_IDS,
     ),
 )
 def test_G4_RT_001_batch_routing(execution_mode, T):
@@ -850,7 +861,9 @@ def test_G4_RT_001_batch_routing(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS,
+        compiled=TOPK_STAGGERED_INPUT,
+        decode_compiled=TOPK_FLOAT_IDS,
     ),
 )
 def test_G4_RT_002_routing_weight_normalization(execution_mode, T):

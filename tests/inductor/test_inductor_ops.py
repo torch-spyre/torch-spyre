@@ -8564,6 +8564,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A non-stick reduction of a DL16_TO_FP32 value, then a pointwise op with a
+        # STANDARD operand. The sum is tagged DL16_TO_FP32 (#5553), so the add mixes
+        # EAs; de-staggering it first is #5495's insert_ea_shuffle. Until #5495
+        # lands, the add reads the staggered sum as STANDARD and returns permuted
+        # values with no error.
+        (
+            "test_ea_reduction_dl16tofp32_then_standard_add",
+            "test_ea_reduction_dl16tofp32_then_standard_add_cpu",
+        ): {
+            "expect_fail": {
+                "sum_dim0": "sum(0) is tagged DL16_TO_FP32, but nothing shuffles it to "
+                "STANDARD before the add, so the add returns permuted values, pending #5495",
+            },
+            "param_sets": {
+                "sum_dim0": (
+                    cached_randn((64, 128), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float32),
+                ),
+            },
+        },
         (
             "test_round_trip_to_dtype_implicit_invalid",
             "test_round_trip_to_dtype_implicit_invalid_cpu",
@@ -13679,6 +13699,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return op(z, dim=dim)
 
         self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_dl16tofp32_then_standard_add_cpu(self, x, y):
+        # The reduction output keeps the DL16_TO_FP32 EA (#5553) and meets a
+        # STANDARD operand in the add. Correct only once the staggered sum is
+        # shuffled to STANDARD first (#5495).
+        def fn(x, y):
+            return x.float().sum(0) + y
+
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
         # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
