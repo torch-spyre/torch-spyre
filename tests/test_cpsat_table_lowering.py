@@ -35,6 +35,7 @@ pytest.importorskip("ortools.sat.python.cp_model")
 
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
+from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
@@ -148,10 +149,27 @@ class Case:
         return plan
 
 
-# ----------------------------------------------------------------------- the walk
+def _nodes(case: Case, expr: sympy.Basic, cap: int = CAP) -> dict[sympy.Basic, Node]:
+    """Each Node under expr lowered by one printer, by its sympy node, children
+    before their parents."""
+    nodes: dict[sympy.Basic, Node] = {}
+
+    def gather(node: Node) -> None:
+        if node.expr in nodes:
+            assert nodes[node.expr] is node  # one Node per sympy node
+            return
+        for child in node.children:
+            gather(child)
+        nodes[node.expr] = node
+
+    gather(TableLowering(case.inputs, cap=cap).lower(expr))
+    return nodes
 
 
-def test_the_factory_makes_children_first_and_shares_a_subexpression():
+# -------------------------------------------------------------------- the printer
+
+
+def test_the_printer_prints_children_first_and_shares_a_subexpression():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -159,7 +177,7 @@ def test_the_factory_makes_children_first_and_shares_a_subexpression():
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     before = sympy.srepr(expr)
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     order = list(nodes)
     for expr_node, node in nodes.items():
         for child in node.children:
@@ -175,7 +193,7 @@ def test_a_piecewise_arm_gets_no_node():
     case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     expr = sympy.Piecewise((a, a > 2), (a**2, True))
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     assert not any(isinstance(e, ExprCondPair) for e in nodes)
     assert [c.expr for c in nodes[expr].children] == [a, a > 2, a**2, sympy.true]
 
@@ -186,13 +204,37 @@ def test_each_node_is_an_input_a_constant_or_an_operation():
     a = case.symbol("a")
     root2 = sympy.sqrt(2)
     expr = 3 * a + root2 * a**0.5
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     assert type(nodes[a]) is InputNode
     assert nodes[a].input is case.inputs[a]
     assert type(nodes[sympy.Integer(3)]) is ConstantNode
     assert type(nodes[root2]) is ConstantNode  # an operation on numbers
     assert type(nodes[a**0.5]) is Node
     assert type(nodes[expr]) is Node
+
+
+def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
+    """A node is printed by the print method of the nearest class along its MRO that
+    has one, so a Dummy, a subclass of Symbol, is an InputNode, and a class with none
+    goes to emptyPrinter, a Node. A RelayoutCharge's prices are data, not children. A
+    printer keeps its Nodes: what two calls of lower share is one Node."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    a = case.symbol("a")
+    dummy = sympy.Dummy("a")
+    case.inputs[dummy] = case.inputs[a]
+    printer = TableLowering(case.inputs, cap=CAP)
+    assert isinstance(printer, Printer)
+    leaf = printer.lower(dummy)
+    assert type(leaf) is InputNode and leaf.input is case.inputs[a]
+    assert type(printer.lower(sympy.log(a))) is Node
+    assert type(printer.lower(sympy.log(sympy.Integer(2)) + sympy.pi)) is ConstantNode
+    charge = RelayoutCharge(dummy, a, 3, 4, 5)
+    assert [child.expr for child in printer.lower(charge).children] == [dummy, a]
+    root = printer.lower(sympy.log(a) + dummy)
+    assert [child.expr for child in root.children] == list(root.expr.args)
+    assert all(child is printer.lower(child.expr) for child in root.children)
+    assert root is printer.lower(root.expr)
 
 
 def test_an_input_node_makes_its_position_on_its_variable():
@@ -202,7 +244,7 @@ def test_an_input_node_makes_its_position_on_its_variable():
     position = case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
     offset = case.integer("y", 2, 4)
     d0, d1, y = case.symbol("d0"), case.symbol("d1"), case.symbol("y")
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(d0 * d1 + y)
+    nodes = _nodes(case, d0 * d1 + y)
     assert nodes[d0].realization.index == nodes[d1].realization.index == position
     assert nodes[y].realization.index == offset and offset.lo == 2
     assert list(nodes[d1].realization.values) == [8.0, 4.0, 2.0]
@@ -231,7 +273,7 @@ def test_a_node_gathers_its_columns_from_its_children():
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     expr = a**0.5 + 2 * b
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     assert set(nodes[expr].columns) == {a, b}
     assert all(nodes[expr].columns[s] is nodes[s].columns[s] for s in (a, b))
     assert dict(nodes[2 * b].columns) == {b: nodes[b].columns[b]}
@@ -501,7 +543,7 @@ def test_a_node_is_evaluated_once_and_only_when_its_realization_is_read(monkeypa
     calls = _count_evaluations(monkeypatch)
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     assert calls == []  # making the nodes realizes nothing
     computed = [e for e in nodes if e.free_symbols and not isinstance(e, sympy.Symbol)]
     for _ in range(2):
@@ -712,7 +754,7 @@ def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
     ]
     expr = sympy.Add(*terms)
     calls = _count_lambdify(monkeypatch)
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     nodes[expr].cp_expr(case.model)
     computed = [n for n in nodes.values() if type(n) is Node]
     assert len(computed) > 300
@@ -767,7 +809,7 @@ def test_every_list_is_stage_1s(make):
     case.add_input("b", b=[1.0, 3.0])
     case.add_input("c", c=[1.0, 3.0, 7.0])
     expr = make(case.symbol("a"), case.symbol("b"), case.symbol("c"))
-    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    nodes = _nodes(case, expr)
     nodes[expr].cp_expr(case.model)
     for node in nodes.values():
         if type(node) is Node:

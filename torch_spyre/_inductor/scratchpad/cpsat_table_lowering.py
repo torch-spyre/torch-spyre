@@ -21,11 +21,12 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 
 - values: ``Index``, a position, and ``AbstractRealization``, what a node is realized
   as, with its one kind here, ``TableRealization``, hold no model;
-- the nodes: ``TableLowering`` is a factory that makes one ``Node`` per node of the
-  expression, of a class chosen by the node's sympy class. Each node realizes
-  itself, here as a table, the first time its realization is read, and reads its
-  children's realizations as it does, so reading the root realizes every node under
-  it. A node refuses a value of its own that is not finite, whether or not its
+- the nodes: ``TableLowering`` is a sympy ``Printer`` that prints a node of the
+  expression as a ``Node``: its print methods, dispatched on the node's sympy class,
+  make the Node over the Nodes of the node's children. Each node realizes itself,
+  here as a table, the first time its realization is read, and reads its children's
+  realizations as it does, so reading the root realizes every node under it. A node
+  refuses a value of its own that is not finite, whether or not its
   parent's value depends on it. A symbol's ``InputNode`` is handed its variable and
   its values, and makes its own position on that variable. The plan, the root's
   ``Node``, holds no model either;
@@ -45,7 +46,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from typing import Any, TypeAlias, cast
@@ -53,8 +54,8 @@ from typing import Any, TypeAlias, cast
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
-from sympy.functions.elementary.piecewise import ExprCondPair
 from sympy.logic.boolalg import Boolean
+from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
@@ -309,17 +310,6 @@ def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
 # ------------------------------------------------------------------------ the walk
 
 
-def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
-    """A node's children: its arguments, except a Piecewise, whose children are its
-    arms' values and conditions, and a RelayoutCharge, whose children are its literal
-    and its division (its prices are data)."""
-    if isinstance(expr, sympy.Piecewise):
-        return tuple(part for pair in expr.args for part in pair.args)
-    if isinstance(expr, RelayoutCharge):
-        return expr.args[:2]
-    return expr.args
-
-
 def _divides(expr: sympy.Basic, factor: sympy.Basic) -> bool:
     """Whether factor is a factor of the Mul expr with a negative rational exponent,
     which lambdify prints as a division."""
@@ -343,8 +333,9 @@ class Node:
 
     expr is the sympy node, injected and only read: it says which operation the node
     is, and gives its arguments and its free symbols. The Nodes make the same graph
-    as the sympy nodes: children holds the Nodes of children_of(expr), made before
-    it, and a subexpression shared by two parents is one Node that both hold. A
+    as the sympy nodes: children holds the Nodes of its children, printed before it
+    (TableLowering), and a subexpression shared by two parents is one Node that both
+    hold. A
     node reads only its children: the columns of its inputs are gathered from them,
     and it reads their realizations when it is realized, a Mul the realization of the
     base of a factor it divides by too (operands). cap bounds its table. No model is
@@ -431,8 +422,10 @@ class Node:
         then condition, a RelayoutCharge's prices as constants, and in a Mul the base
         of a factor with a negative rational exponent in its place, with the exponent.
         Every other operand is a child, as it is or as a condition."""
-        children = dict(zip(children_of(self.expr), self.children))
-        parts = children_of(self.expr) if self.expr.is_Piecewise else self.expr.args
+        children = {child.expr: child for child in self.children}
+        parts: Sequence[sympy.Basic] = self.expr.args
+        if self.expr.is_Piecewise:  # its children, not its arms
+            parts = [child.expr for child in self.children]
         sources: list[Node | float] = []
         forms: list[Form] = []
         for part in parts:
@@ -471,7 +464,7 @@ class Node:
 @dataclass(eq=False)
 class InputNode(Node):
     """A symbol: input data. input is its variable and its value at each of that
-    variable's values, injected by the factory from the inputs, or None for a symbol
+    variable's values, injected by the printer from the inputs, or None for a symbol
     with no input, which raises when it is read. The node makes its own position, an
     InputIndex on its variable, so the caller makes none."""
 
@@ -526,47 +519,61 @@ class ConstantNode(Node):
         return self._finite(TableRealization(values=value, index=UNIT))
 
 
-class TableLowering:
-    """Plans cost expressions as tables: a factory for Nodes. It makes one Node
-    per node, of the class the node's sympy class calls for, and hands it what it
-    reads; the nodes do the rest. It holds no model, so planning cannot write to one,
-    and it keeps nothing between calls of lower.
+class TableLowering(Printer):
+    """Plans cost expressions as tables: a sympy Printer whose print of a node is its
+    Node. A Printer dispatches on the node's sympy class, the nearest class along its
+    MRO that has a print method, and falls back to emptyPrinter: here each print
+    method makes the node's Node over the Nodes of the node's children, which it
+    prints first. The nodes do the rest: nothing is realized by printing. It holds no
+    model, so planning cannot write to one.
 
-    inputs gives each symbol's variable and values, which the factory hands to the
+    inputs gives each symbol's variable and values, which the printer hands to the
     symbol's InputNode; cap bounds the entries of one table, the length of its list,
-    and is handed to every node.
+    and is handed to every node. A printer keeps the Nodes it has made, by their sympy
+    node: a subexpression shared by two parents, or by two calls of lower, is printed
+    once.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
+        super().__init__()
         self.inputs = inputs
         self.cap = cap
+        self._nodes: dict[sympy.Basic, Node] = {}
 
     def lower(self, root: sympy.Basic) -> Node:
         """root as a plan: root's Node, over the graph of nodes under it. Nothing is
-        realized here; the root's cp_expr reads it, which realizes it, and through
-        it every node under it."""
-        return self.rewrite(root)[root]
+        realized here, and root is not changed; the root's cp_expr reads it, which
+        realizes it, and through it every node under it."""
+        return self._print(root)
 
-    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, Node]:
-        """Each node under root, once, as a Node holding its children's Nodes,
-        made after them, in the order of sympy.postorder_traversal with its repeats
-        dropped. An arm's ExprCondPair gets no Node. Nothing is realized here;
-        root is not changed."""
-        nodes: dict[sympy.Basic, Node] = {}
-        for expr in dict.fromkeys(sympy.postorder_traversal(root)):
-            if isinstance(expr, ExprCondPair):
-                continue
-            nodes[expr] = self._node(expr, tuple(nodes[c] for c in children_of(expr)))
-        return nodes
+    def _print(self, expr: sympy.Basic, **kwargs: Any) -> Node:
+        """expr's Node, printed the first time it is met and kept."""
+        if expr not in self._nodes:
+            self._nodes[expr] = super()._print(expr, **kwargs)
+        return self._nodes[expr]
 
-    def _node(self, expr: sympy.Basic, children: tuple[Node, ...]) -> Node:
-        """expr's Node: an InputNode holding its symbol's input, a ConstantNode for a
-        node with no free symbol, and a Node for every other node."""
-        if isinstance(expr, sympy.Symbol):
-            return InputNode(expr, children, self.cap, input=self.inputs.get(expr))
-        if not expr.free_symbols:
-            return ConstantNode(expr, children, self.cap)
-        return Node(expr, children, self.cap)
+    def _node(self, expr: sympy.Basic, children: Iterable[sympy.Basic]) -> Node:
+        """expr's Node holding the Nodes of children, printed first: a ConstantNode
+        for a node with no free symbol, and a Node for any other."""
+        kind = Node if expr.free_symbols else ConstantNode
+        return kind(expr, tuple(self._print(child) for child in children), self.cap)
+
+    def _print_Symbol(self, expr: sympy.Symbol) -> Node:
+        """An InputNode holding the symbol's input."""
+        return InputNode(expr, (), self.cap, input=self.inputs.get(expr))
+
+    def _print_Piecewise(self, expr: sympy.Piecewise) -> Node:
+        """Its children are its arms' values and conditions, value then condition: an
+        arm's ExprCondPair gets no Node."""
+        return self._node(expr, [part for pair in expr.args for part in pair.args])
+
+    def _print_RelayoutCharge(self, expr: RelayoutCharge) -> Node:
+        """Its children are its literal and its division: its prices are data."""
+        return self._node(expr, expr.args[:2])
+
+    def emptyPrinter(self, expr: sympy.Basic) -> Node:
+        """Any other node: a Node over its arguments."""
+        return self._node(expr, expr.args)
 
 
 def _constant(expr: sympy.Basic) -> float:
