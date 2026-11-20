@@ -351,21 +351,6 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   }
 }
 
-namespace {
-
-// Device dim that carries (the non-stick part of) host dim `host_dim` in a
-// layout built by SpyreTensorLayout::init with the generic stick dim order:
-// host dim 0 is the outermost device dim `host_rank - 1`; host dim h >= 1 is
-// device dim h - 1. The stick host dim (the last) also owns the stick-element
-// dim and is not covered here.
-int64_t host_dim_to_device_dim(int64_t host_rank, int64_t host_dim) {
-  TORCH_CHECK(host_dim >= 0 && host_dim < host_rank - 1, "host dim ", host_dim,
-              " must be a non-stick dim of a rank-", host_rank, " tensor");
-  return host_dim == 0 ? host_rank - 1 : host_dim - 1;
-}
-
-}  // namespace
-
 int64_t valid_element_count(const SpyreTensorLayout& stl) {
   int64_t count = 1;
   for (const auto& [dims, valid] : stl.valid_elements) count *= valid;
@@ -384,48 +369,13 @@ std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl) {
   return pairs;
 }
 
-void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,
-                                 int64_t real_size) {
-  const int64_t host_rank = static_cast<int64_t>(stl.device_size.size()) - 1;
-  const int64_t dev_dim = host_dim_to_device_dim(host_rank, dim);
-  auto it = stl.valid_elements.find({dev_dim});
-  TORCH_CHECK(it != stl.valid_elements.end(), "reserved dim ", dim,
-              " (device dim ", dev_dim,
-              ") is not a singleton valid_elements key in ", stl.toString());
-  TORCH_CHECK(real_size <= stl.device_size[dev_dim], "reserved size ",
-              real_size, " exceeds the padded device extent ",
-              stl.device_size[dev_dim]);
-  it->second = real_size;
-}
-
-bool SpyreTensorImpl::has_intact_reservation() const {
-  if (reserved_dims.empty() || storage_offset() != 0) return false;
-  // The layout has one device dim per host dim plus the stick-element dim.
-  if (static_cast<int64_t>(spyre_layout.device_size.size()) != dim() + 1)
-    return false;
-  // Strides must still be the contiguous strides of sizes().
-  int64_t expected = 1;
-  for (int64_t d = dim() - 1; d >= 0; d--) {
-    if (sizes()[d] != 1 && strides()[d] != expected) return false;
-    expected *= std::max<int64_t>(sizes()[d], 1);
-  }
-  for (const auto& [rdim, info] : reserved_dims) {
-    if (rdim < 0 || rdim >= dim() - 1) return false;
-    const int64_t dev_dim = host_dim_to_device_dim(dim(), rdim);
-    auto it = spyre_layout.valid_elements.find({dev_dim});
-    if (it == spyre_layout.valid_elements.end() || it->second != info.max)
-      return false;
-  }
-  return true;
-}
-
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
     const at::Tensor& tensor) {
   if (!tensor.is_privateuseone()) {
     return std::nullopt;
   }
   auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-  if (impl == nullptr || !impl->has_intact_reservation()) {
+  if (impl == nullptr || impl->reserved_dims.empty()) {
     return std::nullopt;
   }
   return impl->reserved_dims;

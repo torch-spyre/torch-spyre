@@ -561,16 +561,24 @@ bool view_covers_layout(const std::map<int64_t, int64_t>& layout_extent,
 // finest positive stride_map value (for a stick pair, the host stick stride).
 int64_t capped_count(int64_t count, int64_t finest,
                      const std::map<int64_t, int64_t>& size_at_stride,
-                     int64_t view_numel) {
+                     const std::vector<int64_t>& view_sizes,
+                     const std::vector<int64_t>& view_strides) {
   // A view dim at this stride limits the count to its size.
   const auto size = size_at_stride.find(finest);
   if (size != size_at_stride.end()) return std::min(count, size->second);
   // The view has no dim at this stride. A stick key (finest stride 1) is then
-  // indexed away. Any other key is still covered when the view holds the
-  // count * finest host elements it spans (a flattened view walks through the
-  // device dims below its innermost contiguous run); otherwise it is indexed
-  // away and one element (or row) remains.
-  if (finest == 1 || view_numel < count * finest) return 1;
+  // indexed away. Any other key is still covered only when the view dims below
+  // this stride hold the count * finest host elements it spans (a flattened
+  // view walks through them); the view's other dims, such as an index dim
+  // removed by unbind, do not extend the key. Otherwise one element (or row)
+  // remains.
+  int64_t inner_numel = 1;
+  for (size_t i = 0; i < view_sizes.size(); i++) {
+    if (view_sizes[i] > 1 && view_strides[i] > 0 && view_strides[i] < finest) {
+      inner_numel *= view_sizes[i];
+    }
+  }
+  if (finest == 1 || inner_numel < count * finest) return 1;
   return count;
 }
 
@@ -585,7 +593,6 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
   if (view_covers_layout(layout_extent, view_sizes, view_strides)) return;
   const std::map<int64_t, int64_t> size_at_stride =
       view_size_at_stride(layout_extent, view_sizes, view_strides);
-  const int64_t view_numel = c10::multiply_integers(view_sizes);
 
   for (auto& [dims, count] : stl.valid_elements) {
     std::optional<int64_t> finest;
@@ -594,7 +601,8 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
       if (stride > 0 && (!finest || stride < *finest)) finest = stride;
     }
     if (finest)
-      count = capped_count(count, *finest, size_at_stride, view_numel);
+      count = capped_count(count, *finest, size_at_stride, view_sizes,
+                           view_strides);
   }
 }
 
@@ -1127,7 +1135,6 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto padded_size = size.vec();
   padded_size[dim] = max_size;
   auto device_layout = SpyreTensorLayout(padded_size, dtype);
-  set_reserved_valid_elements(device_layout, dim, max_size);
 
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   // Overflow-checked (throws), unlike a bare accumulate: a huge `max` must
@@ -1218,6 +1225,14 @@ at::Tensor spyre_empty_reserved_with_layout(
               carrier, " (the reserved host dimension ", dim,
               ") must have extent max=", max_size, ", got ",
               device_size[carrier]);
+  const auto carrier_valid = device_layout.valid_elements.find({carrier});
+  TORCH_CHECK(carrier_valid != device_layout.valid_elements.end() &&
+                  carrier_valid->second == max_size,
+              "device_layout with a reservation: the layout's valid count for "
+              "the reserved host dimension ",
+              dim, " must be the declared max=", max_size,
+              " on its own singleton device dimension ", carrier, ", got ",
+              device_layout.toString());
 
   // The layout must also hold the host shape at max_size as a whole. The
   // storage below is sized from the layout, so a layout too small in another
@@ -1866,18 +1881,6 @@ std::vector<int64_t> pinned_reserved_layout_size(
     c10::IntArrayRef size_int) {
   std::vector<int64_t> layout_size = size_int.vec();
   {
-    // reserved_dims keys are absolute dim indices. If the shape, strides or
-    // offset were changed in place since allocation (t_, squeeze_,
-    // as_strided_, ...), a key can name a different axis than it did, and
-    // every check below would validate the wrong dimension. Fail rather than
-    // trust it; falling through as "unreserved" would reallocate instead.
-    TORCH_CHECK(self_impl.has_intact_reservation(),
-                "resize_ on a max-reserved Spyre tensor: its shape, strides "
-                "or storage offset were changed in place after allocation "
-                "(e.g. t_(), transpose_(), squeeze_(), as_strided_()), so the "
-                "reservation no longer refers to the same axis. current "
-                "shape=",
-                self.sizes());
     // Scope today: at most one entry, so this loop runs once; the guard is
     // already written per-dim so a later second entry needs no changes here.
     for (const auto& [rdim, info] : self_impl.reserved_dims) {
@@ -2072,7 +2075,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   const auto* root_impl =
       static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
-  if (root_impl->has_intact_reservation()) {
+  if (!root_impl->reserved_dims.empty()) {
     whole_elements = root.numel();
   } else if (!root_impl->spyre_layout.valid_elements.empty()) {
     whole_elements = 1;

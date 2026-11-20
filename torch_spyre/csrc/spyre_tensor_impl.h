@@ -345,19 +345,6 @@ class SpyreTensorImpl : public at::TensorImpl {
    */
   std::map<int64_t, ReservedDimInfo> reserved_dims;
 
-  /**
-   * True if this tensor has a reservation AND is still the tensor it was
-   * allocated as. reserved_dims keys are absolute dim indices, so they only
-   * mean something while the axes are unchanged. The layout's valid_elements
-   * entry for each reserved dim is set to the real size at allocation and on
-   * every spyre_resize_, but in-place metadata ops (t_, transpose_, squeeze_,
-   * unsqueeze_, as_strided_) change sizes()/strides() without touching it. A
-   * mismatch with sizes(), non-contiguous strides, a rank change or a
-   * nonzero storage offset therefore means the map is stale, and callers
-   * must not trust it.
-   */
-  bool has_intact_reservation() const;
-
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
@@ -423,11 +410,6 @@ struct StickPair {
 // The stick pairs of `stl`, in key order. Throws on a key that is neither a
 // singleton {j} nor a stick pair, which the host copy path cannot describe.
 std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl);
-
-// Records `real_size` as the valid extent of reserved host dim `dim` (the
-// layout was built from the padded shape). Only non-stick dims are supported.
-void set_reserved_valid_elements(SpyreTensorLayout& stl, int64_t dim,
-                                 int64_t real_size);
 
 }  // namespace spyre
 
