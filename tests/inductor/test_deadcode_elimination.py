@@ -22,7 +22,9 @@ from torch import fx
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
@@ -178,6 +180,92 @@ class TestDeadMutationElimination(unittest.TestCase):
 
         self.assertIn("mutation", survivors)
         self.assertIn("producer", survivors)
+
+
+class TestMutatingFallbackElimination(unittest.TestCase):
+    """A mutating ``ExternKernel`` is judged by the mutation it declares.
+
+    An ``IndexPutFallback`` owns no output buffer and is no ``FallbackKernel``,
+    so judging side effects by class alone reads it as pure and drops the write.
+    A ``FallbackKernel`` is excluded: the one name it declares does not cover
+    all it does, so ``has_side_effects`` stays the decider for it.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(V.set_fake_mode(FakeTensorMode()))
+        stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
+
+    def _index_put(self, target_name):
+        """``target[index] = values`` as the lowering's mutating fallback."""
+        # Same buffer fixture as the class above.
+        make = TestDeadMutationElimination._make_buffer
+        target = make(target_name)
+        values = make("values")
+        index = make("index")
+        fallback = IndexPutFallback(
+            torch.ops.aten.index_put_.default,
+            TensorBox(StorageBox(target)),
+            [TensorBox(StorageBox(index))],
+            TensorBox(StorageBox(values)),
+            False,
+        )
+        self.assertEqual(
+            fallback.get_mutation_names(), [target_name], "fixture drifted"
+        )
+        return [target, values, index, fallback], fallback.get_name()
+
+    def _run(self, operations, output_names):
+        V.graph.operations = list(operations)
+        V.graph.get_output_names = lambda: list(output_names)
+        deadcode_elimination(V.graph)
+        return {op.get_name() for op in V.graph.operations}
+
+    def test_mutating_fallback_into_live_target_is_kept(self):
+        """The write reaches a graph output, so the op and its reads stay."""
+        ops, name = self._index_put("live_target")
+
+        survivors = self._run(ops, output_names=["live_target"])
+
+        self.assertIn(name, survivors)
+        self.assertIn("values", survivors)
+
+    def test_mutating_fallback_into_dead_target_is_collected(self):
+        """Nothing reads the destination, so the write is still dropped."""
+        ops, name = self._index_put("dead_target")
+
+        survivors = self._run(ops, output_names=[])
+
+        self.assertNotIn(name, survivors)
+        self.assertNotIn("values", survivors)
+
+    def test_impure_fallback_into_dead_target_is_kept(self):
+        """An impure fallback stays although the buffer it writes is dead.
+
+        ``normal_`` is a Spyre fallback op: it mutates its argument and also
+        advances the generator, so the write going unread does not make the
+        call dead. Judging it by the one name it declares would drop it and
+        shift the RNG stream for every random op after it.
+        """
+        target = TestDeadMutationElimination._make_buffer("rng_target")
+        before = len(V.graph.operations)
+        FallbackKernel.create(
+            torch.ops.aten.normal_.default, TensorBox(StorageBox(target))
+        )
+        ops = V.graph.operations[before:]
+        self.assertEqual(
+            [list(op.get_mutation_names()) for op in ops],
+            [["rng_target"]],
+            "fixture drifted",
+        )
+        self.assertTrue(all(op.has_side_effects() for op in ops), "not impure")
+
+        survivors = self._run([target, *ops], output_names=[])
+
+        self.assertLessEqual({op.get_name() for op in ops}, survivors)
 
 
 class TestUnusedCollectiveIsKept(unittest.TestCase):

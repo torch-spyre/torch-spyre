@@ -1,0 +1,275 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Read-only stores behind plan (reuse lookup), run (rows landed) and verdict: none, ClickHouse, in-memory.
+
+The engine never writes rows; the ingest does. A store that cannot answer raises StoreError, which callers report
+(exit 5) rather than treat as "nothing stored".
+"""
+
+import os
+import uuid
+from datetime import datetime, timezone
+
+import regex as re
+
+from spyre_bench import engine
+
+LABEL_PREFIX = "env.label."
+ID_BATCH = 1000
+DB_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+STATUS_OF_VIEW = {"unchanged": "pass"}  # the SQL view's word for the engine's `pass`
+INSTALL_HINT = "install clickhouse-connect (pip install 'spyre-bench[clickhouse]')"
+
+
+class StoreError(RuntimeError):
+    """The store is unreachable, misconfigured or refused the query."""
+
+
+class Store:
+    """Interface. Subclasses answer from their own backend; the base answers "nothing stored"."""
+
+    name = "none"
+
+    def stored_results(self, benchmark_ids, subject_id):
+        """Rows for engine.reuse_lookup: benchmark_id, subject_id, env_id, labels, validity, n, ts, run_id."""
+        return []
+
+    def invalidations(self, run_ids):
+        """Active invalidation events for these runs (none are readable yet)."""
+        return []
+
+    def check(self):
+        """Raise StoreError if the store cannot possibly work (missing settings); never connects."""
+
+    def landed(self, run_id):
+        """The benchmark_ids that have measurement rows for a run."""
+        raise StoreError(f"store {self.name!r} cannot report landed rows")
+
+    def verdict_rows(self, run_id):
+        """Raw verdict rows (dicts) of one run."""
+        raise StoreError(f"store {self.name!r} holds no verdicts")
+
+    def latest_run(self, artifact_id):
+        """The run id of the artifact's newest run that has measurement rows, or None."""
+        raise StoreError(f"store {self.name!r} holds no runs")
+
+
+class NullStore(Store):
+    pass
+
+
+class MemoryStore(Store):
+    """In-memory store for tests and demos: lists of dicts shaped like the rows each method returns."""
+
+    name = "memory"
+
+    def __init__(self, results=(), landed=None, verdicts=None, runs=None, fail=None):
+        self.results = list(results)
+        self.landed_ids = landed if landed is not None else {}
+        self.verdicts = verdicts if verdicts is not None else {}
+        self.runs = runs if runs is not None else {}
+        self.fail = fail
+        self.calls = []
+
+    def _check(self, what):
+        self.calls.append(what)
+        if self.fail:
+            raise StoreError(self.fail)
+
+    def stored_results(self, benchmark_ids, subject_id):
+        self._check("stored_results")
+        return [r for r in self.results if r["benchmark_id"] in set(benchmark_ids) and r["subject_id"] == subject_id]
+
+    def landed(self, run_id):
+        self._check("landed")
+        got = self.landed_ids.get(run_id, set())
+        return set(got() if callable(got) else got)
+
+    def verdict_rows(self, run_id):
+        self._check("verdict_rows")
+        return list(self.verdicts.get(run_id, []))
+
+    def latest_run(self, artifact_id):
+        self._check("latest_run")
+        return self.runs.get(artifact_id)
+
+
+def connection_settings(env=None):
+    """ClickHouse connection settings from CLICKHOUSE_* (database also BENCH_CLICKHOUSE_DB)."""
+    env = os.environ if env is None else env
+
+    def get(name, default=""):
+        return (env.get(name) or "").strip() or default
+
+    host = get("CLICKHOUSE_HOST")
+    if not host:
+        raise StoreError("CLICKHOUSE_HOST is unset; the clickhouse store needs CLICKHOUSE_HOST (and CLICKHOUSE_PASS)")
+    port = get("CLICKHOUSE_PORT", "443")
+    if not port.isdigit():
+        raise StoreError(f"CLICKHOUSE_PORT is not a number: {port!r}")
+    db = get("BENCH_CLICKHOUSE_DB") or get("CLICKHOUSE_DB_V2") or get("CLICKHOUSE_DB")
+    if not db or not DB_NAME.match(db):
+        raise StoreError(
+            "database name unset or invalid: set BENCH_CLICKHOUSE_DB (or CLICKHOUSE_DB_V2) to [A-Za-z0-9_]+"
+        )
+    return {
+        "host": host,
+        "port": int(port),
+        "username": get("CLICKHOUSE_USER", "default"),
+        "password": get("CLICKHOUSE_PASS"),
+        "secure": get("CLICKHOUSE_SECURE", "1") not in ("0", "false", "no"),
+        "database": db,
+    }
+
+
+def validity_word(value):
+    """A stored validity in the engine's vocabulary; anything else (absent, misspelt) is invalid."""
+    return value if value in engine.VALIDITY_ORDER else "invalid"
+
+
+def _uuid_or_none(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+class ClickHouseStore(Store):
+    """Reads the v2 tables and views over clickhouse_connect. `client` is injectable for tests."""
+
+    name = "clickhouse"
+
+    def __init__(self, client=None, database=None, env=None):
+        self._client = client
+        self._env = env
+        self._db = database
+
+    def check(self):
+        """Raise StoreError now if the connection settings are missing, without connecting."""
+        if self._client is None:
+            connection_settings(self._env)
+
+    def _connection(self):
+        if self._client is None:
+            settings = connection_settings(self._env)
+            try:
+                import clickhouse_connect
+            except ImportError as e:
+                raise StoreError(f"clickhouse_connect is not importable ({e}); {INSTALL_HINT}") from e
+            self._db = settings.pop("database")
+            try:
+                self._client = clickhouse_connect.get_client(**settings)
+            except Exception as e:  # noqa: BLE001 - any connect failure must surface as a store error
+                raise StoreError(f"cannot connect to ClickHouse: {type(e).__name__}: {e}") from e
+        if self._db is None:
+            self._db = connection_settings(self._env)["database"]
+        return self._client
+
+    def _rows(self, sql, parameters):
+        client = self._connection()
+        sql = sql.replace("{db}", f"`{self._db}`")
+        try:
+            result = client.query(sql, parameters=parameters)
+        except Exception as e:  # noqa: BLE001 - any query failure must surface as a store error
+            raise StoreError(f"ClickHouse query failed: {type(e).__name__}: {e}") from e
+        return [dict(zip(result.column_names, row)) for row in result.result_rows]
+
+    def stored_results(self, benchmark_ids, subject_id):
+        subject = _uuid_or_none(subject_id)
+        ids = sorted({i for i in (_uuid_or_none(b) for b in benchmark_ids) if i})
+        if not subject or not ids:
+            return []
+        out = []
+        for start in range(0, len(ids), ID_BATCH):  # one Array(UUID) parameter must stay under the HTTP limit
+            out += self._stored_batch(subject, ids[start : start + ID_BATCH])
+        return out
+
+    def _stored_batch(self, subject, ids):
+        rows = self._rows(
+            "SELECT toString(run_id) AS run_key, toString(benchmark_id) AS benchmark_key, max(run_ts) AS stored_at, "
+            "groupArray(run_props) AS props_all, "
+            "max(arrayMax(arrayMap(v -> length(v), mapValues(samples)))) AS n "
+            "FROM {db}.v_benchmark_results_enriched "
+            "WHERE artifact_id = {subject:UUID} AND benchmark_id IN {ids:Array(UUID)} "
+            "GROUP BY run_id, benchmark_id",
+            {"subject": subject, "ids": ids},
+        )
+        out = []
+        for r in rows:
+            props_all = [p or {} for p in (r["props_all"] or [{}])]
+            props = props_all[0]
+            ts = r["stored_at"]
+            if not isinstance(ts, datetime):
+                continue  # no usable timestamp: unknown, so never reused
+            env_ids = {p.get("env.id") for p in props_all}
+            validity = min(
+                (validity_word(p.get("run.validity")) for p in props_all), key=engine.VALIDITY_ORDER.index
+            )  # one weak row weakens the whole (run, benchmark)
+            out.append(
+                {
+                    "run_id": r["run_key"],
+                    "benchmark_id": r["benchmark_key"],
+                    "subject_id": subject,
+                    "env_id": (env_ids.pop() or None) if len(env_ids) == 1 else None,
+                    "labels": {k: v for k, v in props.items() if k.startswith(LABEL_PREFIX)},
+                    "validity": validity,
+                    "n": int(r["n"] or 0),
+                    "ts": ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc),
+                }
+            )
+        return out
+
+    def landed(self, run_id):
+        run = _uuid_or_none(run_id)
+        if not run:
+            raise StoreError(f"run id {run_id!r} is not a UUID")
+        rows = self._rows(
+            "SELECT DISTINCT toString(benchmark_id) AS benchmark_key FROM {db}.benchmark_runs WHERE run_id = {run:UUID}",
+            {"run": run},
+        )
+        return {r["benchmark_key"] for r in rows}
+
+    def latest_run(self, artifact_id):
+        artifact = _uuid_or_none(artifact_id)
+        if not artifact:
+            raise StoreError(f"artifact id {artifact_id!r} is not a UUID")
+        rows = self._rows(
+            "SELECT toString(run_id) AS run_key FROM {db}.v_benchmark_metric_verdicts "
+            "WHERE run_id IN (SELECT run_id FROM {db}.v_benchmark_results_enriched WHERE artifact_id = {artifact:UUID}) "
+            "GROUP BY run_id ORDER BY max(ts) DESC LIMIT 1",
+            {"artifact": artifact},
+        )
+        return rows[0]["run_key"] if rows else None
+
+    def verdict_rows(self, run_id):
+        run = _uuid_or_none(run_id)
+        if not run:
+            raise StoreError(f"run id {run_id!r} is not a UUID")
+        return self._rows(
+            "SELECT toString(run_id) AS run_key, toString(benchmark_id) AS benchmark_key, name, component, backend, "
+            "arch, metric, tier, status, reason, baseline_kind, n_baseline, n_current, baseline_value, "
+            "current_value, delta_pct, worse_pct, floor_pct "
+            "FROM {db}.v_benchmark_metric_verdicts WHERE run_id = {run:UUID} ORDER BY name, metric",
+            {"run": run},
+        )
+
+
+def open_store(name, client=None):
+    """Store by name: none | clickhouse."""
+    if name in (None, "", "none"):
+        return NullStore()
+    if name == "clickhouse":
+        return ClickHouseStore(client=client)
+    raise StoreError(f"unknown store {name!r} (none | clickhouse)")

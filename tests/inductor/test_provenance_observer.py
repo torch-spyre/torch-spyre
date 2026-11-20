@@ -347,7 +347,7 @@ class TestSplitMultiOpsProvenance:
         prior = ProvenanceTransform("rewrite", "prior_pass")
         setattr(parent, _SPYRE_PROV_HISTORY_ATTR, (prior,))
 
-        operations = []
+        operations = [parent]
         graph_lowering = _FakeGraphLowering(graph, operations)
         _make_intermediate_bufs(
             [
@@ -363,15 +363,16 @@ class TestSplitMultiOpsProvenance:
             {0: input_node.name},
             SimpleNamespace(dtype=torch.float32, device=torch.device("cpu")),
             operations,
-            0,
+            parent,
             graph_lowering,
             orig_node,
             parent,
             final_op_name="add",
         )
 
-        assert len(operations) == 2
-        handles = [build_debug_handle(buffer) for buffer in operations]
+        assert len(operations) == 3
+        assert operations[-1] is parent  # the new buffers go before it
+        handles = [build_debug_handle(buffer) for buffer in operations[:2]]
         assert all(handle is not None for handle in handles)
         assert {handle.source.to_str() for handle in handles} == {"/tmp/model.py:41:0"}
         assert {handle.aten_op for handle in handles} == {

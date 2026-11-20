@@ -795,7 +795,7 @@ def generate_sdsc(
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
-            str(dim): int(expr.subs({Symbol("core_id"): c}))
+            str(dim): int(expr.xreplace({Symbol("core_id"): c}))
             for dim, expr in sdsc_spec.core_id_to_work_slice.items()
         }
         for c in range(sdsc_spec.num_cores)
@@ -1026,7 +1026,7 @@ def generate_sdsc(
             #
             # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
             # a minted symbol names a loop-nesting *level*, not a
-            # dimension -- _general_tile_advance (spyre_kernel.py) sums
+            # dimension -- _index_tile_advance (spyre_kernel.py) sums
             # every host dim tiled at a level into ONE combined
             # coefficient on that level's minted symbol before this
             # tensor's device_tile_advance_expr is ever built, so by the

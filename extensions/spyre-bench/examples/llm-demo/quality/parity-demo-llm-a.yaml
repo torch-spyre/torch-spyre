@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Greedy output parity against a stored reference asset. The reference is produced once and
+# consumed here by content id; `depends_on` orders the plan.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-tp1-fp16-mml100}
+spec:
+  type: llm/vllm
+  backend: spyre
+  token: demoa
+  model: demo-llm-a
+  precision: fp16
+  flags: {max-model-len: 100, max-num-seqs: 10}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: parity-demo-llm-a, owner: example-team}
+spec:
+  type: quality
+  level: service
+  tier: sanity
+  system: demo-llm-a-tp1-fp16-mml100
+  workload:
+    type: llm/parity
+    inputs:
+      - {name: prompts, dataset: parity-prompts}
+      - {name: reference, asset: demo-llm-a-reference-outputs}
+    sampling: {temperature: 0, max_tokens: 128}
+  environment: ref-1card
+  run: {cache: warm, timeout: 30m, est: 12m}
+  relations:
+    - {type: depends_on, target: reference-outputs-demo-llm-a}
+  variants:
+    - name: parity_demoa_tp1_greedy_n64_out128

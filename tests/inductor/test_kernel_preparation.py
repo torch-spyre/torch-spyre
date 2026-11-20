@@ -23,6 +23,7 @@ emission, and the late binding of pooled intermediates.
 from types import SimpleNamespace
 from unittest.mock import Mock, patch as mock_patch
 
+import pytest
 import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep
@@ -156,6 +157,51 @@ def test_a_rejected_attempt_demotes_restarts_and_keeps_the_final_kernels():
     assert layouts["z"].allocation == {"lx": 0} and layouts["z"].lx_view is _VIEW
     for node in (writer, copy, unrelated):
         assert node.prepared_kernel is kernels[node.name]
+
+
+def test_kernel_preparation_gives_up_after_exhausting_the_demotion_budget():
+    """A failure that demotion never actually clears must not loop forever.
+
+    Real demotion always drops progress within a bounded number of retries;
+    forcing it to a no-op here simulates a genuine non-convergent failure,
+    so the pass must exhaust its retry budget and raise instead of looping.
+    """
+
+    layouts = {"target": _layout(True)}
+    stubborn = _Node("stubborn", writes=("target",))
+    graph, backend = _graph(layouts)
+    graph._spyre_lx_relayout_copies = {}
+    attempts = []
+
+    def prepare(node, kernel):
+        attempts.append(node.name)
+        kernel.failed_node = node
+        raise ValueError("ownership mismatch: never resolves")
+
+    with (
+        mock_patch.object(scheduler_module, "SchedulerNode", _Node),
+        mock_patch.object(scheduler_module, "V", SimpleNamespace(graph=graph)),
+        mock_patch.object(backend, "prepare_kernel", side_effect=prepare),
+        mock_patch.object(
+            scheduler_module,
+            "materialized_lx_relayout_for_destination",
+            return_value=None,
+        ),
+        # No-op: real demotion would clear "target"'s LX allocation, which
+        # would let the second attempt succeed instead of exhausting the
+        # budget -- exactly the case under test.
+        mock_patch.object(scheduler_module, "demote_lx_relayout_group"),
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="LX ownership finalization did not reach its monotone "
+            "demotion fixed point",
+        ):
+            scheduler_module.prepare_spyre_kernels([stubborn])
+
+    # initial_lx_names has exactly one entry ("target"), so the pass allows
+    # itself len(initial_lx_names) + 1 == 2 full attempts before giving up.
+    assert attempts == ["stubborn", "stubborn"]
 
 
 def test_a_pooled_mutation_destination_leaves_the_external_argument_list():

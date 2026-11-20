@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
+    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -52,6 +53,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -488,7 +490,7 @@ def _unambiguous_physical_axis(
     positions = [
         index
         for index, coordinate in enumerate(arg.device_coordinates[:-1])
-        if dim in coordinate.subs(symbol_mapping).free_symbols
+        if dim in coordinate.xreplace(symbol_mapping).free_symbols
     ]
     return positions[0] if len(positions) == 1 else None
 
@@ -526,7 +528,7 @@ def _get_device_dim_order(
     - Explicitly includes kernel dimensions (ki, kj) even if they don't appear in device_coordinates
       (e.g., when kernel_size=1, they don't iterate naturally but are still structural dimensions).
     """
-    last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
+    last_coord = arg.device_coordinates[-1].xreplace(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
     stick_dim = free[0] if free else None
 
@@ -545,7 +547,7 @@ def _get_device_dim_order(
                         if sym not in dim_order:
                             dim_order.append(sym)
             continue
-        expr = coord.subs(symbol_mapping)
+        expr = coord.xreplace(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
         for sym in sorted(expr.free_symbols, key=str):
@@ -1499,6 +1501,42 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
+# A QFP8WT 2D stick packs 2 K rows x 64 N columns into 128 bytes, so a K row is
+# 64 bytes, while dim_device_stride counts 128. A K start offset is therefore
+# halved; K is device coordinate -2, directly outside the stick.
+_QFP8WT_ROWS_PER_STICK = 2
+
+
+def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
+    """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
+    return (
+        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
+    )
+
+
+def _check_qfp8wt_offset(arg: TensorArg) -> None:
+    """Reject a QFP8WT offset that cannot be addressed.
+
+    An odd K start falls inside a stick, and offsets on other axes (column
+    slices) are not modelled; either would read the wrong data.
+    """
+    origin = [
+        c.xreplace({s: Integer(0) for s in c.free_symbols})
+        for c in arg.device_coordinates
+    ]
+    k_axis = len(origin) - 2
+    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+        raise Unsupported(
+            f"a column offset into a QFP8WT weight (device origin {origin}); "
+            "only a row slice of a QFP8WT weight is supported"
+        )
+    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
+        raise Unsupported(
+            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
+            f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
+        )
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -1558,6 +1596,9 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
+        is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
+        if is_qfp8wt_2d_stick:
+            _check_qfp8wt_offset(arg)
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1572,7 +1613,7 @@ def _create_sdsc_tensors(
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
-        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # advance, stamped by loop_tiling_lowering.lower_loop_tiling (host-stride
         # terms) and substituted to device-stride terms, per-arg, by
         # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
         # levels is handled later, in compute_ops.generate_sdsc's
@@ -1606,7 +1647,7 @@ def _create_sdsc_tensors(
                         axis
                         for axis, coordinate in enumerate(arg.device_coordinates[:-1])
                         if int(arg.device_size[axis]) > 1
-                        and not coordinate.subs(symbol_mapping).free_symbols
+                        and not coordinate.xreplace(symbol_mapping).free_symbols
                         and math.prod(arg.device_size[axis + 1 :]) == element_advance
                     ]
                     if len(candidates) == 1:
@@ -1621,7 +1662,7 @@ def _create_sdsc_tensors(
         gap_factor_by_inner_axis: dict[int, int] = {}
         for tiled_axis in tiled_constant_axes:
             for inner_axis in range(tiled_axis + 1, len(arg.device_coordinates) - 1):
-                coordinate = arg.device_coordinates[inner_axis].subs(symbol_mapping)
+                coordinate = arg.device_coordinates[inner_axis].xreplace(symbol_mapping)
                 if coordinate.free_symbols:
                     gap_factor_by_inner_axis[inner_axis] = gap_factor_by_inner_axis.get(
                         inner_axis, 1
@@ -1739,9 +1780,11 @@ def _create_sdsc_tensors(
                     if stick_dim not in dim_order:
                         dim_order = dim_order + [stick_dim]
 
-        # layernormscale is unary on one value per stick, so the stick dim is
-        # reduced on the input and on the output.
-        if op_spec.op == "layernormscale":
+        # layernormscale is unary on one value per stick. For fp32 the stick dim
+        # is reduced on the input and on the output; otherwise only on the input.
+        if op_spec.op == "layernormscale" and (
+            arg.device_dtype == DataFormats.IEEE_FP32 or len(sdsc_args) == 0
+        ):
             reduced_dims = [stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
@@ -1885,6 +1928,9 @@ def _create_sdsc_tensors(
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
+                n_coords = len(arg.device_coordinates)
+                if is_qfp8wt_2d_stick and coord_idx % n_coords == n_coords - 2:
+                    dim_offset //= _QFP8WT_ROWS_PER_STICK
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
@@ -1911,7 +1957,7 @@ def _create_sdsc_tensors(
                     dim != stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
-                    and coord_without_offset.subs(symbol_mapping) == dim
+                    and coord_without_offset.xreplace(symbol_mapping) == dim
                     and coord_without_offset in op_spec.iteration_space
                     and -(
                         -it_dim_size
@@ -2020,7 +2066,7 @@ def _create_sdsc_tensors(
             # weight (from the matmul's reduction variable), and
             # qfp8wt_dim_order does by default otherwise.
             companion = None
-            k_syms = arg.device_coordinates[-2].subs(symbol_mapping).free_symbols
+            k_syms = arg.device_coordinates[-2].xreplace(symbol_mapping).free_symbols
             if len(k_syms) == 1:
                 companion = next(iter(k_syms))
             if (
@@ -2182,11 +2228,31 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
-def _ref_arg(op_spec):
-    if op_spec.is_reduction:
-        return op_spec.args[0]
+def _merged_reduction_dim_order(op_spec, symbol_mapping):
+    """Union op_dim_order/op_stick_dim across every reduction operand.
 
-    return op_spec.args[-1]
+    A broadcast operand (e.g. an expand()'d reduction input) collapses the
+    dims it does not vary over to a constant, dropping them from its own
+    dim_order; a reduction's destination/accumulator likewise elides its own
+    stick to a constant. Basing op_dim_order on a single operand can
+    therefore miss dims that only appear on another operand, so this merges
+    the per-operand dim orders instead, keeping the first non-None stick
+    symbol seen.
+
+    Operands are visited in op_spec.args order. A dim shared by two operands
+    is assumed to appear in the same relative order in both; if they
+    disagree, the order from the first operand to mention it wins.
+    """
+    merged_order: list[Symbol] = []
+    merged_stick: Symbol | None = None
+    for arg in op_spec.args:
+        order, stick = _get_device_dim_order(arg, symbol_mapping)
+        if merged_stick is None:
+            merged_stick = stick
+        for sym in order:
+            if sym not in merged_order:
+                merged_order.append(sym)
+    return merged_order, merged_stick
 
 
 def _round_up_to_stick(
@@ -2505,14 +2571,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
     )
-    # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
-    # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
-    # loop-nesting-level markers -- so they have no dim label to rename to.
+    # Tile-advance symbols (see spyre_kernel.py's _get_or_mint_level_symbol) are
+    # not iteration-space dimensions -- they are loop-nesting-level markers -- so
+    # they have no dim label to rename to. They are a loop's own induction
+    # variable (`u{n}`) or, for an op with no loop variable (span-overflow, the
+    # allocator's tiling), a minted `_tile_adv_{op_name}_lvl{n}`.
     # Register each as an identity mapping instead, so compile_op_spec's
     # `symbol_mapping[s]` lookup for op_spec.tiled_symbols does not silently
     # drop them. setdefault never overwrites a real-symbol entry above, and
-    # collides with none: minted names (`_tile_adv_{op_name}_lvl{n}`) can
-    # never equal a dim label or a real Inductor `d{i}` symbol name.
+    # collides with none: neither form can equal a dim label or a real Inductor
+    # `d{i}` symbol name.
     for level in op_spec.tiled_symbols:
         for sym in level:
             symbol_mapping.setdefault(sym, sym)
@@ -2608,8 +2676,24 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    if op_spec.is_reduction:
+        if (
+            not (is_matmul or is_pool or has_indirect_access)
+            and not is_conv
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
+            op_dim_order, op_stick_dim = _merged_reduction_dim_order(
+                op_spec, symbol_mapping
+            )
+        else:
+            op_dim_order, op_stick_dim = _get_device_dim_order(
+                op_spec.args[0], symbol_mapping
+            )
+    else:
+        op_dim_order, op_stick_dim = _get_device_dim_order(
+            op_spec.args[-1], symbol_mapping
+        )
 
     # A dtype conversion that changes the elements per stick (DL16TOFP32,
     # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
@@ -2731,41 +2815,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow a core-split index-entry iteration to the padded output device_size.
-    # The output's entry-dim device_size was rounded up to the index stick
-    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
-    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors puts each core's output base on a stick boundary
-    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
-    # grown iteration would dereference the index's padding lanes as table rows,
-    # and those hold whatever the index's producer left there.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    # Never iterate past the index's allocated entries: the padding
-                    # lanes past them are uninitialized and read as indices.
-                    idx_pos = next(
-                        i
-                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
-                        if c.free_symbols == {entry_c}
-                    )
-                    idx_eps = idx_arg.device_dtype.elems_per_stick()
-                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
-                    dev = min(int(out_arg.device_size[pos]), idx_extent)
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dim_splits[entry_mb] > 1
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
-
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if reinstated_unit_spatial:
         injected_dims["unit_spatial_dims"] = reinstated_unit_spatial
@@ -2872,7 +2921,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]
             for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
-                mapped_coord = coord.subs(symbol_mapping)
+                mapped_coord = coord.xreplace(symbol_mapping)
                 dim_sym = next(
                     (
                         s
