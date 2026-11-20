@@ -1691,7 +1691,15 @@ class _OPWrapper:
         # dispatch reaches that rewrite through this lazy compilation path,
         # outside Dynamo's usual scalar-capture setup.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
-            return self._compiled_fn(*args, **kwargs)
+            try:
+                return self._compiled_fn(*args, **kwargs)
+            except Exception:
+                # A RuntimeError raised while the decomposition is traced makes
+                # Dynamo skip the function from then on. Later calls would run
+                # its Python body, whose custom ops have no eager kernel and
+                # return None. Clear that state so the next call compiles again.
+                torch._C._dynamo.eval_frame.reset_code(self._fn.__code__)
+                raise
 
 
 def _register_spyre_dispatchkey_kernels_permanently():

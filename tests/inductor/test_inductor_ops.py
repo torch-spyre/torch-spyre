@@ -11651,6 +11651,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         "spyre",
                         compile=compile_mode,
                     )
+        # An eager call that raised must leave the next eager call working. Called
+        # directly: _compile_and_run resets the compile caches between calls.
+        x_dev = x.to("spyre")
+        with pytest.raises(RuntimeError, match="bins must be > 0"):
+            torch.histc(x_dev, bins=0)
+        out = torch.histc(x_dev, bins=8, min=0, max=1)
+        assert out is not None
+        torch.testing.assert_close(
+            out.cpu(), torch.histc(x, bins=8, min=0, max=1), rtol=0, atol=0
+        )
 
     @expects_raise
     def test_topk_largest_false_rejected(self):
