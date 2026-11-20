@@ -21,16 +21,16 @@ unit from the first pass after the splice.  ``loop_info`` stays on the leaf
 ops: the node adds structure and the per-loop facts (induction variable, trip
 count, carries) but replaces nothing yet.
 
-Passes that know nothing about nodes run against :class:`OpsView`, which
-iterates the leaf ops in program order and forwards every mutation to the list
-that owns the op.  After the pass loop the nodes stay: each reaches
+Passes that read the graph flat run against :class:`OpsView`, which iterates
+the leaf ops in program order and refuses edits: a pass that changes the graph
+names the position with the helpers below (``insert_before``, ``move_after``,
+``remove_op``, ...), each of which finds the list that owns the anchor.  After the pass loop the nodes stay: each reaches
 Inductor's scheduler as one ``LoopSchedulerNode`` (``loop_scheduler.py``), and
 the readers in between descend into them; at that hand-off
 :func:`peel_non_members` moves an op a pass left at the edge of a body
 without the loop's ``loop_info`` back out of the node.  :func:`expand`
 flattens them only
-on a pass error, for any pass in ``passes._PASSES_RUN_EXPANDED`` (none at
-present), and in the equivalence tests that compare against the flat path.
+on a pass error and in the equivalence tests that compare against the flat path.
 """
 
 from __future__ import annotations
@@ -196,13 +196,16 @@ def owning_list(
 
 
 class OpsView(MutableSequence):
-    """A flat read view over a nested op list; mutations go to the owning list.
+    """A flat READ-ONLY view over a nested op list.
 
     Iteration, ``len``, indexing and ``index`` see the leaf ops in program
-    order, exactly the list a pass saw before nodes existed.  ``insert``,
-    ``remove``, item assignment and ``del`` act on the list that directly holds
-    the op at that flat position, so a new op placed beside an op in a body
-    joins that body.  ``append`` and an insert at the end go to the top level.
+    order, exactly the list a pass saw before nodes existed.  ``append`` (what
+    ``GraphLowering.register_operation`` does with a newly lowered op) goes to
+    the top level and ``hoist_to_front`` moves ops to the head of the graph.
+    ``insert``, ``remove``, item assignment and ``del`` raise ``TypeError``: a
+    pass that edits the graph says where an op goes with ``insert_before`` /
+    ``insert_after`` / ``move_before`` / ``move_after`` / ``remove_op`` /
+    ``replace_op``.
     """
 
     def __init__(self, real: list[ir.Operation]) -> None:
@@ -259,54 +262,30 @@ class OpsView(MutableSequence):
         self._changed()
         self.real.append(op)
 
-    def insert(self, i: int, op: ir.Operation) -> None:
-        """``list.insert`` over the flat view, into the list that owns ``flat[i]``.
+    # The view is read-only apart from ``append`` and ``hoist_to_front``. "Next to
+    # this flat neighbour" does not say whether an op belongs inside a loop body or
+    # beside the node, so a pass that edits the graph names where the op goes with
+    # ``insert_before`` / ``insert_after`` / ``move_before`` / ``move_after`` /
+    # ``remove_op`` / ``replace_op`` (below). The four list mutators exist only
+    # because ``MutableSequence`` requires them; they fail loudly.
+    def _refuse(self, what: str) -> TypeError:
+        return TypeError(
+            f"OpsView is a read-only view: {what} would place the op by its flat "
+            "neighbour. Use insert_before / insert_after / move_before / move_after "
+            "/ remove_op / replace_op from torch_spyre._inductor.loop_node."
+        )
 
-        An op inserted at the flat index of a loop's FIRST member therefore lands
-        inside that loop's body, although a pass that means "just before the
-        loop" (the LX allocator's clone insert) wants it outside.
-        ``peel_non_members`` moves such an op out at the hand-off, once its
-        ``loop_info`` is final.  Nothing inside the pass loop reads structural
-        membership (which ``LoopNode.body`` an op is in): every pass sees the
-        flat view and reads the per-op ``loop_info``, which this placement
-        does not change.  A future pass that reads structural membership
-        before the hand-off would see such an op inside the body.
-        """
-        flat = self._flat()
-        n = len(flat)
-        if i < 0:
-            i = max(i + n, 0)
-        self._changed()
-        if i >= n:
-            self.real.append(op)
-            return
-        lst, j = self._locate(flat[i])
-        lst.insert(j, op)
+    def insert(self, i: int, op: ir.Operation) -> None:
+        raise self._refuse("insert")
 
     def remove(self, op: ir.Operation) -> None:
-        # list.remove semantics (first entry that ``is`` or ``==`` op), then
-        # remove that exact object from the list that owns it.
-        flat = self._flat()
-        found = flat[flat.index(op)]
-        lst, j = self._locate(found)
-        self._changed()
-        del lst[j]
+        raise self._refuse("remove")
 
     def __setitem__(self, i, op) -> None:
-        if isinstance(i, slice):
-            self._reorder(i, op)
-            return
-        old = self._flat()[i]
-        lst, j = self._locate(old)
-        self._changed()
-        lst[j] = op
+        raise self._refuse("item assignment")
 
     def __delitem__(self, i) -> None:
-        if isinstance(i, slice):
-            raise NotImplementedError("OpsView does not support slice deletion")
-        lst, j = self._locate(self._flat()[i])
-        self._changed()
-        del lst[j]
+        raise self._refuse("del")
 
     def hoist_to_front(self, ops: Iterable[ir.Operation]) -> None:
         """Move ``ops``, in the order given, to the head of the TOP-LEVEL list,
@@ -323,42 +302,6 @@ class OpsView(MutableSequence):
             lst.pop(i)
         self.real[:0] = ops
         self._changed()
-
-    def _reorder(self, s: slice, new_flat: Iterable[ir.Operation]) -> None:
-        """``view[:] = reordered``: a wholesale rewrite of the flat order.
-
-        The view only receives a flat order, so it cannot tell whether a pass
-        meant to move an op across a node boundary.  It therefore keeps every
-        op in the list that holds it and only permutes ops WITHIN each list;
-        nodes keep their place among the ops around them.  A pass that really
-        wants to hoist or sink an op across a boundary needs a different API
-        (:meth:`hoist_to_front`): through this one the expanded order can differ
-        from what the same rewrite would give on a flat list (a reordered op that
-        sits in a body). No pass in the pipeline reorders wholesale any more.
-        """
-        if s != slice(None):
-            raise NotImplementedError("only view[:] = ... is supported")
-        new_flat = list(new_flat)
-        rank = {id(o): k for k, o in enumerate(new_flat)}
-        owned = [id(o) for o in all_ops(self.real)]
-        if len(new_flat) != len(owned) or set(rank) != set(owned):
-            raise RuntimeError("a wholesale rewrite of the view added or dropped ops")
-
-        def first_rank(entry: ir.Operation) -> int:
-            # A node sorts by its earliest body op, so it keeps its position
-            # relative to the ops around it.
-            if isinstance(entry, LoopNode):
-                return min(first_rank(x) for x in entry.body)
-            return rank[id(entry)]
-
-        def settle(lst: list[ir.Operation]) -> None:
-            for entry in lst:
-                if isinstance(entry, LoopNode):
-                    settle(entry.body)
-            lst.sort(key=first_rank)
-
-        self._changed()
-        settle(self.real)
 
 
 _BUILDING_LOOP: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -496,6 +439,17 @@ def remove_op(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> N
     """
     lst, i = _holder(_real_list(operations), op)
     del lst[i]
+
+
+def replace_op(
+    operations: "list[ir.Operation] | OpsView", old: ir.Operation, new: ir.Operation
+) -> None:
+    """Put ``new`` where ``old`` is, in whichever list holds ``old``.
+
+    Raises ``ValueError`` if ``old`` is not in ``operations``.
+    """
+    lst, i = _holder(_real_list(operations), old)
+    lst[i] = new
 
 
 def top_level_entry(
@@ -799,24 +753,3 @@ def _inductions_of(
                     break
         _inductions_of(op.body, depth + 1, out)
     return out
-
-
-@contextlib.contextmanager
-def expanded(graph: Any) -> Iterator[None]:
-    """Run a block with the nodes expanded to today's flat list, then rebuild
-    them from the ops' ``loop_group_id`` (keeping each loop's induction).
-
-    For a pass whose edit the flat view cannot express: a wholesale reorder
-    that moves an op across a node boundary (see ``OpsView._reorder``).
-    """
-    operations = graph.operations
-    if not has_loop_nodes(operations):
-        yield
-        return
-    inductions = _inductions_of(operations)
-    expand(graph)
-    try:
-        yield
-    finally:
-        assert graph.operations is operations, "the pass rebound graph.operations"
-        collapse(graph, inductions=inductions)

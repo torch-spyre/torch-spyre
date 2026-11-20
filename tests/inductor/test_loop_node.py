@@ -52,7 +52,6 @@ from torch_spyre._inductor.loop_node import (
     building_loop,
     collapse,
     expand,
-    expanded,
     in_building_loop,
     insert_after,
     insert_before,
@@ -61,6 +60,7 @@ from torch_spyre._inductor.loop_node import (
     owning_list,
     remove_op,
     peel_non_members,
+    replace_op,
     request_loop_nodes,
     top_level_entry,
 )
@@ -353,25 +353,6 @@ class TestCollapse(unittest.TestCase):
         self.assertEqual(outer.carries, (record,))
         self.assertEqual(inner.carries, (record,))
 
-    def test_expanded_runs_flat_then_rebuilds(self):
-        u0, u1 = sympy.Symbol("u0"), sympy.Symbol("u1")
-        const = _Op("const")
-        a = _Op("a", (0,), [2])
-        b = _Op("b", (0, 1), [2, 8])
-        graph = _graph([a, b, const])
-        collapse(graph, inductions={0: u0, 1: u1})
-        real = graph.operations
-        with expanded(graph):
-            self.assertEqual(graph.operations, [a, b, const])
-            # A pass hoists the constant across the loop, as dedup does.
-            graph.operations[:] = [const, a, b]
-        self.assertIs(graph.operations, real)
-        self.assertIs(real[0], const)
-        (outer,) = real[1:]
-        self.assertEqual(outer.induction, u0)
-        self.assertEqual(outer.body[1].induction, u1)
-        self.assertEqual(list(all_ops(real)), [const, a, b])
-
     def test_disabled_switch_builds_nothing(self):
         ops = [_Op("a", (0,), [4])]
         graph = _graph(ops)
@@ -494,69 +475,51 @@ class TestOpsView(unittest.TestCase):
         OpsView(real).append(x)
         self.assertIs(real[-1], x)
 
-    def test_insert_before_op_in_body(self):
+    def test_the_list_mutators_refuse_and_change_nothing(self):
+        """``insert`` / ``remove`` / item assignment / ``del`` place an op by its flat
+        neighbour, which cannot say whether it belongs in a body or beside the node.
+        They raise, and the graph is untouched."""
         real, outer, inner, (a, b, c, d, e, f) = _nested()
         view = OpsView(real)
         x = _Op("x")
-        view.insert(view.index(d), x)
+        edits = {
+            "insert": lambda: view.insert(view.index(d), x),
+            "insert at end": lambda: view.insert(len(view), x),
+            "remove": lambda: view.remove(c),
+            "setitem": lambda: view.__setitem__(view.index(d), x),
+            "slice assignment": lambda: view.__setitem__(slice(None), list(view)),
+            "delitem": lambda: view.__delitem__(view.index(e)),
+            "pop": lambda: view.pop(),
+            "reverse": lambda: view.reverse(),
+            "clear": lambda: view.clear(),
+        }
+        for what, edit in edits.items():
+            with self.subTest(what), self.assertRaisesRegex(TypeError, "read-only"):
+                edit()
+        self.assertEqual(list(view), [a, b, c, d, e, f])
+        self.assertEqual(real, [a, outer, f])
+        self.assertEqual(outer.body, [b, inner, e])
+        self.assertEqual(inner.body, [c, d])
+
+    def test_helpers_edit_through_the_view_and_the_view_follows(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        self.assertEqual(len(view), 6)
+        x, y = _Op("x"), _Op("y")
+        insert_before(view, d, x)
         self.assertEqual(inner.body, [c, x, d])
         self.assertEqual(list(view), [a, b, c, x, d, e, f])
+        remove_op(view, c)
+        self.assertEqual(inner.body, [x, d])
+        replace_op(view, x, y)
+        self.assertEqual(inner.body, [y, d])
+        self.assertEqual(len(view), 6)
+        view.append(x)
+        self.assertIs(view[-1], x)
 
-    def test_insert_after_op_in_body(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        x = _Op("x")
-        # "after d" is "before e", which lives in the outer body.
-        view.insert(view.index(d) + 1, x)
-        self.assertEqual(outer.body, [b, inner, x, e])
-        self.assertEqual(list(view), [a, b, c, d, x, e, f])
-
-    def test_insert_at_end(self):
-        real, *_ = _nested()
-        view = OpsView(real)
-        x, y = _Op("x"), _Op("y")
-        view.insert(len(view), x)
-        view.insert(100, y)
-        self.assertEqual(real[-2:], [x, y])
-
-    def test_insert_negative_index(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        x = _Op("x")
-        view.insert(-1, x)  # before f, as list.insert does
-        self.assertEqual(real, [a, outer, x, f])
-
-    def test_remove(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        view.remove(c)
-        self.assertEqual(inner.body, [d])
-        view.remove(a)
-        self.assertEqual(real, [outer, f])
-        with self.assertRaises(ValueError):
-            view.remove(_Op("z"))
-
-    def test_setitem(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        x = _Op("x")
-        view[view.index(d)] = x
-        self.assertEqual(inner.body, [c, x])
-        y = _Op("y")
-        view[-1] = y
-        self.assertIs(real[-1], y)
-
-    def test_delitem(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        del view[view.index(e)]
-        self.assertEqual(outer.body, [b, inner])
-        del view[0]
-        self.assertEqual(real, [outer, f])
-
-    def test_mutation_while_iterating_matches_list(self):
+    def test_removing_the_visited_op_matches_a_list_iteration(self):
         # A pass that removes the op it is visiting skips the next one on a
-        # list; the view must behave the same.
+        # list; iterating the view while editing through the helpers must too.
         real, *_ = _nested()
         flat = list(all_ops(real))
         seen_view, seen_list = [], []
@@ -564,59 +527,13 @@ class TestOpsView(unittest.TestCase):
         for op in view:
             seen_view.append(op)
             if op.get_name() in ("b", "d"):
-                view.remove(op)
+                remove_op(view, op)
         for op in flat:
             seen_list.append(op)
             if op.get_name() in ("b", "d"):
                 flat.remove(op)
         self.assertEqual(seen_view, seen_list)
         self.assertEqual(list(view), flat)
-
-    def test_reorder_permutes_within_each_list(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        # Move f and d to the front, as a "hoist to front" rewrite would.
-        view[:] = [f, d, a, b, c, e]
-        # Each op stays in its own list, and a node sorts by its earliest op:
-        # d (rank 1) drags inner ahead of b and outer ahead of a. So the flat
-        # result differs from the same rewrite on a flat list.
-        self.assertEqual(real, [f, outer, a])
-        self.assertEqual(outer.body, [inner, b, e])
-        self.assertEqual(inner.body, [d, c])
-        self.assertEqual(list(view), [f, d, c, b, e, a])
-
-    def test_reorder_node_sorts_by_earliest_body_op(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        view[:] = [c, a, b, d, e, f]
-        # outer sorts by its earliest op (c), ahead of a.
-        self.assertEqual(real, [outer, a, f])
-
-    def test_reorder_rejects_added_or_dropped_ops(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        with self.assertRaises(RuntimeError):
-            view[:] = [a, b, c, d, e]
-        with self.assertRaises(RuntimeError):
-            view[:] = [a, b, c, d, e, f, _Op("x")]
-        with self.assertRaises(RuntimeError):
-            view[:] = [a, b, c, d, e, e]
-        with self.assertRaises(NotImplementedError):
-            view[1:3] = [b, c]
-        self.assertEqual(list(view), [a, b, c, d, e, f])
-
-    def test_cache_invalidated_by_every_edit(self):
-        real, outer, inner, (a, b, c, d, e, f) = _nested()
-        view = OpsView(real)
-        self.assertEqual(len(view), 6)
-        x = _Op("x")
-        view.insert(2, x)
-        self.assertEqual(len(view), 7)
-        view.remove(x)
-        view.append(x)
-        self.assertIs(view[-1], x)
-        del view[-1]
-        self.assertEqual(len(view), 6)
 
 
 class TestOpsViewCrossingNodes(unittest.TestCase):
@@ -655,8 +572,8 @@ class TestOpsViewCrossingNodes(unittest.TestCase):
             OpsView(real).hoist_to_front([_Op("stranger")])
 
     def test_insert_after_through_the_view_stays_beside_the_anchor(self):
-        """``view.insert`` past the last flat position goes to the top level; the
-        function puts the op next to its anchor, inside the body."""
+        """After the last op of a body the op still belongs in the body, next to its
+        anchor, not at the top level."""
         x, y, z = _Op("x"), _Op("y"), _Op("z")
         node = _node("loop", [x, y])
         real = [node, z]
@@ -679,10 +596,9 @@ class TestOpsViewCrossingNodes(unittest.TestCase):
 class TestExplicitEdits(unittest.TestCase):
     """Edits that say where the op belongs (stage 8.0).
 
-    ``view.insert(view.index(anchor), op)`` puts the op in the list that holds the op
-    at that flat position, so "just before a loop" lands inside the body when the
-    flat neighbour is the loop's first member. These say it explicitly: an op placed
-    before a node is outside it, an op placed before a body op is in that body.
+    A flat position cannot say whether "just before the loop's first member" means
+    inside the body or beside the node. These say it explicitly: an op placed before
+    a node is outside it, an op placed before a body op is in that body.
     """
 
     def test_insert_before_a_body_op_joins_its_body_through_the_view(self):
@@ -697,13 +613,12 @@ class TestExplicitEdits(unittest.TestCase):
     def test_insert_before_a_node_is_outside_it_even_when_its_first_member_is_next(
         self,
     ):
-        """The case the flat view gets wrong: ``c`` is the first flat op of
-        ``inner``. ``view.insert(index(c))`` puts the op inside; naming the node puts
-        it before the loop, where it runs once."""
+        """``c`` is the first flat op of ``inner``. Naming ``c`` puts the op inside
+        the body; naming the node puts it before the loop, where it runs once."""
         real, outer, inner, (a, b, c, d, e, f) = _nested()
         view = OpsView(real)
         inside, outside = _Op("inside"), _Op("outside")
-        view.insert(view.index(c), inside)
+        insert_before(view, c, inside)
         self.assertEqual(inner.body, [inside, c, d])
         insert_before(view, inner, outside)
         self.assertEqual(outer.body, [b, outside, inner, e])
@@ -842,9 +757,9 @@ class TestTopLevelEntry(unittest.TestCase):
 
 
 class TestPeelNonMembers(unittest.TestCase):
-    """An op without the loop's ``loop_info`` at the edge of a body (where
-    ``OpsView.insert`` puts an op inserted "before the loop" at its first
-    member's flat position) leaves the node; one between members stays."""
+    """An op without the loop's ``loop_info`` at the edge of a body leaves the node;
+    one between members stays. (No pass puts one there any more: every edit names
+    its position. This is the hand-off's repair for one that does.)"""
 
     def _collapsed(self, ops):
         graph = _graph(ops)
@@ -854,10 +769,9 @@ class TestPeelNonMembers(unittest.TestCase):
     def test_leading_and_trailing_non_members_leave_the_node(self):
         a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
         graph = self._collapsed([_Op("pre"), a, b, _Op("post")])
-        view = OpsView(graph.operations)
         clone, drain = _Op("clone"), _Op("drain")
-        view.insert(view.index(a), clone)  # "before the loop entry"
         node = next(o for o in graph.operations if isinstance(o, LoopNode))
+        node.body.insert(0, clone)  # "before the loop entry", misplaced in the body
         node.body.append(drain)  # "after the loop's last member", in the body
         self.assertEqual(_names(node.body), ["clone", "a", "b", "drain"])
         peel_non_members(graph)

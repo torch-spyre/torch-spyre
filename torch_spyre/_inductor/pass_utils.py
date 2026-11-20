@@ -88,7 +88,7 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopNode, all_ops, replace_op
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -3707,8 +3707,7 @@ def replace_computed_buffer_body(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     _invalidate_body_caches(new_data)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
@@ -3824,8 +3823,7 @@ def redirect_computed_buffer_reads(
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf, layout_state=True)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
 
