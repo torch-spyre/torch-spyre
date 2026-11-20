@@ -6983,7 +6983,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
             },
         },
-        ("test_sum_default", "test_reduce_cpu"): {
+        ("test_sum_default", "test_reduce_exact_cpu"): {
             "ops_dict": {
                 "sum": torch.sum,
             },
@@ -11195,6 +11195,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_cpu(self, op, x):
         self.compare_with_cpu(lambda x: op(x), x)
+
+    def test_reduce_exact_cpu(self, op, x):
+        """Like test_reduce_cpu but with exact (atol=0, rtol=0) comparison.
+
+        Used for integer/bool reductions whose results are deterministic counts.
+        atol=rtol=0.1 (the compare_with_cpu default) would accept 436 vs 442.
+        """
+        self.compare_with_cpu(lambda x: op(x), x, atol=0, rtol=0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
