@@ -87,6 +87,15 @@ class SchemaApplier:
         r"(?: DEFINER = \S+ SQL SECURITY DEFINER)? AS (SELECT|WITH)\b"
     )
     SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
+    # Newer servers append these table settings at their default values; a different value is drift.
+    DEFAULT_TABLE_SETTINGS = {
+        "index_granularity": "8192",
+        "auto_statistics_types": "''",
+        "default_compression_codec": "'LZ4'",
+    }
+    TABLE_SETTINGS = re.compile(
+        r"\s+SETTINGS\s+((?:\w+\s*=\s*(?:'[^']*'|[^,\s]+)(?:\s*,\s*)?)+)\s*$"
+    )
     ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
     ADDS = re.compile(
         r"\bADD\s+(?:COLUMN|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
@@ -575,6 +584,18 @@ class SchemaApplier:
         return chosen
 
     @classmethod
+    def without_default_settings(cls, sql: str) -> str:
+        """`sql` less the trailing SETTINGS items that sit at the server's default value."""
+        m = cls.TABLE_SETTINGS.search(sql)
+        if not m:
+            return sql
+        items = re.findall(r"(\w+)\s*=\s*('[^']*'|[^,\s]+)", m.group(1))
+        kept = [
+            f"{k} = {v}" for k, v in items if cls.DEFAULT_TABLE_SETTINGS.get(k) != v
+        ]
+        return sql[: m.start()] + (" SETTINGS " + ", ".join(kept) if kept else "")
+
+    @classmethod
     def canonical(cls, client, sql: str, db: str) -> str:
         """One definition in the server's own formatting, database-unqualified."""
         # Client-side binding: a DDL-sized value overflows a server-side URL parameter.
@@ -583,6 +604,7 @@ class SchemaApplier:
         ).result_rows[0][0]
         s = cls.plain_engine(s)
         s = s.replace(" IF NOT EXISTS", "", 1).replace(f"{db}.", "")
+        s = cls.without_default_settings(s)
         for default in cls.SERVER_DEFAULTS:
             s = s.replace(default, "")
         return cls.VIEW_COLUMNS.sub(r"\1 AS \2", s, count=1)

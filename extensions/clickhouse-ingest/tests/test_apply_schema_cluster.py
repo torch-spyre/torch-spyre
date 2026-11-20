@@ -1418,3 +1418,45 @@ def test_a_real_file_comment_is_drift_against_a_converted_table_without_it():
     assert SchemaApplier.differs(FormatOnly(), commented, conv, "db") != ""
     conv2 = replicated(plain, "db", "t") + " COMMENT 'ha-twin | mine'"
     assert SchemaApplier.differs(FormatOnly(), commented, conv2, "db") == ""
+
+
+# ---- server-appended default table settings ---------------------------------------------
+
+LIVE_DEFAULTS = (
+    "CREATE TABLE t (a UInt8, test_case_id String) ENGINE = MergeTree "
+    "ORDER BY (a, test_case_id) SETTINGS index_granularity = 8192, "
+    "auto_statistics_types = '', default_compression_codec = 'LZ4'"
+)
+FILE_PLAIN = "CREATE TABLE t (a UInt8, test_case_id String) ENGINE = MergeTree ORDER BY (a, test_case_id)"
+
+
+def test_server_default_settings_are_not_drift():
+    assert (
+        SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), LIVE_DEFAULTS, "db") == ""
+    )
+    conv = (
+        replicated(LIVE_DEFAULTS.split(" SETTINGS")[0], "db", "t")
+        + LIVE_DEFAULTS[LIVE_DEFAULTS.index(" SETTINGS") :]
+    )
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), conv, "db") == ""
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        " SETTINGS index_granularity = 4096",
+        " SETTINGS index_granularity = 8192, default_compression_codec = 'ZSTD'",
+        " SETTINGS auto_statistics_types = 'tdigest'",
+        " SETTINGS storage_policy = 'x'",
+    ],
+)
+def test_a_real_settings_difference_is_still_drift(tail):
+    live = FILE_PLAIN + tail
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), live, "db") != ""
+    assert SchemaApplier.differs(FormatOnly(), _obj(live), FILE_PLAIN, "db") != ""
+
+
+def test_a_file_setting_with_a_default_sibling_keeps_the_real_one():
+    file = FILE_PLAIN + " SETTINGS storage_policy = 'x'"
+    live = file + ", auto_statistics_types = '', default_compression_codec = 'LZ4'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") == ""
