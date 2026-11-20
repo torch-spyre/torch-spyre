@@ -41,11 +41,6 @@ _SCATTER_ADD_EAGER = rejection(
     "aten::scatter_add.out is not registered on Spyre.",
     r"Could not run 'aten::scatter_add.out'",
 )
-_SLICE_OFFSET_ALIGNMENT = rejection(
-    5383,
-    "compile copy_from_d2d of a sliced view requires a stick-aligned storage_offset.",
-    r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-)
 _POINTWISE_NO_LAYOUT = rejection(
     6388,
     "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
@@ -326,7 +321,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     def test_rope_gather_mul(self, execution_mode):
         """Gather cos[pos] * q + sin[pos] * rotate90(q) RoPE pattern."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
-        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         cos = cached_randn((4096, 64), differentiation="chnk07c", dtype=torch.float16)
         sin = cached_randn((4096, 64), differentiation="chnk07s", dtype=torch.float16)
         q = cached_randn((32, 64), differentiation="chnk07q", dtype=torch.float16)
@@ -348,7 +342,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     def test_gather_unbind_stack(self, execution_mode):
         """Gather + unbind + stack at new axis."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
-        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         x = cached_randn((64, 4, 32), differentiation="chnk08", dtype=torch.float16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
         compare_mode(
@@ -544,11 +537,7 @@ class TestGatherComposedChainsAndEndToEndPipelines:
         """NeoX rotate-half RoPE applied to both Q and K after position gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6388
-        _xfail_existing(
-            execution_mode,
-            eager=_SLICE_OFFSET_ALIGNMENT,
-            compiled=_POINTWISE_NO_LAYOUT,
-        )
+        _xfail_existing(execution_mode, compiled=_POINTWISE_NO_LAYOUT)
         cos_sin = cached_randn(
             (4096, 128), differentiation="ropi02", dtype=torch.float16
         )
@@ -579,7 +568,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     def test_rope_interleaved_separate_cos_sin_caches(self, execution_mode):
         """Interleaved RoPE with separate cos/sin caches; both gathered then applied to Q and K."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
-        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         cos = cached_randn((2048, 64), differentiation="ropi03c", dtype=torch.float16)
         sin = cached_randn((2048, 64), differentiation="ropi03s", dtype=torch.float16)
         q = cached_randn((32, 64), differentiation="ropi03q", dtype=torch.float16)

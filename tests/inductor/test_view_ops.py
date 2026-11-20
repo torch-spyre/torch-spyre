@@ -2678,24 +2678,10 @@ class TestSplitUnaligned:
             dtype=dtype,
             differentiation=f"split_2d_unaligned_trailing_{dtype}",
         )
-        if execution_mode == "eager":
-            # TODO: Close #5383 and convert to positive test when eager copy_from_d2d supports unaligned storage_offset
-            with pytest.raises(
-                (InductorError, LoweringException),
-                match=r"Unsupported: (Spyre backend does not support: )?(spyre::)?copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-            ):
-                _compare_modes(
-                    execution_mode,
-                    lambda t: torch.stack(
-                        [_apply_consumer(c, consumer) for c in t.split(65, dim=-1)]
-                    ),
-                    x,
-                )
-            return
-        if execution_mode == "compiled" and consumer == "sum_last":
+        if consumer == "sum_last":
             # TODO: Close #3916 and convert to positive test when mutation targets with a non-stick-aligned write offset are supported
             with pytest.raises(
-                InductorError,
+                (InductorError, LoweringException),
                 match=r"Unsupported: (Spyre backend does not support: )?no offset-free alternative stick dim for mutation target",
             ):
                 _compare_modes(
@@ -2739,20 +2725,6 @@ class TestSplitUnaligned:
             dtype=dtype,
             differentiation=f"split_3d_unaligned_trailing_{dtype}",
         )
-        if execution_mode == "eager":
-            # TODO: Close #5383 and convert to positive test when eager copy_from_d2d supports unaligned storage_offset
-            with pytest.raises(
-                (InductorError, LoweringException),
-                match=r"Unsupported: (Spyre backend does not support: )?(spyre::)?copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-            ):
-                _compare_modes(
-                    execution_mode,
-                    lambda t: torch.stack(
-                        [_apply_consumer(c, consumer) for c in t.split(70, dim=-1)]
-                    ),
-                    x,
-                )
-            return
         if execution_mode == "compiled" and consumer == "pointwise":
             # TODO: Convert to positive test when unaligned split offsets are supported (#5216)
             with pytest.raises(
@@ -2794,20 +2766,6 @@ class TestSplitUnaligned:
             dtype=dtype,
             differentiation=f"split_4d_unaligned_inner_{dtype}",
         )
-        if execution_mode == "eager":
-            # TODO: Close #5383 and convert to positive test when eager copy_from_d2d supports unaligned storage_offset
-            with pytest.raises(
-                (InductorError, LoweringException),
-                match=r"Unsupported: (Spyre backend does not support: )?(spyre::)?copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-            ):
-                _compare_modes(
-                    execution_mode,
-                    lambda t: torch.stack(
-                        [_apply_consumer(c, consumer) for c in t.split(65, dim=-1)]
-                    ),
-                    x,
-                )
-            return
         if execution_mode == "compiled" and consumer == "pointwise":
             # TODO: Convert to positive test when unaligned split offsets are supported (#5216)
             with pytest.raises(
@@ -2822,11 +2780,7 @@ class TestSplitUnaligned:
                     x,
                 )
             return
-        if (
-            execution_mode == "compiled"
-            and consumer == "sum_last"
-            and dtype == torch.float16
-        ):
+        if consumer == "sum_last" and dtype == torch.float16:
             strict_xfail(
                 request,
                 AssertionError,
@@ -2889,18 +2843,13 @@ class TestSplitSize1:
             (4, 32, 2), dtype=dtype, differentiation=f"split_3d_trailing_size1_{dtype}"
         )
         if execution_mode == "eager":
-            # TODO: Convert to positive test when eager copy_from_d2d supports unaligned storage_offset (#5383)
-            with pytest.raises(
-                (InductorError, LoweringException),
-                match=r"Unsupported: (Spyre backend does not support: )?(spyre::)?copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-            ):
-                _compare_modes(
-                    execution_mode,
-                    lambda t: torch.stack(
-                        [_apply_consumer(c, consumer) for c in t.split(1, dim=-1)]
-                    ),
-                    x,
-                )
+            _compare_modes(
+                execution_mode,
+                lambda t: torch.stack(
+                    [_apply_consumer(c, consumer) for c in t.split(1, dim=-1)]
+                ),
+                x,
+            )
         else:
             if consumer == "pointwise":
                 # TODO: Convert to positive test when sub-stick split chunks are supported (#5216)
