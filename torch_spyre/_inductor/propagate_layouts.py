@@ -84,6 +84,7 @@ from .ir import (
     SpyreConstantFallback,
     SpyreEmptyFallback,
 )
+from .loop_node import remove_op
 from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
@@ -3297,7 +3298,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
     for op in removed_ops:
         for write in op_read_writes(op).writes:
             V.graph.removed_buffers.add(write.name)
-        operations.remove(op)
+        remove_op(operations, op)
 
 
 def _eager_view_input_layout(
