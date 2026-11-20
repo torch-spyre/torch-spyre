@@ -46,6 +46,15 @@ from .constants import (
 )
 from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
+from .linear_attention import (
+    DEFAULT_CHUNK_SIZE,
+    check_linear_attention,
+    chunkwise_linear_attention,
+    default_scale,
+    pad_sequence_end,
+    padded_sequence_length,
+    single_token_linear_attention,
+)
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
     STICK,
@@ -1675,7 +1684,14 @@ class _OPWrapper:
         if torch.compiler.is_compiling():
             return self._fn(*args, **kwargs)
         if self._compiled_fn is None:
-            self._compiled_fn = torch.compile(self._fn, dynamic=False)
+            from torch_spyre.ops.eager import _static_compile
+
+            # ``dynamic=False`` does not override ``mark_dynamic`` on a tensor
+            # declared with ``.to("spyre", dynamic=...)``; the kernel gets
+            # unmarked twins instead, as in ``compile_once`` (#6030). No autograd
+            # kernel sits above this wrapper, so a marked tensor that requires
+            # grad is rejected rather than losing its history to the twin.
+            self._compiled_fn = _static_compile(self._fn, autograd_handled=False)
         # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
         # scalar induction variable with ``item()``.  Eager PrivateUse1
         # dispatch reaches that rewrite through this lazy compilation path,
@@ -2791,6 +2807,76 @@ def spyre_sliding_window_attention(
         num_heads,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
+
+
+@register_spyre_decompositions([torch.ops.spyre.linear_attention.default])
+def spyre_linear_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunkwise linear attention built from matmuls Spyre already lowers.
+
+    The sequence is padded at its end to a whole number of chunks, each chunk
+    is processed with the intra-chunk masked matmul plus a read of the carried
+    state, and the padding is sliced off the output. See ``linear_attention.py``
+    for the algorithm and why end-padding leaves the output and final state
+    exact. The chunk loop is a ``for_each_tile`` loop with the state as its
+    carry, so the traced graph does not grow with the number of chunks. A
+    single-token call (``L == 1``) skips the loop and the mask: one state update
+    plus one matmul.
+    """
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+
+    seqlen = query.size(2)
+    if seqlen == 1:
+        # Single-token decode: no chunk loop, no mask and no tril_mask transfer.
+        return single_token_linear_attention(
+            query,
+            key,
+            value,
+            initial_state=initial_state,
+            scale=default_scale(query.size(-1)) if scale is None else scale,
+        )
+
+    pad_rows = padded_sequence_length(seqlen, chunk_size) - seqlen
+    query = pad_sequence_end(query, pad_rows)
+    key = pad_sequence_end(key, pad_rows)
+    value = pad_sequence_end(value, pad_rows)
+
+    # spyre::tril_mask builds the [C, C] lower-triangular 0/1 mask on CPU and
+    # transfers it to the query device, keeping the CPU-side construction
+    # opaque to torch.compile exactly as spyre_triu does for triu_mask. A
+    # non-causal call reads one shared state and needs no mask.
+    # TODO: if profiling shows the per-call build and transfer of this mask
+    # matters for prefill, cache it per (chunk_size, dtype). A shared tensor
+    # must not be reused in place by Inductor, so check that before caching.
+    intra_mask = (
+        torch.ops.spyre.tril_mask(chunk_size, chunk_size, 0, query.dtype, query.device)
+        if is_causal
+        else None
+    )
+    output, state = chunkwise_linear_attention(
+        query,
+        key,
+        value,
+        chunk_size=chunk_size,
+        intra_mask=intra_mask,
+        initial_state=initial_state,
+        scale=default_scale(query.size(-1)) if scale is None else scale,
+        is_causal=is_causal,
+    )
+    if pad_rows:
+        # Slicing leaves a view with the padded row stride; the op's fake
+        # advertises a contiguous [B, H, L, Dv] output, so materialize it.
+        output = output[:, :, :seqlen, :].contiguous()
+    return output, state
 
 
 @register_spyre_decompositions([torch.ops.aten.max.default])

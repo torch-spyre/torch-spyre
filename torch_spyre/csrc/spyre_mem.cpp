@@ -1055,26 +1055,14 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-/**
- * Allocate a Spyre tensor sized/laid out for a ceiling (`max_size`) at
- * `dim` rather than for `size[dim]` itself. `size`/`stride` remain the
- * tensor's logical (PyTorch-visible) shape; only the SpyreTensorLayout and
- * the underlying storage are computed against the padded shape. Because
- * padding dim 0 (the outermost dimension) does not change stride_map (see
- * SpyreTensorLayout::init), the layout's valid_elements for `dim` is set to
- * `max_size`, so the layout is the same at every size in the declared range.
- * Only the real data is transferred, into the front of the larger buffer.
- *
- * Only dim 0 is supported. Padding any other non-stick dimension changes the
- * host stride of every dimension outside it, so stride_map (built from the
- * padded shape) would disagree with the real host strides and the
- * host-to-device copy would place data at the wrong offsets and can write
- * past the buffer. spyre_empty_reserved() rejects such a `dim`.
- */
-at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
-                                c10::ScalarType dtype, int64_t dim,
-                                int64_t min_size, int64_t max_size,
-                                int64_t granularity) {
+namespace {
+
+// The reservation rules shared by spyre_empty_reserved and
+// spyre_empty_reserved_with_layout: the declaration itself (positivity, range,
+// max a multiple of granularity), today's size inside it, and dim 0 only.
+void check_reservation_args(c10::IntArrayRef size, c10::ScalarType dtype,
+                            int64_t dim, int64_t min_size, int64_t max_size,
+                            int64_t granularity) {
   at::detail::check_size_nonnegative(size);
   TORCH_CHECK(spyre::is_supported_dtype(dtype),
               "Spyre backend does not support dtype ", dtype);
@@ -1110,6 +1098,31 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
               "any other dimension changes the host stride of every "
               "dimension outside it, which the host-to-device copy does not "
               "handle");
+}
+
+}  // namespace
+
+/**
+ * Allocate a Spyre tensor sized/laid out for a ceiling (`max_size`) at
+ * `dim` rather than for `size[dim]` itself. `size`/`stride` remain the
+ * tensor's logical (PyTorch-visible) shape; only the SpyreTensorLayout and
+ * the underlying storage are computed against the padded shape. Because
+ * padding dim 0 (the outermost dimension) does not change stride_map (see
+ * SpyreTensorLayout::init), the layout's valid_elements for `dim` is set to
+ * `max_size`, so the layout is the same at every size in the declared range.
+ * Only the real data is transferred, into the front of the larger buffer.
+ *
+ * Only dim 0 is supported. Padding any other non-stick dimension changes the
+ * host stride of every dimension outside it, so stride_map (built from the
+ * padded shape) would disagree with the real host strides and the
+ * host-to-device copy would place data at the wrong offsets and can write
+ * past the buffer. spyre_empty_reserved() rejects such a `dim`.
+ */
+at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
+                                c10::ScalarType dtype, int64_t dim,
+                                int64_t min_size, int64_t max_size,
+                                int64_t granularity) {
+  check_reservation_args(size, dtype, dim, min_size, max_size, granularity);
 
   auto padded_size = size.vec();
   padded_size[dim] = max_size;
@@ -1144,6 +1157,99 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
                         << " min=" << min_size << " max=" << max_size
                         << " granularity=" << granularity
                         << " reserved_bytes=" << size_bytes
+                        << "): " << device_layout.toString();
+  return tensor;
+}
+
+at::Tensor spyre_empty_reserved_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, int64_t dim, int64_t min_size,
+    int64_t max_size, int64_t granularity) {
+  check_reservation_args(size, dtype, dim, min_size, max_size, granularity);
+  const auto& device_size = device_layout.device_size;
+  const auto& stride_map = device_layout.stride_map;
+  TORCH_CHECK(!device_size.empty() && stride_map.size() == device_size.size(),
+              "device_layout with a reservation: the layout has no usable "
+              "device dimensions");
+  TORCH_CHECK(device_layout.device_dtype == get_device_dtype(dtype),
+              "device_layout with a reservation: the layout's device dtype "
+              "does not match tensor dtype ",
+              dtype);
+
+  // The layout describes the buffer at max_size. The reserved host dimension
+  // must therefore occupy exactly one device dimension, whole (its stride-map
+  // entry is the host stride of `dim`), never the stick-elements dimension,
+  // and that dimension's extent must be max_size. Those are the dimension the
+  // transfer at the current size and every later resize_ move along; a
+  // reserved dimension folded into another or split across the stick could
+  // not be resized in place.
+  const int64_t host_stride = stride[dim];
+  int64_t carrier = -1;
+  int64_t carriers = 0;
+  for (size_t d = 0; d < device_size.size(); ++d) {
+    if (stride_map[d] == host_stride && device_size[d] > 1) {
+      carrier = static_cast<int64_t>(d);
+      ++carriers;
+    }
+  }
+  TORCH_CHECK(carriers == 1,
+              "device_layout with a reservation: the reserved "
+              "host dimension ",
+              dim, " (host stride ", host_stride,
+              ") must occupy exactly one device dimension of the layout, "
+              "found ",
+              carriers, " in ", device_layout.toString(),
+              carriers > 1
+                  ? ". More than one device dimension walks that host "
+                    "stride (another host dimension with the same stride, "
+                    "or a layout that repeats it), so the reserved rows "
+                    "have no single device dimension to resize along: "
+                    "give the reserved dimension a device dimension of "
+                    "its own"
+                  : "");
+  TORCH_CHECK(carrier != static_cast<int64_t>(device_size.size()) - 1,
+              "device_layout with a reservation: the reserved host dimension ",
+              dim,
+              " lands on the stick-elements dimension of the layout, which "
+              "cannot be resized");
+  TORCH_CHECK(device_size[carrier] == max_size,
+              "device_layout with a reservation: the layout describes the "
+              "buffer at the declared max, so device dimension ",
+              carrier, " (the reserved host dimension ", dim,
+              ") must have extent max=", max_size, ", got ",
+              device_size[carrier]);
+
+  // The layout must also hold the host shape at max_size as a whole. The
+  // storage below is sized from the layout, so a layout too small in another
+  // dimension would let today's transfer run and the first resize_ past the
+  // host bytes fail inside the reservation invariant, with a message that
+  // does not name the layout. Overflow-checked like spyre_empty_reserved.
+  auto padded_size = size.vec();
+  padded_size[dim] = max_size;
+  const size_t layout_bytes = get_device_size_in_bytes(device_layout);
+  const size_t host_bytes_at_max = at::detail::computeStorageNbytesContiguous(
+      padded_size, c10::elementSize(dtype));
+  TORCH_CHECK(layout_bytes >= host_bytes_at_max,
+              "device_layout with a reservation: the layout holds ",
+              layout_bytes, " bytes, fewer than the ", host_bytes_at_max,
+              " bytes of the host shape at max=", max_size,
+              " (every dimension of the layout must cover the host shape at "
+              "the declared maximum): ",
+              device_layout.toString());
+
+  // From here on exactly spyre_empty_with_layout, plus the contract. Storage
+  // is sized from the layout, which is at max_size by the check above, and the
+  // real shape is carried by the layout's valid_elements, as for
+  // spyre_empty_reserved.
+  auto tensor =
+      spyre_empty_with_layout(size, stride, dtype, device_layout, std::nullopt);
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  spyre_tensor_impl->reserved_dims = {
+      {dim, ReservedDimInfo{min_size, max_size, granularity}}};
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (explicit, reserved dim=" << dim
+                        << " min=" << min_size << " max=" << max_size
+                        << " granularity=" << granularity
                         << "): " << device_layout.toString();
   return tensor;
 }
@@ -1815,18 +1921,6 @@ std::vector<int64_t> pinned_reserved_layout_size(
   return layout_size;
 }
 
-// Builds the layout for `layout_size`, with each reserved dim's valid count set
-// to its declared max, so the layout does not change across resize_.
-SpyreTensorLayout layout_for_resize(const SpyreTensorImpl& self_impl,
-                                    const std::vector<int64_t>& layout_size,
-                                    c10::ScalarType dtype) {
-  auto new_layout = SpyreTensorLayout(layout_size, dtype);
-  for (const auto& [rdim, info] : self_impl.reserved_dims) {
-    set_reserved_valid_elements(new_layout, rdim, info.max);
-  }
-  return new_layout;
-}
-
 const at::Tensor& spyre_resize_(
     const at::Tensor& self, c10::SymIntArrayRef size,
     std::optional<c10::MemoryFormat> memory_format_opt) {
@@ -1867,9 +1961,15 @@ const at::Tensor& spyre_resize_(
           ? size_int.vec()
           : pinned_reserved_layout_size(*self_impl, self, size_int);
   // Use STL device bytes (stick-padded) to determine if existing allocation
-  // suffices.
+  // suffices. A reserved tensor keeps the layout it was allocated with: it
+  // was sized for the maximum at allocation, derived from the host size or
+  // given explicitly through device_layout=, and rebuilding it from the host
+  // size here would replace an explicit layout with the default one, after
+  // which every later read goes through a layout the bytes were not written
+  // in (#6027). The plain path keeps rebuilding, as before.
   const SpyreTensorLayout new_layout =
-      layout_for_resize(*self_impl, layout_size, dtype);
+      self_impl->reserved_dims.empty() ? SpyreTensorLayout(layout_size, dtype)
+                                       : self_impl->spyre_layout;
   const size_t new_device_bytes = get_device_size_in_bytes(new_layout);
   const size_t new_cpu_bytes =
       at::detail::computeStorageNbytesContiguous(size_int, self.itemsize());

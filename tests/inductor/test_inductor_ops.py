@@ -14784,6 +14784,76 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @expects_raise
+    def test_index_put_bool_mask(self):
+        """``out[mask] = values`` with a boolean mask.
+
+        Upstream lowers a mask to a mutating fallback, which Spyre rejects.
+        TODO(issue#692): compare against CPU once this lowers on device.
+        """
+
+        def fn(x, mask, values):
+            out = x.clone()
+            out.index_put_((mask,), values, accumulate=False)
+            return out
+
+        with pytest.raises(InductorError, match="has no Spyre kernel"):
+            _compile_and_run(
+                fn,
+                [
+                    torch.zeros(4, 4, dtype=torch.float32),
+                    torch.eye(4, dtype=torch.bool),
+                    torch.tensor([1.0, 2.0, 3.0, 4.0]),
+                ],
+                "spyre",
+            )
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_put_integer_index(self):
+        """``out[index] = values`` with an integer index.
+
+        Compiled, this form lowers to a device scatter, so a host fallback is
+        a regression and fails the test. Eager is not run: it has no device
+        kernel for this op. Indices are distinct and the tolerance exact.
+        """
+
+        def fn(x, index, values):
+            out = x.clone()
+            out.index_put_((index,), values, accumulate=False)
+            return out
+
+        self.compare_with_cpu(
+            fn,
+            torch.zeros(4, 8, dtype=torch.float32),
+            torch.tensor([0, 2]),
+            torch.ones(2, 8, dtype=torch.float32),
+            run_eager=False,
+            atol=0,
+            rtol=0,
+        )
+
+    @expects_raise
+    def test_scatter_reduce_non_sum_modes(self):
+        """``scatter_reduce_`` with a reduction other than sum.
+
+        Upstream lowers these modes to a mutating fallback, which Spyre
+        rejects.
+        TODO(issue#4361): compare against CPU once they lower on device.
+        """
+
+        def fn(out, src, index, reduce):
+            o = out.clone()
+            o.scatter_reduce_(0, index, src, reduce)
+            return o
+
+        out = torch.full((128, 256), 2.0, dtype=torch.float16)
+        src = torch.full((3, 256), 4.0, dtype=torch.float16)
+        index = torch.arange(3).unsqueeze(1).expand(3, 256).contiguous()
+        for reduce in ("amax", "amin", "prod", "mean"):
+            with self.subTest(reduce=reduce):
+                with pytest.raises(InductorError, match="has no Spyre kernel"):
+                    _compile_and_run(fn, [out, src, index, reduce], "spyre")
+
     def _index_reduce_all_modes(self, dst, dim, index, src):
         """Compiled and eager index_reduce_ match CPU for every reduce mode.
 
