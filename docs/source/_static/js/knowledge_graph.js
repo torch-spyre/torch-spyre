@@ -233,6 +233,15 @@
         },
       },
       {
+        selector: "edge[relationship = 'contains_field']",
+        style: {
+          "line-style": "dashed",
+          "line-color": "#d35400",
+          "target-arrow-color": "#d35400",
+          width: 1.2,
+        },
+      },
+      {
         selector: "edge[relationship = 'imports']",
         style: {
           "line-color": "#f39c12",
