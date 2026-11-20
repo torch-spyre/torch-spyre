@@ -1251,8 +1251,7 @@ def paged_gather_fn(
     stays invariant and only one page is live per trip. That index is a POINT
     read -- one int32 element whose address moves with the spliced loop var and
     which carries no iteration dim of its own -- so it is the shape coarse
-    tiling handles through squeezed_advance_per_read rather than a tiled dim
-    (the advance is read off the index). Pre-gathering the pages
+    tiling reads off the index rather than from a tiled dim. Pre-gathering the pages
     ahead of the loop would compile without any of that, at the cost of keeping
     the whole sequence's K/V live across it.
     """

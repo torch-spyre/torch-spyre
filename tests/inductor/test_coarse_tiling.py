@@ -760,32 +760,6 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(info.loop_tiled_dims, [[0], [1]])
 
-    def test_tile_advance_defaults(self):
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[0]],
-        )
-        self.assertEqual(info.tiled_dims_per_read, [])
-        self.assertEqual(info.output_tiled_dims, [])
-
-    def test_tile_advance_explicit(self):
-        info = CoarseTileInfo(
-            loop_group_id=(0, 0),
-            loop_count=[Integer(2), Integer(4)],
-            loop_tiled_dims=[[0], [1]],
-            tiled_dims_per_read=[[[(0, Integer(512))], [(1, Integer(1024))]]],
-            output_tiled_dims=[[(0, Integer(512))], [(1, Integer(1024))]],
-        )
-        self.assertEqual(
-            info.tiled_dims_per_read,
-            [[[(0, Integer(512))], [(1, Integer(1024))]]],
-        )
-        self.assertEqual(
-            info.output_tiled_dims,
-            [[(0, Integer(512))], [(1, Integer(1024))]],
-        )
-
 
 class TestConfigFlags(unittest.TestCase):
     """Test configuration flags."""
@@ -1685,7 +1659,6 @@ class TestPatchConsumersLoopInfo(unittest.TestCase):
 
     def _redirected_index(self, consumer, old_name: str) -> sympy.Expr:
         consumer.loop_info = SimpleNamespace(
-            tiled_dims_per_read=[],
             loop_count=[],
             loop_tiled_dims=[],
             loop_tiled_reduction_dims=[],
@@ -5004,53 +4977,58 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         self.assertEqual(_affine_bounds(dep), (0, 4095))
 
-    def test_loop_bound_covers_every_expert_step(self):
+    @staticmethod
+    def _looped_read(index, trips, *, var_names=(), size=()):
+        """A stub op in a one-level loop (variable ``u0``) and its read of ``weight``
+        at ``index``: what ``_loop_advance_bound`` reads the step from."""
         from torch._inductor.dependencies import MemoryDep
+
+        u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+        dep = MemoryDep(name="weight", index=index(u0), var_names=var_names, size=size)
+        info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[trips], loop_tiled_dims=[[]]
+        )
+        op = SimpleNamespace(
+            loop_info=info,
+            dim_hints=[
+                DimHint(
+                    dim_names=[],
+                    split_count=1,
+                    loop_var=u0,
+                    is_reduction=False,
+                    loop_var_range=trips,
+                )
+            ],
+            get_read_writes=lambda: SimpleNamespace(
+                reads=OrderedSet([dep]), writes=OrderedSet()
+            ),
+        )
+        return op, dep, info
+
+    def test_loop_bound_covers_every_expert_step(self):
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
-        op = SimpleNamespace(
-            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
-        )
-        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(3)],
-            loop_tiled_dims=[[0]],
-            tiled_dims_per_read=[[[]]],
-            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
-        )
+        op, dep, info = self._looped_read(lambda u: 4096 * u, Integer(3))
 
-        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 8192))
+        self.assertEqual(_loop_advance_bound(op, dep, info), (0, 8192))
 
     def test_loop_bound_takes_the_declared_maximum_for_a_symbolic_count(self):
         # A for_each_tile over a dim declared {min 8, max 64, granularity 8}
         # walks FloorDiv(s0, 8) trips. The proof bounds the advance at the
         # declared maximum, 64 // 8 = 8 trips, the conservative count: the
         # reach at any admissible size is inside it (#6433).
-        from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.pass_utils import declared_dims
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        op = SimpleNamespace(
-            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
-        )
-        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[sympy.floor(s0 / 8)],
-            loop_tiled_dims=[[0]],
-            tiled_dims_per_read=[[[]]],
-            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
-        )
+        op, dep, info = self._looped_read(lambda u: 4096 * u, sympy.floor(s0 / 8))
 
         with declared_dims({"s0": (8, 64, 8)}):
-            self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 4096 * (8 - 1)))
+            self.assertEqual(_loop_advance_bound(op, dep, info), (0, 4096 * (8 - 1)))
 
     def test_loop_bound_declines_a_symbolic_count_without_a_declaration(self):
         # The same count with no declaration has no finite bound, so the proof
         # declines as it did for every symbolic count before #6433.
-        from torch._inductor.dependencies import MemoryDep
         from torch._inductor.virtualized import V
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
         from torch_spyre._inductor.pass_utils import declared_dims
@@ -5059,79 +5037,31 @@ class TestReadCopyElisionProof(unittest.TestCase):
         shape_env = ShapeEnv()
         # A symbol the ShapeEnv knows but nothing bounds: an unbacked size.
         s1 = shape_env.create_unbacked_symint().node.expr
-        op = SimpleNamespace(
-            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
-        )
-        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[sympy.floor(s1 / 8)],
-            loop_tiled_dims=[[0]],
-            tiled_dims_per_read=[[[]]],
-            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
-        )
+        op, dep, info = self._looped_read(lambda u: 4096 * u, sympy.floor(s1 / 8))
         graph = SimpleNamespace(sizevars=SimpleNamespace(shape_env=shape_env))
 
         with declared_dims({}), V.set_graph_handler(graph):
-            self.assertIsNone(_loop_advance_bound(op, dep, info, 0))
+            self.assertIsNone(_loop_advance_bound(op, dep, info))
 
-    def test_unsqueezed_loop_step_uses_dependency_stride(self):
-        from torch._inductor.dependencies import MemoryDep
+    def test_loop_step_is_the_loop_variables_coefficient_in_the_index(self):
+        d0, d1 = sympy.symbols("d0 d1", integer=True)
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
-        d0, d1 = sympy.symbols("d0 d1", integer=True)
-        op = SimpleNamespace(
-            data=SimpleNamespace(
-                ranges=[Integer(64), Integer(128)], reduction_ranges=[]
-            )
-        )
-        dep = MemoryDep(
-            name="weight",
-            index=128 * d0 + d1,
+        op, dep, info = self._looped_read(
+            lambda u: 128 * d0 + d1 + 8192 * u,
+            Integer(3),
             var_names=(d0, d1),
             size=(Integer(64), Integer(128)),
         )
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(3)],
-            loop_tiled_dims=[[0]],
-            tiled_dims_per_read=[[[(0, Integer(64))]]],
-        )
 
-        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 16384))
+        self.assertEqual(_loop_advance_bound(op, dep, info), (0, 16384))
 
-    def test_loop_bound_maps_output_and_reduction_dims_around_squeezed_dim(self):
-        from torch._inductor.dependencies import MemoryDep
+    def test_a_read_that_does_not_move_with_the_loop_has_no_bound(self):
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
-        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True)
-        op = SimpleNamespace(
-            data=SimpleNamespace(
-                ranges=[Integer(64), Integer(1)],
-                reduction_ranges=[Integer(32), Integer(16)],
-            )
-        )
-        dep = MemoryDep(
-            name="weight",
-            index=512 * d0 + 16 * d1 + d2,
-            var_names=(d0, d1, d2),
-            size=(Integer(64), Integer(32), Integer(16)),
-        )
-        info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(2)],
-            loop_tiled_dims=[[0, 2]],
-            tiled_dims_per_read=[
-                [
-                    [
-                        (0, Integer(8)),
-                        (2, Integer(4)),
-                    ]
-                ]
-            ],
-        )
+        op, dep, info = self._looped_read(lambda u: Integer(0), Integer(3))
 
-        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 4160))
+        self.assertIsNone(_loop_advance_bound(op, dep, info))
 
     def test_direct_read_storage_encoding_must_match(self):
         from torch_spyre._C import ElementArrangement
