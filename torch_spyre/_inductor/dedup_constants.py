@@ -23,7 +23,7 @@ from torch._inductor.virtualized import V
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
-from .loop_node import OpsView
+from .loop_node import OpsView, remove_op
 from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance
 
@@ -177,7 +177,7 @@ def _drop_constant(
         pass_name="dedup_and_promote_constants",
         reason="duplicate constant",
     )
-    operations.remove(dup)
+    remove_op(operations, dup)
     V.graph.removed_buffers.add(D)
     V.graph.name_to_buffer.pop(D, None)
     V.graph.name_to_op.pop(op_name, None)
@@ -211,7 +211,7 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
     workload). This implementation performs the same get_read_writes
     calls at most once per op, in a single sweep, and consults the
     precomputed reverse index per duplicate. The remaining
-    ``operations.remove(dup)`` in ``_drop_constant`` still runs once per
+    ``remove_op`` in ``_drop_constant`` still runs once per
     duplicate; its measured cost is negligible relative to the
     consumer-discovery term and is intentionally not batched in this
     change.
