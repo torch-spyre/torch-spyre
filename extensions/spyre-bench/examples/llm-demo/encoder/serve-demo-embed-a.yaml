@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-embed-a-tp1-fp16}
+spec:
+  type: llm/vllm
+  backend: spyre
+  token: demo-embed-a
+  model: demo-embed-a
+  precision: fp16
+  flags: {load-format: auto, runner: pooling, max-model-len: 512, max-num-seqs: 4}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-embed-a-tp1-fp16-pc}
+spec:
+  base: demo-embed-a-tp1-fp16
+  patch: {flags: {max-num-batched-tokens: 512, enable-prefix-caching: true}}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-embed-a-tp1-fp16-nopc}
+spec:
+  base: demo-embed-a-tp1-fp16
+  patch: {flags: {enable-prefix-caching: false}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-demo-embed-a, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: extended
+  system: demo-embed-a-tp1-fp16-nopc
+  environment: ref-1card
+  workload:
+    type: llm/serve
+    endpoint: /v1/embeddings
+    input_len: 512
+    flags: {dataset-name: random, backend: openai-embeddings, random-range-ratio: 0.5}
+  metrics: [llm.request_throughput, llm.e2el.mean, llm.e2el.p99]
+  run: {cache: warm, timeout: 30m}
+  variants:
+    - name: serve_demo-embed-a_tp1_c64_n200_in512
+      tier: sanity
+      system: demo-embed-a-tp1-fp16-pc
+      workload: {load: {executor: closed, concurrency: 64, requests: 200, warmup_requests: 8}}
+      env: {DEMO_FLAG_A: 64}
+      run: {est: 8m}
+    - name: serve_demo-embed-a_tp1_c16_n10000_in512
+      workload: {load: {executor: closed, concurrency: 16, requests: 10000, warmup_requests: 100}}
+      run: {est: 20m}

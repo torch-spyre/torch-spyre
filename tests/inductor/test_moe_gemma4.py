@@ -229,6 +229,15 @@ TOPK_FLOAT_IDS = _xfail(
     "#5847: topk returns float32 indices",
     r"'dtype' do not match: torch\.float32 != torch\.int64",
 )
+# topk of a DL16_TO_FP32 input (the FP32 softmax of a BF16 [12, 128] input) puts the
+# stick on the row dim, and the result is tagged STANDARD, so the D2H copy does not
+# restore the staggered row order: every row from row 4 up holds another row's top-k.
+# #5495 does not help, it shuffles Pointwise ops only.
+TOPK_STAGGERED_INPUT = _xfail(
+    AssertionError,
+    "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
+    "Tensor-likes are not close",
+)
 # An FP32 softmax of a BF16 [12, 128] input, or a .float() of its [12, 8] top-k
 # mask, stages a DL16_TO_FP32 operand whose stick pair is on no single dim. This
 # fails before #4639 (wrong compiled / tied topk values) can be observed.
@@ -264,10 +273,23 @@ FLOAT_IDS_AS_INDEX_EAGER = _xfail(
     "#5847: float32 topk ids cannot index per_expert_scale",
     "tensors used as indices must be long, int, byte or bool",
 )
-SORT_MULTI_OUTPUT = _xfail(
+# With #5831 fixed, the compiled grouped_mm sort gets past split_multi_ops and
+# stops at the restickify of its gather (T=12) or at the routing flatten (T=1).
+SORT_RESTICKIFY = _xfail(
     InductorError,
-    "#5831: split_multi_ops fails on multi-output sort",
-    "'tuple' object has no attribute 'to'",
+    "#4327: restickify op_spec has 3 args",
+    "restickify op_spec has 3 args",
+)
+SORT_STICK_INCOMPATIBILITY = _xfail(
+    InductorError,
+    "#3193: compiled grouped_mm sort raises no mechanism to resolve stick incompatibility",
+    "no mechanism to resolve stick incompatibility",
+)
+# At T=1 the compiled tied topk runs, but selects experts outside the tied pool.
+TIED_TOPK_COMPILED = _xfail(
+    AssertionError,
+    "#4639: compiled tied topk selects experts outside the tied pool",
+    r"compiled spyre <-> cpu\[1\] mismatch",
 )
 HISTC = _xfail(
     NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
@@ -277,9 +299,13 @@ REPEAT_INTERLEAVE = _xfail(
     "#673: repeat_interleave.Tensor has no Spyre kernel",
     r"aten::repeat_interleave\.Tensor",
 )
-# The grouped_mm MoE stops at its sort: no stable-sort kernel eager, and
-# split_multi_ops rejects the multi-output sort compiled.
-GROUPED_MM_SORT = dict(eager=STABLE_SORT, compiled=SORT_MULTI_OUTPUT)
+# The grouped_mm MoE stops at its sort eager (no stable-sort kernel); compiled it
+# stops at a restickify (T=12) or at the routing flatten (T=1). _modes takes no
+# decode marks, so the _cases scenarios use GROUPED_MM_SORT_CASES.
+GROUPED_MM_SORT = dict(eager=STABLE_SORT, compiled=SORT_RESTICKIFY)
+GROUPED_MM_SORT_CASES = dict(
+    GROUPED_MM_SORT, decode_compiled=SORT_STICK_INCOMPATIBILITY
+)
 UPCAST_RMS_NORM = _xfail(
     AssertionError,
     "#5893: FP32 RMSNorm of an upcast BF16 input returns wrong values, so eager "
@@ -805,7 +831,9 @@ def _f32(tensors):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS,
+        compiled=TOPK_STAGGERED_INPUT,
+        decode_compiled=TOPK_FLOAT_IDS,
     ),
 )
 def test_G4_RT_001_batch_routing(execution_mode, T):
@@ -850,7 +878,9 @@ def test_G4_RT_001_batch_routing(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS, compiled=STAGGERED_UPCAST, decode_compiled=TOPK_FLOAT_IDS
+        eager=TOPK_FLOAT_IDS,
+        compiled=TOPK_STAGGERED_INPUT,
+        decode_compiled=TOPK_FLOAT_IDS,
     ),
 )
 def test_G4_RT_002_routing_weight_normalization(execution_mode, T):
@@ -980,7 +1010,7 @@ def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT_CASES))
 def test_G4_GM_001_sort_dispatch(execution_mode, T):
     """torch.sort by expert, then gather rows with perm // K."""
     _seed()
@@ -1133,7 +1163,7 @@ def test_G4_GM_005_router_and_grouped_mm_moe(execution_mode, T):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT_CASES))
 def test_G4_DT_002_fp32_reference_vs_bf16_execution(execution_mode, T):
     """grouped_mm MoE in BF16 stays within a justified bound of an FP32 reference."""
     _seed()
@@ -1190,7 +1220,7 @@ def _run_case_with_ids(expert_ids, execution_mode):
     return torch.bincount(flat, minlength=EXPERTS), _hf_offsets(torch.sort(flat).values)
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT_CASES))
 def test_G4_EC_001_repeated_expert_selection_within_token(execution_mode, T):
     # Each token picks one expert K times; tokens pick different experts.
     ids = (torch.arange(T) % EXPERTS).unsqueeze(1).expand(T, K8).contiguous()
@@ -1200,7 +1230,7 @@ def test_G4_EC_001_repeated_expert_selection_within_token(execution_mode, T):
     assert offsets[T - 1].item() == offsets[-1].item() == T * K8
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT_CASES))
 def test_G4_EC_002_empty_expert_segments(execution_mode, T):
     """Experts 8-127 get no rows, so their grouped_mm segments are empty."""
     ids = torch.arange(K8, dtype=torch.long).expand(T, K8).contiguous()
@@ -1214,7 +1244,8 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
     ("execution_mode", "T"),
     _cases(
         eager=STAGGERED_UPCAST,
-        compiled=SORT_MULTI_OUTPUT,
+        compiled=TOPK_STAGGERED_INPUT,
+        decode_compiled=TIED_TOPK_COMPILED,
         decode_eager=_xfail(
             InductorError,
             "#4404: restickify restore expects a padding-prepended gap dim",
@@ -1281,7 +1312,7 @@ def test_G4_EC_004_all_128_experts_active(execution_mode):
     assert torch.equal(offsets, torch.arange(1, EXPERTS + 1, dtype=torch.int32))
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT_CASES))
 def test_G4_EC_005_single_expert_routing_all_tokens(execution_mode, T):
     """Every routed row goes to expert 0; the other 127 segments are empty."""
     ids = torch.zeros(T, K8, dtype=torch.long)

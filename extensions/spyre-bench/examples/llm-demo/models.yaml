@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# A Model names weight assets by role; model_id = hash of the (role, asset_id) set, so a revision bump is a new benchmark.
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a}
+spec:
+  assets: [{role: weights, asset: demo-llm-a-weights}]
+  family: demo
+  architecture: decoder-only
+  params: {total: 1000000, active: 1000000}
+  native_precision: bf16
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-embed-a}
+spec:
+  assets: [{role: weights, asset: demo-embed-a-weights}]
+  family: demo
+  architecture: encoder-only
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-c}
+spec:
+  assets: [{role: weights, asset: demo-llm-c-weights}]
+  family: demo
+  architecture: decoder-only

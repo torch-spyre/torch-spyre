@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Synthetic: shows the vllm key list (the serving-benchmark producer hashes five keys, vllm-sweep four more; it writes no
+# tags and names a benchmark after its test) on a kernel workload. The load fields standing in for input_len and
+# output_len are arbitrary; a real serving Benchmark would map its own workload values.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-latency}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: ingest-demo-fp16
+  workload: {type: kernel/op, op: add, dtype: fp16, shape: [1, 512], load: {executor: iterations, iterations: 128, warmup_iterations: 16}}
+  run: {repeats: 1, timeout: 30m, est: 2m, isolation: process}
+  identity:
+    mode: ingest
+    profile: vllm
+    name: latency_demo_tp1_in128_out16
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: latency}
+      - {key: tensor_parallel, value: 1}
+      - {key: input_len, from: case.load.iterations}
+      - {key: output_len, from: case.load.warmup_iterations}
+  variants:
+    - name: op_latency_fp16

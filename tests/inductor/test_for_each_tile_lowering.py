@@ -71,6 +71,7 @@ from for_each_tile_fixtures import (
     two_loops_shared_init_fn,
 )
 from torch_spyre._inductor.loop_carries import apply_loop_carries
+from torch_spyre._inductor.loop_facts import output_advance, read_advance
 from torch_spyre._inductor.loop_node import all_ops, expand
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
@@ -1514,6 +1515,26 @@ class TestCarryRealInputOwnership(unittest.TestCase):
 
 
 class TestSpliceWhileLoops(unittest.TestCase):
+    @staticmethod
+    def _advances(reader, record, source_name, copy_name):
+        """Per-level advance (in elements) of the consumer's read of the staged copy,
+        and of the direct read of the source that replaces it."""
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.loop_facts import read_advance
+        from torch_spyre._inductor.read_copy_elision import _clone_direct_consumer
+
+        def read_of(op, name):
+            (dep,) = [
+                d
+                for d in op.get_read_writes().reads
+                if isinstance(d, MemoryDep) and d.name == name
+            ]
+            return read_advance(op, dep)
+
+        direct = _clone_direct_consumer(reader, record)
+        return read_of(reader, copy_name), read_of(direct, source_name)
+
     def _run_graph(self, fn, args):
         """Lower fn(*args) through a fresh GraphLowering and return it.
 
@@ -2042,10 +2063,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertEqual(list(input_copy.data.ranges), [1, 64, 1, 8, 128])
             self.assertEqual(list(input_copy.layout.size), [1, 64, 1, 8, 128])
             self.assertEqual(list(input_copy.layout.stride), [0, 128, 0, 8192, 1])
-            self.assertEqual(
-                input_copy.loop_info.squeezed_advance_per_read,
-                [[[(8192, 1)]]],
-            )
             self.assertEqual(source_index.coeff(identity_indices[0]), 8192)
             self.assertEqual(source_index.coeff(identity_indices[3]), 40960)
 
@@ -2168,17 +2185,14 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertEqual(direct_record.source_name, source_name)
 
             self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            # Per level, outermost first: the consumer reads the staged copy one
+            # head tile further each outer trip, and the direct read of the source
+            # (what replaces the copy) moves by its own source stride.
             self.assertEqual(
-                direct_record.direct_tiled_dims_per_level,
-                ((), ((3, 64),)),
-            )
-            self.assertEqual(
-                direct_record.direct_squeezed_advance_per_level,
-                (((81920, 1),), ()),
-            )
-            self.assertEqual(
-                direct_reader.loop_info.squeezed_advance_per_read,
-                [[[(65536, 1)], []]],
+                self._advances(
+                    direct_reader, direct_record, source_name, input_copy.get_name()
+                ),
+                ((65536, 8192), (81920, 8192)),
             )
 
             self.assertFalse(
@@ -2272,13 +2286,12 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertEqual(direct_record.copy_name, input_copy.get_name())
             self.assertEqual(direct_record.source_name, source_name)
             self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            # Invariant in the outer loop, one sequence tile per inner trip.
             self.assertEqual(
-                direct_record.direct_tiled_dims_per_level,
-                ((), ((3, 64),)),
-            )
-            self.assertEqual(
-                direct_record.direct_squeezed_advance_per_level,
-                ((), ()),
+                self._advances(
+                    direct_reader, direct_record, source_name, input_copy.get_name()
+                ),
+                ((0, 8192), (0, 8192)),
             )
 
             self.assertFalse(
@@ -2316,7 +2329,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             loop_group_id=(0, 1),
             loop_count=[2, 4],
             loop_tiled_dims=[[], [0]],
-            tiled_dims_per_read=[[[], [(0, 64)]]],
         )
         graph = mock.Mock()
         graph.try_get_buffer.side_effect = {"root": producer}.get
@@ -2342,12 +2354,14 @@ class TestSpliceWhileLoops(unittest.TestCase):
             reads=[
                 MemoryDep(
                     "root",
-                    256 * outer + 64 * inner + element,
+                    100 * outer + 64 * inner + element,
                     (element,),
                     (256,),
                 )
             ]
         )
+        # The outer step selects no whole producer slice (an axis stride times
+        # its tile), so the edge is not valid.
         self.assertFalse(
             _identity_chain_has_valid_loop_advances(
                 graph, ["root"], reader, loop_by_group
@@ -5482,8 +5496,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         inlined flat-table read is ``e + 32*u0`` -- the coefficient coincidence that
         used to make lookup_marker_dim call the entries axis tiled. Real lowering,
         CPU-only: consume the marker, stamp the real group, then assert the entries
-        axis is not loop_tiled and the read's own per-trip advance is exactly one
-        ``(32, 1)`` pair.
+        axis is not loop_tiled and the read's own per-trip advance is exactly 32.
         """
         import sympy
         from torch._inductor import ir
@@ -5530,10 +5543,10 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 ]
                 for read_idx, dep in enumerate(reads):
                     if dep.index.coeff(loop_var) == 32:
-                        consumers.append((op, read_idx))
+                        consumers.append((op, read_advance(op, dep)))
 
         self.assertTrue(consumers, "no read carries the 32*u0 per-trip advance")
-        for op, read_idx in consumers:
+        for op, advance in consumers:
             info = getattr(op, "loop_info", None)
             self.assertIsNotNone(info, "the consumer was not stamped")
             loop_tiled = [pos for level in info.loop_tiled_dims for pos in level]
@@ -5542,23 +5555,10 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 loop_tiled,
                 "the consumed marker's entries axis must not be stamped loop_tiled",
             )
-            tiled_entries = [
-                entry for level in info.tiled_dims_per_read[read_idx] for entry in level
-            ]
             self.assertEqual(
-                tiled_entries,
-                [],
-                "the consumed read must carry no tiled_dims_per_read entry",
-            )
-            advances = [
-                pair
-                for level in info.squeezed_advance_per_read[read_idx]
-                for pair in level
-            ]
-            self.assertEqual(
-                advances,
-                [(sympy.Integer(32), sympy.Integer(1))],
-                "the read's own per-trip advance must be exactly one (32, 1) pair",
+                advance,
+                (sympy.Integer(32),),
+                "the read's own per-trip advance must be exactly 32",
             )
 
     def test_consumed_read_does_not_hide_a_retained_read(self):
@@ -5785,8 +5785,10 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             "no op in split_m_elementwise_fn's body has a marker-resolved tiled dim",
         )
 
-    def test_tiled_dims_per_read_has_one_entry_per_read_dep(self):
-        """tiled_dims_per_read/output_tiled_dims match op.get_read_writes().
+    def test_the_stamp_holds_the_loops_own_facts_and_an_advancing_read_has_its_step(
+        self,
+    ):
+        """The stamp is the loop's own facts; an advance is read off the index.
 
         Deviates from the brief's literal snippet in two ways, both
         verified empirically against the real fixture/API before writing
@@ -5845,63 +5847,24 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             _stamp_direct_loop_info(group_ops, loop_var, result.trip_count, group_idx=0)
 
             # op.get_read_writes() needs the live GraphLowering (V.graph)
-            # context, same as the stamping call above -- stays inside the
-            # `with` block rather than reading loop_info alone afterward.
+            # context, same as the stamping call above.
             saw_advancing_read = False
             for op in group_ops:
-                if not getattr(op, "loop_info", None):
+                info = getattr(op, "loop_info", None)
+                if not info:
                     continue
-                info = op.loop_info
+                self.assertEqual(info.loop_group_id, (0,))
+                self.assertEqual(list(info.loop_count), [result.trip_count])
+                self.assertFalse(hasattr(info, "tiled_dims_per_read"))
                 rw = op.get_read_writes()
-                reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
-                self.assertEqual(
-                    len(info.tiled_dims_per_read),
-                    len(reads),
-                    f"{op.get_name()}: tiled_dims_per_read entry count must "
-                    "match the op's own read-dep count",
-                )
-                # Each per-read entry carries one list per nesting level
-                # (parallel to loop_tiled_dims's own [loop_tiled_dims]
-                # wrapping) -- this function only ever stamps one level, so
-                # entry[-1] is that level's (pos, extent) list.
-                for dep, per_read_levels in zip(reads, info.tiled_dims_per_read):
-                    per_level = per_read_levels[-1]
-                    if dep.index.coeff(loop_var) != 0:
-                        # Extent is this dep's own per-trip tile size (its
-                        # matched range var's own dep.ranges value), not
-                        # trip_count -- these only coincide when tile_size==1.
-                        # See _extent_at_pos's docstring: stamping trip_count
-                        # here silently doubled the read-side device advance
-                        # on any tile_size>1 fixture (confirmed on
-                        # add_tiled_fn). split_m_elementwise_fn's tile_size=64
-                        # means the real per-trip extent is 64, not
-                        # result.trip_count (2).
-                        pos = info.loop_tiled_dims[-1][0]
-                        matched_var = next(
-                            var
-                            for var, rng in dep.ranges.items()
-                            if dep.index.coeff(var) * rng == dep.index.coeff(loop_var)
-                        )
-                        self.assertEqual(
-                            per_level,
-                            [(pos, dep.ranges[matched_var])],
-                            f"{op.get_name()}: advancing read must carry "
-                            "(resolved_pos, per-trip tile extent)",
-                        )
-                        saw_advancing_read = True
-                    else:
-                        self.assertEqual(
-                            per_level,
-                            [],
-                            f"{op.get_name()}: non-advancing read must stay empty",
-                        )
-
+                for dep in (d for d in rw.reads if isinstance(d, MemoryDep)):
+                    (step,) = read_advance(op, dep)
+                    self.assertEqual(step, dep.index.coeff(loop_var))
+                    saw_advancing_read = saw_advancing_read or step != 0
                 writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
-                if writes and writes[0].index.coeff(loop_var) == 0:
+                if writes:
                     self.assertEqual(
-                        info.output_tiled_dims[-1],
-                        [],
-                        f"{op.get_name()}: non-advancing write must stay empty",
+                        output_advance(op), (writes[0].index.coeff(loop_var),)
                     )
 
         self.assertTrue(

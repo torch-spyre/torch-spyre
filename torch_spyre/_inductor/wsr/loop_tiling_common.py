@@ -352,7 +352,7 @@ def _hint_ranges_pos(
     # ``dep.index == 32*u0`` with no ``d{i}`` coordinates at all -- so
     # loop_var can appear in its index without ever being resolvable
     # through the marker map. That is not a gap: it is the shape
-    # for_each_tile handles through squeezed_advance_per_read once this function returns
+    # for_each_tile reads off the index once this function returns
     # (None, False) for it, by stashing hint.loop_var into
     # unattributed_loop_vars. Counting it here as "mentions loop_var"
     # would raise on every legitimate point-splice-advance read instead of

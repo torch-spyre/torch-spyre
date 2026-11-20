@@ -390,46 +390,19 @@ def _level_loop_vars(op, levels) -> list:
     ]
 
 
-def _stamped_advances(tiled, squeezed, n_levels: int) -> list[bool] | None:
-    """Per-level "this dependency's address advances" verdict stamped by the lowering.
-
-    ``tiled`` is one dependency's ``CoarseTileInfo.tiled_dims_per_read`` entry (or
-    ``output_tiled_dims``) and ``squeezed`` the parallel
-    ``squeezed_advance_per_read`` entry (or ``squeezed_advance_output``).  The
-    ``for_each_tile`` lowering decides advancement per dependency
-    (``_stamp_direct_loop_info``: a nonzero coefficient on the loop variable), and
-    ``insert_restickify`` rewrites the verdict when it moves an advance onto a copy;
-    code generation reads only these stamps.  A level advances when either list names
-    something at that level; an empty level is the explicit "pinned" verdict.
-    ``None`` when the stamp is missing or does not cover every level.
-    """
-    if tiled is None or len(tiled) != n_levels:
-        return None
-    if squeezed and len(squeezed) != n_levels:
-        return None
-    return [
-        bool(tiled[lv]) or bool(squeezed and squeezed[lv]) for lv in range(n_levels)
-    ]
-
-
-def _loop_var_advances(index, loop_vars, stamped=None) -> list[bool]:
+def _loop_var_advances(index, loop_vars) -> list[bool]:
     """Per level: does a dependency at ``index`` advance with that level's loop?
 
-    A complete stamped verdict decides for every level, with or without a paired
-    ``for_each_tile`` loop variable (``_stamped_advances``); the tiled dims of every
-    level are handled by ``_loop_factor_for_index`` itself.  Without a stamp, only a
-    level with a paired loop variable can say yes, by the lowering's own rule: the
-    address advances iff the index has a nonzero coefficient on the loop variable.  A
-    loop variable that is merely a free symbol of the index does not advance the
-    address; the tested example is the synthetic index ``4096*FloorDiv(u0, 2)``
-    (coefficient 0).  No lowered kernel is known to produce such a read; following the
-    lowering's rule keeps the price consistent with what the lowering stamps.
+    Only a level with a paired loop variable can say yes, by the lowering's own rule:
+    the address advances iff the index has a nonzero coefficient on the loop
+    variable (the tiled dims of every level are handled by ``_loop_factor_for_index``
+    itself).  A loop variable that is merely a free symbol of the index does not
+    advance the address; the tested example is the synthetic index
+    ``4096*FloorDiv(u0, 2)`` (coefficient 0).
     """
     advances = []
     for lv, var in enumerate(loop_vars):
-        if stamped is not None:
-            advances.append(stamped[lv])
-        elif var is None:
+        if var is None:
             advances.append(False)
         else:
             try:
@@ -1473,7 +1446,6 @@ def extract_op_features(
     # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
     # set above, from the committed loop_info or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
-    _li = getattr(op, "loop_info", None)
     _rw = None
     try:
         _rw = op_read_writes(op)
@@ -1481,20 +1453,10 @@ def extract_op_features(
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
     if _levels and _write_index is not None:
-        _write_advances = _loop_var_advances(
-            _write_index,
-            _loop_vars,
-            _stamped_advances(
-                getattr(_li, "output_tiled_dims", None),
-                getattr(_li, "squeezed_advance_output", None),
-                len(_levels),
-            ),
-        )
+        _write_advances = _loop_var_advances(_write_index, _loop_vars)
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
         out_factor = _select(tiles_out_dim, 1, loop_trip)
-    _stamped_reads = getattr(_li, "tiled_dims_per_read", None) or []
-    _squeezed_reads = getattr(_li, "squeezed_advance_per_read", None) or []
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -1631,18 +1593,9 @@ def extract_op_features(
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
-    # The lowering stamps one verdict per MemoryDep read, in read order; StarDep and
-    # WeakDep have no index and no entry.
-    n_indexed_reads = sum(_dep_index(dep) is not None for dep in reads)
-    stamps_cover_reads = len(_stamped_reads) == n_indexed_reads and (
-        not _squeezed_reads or len(_squeezed_reads) == n_indexed_reads
-    )
-    indexed_pos = -1
     for dep in reads:
         name = getattr(dep, "name", "?")
         index = _dep_index(dep)
-        if index is not None:
-            indexed_pos += 1
         # Broadcast heuristic: the read index references fewer loop variables than
         # the output rank -> it is loaded ONCE and reused across the broadcast dim, so
         # it is counted at its own (small) device size, not the output size. This
@@ -1656,22 +1609,11 @@ def extract_op_features(
         except Exception:  # noqa: BLE001
             broadcast = False
         # One verdict per read and level: does this read's address advance with
-        # that level's for_each_tile variable? The lowering stamps it, else its
-        # own coefficient rule decides (``_loop_var_advances``). It sets both the
+        # that level's loop variable (``_loop_var_advances``)? It sets both the
         # read's loop factor and its loop-delivery eligibility, so the two prices
         # cannot disagree about one read.
         read_advances = (
-            _loop_var_advances(
-                index,
-                _loop_vars,
-                _stamped_advances(
-                    _stamped_reads[indexed_pos],
-                    _squeezed_reads[indexed_pos] if _squeezed_reads else None,
-                    len(_levels),
-                )
-                if stamps_cover_reads
-                else None,
-            )
+            _loop_var_advances(index, _loop_vars)
             if (_levels and index is not None)
             else []
         )
