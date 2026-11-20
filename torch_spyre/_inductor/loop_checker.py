@@ -73,7 +73,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
-from .loop_facts import counted_loop_path, enclosing_loops, node_levels
+from .loop_facts import counted_loop_path, node_levels, stamped_levels
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -303,7 +303,7 @@ def _node_fact_problems(
             f"nodes around it {[n.get_name() for n in enclosing]}"
         )
         return
-    stamped, derived = _facts(enclosing_loops(op)), _facts(node_levels(op))
+    stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
     if stamped != derived:
         problems.append(
             f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"

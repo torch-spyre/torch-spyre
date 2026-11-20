@@ -43,7 +43,12 @@ from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
 )
-from torch_spyre._inductor.loop_facts import enclosing_loops, node_levels
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    node_levels,
+    stamped_levels,
+)
 from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
@@ -796,9 +801,25 @@ class TestNodeFacts(unittest.TestCase):
                         level.tiled_dims,
                         level.tiled_reduction_dims,
                     )
-                    for level in enclosing_loops(op)
+                    for level in stamped_levels(op)
                 ],
             )
+            self.assertEqual(enclosing_loops(op), node_levels(op))
+        self.assertEqual(counted_loop_path(a), (0,))
+
+    def test_an_op_no_node_holds_answers_from_its_stamp(self):
+        a = _Op("a", (0,), [4])
+        a.loop_info.loop_tiled_dims = [[1]]
+        self.assertEqual(node_levels(a), ())
+        (level,) = enclosing_loops(a)
+        self.assertEqual((level.group_path, level.tiled_dims), ((0,), (1,)))
+        self.assertEqual(counted_loop_path(a), (0,))
+
+    def test_an_op_moved_out_of_its_loop_falls_back_to_its_stamp(self):
+        graph, node, a, b = self._tiled_pair()
+        move_after(graph.operations, node, a)
+        self.assertEqual(node_levels(a), ())
+        self.assertEqual(enclosing_loops(a), stamped_levels(a))
 
     def test_nested_chain_is_outermost_first(self):
         b = _Op("b", (0,), [4])
