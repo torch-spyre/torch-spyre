@@ -128,9 +128,11 @@ def _placeholder(meta: torch.Tensor, spec: Optional[tuple], args: list) -> torch
     """A tensor with the metadata of a graph output, from the child's spec if any.
 
     A spec is ``("alias", input_index, size, stride, offset)`` for an output that
-    is a view of a graph input, or ``("new", size, stride, offset, dtype, device,
-    layout_repr)`` for a buffer the graph allocates, where ``layout_repr`` is the
-    ``SpyreTensorLayout`` as the generated wrapper spells it (None off the device).
+    is a view of a graph input, ``("new", size, stride, offset, dtype, device,
+    layout_repr)`` for a buffer the graph allocates, or ``("view", base_size,
+    base_stride, size, stride, offset, dtype, device, layout_repr)`` for a view of
+    such a buffer, where ``layout_repr`` is the ``SpyreTensorLayout`` as the generated
+    wrapper spells it (None off the device).
     """
     if spec is not None and spec[0] == "alias":
         _, index, size, stride, offset = spec
@@ -147,23 +149,50 @@ def _placeholder(meta: torch.Tensor, spec: Optional[tuple], args: list) -> torch
                 base, tuple(size), tuple(stride), offset, layout
             )
         return torch.as_strided(base, size, stride, offset)
+    if spec is not None and spec[0] == "view":
+        _, base_size, base_stride, size, stride, offset, dtype, device, layout_repr = (
+            spec
+        )
+        base = _fresh(base_size, base_stride, dtype, torch.device(device), layout_repr)
+        if layout_repr is not None:
+            from torch_spyre._C import as_strided_with_layout
+
+            return as_strided_with_layout(
+                base, tuple(size), tuple(stride), offset, base.device_tensor_layout()
+            )
+        return torch.as_strided(base, size, stride, offset)
     if spec is not None and spec[0] == "new":
         _, size, stride, _offset, dtype, device, layout_repr = spec
-        device = torch.device(device)
-        if layout_repr is not None:
-            from torch_spyre._C import fill_tensor, spyre_empty_with_layout
-            from torch_spyre._inductor.wrapper import spec_eval_namespace
-
-            layout = eval(layout_repr, spec_eval_namespace())  # noqa: S307 - our own repr
-            out = spyre_empty_with_layout(
-                tuple(size), tuple(stride), dtype, layout, device=device
-            )
-            fill_tensor(out, 0.0)
-            return out
-        return torch.empty_strided(size, stride, dtype=dtype, device=device).zero_()
+        return _fresh(size, stride, dtype, torch.device(device), layout_repr)
     return torch.zeros(
         tuple(int(d) for d in meta.shape), dtype=meta.dtype, device=meta.device
     )
+
+
+def _fresh(
+    size: list,
+    stride: list,
+    dtype: torch.dtype,
+    device: torch.device,
+    layout_repr: Optional[str],
+) -> torch.Tensor:
+    """A zeroed buffer with the layout the child reported, or the eager one without it."""
+    if layout_repr is not None:
+        from torch_spyre._C import fill_tensor, spyre_empty_with_layout
+        from torch_spyre._inductor.wrapper import spec_eval_namespace
+
+        layout = eval(layout_repr, spec_eval_namespace())  # noqa: S307 - our own repr
+        out = spyre_empty_with_layout(
+            tuple(size), tuple(stride), dtype, layout, device=device
+        )
+        fill_tensor(out, 0.0)
+        return out
+    out = torch.empty_strided(size, stride, dtype=dtype, device=device)
+    try:
+        return out.zero_()
+    except RuntimeError:
+        # torch-spyre fills dense storage only; a padded-stride output gets a dense stand-in.
+        return torch.zeros(tuple(size), dtype=dtype, device=device)
 
 
 def _output_specs(graph: Any) -> list:
@@ -197,6 +226,30 @@ def _output_specs(graph: Any) -> list:
             specs.append(("alias", index, size, stride, offset))
             continue
         device_layout = getattr(layout, "device_layout", None)
+        if base is not None and device_layout is None:
+            # A view of a fresh buffer: the device layout lives on the buffer.
+            try:
+                base_layout = base.get_layout()
+                base_device_layout = getattr(base_layout, "device_layout", None)
+                base_size = [int(s) for s in base_layout.size]
+                base_stride = [int(s) for s in base_layout.stride]
+            except Exception:  # noqa: BLE001 - symbolic or layout-less base: a plain buffer
+                base_device_layout = None
+            if base_device_layout is not None:
+                specs.append(
+                    (
+                        "view",
+                        base_size,
+                        base_stride,
+                        size,
+                        stride,
+                        offset,
+                        layout.dtype,
+                        str(layout.device),
+                        repr(base_device_layout),
+                    )
+                )
+                continue
         specs.append(
             (
                 "new",

@@ -223,12 +223,15 @@ def test_placeholders_take_the_layouts_the_child_reports(monkeypatch):
                 ("new", [2, 3], [1, 2], 0, torch.float32, "cpu", None),
                 None,
                 ("alias", 0, [2], [2], 1),
+                ("view", [6], [1], [2, 1], [2, 1], 1, torch.float32, "cpu", None),
             ]
         )
         time.sleep(0.5)
 
     monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", fake_inner)
-    gm = _graph_with_outputs(((2, 3), torch.float16), None, ((2,), torch.float32))
+    gm = _graph_with_outputs(
+        ((2, 3), torch.float16), None, ((2,), torch.float32), ((2, 1), torch.float32)
+    )
     x = torch.arange(6.0)
     with pp.fork_inner_compiles(1, placeholders=True) as pool:
         stand_in = spyre_inductor._spyre_inner_compile(gm, [x])
@@ -240,6 +243,9 @@ def test_placeholders_take_the_layouts_the_child_reports(monkeypatch):
         assert out[0].dtype == torch.float32 and not out[0].any()
         assert out[1] == 0
         assert torch.equal(out[2], x[1:5:2]) and out[2].data_ptr() == x[1:].data_ptr()
+        # A view of a fresh buffer: zeros with the view's shape, strides and offset.
+        assert out[3].shape == (2, 1) and out[3].stride() == (2, 1)
+        assert out[3].storage_offset() == 1 and not out[3].any()
         # A second run of the same stand-in reuses the report.
         assert stand_in([x])[2].stride() == (2,)
     assert (pool.ok, pool.failed) == (1, 0)
@@ -274,15 +280,35 @@ def test_output_specs_tell_fresh_buffers_from_views_of_inputs():
     buf = ir.Buffer(
         name="buf0", layout=ir.FixedLayout(cpu, torch.float16, [2, 3], [1, 2])
     )
+    # A view of a fresh device buffer: the layout lives on the buffer, not the view.
+    laid_out = ir.FixedLayout(cpu, torch.float16, [4, 2], [2, 1])
+    laid_out.device_layout = "L"
+    buf1 = ir.Buffer(name="buf1", layout=laid_out)
+    buf1_view = ir.ReinterpretView(
+        data=ir.StorageBox(buf1),
+        layout=ir.FixedLayout(cpu, torch.float16, [4, 2, 1], [2, 1, 1]),
+    )
+    plain_view = ir.ReinterpretView(
+        data=ir.StorageBox(buf),
+        layout=ir.FixedLayout(cpu, torch.float16, [3, 2], [2, 1]),
+    )
     graph = types.SimpleNamespace(
         graph_input_names=["arg0_1"],
-        graph_outputs=[ir.TensorBox(ir.StorageBox(buf)), 7, ir.TensorBox(view)],
+        graph_outputs=[
+            ir.TensorBox(ir.StorageBox(buf)),
+            7,
+            ir.TensorBox(view),
+            ir.TensorBox(buf1_view),
+            ir.TensorBox(plain_view),
+        ],
     )
     specs = pp._output_specs(graph)
     assert specs == [
         ("new", [2, 3], [1, 2], 0, torch.float16, "cpu", None),
         None,
         ("alias", 0, [2], [2], 1),
+        ("view", [4, 2], [2, 1], [4, 2, 1], [2, 1, 1], 0, torch.float16, "cpu", "'L'"),
+        ("new", [3, 2], [2, 1], 0, torch.float16, "cpu", None),
     ]
     del GraphLowering, V
 
