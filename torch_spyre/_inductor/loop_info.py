@@ -23,12 +23,8 @@ the ``loop_facts`` accessors. It is the last per-op copy of the loop's facts; it
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import sympy
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass

@@ -2281,6 +2281,8 @@ def _identity_chain_has_valid_loop_advances(
     from torch_spyre._inductor.loop_info import LoopInfo
 
     final_info = getattr(final_consumer, "loop_info", None)
+    # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+    # lowering, so no strict_loop_vars op exists yet.
     if not isinstance(final_info, LoopInfo):
         return False
 
@@ -2295,6 +2297,8 @@ def _identity_chain_has_valid_loop_advances(
     ]
     for reader in readers:
         reader_info = getattr(reader, "loop_info", None)
+        # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+        # lowering, so no strict_loop_vars op exists yet.
         if not isinstance(reader_info, LoopInfo):
             return False
         reader_group = reader_info.loop_group_id
@@ -2538,6 +2542,8 @@ def _contract_cross_scope_input_materializations(
             if not valid_chain or terminal_consumer is None or terminal_dep is None:
                 continue
             terminal_info = getattr(terminal_consumer, "loop_info", None)
+            # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+            # lowering, so no strict_loop_vars op exists yet.
             if not isinstance(terminal_info, LoopInfo):
                 continue
 
@@ -2577,6 +2583,8 @@ def _contract_cross_scope_input_materializations(
                     continue
 
             final_info = getattr(final_consumer, "loop_info", None)
+            # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+            # lowering, so no strict_loop_vars op exists yet.
             if not isinstance(final_info, LoopInfo):
                 continue
             if isinstance(

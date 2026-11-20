@@ -740,7 +740,7 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
 # ===========================================================================
 
 
-class TestCoarseTileInfo(unittest.TestCase):
+class TestLoopInfo(unittest.TestCase):
     def test_fields(self):
         info = LoopInfo(
             loop_group_id=(0,),
@@ -6343,7 +6343,7 @@ class TestSymbolKind(unittest.TestCase):
         self.assertNotIn("input_arg_extract", op1_operand)
 
 
-class TestCoarseTileInfoReductionField(unittest.TestCase):
+class TestLoopInfoReductionField(unittest.TestCase):
     """LoopInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
 
     def test_field_present_and_defaults_to_empty(self):
