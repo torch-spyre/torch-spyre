@@ -134,6 +134,10 @@ them with `PARAMS`, and `pr-review` checks them.
 | `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
 | `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS` | Seconds allowed for each `dbo-opt` invocation (default 60; non-positive disables) |
 | `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before the backend compiler; no runnable kernel, measurement only |
+| `TORCH_SPYRE_FFT_DIRECT_MAX` | Largest FFT length run as one direct `(2n, 2n)` matmul (`torch_spyre.ops.fft`); longer lengths use the four-step factorization (default 32768) |
+| `TORCH_SPYRE_FFT_W_CACHE_BYTES` | Byte budget for the cached fp16 DFT matrices (`torch_spyre.ops.fft`); LRU-evicted when exceeded (default: forward+inverse at the direct ceiling) |
+| `TORCH_SPYRE_NARROWING_CHECK` | Guards that split a `dynamic=` range: `warn` (default), `error`, `off` |
+| `TORCH_SPYRE_RECOMPILE_CHECK` | Recompiles that break a `dynamic=` range: `warn` (default), `error`, `all`, `off` |
 
 ## Spyre Hardware Basics
 
@@ -173,6 +177,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
+- **find-numerical-divergence** — the first kernel where a right run and a wrong run part
 - **check-docs** — documentation consistency and staleness audit
 - **daily-status** — automated standup updates from git activity
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow

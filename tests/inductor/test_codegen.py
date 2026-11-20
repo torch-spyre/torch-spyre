@@ -53,6 +53,7 @@ from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from utils_inductor import mock_backend_compiler
+from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -171,14 +172,19 @@ class TestSpyreConfig(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with patch(
-                "torch_spyre._inductor.pass_utils.V",
-                self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+            with (
+                patch(
+                    "torch_spyre._inductor.pass_utils.V",
+                    self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
+                ),
+                # Pinned at the old default: the test checks the divisor pick,
+                # not the current max_buckets default.
+                config.patch(max_buckets=32),
             ):
                 result = _collect_symbol_metadata({s0: s0})
         # max comes straight from the ShapeEnv upper bound;
         # granularity is the smallest divisor of 512 with d >= 4 and
-        # 512/d <= 32, which is 16.
+        # 512/d <= 32 (the pinned cap), which is 16.
         self.assertEqual(result, {s0: (512, 16)})
 
     def test_collect_symbol_metadata_auto_dynamic_skipped(self):
@@ -1452,3 +1458,42 @@ class TestMatmulReuseDims(InductorTestCase):
             "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
             "the broadcast batch dim E",
         )
+
+
+class TestStaggeredFp32Consumer(InductorTestCase):
+    """An op that keeps the staggered arrangement iterates the whole stick pair.
+
+    A widened FP32 value spans a pair of FP32 sticks per FP16 stick, so an op
+    whose operands both carry the arrangement covers both sticks of the pair.
+    """
+
+    def test_staggered_output_covers_the_stick_pair(self):
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 32), row, sympy.Mod(lane, 32)]
+        iteration_space = {row: (sympy.Integer(4), 1), lane: (sympy.Integer(32), 1)}
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=arg_index,
+                    device_dtype=DataFormats.IEEE_FP32,
+                    device_size=[2, 4, 32],
+                    device_coordinates=coords,
+                    allocation={"hbm": address},
+                    element_arrangement=ElementArrangement.DL16_TO_FP32,
+                    stride_map=[32, 64, 1],
+                )
+                for arg_index, (is_input, address) in enumerate(
+                    [(True, 0), (False, 0x100000)]
+                )
+            ],
+            op_info={},
+        )
+        simplify_op_spec(spec)
+        sdsc_spec, _ = parse_op_spec(spec)
+        sizes = sorted(int(size) for size in sdsc_spec.iteration_space.values())
+        self.assertEqual(sizes, [4, 64])
