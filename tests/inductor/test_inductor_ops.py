@@ -6988,8 +6988,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "sum": torch.sum,
             },
             "param_sets": {
+                # bool_1d (64) and bool_2d (last dim 256) are aligned to the
+                # fp16 stick size (64 elements); they pass after the bool→fp32
+                # upcast because the staggered DL16_TO_FP32 input is aligned.
                 "bool_1d": (cached_randint((64,), high=2) > 0,),
                 "bool_2d": (cached_randint((67, 256), high=2) > 0,),
+                # Unaligned bool: the bool→fp32 upcast produces a staggered
+                # DL16_TO_FP32 tensor; the backend cannot reduce a staggered
+                # input whose stick-dim size is not a multiple of 64 (#4014).
+                "bool_1d_unaligned": (cached_randint((100,), high=2) > 0,),
+                "bool_2d_unaligned": (cached_randint((1, 855), high=2) > 0,),
+                # Same problem from an fp16 compare intermediate (not a host
+                # bool, but still fp16-backed → DL16_TO_FP32 after upcast).
+                "bool_2d_unaligned_cmp": (
+                    cached_randn((1, 100), dtype=torch.float16) > 0,
+                ),
                 "int32_1d": (cached_randint((64,), dtype=torch.int32),),
                 "int32_2d": (cached_randint((67, 256), dtype=torch.int32),),
                 "int64_1d": (cached_randint((64,), dtype=torch.int64),),
@@ -6998,6 +7011,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
                 "fp32_1d": (cached_randn((64,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((67, 256), dtype=torch.float32),),
+            },
+            # Unaligned staggered inputs raise Unsupported until #4014 is fixed.
+            "expect_fail": {
+                "sum_bool_1d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+                "sum_bool_2d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+                "sum_bool_2d_unaligned_cmp": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
             },
         },
         # Reductions over an expand()-broadcast operand, across dim alignment,

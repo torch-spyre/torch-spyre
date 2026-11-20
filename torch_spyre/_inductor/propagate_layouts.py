@@ -2350,6 +2350,51 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+def _prune_unaligned_staggered_inputs(op: Operation, arg: "PropArg") -> None:
+    """Remove staggered STL candidates whose stick dim is not aligned to 64 elements.
+
+    A staggered input (``DL16_TO_FP32`` / ``FP32_TO_DL16``) upcast to fp32 spreads
+    fp16-width elements across a stick pair.  The backend can reduce standard-EA
+    unaligned tensors but not staggered ones (issue #4014): a staggered reduction on a
+    stick dimension whose size is not a multiple of 64 (the fp16 elements-per-stick)
+    silently returns a wrong count.
+
+    This function filters those unsafe candidates out of ``arg.layouts`` in-place.
+    If every candidate was staggered-and-unaligned the caller raises ``Unsupported``
+    immediately (no restickify attempt is made — staggered STLs cannot be restickified).
+    """
+    in_coords = host_coordinates(arg.layout, arg.dep, None)
+    fp16_eps = get_elem_in_stick(torch.float16)  # 64
+
+    bad: dict[int, int] = {}  # id(stl) -> stick-dim size for unaligned staggered stls
+    for stl in arg.layouts:
+        if stl.element_arrangement not in STAGGERED_EAS:
+            continue
+        dev_coords = try_device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        stick_dim = matching_dim(in_coords, dev_coords[-1])
+        if stick_dim is None:
+            continue
+        n = concretize_expr(arg.layout.size[stick_dim])
+        if n % fp16_eps != 0:
+            bad[id(stl)] = n
+
+    if not bad:
+        return
+
+    kept = [stl for stl in arg.layouts if id(stl) not in bad]
+    if not kept:
+        stl = arg.layouts[0]
+        n = bad[id(stl)]
+        raise Unsupported(
+            f"{op.get_name()} ({op.data.reduction_type}): reduction of a staggered "
+            f"({stl.element_arrangement}) input whose stick-dim size {n} is not a "
+            f"multiple of {fp16_eps} (issue #4014)"
+        )
+    arg.layouts[:] = kept
+
+
 def _reduction_layouts(
     op: Operation,
     output: FixedLayout,
@@ -2374,6 +2419,7 @@ def _reduction_layouts(
     (one element per stick), as in ``_topk_layouts``.
     """
     arg = args[0]
+    _prune_unaligned_staggered_inputs(op, arg)
     layouts = []
     for stl in arg.layouts:
         layouts.extend(
