@@ -81,6 +81,7 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
+    REDUCTIONS_NON_STICK_DIM_ONLY,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
 )
@@ -3302,6 +3303,21 @@ def restickify_dense_stl_to_sparse(
     return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
 
 
+def _non_stick_reduction_var(
+    op: "Operation | None", in_dep: MemoryDep, out_dep: MemoryDep
+) -> "sympy.Symbol | None":
+    """The reduced loop variable, when ``op`` is a reduction that cannot reduce
+    along the stick dim (``REDUCTIONS_NON_STICK_DIM_ONLY``, backend #4409).
+
+    The reduced variable is the one the read indexes with and the write does not.
+    """
+    if op is None or not isinstance(getattr(op, "data", None), Reduction):
+        return None
+    if op.data.reduction_type not in REDUCTIONS_NON_STICK_DIM_ONLY:
+        return None
+    return next(iter(in_dep.index.free_symbols - out_dep.index.free_symbols), None)
+
+
 def dense_relocation_serves_read(
     stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3309,9 +3325,15 @@ def dense_relocation_serves_read(
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     *,
     op: "Operation | None" = None,
+    forbidden_stick_sym: "sympy.Symbol | None" = None,
 ) -> "SpyreTensorLayout | None":
     """A dense layout of ``in_host`` with the stick moved to another real dim, when
     it can serve the read of ``dep`` that ``stl`` cannot, else ``None``.
+
+    ``forbidden_stick_sym`` is a loop variable that must not land on the stick: a
+    ``prod`` cannot reduce along the stick dim (backend #4409), and the widest dim
+    a reshape leaves alone is often the reduced one. A candidate whose stick would
+    carry it is skipped and the next one tried.
 
     A reshape that cuts the stick dim (``[4, 512, 20, 20]`` read as
     ``[4, 4, 128, 400]``) is legal once a dim the reshape leaves alone carries the
@@ -3365,8 +3387,15 @@ def dense_relocation_serves_read(
             sizes[current_stick],
             strides[current_stick],
         )
-        if try_device_coordinates(target, dep, indirect_sizes, op=op) is not None:
-            return target
+        coords = try_device_coordinates(target, dep, indirect_sizes, op=op)
+        if coords is None:
+            continue
+        if (
+            forbidden_stick_sym is not None
+            and forbidden_stick_sym in coords[-1].free_symbols
+        ):
+            continue
+        return target
     return None
 
 
@@ -3475,7 +3504,14 @@ def compute_restickify_needed(
         # is reported infeasible and the beam search drops that candidate.
         # Before the sparse layout, which costs elems_per_stick times the memory,
         # try a dense layout with the stick on a dim the read leaves alone.
-        dense = dense_relocation_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
+        dense = dense_relocation_serves_read(
+            in_stl,
+            in_host,
+            in_dep,
+            ind_sizes,
+            op=op,
+            forbidden_stick_sym=_non_stick_reduction_var(op, in_dep, out_dep),
+        )
         if dense is not None:
             # Both layout rules carry on to _candidate_output_stls after a
             # relocation, so the output paired with this target need not have the

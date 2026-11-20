@@ -247,6 +247,33 @@ class TestStickRelocation(unittest.TestCase):
                             out.float(), ref.float(), atol=5e-2, rtol=1e-2
                         )
 
+    def test_prod_does_not_relocate_onto_the_reduced_dim(self):
+        # prod cannot reduce along the stick dim (backend #4409). The relocation
+        # takes the widest dim the reshape leaves alone, which here is the reduced
+        # dim itself, so it must decline and leave the read to the sparse layout.
+        # Relocating onto it compiled on no build: main compiles these, and an
+        # earlier version of this branch failed them with UnalignedStickSplit.
+        cases = {
+            "(1,32,20,20) reduce 32": ((1, 32, 20, 20), (1, 32, 400)),
+            "(1,64,20,20) reduce 64": ((1, 64, 20, 20), (1, 64, 400)),
+            "(2,8,20,20) reduce 8": ((2, 8, 20, 20), (2, 8, 400)),
+        }
+        for name, (shape, view) in cases.items():
+            with self.subTest(name):
+                torch.manual_seed(0)
+                # Values near 1: a product of 32 signed fp16 terms overflows, and
+                # a reference of inf cannot tell a right answer from a wrong one.
+                x = torch.rand(*shape, dtype=torch.float16) * 0.2 + 0.9
+                fn = lambda t, v=view: t.reshape(v).prod(1)  # noqa: E731
+                ref = fn(x.float())
+                torch.compiler.reset()
+                with inductor_config.patch(force_disable_caches=True):
+                    out = torch.compile(fn, dynamic=False)(x.to("spyre"))
+                torch.spyre.synchronize()
+                torch.testing.assert_close(
+                    out.cpu().float(), ref.float(), atol=5e-2, rtol=5e-2
+                )
+
     def test_escaping_view_with_in_graph_consumer(self):
         # The view escapes and also feeds another op. Nothing is rewritten in the
         # graph, so the view stays a view of ``y``.
