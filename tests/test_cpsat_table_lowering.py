@@ -100,7 +100,7 @@ class Case:
     def lower(
         self, expr: sympy.Basic, cap: int = CAP
     ) -> tuple[AbstractRealization, cp_model.LinearExprT]:
-        root = TableLowering(self.inputs, cap=cap).lower(expr)
+        root = TableLowering(self.inputs, cap=cap).print(expr)
         return root, root.cp_expr(self.model)
 
     def solutions(self, exprs: list) -> list[tuple[int, ...]]:
@@ -162,7 +162,7 @@ def _printed(
     """Each node under expr as one printer lowers it: its table by its sympy node,
     operands before their parents."""
     printer = Recording(case.inputs, cap)
-    printer.lower(expr)
+    printer.print(expr)
     return {
         node: realization.table(CAP) for node, realization in printer.printed.items()
     }
@@ -186,7 +186,7 @@ def test_the_printer_prints_operands_first_and_a_shared_subexpression_once(monke
     before = sympy.srepr(expr)
     calls = _count_evaluations(monkeypatch)
     printer = Recording(case.inputs)
-    root = printer.lower(expr)
+    root = printer.print(expr)
     order = list(printer.printed)
     for node in order:
         for operand in node.args:
@@ -219,7 +219,7 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
     root2 = sympy.sqrt(2)
     expr = 3 * a + root2 * a**0.5
     printer = Recording(case.inputs)
-    printer.lower(expr)
+    printer.print(expr)
     for realization in printer.printed.values():
         assert type(realization) is TableRealization
         assert realization.table(CAP) is realization
@@ -237,8 +237,7 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     """print is the printer's public method. A node is printed by the print method of
     the nearest class along its MRO that has one, so a Dummy, a subclass of Symbol, is
     its column, and a class with none goes to emptyPrinter. A printer keeps what it
-    has printed: what two calls of print share is one realization, and lower is print
-    of the root."""
+    has printed: what two calls of print share is one realization."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
@@ -253,8 +252,9 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     assert list(logs.values) == pytest.approx([0.0, math.log(2), math.log(4)])
     constant = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi).table(CAP)
     assert constant.index == UNIT
-    root = printer.lower(sympy.log(a) + dummy)
+    root = printer.print(sympy.log(a) + dummy)
     assert root is printer.print(sympy.log(a) + dummy)
+    assert not hasattr(printer, "lower")  # print is the entry point
     assert printer.print(sympy.log(a)) is logs
 
 
@@ -284,7 +284,7 @@ def test_the_printer_makes_a_symbols_position_on_its_variable():
     ):
         printer = TableLowering({d0: refused}, cap=CAP)  # type: ignore[dict-item]
         with pytest.raises(TableLoweringError, match=match) as caught:
-            printer.lower(d0)
+            printer.print(d0)
         assert caught.value.node == d0
 
 
@@ -309,16 +309,16 @@ def test_a_table_at_the_cap_is_made_and_one_past_it_is_refused():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    root = TableLowering(case.inputs, cap=3).lower(a**0.5).table(CAP)  # at the cap
+    root = TableLowering(case.inputs, cap=3).print(a**0.5).table(CAP)  # at the cap
     assert root.index == position
     assert list(root.values) == pytest.approx([1.0, 2**0.5, 2.0])
     with pytest.raises(
         TableLoweringError,
         match="one table over its inputs would hold 3 entries, past the cap of 2",
     ):
-        TableLowering(case.inputs, cap=2).lower(a**0.5)
+        TableLowering(case.inputs, cap=2).print(a**0.5)
     with pytest.raises(TableLoweringError, match="no input"):
-        TableLowering({}, cap=CAP).lower(a**0.5)
+        TableLowering({}, cap=CAP).print(a**0.5)
 
 
 def _count_evaluations(monkeypatch) -> list[sympy.Basic]:
@@ -344,7 +344,7 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     with pytest.raises(
         TableLoweringError, match="6 entries, past the cap of 5"
     ) as caught:
-        TableLowering(case.inputs, cap=5).lower(sympy.log(a**0.5 * b))
+        TableLowering(case.inputs, cap=5).print(sympy.log(a**0.5 * b))
     assert caught.value.node == sympy.log(a**0.5 * b)  # the root, refused first
     assert calls == []  # not the root's table, and nothing under it
 
@@ -363,19 +363,19 @@ def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     assert rows == {1: 1024, 2: 2048, 3: 4096, 4: 8192}
 
 
-def test_lower_touches_no_model_and_a_refusal_comes_from_lower():
+def test_print_touches_no_model_and_a_refusal_comes_from_print():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
-    root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
+    root = TableLowering(case.inputs, cap=CAP).print(a**0.5 * b)
     assert isinstance(root, TableRealization) and root.index.size == 6
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
     root.cp_expr(case.model)  # only the build adds to the model
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
-        TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
+        TableLowering(case.inputs, cap=4).print(a**0.5 * b)
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
 
 
@@ -402,7 +402,7 @@ def test_a_realization_is_abstract_and_a_table_is_one():
     assert table.finite
     assert not TableRealization(values=[1.0, np.inf, 4.0], index=position).finite
     a = case.symbol("a")
-    lowered = TableLowering(case.inputs, cap=CAP).lower(a**0.5)
+    lowered = TableLowering(case.inputs, cap=CAP).print(a**0.5)
     assert isinstance(lowered, AbstractRealization)
 
 
@@ -421,7 +421,7 @@ def test_a_parent_asks_an_operand_for_its_table_within_the_printers_cap(monkeypa
         return original(self, cap)
 
     monkeypatch.setattr(TableRealization, "table", table)
-    TableLowering(case.inputs, cap=7).lower(a**0.5 * b + sympy.log(a))
+    TableLowering(case.inputs, cap=7).print(a**0.5 * b + sympy.log(a))
     assert asked and set(asked) == {7}
 
 
@@ -513,7 +513,7 @@ def _stage_1(case: Case, expr: sympy.Basic) -> np.ndarray:
 
 
 def _list(case: Case, expr: sympy.Basic) -> list[float]:
-    return list(TableLowering(case.inputs, cap=CAP).lower(expr).table(CAP).values)
+    return list(TableLowering(case.inputs, cap=CAP).print(expr).table(CAP).values)
 
 
 def test_a_list_is_row_major_with_the_last_position_fastest():
@@ -586,14 +586,14 @@ def test_a_node_is_evaluated_once_its_operands_before_it(monkeypatch):
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     printer = Recording(case.inputs)
-    root = printer.lower(expr)
+    root = printer.print(expr)
     computed = [e for e in printer.printed if e.free_symbols and not e.is_Symbol]
     # lowering the root evaluates every node under it, each once, the root last
     assert len(calls) == len(computed) and set(calls) == set(computed)
     assert calls[-1] == expr
-    printer.lower(expr)
+    printer.print(expr)
     root.cp_expr(case.model)
-    assert len(calls) == len(computed)  # kept: neither a second lower nor the build
+    assert len(calls) == len(computed)  # kept: neither a second print nor the build
 
 
 # ---------------------------------------------------------------- exact lowering
@@ -792,14 +792,14 @@ def test_a_node_is_lambdified_once_and_nothing_keeps_its_function(monkeypatch):
     expr = sympy.Add(*terms)
     calls = _count_lambdify(monkeypatch)
     printer = Recording(case.inputs)
-    root = printer.lower(expr)
+    root = printer.print(expr)
     computed = [e for e in printer.printed if e.free_symbols and not e.is_Symbol]
     assert len(calls) == len(computed) > 300
     assert len({str(c) for c in calls}) <= 12
-    printer.lower(expr)
+    printer.print(expr)
     root.cp_expr(cp_model.CpModel())  # a realization is kept by its printer
     assert len(calls) == len(computed)
-    TableLowering(case.inputs, cap=CAP).lower(expr)
+    TableLowering(case.inputs, cap=CAP).print(expr)
     assert len(calls) == 2 * len(computed)
     np.testing.assert_allclose(root.table(CAP).values, _stage_1(case, expr), rtol=1e-12)
 
@@ -922,7 +922,7 @@ def test_the_cost_models_objective_has_the_annealers_values(rows):
     for k, split in enumerate((SPLIT_M, SPLIT_N, SPLIT_K)):
         case.inputs[split] = (candidate, [float(s[k]) for s in MENU])
     case.inputs[WEIGHT_LX] = (lit, [0.0, 1.0])
-    root = TableLowering(case.inputs, cap=CAP).lower(expr)
+    root = TableLowering(case.inputs, cap=CAP).print(expr)
     prices = [f for f in expr.atoms(sympy.Function) if "delivery_price" in str(f)]
     assert bool(prices) == (rows == 8)
     symbols, points = _points(case, expr)
