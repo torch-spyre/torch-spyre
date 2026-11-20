@@ -68,6 +68,7 @@ from torch._inductor.utils import sympy_index_symbol
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import loop_node
+from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor import passes as spyre_passes
 from torch_spyre._inductor.spyre_kernel import SpyreKernel
 from torch_spyre._inductor.views import tiling_expr_to_device_expr
@@ -81,6 +82,25 @@ from test_loop_advance import CORPUS
 d1, d2 = (sympy_index_symbol(f"d{i}") for i in (1, 2))
 
 
+def _inductions_of(operations, depth=0, out=None):
+    """Group index -> induction of every node in ``operations``, recovered from the
+    first body member of each node (a ``LoopNode`` does not record its group index;
+    ``loop_node.collapse`` keys it by the members' ``loop_group_id``). This was
+    ``loop_node._inductions_of`` until 8.5 deleted it as unused by the pipeline."""
+    out = {} if out is None else out
+    for op in operations:
+        if not isinstance(op, loop_node.LoopNode):
+            continue
+        if op.induction is not None:
+            for leaf in loop_node.all_ops(op.body):
+                path = counted_loop_path(leaf)
+                if len(path) > depth:
+                    out[path[depth]] = op.induction
+                    break
+        _inductions_of(op.body, depth + 1, out)
+    return out
+
+
 class _Probe:
     """Records, per access, the kernel's advance and the index-derived one."""
 
@@ -91,7 +111,7 @@ class _Probe:
     def hand_off(self, original):
         def wrapper(graph):
             operations = getattr(graph.operations, "real", graph.operations)
-            self.inductions.update(loop_node._inductions_of(operations))
+            self.inductions.update(_inductions_of(operations))
             return original(graph)
 
         return wrapper
