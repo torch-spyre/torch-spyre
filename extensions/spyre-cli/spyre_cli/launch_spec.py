@@ -188,10 +188,18 @@ def spyre_layout(layout):
     if layout is None:
         return None
     try:
+        # valid_elements is a required argument of the only constructor that
+        # takes a device_size and stride_map. A spec that predates the field
+        # gives {}, which the constructor documents as "unknown".
+        valid_elements = {
+            tuple(int(d) for d in dims): int(count)
+            for dims, count in (layout.valid_elements or [])
+        }
         return SpyreTensorLayout(
             [int(d) for d in layout.device_size],
             [int(x) for x in layout.stride_map],
             getattr(DataFormats, layout.device_dtype),
+            valid_elements,
             getattr(ElementArrangement, layout.element_arrangement or "STANDARD"),
         )
     except (AttributeError, TypeError, ValueError):

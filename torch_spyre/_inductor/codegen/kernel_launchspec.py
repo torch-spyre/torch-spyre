@@ -42,6 +42,10 @@ class LaunchArgLayout:
     stride_map: list[int]
     device_dtype: str
     element_arrangement: str
+    # SpyreTensorLayout.valid_elements as [device dims, count] pairs, since JSON
+    # cannot key on a tuple. Empty means unknown, which is what a spec written
+    # before this field reads as.
+    valid_elements: list = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict) -> "LaunchArgLayout":
@@ -54,12 +58,18 @@ class LaunchArgLayout:
 
         The two enums are stored by name: a spec is read by a process that may
         not have our types, so it carries the spelling rather than the value.
+        ``valid_elements`` is recorded because the only constructor that takes
+        a ``device_size`` and ``stride_map`` requires it.
         """
         return cls(
             device_size=[int(d) for d in device_layout.device_size],
             stride_map=[int(s) for s in device_layout.stride_map],
             device_dtype=_enum_name(device_layout.device_dtype),
             element_arrangement=_enum_name(device_layout.element_arrangement),
+            valid_elements=sorted(
+                [[int(d) for d in dims], int(count)]
+                for dims, count in dict(device_layout.valid_elements).items()
+            ),
         )
 
 
