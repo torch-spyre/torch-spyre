@@ -2879,7 +2879,13 @@ def _host_size_stride_for_expr(
     label: str,
     stick_size: int,
 ) -> "tuple[int, int] | None":
-    """Return (host_size, host_stride) for the host dim group that expr maps to.
+    """Return (size, host_stride) of the host dim group that expr maps to.
+
+    The size is how many elements the whole tensor holds along expr's variable,
+    not the variable's loop range, so a sliced read still gets the full size.  It
+    is the host dim's size when the variable owns the whole dim.  When the dim is
+    split over several variables (64 * d3 + d4), it is the variable's own part,
+    and only if config.allow_restickify_split_host_dim is set (else None).
 
     Uses ``_factorized_chain`` to discover all host dims that carry the
     expression's variable.  Multi-dim results represent a factorized layout
