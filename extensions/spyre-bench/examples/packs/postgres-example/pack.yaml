@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A third-party pack owned outside the project: proves a non-AI system needs no core change.
+# Not in packs/index.yaml: register it at run time with --pack examples/packs/postgres-example.
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: postgres-example, owner: example-team}
+spec:
+  prefix: pg
+  version: 0.2.0
+  requires: {core: "0.2"}
+  types:
+    - {name: postgres, for: System, schema: schemas/system-postgres.json}
+    - {name: pgbench, for: Workload, schema: schemas/workload-pgbench.json, levels: [service, transaction],
+       runner: pgbench, load: [closed], default_metrics: [pg.tps, pg.latency.mean], non_identity: [progress_s]}
+  vocabularies:
+    levels: [transaction]
+  attributes:
+    - {key: env.label.storage.class, class: label, role: root, type: enum, values: [nvme-local, ebs-gp3, ceph-rbd]}
+    - {key: env.fp.pg.server_version, class: environment, role: root, type: string, fingerprint: true}
+    - {key: case.script, class: identity, role: root, type: string}
+    - {key: system.major, class: identity, role: root, type: int, order: numeric}
+  runners:
+    - {name: pgbench, protocol: process/v1, command: [python3, -m, pg_bench.pgbench_runner]}
+  probes:
+    - {name: pg-settings, protocol: process/v1, command: [python3, -m, pg_bench.probe], produces: [env.fp.pg.server_version]}
+  gates:
+    - {id: pg.settings_applied, phase: pre, reason: PG_SETTINGS_DRIFT, check: "SHOW ALL matches System settings"}
+  metrics:
+    - {name: pg.tps, unit: "{transaction}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative,
+       noise: {min_repeats: 3, cv_max: 0.05}, description: "transactions per second excluding connection time"}
+    - {name: pg.latency.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 3}}
