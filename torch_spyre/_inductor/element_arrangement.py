@@ -49,6 +49,7 @@ from .logging_utils import get_inductor_logger
 from .loop_node import move_before
 from .pass_utils import (
     indirect_info_from_op,
+    is_topk,
     origin_in_graph,
     redirect_computed_buffer_reads,
 )
@@ -381,7 +382,19 @@ def _mark_mismatched_ea(
         out_stl = _committed_stl(graph, op.get_name())
         indirect_names, _, _ = indirect_info_from_op(op)
         stls = _operand_stls(graph, op, indirect_names)
-        if out_stl is None or len(stls) < 2:
+        if out_stl is None:
+            continue
+        if is_topk(op):
+            targets = {
+                n: ElementArrangement.STANDARD
+                for n, s in stls.items()
+                if s.element_arrangement != ElementArrangement.STANDARD
+            }
+            if targets:
+                _log_op(graph, op, stls, targets)
+                marked.append((op, targets))
+            continue
+        if len(stls) < 2:
             continue
         if _has_indirect_access(op, indirect_names):
             _check_indirect_op(op, stls)
