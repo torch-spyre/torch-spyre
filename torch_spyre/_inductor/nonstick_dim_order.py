@@ -88,7 +88,7 @@ from torch_spyre._C import (
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
-from .loop_node import insert_after
+from .loop_node import move_after, move_before
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -106,6 +106,7 @@ from .pass_utils import (
     get_matmul_m_size,
     get_matmul_n_size,
     indirect_info_from_op,
+    reorder_valid_elements,
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
@@ -465,9 +466,10 @@ def _matmul_reorder_stl(
         new_stride_map,
     )
     return SpyreTensorLayout(
-        device_size=new_device_size,
-        stride_map=new_stride_map,
-        device_dtype=stl.device_dtype,
+        new_device_size,
+        new_stride_map,
+        stl.device_dtype,
+        reorder_valid_elements(stl, new_order),
     )
 
 
@@ -540,6 +542,7 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+        valid_elements=reorder_valid_elements(stl, order),
     )
 
 
@@ -635,8 +638,8 @@ def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
         [stl.device_size[i] for i in order],
         [stl.stride_map[i] for i in order],
         stl.device_dtype,
-        stl.element_arrangement,
         valid_elements,
+        stl.element_arrangement,
     )
 
 
@@ -1207,9 +1210,7 @@ def _insert_mutation_relayout_copy(
         mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
 
     operations = graph.operations
-    mutation_op_index = operations.index(mutation_op)
-    operations.remove(buf_tmp)
-    operations.insert(mutation_op_index, buf_tmp)
+    move_before(operations, mutation_op, buf_tmp)
 
     # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout).
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
@@ -1223,10 +1224,9 @@ def _insert_mutation_relayout_copy(
         buf_tmp,  # use buf_tmp as metadata source, not mutation_op
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
-    operations.remove(buf_copyback)
     # Right after the mutation op, in the list that holds it: a flat index past the
     # last op of a loop body would put the copy outside the loop.
-    insert_after(operations, mutation_op, buf_copyback)
+    move_after(operations, mutation_op, buf_copyback)
 
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's
@@ -1242,8 +1242,6 @@ def _insert_mutation_relayout_copy(
                 loop_count=list(loop_info.loop_count),
                 loop_tiled_dims=[[] for _ in range(depth)],
                 loop_tiled_reduction_dims=[[] for _ in range(depth)],
-                tiled_dims_per_read=[[[] for _ in range(depth)]],
-                output_tiled_dims=[[] for _ in range(depth)],
             )
 
     logger.info(

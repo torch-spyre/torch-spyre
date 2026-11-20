@@ -15,7 +15,7 @@
 
 import math
 from collections.abc import Collection, Mapping, Sequence
-from typing import Optional
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -33,6 +33,7 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advances_anywhere,
 )
+from torch_spyre._inductor.loop_info import LoopCarryRecord
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -42,6 +43,14 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+
+def is_loop_carry_storage(op: Any) -> bool:
+    """True only for storage explicitly created as a counted-loop carry."""
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
 # default. `convolution` is aten's direct-conv op name; it is listed because a
@@ -390,32 +399,24 @@ def _is_tiled_advancing(op: Operation) -> bool:
     JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
     advances per loop iteration has no way to express its address change if
     pinned to LX. This derives the same answer ``is_tiled_lx`` derives, but
-    earlier (at IR/allocation time) and directly from ``loop_info``, letting
-    the allocator exclude such buffers from LX candidacy up front instead of
-    crashing at codegen time.
+    earlier (at IR/allocation time) and directly from the write's index,
+    letting the allocator exclude such buffers from LX candidacy up front
+    instead of crashing at codegen time.
 
-    Note this checks ``output_tiled_dims`` -- whether *this op's own write*
-    advances -- not ``loop_tiled_dims``, which only says the op is tiled at
+    Note this asks whether *this op's own write* advances (its index has a
+    nonzero coefficient on a loop variable), not whether the op is tiled at
     all. A loop-internal buffer (e.g. drained by a copy op every iteration)
     can be tiled yet have its own write pinned at a fixed address; such a
-    buffer is LX-eligible.
-
-    Also checks ``squeezed_advance_output``: a dim tiled down to per-tile
-    extent 1 (e.g. a coarse-tiled batch dim with one tile per iteration) is
-    squeezed out of the write's own index entirely, so it never appears in
-    ``output_tiled_dims`` even though the write's device address genuinely
-    advances every iteration (see ``loop_info.py``'s
-    ``squeezed_advance_output`` docstring). Missing this let a
-    mutation_write_back accumulator (e.g. flash attention's running max/
-    denominator carry) reside in LX, where the advance later crashed --
-    or, if the crash path were ever bypassed, silently pinned every
-    iteration to the same address.
+    buffer is LX-eligible. A dim tiled down to per-tile extent 1 is squeezed out
+    of the write's own dims but still moves the address, and the index shows it:
+    missing it once let a mutation_write_back accumulator (e.g. flash attention's
+    running max/denominator carry) reside in LX, where the advance later crashed.
     """
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    # The record test (False without a loop_info) lives in loop_facts; the
-    # layout gate above is an LX question and stays here.
+    # The loop fact (False without a loop_info) lives in loop_facts; the layout
+    # gate above is an LX question and stays here.
     return output_advances_anywhere(op)
 
 
@@ -429,33 +430,23 @@ def _is_read_advancing_anywhere(
     op *reads* ``name`` via a reference that advances across that reader's
     own coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
     into a nested tile every outer iteration). ``SpyreKernel.
-    _general_tile_advance`` derives a read reference's
-    ``device_tile_advance_expr`` from the *consuming* op's own
-    ``loop_info.tiled_dims_per_read``, not from the producer's
-    ``output_tiled_dims`` -- so a reader can advance even when the
+    _index_tile_advance`` derives a read reference's
+    ``device_tile_advance_expr`` from the *consuming* op's own index, not
+    from the producer's write -- so a reader can advance even when the
     producer's own write is fixed. ``compute_ops.py``'s ``is_tiled_lx``
     check applies to every ``TensorArg`` (read and write) at codegen time,
     so missing this at allocation time defers the same
     ``NotImplementedError`` to codegen instead of routing the buffer to
     HBM up front.
 
-    Mirrors ``_general_tile_advance``'s own positional dep-index matching:
-    for each reader op, ``name``'s occurrences among that op's
-    ``MemoryDep`` reads are matched in order to
-    ``loop_info.tiled_dims_per_read`` by position.
+    For each reader op, each of ``name``'s ``MemoryDep`` reads is asked
+    whether its index moves with one of the op's loop variables.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
         if getattr(reader_op, "loop_info", None) is None:
             continue
-        # read_advances_anywhere answers from the record at dep's position
-        # among the reader's MemoryDep reads, and is False when dep is not
-        # one of them (it is name's write on this op), when dep lies past
-        # the end of tiled_dims_per_read, and when every level of its tiled
-        # and squeezed entries is empty (e.g. [[], []]: _general_tile_advance
-        # contributes no term for an empty level).  The squeezed entry
-        # covers a dim tiled down to per-tile extent 1, which is squeezed out
-        # of the read's own index and so never appears in tiled_dims_per_read
-        # (see loop_info.py's squeezed_advance_per_read docstring).
+        # read_advances_anywhere is False when dep is not one of the reader's
+        # MemoryDep reads (it is name's write on this op).
         read_deps = [
             d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
         ]

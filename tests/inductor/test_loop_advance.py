@@ -12,21 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the per-read / output advance accessors in ``loop_facts``.
+"""The per-read / output advance accessors of ``loop_facts`` against the kernel.
 
-Two layers.  Unit tests pin the semantics on stub operations.  The corpus
-test compiles the ``for_each_tile`` graphs and, at the point where the kernel
-builds each ``TensorArg``, compares the accessor against the
-``device_tile_advance_expr`` the kernel emits, and the ``*_anywhere``
-accessors against the record-based readers in ``scratchpad/utils.py``.  It
-compares against the existing readers, so it cannot pass by agreeing with
-itself.
+The corpus test compiles the ``for_each_tile`` graphs and, at the point where the
+kernel builds each ``TensorArg``, compares the accessor against the
+``device_tile_advance_expr`` the kernel emits (the accessor gives host elements per
+level; the kernel projects them to the device with its own level symbols). The
+unit tests of the accessors are in ``test_loop_shim.py``.
 """
 
 import contextlib
 import dataclasses
 import sys
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -44,11 +41,6 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advance,
     read_advances_anywhere,
-)
-from torch_spyre._inductor.loop_info import CoarseTileInfo
-from torch_spyre._inductor.scratchpad.utils import (
-    _is_read_advancing_anywhere,
-    _is_tiled_advancing,
 )
 from torch_spyre._inductor.spyre_kernel import SpyreKernel
 from torch_spyre._inductor.views import tiling_expr_to_device_expr
@@ -92,162 +84,6 @@ from for_each_tile_fixtures import (
 )
 
 d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
-
-
-# ---------------------------------------------------------------------------
-# Unit tests on stub operations
-# ---------------------------------------------------------------------------
-
-
-def _dep(name, index, nvars=2):
-    var_names = tuple(sympy_index_symbol(f"d{i}") for i in range(nvars))
-    return MemoryDep(name, index, var_names, tuple([sympy.Integer(8)] * nvars))
-
-
-def _op(reads=(), writes=(), info=None, ranges=(8, 128)):
-    rw = SimpleNamespace(reads=list(reads), writes=list(writes))
-    op = SimpleNamespace(
-        get_read_writes=lambda: rw,
-        data=SimpleNamespace(ranges=[sympy.Integer(r) for r in ranges]),
-    )
-    if info is not None:
-        op.loop_info = info
-    return op
-
-
-def _info(depth, per_read=(), out=(), sq_read=(), sq_out=()):
-    return CoarseTileInfo(
-        loop_group_id=tuple(range(depth)),
-        loop_count=[sympy.Integer(2)] * depth,
-        loop_tiled_dims=[[] for _ in range(depth)],
-        loop_tiled_reduction_dims=[[] for _ in range(depth)],
-        tiled_dims_per_read=[list(r) for r in per_read],
-        output_tiled_dims=list(out),
-        squeezed_advance_per_read=[list(r) for r in sq_read],
-        squeezed_advance_output=list(sq_out),
-    )
-
-
-X = _dep("x", 128 * d0 + d1)
-Y = _dep("y", d1)
-OUT = _dep("out", 128 * d0 + d1)
-
-
-def test_no_loop_info():
-    op = _op(reads=[X], writes=[OUT])
-    assert read_advance(op, X) == ()
-    assert output_advance(op) == ()
-    assert not read_advances_anywhere(op, X)
-    assert not output_advances_anywhere(op)
-
-
-def test_dep_not_a_read():
-    op = _op(reads=[X], writes=[OUT], info=_info(1, per_read=[[[(0, 4)]]]))
-    assert read_advance(op, Y) == ()
-    assert read_advance(op, OUT) == ()
-    assert not read_advances_anywhere(op, Y)
-
-
-def test_one_tiled_dim():
-    op = _op(reads=[X, Y], writes=[OUT], info=_info(1, per_read=[[[(0, 4)]], [[]]]))
-    assert read_advance(op, X) == (512,)
-    assert read_advance(op, Y) == (sympy.S.Zero,)
-    assert read_advances_anywhere(op, X)
-    assert not read_advances_anywhere(op, Y)
-
-
-def test_two_levels_tile_the_same_dim():
-    # Outer extent = inner extent (16) * inner count (4).
-    info = _info(2, per_read=[[[(0, 64)], [(0, 16)]]])
-    op = _op(reads=[X], writes=[OUT], info=info)
-    assert read_advance(op, X) == (128 * 64, 128 * 16)
-
-
-def test_constant_offset_is_not_an_advance():
-    # A slice offset (+32) is not part of the per-trip step.
-    dep = _dep("x", 128 * d0 + d1 + 32)
-    op = _op(reads=[dep], writes=[OUT], info=_info(1, per_read=[[[(0, 4)]]]))
-    assert read_advance(op, dep) == (512,)
-
-
-def test_squeezed_only_read():
-    op = _op(
-        reads=[X],
-        writes=[OUT],
-        info=_info(1, per_read=[[[]]], sq_read=[[[(sympy.Integer(8192), 1)]]]),
-    )
-    assert read_advance(op, X) == (8192,)
-    assert read_advances_anywhere(op, X)
-
-
-def test_caller_supplied_reads_are_used_in_place_of_get_read_writes():
-    # scratchpad passes the memoized op_read_writes reads; the record lookup
-    # must use them, not re-trace the op.
-    info = _info(1, per_read=[[[]], [[(0, 4)]]])
-    op = _op(reads=[X, Y], writes=[OUT], info=info)
-    op.get_read_writes = None  # would raise if called
-    assert read_advances_anywhere(op, Y, reads=[X, Y])
-    assert not read_advances_anywhere(op, X, reads=[X, Y])
-    assert not read_advances_anywhere(op, OUT, reads=[X, Y])
-
-
-def test_same_buffer_read_twice_takes_positional_record():
-    a = _dep("x", 128 * d0 + d1)
-    b = _dep("x", d1)
-    info = _info(1, per_read=[[[(0, 2)]], [[(1, 64)]]])
-    op = _op(reads=[a, b], writes=[OUT], info=info)
-    assert read_advance(op, a) == (256,)
-    assert read_advance(op, b) == (64,)
-
-
-def test_empty_level_is_zero():
-    info = _info(3, per_read=[[[], [(0, 2)], []]])
-    op = _op(reads=[X], writes=[OUT], info=info)
-    assert read_advance(op, X) == (sympy.S.Zero, 256, sympy.S.Zero)
-
-
-def test_record_shorter_than_depth_pads_with_zero():
-    op = _op(reads=[X, Y], writes=[OUT], info=_info(2, per_read=[[[(0, 2)]]]))
-    assert read_advance(op, X) == (256, sympy.S.Zero)
-    assert read_advance(op, Y) == (sympy.S.Zero, sympy.S.Zero)
-
-
-def test_unit_dim_is_squeezed_out_of_symbol_numbering():
-    # ranges (1, 8, 128): host dim 1 is d0 in dep.index.
-    op = _op(
-        reads=[X],
-        writes=[OUT],
-        info=_info(1, per_read=[[[(1, 2)]]]),
-        ranges=(1, 8, 128),
-    )
-    assert read_advance(op, X) == (256,)
-
-
-def test_output():
-    info = _info(
-        2, out=[[(1, 64)], []], sq_out=[[], [(sympy.Integer(1024), sympy.Integer(1))]]
-    )
-    op = _op(reads=[X], writes=[OUT, _dep("other", d0)], info=info)
-    assert output_advance(op) == (64, 1024)
-    assert output_advances_anywhere(op)
-
-
-def test_output_with_no_memory_write():
-    # No term without a write; the record reader still answers from the
-    # record, as _is_tiled_advancing does.
-    op = _op(reads=[X], writes=[], info=_info(1, out=[[(0, 2)]]))
-    assert output_advance(op) == ()
-    assert output_advances_anywhere(op)
-
-
-def test_does_not_mutate():
-    info = _info(1, per_read=[[[(0, 4)]]], out=[[(0, 4)]])
-    before = dataclasses.replace(info)
-    op = _op(reads=[X], writes=[OUT], info=info)
-    read_advance(op, X)
-    output_advance(op)
-    assert op.loop_info == before
-    assert X.index == 128 * d0 + d1
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +235,7 @@ MUST_ADVANCE = set(CORPUS)
 
 
 def _kernel_read_dep(kernel, ir_node, name):
-    """The dep ``_general_tile_advance`` is about to use for read ``name``.
+    """The dep ``_tile_advance`` is about to use for read ``name``.
 
     The kernel's own rule (name resolved through ``mutation_real_name``, then
     the next unconsumed match), read from its state before the call.
@@ -408,7 +244,7 @@ def _kernel_read_dep(kernel, ir_node, name):
     scheduler = getattr(V.graph, "scheduler", None)
     real = scheduler.mutation_real_name if scheduler is not None else {}
     matching = [d for d in reads if real.get(d.name, d.name) == name]
-    consumed = kernel._general_tile_advance_seen.get(name, 0)
+    consumed = kernel._tile_advance_seen.get(name, 0)
     return matching[consumed] if consumed < len(matching) else None
 
 
@@ -417,10 +253,6 @@ class _Recorder:
         self.compared = []  # (op, kind, name, kernel_expr, accessor)
         self.mismatches = []
         self.anywhere_mismatches = []
-        # Records the record-based *_anywhere calls advancing although every
-        # per-level term is zero (or the reverse).  Reported, not asserted:
-        # the accessors follow the existing record-based readers.
-        self.term_vs_record = []
 
     def check(self, kernel, tensor, is_input, name, result):
         ir_node = kernel.current_node.node
@@ -439,18 +271,9 @@ class _Recorder:
                 return
             adv = read_advance(ir_node, dep)
             ours_any = read_advances_anywhere(ir_node, dep)
-            # The reader memoizes read_writes on the op; do not leave that
-            # behind on an op the kernel is still generating code for.
-            had_cache = "_ts_cached_read_writes" in ir_node.__dict__
-            theirs_any = _is_read_advancing_anywhere(
-                dep.name, {dep.name: [(ir_node, dep)]}
-            )
-            if not had_cache:
-                ir_node.__dict__.pop("_ts_cached_read_writes", None)
         else:
             adv = output_advance(ir_node)
             ours_any = output_advances_anywhere(ir_node)
-            theirs_any = _is_tiled_advancing(ir_node)
         kind = "read" if is_input else "write"
         # Project the accessor's per-level host advances with the kernel's own
         # level symbols; a level the kernel skipped never minted a symbol, so
@@ -471,16 +294,14 @@ class _Recorder:
         self.compared.append(record)
         if sympy.simplify(ours - theirs) != 0:
             self.mismatches.append((*record, ours))
-        if ours_any != theirs_any:
-            self.anywhere_mismatches.append((op_name, kind, name, ours_any, theirs_any))
         if any(a != 0 for a in adv) != ours_any:
-            self.term_vs_record.append((op_name, kind, name, adv, ours_any))
+            self.anywhere_mismatches.append((op_name, kind, name, adv, ours_any))
 
 
 def _compile_and_compare(case):
     fn, args, ctx = CORPUS[case]()
     rec = _Recorder()
-    original = SpyreKernel._general_tile_advance
+    original = SpyreKernel._tile_advance
 
     def wrapper(kernel, tensor, is_input, name):
         if is_input:
@@ -492,7 +313,7 @@ def _compile_and_compare(case):
     torch._dynamo.reset()
     with (
         mock.patch.object(
-            SpyreKernel, "_general_tile_advance", autospec=True, side_effect=wrapper
+            SpyreKernel, "_tile_advance", autospec=True, side_effect=wrapper
         ),
         torch._inductor.config.patch(force_disable_caches=True),
         ctx if ctx is not None else contextlib.nullcontext(),
@@ -514,8 +335,6 @@ def test_corpus_matches_kernel(case):
     )
     for r in advancing:
         print(f"  {r[0]} {r[1]} {r[2]}: kernel={r[3]} accessor={r[4]}")
-    for r in rec.term_vs_record:
-        print(f"  TERM-VS-RECORD {r[0]} {r[1]} {r[2]}: terms={r[3]} record_any={r[4]}")
     assert rec.compared, f"{case}: the kernel built no TensorArg with a loop_info"
     if case in MUST_ADVANCE:
         assert advancing, f"{case}: no advancing record; comparison is vacuous"
@@ -523,7 +342,10 @@ def test_corpus_matches_kernel(case):
         f"  {m[0]} {m[1]} {m[2]}: kernel={m[3]} accessor={m[4]} projected={m[5]}"
         for m in rec.mismatches
     )
-    assert not rec.anywhere_mismatches, "anywhere != record reader:\n" + "\n".join(
-        f"  {m[0]} {m[1]} {m[2]}: accessor={m[3]} existing={m[4]}"
-        for m in rec.anywhere_mismatches
+    assert not rec.anywhere_mismatches, (
+        "*_anywhere disagrees with the per-level terms:\n"
+        + "\n".join(
+            f"  {m[0]} {m[1]} {m[2]}: accessor={m[3]} existing={m[4]}"
+            for m in rec.anywhere_mismatches
+        )
     )

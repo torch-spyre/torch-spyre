@@ -48,14 +48,21 @@ from torch_spyre._inductor.loop_node import (
     LoopNode,
     OpsView,
     all_ops,
+    build_pending_loop_nodes,
     building_loop,
     collapse,
     expand,
     expanded,
     in_building_loop,
     insert_after,
+    insert_before,
+    move_after,
+    move_before,
     owning_list,
+    remove_op,
     peel_non_members,
+    request_loop_nodes,
+    top_level_entry,
 )
 
 
@@ -405,6 +412,70 @@ def _nested():
     return [a, outer, f], outer, inner, (a, b, c, d, e, f)
 
 
+class TestPendingLoopNodes(unittest.TestCase):
+    """``request_loop_nodes`` / ``build_pending_loop_nodes``: a lowering records the
+    loops it built mid-pipeline and the pass loop wraps them once the pass is over."""
+
+    def test_only_the_requested_group_is_wrapped(self):
+        u1 = sympy.Symbol("u1")
+        a, b = _Op("a", (0,), [2]), _Op("b", (0,), [2])  # a flat loop nobody asked for
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph = _graph([a, b, c, d])
+        request_loop_nodes(graph, {1: u1})
+        build_pending_loop_nodes(graph)
+        first, node = graph.operations[:2], graph.operations[2]
+        self.assertEqual(first, [a, b])
+        self.assertIsInstance(node, LoopNode)
+        self.assertEqual((node.body, node.induction, node.trip_count), ([c, d], u1, 4))
+
+    def test_an_existing_node_is_kept_and_the_new_one_is_numbered_after_it(self):
+        u0, u1 = sympy.Symbol("u0"), sympy.Symbol("u1")
+        a = _Op("a", (0,), [2])
+        graph = _graph([a])
+        collapse(graph, inductions={0: u0})
+        (existing,) = graph.operations
+        self.assertEqual(existing.get_name(), "loopnode0")
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph.operations.extend([c, d])
+        request_loop_nodes(graph, {1: u1})
+        build_pending_loop_nodes(graph)
+        self.assertIs(graph.operations[0], existing)
+        self.assertEqual(
+            [o.get_name() for o in graph.operations], ["loopnode0", "loopnode1"]
+        )
+        self.assertEqual(graph.operations[1].body, [c, d])
+
+    def test_building_twice_changes_nothing(self):
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        graph = _graph([c, d])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        built = list(graph.operations)
+        build_pending_loop_nodes(graph)
+        self.assertEqual(graph.operations, built)
+
+    def test_requests_accumulate_until_built(self):
+        a, b = _Op("a", (0,), [2]), _Op("b", (1,), [3])
+        graph = _graph([a, b])
+        request_loop_nodes(graph, {0: sympy.Symbol("u0")})
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        self.assertEqual([type(o) for o in graph.operations], [LoopNode, LoopNode])
+
+    def test_an_empty_request_is_not_recorded(self):
+        graph = _graph([_Op("a")])
+        request_loop_nodes(graph, {})
+        build_pending_loop_nodes(graph)
+        self.assertEqual(len(graph.operations), 1)
+
+    def test_the_flat_view_is_refused(self):
+        graph = _graph([_Op("c", (1,), [4])])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        graph.operations = OpsView(graph.operations)
+        with self.assertRaises(AssertionError):
+            build_pending_loop_nodes(graph)
+
+
 class TestOpsView(unittest.TestCase):
     def test_iteration_is_flat(self):
         real, _, _, (a, b, c, d, e, f) = _nested()
@@ -605,6 +676,171 @@ class TestOpsViewCrossingNodes(unittest.TestCase):
         self.assertEqual(real, [node, w, z])
 
 
+class TestExplicitEdits(unittest.TestCase):
+    """Edits that say where the op belongs (stage 8.0).
+
+    ``view.insert(view.index(anchor), op)`` puts the op in the list that holds the op
+    at that flat position, so "just before a loop" lands inside the body when the
+    flat neighbour is the loop's first member. These say it explicitly: an op placed
+    before a node is outside it, an op placed before a body op is in that body.
+    """
+
+    def test_insert_before_a_body_op_joins_its_body_through_the_view(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        self.assertEqual(list(view), [a, b, c, d, e, f])  # fills the cache
+        x = _Op("x")
+        insert_before(view, d, x)
+        self.assertEqual(inner.body, [c, x, d])
+        self.assertEqual(list(view), [a, b, c, x, d, e, f])  # the cache was dropped
+
+    def test_insert_before_a_node_is_outside_it_even_when_its_first_member_is_next(
+        self,
+    ):
+        """The case the flat view gets wrong: ``c`` is the first flat op of
+        ``inner``. ``view.insert(index(c))`` puts the op inside; naming the node puts
+        it before the loop, where it runs once."""
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        inside, outside = _Op("inside"), _Op("outside")
+        view.insert(view.index(c), inside)
+        self.assertEqual(inner.body, [inside, c, d])
+        insert_before(view, inner, outside)
+        self.assertEqual(outer.body, [b, outside, inner, e])
+        self.assertEqual(real, [a, outer, f])
+
+    def test_insert_before_a_top_level_node_goes_to_the_top_level(self):
+        real, outer, _, (a, b, c, d, e, f) = _nested()
+        x = _Op("x")
+        insert_before(OpsView(real), outer, x)
+        self.assertEqual(real, [a, x, outer, f])
+
+    def test_insert_before_an_op_that_is_not_there_raises(self):
+        real, *_ = _nested()
+        with self.assertRaises(ValueError):
+            insert_before(OpsView(real), _Op("stranger"), _Op("x"))
+
+    def test_move_before_takes_an_op_out_of_its_list_and_into_the_anchors(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        move_before(view, d, f)  # a top-level op into the inner body
+        self.assertEqual(inner.body, [c, f, d])
+        self.assertEqual(real, [a, outer])
+        self.assertEqual(list(view), [a, b, c, f, d, e])
+
+    def test_move_before_a_node_takes_a_body_op_out_of_the_loop(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_before(OpsView(real), outer, d)
+        self.assertEqual(real, [a, d, outer, f])
+        self.assertEqual(inner.body, [c])
+
+    def test_move_before_within_one_list_reorders_it(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_before(OpsView(real), c, d)
+        self.assertEqual(inner.body, [d, c])
+
+    def test_move_after_a_node_puts_the_op_after_the_loop(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_after(OpsView(real), inner, b)
+        self.assertEqual(outer.body, [inner, b, e])
+
+    def test_move_after_the_last_body_op_stays_in_the_body(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_after(OpsView(real), d, a)
+        self.assertEqual(inner.body, [c, d, a])
+        self.assertEqual(real, [outer, f])
+
+    def test_moving_an_op_relative_to_itself_raises(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        with self.assertRaises(ValueError):
+            move_before(OpsView(real), c, c)
+        self.assertEqual(inner.body, [c, d])  # and the op was not taken out
+
+    def test_move_of_an_op_that_is_not_there_raises_and_changes_nothing(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        with self.assertRaises(ValueError):
+            move_before(OpsView(real), c, _Op("stranger"))
+        self.assertEqual(inner.body, [c, d])
+
+    def test_a_node_cannot_be_moved_relative_to_an_op_it_holds(self):
+        """Detaching the node would detach the anchor: it raises before changing
+        anything, and the node is still where it was."""
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        for move in (move_before, move_after):
+            with self.assertRaises(ValueError):
+                move(OpsView(real), c, outer)  # c is in a node nested in outer
+            with self.assertRaises(ValueError):
+                move(OpsView(real), inner, outer)
+            self.assertEqual(real, [a, outer, f])
+            self.assertEqual(outer.body, [b, inner, e])
+            self.assertEqual(inner.body, [c, d])
+
+    def test_a_node_moves_with_its_body_relative_to_an_outside_anchor(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        move_before(OpsView(real), a, inner)
+        self.assertEqual(real, [inner, a, outer, f])
+        self.assertEqual(inner.body, [c, d])
+        self.assertEqual(outer.body, [b, e])
+
+    def test_move_to_an_anchor_that_is_not_there_raises_and_changes_nothing(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        with self.assertRaises(ValueError):
+            move_before(OpsView(real), _Op("stranger"), d)
+        self.assertEqual(inner.body, [c, d])  # d is still where it was
+
+    def test_remove_op_takes_the_op_from_the_list_that_holds_it(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        remove_op(view, d)
+        self.assertEqual(inner.body, [c])
+        self.assertEqual(list(view), [a, b, c, e, f])
+
+    def test_remove_op_works_on_the_real_list_and_on_a_node(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        remove_op(real, inner)
+        self.assertEqual(outer.body, [b, e])
+
+    def test_removing_the_last_member_leaves_an_empty_body(self):
+        """Nothing here decides what an empty node means (see the hoist test)."""
+        x = _Op("x")
+        node = _node("loop", [x])
+        real = [node]
+        remove_op(real, x)
+        self.assertEqual(node.body, [])
+        self.assertEqual(real, [node])
+
+    def test_remove_op_of_an_op_that_is_not_there_raises(self):
+        real, *_ = _nested()
+        with self.assertRaises(ValueError):
+            remove_op(OpsView(real), _Op("stranger"))
+
+
+class TestTopLevelEntry(unittest.TestCase):
+    """``top_level_entry``: the op, or the outermost node that holds it. A clone that
+    must run once, outside every loop of its anchor, is placed beside this."""
+
+    def test_a_top_level_op_is_its_own_entry(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        self.assertIs(top_level_entry(OpsView(real), a), a)
+        self.assertIs(top_level_entry(real, f), f)
+
+    def test_a_body_op_has_the_outermost_node_as_its_entry(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        self.assertIs(top_level_entry(view, b), outer)  # one level down
+        self.assertIs(top_level_entry(view, d), outer)  # two levels down
+
+    def test_a_node_is_its_own_entry_at_the_top_level_and_nested(self):
+        real, outer, inner, _ = _nested()
+        self.assertIs(top_level_entry(real, outer), outer)
+        self.assertIs(top_level_entry(real, inner), outer)
+
+    def test_an_op_that_is_not_there_raises(self):
+        real, *_ = _nested()
+        with self.assertRaises(ValueError):
+            top_level_entry(OpsView(real), _Op("stranger"))
+
+
 class TestPeelNonMembers(unittest.TestCase):
     """An op without the loop's ``loop_info`` at the edge of a body (where
     ``OpsView.insert`` puts an op inserted "before the loop" at its first
@@ -739,6 +975,19 @@ class TestDeadcodeOnRealNestedList(unittest.TestCase):
         keep = self._buf("keep")
         survivors = self._run([acc, node, keep], output_names=["keep"])
         self.assertEqual(survivors, [keep])
+
+    def test_a_dead_leaf_is_removed_from_its_body_through_the_flat_view(self):
+        """As the pass runs it: ``graph.operations`` is the flat view, and a dead op
+        inside a body leaves that body, not the top level."""
+        keep = self._buf("keep")
+        live = self._buf("live")
+        dead = self._buf("dead")
+        node = _node("loopnode0", [live, dead])
+        real = [node, keep]
+        self._run(OpsView(real), output_names=["keep", "live"])
+        self.assertEqual(node.body, [live])
+        self.assertEqual(real, [node, keep])
+        self.assertIn("dead", V.graph.removed_buffers)
 
     def test_impure_fallback_keeps_loop(self):
         fb = MagicMock(spec=FallbackKernel)
