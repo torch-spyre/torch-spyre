@@ -2536,6 +2536,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # min == max: the data's own range.
                 "fp32_auto_range": (torch.randn((256,)), 20, 0, 0),
+                # Integer data sits on the bin edges of its own range (5..20 in 10
+                # bins: every third value), where the scaled position is a whole
+                # number.
+                "int32_auto_range": (
+                    (torch.arange(192) % 16 + 5).to(torch.int32),
+                    10,
+                    0,
+                    0,
+                ),
                 # topk indices are int64 in most router code.
                 "int64_192": (
                     torch.randint(0, 128, (192,), dtype=torch.int64),
@@ -2556,8 +2565,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # No elements: every count is zero.
                 "empty_input": (torch.empty((0,)), 8, 0, 1),
                 # fp16 inputs are multiples of 1/16, exact in device fp16, with
-                # values below min and above max. Counts stay under 1024, the
-                # largest whole number device fp16 holds exactly.
+                # values below min and above max.
                 "fp16_192": (
                     (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
                     8,
@@ -2593,6 +2601,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                     0,
                 ),
+                # All positive and off the stick boundary: a padding zero read as
+                # data would move the range's minimum.
+                "fp16_auto_range_positive_100": (
+                    ((torch.arange(100) % 13 + 8) / 16).to(torch.float16),
+                    7,
+                    0,
+                    0,
+                ),
+                "fp16_auto_range_negative_100": (
+                    (-(torch.arange(100) % 13 + 8) / 16).to(torch.float16),
+                    7,
+                    0,
+                    0,
+                ),
+                # The most elements fp16 allows, all in one bin: the largest count.
+                "fp16_1024_in_one_bin": (
+                    torch.full((1024,), 0.5, dtype=torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
                 # The most bins fp16 allows.
                 "fp16_bins_1024": (
                     (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
@@ -2606,10 +2635,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                     1,
                 ),
+                # TODO: an fp16 input is counted in fp16, exact only up to 1024.
+                # When it is counted in fp32 (#5553) this becomes a positive case.
+                "fp16_1025_elements": (
+                    (torch.randint(-4, 21, (1025,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
             },
             "expect_raise": {
                 "2d_input": "histc: only 1-D input is supported",
                 "fp16_bins_1025": "histc: float16 input supports at most 1024 bins",
+                "fp16_1025_elements": (
+                    "histc: float16 input supports at most 1024 elements"
+                ),
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {

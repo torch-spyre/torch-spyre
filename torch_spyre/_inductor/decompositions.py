@@ -1862,11 +1862,18 @@ def spyre_topk(
     )
 
 
-def _histc_bin_index(x, lo, hi, width_den, bins):
+def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
     """torch's histc bin index for fp32 ``x``: 0..bins-1 in range; below ``lo``,
     above ``hi`` or for NaN, a negative number or NaN, which matches no bin."""
     valid = (x <= hi).to(torch.float32)
-    pos = torch.floor((x - lo) * float(bins) / width_den)
+    scaled = (x - lo) * float(bins)
+    pos = torch.floor(scaled / width_den)
+    if repair_division:
+        # Dividing by a device tensor can land a float step under a whole
+        # quotient, which floors to the bin below. Multiply back to restore it.
+        rem = scaled - pos * width_den
+        pos = pos + (rem >= width_den).to(torch.float32)
+        pos = pos - (rem < 0).to(torch.float32)
     pos = pos - torch.relu(pos - (bins - 1.0))  # x == hi -> bins - 1
     return pos * valid + (valid - 1.0)
 
@@ -1897,11 +1904,17 @@ def spyre_histc(
         raise RuntimeError(f"torch.histc: range of [{lo}, {hi}] is not finite")
     if lo > hi:
         raise RuntimeError("torch.histc: max must be larger than min")
-    # An fp16 input is compared as fp16 (the index maths stays in fp32).
+    # An fp16 input is compared and counted as fp16 (the index maths stays in
+    # fp32). Device fp16 holds whole numbers exactly only up to 1024, hence the
+    # two limits.
+    # TODO: count in fp32, with no element limit, once a reduction keeps its
+    # input's element arrangement (#5553).
     idx_dtype = torch.float16 if input.dtype == torch.float16 else torch.float32
-    if idx_dtype == torch.float16 and bins > 1024:
-        # Device fp16 holds whole numbers exactly only up to 1024.
-        raise Unsupported("histc: float16 input supports at most 1024 bins")
+    if idx_dtype == torch.float16:
+        if bins > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 bins")
+        if input.numel() > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 elements")
     if input.numel() == 0:
         return input.new_zeros((bins,))
 
@@ -1914,11 +1927,15 @@ def spyre_histc(
     if lo == hi:
         # min == max: the data's range, widened by 1 if constant, as torch does.
         # Unlike torch, NaN or inf in the data does not raise.
-        lo_t, hi_t = torch.amin(x), torch.amax(x)
+        # An fp16 input's fp32 copy is padded, and a reduction over it would read
+        # the padding, so its range is taken from the input itself.
+        src = input if input.dtype == torch.float16 else x
+        lo_t = torch.amin(src).to(torch.float32)
+        hi_t = torch.amax(src).to(torch.float32)
         same = lo_t == hi_t
         lo_t = torch.where(same, lo_t - 1, lo_t)
         hi_t = torch.where(same, hi_t + 1, hi_t)
-        idx = _histc_bin_index(x, lo_t, hi_t, hi_t - lo_t, bins)
+        idx = _histc_bin_index(x, lo_t, hi_t, hi_t - lo_t, bins, repair_division=True)
     else:
         # Edges in fp32, as torch computes them.
         idx = _histc_bin_index(

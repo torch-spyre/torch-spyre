@@ -1085,10 +1085,11 @@ def _lower_pool2d(
 @register_spyre_lowering(torch.ops.spyre.histc_count)
 def lower_histc_count(idx, bin_ids, bins, out_dtype):
     """Broadcast idx to (bins_pad, n), restickify so the bins are on the stick,
-    compare with 0..bins_pad-1 and sum down the rows. Each intermediate is its
-    own realized op: split_multi_ops cannot split buffers built here."""
+    compare with 0..bins_pad-1 and sum down the rows in idx's dtype. Each
+    intermediate is its own realized op: split_multi_ops cannot split buffers
+    built here."""
     aten = torch.ops.aten
-    f32 = torch.float32
+    sum_dtype = idx.get_dtype()
     n = int(idx.get_size()[0])
     bins_pad = int(bin_ids.get_size()[0])
 
@@ -1112,8 +1113,8 @@ def lower_histc_count(idx, bin_ids, bins, out_dtype):
     xb = lowering.permute(lower_restickify(rows), [1, 0])  # (n, bins_pad)
     eq = lowering.lowerings[aten.eq.Tensor]
     match = realized(eq, xb, lowering.unsqueeze(bin_ids, 0))
-    counts = realized(lowering.sum_, cast(match, f32), [0])  # (bins_pad,)
-    if out_dtype != f32:
+    counts = realized(lowering.sum_, cast(match, sum_dtype), [0])  # (bins_pad,)
+    if out_dtype != sum_dtype:
         # Whole numbers: no trunc needed.
         counts = cast(counts, out_dtype, skip_trunc=True)
     return lowering.slice_(counts, 0, 0, bins)

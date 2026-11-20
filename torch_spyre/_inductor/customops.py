@@ -177,7 +177,8 @@ def histc_count(
     idx: torch.Tensor, bin_ids: torch.Tensor, bins: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Counts of each value 0..bins-1 in the 1-D fp32 or fp16 ``idx``, as a
-    (bins,) tensor of ``out_dtype``. Other values are ignored. ``bin_ids`` is
+    (bins,) tensor of ``out_dtype``. Other values are ignored. The count is
+    summed in ``idx``'s dtype. ``bin_ids`` is
     ``histc_bin_ids(bins_pad, idx.dtype)``."""
     pass
 

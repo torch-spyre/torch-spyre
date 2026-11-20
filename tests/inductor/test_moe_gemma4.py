@@ -269,9 +269,6 @@ SORT_MULTI_OUTPUT = _xfail(
     "#5831: split_multi_ops fails on multi-output sort",
     "'tuple' object has no attribute 'to'",
 )
-HISTC = _xfail(
-    NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
-)
 REPEAT_INTERLEAVE = _xfail(
     NotImplementedError,
     "#673: repeat_interleave.Tensor has no Spyre kernel",
@@ -1009,7 +1006,7 @@ def test_G4_GM_001_sort_dispatch(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=HISTC, compiled=HISTC),
+    _cases(),
 )
 def test_G4_GM_002_histc_cumsum_offsets(execution_mode, T):
     """Per-expert row counts with histc, then int32 cumulative offsets."""
