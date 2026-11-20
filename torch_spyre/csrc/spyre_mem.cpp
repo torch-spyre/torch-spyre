@@ -595,6 +595,20 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
       view_size_at_stride(layout_extent, view_sizes, view_strides);
 
   for (auto& [dims, count] : stl.valid_elements) {
+    // A stick pair {outer, inner} counts rows of the stick: the count is the
+    // rows the view takes along the outer dim times the stick. Capping it as a
+    // single stride would reduce it to the stick's own extent, one row.
+    if (dims.size() == 2) {
+      const int64_t outer_stride = stl.stride_map[dims[0]];
+      const auto rows = size_at_stride.find(outer_stride);
+      if (outer_stride > 0 && rows != size_at_stride.end() &&
+          rows->second != std::numeric_limits<int64_t>::max()) {
+        count = std::min(count, rows->second * stl.device_size[dims[1]]);
+        continue;
+      }
+      // No view dim at the outer stride (a flattened view covers the rows
+      // through its stick-stride dim): the single-stride rule below applies.
+    }
     std::optional<int64_t> finest;
     for (const int64_t d : dims) {
       const int64_t stride = stl.stride_map[d];

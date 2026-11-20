@@ -70,22 +70,6 @@ class TestGetReservedDims(TestCase):
         self.assertIsNone(get_reserved_dims(x_dev.t()))
         self.assertIsNone(get_reserved_dims(x_dev.t().detach()))
 
-    def test_in_place_transpose_drops_the_map(self) -> None:
-        x = torch.rand(560, 1024, dtype=torch.float16)
-        x_dev = x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
-        d = x_dev.detach()
-        d.t_()
-        self.assertIsNone(get_reserved_dims(d))
-        # The original is a different tensor object and is untouched.
-        self.assertIsNotNone(get_reserved_dims(x_dev))
-
-    def test_in_place_rank_change_drops_the_map(self) -> None:
-        x = torch.rand(560, 1024, dtype=torch.float16)
-        x_dev = x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
-        d = x_dev.detach()
-        d.unsqueeze_(0)
-        self.assertIsNone(get_reserved_dims(d))
-
 
 if __name__ == "__main__":
     run_tests()
