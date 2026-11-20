@@ -94,7 +94,8 @@ class SchemaApplier:
         "default_compression_codec": "'LZ4'",
     }
     TABLE_SETTINGS = re.compile(
-        r"\s+SETTINGS\s+((?:\w+\s*=\s*(?:'[^']*'|[^,\s]+)(?:\s*,\s*)?)+)\s*$"
+        r"\s+SETTINGS\s+((?:\w+\s*=\s*(?:'[^']*'|[^,\s]+)(?:\s*,\s*)?)+)"
+        r"(\s+COMMENT\s+'(?:[^'\\]|\\.|'')*')?\s*$"
     )
     ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
     ADDS = re.compile(
@@ -593,7 +594,11 @@ class SchemaApplier:
         kept = [
             f"{k} = {v}" for k, v in items if cls.DEFAULT_TABLE_SETTINGS.get(k) != v
         ]
-        return sql[: m.start()] + (" SETTINGS " + ", ".join(kept) if kept else "")
+        return (
+            sql[: m.start()]
+            + (" SETTINGS " + ", ".join(kept) if kept else "")
+            + (m.group(2) or "")
+        )
 
     @classmethod
     def canonical(cls, client, sql: str, db: str) -> str:

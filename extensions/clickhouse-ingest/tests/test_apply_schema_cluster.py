@@ -1460,3 +1460,46 @@ def test_a_file_setting_with_a_default_sibling_keeps_the_real_one():
     file = FILE_PLAIN + " SETTINGS storage_policy = 'x'"
     live = file + ", auto_statistics_types = '', default_compression_codec = 'LZ4'"
     assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") == ""
+
+
+DEFAULTS_SQL = " SETTINGS index_granularity = 8192, auto_statistics_types = '', default_compression_codec = 'LZ4'"
+
+
+@pytest.mark.parametrize("comment", ["x", "uses SETTINGS a = 1", "it''s", "a\\'b"])
+def test_defaults_before_a_table_comment_are_not_drift(comment):
+    file = f"{FILE_PLAIN} COMMENT '{comment}'"
+    live = f"{FILE_PLAIN}{DEFAULTS_SQL} COMMENT '{comment}'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") == ""
+
+
+def test_a_real_setting_before_a_table_comment_is_still_drift():
+    file = f"{FILE_PLAIN} COMMENT 'x'"
+    live = f"{FILE_PLAIN} SETTINGS index_granularity = 4096 COMMENT 'x'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") != ""
+    live2 = f"{FILE_PLAIN}{DEFAULTS_SQL}, storage_policy = 'p' COMMENT 'x'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(file), live2, "db") != ""
+
+
+def test_a_different_comment_after_defaults_is_still_drift():
+    live = f"{FILE_PLAIN}{DEFAULTS_SQL} COMMENT 'y'"
+    assert (
+        SchemaApplier.differs(
+            FormatOnly(), _obj(f"{FILE_PLAIN} COMMENT 'x'"), live, "db"
+        )
+        != ""
+    )
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), live, "db") != ""
+
+
+def test_the_marker_with_defaults_and_after_them_a_real_comment():
+    base = replicated(FILE_PLAIN, "db", "t")
+    marker = base + DEFAULTS_SQL + " COMMENT 'ha-twin'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), marker, "db") == ""
+    mine = base + DEFAULTS_SQL + " COMMENT 'ha-twin | mine'"
+    assert (
+        SchemaApplier.differs(
+            FormatOnly(), _obj(f"{FILE_PLAIN} COMMENT 'mine'"), mine, "db"
+        )
+        == ""
+    )
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), mine, "db") != ""
