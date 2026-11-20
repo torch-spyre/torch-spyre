@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The table lowering of a CP-SAT cost objective: the base mechanics, one table per
-node, printed by a sympy Printer, each node's list computed from its operands' lists. No device and no compile:
-each test builds its inputs by hand and solves the lowered model with CP-SAT.
+"""The table lowering of a CP-SAT cost objective: one table per node and a sum kept
+linear, printed by a sympy Printer, each node's list computed from its operands' lists.
+No device and no compile: each test builds its inputs by hand and solves the lowered
+model with CP-SAT.
 
 *Exact* means: every assignment of the inputs has exactly one solution, so each
 position and the cost are determined by the inputs, and that solution's cost is
@@ -46,6 +47,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Index,
     Input,
     InputIndex,
+    LinearRealization,
     TableRealization,
     TableLowering,
     TableLoweringError,
@@ -135,7 +137,10 @@ class Case:
         assignments = list(itertools.product(*(self.values[v] for v in self.variables)))
         assert len(rows) == len(assignments)
         assert sorted(row[:-1] for row in rows) == sorted(assignments)
-        bound = 0.5  # one table, rounded once
+        # each list is rounded once, and a sum's constant with them
+        bound = (
+            (len(plan.terms) + 1) / 2 if isinstance(plan, LinearRealization) else 0.5
+        )
         for row in rows:
             exact = COST_SCALE * self.sympy_value(expr, row[:-1])
             assert abs(row[-1] - exact) <= bound, (row, exact)
@@ -168,6 +173,11 @@ def _printed(
     }
 
 
+def _tables(model: cp_model.CpModel) -> list[int]:
+    """The entries of each table in model: one add_element per table."""
+    return [len(c.element.exprs) for c in model.proto.constraints if c.has_element()]
+
+
 def _operations(printed: dict[sympy.Basic, TableRealization]) -> list[sympy.Basic]:
     """The nodes whose lists the printer computes: neither a symbol nor a constant."""
     return [e for e in printed if e.free_symbols and not isinstance(e, sympy.Symbol)]
@@ -181,8 +191,8 @@ def test_the_printer_prints_operands_first_and_a_shared_subexpression_once(monke
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
-    shared = a**0.5 + b
-    expr = shared * a + sympy.log(shared)
+    shared = a**0.5 * b
+    expr = sympy.exp(shared) + sympy.log(shared)
     before = sympy.srepr(expr)
     calls = _count_evaluations(monkeypatch)
     printer = Recording(case.inputs)
@@ -217,7 +227,7 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     root2 = sympy.sqrt(2)
-    expr = 3 * a + root2 * a**0.5
+    expr = sympy.Max(a, 3) ** root2
     printer = Recording(case.inputs)
     printer.print(expr)
     for realization in printer.printed.values():
@@ -229,7 +239,7 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
     assert list(printed[sympy.Integer(3)].values) == [3.0]
     assert printed[root2].index == UNIT  # an operation on numbers
     assert list(printed[root2].values) == [2**0.5]
-    assert printed[a**0.5].index == position
+    assert printed[sympy.Max(a, 3)].index == position
     assert printed[expr].index == position
 
 
@@ -583,8 +593,8 @@ def test_a_node_is_evaluated_once_its_operands_before_it(monkeypatch):
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     calls = _count_evaluations(monkeypatch)
-    shared = a**0.5 + b
-    expr = shared * a + sympy.log(shared)
+    shared = a**0.5 * b
+    expr = sympy.Max(sympy.exp(shared), sympy.log(shared))
     printer = Recording(case.inputs)
     root = printer.print(expr)
     computed = [e for e in printer.printed if e.free_symbols and not e.is_Symbol]
@@ -737,23 +747,177 @@ def test_a_symbol_with_no_input_is_refused_by_name():
     assert "no input" in caught.value.reason
 
 
-def test_the_naive_lowering_explodes_past_the_cap():
-    """One table per node puts the sum over all three buffers in one table, 21 * 11 *
-    20 = 4620 entries, though no term reads more than one buffer. Under a cap of 4096
-    the sum is refused, by name; keeping a sum linear is the next optimization."""
+# -------------------------------------------------------------------- linear sums
+
+
+def test_a_sum_is_exact_with_no_table_across_its_terms():
+    """One table for the sum over all three buffers would hold 21 * 11 * 20 = 4620
+    entries, though no term reads more than one buffer. Kept linear, the sum is three
+    tables of 21, 11 and 20 entries, under a cap that one table would pass. A parent
+    that asks for the sum's table gets the one table, within the cap it asks with."""
     case = Case()
     case.add_input("a", a=[float(v) for v in range(1, 22)])
     case.add_input("b", b=[float(v) for v in range(1, 12)])
     case.add_input("c", c=[float(v) for v in range(1, 21)])
     a, b, c = case.symbol("a"), case.symbol("b"), case.symbol("c")
     expr = a**0.5 + b**0.5 + c**0.25
+    plan = case.assert_exact(expr, cap=4096)
+    assert sorted(_tables(case.model)) == [11, 20, 21]
+    assert plan.table(CAP).index.size == 4620
     with pytest.raises(
         TableLoweringError, match="4620 entries, past the cap of 4096"
     ) as caught:
-        case.lower(expr, cap=4096)
+        plan.table(4096)
+    assert caught.value.node is None  # refused by the sum, which holds no node
+
+
+def test_a_sum_is_a_linear_realization_of_its_operands_realizations():
+    """The printer keeps a sum linear: its terms are its operands' own realizations,
+    a constant operand goes into its constant, and its positions are its inputs' in
+    the order of its symbols. A sum with no symbol is its value."""
+    case = Case()
+    pa = case.add_input("a", a=[1.0, 2.0, 4.0])
+    pb = case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    printer = TableLowering(case.inputs, cap=CAP)
+    root = printer.print(sympy.log(b) + a**0.5 + 2.5)
+    assert type(root) is LinearRealization
+    assert root.constant == 2.5
+    assert set(root.terms) == {printer.print(a**0.5), printer.print(sympy.log(b))}
+    assert root.positions == (pa, pb)
+    assert list(root.table(CAP).values) == pytest.approx(
+        [2.5 + va**0.5 + math.log(vb) for va in (1.0, 2.0, 4.0) for vb in (1.0, 3.0)]
+    )
+    number = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi)
+    assert type(number) is TableRealization and number.index == UNIT
+
+
+def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied():
+    """Of a list and of a sum, in float. A product of two operands is one table, and
+    a constant over an operand is divided, in one table: 98 * (1 / 49) is under 2."""
+    case = Case()
+    pa = case.add_input("a", a=[1.0, 7.0, 49.0])
+    pb = case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    printer = TableLowering(case.inputs, cap=CAP)
+    roots = printer.print(a**0.5).table(CAP)
+    scaled = printer.print(7 * a**0.5)
+    assert type(scaled) is TableRealization and scaled.index == pa
+    assert list(scaled.values) == [7 * value for value in roots.values]
+    total = printer.print(-2 * (a**0.5 + b + 0.25))
+    assert type(total) is LinearRealization and total.constant == -0.5
+    assert {term.index: list(term.values) for term in total.terms} == {
+        pa: [-2 * value for value in roots.values],
+        pb: [-2.0, -6.0],
+    }
+    product = printer.print(a**0.5 * b)
+    assert type(product) is TableRealization
+    assert product.index == CombineIndex(pa, pb)
+    quotient = printer.print(98 / a)
+    assert type(quotient) is TableRealization
+    assert list(quotient.values) == [98.0, 14.0, 2.0] and 98 * (1 / 49) < 2
+
+
+def test_a_coefficient_on_a_sum_is_applied_before_the_rounding():
+    """7 * (a**0.5 + b**0.5 + 1/3): each list and the constant are multiplied in float
+    and rounded once, not rounded and then multiplied."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    expr = 7 * (a**0.5 + b**0.5 + sympy.Rational(1, 3))
+    plan = case.assert_exact(expr)
+    assert type(plan) is LinearRealization and len(plan.terms) == 2
+    _, objective = case.lower(expr)
+    cost = case.model.new_int_var(0, 2**40, "at")
+    case.model.add(cost == objective)
+    rows = {row[:2]: row[2] for row in case.solutions(case.variables + [cost])}
+    once = [round(1024 * 7 * value) for value in (2**0.5, 1.0, 1 / 3)]
+    apart = [7 * round(1024 * value) for value in (2**0.5, 1.0, 1 / 3)]
+    assert rows[1, 0] == sum(once) == 19694 and sum(apart) == 19691
+
+
+def test_lists_on_one_position_are_added_before_the_rounding():
+    """Two terms on one buffer are one list and one lookup: split**0.5 + split**0.7 at
+    split 2 is rint(1024 * (2**0.5 + 2**0.7)) = 3112, where the two lists rounded
+    apart give 1448 + 1663 = 3111. A sum under a coefficient is taken term by term, so
+    its lists join the others on their positions."""
+    case = Case()
+    case.add_input("a", split=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0, 9.0])
+    split, b = case.symbol("split"), case.symbol("b")
+    plan, objective = case.lower(split**0.5 + split**0.7)
+    assert isinstance(plan, LinearRealization) and len(plan.terms) == 1
+    assert _tables(case.model) == [3]
+    cost = case.model.new_int_var(0, 2**40, "cost")
+    case.model.add(cost == objective)
+    rows = dict(case.solutions([case.variables[0], cost]))
+    assert rows[1] == 3112
+    assert round(1024 * 2**0.5) + round(1024 * 2**0.7) == 3111
+    nested = case.assert_exact(split**0.5 + 2 * (split**0.7 + b**0.5) + b**0.25)
+    assert isinstance(nested, LinearRealization)
+    assert sorted(term.index.size for term in nested.terms) == [3, 3]
+
+
+def test_an_affine_list_adds_no_table():
+    """A list whose rounded entries are affine in its position is its first entry plus
+    a step times the position, a linear expression: 3 * b over b = 1 .. 6, and any
+    list of two values, as a 0/1 literal's term is. A list that is not takes a
+    table."""
+    case = Case()
+    case.add_input("b", b=[float(v) for v in range(1, 7)])
+    case.integer("x", 0, 2)
+    b, x = case.symbol("b"), case.symbol("x")
+    constraints = len(case.model.proto.constraints)
+    variables = len(case.model.proto.variables)
+    _, objective = case.lower(3 * b - 2.25 * x + sympy.exp(x))
+    assert len(case.model.proto.constraints) == constraints
+    assert len(case.model.proto.variables) == variables
+    assert not isinstance(objective, int)
+    case.assert_exact(3 * b - 2.25 * x + sympy.exp(x))
+    assert _tables(case.model) == []
+    case.assert_exact(b**0.5 + 3 * b)
+    assert _tables(case.model) == [6]
+
+
+def test_a_sum_under_a_power_is_read_as_its_table_and_refused_past_the_cap():
+    """A parent that computes its own list reads a sum as one table over the sum's
+    inputs. Past the cap the parent is refused, before the sum is printed."""
+    case = Case()
+    pa = case.add_input("a", a=[1.0, 2.0, 4.0])
+    pb = case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    expr = (a + 2 * b) ** 0.5
+    plan = case.assert_exact(expr)
+    assert type(plan) is TableRealization and plan.index == CombineIndex(pa, pb)
+    assert _tables(case.model) == [6]
+    printer = Recording(case.inputs, cap=5)
+    with pytest.raises(
+        TableLoweringError, match="6 entries, past the cap of 5"
+    ) as caught:
+        printer.print(expr)
     assert caught.value.node == expr
-    plan, _ = case.lower(expr, cap=8192)
-    assert plan.table(CAP).index.size == 4620
+    assert a + 2 * b not in printer.printed
+
+
+def test_a_sum_that_is_not_finite_is_refused_at_the_sum():
+    """Each list of a sum is finite, and their total need not be. Lists on one
+    position are added as the sum is printed, a sum's table is made when a parent asks
+    for it, and a coefficient is applied as its product is printed: each refuses a
+    value that is not finite, naming its node, though the root's own list is
+    finite."""
+    case = Case()
+    case.add_input("a", d0=[1.0, 1.7e308], d1=[1.0, 1.7e308])
+    case.add_input("b", b=[1.0, 1.7e308])
+    d0, d1, b = case.symbol("d0"), case.symbol("d1"), case.symbol("b")
+    for node, expr in (
+        (d0 + d1 + b, d0 + d1 + b),
+        (d0 + b, 1 / (d0 + b)),
+        (10 * d0, sympy.Min(10 * d0, 5)),
+    ):
+        with pytest.raises(TableLoweringError, match="not finite") as caught:
+            case.lower(expr)
+        assert caught.value.node == node
 
 
 # ---------------------------------------------------------------- a node's function
@@ -971,7 +1135,8 @@ def _refused(reason):
 # its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's numpy steps change no lowering,
 # so they have none, and the fold's example comes with Stage 10, since whether it fits
 # where the switch and Stage 9's rungs do not depends on the fold's own counts. The
-# first example lowers today, so the check below runs end to end on every stage.
+# first example lowers today, so the check below runs end to end on every stage, and
+# linear_sum lowers since a sum is kept linear: one table of it needs 10^4 entries.
 EXAMPLES = [
     pytest.param(
         lambda: _with(
@@ -996,11 +1161,6 @@ EXAMPLES = [
         ),
         CAP,
         id="linear_sum",
-        marks=_refused(
-            "a sum is one table over every input of its terms: four terms on a buffer "
-            "each need 10^4 entries, past the cap of 8192, and a sum read term by "
-            "term is not built"
-        ),
     ),
     pytest.param(
         lambda: _with(
