@@ -417,7 +417,7 @@ int64_t valid_element_count(const SpyreTensorLayout& stl);
 struct StickPair {
   int64_t outer;
   int64_t inner;
-  int64_t count;
+  int64_t valid_count;
 };
 
 // The stick pairs of `stl`, in key order. Throws on a key that is neither a
