@@ -42,7 +42,7 @@ from .errors import Unsupported
 from .loop_facts import read_advance
 from .loop_info import LoopInfo
 from .pass_utils import copy_op_metadata
-from .loop_node import remove_op
+from .loop_node import record_loop_info, remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -559,6 +559,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             reason="read advancing input directly from HBM",
         )
         replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
+        record_loop_info(replacement)
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):
             if hasattr(direct_op, attr):
                 setattr(replacement, attr, getattr(direct_op, attr))

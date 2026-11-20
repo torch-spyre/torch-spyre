@@ -107,6 +107,7 @@ class LoopNode(ir.Operation):
         induction: sympy.Symbol | None,
         trip_count: Any,
         carries: Iterable[Any] = (),
+        group_id: int | None = None,
         origin_node: Any = None,
         origins: OrderedSet[Any] | None = None,
     ) -> None:
@@ -118,6 +119,16 @@ class LoopNode(ir.Operation):
         self.induction = induction
         self.trip_count = trip_count
         self.carries: tuple[Any, ...] = tuple(carries)
+        # This loop's index among its siblings (its entry in a member's
+        # ``loop_group_id``), and for each leaf op of the body, by name, what that
+        # op tiles at this level: ``(tiled_dims, tiled_reduction_dims)``. A tiled dim
+        # is not recoverable from the op's own index (the range is already divided
+        # and an access need not move with the loop), so the lowering that divided
+        # it records it here.
+        self.group_id = group_id
+        # False on a node built by hand (unit tests), whose facts nothing recorded.
+        self.facts_recorded = False
+        self.tiling: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
         self.origin_node = origin_node
         self.origins: OrderedSet[Any] = (
             OrderedSet(origins) if origins is not None else OrderedSet()
@@ -336,6 +347,8 @@ class OpsView(MutableSequence):
             lst, i = self._locate(op)
             lst.pop(i)
         self.real[:0] = ops
+        for op in ops:
+            _set_chain(op, ())
         self._changed()
 
 
@@ -428,6 +441,54 @@ def _holder(
     return found
 
 
+def _set_chain(entry: ir.Operation, chain: tuple["LoopNode", ...]) -> None:
+    """Point every leaf op under ``entry`` at its enclosing nodes, outermost first
+    (``chain`` is what encloses ``entry`` itself)."""
+    if isinstance(entry, LoopNode):
+        inner = (*chain, entry)
+        for child in entry.body:
+            _set_chain(child, inner)
+    else:
+        entry._loop_chain = chain  # type: ignore[attr-defined]
+
+
+def record_loop_info(op: ir.Operation) -> None:
+    """``op.loop_info`` was (re)written after the op was placed: make the nodes
+    around it hold the new tiled dims. A pass that stamps an op it has already
+    put in a body calls this right after the stamp (the loop checker, rule 6,
+    reports a node that disagrees with the stamp)."""
+    _fill_tiling(op, overwrite=True)
+
+
+def _fill_tiling(entry: ir.Operation, overwrite: bool = False) -> None:
+    """Give each node enclosing a leaf op of ``entry`` the op's tiled dims at that
+    level, read from the op's ``loop_info``, unless the node already has them
+    (``overwrite`` replaces them)."""
+    for leaf in all_ops([entry]):
+        info = getattr(leaf, "loop_info", None)
+        if info is None:
+            continue
+        name = leaf.get_name()
+        for level, node in enumerate(getattr(leaf, "_loop_chain", ())):
+            if overwrite or name not in node.tiling:
+                node.tiling[name] = (
+                    _level_dims(info.loop_tiled_dims, level),
+                    _level_dims(info.loop_tiled_reduction_dims, level),
+                )
+
+
+def _level_dims(lists: Any, level: int) -> tuple[int, ...]:
+    return tuple(lists[level]) if level < len(lists) else ()
+
+
+def _adopt(operations: list[ir.Operation], entry: ir.Operation) -> None:
+    """``entry`` was just put in ``operations``: record which nodes enclose it."""
+    chain = _enclosing_chain(operations, entry)
+    assert chain is not None
+    _set_chain(entry, tuple(chain))
+    _fill_tiling(entry)
+
+
 def insert_before(
     operations: "list[ir.Operation] | OpsView",
     anchor: ir.Operation,
@@ -442,8 +503,10 @@ def insert_before(
     ``view.insert(view.index(x), op)``, naming a node puts the op outside it even
     when the node's first member is the next flat op.
     """
-    lst, i = _holder(_real_list(operations), anchor)
+    real = _real_list(operations)
+    lst, i = _holder(real, anchor)
     lst.insert(i, op)
+    _adopt(real, op)
 
 
 def insert_after(
@@ -461,8 +524,10 @@ def insert_after(
     puts an op inserted past the last flat position at the top level, outside the
     loop it was meant for.
     """
-    lst, i = _holder(_real_list(operations), anchor)
+    real = _real_list(operations)
+    lst, i = _holder(real, anchor)
     lst.insert(i + 1, op)
+    _adopt(real, op)
 
 
 def remove_op(operations: "list[ir.Operation] | OpsView", op: ir.Operation) -> None:
@@ -483,8 +548,11 @@ def replace_op(
 
     Raises ``ValueError`` if ``old`` is not in ``operations``.
     """
-    lst, i = _holder(_real_list(operations), old)
+    real = _real_list(operations)
+    lst, i = _holder(real, old)
     lst[i] = new
+    _set_chain(new, tuple(getattr(old, "_loop_chain", ())))
+    _fill_tiling(new)
 
 
 def top_level_entry(
@@ -557,6 +625,8 @@ def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
     """Insert ``op`` as the first entry of ``node``'s body: it runs every trip,
     before the rest of the body."""
     node.body.insert(0, op)
+    _set_chain(op, _chain_of(node))
+    _fill_tiling(op)
 
 
 def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
@@ -570,6 +640,18 @@ def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
     end, wants :func:`insert_after` and owns that choice.
     """
     node.body.append(op)
+    _set_chain(op, _chain_of(node))
+    _fill_tiling(op)
+
+
+def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
+    """The nodes enclosing the body of ``node``, outermost first, ``node`` last.
+    Read from a leaf of ``node`` that is already placed; ``(node,)`` if it has none."""
+    for leaf in all_ops(node.body):
+        chain = getattr(leaf, "_loop_chain", None)
+        if chain and node in chain:
+            return chain[: chain.index(node) + 1]
+    return (node,)
 
 
 def _group_path(op: ir.Operation) -> tuple[int, ...]:
@@ -627,6 +709,7 @@ def _wrap(
         node = LoopNode(
             f"loopnode{counter[0]}",
             (),
+            group_id=group_idx,
             induction=inductions.get(group_idx),
             trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
         )
@@ -676,6 +759,7 @@ def build_pending_loop_nodes(graph: Any) -> None:
         operations[:] = _wrap(
             list(operations), 0, (), pending, [existing], frozenset(pending)
         )
+        _record_node_facts(operations)
 
 
 def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
@@ -683,6 +767,16 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
         if isinstance(op, LoopNode):
             yield op
             yield from _nodes_in(op.body)
+
+
+def _record_node_facts(operations: list[ir.Operation]) -> None:
+    """Fill every node's per-member tiling and every leaf's node chain, after the
+    nodes were built from the ops' ``loop_info``."""
+    for entry in operations:
+        _set_chain(entry, ())
+        _fill_tiling(entry)
+    for node in _nodes_in(operations):
+        node.facts_recorded = True
 
 
 def collapse(
@@ -702,6 +796,7 @@ def collapse(
         return
     with building_loop():
         operations[:] = _wrap(list(operations), 0, (), inductions or {}, [0])
+        _record_node_facts(operations)
 
 
 def expand(graph: Any) -> None:
@@ -713,3 +808,5 @@ def expand(graph: Any) -> None:
         return
     with building_loop():
         operations[:] = list(all_ops(operations))
+        for op in operations:
+            op._loop_chain = ()  # type: ignore[attr-defined]

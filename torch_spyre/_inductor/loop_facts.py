@@ -95,6 +95,33 @@ def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
     return _levels(getattr(op, "loop_info", None))
 
 
+def node_levels(op: Operation) -> tuple[LoopLevel, ...]:
+    """The same levels as :func:`enclosing_loops`, read from the ``LoopNode``s
+    around ``op`` (``op._loop_chain``, set where the node is built and by the
+    ``loop_node`` edit helpers) instead of from ``op.loop_info``.
+
+    ``induction`` is the node's, where ``enclosing_loops`` reports ``None``. ``()``
+    for an op no node holds.
+    """
+    chain = getattr(op, "_loop_chain", ())
+    if not chain:
+        return ()
+    name = op.get_name()
+    levels = []
+    for i, node in enumerate(chain):
+        tiled, tiled_reduction = node.tiling.get(name, ((), ()))
+        levels.append(
+            LoopLevel(
+                group_path=tuple(n.group_id for n in chain[: i + 1]),
+                trip_count=sympy.sympify(node.trip_count),
+                induction=node.induction,
+                tiled_dims=tiled,
+                tiled_reduction_dims=tiled_reduction,
+            )
+        )
+    return tuple(levels)
+
+
 def loop_depth(op: Operation) -> int:
     """Number of counted loops enclosing ``op``."""
     return len(enclosing_loops(op))
