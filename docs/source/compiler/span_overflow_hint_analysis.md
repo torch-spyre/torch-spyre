@@ -97,9 +97,12 @@ def fn(x, index):
     return x[index] + 1
 ```
 
-Even if the resulting output layout is large, automatic span-overflow tiling is
-skipped because indirect access needs the dedicated indirect-access path.  The
-planner returns `None`.
+A gather is an indirect read inside a `Pointwise` op, so the planner handles it
+here.  Work division cannot bring a large gather under the span limit -- the
+shared table keeps one base address on every core -- so the candidates are moved
+onto the table's own data dims, which a tile can advance uniformly.
+
+Any other indirect-access op keeps its dedicated lowering path and is skipped.
 
 Code flow:
 
@@ -107,7 +110,9 @@ Code flow:
 plan_span_overflow_tile
   -> Pointwise branch
   -> _has_indirect_reads(op) == True
-  -> return None
+  -> _gather_data_dim_candidates
+  -> work division first: fits_span_without_tiling -> return None if it fits
+  -> otherwise the shared cost search
 ```
 
 ### 3. Reduction Output Span Overflow
@@ -522,7 +527,8 @@ The planner skips:
 - non-`FixedTiledLayout` ops, including mutation/copy-back intermediate layouts;
 - symbolic/dynamic layout metadata;
 - scalar/full reductions where `op.data.ranges` is empty;
-- Pointwise or Reduction ops with indirect/gather/scatter-style reads.
+- Reduction ops with indirect/gather/scatter-style reads (a Pointwise gather
+  is planned here; see above).
 
 It raises `Unsupported` (rather than skipping) when a reduction-only input span
 overflows but the op cannot be reduction-range tiled -- `mean` or more than one
@@ -534,7 +540,8 @@ raise (see Known Limitations) and are silently skipped instead.
 | Case | Supported? | Planner behavior |
 |---|---:|---|
 | Pointwise output span overflow | Yes | Emit one or more output-range tile levels |
-| Pointwise indirect/gather read | No | Return `None`; indirect path owns it |
+| Pointwise indirect/gather read (a gather) | Yes | Emit tile levels on the table's data dims |
+| Other indirect-access op | No | Return `None`; its own lowering path owns it |
 | Reduction output span overflow | Yes | Emit output-range tile levels if post-tile layout validates |
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
@@ -557,8 +564,9 @@ For `Pointwise` ops, `plan_span_overflow_tile` does:
 
 ```text
 check op/layout eligibility
-check _has_indirect_reads(op); skip if true
 collect output span candidates
+if indirect access: move candidates to the table's data dims, and
+  return None when work division alone already fits the span
 search for cheapest valid tile combination
 ```
 
@@ -587,7 +595,7 @@ For `Reduction` ops, `plan_span_overflow_tile` does:
 
 ```text
 check op/layout eligibility
-check _has_indirect_reads(op); skip if true
+check _has_indirect_reads(op); skip if true (Reduction keeps its own path)
 skip scalar reductions
 _has_untileable_reduction_span(op); raise Unsupported if true
 collect output span candidates
@@ -818,7 +826,8 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 
 `coarse_tile_span_overflow.span_overflow_groups(graph)`:
 
-1. skips auto groups if `config.ignore_span_overflow_hints` is enabled;
+1. with `config.ignore_span_overflow_hints` enabled, keeps only ops taking
+   part in an indirect access and skips the rest;
 2. skips ops that a `for_each_tile` loop already tiles (they carry dim hints);
 3. calls `plan_span_overflow_tile`;
 4. maps each `selected_host_dim` to a concrete output loop symbol via
@@ -886,18 +895,24 @@ From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` lo
 
 ## Configuration
 
-Automatic span-overflow hints are opt-in.  By default:
+Automatic span-overflow hints are opt-in for most ops.  By default:
 
 ```python
 config.ignore_span_overflow_hints == True
 ```
 
 because `SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS` defaults to `1`.  Enable the
-pass with:
+pass for every op with:
 
 ```bash
 SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
 ```
+
+Indirect access is the exception: a gather, a scatter, and the relayout copy
+`enforce_indirect_access_layout` inserts to feed one are planned whatever the
+setting, because work division cannot bring them under the span limit on its
+own.  The relayout copy carries `INDIRECT_RELAYOUT_ATTR`, set where it is
+inserted, since nothing about its own shape says what it feeds.
 
 Ops that a `for_each_tile` loop already tiles take precedence.  Automatic hints
 are not added to ops that already carry dim hints.
