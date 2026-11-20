@@ -905,6 +905,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       }
       cpu_product = std::min(cpu_product, dma_size);
       adjusted_cpu_sizes.push_back(cpu_product);
+      // The dma_stride fallback mixes device and host units, but it is only
+      // taken when every matched host dim has size 1. Such a dim is never
+      // stepped, so its stride is not used.
       adjusted_cpu_strides.push_back(cpu_min_stride.value_or(dma_stride));
       dev_product = std::min(dev_product, dma_size);
       adjusted_dev_sizes.push_back(dev_product);
