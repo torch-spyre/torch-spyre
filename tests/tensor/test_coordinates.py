@@ -43,6 +43,7 @@ from torch_spyre._inductor.pass_utils import (
     dense_relocation_serves_read,
     device_coordinates,
     is_stick_expr_offset_free,
+    non_stick_reduction_vars,
     restickify_dense_stl_to_sparse,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -1732,6 +1733,63 @@ class TestDenseRelocationServesRead(TestCase):
                 stl = SpyreTensorLayout(list(shape), torch.float16)
                 _, dep = _flat_read(math.prod(shape))
                 self.assertIsNone(dense_relocation_serves_read(stl, host, dep))
+
+    @staticmethod
+    def _prod_read():
+        """``x[8, 32, 20, 20]`` read as ``[8, 32, 400]`` and reduced over dim 1.
+
+        Merging dims 2 and 3 cuts the stick, and dims 0 and 1 are left alone. The
+        widest of them is dim 1, the one the ``prod`` reduces, which cannot carry
+        the stick (backend #4409). Returns the read, the write, and dim 1's symbol.
+        """
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        read = MemoryDep(
+            "arg0_1", 12800 * d0 + 400 * d1 + d2, (d0, d1, d2), (8, 32, 400)
+        )
+        write = MemoryDep("buf0", 400 * d0 + d2, (d0, d2), (8, 400))
+        return read, write, d1
+
+    def test_the_reduced_dim_is_skipped_for_the_next_candidate(self):
+        # The device half of test_prod_does_not_relocate_onto_the_reduced_dim: on
+        # device the shapes without a second real dim only prove the relocation
+        # declines, which the sparse fallback would also do. This pins the dim the
+        # stick actually lands on.
+        read, write, reduced = self._prod_read()
+        self.assertEqual(non_stick_reduction_vars("prod", read, write), {reduced})
+        # Only REDUCTIONS_NON_STICK_DIM_ONLY reductions constrain the stick.
+        self.assertIsNone(non_stick_reduction_vars("sum", read, write))
+
+        host = _contiguous_host([8, 32, 20, 20])
+        stl = SpyreTensorLayout([8, 32, 20, 20], torch.float16)
+        # Unconstrained, the widest dim left alone wins: dim 1, host stride 400.
+        unguarded = dense_relocation_serves_read(stl, host, read)
+        self.assertEqual(unguarded.stride_map[-1], 400)
+        # Forbidding the reduced variable moves on to the next candidate, dim 0
+        # (host stride 12800), and leaves dim 1's 32 elements a real device dim.
+        guarded = dense_relocation_serves_read(
+            stl, host, read, forbidden_stick_syms={reduced}
+        )
+        self.assertEqual(guarded.stride_map[-1], 12800)
+        self.assertIn((32, 400), _non_unit_dims(guarded))
+
+    def test_a_reduction_over_the_only_candidate_dim_relocates_nowhere(self):
+        # [1, 32, 20, 20]: dim 0 is size 1, so skipping dim 1 leaves no candidate
+        # and the read falls through to the sparse layout.
+        d0, d1, d2 = (
+            sympy.Symbol(n, integer=True, nonnegative=True) for n in ("d0", "d1", "d2")
+        )
+        read = MemoryDep("arg0_1", 400 * d1 + d2, (d0, d1, d2), (1, 32, 400))
+        reduced = d1
+        host = _contiguous_host([1, 32, 20, 20])
+        stl = SpyreTensorLayout([1, 32, 20, 20], torch.float16)
+        self.assertIsNotNone(dense_relocation_serves_read(stl, host, read))
+        self.assertIsNone(
+            dense_relocation_serves_read(
+                stl, host, read, forbidden_stick_syms={reduced}
+            )
+        )
 
     def test_an_already_relocated_input_keeps_its_own_dims(self):
         # The stick is a property of the layout, not of the host strides: this

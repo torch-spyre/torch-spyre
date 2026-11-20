@@ -105,6 +105,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    non_stick_reduction_vars,
     op_read_writes,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -826,7 +827,7 @@ def _reduction_layout_from_stl(
         # The stick moved to another real dim serves the read densely; derive the
         # output from the read on that layout, as for any other input layout.
         # Probed without indirect_sizes or op, as above; see the note on the same
-        # call in _default_pointwise_layout.  The reduced variable must stay off
+        # call in _default_pointwise_layout.  The reduced variables must stay off
         # the stick for a prod (#4409): the widest dim the reshape leaves alone is
         # often the reduced one, and the check below would then decline to
         # preserve the layout while the input was still restickified onto it.
@@ -834,10 +835,8 @@ def _reduction_layout_from_stl(
             stl,
             in_layout,
             dep,
-            forbidden_stick_sym=(
-                next(iter(dep.index.free_symbols - output_dep.index.free_symbols), None)
-                if data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
-                else None
+            forbidden_stick_syms=non_stick_reduction_vars(
+                data.reduction_type, dep, output_dep
             ),
         )
         if relocated is not None:

@@ -248,15 +248,21 @@ class TestStickRelocation(unittest.TestCase):
                         )
 
     def test_prod_does_not_relocate_onto_the_reduced_dim(self):
-        # prod cannot reduce along the stick dim (backend #4409). The relocation
-        # takes the widest dim the reshape leaves alone, which here is the reduced
-        # dim itself, so it must decline and leave the read to the sparse layout.
-        # Relocating onto it compiled on no build: main compiles these, and an
-        # earlier version of this branch failed them with UnalignedStickSplit.
+        # prod cannot reduce along the stick dim (backend #4409), and the widest
+        # dim the reshape leaves alone is the reduced one, so the relocation must
+        # skip it. The first three shapes have nothing else that can carry the
+        # stick, so the read falls through to the sparse layout; the last two have
+        # a second real dim and the stick moves there instead. Which dim it lands
+        # on is pinned host-side by TestDenseRelocationServesRead in
+        # tests/tensor/test_coordinates.py -- all this can see is the right value.
+        # main compiles all of them; an earlier version of this branch failed the
+        # first three with UnalignedStickSplit.
         cases = {
             "(1,32,20,20) reduce 32": ((1, 32, 20, 20), (1, 32, 400)),
             "(1,64,20,20) reduce 64": ((1, 64, 20, 20), (1, 64, 400)),
             "(2,8,20,20) reduce 8": ((2, 8, 20, 20), (2, 8, 400)),
+            "(8,32,20,20) reduce 32, dim 0 free": ((8, 32, 20, 20), (8, 32, 400)),
+            "(4,100,3,7) reduce 100, dim 0 free": ((4, 100, 3, 7), (4, 100, 21)),
         }
         for name, (shape, view) in cases.items():
             with self.subTest(name):

@@ -1842,23 +1842,28 @@ def get_matmul_m_size(op: "Operation") -> int:
     return 1
 
 
-def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the single input iteration symbol reduced from the output.
+def reduced_loop_vars(
+    inputs: Sequence[MemoryDep], out_dep: MemoryDep
+) -> set[sympy.Symbol]:
+    """The input iteration symbols reduced from the output.
 
     Symbols must have a range on the input dependency that uses them. Indirect
     gather/scatter address symbols are not iteration dimensions.
     """
-    reduction_vars = {
+    return {
         sym
         for inp in inputs
         for sym in inp.index.free_symbols
         if sym in inp.ranges and not is_indirect(sym.name)
     } - out_dep.index.free_symbols
-    if len(reduction_vars) != 1:
-        raise Unsupported(
-            f"expected exactly 1 reduction variable, got {reduction_vars}"
-        )
-    return next(iter(reduction_vars))
+
+
+def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
+    """Return the single input iteration symbol reduced from the output."""
+    reduced = reduced_loop_vars(inputs, out_dep)
+    if len(reduced) != 1:
+        raise Unsupported(f"expected exactly 1 reduction variable, got {reduced}")
+    return next(iter(reduced))
 
 
 def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) -> set:
@@ -3303,19 +3308,31 @@ def restickify_dense_stl_to_sparse(
     return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
 
 
-def _non_stick_reduction_var(
-    op: "Operation | None", in_dep: MemoryDep, out_dep: MemoryDep
-) -> "sympy.Symbol | None":
-    """The reduced loop variable, when ``op`` is a reduction that cannot reduce
-    along the stick dim (``REDUCTIONS_NON_STICK_DIM_ONLY``, backend #4409).
+def reduction_type_of(op: "Operation | None") -> "str | None":
+    """``op``'s reduction type, or ``None`` when it is not a reduction."""
+    data = getattr(op, "data", None)
+    return data.reduction_type if isinstance(data, Reduction) else None
 
-    The reduced variable is the one the read indexes with and the write does not.
+
+def non_stick_reduction_vars(
+    reduction_type: "str | None", in_dep: MemoryDep, out_dep: MemoryDep
+) -> "set[sympy.Symbol] | None":
+    """The reduced loop variables, when the reduction cannot reduce along the
+    stick dim (``REDUCTIONS_NON_STICK_DIM_ONLY``, backend #4409); else ``None``.
+
+    The one source of truth for both places that pick a relocation target --
+    ``compute_restickify_needed`` and ``_reduction_layout_from_stl``. They pick
+    independently, and a disagreement between them is exactly the bug this
+    guards: one declining to preserve the layout while the other restickified
+    the input onto the reduced dim is what raised ``UnalignedStickSplit``.
+
+    Every reduced variable is forbidden, not an arbitrary one of them. Only
+    ``prod`` is in the set today and it reduces a single dim, so the two are the
+    same today; picking one would stop guarding the moment that is not true.
     """
-    if op is None or not isinstance(getattr(op, "data", None), Reduction):
+    if reduction_type not in REDUCTIONS_NON_STICK_DIM_ONLY:
         return None
-    if op.data.reduction_type not in REDUCTIONS_NON_STICK_DIM_ONLY:
-        return None
-    return next(iter(in_dep.index.free_symbols - out_dep.index.free_symbols), None)
+    return reduced_loop_vars((in_dep,), out_dep)
 
 
 def dense_relocation_serves_read(
@@ -3325,15 +3342,16 @@ def dense_relocation_serves_read(
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     *,
     op: "Operation | None" = None,
-    forbidden_stick_sym: "sympy.Symbol | None" = None,
+    forbidden_stick_syms: "set[sympy.Symbol] | None" = None,
 ) -> "SpyreTensorLayout | None":
     """A dense layout of ``in_host`` with the stick moved to another real dim, when
     it can serve the read of ``dep`` that ``stl`` cannot, else ``None``.
 
-    ``forbidden_stick_sym`` is a loop variable that must not land on the stick: a
+    ``forbidden_stick_syms`` are loop variables that must not land on the stick: a
     ``prod`` cannot reduce along the stick dim (backend #4409), and the widest dim
     a reshape leaves alone is often the reduced one. A candidate whose stick would
-    carry it is skipped and the next one tried.
+    carry one of them is skipped and the next one tried
+    (``non_stick_reduction_vars`` builds the set).
 
     A reshape that cuts the stick dim (``[4, 512, 20, 20]`` read as
     ``[4, 4, 128, 400]``) is legal once a dim the reshape leaves alone carries the
@@ -3390,10 +3408,7 @@ def dense_relocation_serves_read(
         coords = try_device_coordinates(target, dep, indirect_sizes, op=op)
         if coords is None:
             continue
-        if (
-            forbidden_stick_sym is not None
-            and forbidden_stick_sym in coords[-1].free_symbols
-        ):
+        if forbidden_stick_syms and forbidden_stick_syms & coords[-1].free_symbols:
             continue
         return target
     return None
@@ -3510,7 +3525,9 @@ def compute_restickify_needed(
             in_dep,
             ind_sizes,
             op=op,
-            forbidden_stick_sym=_non_stick_reduction_var(op, in_dep, out_dep),
+            forbidden_stick_syms=non_stick_reduction_vars(
+                reduction_type_of(op), in_dep, out_dep
+            ),
         )
         if dense is not None:
             # Both layout rules carry on to _candidate_output_stls after a
