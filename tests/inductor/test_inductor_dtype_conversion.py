@@ -669,12 +669,13 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    # TODO: the mixed-EA gate no longer rejects this; once fp32 restickify lands the
-    # test must become a positive one.
-    @_rejected("requires whole stick pairs", "#5361")
+    # The transposed (4, 64) fp32 result has a stick dim of 4, narrower than one
+    # 64-element stick pair, so the DL16_TO_FP32 layout is rejected ("requires
+    # whole stick pairs").
+    @_rejected("requires whole stick pairs", None)
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
-        """non-contiguous fp16 + fp32: the transposed fp32 output needs an fp32
-        restickify, which is not supported."""
+        """non-contiguous fp16 + fp32: the transposed fp32 output has a stick dim
+        (4) narrower than a whole stick pair so this is rejected."""
         x = cached_randn((64, 4), differentiation="ncim02_fp16")
         y = cached_randn((64, 4), dtype=torch.float32, differentiation="ncim02_fp32")
 
