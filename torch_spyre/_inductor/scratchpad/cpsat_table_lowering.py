@@ -358,9 +358,11 @@ class TableLowering(Printer):
     def _operation(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> TableRealization:
-        """expr as one table: its value on UnitIndex when it has no free symbol, and
-        otherwise one table over its inputs, their positions combined in the order of
-        its symbols, the last fastest.
+        """expr as one table over its inputs, their positions combined in the order of
+        its symbols, the last fastest. A number, true or false is its value on
+        UnitIndex. An operation on numbers is one entry on UnitIndex, computed as any
+        other operation: sqrt(a) and sqrt(19) are then equal at a = 19, where sympy's
+        float(sqrt(19)) is the double below numpy's.
 
         A table past the cap is refused before anything under expr is printed, so it
         is never evaluated. Then the operands are printed, each refusing a value of its
@@ -368,12 +370,13 @@ class TableLowering(Printer):
         tables, each read at expr's entries (Index.on_grid). A condition is read as
         one, and a Mul reads the base of a factor it divides by in the factor's
         place."""
-        if not expr.free_symbols:
+        if not operands:
             value = TableRealization(values=[_constant(expr)], index=UNIT)
             return self._finite(expr, value)
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
         columns = [self.print(symbol).table(self.cap) for symbol in symbols]
-        positions = list(dict.fromkeys(column.index for column in columns))
+        # an operation on numbers has no input: its one entry is on UNIT
+        positions = list(dict.fromkeys(column.index for column in columns)) or [UNIT]
         entries = math.prod(position.size for position in positions)
         if entries > self.cap:
             raise TableLoweringError(
@@ -393,7 +396,10 @@ class TableLowering(Printer):
             form: Form = CONDITION if _is_condition(operand) else None
             if _divides(expr, operand):
                 table, form = self.print(operand.base).table(self.cap), operand.exp  # type: ignore[attr-defined]
-            if table.index == index:
+            # A constant operand is a broadcast of its one entry, under an operation on
+            # numbers too: numpy computes x**0.5 as sqrt(x) for a broadcast exponent
+            # only, and both sides of a tie must take one path.
+            if table.index == index and index != UNIT:
                 arguments.append(table.values)
             else:
                 at = table.index.on_grid(grid)
@@ -414,6 +420,7 @@ class TableLowering(Printer):
 
 
 def _constant(expr: sympy.Basic) -> float:
+    """The value of a node with no operand: a number, true or false."""
     if expr is sympy.true or expr is sympy.false:
         return float(bool(expr))
     try:

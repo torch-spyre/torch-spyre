@@ -830,6 +830,27 @@ def test_a_constant_is_read_as_the_double_it_is():
     assert list(root.table(CAP).values) == [1.0, 2.0, 4.0, 5.0, 6.0]
 
 
+def test_an_operation_on_numbers_is_computed_as_any_other_operation():
+    """Only a number itself is read as its double: an operation on numbers is its
+    node's function on its operands' entries, as numpy computes it over a symbol, so
+    the two sides of a tie are computed alike. sympy's float(3*sqrt(2)) is the double
+    below numpy's 3 * sqrt(2), which makes this ceiling one high at a = 3, and its
+    float(sqrt(19)) the double below numpy's sqrt(19), which makes sqrt(a) greater
+    than sqrt(19) at a = 19."""
+    root2, root19 = sympy.sqrt(2), sympy.sqrt(19)
+    assert math.ceil(2**0.5 * 3 - 4.242640687119285) == 1  # the double at 3*sqrt(2)
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 3.0])
+    a = case.symbol("a")
+    root = case.assert_exact(sympy.ceiling(root2 * a - 3 * root2))
+    assert list(root.table(CAP).values) == [-2.0, -1.0, 0.0]
+    case = Case()
+    case.add_input("a", a=[18.0, 19.0, 20.0])
+    a = case.symbol("a")
+    root = case.assert_exact(sympy.Piecewise((1, sympy.sqrt(a) > root19), (0, True)))
+    assert list(root.table(CAP).values) == [0.0, 0.0, 1.0]
+
+
 def test_a_quotient_is_divided_as_lambdify_prints_it():
     """x/y is Mul(x, Pow(y, -1)), and from the lists of its children it would be
     x*(1/y): 98*(1/49) is 1.9999999999999998, whose floor is 1. The Mul divides by
