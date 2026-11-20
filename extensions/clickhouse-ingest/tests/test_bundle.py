@@ -1112,3 +1112,19 @@ def test_the_sidecar_names_are_one_definition():
     from spyre_clickhouse_ingest import benchmeta
 
     assert benchmeta.is_sidecar is offline.is_sidecar
+
+
+def test_a_tar_bundle_with_a_symlinked_sidecar_is_refused(tmp_path):
+    import tarfile
+
+    from spyre_clickhouse_ingest import offline
+
+    tgz = tmp_path / "evil.tgz"
+    with tarfile.open(tgz, "w:gz") as tar:
+        link = tarfile.TarInfo("results/env.json")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/hostname"
+        tar.addfile(link)
+    with pytest.raises(offline.BundleError, match="unsafe member"):
+        with offline.opened(tgz):
+            pass

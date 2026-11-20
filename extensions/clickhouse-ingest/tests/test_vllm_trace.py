@@ -646,3 +646,12 @@ def test_case_variant_kernel_keys_never_merge_two_kernels():
     facts = _stored_facts(vllm_trace.entries(ctx))
     _encodes(facts)
     assert len(facts) == len(vllm_trace.entries(fleet_ctx()))
+
+
+@pytest.mark.parametrize("name", ["trace", "run", "Results"])
+def test_a_generic_run_dir_name_needs_an_explicit_label(tmp_path, name):
+    run = tmp_path / name
+    shutil.copytree(FLEET / "out" / "w1", run)
+    with pytest.raises(vllm_trace.TraceError, match="--label"):
+        vllm_trace.load(run, FLEET / "rep")
+    assert vllm_trace.load(run, FLEET / "rep", "w1")["label"] == "w1"

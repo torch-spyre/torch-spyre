@@ -164,3 +164,24 @@ def test_a_vllm_series_is_still_gated(db):
     _land(db, ctx, "w1")
     kinds = db.rows("SELECT DISTINCT metric FROM v_benchmark_metric_verdicts")
     assert [r["metric"] for r in kinds] == ["mean_ttft_ms"]
+
+
+def test_run_context_reads_back_through_v_bench_attrs(db):
+    from spyre_clickhouse_ingest.apply_schema import SchemaApplier as A
+
+    for name in ("84-bench-views.sql",):
+        for stmt in A.statements((SCHEMA_DIR / name).read_text()):
+            if "REFRESH" not in stmt.upper().split("AS", 1)[0]:
+                db.run(stmt)
+    ctx = fleet_ctx()
+    ctx.update(profile_level="full", run_utc="2026-11-03 00:05:45")
+    ctx["env"] = {**ctx["env"], "host": "n1"}
+    rid = str(uuid.uuid5(uuid.NAMESPACE_URL, "attrs"))
+    insert_benchmarks(db, "", vllm_trace.COMPONENT, rid,
+                      vllm_trace.entries(ctx, "https://x/b.tgz"),
+                      report_kind=vllm_trace.REPORT_KIND)  # fmt: skip
+    got = db.rows(f"SELECT attrs FROM v_bench_attrs WHERE run_id = '{rid}' LIMIT 1")
+    attrs = got[0]["attrs"]
+    for k in ("run.started_at", "run.trace_uri", "run.node", "run.profile_level"):
+        assert attrs.get(k), k
+    assert attrs["run.trace_uri"] == "https://x/b.tgz"

@@ -217,3 +217,57 @@ def test_a_deeply_nested_sidecar_is_skipped_with_a_warning(tmp_path, caplog):
     (tmp_path / "compile_summary.json").write_text(json.dumps({"total_s": 9.0}))
     assert _run_props(tmp_path)["run.compile.total_s"] == "9.0"
     assert "skipped" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_numbers_are_never_stored(tmp_path, raw):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(
+        '{"mem_total_b": %s, "knobs": {"X": %s}, "host": "n1"}' % (raw, raw)
+    )
+    (tmp_path / "compile_summary.json").write_text('{"total_s": %s}' % raw)
+    (tmp_path / "host_resources.json").write_text('{"load": {"cpu_s": %s}}' % raw)
+    p = _run_props(tmp_path)
+    assert p["run.node"] == "n1"
+    assert not {"run.host.mem_total_b", "run.env.X", "run.compile.total_s"} & set(p)
+    assert "run.res.load.cpu_s" not in p
+
+
+def test_long_keys_and_values_are_skipped_and_empty_knob_names_ignored(tmp_path):
+    _bench(tmp_path)
+    knobs = {"": "a", "-": "b", "K" * 200: "c", "LONG": "v" * 513, "OK": "v" * 512}
+    (tmp_path / "env.json").write_text(json.dumps({"knobs": knobs}))
+    got = {k: v for k, v in _run_props(tmp_path).items() if k.startswith("run.env.")}
+    assert set(got) == {"run.env._", "run.env.OK"}
+
+
+def test_knobs_are_capped(tmp_path):
+    _bench(tmp_path)
+    knobs = {f"K{i:03d}": i for i in range(benchmeta._MAX_KNOBS + 25)}
+    (tmp_path / "env.json").write_text(json.dumps({"knobs": knobs}))
+    got = [k for k in _run_props(tmp_path) if k.startswith("run.env.")]
+    assert len(got) == benchmeta._MAX_KNOBS and "run.env.K000" in got
+
+
+def test_a_sidecar_with_a_vllm_signature_is_not_a_native_bench_file(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "outputs.json").write_text(
+        json.dumps({"avg_latency": 9.9, "token_sha256": ["a"]})
+    )
+    (tmp_path / f"{TEST}.env.json").write_text(
+        json.dumps({"avg_latency": 9.9, "host": "n"})
+    )
+    rows = _rows(tmp_path)
+    assert {r["actual"] for r in rows if r["metric"] == "avg_latency"} == {1.5}
+    assert _run_props(tmp_path)["run.output_digest.0"] == "a"
+
+
+def test_symlinked_sidecars_leaving_the_results_dir_are_not_read(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "env.json").write_text(json.dumps({"host": "leak"}))
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "env.json").symlink_to(outside / "env.json")
+    (results / TEST).symlink_to(outside, target_is_directory=True)
+    assert benchmeta.props_for(str(results), TEST) == {}

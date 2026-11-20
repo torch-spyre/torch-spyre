@@ -33,6 +33,7 @@ only the engine's probe derives, so a sidecar cannot claim one.
 import hashlib
 import json
 import logging
+import math
 import os
 import regex as re
 from typing import Any
@@ -44,6 +45,9 @@ log = logging.getLogger(__name__)
 _MAX_KNOBS = 40
 _MAX_RES = 200
 _MAX_DIGESTS = 16
+# Over-long keys and values are skipped, not truncated, so a stored value is never a prefix of the real one.
+_MAX_KEY = 128
+_MAX_VALUE = 512
 _KEY_UNSAFE = re.compile(r"[^A-Za-z0-9_]+")
 _MALFORMED = (
     TypeError,
@@ -66,6 +70,11 @@ def _load(results_dir: str, test_name: str, kind: str) -> dict[str, Any]:
         path = os.path.join(results_dir, name)
         if not os.path.isfile(path):
             continue
+        # A symlink (file or directory) that leaves the results dir is never read.
+        root = os.path.realpath(results_dir)
+        if os.path.commonpath([root, os.path.realpath(path)]) != root:
+            log.warning("%s leaves the results dir — skipped", name)
+            return {}
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -81,12 +90,16 @@ def _put(out: dict[str, str], key: str, value: Any) -> None:
         return
     if isinstance(value, bool):
         value = int(value)
-    if str(value) != "":
+    if isinstance(value, float) and not math.isfinite(value):
+        return
+    if str(value) != "" and len(key) <= _MAX_KEY and len(str(value)) <= _MAX_VALUE:
         out[key] = str(value)
 
 
 def _num(v: Any) -> float | None:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    return float(v) if math.isfinite(v) else None
 
 
 def _name(v: Any) -> str:
@@ -114,7 +127,7 @@ def _env(d: dict[str, Any], out: dict[str, str]) -> None:
     art = d.get("artifact") if isinstance(d.get("artifact"), dict) else {}
     _put(out, "subject.artifact_id12", art.get("id12") or str(art.get("id") or "")[:12])
     knobs = d.get("knobs") if isinstance(d.get("knobs"), dict) else {}
-    for k in sorted(knobs)[:_MAX_KNOBS]:
+    for k in [k for k in sorted(knobs) if _name(k)][:_MAX_KNOBS]:
         _put(out, "run.env." + _name(k), knobs[k])
 
 
@@ -140,7 +153,7 @@ def _host_resources(d: dict[str, Any], out: dict[str, str]) -> None:
             if len(out) >= _MAX_RES:
                 return
             if _num(v) is not None:
-                out[f"run.res.{_name(name)}.{_name(k)}"] = str(v)
+                _put(out, f"run.res.{_name(name)}.{_name(k)}", v)
 
 
 def _outputs(d: dict[str, Any], out: dict[str, str]) -> None:

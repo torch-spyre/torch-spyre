@@ -53,6 +53,8 @@ REPORT_KIND = "vllm-trace"
 RECORD_TYPES = ("trace_phase", "trace_step", "trace_kernel", "compile_pass")
 RT_PHASE, RT_STEP, RT_KERNEL, RT_COMPILE = RECORD_TYPES
 MAX_LABEL = 128
+# A run dir named like this says nothing, and the label keys the run: two bundles would collide.
+GENERIC_LABELS = frozenset({"trace", "run", "results", "out", "output", "data", "."})
 MAX_COUNT = 2**32 - 1  # iterations is UInt32
 MAX_F32 = 3.4e38  # artifact_results.duration_s is Float32
 BACKEND = "spyre"
@@ -295,6 +297,8 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     )
     # Harness bundles all sit in a dir named `trace`: their manifest names the run.
     label = str(label or manifest.get("label") or run.name)
+    if label.lower() in GENERIC_LABELS:
+        raise TraceError(f"label {label!r} is a generic dir name: pass --label")
     if (
         not label
         or len(label) > MAX_LABEL
