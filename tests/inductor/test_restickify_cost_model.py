@@ -485,6 +485,7 @@ def staged_transport_graph(monkeypatch):
         return local_bounds(MemoryDep(dep.name, index, dep.var_names, dep.size))
 
     monkeypatch.setattr(rce, "_affine_bounds", loop_aware_bounds)
+    original_affine_bounds = local_bounds
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
@@ -578,7 +579,27 @@ def staged_transport_graph(monkeypatch):
                 "input", 1024 * i[2] + 128 * i[0] + i[1] + 1048576 * u0
             ),
         )
+        graph.original_affine_bounds = original_affine_bounds
         yield graph, stage, consumer
+
+
+def test_a_looped_direct_read_is_declined_while_the_local_bound_ignores_the_loop_term(
+    staged_transport_graph, monkeypatch
+):
+    """Pins today's behaviour (#6509): with the production ``_affine_bounds`` the
+    direct read of a looped consumer, which carries its loop term in the index, is
+    declined, although its advance bound is right. The fixture patches the local bound
+    so the other tests can reach the pricing; fixing #6509 turns this test into the
+    positive one."""
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    graph, stage, consumer = staged_transport_graph
+    monkeypatch.setattr(rce, "_affine_bounds", graph.original_affine_bounds)
+    direct, reason = rce._prove_matmul_direct_read(
+        consumer, stage, consumer._read_copy_elision_record
+    )
+    assert direct is None
+    assert reason == "source element range is not statically provable"
 
 
 def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_graph):

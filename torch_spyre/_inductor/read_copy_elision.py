@@ -137,7 +137,10 @@ def _loop_advance_bound(
     """
     try:
         steps = read_advance(op, dep)
-    except (Unsupported, RuntimeError):
+    except Unsupported:
+        # No single step (a non-affine use of the loop variable): decline. A
+        # RuntimeError (the loop checker, or an op that lists the wrong number of
+        # loop variables) is a compiler bug and is not swallowed.
         return None
     if not any(step != 0 for step in steps):
         return None

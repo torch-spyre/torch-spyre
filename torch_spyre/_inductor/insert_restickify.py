@@ -274,7 +274,7 @@ def _moved_loop_term(
     """
     consumer_li = getattr(op, "loop_info", None)
     copy_li = getattr(restick_buff, "loop_info", None)
-    if consumer_li is None or copy_li is None or copy_li is consumer_li:
+    if consumer_li is None or copy_li is None:
         return None
     if not n_levels or shared_loop_depth == 0:
         return None

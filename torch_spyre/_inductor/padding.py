@@ -574,6 +574,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                 if isinstance(new_op, ComputedBuffer):
                     # The padding op re-runs identical work every trip and reads y
                     # at a fixed address, so its index has no loop term.
+                    # TODO(#5863 8.3): like the restickify copy of #6277, this
+                    # loop-invariant copy inherits the matmul's loop_tiled_dims, which
+                    # are indexed against the matmul's dims, not the copy's; clear them
+                    # (or place the copy before the node) when padding is node-aware.
                     new_op.loop_info = dataclasses.replace(op.loop_info)  # type: ignore[attr-defined]
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
