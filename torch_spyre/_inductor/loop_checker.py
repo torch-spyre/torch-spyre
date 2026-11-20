@@ -172,7 +172,7 @@ def _index_symbols(op: ir.Operation) -> set[sympy.Symbol]:
 
 def _node_key(node: LoopNode, depth: int) -> tuple[int, ...] | None:
     """The group path prefix of ``node``'s members at ``depth``, from its first
-    member that has one (the same rule as ``loop_node._node_key``)."""
+    member that has one (the rule ``collapse`` uses)."""
     for leaf in all_ops(node.body):
         path = counted_loop_path(leaf)
         if len(path) > depth:
@@ -238,37 +238,33 @@ def _membership_problems(
             )
 
 
-def _interior_non_members(
-    entries: list[ir.Operation], depth: int, problems: list[str]
-) -> None:
-    """Rule 5: an op that is not a member of its node, between two members.
+def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -> None:
+    """Rule 5: an op in a node's body that is not a member of its loop.
 
-    Head and tail non-members are allowed here: an allocator that inserts "before
-    the loop" through the flat view puts the op in the body, and
-    ``peel_non_members`` moves it out at the hand-off. An ``ExternKernel`` is
-    allowed anywhere (a once-op stays in the body until the scheduler hoists it).
+    The scheduler runs a node's whole body every trip, so such an op would run
+    every trip although it carries no loop. It is reported wherever it sits in the
+    body. (Before stage 8.5 an op at the head or tail was allowed, because the
+    flat view put an op inserted "before the loop" there and ``peel_non_members``
+    moved it out at the hand-off; every edit now names its position, and that
+    repair is gone.) An ``ExternKernel`` is allowed anywhere: a once-op stays in
+    the body until the scheduler hoists it.
     """
     for entry in entries:
         if not isinstance(entry, LoopNode):
             continue
         key = _node_key(entry, depth)
         if key is not None:
-            member = [
-                isinstance(op, LoopNode)
-                or bool(counted_loop_path(op))
-                or isinstance(op, ir.ExternKernel)
-                for op in entry.body
-            ]
-            real = [i for i, m in enumerate(member) if m]
-            if real:
-                for i in range(real[0], real[-1] + 1):
-                    if not member[i]:
-                        problems.append(
-                            f"{entry.body[i].get_name()} is in the body of "
-                            f"{entry.get_name()} between two of its members "
-                            "but is not a member of the loop"
-                        )
-        _interior_non_members(entry.body, depth + 1, problems)
+            for op in entry.body:
+                if not (
+                    isinstance(op, LoopNode)
+                    or bool(counted_loop_path(op))
+                    or isinstance(op, ir.ExternKernel)
+                ):
+                    problems.append(
+                        f"{op.get_name()} is in the body of {entry.get_name()} "
+                        "but is not a member of the loop"
+                    )
+        _non_members(entry.body, depth + 1, problems)
 
 
 def find_violations(operations: list[ir.Operation]) -> list[str]:
@@ -308,7 +304,7 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
 
     carries(operations)
     _membership_problems(operations, 0, (), problems, _covered_keys(operations))
-    _interior_non_members(operations, 0, problems)
+    _non_members(operations, 0, problems)
     return problems
 
 

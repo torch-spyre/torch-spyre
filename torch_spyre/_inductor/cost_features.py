@@ -282,7 +282,7 @@ def _loop_features(op):
 def _tiled_symbols_per_level(op):
     """Per NESTING LEVEL, the set of loop symbols that level tiles.
 
-    ``CoarseTileInfo`` stores the tiled dims as HOST-RANGE indices, one list per level
+    ``LoopInfo`` stores the tiled dims as HOST-RANGE indices, one list per level
     (``loop_tiled_dims`` for output dims, ``loop_tiled_reduction_dims`` for reduction
     dims), while the index expressions are written in iteration-space symbols. The
     iteration space SKIPS unit-size ranges, so a host index must be mapped through the
@@ -363,7 +363,7 @@ def _dep_index(dep):
 def _level_loop_vars(op, levels) -> list:
     """The ``for_each_tile`` loop variable of each level of ``levels``, or ``None``.
 
-    The ``for_each_tile`` lowering stamps one ``CoarseTileInfo`` level per nesting
+    The ``for_each_tile`` lowering stamps one ``LoopInfo`` level per nesting
     level, outermost first, and appends one ``DimHint(loop_var, loop_var_range=trip)``
     per level in the same order, so the i-th hint carrying a ``loop_var_range`` (read
     through ``loop_var_ranges_from_dim_hints``) is the loop variable of level i.  Each

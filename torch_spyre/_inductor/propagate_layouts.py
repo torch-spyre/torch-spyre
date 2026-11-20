@@ -794,6 +794,24 @@ def _qfp8wt_stl(
     )
 
 
+def _with_input_ea(
+    out_stl: SpyreTensorLayout, output_dep: MemoryDep, ea: ElementArrangement
+) -> SpyreTensorLayout:
+    """``out_stl`` tagged with the staggered ``ea`` when its stick has an order.
+
+    An output stick with no host dim (a broadcast stick), or only size-1 ones,
+    holds a lone element that no arrangement moves, and the D2H restore has no
+    stick dim to identify ("Unable to determine the stick dimension"), so it stays
+    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as
+    ``_typecast_layouts`` does.
+    """
+    coords = try_device_coordinates(out_stl, output_dep, None)
+    stick_vars = coords[-1].free_symbols if coords else ()
+    if any(concretize_expr(output_dep.ranges[v]) > 1 for v in stick_vars):
+        return out_stl.with_element_arrangement(ea)
+    return out_stl
+
+
 def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
@@ -866,6 +884,19 @@ def _reduction_layout_from_stl(
             ]
             if out_stl is not None
         ]
+        # Reducing a non-stick dim keeps each stick's element order, so a
+        # staggered EA on the input still describes the output. When the
+        # reduction consumes the stick dim the stagger is gone and the output
+        # stays STANDARD. See #5553.
+        if (
+            stl.element_arrangement in STAGGERED_EAS
+            and reduction_var is not None
+            and reduction_var not in x_stick_expr.free_symbols
+        ):
+            output_stls = [
+                _with_input_ea(out_stl, output_dep, stl.element_arrangement)
+                for out_stl in output_stls
+            ]
         if output_stls:
             return output_stls
 

@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A model-level record: config_name comes from a scalar case value, and the ingest name differs from the Benchmark name.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-softmax}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: ingest-demo-fp16
+  workload: {type: kernel/op, op: softmax, dtype: fp16, shape: [1, 512, 4096], load: {executor: iterations, iterations: 100, warmup_iterations: 3}}
+  run: {repeats: 1, timeout: 30m, est: 2m, isolation: process}
+  identity:
+    mode: ingest
+    name: softmax
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: config_name, from: case.dtype}
+      - {key: input_shapes, from: case.shape, join: "_"}
+      - {key: run_mode, value: inference}
+      - {key: kernel_name, value: ""}
+      - {key: is_total, value: ""}
+  variants:
+    - name: op_softmax_fp16
