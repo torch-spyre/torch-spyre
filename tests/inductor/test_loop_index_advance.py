@@ -404,10 +404,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    transferred = SimpleNamespace(
-        tiled_dims_per_read=[[[]]], squeezed_advance_per_read=[[[(16384, 1)]]]
-    )
-    copy = SimpleNamespace(loop_info=transferred)
+    copy = SimpleNamespace(loop_info=SimpleNamespace())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

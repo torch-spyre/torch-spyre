@@ -410,66 +410,11 @@ def test_a_write_takes_the_first_write_and_counts_no_read():
     assert seen == [(False, 0), (True, 1)]
 
 
-def _stored(tiled=(), squeezed=(), out_tiled=(), out_squeezed=()):
-    return CoarseTileInfo(
-        loop_group_id=(3,),
-        loop_count=[sympy.Integer(8)],
-        loop_tiled_dims=[[]],
-        loop_tiled_reduction_dims=[[]],
-        tiled_dims_per_read=[list(tiled)],
-        squeezed_advance_per_read=[list(squeezed)],
-        output_tiled_dims=list(out_tiled),
-        squeezed_advance_output=list(out_squeezed),
-    )
-
-
-@pytest.mark.parametrize(
-    "stored, index_advance, fails",
-    [
-        ([(0, 64)], 512 * u0, False),  # both say advance
-        ([], sympy.S.Zero, False),  # both say pinned
-        ([(0, 64)], sympy.S.Zero, True),  # record advances, index pinned
-        ([], 512 * u0, True),  # index advances, record pinned
-        ([(0, 64)], None, True),  # op lists no loop variable, record advances
-    ],
-    ids=["agree_advance", "agree_pinned", "record_only", "index_only", "no_variable"],
-)
-def test_the_temporary_check_compares_the_stored_record_with_the_index(
-    stored, index_advance, fails
-):
-    """Stage 7.4 part A keeps the lists written and compares them with the index on
-    every access, so the hardware CI suite is the evidence that reading the index
-    changes nothing. Part B deletes the check with the lists."""
-    kernel = _kernel_for(_stored(tiled=[stored]), reads=[_dep("arg0_1", 512 * u0)])
-    kernel._index_tile_advance = lambda tensor, is_input, name: (
-        None if index_advance is None else (index_advance, None)
-    )
-    with _patched_v():
-        if fails:
-            with pytest.raises(RuntimeError, match="stage 7.4 check"):
-                kernel._tile_advance(None, True, "arg0_1")
-        else:
-            kernel._tile_advance(None, True, "arg0_1")
-
-
-def test_an_op_in_no_loop_has_no_advance():
-    kernel = _kernel_for(None, reads=[_dep("arg0_1", 512 * u0)])
-    with _patched_v():
-        assert kernel._tile_advance(None, True, "arg0_1") is None
-
-
-@pytest.mark.parametrize(
-    "consumer_is_shim, copy_is_shim",
-    [(True, False), (False, True), (True, True)],
-    ids=["shim_consumer", "shim_copy", "both_shim"],
-)
-def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
-    consumer_is_shim, copy_is_shim
-):
-    """Decided: it does not migrate; an op without a complete loop-address record
-    keeps its copy, and says so, not crashes. It tests the consumer and the copy
-    separately and returns the same reason for both, so each combination is run:
-    a test with both shim could not tell which check declined."""
+def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
+    """Decided: it does not migrate; only a ``for_each_tile`` consumer (a
+    ``CoarseTileInfo``) has a saved direct form, so a shim consumer keeps its copy,
+    and says so, not crashes."""
+    consumer_is_shim, copy_is_shim = True, False
     _, legacy = _equal_infos()
     other = _dep("other", d0)
     cp = _dep("cp", d0 + d1)
@@ -499,8 +444,6 @@ def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
         consumer_name="c",
         source_name="src",
         copy_name="cp",
-        direct_tiled_dims_per_level=None,
-        direct_squeezed_advance_per_level=None,
     )
     with mock.patch.object(
         read_copy_elision, "_clone_direct_consumer", lambda *a: direct
@@ -509,4 +452,4 @@ def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
             consumer, copy_op, record
         )
     assert built is None
-    assert reason == "copy has no complete loop-address record"
+    assert reason == "copy reads its source more than once, or consumer is not looped"

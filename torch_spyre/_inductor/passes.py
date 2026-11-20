@@ -643,7 +643,7 @@ class CustomPreSchedulingPasses:
             # stage's loop_info is already in place. If this pass ever
             # moved ahead of splice_while_loops' stamping, that check would
             # silently take the "not yet tiled" branch and emit an empty
-            # tiled_dims_per_read for a stage that is actually tiled -- a
+            # loop_info for a stage that is actually tiled -- a
             # wrong-answer, not a crash.
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
