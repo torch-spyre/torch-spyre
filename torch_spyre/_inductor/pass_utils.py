@@ -2998,6 +2998,11 @@ def compute_restickify_target_layout(
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
     if not candidates:
         return None
+    if len(candidates) > 1:
+        # The new stick variable spans several outer dims; rewriting one of them
+        # would count it twice. The old stick variable is refused the same way
+        # (len(old_var_outer_dims) > 1).
+        return None
     new_sd_outer_dim = candidates[0]
     # Swapping one device axis cannot preserve another host dimension folded
     # into it (for example page * block_size + token in a paged cache).
