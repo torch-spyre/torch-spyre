@@ -2906,8 +2906,8 @@ class TestSplitSize1:
                 # TODO: Convert to positive test when sub-stick split chunks are supported (#5216)
                 match = r"(?s)NotImplementedError: buf\d+ \(Pointwise\): no mechanism to resolve stick incompatibility.*No mechanism to scatter elements from one stick to multiple sticks"
             else:
-                # TODO: Convert to positive test once fixed; bare AssertionError in padding.py _pad_restickify_output (#6435)
-                match = r"^AssertionError:"
+                # TODO: Convert to positive test when sub-stick split chunks are supported (#5216)
+                match = r"NotImplementedError: buf\d+ \(Pointwise\): no mechanism to resolve stick incompatibility"
             with pytest.raises(InductorError, match=match):
                 _compare_modes(
                     execution_mode,
