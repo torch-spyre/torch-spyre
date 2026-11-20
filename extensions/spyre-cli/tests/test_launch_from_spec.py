@@ -77,6 +77,13 @@ class _FakeTensor:
         self.filled = value
         return self
 
+    def copy_(self, src):
+        # default_tensors writes its ones through a host copy; record the value
+        # it copied, the way fill_ records the value it filled with.
+        values = set(src.flatten().tolist())
+        self.filled = values.pop() if len(values) == 1 else values
+        return self
+
     def cpu(self):
         # launch_from_cli reads its outputs back before printing them; a stub
         # has nothing to transfer, so it stands in for itself.
