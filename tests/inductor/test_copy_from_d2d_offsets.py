@@ -377,5 +377,70 @@ class TestCopyFromD2DFP8QFP8WT(unittest.TestCase):
             torch.testing.assert_close(w_clone.cpu().view(torch.uint8), first)
 
 
+class TestCopyFromD2DBetweenLayouts(unittest.TestCase):
+    """Copy rows from a tensor whose sticks run along rows into the canonical
+    layout, whose sticks run along columns (issue #4883).
+
+    The copy is a restickify. Planning it locates the source stick's host dim
+    and outer device dim from the stick coordinate, which carries no variable
+    for a single row and sits at a constant chunk for rows from 64. A single row
+    used to compile to a layout that faulted the card, and rows from a stick
+    boundary failed with "no mechanism to resolve stick incompatibility"; vLLM
+    hit the single-row case copying into ``inputs_embeds``."""
+
+    @staticmethod
+    def _row_major_stick(rows, cols):
+        """A [rows, cols] tensor laid out with each stick holding 64 rows of
+        one column: dim 0 counts 64-row chunks, dim 1 columns, the stick rows.
+
+        Returns the host values and the device tensor. The values are small
+        integers, exact in the device fp16 format, so results compare exactly."""
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        stl = SpyreTensorLayout(
+            device_size=[rows // 64, cols, 64],
+            stride_map=[64 * cols, 1, cols],
+            device_dtype=get_device_dtype(DTYPE),
+            valid_elements={(0, 2): rows, (1,): cols},
+        )
+        host = ((torch.arange(rows * cols).reshape(rows, cols) % 509) + 1).to(DTYPE)
+        return host, host.to(DEVICE, device_layout=stl)
+
+    def _check(self, rows, cols, start, count):
+        host, src = self._row_major_stick(rows, cols)
+        dst = torch.full((rows, cols), -1.0, dtype=DTYPE, device=DEVICE)
+        dst[start : start + count].copy_(src[start : start + count])
+        got = dst.cpu()
+        want = torch.full((rows, cols), -1.0, dtype=DTYPE)
+        want[start : start + count] = host[start : start + count]
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_single_row_from_start(self):
+        """The issue's reproducer: ``dst[:1].copy_(src[:1])`` at 512 x 512."""
+        self._check(512, 512, 0, 1)
+
+    def test_single_row_at_stick_boundaries(self):
+        for rows, cols in [(512, 512), (256, 128), (128, 256)]:
+            for start in (0, 64, rows - 64):
+                with self.subTest(shape=(rows, cols), row=start):
+                    self._check(rows, cols, start, 1)
+
+    def test_rows_from_a_stick_boundary(self):
+        for rows, cols in [(512, 512), (128, 256)]:
+            for start, count in ((64, 2), (64, 64)):
+                with self.subTest(shape=(rows, cols), rows=(start, start + count)):
+                    self._check(rows, cols, start, count)
+
+    def test_single_row_inside_a_stick_is_rejected(self):
+        """Row 5 is lane 5 of every stick, which the restickify cannot move. It
+        must fail to compile, not reach the card with a wrong layout."""
+        from torch._inductor.exc import InductorError
+
+        _, src = self._row_major_stick(512, 512)
+        dst = torch.zeros(512, 512, dtype=DTYPE, device=DEVICE)
+        with self.assertRaisesRegex(InductorError, "stick incompatibility"):
+            dst[5:6].copy_(src[5:6])
+
+
 if __name__ == "__main__":
     unittest.main()
