@@ -2994,20 +2994,30 @@ def _ve_for_var(valid_elements: dict, idc: list, var) -> int | None:
 
 
 def restickify_device_size_new(
-    old_device_size: list,
+    stl: SpyreTensorLayout,
+    idc: list,
     old_sd_outer_dim: int,
     new_sd_outer_dim: int,
+    old_var,
+    new_var,
     stick_size: int,
-    old_var_elems: int,
-    new_var_elems: int,
 ) -> list:
-    """Computes the new device size after restickify from element counts.
+    """Computes the new device size after a restickify, from device geometry only.
 
-    ``old_var_elems`` and ``new_var_elems`` are the total element counts for
-    the old and new stick variable respectively, derived from device geometry
-    (``valid_elements`` and ``device_size``).
+    The element counts of the old and new stick variables come from
+    ``valid_elements`` (see ``_ve_for_stick_var`` and ``_ve_for_var``).  An
+    ``old_var`` of None is a constant stick and a ``new_var`` of None a size-1
+    restickify; each has one element.
     """
-    new_device_size = list(old_device_size)
+    old_var_elems = _ve_for_stick_var(stl, idc, old_var) if old_var is not None else 1
+    new_var_elems = (
+        _ve_for_var(stl.valid_elements, idc, new_var) if new_var is not None else 1
+    )
+    assert old_var_elems is not None and new_var_elems is not None, (
+        "valid_elements gives no count for a stick variable: "
+        f"ve={dict(stl.valid_elements)} idc={idc} old_var={old_var} new_var={new_var}"
+    )
+    new_device_size = list(stl.device_size)
     new_device_size[-1] = stick_size
     new_device_size[old_sd_outer_dim] = (new_var_elems + stick_size - 1) // stick_size
     new_device_size[new_sd_outer_dim] = old_var_elems
@@ -3175,24 +3185,13 @@ def compute_restickify_target_layout(
         stick_size,
     )
     # Dual-path check of restickify_device_size against valid_elements, with no
-    # host sizes.  A constant stick (old_var None) has one element.  Where the NEW
-    # count is right and the OLD path is wrong, the assert fails, so the test is
-    # skipped instead: test_single_arg_size1_after_staggered_ea (old path takes 128
-    # for a 64-element variable and reads past the buffer) and
+    # host sizes.  Where the NEW count is right and the OLD path is wrong, the
+    # assert fails, so the test is skipped instead:
+    # test_single_arg_size1_after_staggered_ea (old path takes 128 for a
+    # 64-element variable and reads past the buffer) and
     # test_compute_restickify_target_layout_factorized_new_sd (invalid fixture).
-    _old_var_elems = _ve_for_stick_var(stl, idc, old_var) if old_var is not None else 1
-    _new_var_elems = _ve_for_var(stl.valid_elements, idc, new_var)
-    assert _old_var_elems is not None and _new_var_elems is not None, (
-        "valid_elements gives no count for a stick variable: "
-        f"ve={dict(stl.valid_elements)} idc={idc} old_var={old_var} new_var={new_var}"
-    )
     _new_device_size = restickify_device_size_new(
-        old_device_size,
-        old_sd_outer_dim,
-        new_sd_outer_dim,
-        stick_size,
-        _old_var_elems,
-        _new_var_elems,
+        stl, idc, old_sd_outer_dim, new_sd_outer_dim, old_var, new_var, stick_size
     )
     assert list(device_size) == _new_device_size, (
         f"restickify_device_size mismatch: old={list(device_size)} "
@@ -3200,7 +3199,6 @@ def compute_restickify_target_layout(
         f"old_device_size={old_device_size} old_sd={old_sd_outer_dim} "
         f"new_sd={new_sd_outer_dim} "
         f"old_sd_host_size={old_sd_host_size} new_sd_host_size={new_sd_host_size} "
-        f"_old_var_elems={_old_var_elems} _new_var_elems={_new_var_elems} "
         f"stick_size={stick_size} stride_map={old_stride_map} "
         f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
         f"old_var={old_var} new_var={new_var}"
@@ -3301,18 +3299,8 @@ def compute_size1_restickify_layout(
     # test_4d_attention_layout[1x4x32x128] (temporarily skipped, fp8 is broken)
     # fails here: rescale_stl_for_dtype grows the batch dim instead of the head
     # dim's, so valid_elements records 64 head-dim elements where there are 128.
-    _old_var_elems_s1 = _ve_for_stick_var(stl, idc, old_var)
-    assert _old_var_elems_s1 is not None, (
-        "valid_elements gives no count for the stick variable: "
-        f"ve={dict(stl.valid_elements)} idc={idc} old_var={old_var}"
-    )
     _new_device_size_s1 = restickify_device_size_new(
-        list(stl.device_size),
-        old_sd_outer_dim,
-        new_sd_outer_dim,
-        stick_size,
-        _old_var_elems_s1,
-        1,
+        stl, idc, old_sd_outer_dim, new_sd_outer_dim, old_var, None, stick_size
     )
     assert list(device_size) == _new_device_size_s1, (
         f"restickify_device_size mismatch (size1): old={list(device_size)} "
@@ -3320,7 +3308,6 @@ def compute_size1_restickify_layout(
         f"old_device_size={list(stl.device_size)} old_sd={old_sd_outer_dim} "
         f"new_sd={new_sd_outer_dim} "
         f"old_sd_host_size={old_sd_host_size} "
-        f"_old_var_elems={_old_var_elems_s1} "
         f"stick_size={stick_size} stride_map={list(stl.stride_map)} "
         f"ve={dict(stl.valid_elements)} idc={[str(e) for e in idc]} "
         f"old_var={old_var}"
