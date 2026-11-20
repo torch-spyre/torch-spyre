@@ -35,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import CeilDiv, FloorDiv, Mod
 from torch._inductor.virtualized import V
 
 
@@ -1330,6 +1330,26 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if name in self.args.output_buffers:
                     self.args.output_buffers[name] = REMOVED
 
+    @staticmethod
+    def _fold_exact_divisions(expr: sympy.Expr) -> sympy.Expr:
+        """``expr`` with each ``x // d`` the ShapeEnv proves exact made a division.
+
+        A ``for_each_tile`` output's extent is ``G * (n // G)``, the tile count
+        times the tile. The loop guards ``n % G == 0``, so that is ``n``, but
+        neither inductor's ``sizevars.simplify`` nor ``ShapeEnv.simplify`` uses
+        the divisibility to cancel it, and the launch spec would record an
+        expression a launcher has no binding for. Replacing ``FloorDiv(x, d)``
+        by ``x / d`` where ``Mod(x, d) == 0`` is provable is exact, and sympy
+        then cancels the product to ``n``.
+        """
+        sizevars = V.graph.sizevars
+        exact = {
+            fd: fd.args[0] / fd.args[1]
+            for fd in expr.atoms(FloorDiv)
+            if sizevars.statically_known_equals(Mod(fd.args[0], fd.args[1]), 0)
+        }
+        return expr.xreplace(exact) if exact else expr
+
     def _record_launch_spec_arg(self, name: str, tensor_arg) -> None:
         """Record one argument's HOST shape and dtype for the launch spec.
 
@@ -1356,8 +1376,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     shape.append(int(dim))
                 else:
                     # A free symbol (mark_dynamic/dynamic=True): name it and let
-                    # the launcher bind it, rather than baking in a hint.
-                    shape.append(str(dim))
+                    # the launcher bind it, rather than baking in a hint. A dim
+                    # that is still an expression after folding is recorded as
+                    # written, and the reader refuses it rather than guess.
+                    shape.append(str(self._fold_exact_divisions(dim)))
 
             record = LaunchArg(
                 arg_index=tensor_arg.arg_index,
