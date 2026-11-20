@@ -159,7 +159,7 @@ def _parse_env_vars() -> Dict[str, LogLevel]:
 
     if os.environ.get("TORCH_SPYRE_DEBUG") == "1":
         warnings.warn(
-            "TORCH_SPYRE_DEBUG is deprecated. Use TORCH_LOGS='spyre:DEBUG' instead.",
+            "TORCH_SPYRE_DEBUG is deprecated. Use TORCH_LOGS='+torch_spyre' instead.",
             DeprecationWarning,
             stacklevel=3,
         )

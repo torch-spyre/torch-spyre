@@ -418,18 +418,8 @@ def enable_spyre_context(
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
-    # coarse_tile.py's nested output-dim + reduction-dim tiling
-    # (lower_loop_tiling) inserts a copy-out op
-    # (_lower_reduction) that mutates a pre-loop accumulation buffer
-    # (accum_full) so its updated value is visible to the NEXT outer-tile
-    # iteration's copy-in. That cross-iteration read has no representation in
-    # the single-pass, pre-unroll IR the scheduler's own dead_node_elimination
-    # walks, so a copy-out with no other downstream reader looks dead and is
-    # removed — even though it is required for correctness. Mark such ops
-    # with _coarse_tile_force_live (see _lower_reduction) and force
-    # SchedulerNode.has_side_effects() to report True for them, mirroring how
-    # upstream itself protects effectful FallbackKernels from the same DCE
-    # pass (torch/_inductor/lowering.py, effectful op handling).
+    # The loop-tiling fill (_insert_fill) is read only by the next trip, which the
+    # pre-unroll IR does not show; _coarse_tile_force_live keeps DCE from dropping it.
     old_scheduler_node_has_side_effects = SchedulerNode.has_side_effects
 
     def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
