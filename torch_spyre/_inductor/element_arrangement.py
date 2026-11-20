@@ -216,12 +216,11 @@ def validate_ops(graph: GraphLowering) -> None:
 
     This pass needs to be run after propagate_spyre_tensor_layouts so that it
     has all the required SpyreTensorLayouts. It only reads the graph. A mixed
-    STANDARD/staggered pointwise or reduction op is accepted here;
-    ``insert_ea_shuffle`` later shuffles the operands that broadcast cannot
-    reconcile.
+    STANDARD/staggered pointwise op is accepted here; ``insert_ea_shuffle``
+    later shuffles the operands that broadcast cannot reconcile.
     """
     for op in graph.operations:
-        if not isinstance(getattr(op, "data", None), (Pointwise, Reduction)):
+        if not isinstance(getattr(op, "data", None), Pointwise):
             continue
 
         inputs = _memory_reads(op)
