@@ -113,6 +113,9 @@ SHAPE_PREFIXES = (
 )  # fmt: skip
 # The host resource sampler's file: records of {test_name, metric, value[, model]}.
 HOST_RESOURCES_SUFFIX = ".host_resources.json"
+# Run-context files beside a vLLM bench's results; benchmeta reads them into run props.
+SIDECAR_KINDS = ("env", "phases", "host_resources", "outputs", "compile_summary")
+SIDECAR_FILES = frozenset(f"{k}.json" for k in SIDECAR_KINDS)
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
 VLLM_SIGNATURES = (
     "avg_latency", "requests_per_second", "tokens_per_second", "request_throughput",
@@ -424,11 +427,20 @@ def shapes(name: str) -> dict:
     return out
 
 
+def is_sidecar(filename: str) -> bool:
+    """A `<kind>.json` or `<test_name>.<kind>.json` file; not a benchmark record file."""
+    return filename in SIDECAR_FILES or any(
+        filename.endswith(f".{k}.json") and k != "host_resources" for k in SIDECAR_KINDS
+    )
+
+
 def check_vllm(root: Path, meta: dict, results: list) -> None:
     """Each results/*.json is a vLLM bench result named as the runner names it, consistent
     with `perf`. The ingest re-reads them through the live leg's extraction."""
     perf = meta.get("perf", {})
     for p in results:
+        if is_sidecar(Path(p).name):
+            continue
         host = Path(p).name.endswith(HOST_RESOURCES_SUFFIX)
         name = (
             Path(p)
