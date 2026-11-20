@@ -1805,6 +1805,15 @@ class TestSpyre(TestCase):
                 ([4, 64, 8192], (Ellipsis, slice(128, 8064)), lambda b: b(4, 64, 7936)),
                 name="packed_cols_rank3",
             ),
+            # Rank-3 host rows with gaps (stride 10240) into a column slice.
+            subtest(
+                (
+                    [4, 64, 8192],
+                    (Ellipsis, slice(128, 4224)),
+                    lambda b: b(4, 64, 10240)[..., :4096],
+                ),
+                name="gapped_cols_rank3",
+            ),
             # Size-1 host dim whose stride differs from the row stride.
             subtest(
                 (
