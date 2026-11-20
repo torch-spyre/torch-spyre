@@ -107,7 +107,6 @@ from .loop_node import (
     build_pending_loop_nodes,
     expand,
     has_loop_nodes,
-    peel_non_members,
     request_loop_nodes,
 )
 from . import loop_scheduler
@@ -519,9 +518,6 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
         raise loop_scheduler.refuse_release()
-    # A pass may have put an op that belongs before (or after) a loop at the
-    # edge of its body; the scheduler runs a node's whole body every trip.
-    peel_non_members(graph)
 
 
 class CustomPreSchedulingPasses:

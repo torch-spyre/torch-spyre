@@ -286,9 +286,8 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     position of the loop's first member, which through ``OpsView`` is inside
     the LoopNode's body with no ``loop_info``; the flat path rebuilt loops from
     ``loop_info`` and ran it once, before the loop, while the flow-through ran it
-    every trip, until ``peel_non_members`` at the hand-off moved it out. Stage
-    8.2 places it before the loop's node, so no hoisted clone is ever at the edge
-    of a body, and the two paths agree. The graph
+    every trip. Stage 8.2 places it before the loop's node, so no hoisted clone is
+    ever at the edge of a body, and the two paths agree. The graph
     of ``test_for_each_tile_lowering.test_one_unhinted_scan_does_not_block_the_other``
     (two sibling paged-gather scans)."""
     from for_each_tile_fixtures import (
@@ -606,6 +605,12 @@ def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     # members only: nothing to refuse, in one loop or in a nest
     _check_members(node, [member_a, member_b])
     _check_members(node, [])
+
+    # a non-member at the head or the tail is refused too (the hand-off no longer
+    # moves it out of the node)
+    for edge in ([outsider, member_a, member_b], [member_a, member_b, outsider]):
+        with pytest.raises(Exception, match="not all members of it"):
+            _check_members(node, edge)
 
     # a non-member between two members is refused, and named
     with pytest.raises(Exception, match="not all members of it") as info:

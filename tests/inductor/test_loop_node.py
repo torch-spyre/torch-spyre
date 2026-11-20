@@ -59,7 +59,6 @@ from torch_spyre._inductor.loop_node import (
     move_before,
     owning_list,
     remove_op,
-    peel_non_members,
     replace_op,
     request_loop_nodes,
     top_level_entry,
@@ -754,57 +753,6 @@ class TestTopLevelEntry(unittest.TestCase):
         real, *_ = _nested()
         with self.assertRaises(ValueError):
             top_level_entry(OpsView(real), _Op("stranger"))
-
-
-class TestPeelNonMembers(unittest.TestCase):
-    """An op without the loop's ``loop_info`` at the edge of a body leaves the node;
-    one between members stays. (No pass puts one there any more: every edit names
-    its position. This is the hand-off's repair for one that does.)"""
-
-    def _collapsed(self, ops):
-        graph = _graph(ops)
-        collapse(graph)
-        return graph
-
-    def test_leading_and_trailing_non_members_leave_the_node(self):
-        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
-        graph = self._collapsed([_Op("pre"), a, b, _Op("post")])
-        clone, drain = _Op("clone"), _Op("drain")
-        node = next(o for o in graph.operations if isinstance(o, LoopNode))
-        node.body.insert(0, clone)  # "before the loop entry", misplaced in the body
-        node.body.append(drain)  # "after the loop's last member", in the body
-        self.assertEqual(_names(node.body), ["clone", "a", "b", "drain"])
-        peel_non_members(graph)
-        self.assertEqual(_names(node.body), ["a", "b"])
-        self.assertEqual(
-            [o.get_name() for o in graph.operations],
-            ["pre", "clone", node.get_name(), "drain", "post"],
-        )
-
-    def test_nested_edges_peel_to_the_level_they_belong_to(self):
-        b = _Op("b", (0,), [4])
-        c, d = _Op("c", (0, 0), [4, 2]), _Op("d", (0, 0), [4, 2])
-        graph = self._collapsed([b, c, d])
-        outer = graph.operations[0]
-        inner = outer.body[1]
-        # A member of the OUTER loop at the head of the inner body, and an
-        # op of no loop at the head of the outer body.
-        x, y = _Op("x", (0,), [4]), _Op("y")
-        inner.body.insert(0, x)
-        outer.body.insert(0, y)
-        peel_non_members(graph)
-        self.assertEqual(graph.operations[0].get_name(), "y")
-        self.assertEqual(_names(outer.body[:2]), ["b", "x"])
-        self.assertIs(outer.body[2], inner)
-        self.assertEqual(_names(inner.body), ["c", "d"])
-
-    def test_a_non_member_between_members_stays(self):
-        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
-        graph = self._collapsed([a, b])
-        node = graph.operations[0]
-        node.body.insert(1, _Op("mid"))
-        peel_non_members(graph)
-        self.assertEqual(_names(node.body), ["a", "mid", "b"])
 
 
 class TestDeadcodeOnRealNestedList(unittest.TestCase):
