@@ -186,9 +186,10 @@ class AbstractRealization(ABC):
         """The realization in model, as a CP-SAT expression in COST_SCALE units."""
 
     @abstractmethod
-    def table(self) -> TableRealization:
+    def table(self, cap: int) -> TableRealization:
         """The realization as one table: what a parent asks for when it computes its
-        own list from this one."""
+        own list from this one. cap bounds the entries of a table that has to be
+        made for it."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -232,8 +233,8 @@ class TableRealization(AbstractRealization):
         model.add_element(self.index.cp_expr(model), entries, target)
         return target
 
-    def table(self) -> TableRealization:
-        """Itself."""
+    def table(self, cap: int) -> TableRealization:
+        """Itself: it is already one table, so none is made and cap is not read."""
         return self
 
 
@@ -371,7 +372,7 @@ class TableLowering(Printer):
     node. A Printer dispatches on the node's sympy class, the nearest class along its
     MRO that has a print method, and falls back to emptyPrinter. A print method prints
     the node's operands first, which returns their realizations, asks each for its
-    table, and returns the node's own realization to the node's parent: in this stage
+    table within the cap, and returns the node's own realization to the node's parent: in this stage
     always one table over the node's inputs. The printer makes the positions itself:
     an InputIndex on a symbol's variable, and for an operation its inputs' positions
     combined.
@@ -472,7 +473,7 @@ class TableLowering(Printer):
             value = TableRealization(values=[_constant(expr)], index=UNIT)
             return self._finite(expr, value)
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-        columns = [self.print(symbol).table() for symbol in symbols]
+        columns = [self.print(symbol).table(self.cap) for symbol in symbols]
         positions = list(dict.fromkeys(column.index for column in columns))
         entries = math.prod(position.size for position in positions)
         if entries > self.cap:
@@ -489,10 +490,10 @@ class TableLowering(Printer):
         forms: list[Form] = []
         for operand in operands:
             # prints the operand, which refuses its own value that is not finite
-            table = self.print(operand).table()
+            table = self.print(operand).table(self.cap)
             form: Form = CONDITION if _is_condition(operand) else None
             if _divides(expr, operand):
-                table, form = self.print(operand.base).table(), operand.exp  # type: ignore[attr-defined]
+                table, form = self.print(operand.base).table(self.cap), operand.exp  # type: ignore[attr-defined]
             if table.index == index:
                 arguments.append(table.values)
             else:
