@@ -88,7 +88,7 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopNode, all_ops, replace_op
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -1266,7 +1266,7 @@ def per_trip_index(
     advance from one counted-loop trip to the next, not an in-tile iteration
     axis. Codegen already applies that advance exactly once, through
     ``device_tile_advance_expr`` (see ``spyre_kernel.create_tensor_arg`` and
-    ``_general_tile_advance``), and pins the var to zero in the *base*
+    ``_index_tile_advance``), and pins the var to zero in the *base*
     coordinates so the raw unbacked symbol neither leaks into the OpSpec
     iteration space nor applies the same advance twice.
 
@@ -1876,9 +1876,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
     propagation runs, per passes.py's pass ordering) lists, per nesting
     level, the raw op.data.ranges positions this loop group tiles -- for the
-    innermost tile-body op itself, output_tiled_dims/tiled_dims_per_read are
-    both empty (this op's own write is already the tile-local slice, so it
-    has nothing further to report), so loop_tiled_dims is the only surviving
+    innermost tile-body op itself, this op's own write is already the
+    tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
     A raw tiled dim is a spurious "excess" batch var iff x's own read lacks
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
@@ -2197,97 +2196,6 @@ def try_device_coordinates(
         return device_coordinates(stl, dep, indirect_sizes, op=op)
     except Unsupported:
         return None
-
-
-def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
-    """Locate a gather's index-entry dim on the output; the one coordinate search.
-
-    The entry dim is the index tensor's STICK dim (its rows are selected at
-    runtime), which on the gather output is a NON-stick dim (the row selector).
-    Multi-core work division splits this dim in whole index sticks, so a split
-    is only legal when the output can hold a stick-aligned slice -- i.e. when the
-    output extent is a whole multiple of the index ``eps``.
-
-    Returns ``(eps, out_pos, out_extent)`` -- the index elems_per_stick, the
-    entry dim's device position in the output layout, and the output
-    device_size there -- or ``None`` when ``op`` is not a gather-style indirect
-    access, the output layout is not yet a committed ``FixedTiledLayout``, or the
-    entry dim coincides with the output's own stick dim (a geometry the
-    stick-alignment padding does not cover). Valid from
-    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
-    committed.
-    """
-    subs = indirect_access_subs_from_op(op)
-    if not subs:
-        return None
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-
-    rw = op.get_read_writes()
-    out_dep = next(iter(rw.writes), None)
-    if out_dep is None:
-        return None
-
-    # Fail safe: callers use this only to *enable* a split / pad a paddable
-    # gather output. If the output can't be analysed (e.g. a scatter writes its
-    # destination indirectly, so device_coordinates can't resolve the entry
-    # coord), return None so the caller stays conservative rather than erroring.
-    try:
-        out_stl = _fixed_read_layout(op).device_layout
-        out_coords = device_coordinates(out_stl, out_dep, None)
-        for d in rw.reads:
-            if not (isinstance(d, MemoryDep) and d.name in index_names):
-                continue
-            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
-            stick_expr = device_coordinates(idx_stl, d, None)[-1]
-            if len(stick_expr.free_symbols) != 1:
-                continue
-            stick_var = next(iter(stick_expr.free_symbols))
-            eps = idx_stl.elems_per_stick()
-            # The entry dim must be a NON-stick dim of the output (exclude the
-            # last, stick, coordinate). On a scatter the entry coord is an
-            # IndirectAccess (its free symbol is the index buffer, not the
-            # iteration stick var), so no match -> None -> partial scatter stays
-            # forbidden, which is correct: its in-place dest can't be padded.
-            for pos, coord in enumerate(out_coords[:-1]):
-                if coord.free_symbols == {stick_var}:
-                    return eps, pos, int(out_stl.device_size[pos])
-    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
-        return None
-    return None
-
-
-def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
-    """The gather output's device layout grown so the entry dim is a whole stick.
-
-    The padding pass applies this returned layout; the coordinate search and the
-    size math both stay here. Returns ``None`` when there is nothing to do -- not
-    a paddable gather entry, or the entry dim is already stick-aligned. The
-    logical size is unchanged: only the physical ``device_size`` grows, and the
-    D2H copy extracts the logical view from the larger allocation.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return None
-    eps, out_pos, out_extent = found
-    if out_extent % eps == 0:
-        return None
-    out_stl = _fixed_read_layout(op).device_layout
-    device_size = list(out_stl.device_size)
-    device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
-    logger.info(
-        "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
-        "stick-aligned multi-core split",
-        op.get_name(),
-        out_pos,
-        out_extent,
-        device_size[out_pos],
-    )
-    return SpyreTensorLayout(
-        device_size,
-        list(out_stl.stride_map),
-        out_stl.device_dtype,
-        forward_valid_elements(out_stl),
-    )
 
 
 def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
@@ -3799,8 +3707,7 @@ def replace_computed_buffer_body(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     _invalidate_body_caches(new_data)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
@@ -3916,8 +3823,7 @@ def redirect_computed_buffer_reads(
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf, layout_state=True)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
 

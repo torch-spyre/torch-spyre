@@ -15,9 +15,8 @@
 """Loop terms in the index of span-overflow groups (stage 7a.2).
 
 The unit tests cover the step rule and the loop-variable minting. The device tests
-add the term to the legacy lowering's result and check that the kernel reads the
-same advance from the index as the legacy record holds (``LoopAdvanceMismatch``
-otherwise), with the same numerics and the same kernel text.
+check that the lowering puts ``step * u`` in the index and that the kernel agrees
+with the carry records and the loop nodes it builds from it.
 """
 
 import pytest

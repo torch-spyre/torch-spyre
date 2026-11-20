@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     Layout,
     MutableBox,
@@ -38,6 +39,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ScatterFallback,
     StorageBox,
     TensorBox,
     _CollectiveKernel,
@@ -82,6 +84,7 @@ from .ir import (
     SpyreConstantFallback,
     SpyreEmptyFallback,
 )
+from .loop_node import remove_op
 from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
@@ -655,6 +658,15 @@ def _typecast_layouts(
         out_ea = ElementArrangement.QFP8CH
     else:
         out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+        # A stick dim with no host dim, or only a size-1 one (0-dim, (1,), (2, 1)),
+        # holds a single element at position 0, which every arrangement leaves in
+        # place. Staggering is a no-op there and EA in DCI cannot permute.
+        # Decide from the read's coordinates, not the input's stride_map: a
+        # round-trip conversion rewrites the stride_map entry (#5566).
+        if out_ea in STAGGERED_EAS and all(
+            concretize_expr(dep.ranges[v]) == 1 for v in in_stick_expr.free_symbols
+        ):
+            out_ea = ElementArrangement.STANDARD
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_coords = host_coordinates(output, output_dep, None)
@@ -782,6 +794,24 @@ def _qfp8wt_stl(
     )
 
 
+def _with_input_ea(
+    out_stl: SpyreTensorLayout, output_dep: MemoryDep, ea: ElementArrangement
+) -> SpyreTensorLayout:
+    """``out_stl`` tagged with the staggered ``ea`` when its stick has an order.
+
+    An output stick with no host dim (a broadcast stick), or only size-1 ones,
+    holds a lone element that no arrangement moves, and the D2H restore has no
+    stick dim to identify ("Unable to determine the stick dimension"), so it stays
+    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as
+    ``_typecast_layouts`` does.
+    """
+    coords = try_device_coordinates(out_stl, output_dep, None)
+    stick_vars = coords[-1].free_symbols if coords else ()
+    if any(concretize_expr(output_dep.ranges[v]) > 1 for v in stick_vars):
+        return out_stl.with_element_arrangement(ea)
+    return out_stl
+
+
 def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
@@ -854,6 +884,19 @@ def _reduction_layout_from_stl(
             ]
             if out_stl is not None
         ]
+        # Reducing a non-stick dim keeps each stick's element order, so a
+        # staggered EA on the input still describes the output. When the
+        # reduction consumes the stick dim the stagger is gone and the output
+        # stays STANDARD. See #5553.
+        if (
+            stl.element_arrangement in STAGGERED_EAS
+            and reduction_var is not None
+            and reduction_var not in x_stick_expr.free_symbols
+        ):
+            output_stls = [
+                _with_input_ea(out_stl, output_dep, stl.element_arrangement)
+                for out_stl in output_stls
+            ]
         if output_stls:
             return output_stls
 
@@ -3255,7 +3298,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
     for op in removed_ops:
         for write in op_read_writes(op).writes:
             V.graph.removed_buffers.add(write.name)
-        operations.remove(op)
+        remove_op(operations, op)
 
 
 def _eager_view_input_layout(
@@ -3832,6 +3875,14 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
+        elif isinstance(op, (IndexPutFallback, ScatterFallback)):
+            # Upstream routes some index_put and scatter forms to a mutating
+            # fallback, which has no Spyre kernel. Reject here, not at run time.
+            # TODO(issue#692, issue#4361): drop this once they lower on device.
+            raise Unsupported(
+                f"{op.python_kernel_name}: upstream lowers this form to a "
+                f"mutating fallback, which has no Spyre kernel"
+            )
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

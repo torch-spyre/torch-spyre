@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
 import time
@@ -67,6 +68,7 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
+    _reduction_syms,
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -142,7 +144,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
 )
 
-from torch_spyre._inductor import config
+from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
 from torch_spyre._inductor.loop_info import (
@@ -698,7 +700,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     hoisted pre-loop input clone are neither loop members nor carries: a
     surviving ``loop_info`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
-    advance in codegen (``_general_tile_advance``), and the records would
+    advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
     clone keeps today's metadata-copy behavior.
@@ -1030,6 +1032,66 @@ class _BufferResidencyChecks:
         return None
 
 
+#: ``plan_allocation``'s template hooks, timed as one region each. The per-pass
+#: timer sees the whole pass as a single region, and that region is a significant
+#: fraction of frontend compile -- with nothing to say which part. These are the
+#: finest attribution available without guessing at internals. The measured share
+#: belongs in the pull request, not here, where it would go stale.
+#:
+#: Named rather than wrapped at the call sites, for two reasons: an override is a
+#: different function object and gets timed without touching its call site, and
+#: main reshapes ``plan_allocation``'s skeleton often enough that a block of
+#: ``with`` statements would conflict where this table does not.
+#:
+#: Hook name -> region suffix. The suffix is spelled out rather than derived from
+#: the method name so a rename upstream can keep the metric the sweeps already
+#: hold. ``tests/test_scratchpad_substage_timers.py`` fails if an entry here times
+#: nothing, so a rename is caught by the change that makes it.
+_TIMED_HOOKS = {
+    "_run_passes": "run_passes",
+    "_prepare_buffers": "prepare_buffers",
+    "_build_solver": "build_solver",
+    "_solve": "solve",
+    "_finalize_lx_relayout_allocation": "finalize_relayout",
+    "_post_solve": "post_solve",
+    "_get_spill_reasons": "spill_reasons",
+    "_push_allocation": "push_allocation",
+    "_log_lx_pinning": "log_pinning",
+}
+
+
+def _time_hooks(cls: type) -> type:
+    """Wrap each of ``_TIMED_HOOKS`` the class defines in a timing region.
+
+    Applied to the subclass as well as the base: an override is a different
+    function object, and timing the base's method would miss it entirely.
+    ``timing_recorder.stage`` is inert unless ``TORCH_SPYRE_TIMING=1``, so this
+    costs one Python frame per hook on a production compile.
+    """
+    for name, suffix in _TIMED_HOOKS.items():
+        attr = cls.__dict__.get(name)
+        if attr is None:
+            continue
+        # A hook may be a staticmethod -- _run_passes is -- and wrapping the
+        # function it holds without putting it back in the same descriptor adds
+        # a self argument the original does not take.
+        kind = type(attr) if isinstance(attr, (staticmethod, classmethod)) else None
+        function = attr.__func__ if kind else attr
+        if getattr(function, "_ts_timed", False):
+            continue
+        region = f"stage:Scratchpad:{suffix}"
+
+        @functools.wraps(function)
+        def timed(*args, _f=function, _r=region, **kwargs):
+            with timing_recorder.stage(_r):
+                return _f(*args, **kwargs)
+
+        timed._ts_timed = True  # type: ignore[attr-defined]
+        setattr(cls, name, kind(timed) if kind else timed)
+    return cls
+
+
+@_time_hooks
 class ScratchpadAllocator:
     """
     Class for allocating on scratchpad
@@ -2971,20 +3033,24 @@ def _drop_read_distance_violations(
     return surviving
 
 
-def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int:
+def _intern_view_group(groups: dict[object, int], view: PerCoreView) -> int:
     """Group index of ``view`` among ``groups``, keyed by physical ownership.
 
     A dict keyed on ``PerCoreView`` interns by structural equality, so two slot
     spellings of one partition (``core_id`` and ``core_id % 4`` over four cores)
     would become two groups and the solver would price two shuffles where one
-    copy serves both consumers. Look up by ``same_partition`` instead and only
-    then mint a new index; the first spelling seen stays the dict key.
+    copy serves both consumers. ``groups`` is keyed by the view's
+    :attr:`~PerCoreView.partition_key` instead, which every spelling of one
+    partition shares, so the lookup agrees with ``same_partition``.
     """
-    for known, index in groups.items():
-        if known.same_partition(view):
-            return index
-    index = len(groups)
-    groups[view] = index
+    key: object = view.partition_key
+    if key is None:
+        # Matches no view, not even an identical one: a group of its own.
+        key = object()
+    index = groups.get(key)
+    if index is None:
+        index = len(groups)
+        groups[key] = index
     return index
 
 
@@ -3193,6 +3259,7 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+@_time_hooks
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -3540,7 +3607,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
-        division = CoreDivision(splits=buffer.sym_core_divs)
+        division = CoreDivision(
+            splits=buffer.sym_core_divs,
+            reduction_syms=_reduction_syms(op, buffer.sym_core_divs),
+        )
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
         if config.auto_coarse_tiling:
@@ -4323,7 +4393,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
-        self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
+        self._relayout_view_groups: dict[str, dict[object, int]] = {}
         lifetimes = calculate_liveness(graph)
         lifetime_start_overrides, lifetime_end_overrides = (
             counted_loop_lifetime_overrides(graph)
@@ -5050,9 +5120,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
-                            }
+                            },
+                            # A clone op cannot have a reduction split.
+                            reduction_syms=frozenset(),
                         )
-                    )  # a clone op cannot have a reduction split
+                    )
                     clone_views.append(view)
                 # No core-count check here: ``same_partition`` already demands
                 # equal core counts, and the guard above ties each view's count
