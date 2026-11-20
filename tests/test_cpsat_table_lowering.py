@@ -163,7 +163,9 @@ def _printed(
     operands before their parents."""
     printer = Recording(case.inputs, cap)
     printer.lower(expr)
-    return {node: realization.table() for node, realization in printer.printed.items()}
+    return {
+        node: realization.table(CAP) for node, realization in printer.printed.items()
+    }
 
 
 def _operations(printed: dict[sympy.Basic, TableRealization]) -> list[sympy.Basic]:
@@ -220,7 +222,7 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
     printer.lower(expr)
     for realization in printer.printed.values():
         assert type(realization) is TableRealization
-        assert realization.table() is realization
+        assert realization.table(CAP) is realization
     printed = _printed(case, expr)
     assert printed[a].index == position and list(printed[a].values) == [1.0, 2.0, 4.0]
     assert printed[sympy.Integer(3)].index == UNIT
@@ -244,12 +246,12 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     case.inputs[dummy] = case.inputs[a]
     printer = TableLowering(case.inputs, cap=CAP)
     assert isinstance(printer, Printer)
-    column = printer.print(dummy).table()
+    column = printer.print(dummy).table(CAP)
     assert column.index == position and list(column.values) == [1.0, 2.0, 4.0]
-    logs = printer.print(sympy.log(a)).table()
+    logs = printer.print(sympy.log(a)).table(CAP)
     assert logs.index == position
     assert list(logs.values) == pytest.approx([0.0, math.log(2), math.log(4)])
-    constant = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi).table()
+    constant = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi).table(CAP)
     assert constant.index == UNIT
     root = printer.lower(sympy.log(a) + dummy)
     assert root is printer.print(sympy.log(a) + dummy)
@@ -307,7 +309,7 @@ def test_a_table_at_the_cap_is_made_and_one_past_it_is_refused():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    root = TableLowering(case.inputs, cap=3).lower(a**0.5).table()  # at the cap
+    root = TableLowering(case.inputs, cap=3).lower(a**0.5).table(CAP)  # at the cap
     assert root.index == position
     assert list(root.values) == pytest.approx([1.0, 2**0.5, 2.0])
     with pytest.raises(
@@ -396,12 +398,31 @@ def test_a_realization_is_abstract_and_a_table_is_one():
         Built()  # type: ignore[abstract]
     table = TableRealization(values=[1.0, 2.0, 4.0], index=position)
     assert isinstance(table, AbstractRealization)
-    assert table.table() is table
+    assert table.table(CAP) is table
     assert table.finite
     assert not TableRealization(values=[1.0, np.inf, 4.0], index=position).finite
     a = case.symbol("a")
     lowered = TableLowering(case.inputs, cap=CAP).lower(a**0.5)
     assert isinstance(lowered, AbstractRealization)
+
+
+def test_a_parent_asks_an_operand_for_its_table_within_the_printers_cap(monkeypatch):
+    """table takes the cap: the bound on a table that has to be made. The printer
+    passes its own to every realization it asks."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    asked: list[int] = []
+    original = TableRealization.table
+
+    def table(self: TableRealization, cap: int) -> TableRealization:
+        asked.append(cap)
+        return original(self, cap)
+
+    monkeypatch.setattr(TableRealization, "table", table)
+    TableLowering(case.inputs, cap=7).lower(a**0.5 * b + sympy.log(a))
+    assert asked and set(asked) == {7}
 
 
 def test_a_list_must_have_its_index_size():
@@ -492,7 +513,7 @@ def _stage_1(case: Case, expr: sympy.Basic) -> np.ndarray:
 
 
 def _list(case: Case, expr: sympy.Basic) -> list[float]:
-    return list(TableLowering(case.inputs, cap=CAP).lower(expr).table().values)
+    return list(TableLowering(case.inputs, cap=CAP).lower(expr).table(CAP).values)
 
 
 def test_a_list_is_row_major_with_the_last_position_fastest():
@@ -584,7 +605,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    assert plan.table().index.size == 12
+    assert plan.table(CAP).index.size == 12
 
 
 def test_variables_above_and_below_zero_read_their_entries():
@@ -638,7 +659,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    assert plan.table().index.size == 6
+    assert plan.table(CAP).index.size == 6
 
 
 def test_an_undefined_function_is_refused():
@@ -732,7 +753,7 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    assert plan.table().index.size == 4620
+    assert plan.table(CAP).index.size == 4620
 
 
 # ---------------------------------------------------------------- a node's function
@@ -780,7 +801,7 @@ def test_a_node_is_lambdified_once_and_nothing_keeps_its_function(monkeypatch):
     assert len(calls) == len(computed)
     TableLowering(case.inputs, cap=CAP).lower(expr)
     assert len(calls) == 2 * len(computed)
-    np.testing.assert_allclose(root.table().values, _stage_1(case, expr), rtol=1e-12)
+    np.testing.assert_allclose(root.table(CAP).values, _stage_1(case, expr), rtol=1e-12)
 
 
 def test_a_function_takes_its_operands_by_their_own_names():
@@ -806,7 +827,7 @@ def test_a_constant_is_read_as_the_double_it_is():
     c = case.symbol("c")
     expr = sympy.ceiling(sympy.Float(2) / 3 * c)
     root = case.assert_exact(expr)
-    assert list(root.table().values) == [1.0, 2.0, 4.0, 5.0, 6.0]
+    assert list(root.table(CAP).values) == [1.0, 2.0, 4.0, 5.0, 6.0]
 
 
 def test_a_quotient_is_divided_as_lambdify_prints_it():
@@ -906,7 +927,7 @@ def test_the_cost_models_objective_has_the_annealers_values(rows):
     assert bool(prices) == (rows == 8)
     symbols, points = _points(case, expr)
     annealer = sympy.lambdify(symbols, expr, modules="math")
-    values = root.table().values
+    values = root.table(CAP).values
     assert len(values) == 2 * len(MENU)
     for value, point in zip(values, points):
         assert value == pytest.approx(annealer(*point), rel=1e-9), point
