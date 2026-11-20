@@ -40,6 +40,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     _check_stick_expr_supported,
+    _former_stick_dim_outermost,
     compute_restickify_needed,
     dense_relocation_serves_read,
     device_coordinates,
@@ -1794,19 +1795,65 @@ class TestDenseRelocationServesRead(TestCase):
         )
 
     def test_an_already_relocated_input_keeps_its_own_dims(self):
-        # The stick is a property of the layout, not of the host strides: this
-        # input's stick is on host dim 0, not its smallest-stride dim. The read
-        # still cannot be served by moving it again, so the answer is the sparse
-        # layout. NOTE: this case does not distinguish the stride_map-based pick
-        # from the host-stride one -- both return None -- so it pins the contract,
-        # not the fix. No input reaching this helper has been found where the two
-        # picks differ.
+        # Defensive, by design: this test cannot fail for the wrong reason,
+        # because both the stride_map-based pick of the current stick dim and the
+        # host-stride one return None here. No input reaching this helper has been
+        # found where the two differ, so the stride_map pick is a guard against a
+        # caller that hands over an input whose stick has already moved, not a fix
+        # for an observed bug. What is pinned is the contract: the stick is a
+        # property of the layout, not of the host strides -- this input's stick is
+        # on host dim 0, not its smallest-stride dim -- and a read that cannot be
+        # served by moving it again gets the sparse layout.
         host = _contiguous_host([4, 100])
         moved = SpyreTensorLayout([4, 100], [100, 1], torch.float16, [1, 0])
         self.assertEqual(list(moved.stride_map), [400, 1, 100])
         self.assertIsNone(
             dense_relocation_serves_read(moved, host, self._split_row_read(4, 100, 5))
         )
+
+
+class TestFormerStickDimOutermost(TestCase):
+    """Where the former stick dim lands, which decides where the padding lands.
+
+    The restickify into the relocated layout pads that dim up to whole sticks.
+    Outermost, the padding sits at the end of the buffer; anywhere else it falls
+    between another dim's slices, where a merge reads it as data.
+    """
+
+    @staticmethod
+    def _inner_stick():
+        """[4, 100] with the stick on the 100, so the 4 keeps a device dim."""
+        return SpyreTensorLayout([4, 100], [100, 1], torch.float16, [0, 1])
+
+    @staticmethod
+    def _relocated():
+        """[4, 100] with the stick already moved onto the 4."""
+        return SpyreTensorLayout([4, 100], [100, 1], torch.float16, [1, 0])
+
+    def test_an_inner_dim_moves_to_the_front(self):
+        stl = self._inner_stick()
+        self.assertEqual(list(stl.device_size), [2, 4, 64])
+        moved = _former_stick_dim_outermost(stl, 4, 100)
+        self.assertEqual(list(moved.device_size), [4, 2, 64])
+        self.assertEqual(list(moved.stride_map), [100, 64, 1])
+
+    def test_a_dim_already_outermost_is_returned_as_it_is(self):
+        """Idempotent, so a second pass cannot rotate the layout again."""
+        moved = _former_stick_dim_outermost(self._inner_stick(), 4, 100)
+        self.assertIs(_former_stick_dim_outermost(moved, 4, 100), moved)
+
+    def test_a_dim_the_layout_does_not_have_declines(self):
+        """Fails closed: the caller skips the candidate and the read goes sparse.
+
+        Returning the layout unchanged would leave the padding wherever it sits,
+        which is the wrong-values case this helper exists to prevent, and it would
+        do so with no error.
+        """
+        # The 4 has no device dim of its own once the stick is on it.
+        self.assertEqual(list(self._relocated().device_size), [1, 100, 64])
+        self.assertIsNone(_former_stick_dim_outermost(self._relocated(), 4, 100))
+        # Nor does a size and stride belonging to no dim at all.
+        self.assertIsNone(_former_stick_dim_outermost(self._inner_stick(), 7, 999))
 
 
 class TestStickExprOffsetFree(TestCase):

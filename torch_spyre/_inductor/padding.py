@@ -727,12 +727,11 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     # This runs on every pointwise op with a mutation-layout output, which the
     # padding pass never computed coordinates for before.  Probe rather than
     # compute, so an unrepresentable coordinate leaves the op to fail with its
-    # own error instead of the generic one from here (@ani300's suggestion 4 on
-    # #5804).  The trade-off: a sliced restickify whose coordinates cannot be
-    # represented on either side now skips this guard, and codegen reports it
-    # instead.  Layout selection rejects such a read before codegen, so nothing
-    # reaches here that way today; if that changes, the error moves rather than
-    # the behaviour.
+    # own error instead of the generic one from here.  The trade-off: a sliced
+    # restickify whose coordinates cannot be represented on either side now
+    # skips this guard, and codegen reports it instead.  Layout selection
+    # rejects such a read before codegen, so nothing reaches here that way
+    # today; if that changes, the error moves rather than the behaviour.
     in_coords = try_device_coordinates(in_layout.device_layout, in_dep, None)
     out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):

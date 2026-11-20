@@ -188,11 +188,11 @@ class TestStickRelocation(unittest.TestCase):
             "one stick to 8x8": ([(64,)], lambda x: x.reshape(8, 8) * 2),
             "1x2x4x8x7": ([(1, 2, 4, 8, 7)], lambda x: x.reshape(1, 8, 56) * 2),
             "six dims": ([(1, 2, 4, 8, 4, 7)], lambda x: x.reshape(1, 8, 224) * 2),
-            # TODO: the outer dims are merged as well (2 x 16 -> 32), so no single
-            # dim is left alone. The merged dim could take the stick, but the
-            # restickify into it iterates over the two host dims and writes the
-            # stick coordinate 16*d0 + d1, which codegen rejects. When that is
-            # supported this case should become dense.
+            # TODO(#6558): the outer dims are merged as well (2 x 16 -> 32), so
+            # no single dim is left alone and both candidates decline at the
+            # coordinate stage. The merged pair could carry the stick between
+            # them, which needs a restickify able to write the stick coordinate
+            # 16*d0 + d1. When that is supported this case should become dense.
             "outer dims merged too": (
                 [(2, 16, 25600)],
                 _silu_reshape((32, 160, 160)),
@@ -339,9 +339,12 @@ class TestStickRelocation(unittest.TestCase):
 
     @expects_raise
     def test_stick_size_change_is_rejected(self):
-        # TODO(#3999): float16 -> float32 changes the stick size, and the backend
-        # reorders elements across that conversion, so these are refused instead
-        # of returning wrong values. Make this a positive test when #3999 lands.
+        # TODO(#6557): the cast changes the stick size, and
+        # convert_element_type's layout rule returns no candidates for a read its
+        # input's layout cannot serve -- it returns none before the relocation or
+        # the sparse fallback is consulted, so neither gets to serve the read.
+        # Refused rather than wrong, and refused on main too. The same reshape
+        # without the cast compiles. Make this a positive test when #6557 lands.
         cases = {
             "aligned target": ((2, 8, 40), lambda t: t.reshape(2, 320).float()),
             "split then float": (

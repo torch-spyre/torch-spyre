@@ -3477,6 +3477,8 @@ def dense_relocation_serves_read(
             sizes[current_stick],
             strides[current_stick],
         )
+        if target is None:
+            continue
         coords = try_device_coordinates(target, dep, indirect_sizes, op=op)
         if coords is None:
             continue
@@ -3512,13 +3514,19 @@ def _is_factorized_stick(coords: "list[sympy.Expr]", op: "Operation | None") -> 
 
 def _former_stick_dim_outermost(
     stl: SpyreTensorLayout, host_size: int, host_stride: int
-) -> SpyreTensorLayout:
-    """``stl`` with the device dim of the former stick host dim moved outermost.
+) -> "SpyreTensorLayout | None":
+    """``stl`` with the device dim of the former stick host dim moved outermost,
+    or ``None`` when that dim is not in ``stl``.
 
     The restickify into ``stl`` pads that dim to whole sticks
     (``_pad_restickify_output``). Outermost, the padding sits at the end of the
     buffer; inside another dim it falls between that dim's slices, where a read
     that walks the two dims as one (a merge) picks it up as data.
+
+    Not finding the dim fails closed. Returning ``stl`` unchanged would leave the
+    padding wherever it happens to sit, which is the wrong-values case this
+    helper exists to prevent, and it would do so silently; the caller skips the
+    candidate instead and the read falls back to the sparse layout.
     """
     size, smap = list(stl.device_size), list(stl.stride_map)
     j = next(
@@ -3529,7 +3537,9 @@ def _former_stick_dim_outermost(
         ),
         None,
     )
-    if j is None or j == 0:
+    if j is None:
+        return None
+    if j == 0:
         return stl
     perm = [j] + [k for k in range(len(size)) if k != j]
     return SpyreTensorLayout(
