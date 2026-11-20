@@ -65,8 +65,8 @@ COST_SCALE = 1024
 # The largest table entry: a sum of thousands of entries stays inside int64.
 MAX_ENTRY = 2**50
 # A switch holds its factor's values to 1/q: q is the largest power of two up to
-# MAX_SWITCH_SCALE that keeps q * w under MAX_SWITCH_PRODUCT, and under
-# MIN_SWITCH_SCALE the product is no switch.
+# MAX_SWITCH_SCALE that keeps q * w under MAX_SWITCH_PRODUCT. Under MIN_SWITCH_SCALE
+# it is coarse: a product with a table keeps the table instead.
 MAX_SWITCH_SCALE = 2**30
 MIN_SWITCH_SCALE = 2**22
 MAX_SWITCH_PRODUCT = 2**60
@@ -481,7 +481,9 @@ class LinearRealization(AbstractRealization):
     def bounds(self) -> tuple[int, int]:
         bounds = [term.bounds() for term in self.terms]
         constant = _rounded(self.constant)[0]
-        return constant + sum(b[0] for b in bounds), constant + sum(b[1] for b in bounds)
+        return constant + sum(b[0] for b in bounds), constant + sum(
+            b[1] for b in bounds
+        )
 
     @property
     def entries(self) -> int:
@@ -522,25 +524,25 @@ class SwitchRealization(AbstractRealization):
     @cached_property
     def scale(self) -> int:
         """q: 1 when every value is whole, otherwise the largest power of two up to
-        MAX_SWITCH_SCALE that keeps q * w, so every p * w, under MAX_SWITCH_PRODUCT.
-        Under MIN_SWITCH_SCALE, p/q is too coarse for the switch to be used."""
-        if all(v.is_integer() for v in self.values):
-            return 1
+        MAX_SWITCH_SCALE that keeps q * w, so every p * w, under MAX_SWITCH_PRODUCT;
+        0 when none does."""
         widest = max(1, *(abs(bound) for bound in self.rest.bounds()))
-        q = MAX_SWITCH_SCALE
+        q = 1 if all(v.is_integer() for v in self.values) else MAX_SWITCH_SCALE
         while q * widest >= MAX_SWITCH_PRODUCT:
             q //= 2
         return q
 
     @property
-    def usable(self) -> bool:
-        return self.scale == 1 or self.scale >= MIN_SWITCH_SCALE
+    def precise(self) -> bool:
+        """Whether p/q is within 1/MIN_SWITCH_SCALE of each value, relatively."""
+        smallest = min(abs(v) for v in self.values if v)
+        return self.scale == 1 or self.scale * smallest >= MIN_SWITCH_SCALE
 
     def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
         """g under one true/false per value: a 0/1 variable is its own pair, any
         other position is mapped by add_map_domain. The rest sits behind a variable
         of its own when more than two values read it."""
-        if not self.usable:
+        if not self.scale:
             raise TableLoweringError(None, "a switched product too wide for int64")
         if len(self.values) > 2:
             w = _proxy(model, built, self.rest)
@@ -583,10 +585,10 @@ class SwitchRealization(AbstractRealization):
 
     def join(self, other: Any) -> SwitchRealization | None:
         """Products with one factor are one switch over their rests, unless the sum
-        of the rests is too wide for it."""
+        of the rests is too wide for it to stay precise."""
         rest = LinearRealization.of(0.0, (self.rest, other.rest))
         joined = SwitchRealization(self.values, self.index, rest)
-        return joined if joined.usable else None
+        return None if self.precise and other.precise and not joined.precise else joined
 
 
 @dataclass(frozen=True, eq=False)
@@ -734,7 +736,9 @@ def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
     """Each position's coordinate at every joint assignment of positions, row-major,
     the last position fastest."""
     shape = tuple(p.size for p in positions)
-    return dict(zip(positions, np.indices(shape).reshape(len(shape), -1))) if shape else {}
+    return (
+        dict(zip(positions, np.indices(shape).reshape(len(shape), -1))) if shape else {}
+    )
 
 
 def _same_value(value: float) -> float:
@@ -807,7 +811,9 @@ def fold_reachable(
     groups: list[tuple[list[Index], list[tuple[int, Index]]]] = []
     for f, extreme in enumerate(extremes):
         for rung in extreme.rungs:  # type: ignore[attr-defined]
-            leaves = [s for s in rung.steps() if isinstance(s, (InputIndex, LocateIndex))]
+            leaves: list[Index] = [
+                s for s in rung.steps() if isinstance(s, (InputIndex, LocateIndex))
+            ]
             if not leaves:
                 start[f] = joined(f, start[f], int(rung.on_grid({})))
                 continue
@@ -839,10 +845,14 @@ def fold_reachable(
         )
         if len(numbered) > cap:
             return None
-        index = CompactIndex(CombineIndex(index, _combined(positions)), remap, len(numbered))
+        index = CompactIndex(
+            CombineIndex(index, _combined(positions)), remap, len(numbered)
+        )
         states = list(numbered)
     values = [
-        math.prod(ladder.values[s] for ladder, s in zip(ladders, state) if s is not None)
+        math.prod(
+            ladder.values[s] for ladder, s in zip(ladders, state) if s is not None
+        )
         for state in states
     ]
     return TableRealization(values=values, index=index)
@@ -967,8 +977,16 @@ class Node:
         # several lists their ranks combined, equal values sharing a position.
         tables = [s.tabulated if isinstance(s, Node) else s for s in sources]
         if all(t is not None for t in tables):
-            if len({t.index for t in tables if isinstance(t, TableRealization)} - {UNIT}) > 1:
-                tables = [_ranked(t) if isinstance(t, TableRealization) else t for t in tables]
+            if (
+                len(
+                    {t.index for t in tables if isinstance(t, TableRealization)}
+                    - {UNIT}
+                )
+                > 1
+            ):
+                tables = [
+                    _ranked(t) if isinstance(t, TableRealization) else t for t in tables
+                ]
             ways.append(self._candidate(None, tables, forms))
         return ways
 
@@ -1095,7 +1113,9 @@ class InputNode(Node):
         if len(intervals) == 1:
             index = InputIndex(var, size=count, lo=bounds[0])
         else:
-            index = LocateIndex(var, tuple(v for lo, hi in intervals for v in range(lo, hi + 1)))
+            index = LocateIndex(
+                var, tuple(v for lo, hi in intervals for v in range(lo, hi + 1))
+            )
         try:
             return {self.expr: TableRealization(values=values, index=index)}
         except (TypeError, ValueError) as exc:
@@ -1154,13 +1174,18 @@ class MulNode(Node):
 
     def realize(self) -> AbstractRealization:
         coefficient = math.prod(
-            float(c.table.values[0]) for c in self.children if isinstance(c, ConstantNode)
+            float(c.table.values[0])
+            for c in self.children
+            if isinstance(c, ConstantNode)
         )
         factors = [c for c in self.children if not isinstance(c, ConstantNode)]
         if len(factors) == 1:
             return _scaled(factors[0].realization, coefficient)
-        ways = [self.tabulated, self._product(coefficient, factors)]
-        fitting = [way for way in ways if way is not None]
+        table = self.tabulated
+        product = self._product(coefficient, factors)
+        if isinstance(product, SwitchRealization) and not product.precise:
+            product = product if table is None else None  # the table is exact
+        fitting = [way for way in (table, product) if way is not None]
         if not fitting:
             raise TableLoweringError(
                 self.expr, "no table fits the cap and no factor can be switched on"
@@ -1172,8 +1197,7 @@ class MulNode(Node):
     ) -> AbstractRealization | None:
         """coefficient times factors, read linearly: a gate when a factor is one, else
         a switch on the factor with the fewest distinct values among those with a
-        table. None when there is none, or its values pass the cap, or the rest is
-        too wide for it."""
+        table. None when there is none, or its values pass the cap."""
 
         def rest(factor: Node, scale: float) -> AbstractRealization:
             others = [f for f in factors if f is not factor]
@@ -1201,8 +1225,7 @@ class MulNode(Node):
         if table.index.size == 1:
             return rest(factor, coefficient * float(table.values[0]))
         values = tuple(float(v) / size for v in table.values)
-        switch = SwitchRealization(values, table.index, rest(factor, coefficient * size))
-        return switch if switch.usable else None
+        return SwitchRealization(values, table.index, rest(factor, coefficient * size))
 
     def candidates(self) -> list[Candidate]:
         """Rule 2 too: its Min/Max factors folded onto the tuples of their rungs that
@@ -1210,14 +1233,20 @@ class MulNode(Node):
         ladders themselves would pass the cap."""
         ways = super().candidates()
         sources, forms = self.operands()
-        extreme = [isinstance(s, ExtremeNode) and f is None for s, f in zip(sources, forms)]
+        extreme = [
+            isinstance(s, ExtremeNode) and f is None for s, f in zip(sources, forms)
+        ]
         ladders = [s.ladder for s, e in zip(sources, extreme) if e]  # type: ignore[union-attr]
         if len(ladders) < 2 or None in ladders:
             return ways
         if math.prod(ladder.index.size for ladder in ladders) <= self.cap:
             return ways
         fold = fold_reachable(ladders, self.cap)
-        others = [s.tabulated if isinstance(s, Node) else s for s, e in zip(sources, extreme) if not e]
+        others = [
+            s.tabulated if isinstance(s, Node) else s
+            for s, e in zip(sources, extreme)
+            if not e
+        ]
         if fold is None or None in others:
             return ways
         ranked = [_ranked(o) if isinstance(o, TableRealization) else o for o in others]
@@ -1248,7 +1277,10 @@ class ExtremeNode(Node):
         if ladder is None:
             return super().candidates()
         entries = ladder.index.size + _entries_of([ladder.index])
-        return [*super().candidates(), Candidate(ladder.index.size, entries, lambda: ladder)]
+        return [
+            *super().candidates(),
+            Candidate(ladder.index.size, entries, lambda: ladder),
+        ]
 
     @cached_property
     def ladder(self) -> TableRealization | None:
@@ -1260,7 +1292,9 @@ class ExtremeNode(Node):
             return None
         ladder, bound = clamped_ladder([t.values for t in tables], self.is_min)
         rungs = tuple(
-            CompactIndex(t.index, rungs_on(ladder, bound, t.values, self.is_min), len(ladder))
+            CompactIndex(
+                t.index, rungs_on(ladder, bound, t.values, self.is_min), len(ladder)
+            )
             for t in tables
         )
         index = ExtremeIndex(rungs, self.is_min, len(ladder))
@@ -1310,7 +1344,9 @@ def _read_gated(mul: sympy.Basic, literals: set[sympy.Symbol]) -> sympy.Basic:
         if not (off.is_Number and on.is_Number) or (off == 0) == (on == 0):
             continue
         kept = sympy.S.One if off == 0 else sympy.S.Zero
-        args = [a if j == i else a.xreplace({literal: kept}) for j, a in enumerate(args)]
+        args = [
+            a if j == i else a.xreplace({literal: kept}) for j, a in enumerate(args)
+        ]
     return mul.func(*args)
 
 
@@ -1348,7 +1384,9 @@ class TableLowering:
         literals = {
             symbol
             for symbol, (var, values) in self.inputs.items()
-            if isinstance(var, cp_model.IntVar) and var.is_boolean and [*values] == [0, 1]
+            if isinstance(var, cp_model.IntVar)
+            and var.is_boolean
+            and [*values] == [0, 1]
         }
         return root.replace(
             lambda e: e.is_Mul and not literals.isdisjoint(e.free_symbols),

@@ -198,7 +198,9 @@ def _on_inputs(node: Node) -> np.ndarray:
     positions = list(dict.fromkeys(node.columns[s].index for s in symbols))
     table = node.table
     size = math.prod(p.size for p in positions)
-    return np.broadcast_to(table.values[table.index.on_grid(lowering._grid(positions))], (size,))
+    return np.broadcast_to(
+        table.values[table.index.on_grid(lowering._grid(positions))], (size,)
+    )
 
 
 # ----------------------------------------------------------------------- the walk
@@ -427,7 +429,9 @@ def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
     assert pair != CombineIndex(b, a)
     assert UNIT.size == 1 and UNIT == UnitIndex()
     rank = CompactIndex(a, (1, 0, 1), 2)
-    assert rank == CompactIndex(a, (1, 0, 1), 2) and rank != CompactIndex(a, (0, 1, 1), 2)
+    assert rank == CompactIndex(a, (1, 0, 1), 2) and rank != CompactIndex(
+        a, (0, 1, 1), 2
+    )
 
 
 def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
@@ -756,7 +760,9 @@ def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
     expr = sympy.Add(*terms)
     calls = _count_lambdify(monkeypatch)
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
-    np.testing.assert_allclose(_on_inputs(nodes[expr]), _stage_1(nodes[expr]), rtol=1e-12)
+    np.testing.assert_allclose(
+        _on_inputs(nodes[expr]), _stage_1(nodes[expr]), rtol=1e-12
+    )
     computed = [n for n in nodes.values() if type(n) is not InputNode]
     assert len(computed) > 300
     assert len(calls) == len({str(c) for c in calls}) <= 12
@@ -1221,7 +1227,9 @@ def test_a_product_under_a_log_is_exact_as_a_pair_of_ranks():
     plan = case.assert_exact(sympy.log(product + 1), cap=64)
     index = plan.realization.index
     assert isinstance(index, CombineIndex) and index.size == 16
-    assert isinstance(index.left, CompactIndex) and isinstance(index.right, CompactIndex)
+    assert isinstance(index.left, CompactIndex) and isinstance(
+        index.right, CompactIndex
+    )
     assert case.elements() == [9, 12, 16]
     with pytest.raises(TableLoweringError, match="past the cap of 15"):
         Case.lower(case, sympy.log(product + 1), cap=15)
@@ -1270,19 +1278,14 @@ def test_a_max_over_three_buffers_is_read_by_rung():
 
 
 def test_the_graph_of_the_plan_is_exact():
-    """"The process, step by step": four terms over three buffers, split_c with a
+    """ "The process, step by step": four terms over three buffers, split_c with a
     repeated value, at all 24 assignments."""
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     case.add_input("c", c=[1.0, 2.0, 2.0, 4.0])
     a, b, c = case.symbol("a"), case.symbol("b"), case.symbol("c")
-    expr = (
-        7 * a**0.5
-        + a**0.7
-        + 9 * a**-2 * b**0.5
-        + sympy.Max(a / 2, b**0.5, c**0.25)
-    )
+    expr = 7 * a**0.5 + a**0.7 + 9 * a**-2 * b**0.5 + sympy.Max(a / 2, b**0.5, c**0.25)
     case.assert_exact(expr, bound=2.5)
 
 
@@ -1298,11 +1301,15 @@ def _positions(*sizes: int) -> list[InputIndex]:
     ]
 
 
-def _max(ladder: list[float], *operands: tuple[Index, tuple[int, ...]]) -> TableRealization:
+def _max(
+    ladder: list[float], *operands: tuple[Index, tuple[int, ...]]
+) -> TableRealization:
     """A Max by rung: its ladder on the max of its operands' rungs, each a position
     and its rung at each of the position's values."""
     rungs = tuple(CompactIndex(p, remap, len(ladder)) for p, remap in operands)
-    return TableRealization(values=ladder, index=ExtremeIndex(rungs, False, len(ladder)))
+    return TableRealization(
+        values=ladder, index=ExtremeIndex(rungs, False, len(ladder))
+    )
 
 
 def test_a_fold_numbers_only_the_tuples_that_occur_together():
@@ -1443,7 +1450,9 @@ def _maps(model: cp_model.CpModel) -> tuple[dict, dict]:
         "division_a": division,
         "_division_of_division_a": wrapper,
         "split_a": model.new_int_var(1, 32, "split_a"),
-        "gapped": model.new_int_var_from_domain(cp_model.Domain.from_values([1, 2, 4]), "g"),
+        "gapped": model.new_int_var_from_domain(
+            cp_model.Domain.from_values([1, 2, 4]), "g"
+        ),
         "wide": model.new_int_var(0, 10**6, "wide"),
         "number": 3,
     }
@@ -1466,7 +1475,9 @@ def test_the_inputs_come_from_the_printers_maps():
 
 def test_a_variable_with_gaps_in_its_domain_gets_a_position():
     case = Case()
-    var = case.model.new_int_var_from_domain(cp_model.Domain.from_values([1, 2, 4]), "g")
+    var = case.model.new_int_var_from_domain(
+        cp_model.Domain.from_values([1, 2, 4]), "g"
+    )
     g = sympy.Symbol("g", integer=True)
     case.inputs[g] = (var, [1, 2, 4])
     case.variables.append(var)
@@ -1502,7 +1513,10 @@ def test_a_failure_leaves_the_model_as_it_was():
     sym_map, buffer_map = _maps(model)
     split_a, tile_a, is_lx = sympy.symbols("split_a tile_a is_lx_a")
     before = str(model.proto)
-    for refused in (split_a + sympy.Symbol("nowhere"), split_a**0.5 + 1e14 * tile_a**0.5):
+    for refused in (
+        split_a + sympy.Symbol("nowhere"),
+        split_a**0.5 + 1e14 * tile_a**0.5,
+    ):
         with pytest.raises(TableLoweringError):
             lower_cost_with_tables(model, sym_map, buffer_map, refused, cap=CAP)
         assert str(model.proto) == before

@@ -2067,7 +2067,8 @@ class TestSolverCapabilities(unittest.TestCase):
                 "decides_lx_relayouts": True,
                 "chooses_tilings": True,
                 "tilings_from_menu": True,
-                "linear_cost_only": True,
+                # the printer's limit: the table lowering does not have it
+                "linear_cost_only": not ts_inductor_config.cpsat_table_lowering,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
         }

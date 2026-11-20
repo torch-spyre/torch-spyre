@@ -650,7 +650,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def linear_cost_only(cls) -> bool:
-        return True
+        """The printer lowers linear terms only; the table lowering has no such
+        limit."""
+        return not config.cpsat_table_lowering
 
     def __init__(
         self,
@@ -865,7 +867,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            if config.cpsat_table_lowering:
+                from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+                    lower_cost_with_tables,
+                )
+
+                # A refusal is a TableLoweringError, which the except below does not
+                # catch: with the tables on, no objective falls back to another solve.
+                cp_cost = lower_cost_with_tables(
+                    model, sym_map, buffer_map, cost_expr, cap=config.cpsat_table_cap
+                )
+            else:
+                cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution

@@ -2955,9 +2955,54 @@ class SolveStatsTest(TestCase):
         objective chose it."""
         solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
         unlowerable = sympy.Function("NoSuchNode")(solver.buffers[0].sym_is_lx)
-        with config.patch({"_cpsat_warn_on_cost_expr": True}):
+        with config.patch(
+            {"_cpsat_warn_on_cost_expr": True, "cpsat_table_lowering": False}
+        ):
             solver.plan_layout_and_core_divisions(unlowerable)
         self.assertFalse(solver.last_solve_stats["objective_used"])
+
+    def test_the_tables_refuse_an_unlowerable_objective_with_no_other_solve(self):
+        """With the table lowering there is no fallback: the refusal leaves the
+        solve as a TableLoweringError, which the except around the objective does
+        not turn into the traffic-objective solve."""
+        from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+            TableLoweringError,
+        )
+
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        unlowerable = sympy.Function("NoSuchNode")(solver.buffers[0].sym_is_lx)
+        with config.patch(
+            {"_cpsat_warn_on_cost_expr": True, "cpsat_table_lowering": True}
+        ):
+            with self.assertRaises(TableLoweringError):
+                solver.plan_layout_and_core_divisions(unlowerable)
+
+    def test_each_lowering_is_the_only_one_its_flag_calls(self):
+        """Flag on, the printer is never called; flag off, the table lowering is
+        never called. Either way the priced solve is the one that makes the plan."""
+        from torch_spyre._inductor.scratchpad import (
+            cpsat_table_lowering,
+            ilp_solver_ortools,
+        )
+
+        def never(*args, **kwargs):
+            raise AssertionError("the other lowering was called")
+
+        priced = lambda solver: 3 * solver.buffers[0].sym_is_lx + 1  # noqa: E731
+        for flag, module, name in (
+            (True, ilp_solver_ortools, "cost_expr_to_cpsat"),
+            (False, cpsat_table_lowering, "lower_cost_with_tables"),
+        ):
+            with self.subTest(cpsat_table_lowering=flag):
+                solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+                with (
+                    config.patch({"cpsat_table_lowering": flag}),
+                    mock.patch.object(module, name, never),
+                ):
+                    solver.plan_layout_and_core_divisions(priced(solver))
+                    self.assertEqual(CpSatLayoutSolver.linear_cost_only(), not flag)
+                self.assertEqual(solver.last_solve_stats["status"], "OPTIMAL")
+                self.assertTrue(solver.last_solve_stats["objective_used"])
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
