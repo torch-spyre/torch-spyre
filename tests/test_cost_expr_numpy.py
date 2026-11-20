@@ -27,6 +27,7 @@ from sympy.logic.boolalg import Boolean
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
 from torch_spyre._inductor.scratchpad.cost_expr_numpy import NUMPY_FUNC_MAP, numpy_eval
+from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
 # One division's menu: its two splits move together, as a buffer's candidates do.
@@ -82,6 +83,43 @@ EXPRESSIONS = [
 ]
 
 
+# Expressions of the classes whose functions take floats: the table lowering's, which
+# the printer leaves to its print methods.
+FLOAT_EXPRESSIONS = [
+    sympy.Abs(x - y),
+    sympy.floor(x / 4) + sympy.ceiling(y / 4),
+    sympy.log(x + y) * sympy.exp(-x / 8),
+    sympy.Piecewise((x, sympy.Not(sympy.And(x > 2, y > 2))), (y, True)),
+    sympy.Piecewise((x, sympy.ITE(x > 2, y > 2, y < 2)), (y, True)),
+]
+
+
+@pytest.mark.parametrize("expr", FLOAT_EXPRESSIONS, ids=str)
+def test_a_node_over_floats_is_sympys_value_at_every_entry(expr):
+    """Over a menu held as a float array, as the table lowering holds a list."""
+    env = {s: np.asarray(menu, dtype=float) for s, menu in MENU.items()}
+    got = np.broadcast_to(_value(expr, env), (4,))
+    for i in range(4):
+        exact = _sympy_value(expr, {s: menu[i] for s, menu in MENU.items()})
+        assert got[i] == pytest.approx(exact, rel=1e-12), i
+
+
+def test_a_relayout_charge_is_its_literal_times_the_price_at_its_division():
+    """At every literal and division, the value the class's own ``_imp_`` gives: 0
+    where the literal is 0 and at a division past the prices. The prices are numbers,
+    or lists of one length with the operands, as the table lowering hands them."""
+    is_lx = np.repeat([0.0, 1.0], 5)
+    division = np.tile([0.0, 1.0, 2.0, 3.0, 4.0], 2)
+    prices = (0.0, 65.0, 147.5)
+    expr = RelayoutCharge(sympy.Symbol("is_lx"), sympy.Symbol("division"), *prices)
+    expected = [RelayoutCharge._imp_(*point, *prices) for point in zip(is_lx, division)]
+    assert list(numpy_eval(expr, [is_lx, division, *prices])) == expected
+    lists = [np.full(10, price) for price in prices]
+    assert list(numpy_eval(expr, [is_lx, division, *lists])) == expected
+    unpriced = RelayoutCharge(sympy.Symbol("is_lx"), sympy.Symbol("division"))
+    assert list(numpy_eval(unpriced, [is_lx, division])) == [0.0] * 10
+
+
 @pytest.mark.parametrize("expr", EXPRESSIONS, ids=str)
 def test_a_node_is_sympys_value_at_every_entry(expr):
     """Over a menu held as an object array, as the printer holds its candidates, each
@@ -94,14 +132,15 @@ def test_a_node_is_sympys_value_at_every_entry(expr):
 
 
 def test_every_function_is_reached():
-    """The expressions above reach every class the core has a function for."""
+    """The expressions above, and the relayout charge, reach every class the core has
+    a function for."""
     reached = {
         cls
-        for expr in EXPRESSIONS
+        for expr in EXPRESSIONS + FLOAT_EXPRESSIONS
         for node in sympy.preorder_traversal(expr)
         for cls in type(node).__mro__
     }
-    assert set(NUMPY_FUNC_MAP) <= reached
+    assert set(NUMPY_FUNC_MAP) - reached == {RelayoutCharge}
 
 
 def test_a_plain_int_stays_exact_at_any_size():
@@ -151,8 +190,8 @@ def test_a_subclass_is_evaluated_as_its_class():
 
 
 def test_a_class_with_no_function_raises():
-    with pytest.raises(NotImplementedError, match="no numpy function for floor"):
-        numpy_eval(sympy.floor(x / 3), [np.asarray([1.0, 2.0])])
+    with pytest.raises(NotImplementedError, match="no numpy function for sinc"):
+        numpy_eval(sympy.sinc(x), [np.asarray([1.0, 2.0])])
 
 
 # ------------------------------------------------------------------- the printer
@@ -196,10 +235,11 @@ def test_the_printer_evaluates_its_candidates_through_the_core(monkeypatch):
             assert values[i] == exact, (expr, i)
 
 
-def test_the_printer_leaves_a_class_outside_the_core_to_its_print_methods():
-    """A node of a class the core has no function for has no candidate values, and
-    neither has a node above it, so the printer lowers them as it did before. A free
-    decision, here a residency literal, stops the evaluation the same way."""
+def test_the_printer_evaluates_only_the_classes_it_did():
+    """The core has functions the printer does not use. A node of a class outside the
+    printer's own list, here Abs, has no candidate values, and neither has a node
+    above it, so the printer lowers them as it did before the core. A free decision,
+    here a residency literal, stops the evaluation the same way."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
     printer, _ = _printer(cp_model.CpModel())
     resident = sympy.Symbol("resident", integer=True)

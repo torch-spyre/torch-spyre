@@ -36,10 +36,11 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 
 One table per node, and the root read as one lookup. A node's list is its function
 applied to its operands' lists, each read at every entry of the node's table. The
-function is the node's sympy class over placeholders, lambdified when the node is
-realized (``_lambdified``): nothing is kept once a lowering is done. It lowers an
-expression whose inputs fit the cap together and refuses anything wider. Nothing imports
-it yet.
+function is the numpy core's for the node's sympy class (``cost_expr_numpy.py``), the
+core the CP-SAT printer evaluates its candidates with. A node of a class the core has
+no function for lambdifies its class over placeholders when it is realized
+(``_lambdified``): nothing is kept once a lowering is done. It lowers an expression
+whose inputs fit the cap together and refuses anything wider. Nothing imports it yet.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 # One cost unit is COST_SCALE objective units: a table entry is
@@ -238,15 +240,44 @@ Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 # The form of an operand in its node's function: as it is (None), a condition
 # (CONDITION), or the base of a Mul's factor with a negative rational exponent, which
-# the function raises to that exponent (the exponent, a sympy.Rational).
+# the Mul divides by (the exponent, a sympy.Rational).
 CONDITION = "condition"
 Form: TypeAlias = "str | sympy.Rational | None"
 
 
+def _evaluate(
+    expr: sympy.Basic, forms: tuple[Form, ...], arguments: Sequence[np.ndarray]
+) -> Any:
+    """expr's list from arguments, its operands' lists in the forms they take, by the
+    numpy core's function of its class; by its class lambdified (_lambdified) when the
+    core has none.
+
+    A condition is compared with 0, as a table holds it as 1.0 or 0.0. A Mul divides
+    its other factors' product by the bases of its factors with a negative rational
+    exponent, each raised to the exponent's size, as lambdify prints a quotient: 98/a,
+    where 98*(1/a) is 1.9999999999999998 at a = 49."""
+    plain = [
+        argument != 0 if form == CONDITION else argument
+        for argument, form in zip(arguments, forms)
+        if form is None or form == CONDITION
+    ]
+    divisors = [
+        argument ** float(-form)  # type: ignore[operator]
+        for argument, form in zip(arguments, forms)
+        if not (form is None or form == CONDITION)
+    ]
+    try:
+        value = numpy_eval(expr, plain)
+    except NotImplementedError:
+        return _apply(_lambdified(expr.func, forms), arguments)
+    return value / math.prod(divisors) if divisors else value
+
+
 def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     """The function of a node of sympy class func whose operands take forms,
-    lambdified with the numpy module over one placeholder per operand. A node calls it
-    once, when it is realized, and nothing keeps the function after that.
+    lambdified with the numpy module over one placeholder per operand: the function of
+    a class the numpy core has none for. A node calls it once, when it is realized,
+    and nothing keeps the function after that.
 
     The placeholders are plain symbols, operand0, operand1, ..., whose names are
     Python identifiers, so lambdify takes them as they are. It renames every argument
@@ -376,7 +407,7 @@ class Node:
         with a value that is not finite is refused at the child, naming it, whether
         or not this node's value depends on it.
 
-        Its list is its function (_lambdified) applied to its operands' lists, each
+        Its list is its function (_evaluate) applied to its operands' lists, each
         read at every entry of its table: an operand on the node's own position as it
         is, one on fewer positions at its own position (Index.on_grid), and a constant
         at every entry. Two symbols on one position move together."""
@@ -409,9 +440,7 @@ class Node:
                 at = table.index.on_grid(grid)
                 arguments.append(np.broadcast_to(table.values[at], (index.size,)))
         values = _values(
-            self.expr,
-            index.size,
-            lambda: _apply(_lambdified(self.expr.func, forms), arguments),
+            self.expr, index.size, lambda: _evaluate(self.expr, forms, arguments)
         )
         return self._finite(TableRealization(values=values, index=index))
 

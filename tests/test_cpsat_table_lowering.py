@@ -736,11 +736,12 @@ def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
     return calls
 
 
-def test_a_node_lambdifies_its_function_once_and_nothing_keeps_it(monkeypatch):
-    """Each node lambdifies its own function, its class over placeholders, once, when
-    it is realized: forty terms of one shape make hundreds of nodes and a few distinct
-    functions. Nothing is kept between lowerings, so a second lowering lambdifies as
-    many again."""
+def test_a_node_is_lambdified_only_when_the_core_has_no_function(monkeypatch):
+    """A node's list comes from the numpy core's function of its class, with no
+    lambdify: forty terms of one shape make hundreds of nodes and none is lambdified.
+    A node of a class the core has no function for, here sinc and sec, lambdifies its
+    class over placeholders once, when it is realized. Nothing is kept between
+    lowerings, so a second lowering lambdifies as many again."""
     case = Case()
     case.add_input("a", a=[float(v) for v in range(1, 65)])
     case.add_input("b", b=[float(v) for v in range(1, 9)])
@@ -753,17 +754,16 @@ def test_a_node_lambdifies_its_function_once_and_nothing_keeps_it(monkeypatch):
         + sympy.Max(a**0.5, b / (i + 1))
         for i in range(40)
     ]
-    expr = sympy.Add(*terms)
+    expr = sympy.Add(*terms) + sympy.sinc(a) * sympy.sec(b / 16)
     calls = _count_lambdify(monkeypatch)
     nodes = _nodes(case, expr)
     nodes[expr].cp_expr(case.model)
-    computed = [n for n in nodes.values() if type(n) is Node]
-    assert len(calls) == len(computed) > 300
-    assert len({str(c) for c in calls}) <= 12
+    assert len([n for n in nodes.values() if type(n) is Node]) > 300
+    assert sorted(str(c) for c in calls) == ["sec(operand0)", "sinc(operand0)"]
     nodes[expr].cp_expr(cp_model.CpModel())  # a realization is kept by its node
-    assert len(calls) == len(computed)
+    assert len(calls) == 2
     _nodes(case, expr)[expr].cp_expr(cp_model.CpModel())
-    assert len(calls) == 2 * len(computed)
+    assert len(calls) == 4
     np.testing.assert_allclose(
         nodes[expr].realization.values, _stage_1(nodes[expr]), rtol=1e-12
     )

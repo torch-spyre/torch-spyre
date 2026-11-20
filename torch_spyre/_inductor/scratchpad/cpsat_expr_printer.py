@@ -74,6 +74,23 @@ _operator_map = {
 }
 
 
+# The classes whose value over a buffer's candidates _evaluate_candidates computes with
+# the numpy core. The core has functions for more (floor, log, ...): a node of any other
+# class is left to its print method.
+_CANDIDATE_CLASSES = (
+    sympy.Add,
+    sympy.Mul,
+    sympy.Pow,
+    sympy.Min,
+    sympy.Max,
+    sympy.core.relational.Relational,
+    sympy.And,
+    sympy.Or,
+    sympy.Piecewise,
+    sympy.KroneckerDelta,
+)
+
+
 def _eq_fact(rel):
     """``(lhs, number)`` for ``Eq``/``Ne`` with a numeric side, else None."""
     lhs, rhs = rel.args
@@ -279,10 +296,9 @@ class _SympyExprToCpSat(Printer):
         owner = owners[0] if owners else None
         if any(other is not owner for other in owners):
             return None
-        try:
-            return owner, numpy_eval(expr, [value[1] for value in evaluated])
-        except NotImplementedError:
-            return None  # a class the numpy core has no function for
+        if not isinstance(expr, _CANDIDATE_CLASSES):
+            return None
+        return owner, numpy_eval(expr, [value[1] for value in evaluated])
 
     def _division_table(self, expr):
         evaluated = self._candidate_values(expr)

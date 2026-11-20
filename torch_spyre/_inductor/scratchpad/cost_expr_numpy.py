@@ -20,8 +20,10 @@ number, a truth value, or a numpy array of them with one entry per candidate: ev
 function works entry by entry, and a number stands for itself at every entry.
 
 The core reads no symbol and walks no expression: its caller evaluates a node's
-operands and hands over their values. The CP-SAT printer's candidate evaluation
-(``cpsat_expr_printer.py``) is that caller.
+operands and hands over their values. It has two callers. The CP-SAT printer
+(``cpsat_expr_printer.py``) evaluates a node over one buffer's candidates, held as
+exact ints. The table lowering (``cpsat_table_lowering.py``) computes each node's float
+list from its operands' lists.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ from typing import Any
 
 import numpy as np
 import sympy
+
+from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 
 def _fold(binary: Callable[[Any, Any], Any]) -> Callable[..., Any]:
@@ -55,14 +59,29 @@ def _piecewise(*parts: Any) -> Any:
     return result
 
 
+def _relayout_charge(is_lx: Any, division: Any, *prices: Any) -> Any:
+    """``RelayoutCharge(is_lx, division, *prices)``: is_lx times the price at the
+    division, 0 at a division past the prices, the division rounded to the nearest
+    integer as the class's own ``_imp_`` rounds it."""
+    index = np.rint(division)
+    priced = [index == i for i in range(len(prices))]
+    return is_lx * (np.select(priced, prices, default=0.0) if priced else 0.0)
+
+
 # Add, Mul, Pow and the relationals are Python's own: a numpy array takes them entry by
 # entry, and a plain int stays exact at any size, where np.add(2**62, 2**62) wraps.
+# floor, ceiling, log and exp are numpy's, which take floats and not exact ints.
 NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Add: lambda *values: sum(values),
     sympy.Mul: lambda *values: math.prod(values),
     sympy.Pow: operator.pow,
+    sympy.Abs: np.abs,
     sympy.Min: _fold(np.minimum),
     sympy.Max: _fold(np.maximum),
+    sympy.floor: np.floor,
+    sympy.ceiling: np.ceil,
+    sympy.log: np.log,
+    sympy.exp: np.exp,
     sympy.Eq: operator.eq,
     sympy.Ne: operator.ne,
     sympy.Lt: operator.lt,
@@ -71,8 +90,11 @@ NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Ge: operator.ge,
     sympy.And: _fold(np.logical_and),
     sympy.Or: _fold(np.logical_or),
+    sympy.Not: np.logical_not,
+    sympy.ITE: np.where,
     sympy.Piecewise: _piecewise,
     sympy.KroneckerDelta: np.equal,
+    RelayoutCharge: _relayout_charge,
 }
 
 
