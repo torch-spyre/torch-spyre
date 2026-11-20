@@ -41,10 +41,32 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.hbm_pool_planning import Allocator, hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
+from torch_spyre.ops.fallbacks import register_fallback
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
+
+
+@torch.library.custom_op("spyre::test_host_copy", mutates_args=())
+def _host_copy(x: torch.Tensor) -> torch.Tensor:
+    """A copy that always runs on the host, splitting a compiled graph's bundles.
+
+    The bundle-boundary tests need an op that falls back to the host. A real
+    op on the fallback list leaves it once it gains a Spyre implementation, so
+    these tests own one instead.
+    """
+    return x.clone()
+
+
+@_host_copy.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@register_fallback(["spyre::test_host_copy"])
+def _host_copy_fallback(x, **kwargs):
+    return x.clone()
 
 
 class TestAllocator(unittest.TestCase):
@@ -774,7 +796,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
     @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
-        """A CPU-fallback op (torch.tril) splits the graph into multiple
+        """A CPU-fallback op (spyre::test_host_copy) splits the graph into multiple
         bundles. With frontend_pool_allocation at its default (False), each
         bundle's pool (if any) is allocated inside that bundle's own
         generated MLIR via sdscbundle.device_mem_allocate -- there is no
@@ -784,7 +806,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
-            b = torch.tril(a)  # fallback op -- forces a bundle boundary
+            b = torch.ops.spyre.test_host_copy(a)  # host fallback: a bundle boundary
             c = torch.exp(b) * 2  # compiled bundle 2
             return c
 
@@ -863,7 +885,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2
-            b = torch.tril(a)  # fallback op -- forces a bundle boundary
+            b = torch.ops.spyre.test_host_copy(a)  # host fallback: a bundle boundary
             c = torch.exp(b) * 2
             return c
 

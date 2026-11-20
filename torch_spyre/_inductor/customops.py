@@ -835,6 +835,33 @@ def _constant(
     return fill_value
 
 
+@torch.library.custom_op("spyre::arange", mutates_args=(), device_types="spyre")
+def spyre_arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    # Marks a cacheable coordinate in the FX graph: the [0, length) ramp, or its
+    # [length, 1] column form when column is set.  Lowering turns this into a
+    # SpyreArangeFallback, whose codegen emits the memoized runtime call.  owned
+    # asks for a private copy rather than the shared cached buffer.
+    pass
+
+
+@spyre_arange.register_fake
+def _arange(
+    length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    column: bool = False,
+    owned: bool = False,
+) -> torch.Tensor:
+    size = (length, 1) if column else (length,)
+    return torch.empty(size, dtype=dtype, device=device)
+
+
 @torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
 def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     warn_fallback(f"conversion from {input.dtype} to {dtype}")
@@ -1198,100 +1225,6 @@ def _(
     device: torch.device,
 ) -> torch.Tensor:
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
-
-
-@torch.library.custom_op("spyre::triu_cpu", mutates_args=())
-def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    """
-    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
-
-    The mask-multiply decomposition needs an elementwise mul, which the device
-    rejects for the narrow integral formats (uint8 -> SENUINT32, int8 ->
-    SENINT8, int32 -> IEEE_INT32); torch.where is rejected for the same
-    formats, so there is no on-device masking path at all.  Mirrors
-    max_dim_int64_fallback: the Spyre kernel is registered in fallbacks.py, and
-    this CompositeExplicitAutograd body computes the real result so calls with
-    non-Spyre inputs (e.g. compare_with_cpu paths) still work.
-    """
-    return torch.triu(input, diagonal)
-
-
-@triu_cpu.register_fake
-def _(input: torch.Tensor, diagonal: int) -> torch.Tensor:
-    return torch.empty_like(input)
-
-
-@torch.library.custom_op("spyre::triu_mask", mutates_args=())
-def triu_mask(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build an upper triangular mask on CPU and transfer to the target device.
-
-    Shape: [H, W] in the input's dtype
-
-    Built entirely on CPU so the construction is opaque to torch.compile —
-    assert_functional_graph is satisfied and the compiled graph only sees the
-    resulting device tensor.  No device_types restriction is set because there
-    are no tensor arguments to dispatch on; the device is an explicit parameter.
-    """
-    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
-    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
-    return mask.to(device=device)
-
-
-@triu_mask.register_fake
-def _(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(h, w, dtype=dtype, device=device)
-
-
-@torch.library.custom_op("spyre::tril_mask", mutates_args=())
-def tril_mask(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build a lower triangular 0/1 mask on CPU and transfer to the target device.
-
-    Shape: [H, W] in the requested dtype. Follows ``torch.tril``: element
-    ``(i, j)`` is 1 when ``j - i <= diagonal``, so ``diagonal=0`` keeps the main
-    diagonal and everything below it.
-
-    The mirror of ``spyre::triu_mask``, built the same way for the same
-    reason: construction on CPU is opaque to torch.compile, so
-    assert_functional_graph is satisfied and the compiled graph only sees the
-    resulting device tensor. Linear attention multiplies its intra-chunk scores
-    by this mask (there is no softmax to carry an additive ``-inf`` mask).
-    """
-    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
-    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) <= diagonal).to(dtype=dtype)  # [H, W]
-    return mask.to(device=device)
-
-
-@tril_mask.register_fake
-def _(
-    h: int,
-    w: int,
-    diagonal: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.empty(h, w, dtype=dtype, device=device)
 
 
 @torch.library.custom_op(
@@ -1674,8 +1607,6 @@ mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
-mark_lx_safe(torch.ops.spyre.triu_mask.default)
-mark_lx_safe(torch.ops.spyre.tril_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)

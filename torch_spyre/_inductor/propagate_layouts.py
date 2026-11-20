@@ -83,6 +83,7 @@ from .ir import (
     SpyreCollectiveKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
 )
 from .pass_utils import (
     collapse_valid_elements,
@@ -3851,6 +3852,12 @@ def propagate_spyre_tensor_layouts(
                 f"{op.python_kernel_name}: upstream lowers this form to a "
                 f"mutating fallback, which has no Spyre kernel"
             )
+        elif isinstance(op, SpyreArangeFallback):
+            # A coordinate's device layout is fixed at construction, so it offers
+            # no alternatives to propagate; committing it here lets consumers read
+            # the stick constraint like they would from a graph input.
+            op.layouts = [op.get_layout().device_layout]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

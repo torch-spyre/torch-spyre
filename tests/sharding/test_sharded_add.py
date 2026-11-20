@@ -47,8 +47,30 @@ from device_env import device_available, emulation_ready, mode_usable
 from torch.distributed.tensor import Shard
 
 from torch_spyre.execution import kernel_runner
+from torch_spyre.ops.fallbacks import register_fallback
 
 _STRIDE_REJECTION = "shard-local strides equal to the global ones"
+
+
+@torch.library.custom_op("spyre::test_sharding_host_copy", mutates_args=())
+def _host_copy(x: torch.Tensor) -> torch.Tensor:
+    """A copy that always runs on the host, as a fallback kernel in a graph.
+
+    The fallback-consumer test needs an op that falls back to the host. A real
+    op on the fallback list leaves it once it gains a Spyre implementation, so
+    the test owns one instead.
+    """
+    return x.clone()
+
+
+@_host_copy.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@register_fallback(["spyre::test_sharding_host_copy"])
+def _host_copy_fallback(x, **kwargs):
+    return x.clone()
 
 
 def expects_raise(test):
@@ -645,16 +667,6 @@ def test_dynamic_shapes_fail_at_compile():
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
-    from torch_spyre.ops.fallbacks import fallback_ops
-
-    # The op must still be a Spyre fallback. An op that gets a lowering becomes
-    # a ComputedBuffer, which the op-kind check rejects first, so this test
-    # would no longer reach the fallback-consumer check (torch.cumsum, used
-    # here before, got a lowering in #3389).
-    assert torch.ops.aten.tril.default in fallback_ops, (
-        "aten.tril is no longer a Spyre fallback; pick another op from "
-        "torch_spyre/ops/fallbacks.py"
-    )
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
@@ -662,7 +674,9 @@ def test_fallback_consumer_fails_at_compile():
     # The fallback's result is the graph output: an op that combined it with
     # a sharded operand would be rejected first, as mixed sharded/unsharded.
     with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
-        torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
+        torch.compile(
+            lambda x: torch.ops.spyre.test_sharding_host_copy(x), dynamic=False
+        )(a)
 
 
 @_requires_emulation
