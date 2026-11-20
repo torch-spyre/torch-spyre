@@ -27,6 +27,7 @@ import contextlib
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor import spyre_hint
@@ -1250,8 +1251,7 @@ def paged_gather_fn(
     stays invariant and only one page is live per trip. That index is a POINT
     read -- one int32 element whose address moves with the spliced loop var and
     which carries no iteration dim of its own -- so it is the shape coarse
-    tiling handles through squeezed_advance_per_read rather than a tiled dim
-    (the advance is read off the index). Pre-gathering the pages
+    tiling reads off the index rather than from a tiled dim. Pre-gathering the pages
     ahead of the loop would compile without any of that, at the cost of keeping
     the whole sequence's K/V live across it.
     """
@@ -1643,6 +1643,64 @@ def restickify_matmul_xt_y_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         return None, x_tile.t() @ y_whole
 
     _, out = for_each_tile(body, (X, Y), dims=(1, None), tile_size=64, out_dim=0)
+    return out
+
+
+# -- Embedding gather with a loop-invariant restickified table (issue #6277) --
+
+EMBED_TABLE_ROWS, EMBED_TABLE_HIDDEN, EMBED_VOCAB = 49216, 4096, 49159
+EMBED_TOKENS, EMBED_TILE = 256, 64
+
+
+def embedding_restickify_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    """(table, ids) sized to reproduce issue #6277.
+
+    table is a (49216, 4096) fp16 gather source: 403 MB, over the 256 MB
+    per-core span limit were it ever resident on one core in full -- the
+    span insert_restickify's full-table copy carries before any
+    work-division split. ids draws EMBED_TOKENS random rows from it, tiled
+    EMBED_TILE at a time by the for_each_tile loop below.
+    """
+    gen = torch.Generator().manual_seed(0)
+    table = (
+        torch.randn(EMBED_TABLE_ROWS, EMBED_TABLE_HIDDEN, generator=gen) * 0.02
+    ).to(torch.float16)
+    ids = torch.randint(
+        0, EMBED_VOCAB, (EMBED_TOKENS, 1), generator=gen, dtype=torch.int64
+    )
+    return table, ids
+
+
+def embedding_restickify_table_fn(
+    table: torch.Tensor, ids: torch.Tensor
+) -> torch.Tensor:
+    """F.embedding(ids, table): ids tiled by for_each_tile, table invariant.
+
+    Regression fixture for issue #6277. `table` is not itself a tiled
+    operand (dims=(None, 0)): the indirect-access layout the embedding op
+    needs forces insert_restickify.py to materialize a full, untiled
+    relayout copy of `table` inside the loop body. Building that copy calls
+    _transfer_loop_info's `elif hasattr(op, "loop_info")` branch, which deep-
+    copies the embedding consumer's CoarseTileInfo onto the copy buffer.
+    Before the fix, the consumer's own `loop_tiled_dims` (its per-tile token
+    axis) survived that copy onto the table buffer's unrelated row dim;
+    work_division_constraints.py's coarse_tile_local_dim_split_domains then
+    read that as "the copy's row dim is loop-tiled" and pinned its core
+    split to 1 -- blocking the only split that keeps the 403 MB copy under
+    the 256 MB per-core span limit, so this failed with "per-core tensor
+    span 384.500 MB ... exceeds hardware limit of 256.00 MB" even though
+    plain (non-looped) embedding over the same table compiles fine (see
+    test_embedding_large_vocab_table_no_span_overflow in
+    test_indirect_access_gather.py).
+    """
+
+    def body(_, tiles):
+        table_whole, id_tile = tiles
+        return None, F.embedding(id_tile.flatten().long(), table_whole)
+
+    _, out = for_each_tile(
+        body, (table, ids), dims=(None, 0), tile_size=EMBED_TILE, out_dim=0
+    )
     return out
 
 
