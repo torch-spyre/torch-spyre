@@ -154,6 +154,14 @@ def _compute_live_ranges(
         for dep in rw.writes:
             if dep.name in pool_candidates:
                 start[dep.name] = idx
+                if isinstance(node, CountedLoopSchedulerNode):
+                    # A counted loop is one opaque step: a buffer it writes is
+                    # live at least through that step (every trip), whether
+                    # or not its node keeps the internal read (a
+                    # LoopSchedulerNode keeps external reads only).  Without
+                    # this, such a buffer would stay live to the end of the
+                    # bundle and block reuse by a later sibling loop.
+                    end[dep.name] = max(end.get(dep.name, idx), idx)
         for dep in rw.reads:
             if dep.name in pool_candidates:
                 end[dep.name] = idx
@@ -450,6 +458,23 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         name, (start, end) = item
         return (start, end, name)
 
+    # A cat/pad output buffer is an empty NopKernelSchedulerNode whose storage the
+    # copy kernels (MutationLayoutSHOULDREMOVE aliases) write into; they share the
+    # nop's layout.allocation dict. The nop itself is never a pool candidate, so map
+    # each nop by that dict's id: when the dict is pooled below, the nop's own
+    # standalone allocation becomes dead and is dropped. Nops are top-level nodes
+    # (never inside a bundle), so this scans all flat nodes once.
+    nop_names_by_alloc_id: dict[int, list[str]] = {}
+    for snode in all_flat_nodes:
+        if not isinstance(snode, NopKernelSchedulerNode):
+            continue
+        for out in snode.get_outputs():
+            nop_name = out.get_name()
+            aid = _alloc_id(nop_name)
+            if aid is None or aid in io_alloc_ids:
+                continue
+            nop_names_by_alloc_id.setdefault(aid, []).append(nop_name)
+
     for bundle in nodes:
         bundle_name = bundle.get_name()
         # Restrict to buffers this bundle actually writes -- buffer_writer_
@@ -595,6 +620,23 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                     # V.graph.removed_buffers before iterating, so adding the
                     # name here keeps it out of codegen entirely.
                     V.graph.removed_buffers.add(name)
+
+            # A nop sharing this (now pooled) allocation dict -- the output buffer
+            # of a cat/pad -- has its storage relocated into the pool by the write
+            # above, so its own wrapper allocation would be dead. removed_buffers
+            # (not should_allocate) drops both its AllocateLine and any
+            # FreeIfNotReusedLine at wrapper plan time. This is safe here: kernel
+            # load()/store() already ran in prepare_spyre_kernels, and pooled
+            # layouts never reach KernelArgs.input/output.
+            for nop_name in nop_names_by_alloc_id.get(id(layout.allocation), ()):
+                V.graph.removed_buffers.add(nop_name)
+                logger.debug(
+                    "hbm_pool_planning: bundle=%s  nop %s shares pooled allocation "
+                    "of %s -- dropping its standalone allocation",
+                    bundle_name,
+                    nop_name,
+                    rep_name,
+                )
 
         peak = allocator.get_peak_usage()
         pool_extent = allocator.get_pool_end()

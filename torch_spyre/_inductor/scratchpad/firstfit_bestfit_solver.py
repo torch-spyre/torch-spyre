@@ -116,10 +116,6 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         return False
 
     @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return False
-
-    @classmethod
     def linear_cost_only(cls) -> bool:
         return False
 

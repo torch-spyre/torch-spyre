@@ -64,6 +64,26 @@ DEVICE = "spyre"
 DTYPE = torch.float16
 
 
+class TestCopyFromD2DNestedCompile(unittest.TestCase):
+    def test_copy_during_compiler_internal_tracing(self):
+        from torch._dynamo.eval_frame import _use_eager_on_nested_compile
+
+        for shape in ((), (2, 64)):
+            with self.subTest(shape=shape):
+                expected = torch.full(shape, 3.0, dtype=DTYPE)
+                src = expected.to(DEVICE)
+                dst = torch.full(shape, -1.0, dtype=DTYPE, device=DEVICE)
+                with _use_eager_on_nested_compile():
+                    # This tracing mode does not require no_dispatch(); checking
+                    # the key ensures only the nested-compile condition saves us.
+                    self.assertFalse(
+                        torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
+                    )
+                    result = dst.copy_(src)
+                self.assertIs(result, dst)
+                torch.testing.assert_close(dst.cpu(), expected)
+
+
 class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
     """Contiguous slices at varying offsets — the core reproducer."""
 

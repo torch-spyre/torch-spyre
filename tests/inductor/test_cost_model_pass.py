@@ -789,15 +789,22 @@ def test_relayout_fields_survive_schema_roundtrip_and_old_records():
 
 
 def test_relayout_split_clamps_to_fitted_range():
-    # Past split 8 the law over-predicts 12-40% (measured at 16): clamp, never
-    # extrapolate. Below 2 the fitted intercept would go negative: clamp up.
-    f16 = _relayout_feats(2097152, 16, 512, 16)
-    f8 = _relayout_feats(2097152, 16, 512, 8)
-    # The WHOLE term clamps: split 16 prices exactly as split 8. Measured, the
-    # unclamped law over-predicts split 16 by 12-40%; the clamp under-predicts
-    # it by ~15% -- bounded either way, and never an extrapolated log2.
-    assert cost_model.relayout_ns(f16) == pytest.approx(cost_model.relayout_ns(f8))
+    # The law is measured at splits 2-32: clamp into that range, never
+    # extrapolate. Inside it the law is evaluated at the true split (split 16
+    # no longer prices as split 8); above it the WHOLE term clamps to the top
+    # of the range; below 2 the fitted intercept would go negative: clamp up.
+    p = cost_model.CostParams()
+    assert (p.relayout_split_min, p.relayout_split_max) == (2, 32)
+    f8 = _relayout_feats(2097152, 32, 512, 8)
+    f16 = _relayout_feats(2097152, 32, 512, 16)
+    f32 = _relayout_feats(2097152, 32, 512, 32)
+    f64 = _relayout_feats(2097152, 32, 512, 64)
+    assert cost_model.relayout_ns(f16) > cost_model.relayout_ns(f8)
+    assert cost_model.relayout_ns(f32) > cost_model.relayout_ns(f16)
+    assert cost_model.relayout_ns(f64) == pytest.approx(cost_model.relayout_ns(f32))
     f1 = _relayout_feats(2097152, 8, 512, 1)
+    f2 = _relayout_feats(2097152, 8, 512, 2)
+    assert cost_model.relayout_ns(f1) == pytest.approx(cost_model.relayout_ns(f2))
     assert cost_model.relayout_ns(f1) > 0.0  # clamped up to 2: never negative
 
 

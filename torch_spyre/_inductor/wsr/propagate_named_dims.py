@@ -52,15 +52,15 @@ hints_logger = get_inductor_logger("wsr.assign_dim_hints")
 # Used for propagation of named dims if this pass runs.
 # This pass does not run unless the driver program called name_tensor_dims.
 _named_dims: dict[str, int] = {}
+# Names are kept until reset(), which assign_dim_hints calls at the end of every
+# compilation. A compilation runs the pass only when one of its own inputs is
+# named (see _graph_has_named_inputs).
 _named_tensor_dims = WeakTensorKeyDictionary()
-_enabled = False
 
 
 def reset():
-    global _enabled
     _named_dims.clear()
     _named_tensor_dims.clear()
-    _enabled = False
 
 
 def declare_tensor_dim(name: str, size: int) -> None:
@@ -69,9 +69,13 @@ def declare_tensor_dim(name: str, size: int) -> None:
 
 
 def name_tensor_dims(tensor: torch.Tensor, named_dims: list[str]) -> torch.Tensor:
-    """Annotate a tensor with its named dimensions: [name, ...]"""
-    global _enabled
-    _enabled = True
+    """Annotate a tensor with its named dimensions: [name, ...]
+
+    The next compilation that takes ``tensor`` as an input propagates the
+    names; compilations of other tensors do not. Every compilation clears all
+    names when it ends, so name the tensor again before each compilation that
+    should use them.
+    """
     _named_tensor_dims[tensor] = named_dims
     return tensor
 
@@ -491,7 +495,7 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         elif isinstance(op, SpyreConstantFallback):
             _set_no_named_dims(op)
         else:
-            logger.warning(f"unhandled operation type {type(op)}")
+            logger.debug(f"unhandled operation type {type(op)}")
             _set_no_named_dims(op)
 
     if logger.isEnabledFor(logging.INFO):
@@ -521,16 +525,29 @@ def _graph_has_named_dims_hint(graph: GraphLowering) -> bool:
     )
 
 
+def _graph_has_named_inputs(graph: GraphLowering) -> bool:
+    """Whether a tensor passed to this compilation was named by name_tensor_dims()."""
+    if not len(_named_tensor_dims):
+        return False
+    try:
+        real_inputs = V.get_real_inputs()
+        return any(
+            isinstance(tensor, torch.Tensor) and tensor in _named_tensor_dims
+            for _, tensor in zip(graph.graph_input_names, real_inputs)
+        )
+    except TypeError:  # no real inputs installed (NullHandler)
+        return False
+
+
 def propagate_named_dims(
     graph: GraphLowering,
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
-    global _enabled
-    # Run when a driver called name_tensor_dims() (_enabled) OR when the graph
-    # itself carries an in-graph named_dims hint. Do not set _enabled here — the
-    # finally block still resets it, and _graph_has_named_dims_hint re-derives
-    # the in-graph case each run.
-    if not (_enabled or _graph_has_named_dims_hint(graph)):
+    # Run when this compilation's own inputs were named with name_tensor_dims()
+    # OR when the graph itself carries an in-graph named_dims hint. Both are
+    # derived from this graph, so nothing armed for one compilation can make an
+    # unrelated later one (say after a call served from the compile cache) run.
+    if not (_graph_has_named_inputs(graph) or _graph_has_named_dims_hint(graph)):
         return
     try:
         _propagate_named_dims_impl(graph)
@@ -543,9 +560,6 @@ def propagate_named_dims(
         # compilation, so clear them here on the error path only.
         _named_dims.clear()
         raise
-    finally:
-        _named_tensor_dims.clear()
-        _enabled = False
 
 
 def validate_named_dims(graph: GraphLowering) -> None:

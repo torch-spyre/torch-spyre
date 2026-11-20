@@ -27,6 +27,7 @@ import contextlib
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor import spyre_hint
@@ -219,6 +220,42 @@ def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         def inner_body(acc, inner_ops):
             x_inner_tile, y_inner_tile = inner_ops
             return acc + x_inner_tile @ y_inner_tile, None
+
+        m_tile = x_tile.shape[0]
+        final, _ = for_each_tile(
+            inner_body,
+            (x_tile, y_whole),
+            dims=(-1, 0),
+            tile_size=64,
+            init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+        )
+        return None, final
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
+def nested_split_m_then_k_hinted_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """nested_split_m_then_k_fn, with a spyre_hint inside the INNER for_each_tile's body.
+
+    Regression fixture for cyang49's PR #5057 review: the inner scan's combine-fn
+    subgraph is reached only through the outer scan's own combine-fn subgraph, not
+    visible to a root-level-only walk. By the time the outer scan's combine-fn is
+    snapshotted, Inductor has already decomposed the inner scan into its own
+    while_loop (verified empirically), so the inner hint's recovery is actually
+    carried by that inner for_each_tile's own collect/recover cycle running before
+    the outer one -- not by any recursion into the outer scan's snapshot. This
+    fixture pins that the hint still survives end to end regardless.
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+
+        def inner_body(acc, inner_ops):
+            x_inner_tile, y_inner_tile = inner_ops
+            with spyre_hint(work_div={"K": 2}):
+                return acc + x_inner_tile @ y_inner_tile, None
 
         m_tile = x_tile.shape[0]
         final, _ = for_each_tile(
@@ -1007,6 +1044,28 @@ def abs_tiled_reference(A: torch.Tensor) -> torch.Tensor:
     return A.abs()
 
 
+def upcast_add_tiled_fn(
+    A: torch.Tensor, tile_size: int, downcast_in_body: bool
+) -> torch.Tensor:
+    """Map mode: fp16 -> fp32 conversion inside the body, then ``+ 1``.
+
+    The result returns to fp16 inside the body or, with ``downcast_in_body``
+    false, after the loop, so the loop also writes an fp32 output.
+    """
+
+    def body(_, ops):
+        (a_tile,) = ops
+        out = a_tile.float() + 1.0
+        return None, out.half() if downcast_in_body else out
+
+    _, out = for_each_tile(body, (A,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out.half()
+
+
+def upcast_add_tiled_reference(A: torch.Tensor) -> torch.Tensor:
+    return (A.float() + 1.0).half()
+
+
 def abs_add_mul_tiled_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, tile_size: int
 ) -> torch.Tensor:
@@ -1048,6 +1107,71 @@ def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
 
 def softmax_row_tiled_reference(X: torch.Tensor) -> torch.Tensor:
     return torch.softmax(X, dim=-1)
+
+
+def reshape_sum_tiled_fn(
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
+) -> torch.Tensor:
+    """Map mode: reshape each tile to (group, -1, cols) and reduce dim 0.
+
+    The reduction axis exists only in the reshaped view of the tile, so its
+    input stride is a multiple of the tile's own row stride -- the load
+    shape whose reduce variable used to be dropped while inlining the tile
+    marker (issue #6407). ``dim=1`` tiles columns: the tile then reads its
+    input at a row stride different from its own layout's, so the read is
+    only right if the reduce term is folded into the row dim.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        return None, x_tile.reshape(group, -1, x_tile.shape[-1]).sum(dim=0)
+
+    _, out = for_each_tile(body, (X,), dims=(dim,), tile_size=tile_size, out_dim=dim)
+    return out
+
+
+def reshape_sum_tiled_reference(
+    X: torch.Tensor, tile_size: int, group: int, dim: int = 0
+) -> torch.Tensor:
+    return torch.cat(
+        [
+            tile.reshape(group, -1, tile.shape[-1]).sum(dim=0)
+            for tile in X.split(tile_size, dim=dim)
+        ],
+        dim=dim,
+    )
+
+
+def reshape_mul_sum_tiled_fn(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    """Map mode: reduce (row-tile * W) over a reshaped axis, W passed whole.
+
+    W's read keeps the reduce variable even where the tile's read loses it,
+    so issue #6407 did not crash here: it compiled and every reduce step read
+    the same window of the tile.
+    """
+
+    def body(_, ops):
+        x_tile, w = ops
+        shape = (group, -1, x_tile.shape[-1])
+        return None, (x_tile.reshape(shape) * w.reshape(shape)).sum(dim=0)
+
+    _, out = for_each_tile(body, (X, W), dims=(0, None), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def reshape_mul_sum_tiled_reference(
+    X: torch.Tensor, W: torch.Tensor, tile_size: int, group: int
+) -> torch.Tensor:
+    shape = (group, -1, X.shape[-1])
+    return torch.cat(
+        [
+            (tile.reshape(shape) * W.reshape(shape)).sum(dim=0)
+            for tile in X.split(tile_size, dim=0)
+        ],
+        dim=0,
+    )
 
 
 def nested_add_outer_row_inner_col_fn(
@@ -1127,8 +1251,7 @@ def paged_gather_fn(
     stays invariant and only one page is live per trip. That index is a POINT
     read -- one int32 element whose address moves with the spliced loop var and
     which carries no iteration dim of its own -- so it is the shape coarse
-    tiling handles through squeezed_advance_per_read rather than a tiled dim
-    (see coarse_tile._point_splice_advance_for_dep). Pre-gathering the pages
+    tiling reads off the index rather than from a tiled dim. Pre-gathering the pages
     ahead of the loop would compile without any of that, at the cost of keeping
     the whole sequence's K/V live across it.
     """
@@ -1229,6 +1352,64 @@ def paged_gather_kv_reference(
     for p in PAGE_ORDER:
         acc = acc + (qf @ kf[p].transpose(0, 1)) @ vf[p]
     return acc
+
+
+def paged_gather_kv_one_hinted_fn(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    table: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Two sibling paged_gather_kv_fn-shaped scans; only the second carries a
+    spyre_hint on its K/V-page gather and matmuls, like spyre-inference's real
+    page_attn_head_major_prefill_kernel block_body (K/V gather + Q@K^T, P@V).
+
+    Regression fixture for recover_spyre_hints's scan<->while_loop_body
+    positional pairing (torch-spyre PR #5057 / cyang49's review): the first
+    scan is deliberately unhinted so collect_spyre_hints must still snapshot
+    it (as an empty entry) -- otherwise the second scan's hinted body would
+    shift out of alignment against `body_nodes` in
+    _recover_hop_subgraph_hints and lose its hint.
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    def plain_body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        k_page = k_all.index_select(0, page_idx).squeeze(0)
+        v_page = v_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ k_page.transpose(0, 1)
+        return acc + scores @ v_page, None
+
+    def hinted_body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        matmul_split = {"Lq": 4}
+        with spyre_hint(named_dims=["Pool", "Hs"], work_div=matmul_split):
+            k_page = k_all.index_select(0, page_idx).squeeze(0)
+            v_page = v_all.index_select(0, page_idx).squeeze(0)
+        with spyre_hint(named_dims=["Lq", "Pool"], work_div=matmul_split):
+            scores = q_whole @ k_page.transpose(0, 1)
+        with spyre_hint(named_dims=["Lq", "Hs"], work_div=matmul_split):
+            out_tile = scores @ v_page
+        return acc + out_tile, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    a, _ = for_each_tile(
+        plain_body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    b, _ = for_each_tile(
+        hinted_body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return a + b
 
 
 # Half of PAGE_LQ (32): like NESTED_SOFTMAX_OUTER_TILE_SIZE above, chosen so
@@ -1465,6 +1646,64 @@ def restickify_matmul_xt_y_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# -- Embedding gather with a loop-invariant restickified table (issue #6277) --
+
+EMBED_TABLE_ROWS, EMBED_TABLE_HIDDEN, EMBED_VOCAB = 49216, 4096, 49159
+EMBED_TOKENS, EMBED_TILE = 256, 64
+
+
+def embedding_restickify_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    """(table, ids) sized to reproduce issue #6277.
+
+    table is a (49216, 4096) fp16 gather source: 403 MB, over the 256 MB
+    per-core span limit were it ever resident on one core in full -- the
+    span insert_restickify's full-table copy carries before any
+    work-division split. ids draws EMBED_TOKENS random rows from it, tiled
+    EMBED_TILE at a time by the for_each_tile loop below.
+    """
+    gen = torch.Generator().manual_seed(0)
+    table = (
+        torch.randn(EMBED_TABLE_ROWS, EMBED_TABLE_HIDDEN, generator=gen) * 0.02
+    ).to(torch.float16)
+    ids = torch.randint(
+        0, EMBED_VOCAB, (EMBED_TOKENS, 1), generator=gen, dtype=torch.int64
+    )
+    return table, ids
+
+
+def embedding_restickify_table_fn(
+    table: torch.Tensor, ids: torch.Tensor
+) -> torch.Tensor:
+    """F.embedding(ids, table): ids tiled by for_each_tile, table invariant.
+
+    Regression fixture for issue #6277. `table` is not itself a tiled
+    operand (dims=(None, 0)): the indirect-access layout the embedding op
+    needs forces insert_restickify.py to materialize a full, untiled
+    relayout copy of `table` inside the loop body. Building that copy calls
+    _transfer_loop_info's `elif hasattr(op, "loop_info")` branch, which deep-
+    copies the embedding consumer's CoarseTileInfo onto the copy buffer.
+    Before the fix, the consumer's own `loop_tiled_dims` (its per-tile token
+    axis) survived that copy onto the table buffer's unrelated row dim;
+    work_division_constraints.py's coarse_tile_local_dim_split_domains then
+    read that as "the copy's row dim is loop-tiled" and pinned its core
+    split to 1 -- blocking the only split that keeps the 403 MB copy under
+    the 256 MB per-core span limit, so this failed with "per-core tensor
+    span 384.500 MB ... exceeds hardware limit of 256.00 MB" even though
+    plain (non-looped) embedding over the same table compiles fine (see
+    test_embedding_large_vocab_table_no_span_overflow in
+    test_indirect_access_gather.py).
+    """
+
+    def body(_, tiles):
+        table_whole, id_tile = tiles
+        return None, F.embedding(id_tile.flatten().long(), table_whole)
+
+    _, out = for_each_tile(
+        body, (table, ids), dims=(None, 0), tile_size=EMBED_TILE, out_dim=0
+    )
+    return out
+
+
 def matmul_x_yt_tile_m_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """x @ y.t() (the nn.Linear weight pattern), tiled on M; y is invariant."""
 
@@ -1674,6 +1913,36 @@ def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
     with spyre_hint(work_div={"T": row_split}):
         final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
     return final
+
+
+def grouped_carry_group_sum_fn(
+    values: torch.Tensor,
+    group: int,
+    cores: int,
+    init: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """values[E, T, C].sum(0) through a grouped carry: ``group`` slabs per trip
+    add into a carry [G, T, C], and one sum over G follows the loop.
+
+    The loop and its carry use the core map {G: group, T: cores // group}; the
+    sum uses {T: cores}. Each core of the sum then reads its rows from all
+    ``group`` parts of the carry, which are on ``group`` cores. ``init``
+    is the carry's first value (zeros when None); a caller-owned one makes the
+    loop write a compiler-made copy of it.
+    """
+
+    def body(acc, ops):
+        (tile,) = ops
+        return acc + tile, None
+
+    if init is None:
+        init = values.new_zeros(group, *values.shape[1:])
+    with spyre_hint(
+        named_dims=["G", "T", "C"], work_div={"G": group, "T": cores // group}
+    ):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=group, init=init)
+    with spyre_hint(named_dims=["T", "C"], work_div={"T": cores}):
+        return final.sum(0)
 
 
 def carried_routed_expert_sum_fn(

@@ -14,8 +14,8 @@
 
 
 import math
-from collections.abc import Mapping
-from typing import Optional
+from collections.abc import Collection, Mapping, Sequence
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -28,6 +28,12 @@ from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    output_advances_anywhere,
+    read_advances_anywhere,
+)
+from torch_spyre._inductor.loop_info import LoopCarryRecord
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -37,6 +43,14 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+
+def is_loop_carry_storage(op: Any) -> bool:
+    """True only for storage explicitly created as a counted-loop carry."""
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
 # default. `convolution` is aten's direct-conv op name; it is listed because a
@@ -112,9 +126,7 @@ def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
     dedup_and_promote_constants hoisted to the graph head) but runs once,
     outside the loop.
     """
-    if isinstance(op, ExternKernel):
-        return ()
-    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    return counted_loop_path(op)
 
 
 def counted_loop_entry(
@@ -293,6 +305,39 @@ def is_empty_tiled_layout(layout: object) -> bool:
     )
 
 
+def storage_has_single_writer(
+    graph: GraphLowering,
+    producer: Operation,
+    *,
+    transferred_mutations: Sequence[Operation] = (),
+) -> bool:
+    """Prove fresh storage has no aliases or writers beyond its producer.
+
+    Explicitly transferred mutations (a collective and its later accesses,
+    moved onto a private drain) are exempted, including the alias an in-place
+    collective declares on its operand. Ordinary gathered sources have no
+    exemption. Inspect mutation/alias declarations as well as liveness
+    dependencies.
+    """
+    name = producer.get_name()
+    for op in graph.operations:
+        if any(op is moved for moved in transferred_mutations):
+            continue
+        try:
+            if (
+                name in op.get_mutation_names()
+                or name in op.get_inputs_that_alias_output()
+                or (
+                    op is not producer
+                    and any(dep.name == name for dep in op_read_writes(op).writes)
+                )
+            ):
+                return False
+        except NotImplementedError:
+            return False
+    return True
+
+
 def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
@@ -354,37 +399,25 @@ def _is_tiled_advancing(op: Operation) -> bool:
     JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
     advances per loop iteration has no way to express its address change if
     pinned to LX. This derives the same answer ``is_tiled_lx`` derives, but
-    earlier (at IR/allocation time) and directly from ``loop_info``, letting
-    the allocator exclude such buffers from LX candidacy up front instead of
-    crashing at codegen time.
+    earlier (at IR/allocation time) and directly from the write's index,
+    letting the allocator exclude such buffers from LX candidacy up front
+    instead of crashing at codegen time.
 
-    Note this checks ``output_tiled_dims`` -- whether *this op's own write*
-    advances -- not ``loop_tiled_dims``, which only says the op is tiled at
+    Note this asks whether *this op's own write* advances (its index has a
+    nonzero coefficient on a loop variable), not whether the op is tiled at
     all. A loop-internal buffer (e.g. drained by a copy op every iteration)
     can be tiled yet have its own write pinned at a fixed address; such a
-    buffer is LX-eligible.
-
-    Also checks ``squeezed_advance_output``: a dim tiled down to per-tile
-    extent 1 (e.g. a coarse-tiled batch dim with one tile per iteration) is
-    squeezed out of the write's own index entirely, so it never appears in
-    ``output_tiled_dims`` even though the write's device address genuinely
-    advances every iteration (see ``loop_info.py``'s
-    ``squeezed_advance_output`` docstring). Missing this let a
-    mutation_write_back accumulator (e.g. flash attention's running max/
-    denominator carry) reside in LX, where the advance later crashed --
-    or, if the crash path were ever bypassed, silently pinned every
-    iteration to the same address.
+    buffer is LX-eligible. A dim tiled down to per-tile extent 1 is squeezed out
+    of the write's own dims but still moves the address, and the index shows it:
+    missing it once let a mutation_write_back accumulator (e.g. flash attention's
+    running max/denominator carry) reside in LX, where the advance later crashed.
     """
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
-        return False
-    if any(dims for dims in loop_info.output_tiled_dims):
-        return True
-    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
-    return any(level for level in squeezed_advance_output)
+    # The loop fact (False without a loop_info) lives in loop_facts; the layout
+    # gate above is an LX question and stays here.
+    return output_advances_anywhere(op)
 
 
 def _is_read_advancing_anywhere(
@@ -397,53 +430,27 @@ def _is_read_advancing_anywhere(
     op *reads* ``name`` via a reference that advances across that reader's
     own coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
     into a nested tile every outer iteration). ``SpyreKernel.
-    _general_tile_advance`` derives a read reference's
-    ``device_tile_advance_expr`` from the *consuming* op's own
-    ``loop_info.tiled_dims_per_read``, not from the producer's
-    ``output_tiled_dims`` -- so a reader can advance even when the
+    _index_tile_advance`` derives a read reference's
+    ``device_tile_advance_expr`` from the *consuming* op's own index, not
+    from the producer's write -- so a reader can advance even when the
     producer's own write is fixed. ``compute_ops.py``'s ``is_tiled_lx``
     check applies to every ``TensorArg`` (read and write) at codegen time,
     so missing this at allocation time defers the same
     ``NotImplementedError`` to codegen instead of routing the buffer to
     HBM up front.
 
-    Mirrors ``_general_tile_advance``'s own positional dep-index matching:
-    for each reader op, ``name``'s occurrences among that op's
-    ``MemoryDep`` reads are matched in order to
-    ``loop_info.tiled_dims_per_read`` by position.
+    For each reader op, each of ``name``'s ``MemoryDep`` reads is asked
+    whether its index moves with one of the op's loop variables.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
-        loop_info = getattr(reader_op, "loop_info", None)
-        if loop_info is None:
+        if getattr(reader_op, "loop_info", None) is None:
             continue
+        # read_advances_anywhere is False when dep is not one of the reader's
+        # MemoryDep reads (it is name's write on this op).
         read_deps = [
             d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
         ]
-        if dep not in read_deps:
-            continue  # dep is name's write on this op, not a read
-        dep_idx = read_deps.index(dep)
-        if dep_idx >= len(loop_info.tiled_dims_per_read):
-            continue
-        # Mirrors _general_tile_advance's own per-level loop: a dep whose
-        # outer per-level list is non-empty but every level's own
-        # (dim, extent) list is empty (e.g. [[], []]) still advances by
-        # zero -- _general_tile_advance's `if not dim_extent_pairs:
-        # continue` never contributes a term for such a level, so the
-        # resulting device_tile_advance_expr is None, not merely small.
-        if any(loop_info.tiled_dims_per_read[dep_idx]):
-            return True
-        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
-        # read side: a dim tiled down to per-tile extent 1 is squeezed out
-        # of this read's own index, so it never appears in
-        # tiled_dims_per_read even though the read's device address
-        # genuinely advances every iteration (see loop_info.py's
-        # squeezed_advance_per_read docstring).
-        squeezed_advance_per_read = (
-            getattr(loop_info, "squeezed_advance_per_read", None) or []
-        )
-        if dep_idx < len(squeezed_advance_per_read) and any(
-            squeezed_advance_per_read[dep_idx]
-        ):
+        if read_advances_anywhere(reader_op, dep, reads=read_deps):
             return True
     return False
 
@@ -565,7 +572,7 @@ def _op_num_cores(op: Operation) -> int:
 def get_ncores_for_buffers(
     graph: GraphLowering,
     cache: Optional[dict] = None,
-    drained_readers: Optional[Mapping[str, str]] = None,
+    drained_readers: Optional[Mapping[str, Collection[str]]] = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -581,18 +588,21 @@ def get_ncores_for_buffers(
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
 
-    ``drained_readers`` maps a loop-carry storage to the collective that a
-    validated drain plan will repoint at the post-loop drain.  The judge runs
-    before that rewrite, so that collective's use is not one of the storage's.
+    ``drained_readers`` maps a loop-carry storage to the post-loop accesses (a
+    collective, its waits, later readers) that a validated drain plan will
+    repoint at the post-loop drain.  The judge runs before that rewrite, so
+    their uses are not the storage's.
     """
+    from .lx_relayout import is_partial_lx_read, local_lx_subrange_certificate
+
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
-        drained_reader = (drained_readers or {}).get(buf_name)
-        if drained_reader is not None:
-            users = [(op, dep) for op, dep in users if op.get_name() != drained_reader]
+        drained = (drained_readers or {}).get(buf_name)
+        if drained:
+            users = [(op, dep) for op, dep in users if op.get_name() not in drained]
         layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
         if is_empty_tiled_layout(layout):
             # Reject before the unsplit whole-buffer view shortcut and before
@@ -676,6 +686,20 @@ def get_ncores_for_buffers(
                     f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
                 )
                 break
+        if mismatch_reason is None:
+            producer = graph.try_get_buffer(buf_name)
+            for op, dep in users:
+                if dep in op_read_writes(op).reads and is_partial_lx_read(
+                    producer, dep
+                ):
+                    if (
+                        local_lx_subrange_certificate(
+                            graph, producer, op, ref_view, ref_view
+                        )
+                        is None
+                    ):
+                        mismatch_reason = f"partial LX read on '{op.get_name()}'"
+                        break
         if mismatch_reason is not None:
             num_cores = -1
             mismatch_reasons_cache[buf_name] = mismatch_reason
@@ -726,10 +750,14 @@ def _would_produce_lx_back_gap(
 ) -> bool:
     """Check if pinning a buffer to LX would produce a backGapCore_.
 
-    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
-    The backend supports backGap for HBM but not for LX, so buffers triggering
-    this condition must stay in HBM.
+    A backGap fires when the in-core iteration and physical device extents
+    differ, including the negative gap used for overlapping unfold reads.
+    Generic LX gaps remain unsupported. The allocator may admit only a
+    certified prefix-slice gather whose unsplit-K consumer uses a uniform
+    outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
+    from .lx_relayout import local_lx_subrange_geometry
+
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout
     device_size = stl.device_size
@@ -739,6 +767,13 @@ def _would_produce_lx_back_gap(
         rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             if dep.name != buf_name:
+                continue
+            if (
+                dep in rw.reads
+                and local_lx_subrange_geometry(graph, buf, op) is not None
+            ):
+                # Emission uses the proved compact input shape. Other readers
+                # still undergo the ordinary back-gap test below.
                 continue
             try:
                 coords = device_coordinates(stl, dep, None)
@@ -769,7 +804,21 @@ def _would_produce_lx_back_gap(
                     )
                     + 1
                 )
-                if device_size[d] > covered:
+                if device_size[d] > covered or (
+                    device_size[d] < covered and coord_expr.as_coeff_Add()[1] in syms
+                ):
+                    return True
+                # Normalization splits an affine coordinate such as 2*w + k
+                # into nested axes. The original axis can be fully covered
+                # while its inner k axis needs a negative backGap. Check that
+                # overlap before allowing this buffer to reside in LX.
+                from torch_spyre._inductor.work_division_constraints import (
+                    overlapping_coordinate_extents,
+                )
+
+                if overlapping_coordinate_extents(
+                    coord_expr, {sym: int(dep.ranges[sym]) for sym in syms}
+                ):
                     return True
     return False
 

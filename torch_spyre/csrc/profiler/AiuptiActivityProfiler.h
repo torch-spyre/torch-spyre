@@ -63,9 +63,6 @@ class AiuptiActivityProfilerSession
   void popUserCorrelationId() override;
 
  private:
-  void checkTimestampOrder(const libkineto::ITraceActivity* act1);
-  void removeCorrelatedPtiActivities(const libkineto::ITraceActivity* act1);
-  bool outOfRange(const libkineto::ITraceActivity& act);
   int64_t getMappedQueueId(uint64_t sycl_queue_id);
   const libkineto::ITraceActivity* linkedCpuActivity(uint64_t externalId);
   const libkineto::ITraceActivity* linkedActivity(
@@ -91,8 +88,6 @@ class AiuptiActivityProfilerSession
   static std::vector<std::array<unsigned char, 16>> deviceUUIDs_;
   static std::vector<std::string> correlateRuntimeOps_;
 
-  int64_t captureWindowStartTime_{0};
-  int64_t captureWindowEndTime_{0};
   int64_t profilerStartTs_{0};
   int64_t profilerEndTs_{0};
   std::unordered_map<int64_t, int64_t> cpuCorrelationMap_;
@@ -102,8 +97,6 @@ class AiuptiActivityProfilerSession
   // Stay unique when multiple captures from this session share an export.
   int64_t nextSubmissionFlowId_{int64_t{1} << 32};
   std::unordered_map<int64_t, int64_t> userCorrelationMap_;
-  std::unordered_map<int64_t, const libkineto::ITraceActivity*>
-      correlatedPtiActivities_;
   std::map<std::pair<int64_t, int64_t>, std::vector<int64_t>> activeThreadMap_;
   std::vector<std::string> errors_;
 

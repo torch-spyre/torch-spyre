@@ -14,11 +14,16 @@
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    ExternKernel,
     FallbackKernel,
     MutationLayoutSHOULDREMOVE,
     Operation,
 )
+from torch._inductor.dependencies import ReadWrites
 from torch._inductor.graph import GraphLowering
+
+from .loop_info import LoopCarryRecord
+from .loop_node import LoopNode, all_ops, remove_op
 
 
 def live_operations(graph: GraphLowering) -> frozenset[str]:
@@ -39,6 +44,9 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
     live_bufs |= set(graph.graph_inputs)
     live_bufs |= set(graph.constants)
     live_ops: set[str] = set()
+    # Nothing edits an op while liveness is computed, so trace each op once
+    # rather than once per fixed-point iteration.
+    read_writes = [(op, op.get_read_writes()) for op in reversed(operations)]
 
     # A mutation is judged by whether its target is live, and in a spliced
     # while-loop body list order is not execution order: a read at the top of
@@ -50,7 +58,7 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
     # terminates.
     for _ in range(len(operations) + 1):
         before = (len(live_bufs), len(live_ops))
-        _walk_once(operations, live_bufs, live_ops)
+        _walk_once(read_writes, live_bufs, live_ops)
         if (len(live_bufs), len(live_ops)) == before:
             break
 
@@ -58,11 +66,16 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
 
 
 def _walk_once(
-    operations: list[Operation], live_bufs: set[str], live_ops: set[str]
+    read_writes: list[tuple[Operation, ReadWrites]],
+    live_bufs: set[str],
+    live_ops: set[str],
 ) -> None:
-    """One reverse liveness pass, accumulating into ``live_bufs``/``live_ops``."""
-    for op in reversed(operations):
-        rw = op.get_read_writes()
+    """One reverse liveness pass, accumulating into ``live_bufs``/``live_ops``.
+
+    ``read_writes`` pairs each operation with its read/writes, in reverse
+    topological order.
+    """
+    for op, rw in read_writes:
         # A side-effecting op is live whenever its write can still be observed.
         # A mutation into a dead target cannot be observed, so it is judged on
         # its own reachability like any pure op.
@@ -74,40 +87,75 @@ def _walk_once(
         # target's storage, so the target has to survive with it.
         for dep in rw.reads:
             live_bufs.add(dep.name)
-        target = _mutation_target(op)
-        if target is not None:
+        for target in _mutation_targets(op):
             live_bufs.add(target)
 
 
 def _mutation_target(op: Operation) -> str | None:
-    """The buffer a ``MutationLayoutSHOULDREMOVE`` op writes into, else None."""
-    if isinstance(op, ComputedBuffer) and isinstance(
-        op.layout, MutationLayoutSHOULDREMOVE
-    ):
+    """The buffer ``op`` writes into in place, else None.
+
+    That is a ``MutationLayoutSHOULDREMOVE`` op's target, or the declared
+    storage of a loop-carry update still in its pure form: between the splice
+    and ``loop_carries.apply_loop_carries`` the update writes its own buffer,
+    but its ``LoopCarryRecord`` says it will write the storage, and its value
+    reaches the next trip only through that write. Judging it as the mutation
+    it is about to become keeps a carry whose result nobody reads after the
+    loop, exactly as when the splice made the write in place itself.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return None
+    if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
         return op.layout.get_buffer().get_name()
+    record = getattr(op, "_loop_carry_record", None)
+    if isinstance(record, LoopCarryRecord) and record.update_name == op.get_name():
+        return record.storage_name
     return None
+
+
+def _mutation_targets(op: Operation) -> list[str]:
+    """Every buffer ``op`` writes in place: its own target, or for a
+    ``LoopNode`` the targets of its body's mutations."""
+    if isinstance(op, LoopNode):
+        return op.mutation_targets()
+    target = _mutation_target(op)
+    if target is not None:
+        return [target]
+    if isinstance(op, ExternKernel) and not isinstance(op, FallbackKernel):
+        # An ExternKernel names the buffers it writes in place.  A fallback is
+        # left out: its names do not cover all it does, so has_side_effects
+        # stays the decider.
+        return list(op.get_mutation_names())
+    return []
 
 
 def _mutation_target_is_live(op: Operation, live_bufs: set[str]) -> bool:
     """Whether a side-effecting op's write can still be observed.
 
-    Only a ``MutationLayoutSHOULDREMOVE`` names a target, so anything else
-    side-effecting (an impure ``FallbackKernel``) is assumed observable.
+    An op that names no target (an impure ``FallbackKernel``) is assumed
+    observable.  A ``LoopNode`` is observable when any side-effecting op of
+    its body is: one whose mutation target is live, or an impure fallback.
     """
-    target = _mutation_target(op)
-    return target is None or target in live_bufs
+    if isinstance(op, LoopNode):
+        return any(
+            _has_side_effects(leaf) and _mutation_target_is_live(leaf, live_bufs)
+            for leaf in all_ops(op.body)
+        )
+    targets = _mutation_targets(op)
+    return not targets or bool(set(targets) & live_bufs)
 
 
 def _has_side_effects(op: Operation) -> bool:
     """Return True if op must not be eliminated regardless of whether its
     outputs are used.
 
-    A mutation writes into a buffer it does not own, so it has side effects;
-    whether that write can still be observed is ``_mutation_target_is_live``'s
-    call.  FallbackKernel delegates to is_impure on the underlying op overload.
-    All other op types are pure.
+    An op that writes a buffer it does not own has side effects; whether that
+    write is still observable is ``_mutation_target_is_live``'s call.  A
+    ``FallbackKernel`` delegates to is_impure on its op overload.  A
+    ``LoopNode`` has side effects when any op of its body has.
     """
-    if _mutation_target(op) is not None:
+    if isinstance(op, LoopNode):
+        return op.has_side_effects()
+    if _mutation_targets(op):
         return True
     if isinstance(op, FallbackKernel):
         return op.has_side_effects()
@@ -138,7 +186,11 @@ def deadcode_elimination(graph: GraphLowering) -> None:
         dead.append(op)
 
     for op in dead:
-        rw = op.get_read_writes()
-        for dep in rw.writes:
-            graph.removed_buffers.add(dep.name)
-        operations.remove(op)
+        # A dead LoopNode takes its whole body with it; record each leaf's own
+        # writes, as removing those leaves one by one would (the node's
+        # summary also names its mutation targets, which it does not own).
+        for leaf in all_ops([op]):
+            rw = leaf.get_read_writes()
+            for dep in rw.writes:
+                graph.removed_buffers.add(dep.name)
+        remove_op(operations, op)

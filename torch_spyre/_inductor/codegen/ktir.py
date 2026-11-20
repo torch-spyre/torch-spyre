@@ -75,7 +75,11 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     reduction_indexing,
     row_major_strides,
 )
-from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
+from torch_spyre._inductor.constants import (
+    ABSMAX_OP,
+    MAX_POOL_SIZE_BYTES,
+    STAGGERED_EAS,
+)
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -2088,8 +2092,6 @@ def _assert_one_pool(plan: KernelPlan) -> None:
 # there is no basis on which to justify a MANDATORY fusion, so opportunistic is
 # the most that can be defended.
 
-_ABSMAX_OP = "absmax"
-
 
 @dataclasses.dataclass(frozen=True)
 class PlanFusion:
@@ -2295,7 +2297,7 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
     PlanFusion(
         name="absmax",
         pattern=(("abs", False), ("max", True)),
-        result_op=_ABSMAX_OP,
+        result_op=ABSMAX_OP,
         why=(
             "the min/max unit takes the absolute value as a mode bit, so max(|x|) "
             "is one reduction and not a pointwise pass plus a reduction; and a "
@@ -3424,7 +3426,7 @@ class KtirBuilder:
         # that reorders the expression -- or that writes ``maximumf``, the spelling
         # the bare ``max`` reduction uses, in place of ``maxnumf`` -- breaks the
         # match, and it breaks it SILENTLY: it fails as a non-match, not an error.
-        _ABSMAX_OP: Recipe(
+        ABSMAX_OP: Recipe(
             arity=1,
             arms=Arm(
                 kind=BindingKind.COMBINER,
