@@ -21,36 +21,35 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 
 - values: ``Index``, a position, and ``AbstractRealization``, what a node is realized
   as, with its one kind here, ``TableRealization``, hold no model;
-- the nodes: ``TableLowering`` is a sympy ``Printer`` that prints a node of the
-  expression as a ``Node``: its print methods, dispatched on the node's sympy class,
-  make the Node over the Nodes of the node's children. Each node realizes itself,
-  here as a table, the first time its realization is read, and reads its children's
-  realizations as it does, so reading the root realizes every node under it. A node
-  refuses a value of its own that is not finite, whether or not its
-  parent's value depends on it. A symbol's ``InputNode`` is handed its variable and
-  its values, and makes its own position on that variable. The plan, the root's
-  ``Node``, holds no model either;
-- the build: the root's ``cp_expr`` reads its realization, which builds itself into
-  the model (``TableRealization.cp_expr``), rounded onto ``COST_SCALE``, its position
-  built by ``Index.cp_expr``. Only ``cp_expr`` methods touch the model.
+- the printer: ``TableLowering`` is a sympy ``Printer`` whose print of a node is the
+  node's realization. A print method, dispatched on the node's sympy class, prints the
+  node's operands first, asks each for its table, builds the node's own position and
+  computes its list, and returns the realization to the node's parent. The printer
+  makes the positions: a symbol's on its variable, and an operation's from those of
+  its inputs. It refuses a node whose table would pass the cap before it prints
+  anything under it, and a value that is not finite at the node that makes it,
+  whether or not its parent's value depends on it. It holds no model;
+- the build: the root's realization builds itself into the model
+  (``TableRealization.cp_expr``), rounded onto ``COST_SCALE``, its position built by
+  ``Index.cp_expr``. Only ``cp_expr`` methods touch the model.
 
 One table per node, and the root read as one lookup. A node's list is its function
 applied to its operands' lists, each read at every entry of the node's table. The
 function is the numpy core's for the node's sympy class (``cost_expr_numpy.py``), the
-core the CP-SAT printer evaluates its candidates with. A node of a class the core has
-no function for lambdifies its class over placeholders when it is realized
-(``_lambdified``): nothing is kept once a lowering is done. It lowers an expression
-whose inputs fit the cap together and refuses anything wider. Nothing imports it yet.
+core the CP-SAT printer evaluates its candidates with. For a node of a class the core
+has no function for, the class is lambdified over placeholders when the node is
+printed (``_lambdified``): nothing is kept once a lowering is done. It lowers an
+expression whose inputs fit the cap together and refuses anything wider. Nothing imports
+it yet.
 """
 
 from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cached_property
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias
 
 import numpy as np
 import sympy
@@ -59,7 +58,6 @@ from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
-from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -93,8 +91,8 @@ class Index(ABC):
     expression. Each kind of step is a subclass that holds its parts, the positions it
     is made from, as its own fields, so a step depends on Index alone. A value, with
     no model in it. Steps are frozen dataclasses: two that make the same position from
-    equal parts are equal and hash alike. TableRealization and the nodes do not change
-    when a step is added. The steps here are InputIndex, UnitIndex and
+    equal parts are equal and hash alike. TableRealization and the printer do not
+    change when a step is added. The steps here are InputIndex, UnitIndex and
     CombineIndex."""
 
     # The number of positions, 0 .. size - 1: a field of each step, given or
@@ -117,8 +115,8 @@ class Index(ABC):
 @dataclass(frozen=True)
 class InputIndex(Index):
     """A leaf: a variable's own position, v -> v - lo, for a variable whose values run
-    from lo to lo + size - 1. An InputNode makes one on its variable, which is already
-    in the model. Two on one variable are equal: one position."""
+    from lo to lo + size - 1. The printer makes one on a symbol's variable, which is
+    already in the model. Two on one variable are equal: one position."""
 
     var: cp_model.IntVar
     size: int
@@ -177,14 +175,20 @@ def _read_only(values: Any, index: Index) -> np.ndarray:
 
 
 class AbstractRealization(ABC):
-    """What a node is realized as: the one thing a reader and the objective take of
-    it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
-    realization is a subclass: here a TableRealization, and from Stage 5 a
-    LinearRealization too, what a sum is realized as."""
+    """What a node is realized as: what the printer returns for the node to the
+    node's parent, and what the objective takes of the root. A value, with no model in
+    it, that builds its own CP-SAT side. Each kind of realization is a subclass: here
+    a TableRealization, and from Stage 5 a LinearRealization too, what a sum is
+    realized as."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The realization in model, as a CP-SAT expression in COST_SCALE units."""
+
+    @abstractmethod
+    def table(self) -> TableRealization:
+        """The realization as one table: what a parent asks for when it computes its
+        own list from this one."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -211,8 +215,8 @@ class TableRealization(AbstractRealization):
         constant, and otherwise one add_element on its index's position into a new
         variable whose domain is the rounded values. The position is built only when
         the table is not constant, so a constant table adds nothing to the model.
-        Raises TableLoweringError for an entry past MAX_ENTRY. Its values are finite:
-        the node that makes a table refuses one that is not (Node._finite)."""
+        Raises TableLoweringError, naming no node, for an entry past MAX_ENTRY. Its
+        values are finite: the printer refuses a table that has one that is not."""
         scaled = np.rint(COST_SCALE * self.values)
         largest = float(np.max(np.abs(scaled)))
         if largest > MAX_ENTRY:
@@ -227,6 +231,10 @@ class TableRealization(AbstractRealization):
         )
         model.add_element(self.index.cp_expr(model), entries, target)
         return target
+
+    def table(self) -> TableRealization:
+        """Itself."""
+        return self
 
 
 # Each symbol's input: the variable that picks its value, and the symbol's value at
@@ -276,8 +284,8 @@ def _evaluate(
 def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     """The function of a node of sympy class func whose operands take forms,
     lambdified with the numpy module over one placeholder per operand: the function of
-    a class the numpy core has none for. A node calls it once, when it is realized,
-    and nothing keeps the function after that.
+    a class the numpy core has none for. The printer calls it once for such a node,
+    when it prints it, and nothing keeps the function after that.
 
     The placeholders are plain symbols, operand0, operand1, ..., whose names are
     Python identifiers, so lambdify takes them as they are. It renames every argument
@@ -315,8 +323,8 @@ def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.nda
     """expr's list of count values, from compute(). Raises TableLoweringError naming
     expr when it has no numeric value, and for anything else evaluating it raises. A
     value returned here need not be finite: a division by zero is infinite, and a
-    Piecewise with no arm true is NaN. The node that makes the list refuses it
-    (Node.realize)."""
+    Piecewise with no arm true is NaN. The printer refuses the list, naming expr
+    (TableLowering._finite)."""
     with np.errstate(all="ignore"):
         try:
             result = np.asarray(compute(), dtype=float)
@@ -337,7 +345,7 @@ def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
     return dict(zip(positions, np.indices(shape).reshape(len(shape), -1)))
 
 
-# ------------------------------------------------------------------------ the walk
+# ---------------------------------------------------------------------- the printer
 
 
 def _divides(expr: sympy.Basic, factor: sympy.Basic) -> bool:
@@ -357,252 +365,147 @@ def _is_condition(expr: sympy.Basic) -> bool:
     return isinstance(expr, Boolean) and not isinstance(expr, sympy.Symbol)
 
 
-@dataclass(eq=False)
-class Node:
-    """The CP-SAT counterpart of one sympy node, which realizes itself.
-
-    expr is the sympy node, injected and only read: it says which operation the node
-    is, and gives its arguments and its free symbols. The Nodes make the same graph
-    as the sympy nodes: children holds the Nodes of its children, printed before it
-    (TableLowering), and a subexpression shared by two parents is one Node that both
-    hold. A node reads only its children: the columns of its inputs are gathered from
-    them, and it reads their realizations when it is realized, a Mul the realization
-    of the base of a factor it divides by too (operands). cap bounds its table. No
-    model is involved until cp_expr.
-
-    A node's realization, an AbstractRealization, is what a reader and the objective
-    take of it: in this stage always its table, one TableRealization. Its columns and
-    its realization are computed the first time they are read, and kept. A node
-    refuses a value of its own that is not finite, so one below a finite root is
-    refused at the node that makes it: an infinite Piecewise arm at the arm, taken or
-    not. This class is an operation over free symbols; InputNode and ConstantNode are
-    the leaves. A subclass changes how a node is realized by overriding realize.
-    """
-
-    expr: sympy.Basic
-    children: tuple[Node, ...]
-    cap: int
-
-    @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
-        """Each free symbol's column on its input, gathered from the children."""
-        columns: dict[sympy.Symbol, TableRealization] = {}
-        for child in self.children:
-            columns.update(child.columns)
-        return columns
-
-    @cached_property
-    def realization(self) -> AbstractRealization:
-        """What the node is realized as, made the first time it is read and kept;
-        realize raises TableLoweringError naming the node when it has none."""
-        return self.realize()
-
-    def realize(self) -> AbstractRealization:
-        """Realizes the node: one table over its inputs, their positions combined in
-        the order of their symbols sorted by sympy.default_sort_key, the last
-        fastest. Raises TableLoweringError naming the node when that table would pass
-        the cap, one past the cap never evaluated, and when a value of it is not
-        finite. Under the cap it reads its children's realizations first, so a child
-        with a value that is not finite is refused at the child, naming it, whether
-        or not this node's value depends on it.
-
-        Its list is its function (_evaluate) applied to its operands' lists, each
-        read at every entry of its table: an operand on the node's own position as it
-        is, one on fewer positions at its own position (Index.on_grid), and a constant
-        at every entry. Two symbols on one position move together."""
-        symbols = sorted(self.columns, key=sympy.default_sort_key)
-        positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
-        entries = math.prod(p.size for p in positions)
-        if entries > self.cap:
-            raise TableLoweringError(
-                self.expr,
-                f"one table over its inputs would hold {entries} entries, past the "
-                f"cap of {self.cap}",
-            )
-        for child in self.children:
-            # realizes the child, which refuses its own value that is not finite
-            child.realization
-        index = positions[0]
-        for position in positions[1:]:
-            index = CombineIndex(index, position)
-        grid = _grid(positions)
-        sources, forms = self.operands()
-        arguments = []
-        for source in sources:
-            if not isinstance(source, Node):
-                arguments.append(np.full(index.size, source))
-                continue
-            table = cast(TableRealization, source.realization)
-            if table.index == index:
-                arguments.append(table.values)
-            else:
-                at = table.index.on_grid(grid)
-                arguments.append(np.broadcast_to(table.values[at], (index.size,)))
-        values = _values(
-            self.expr, index.size, lambda: _evaluate(self.expr, forms, arguments)
-        )
-        return self._finite(TableRealization(values=values, index=index))
-
-    def operands(self) -> tuple[list[Node | float], tuple[Form, ...]]:
-        """What the node's function reads, in order, and the form each takes in it
-        (_lambdified): the arguments, a Piecewise's arms' values and conditions, value
-        then condition, a RelayoutCharge's prices as constants, and in a Mul the base
-        of a factor with a negative rational exponent in its place, with the exponent.
-        Every other operand is a child, as it is or as a condition."""
-        children = {child.expr: child for child in self.children}
-        parts: Sequence[sympy.Basic] = self.expr.args
-        if self.expr.is_Piecewise:  # its children, not its arms
-            parts = [child.expr for child in self.children]
-        sources: list[Node | float] = []
-        forms: list[Form] = []
-        for part in parts:
-            if _divides(self.expr, part):
-                sources.append(children[part].children[0])
-                forms.append(part.exp)  # type: ignore[attr-defined]
-            elif part in children:
-                sources.append(children[part])
-                forms.append(CONDITION if _is_condition(part) else None)
-            else:
-                sources.append(_constant(part))
-                forms.append(None)
-        return sources, tuple(forms)
-
-    def _finite(self, table: TableRealization) -> TableRealization:
-        """table, refused naming the node when a value of it is not finite."""
-        if not table.finite:
-            raise TableLoweringError(self.expr, "a value that is not finite")
-        return table
-
-    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The node in model, in COST_SCALE units: its realization built
-        (TableRealization.cp_expr), one lookup or a number. Reading the realization
-        realizes the node, so a refusal comes before anything is added to the model,
-        and a refusal from the build, an entry past MAX_ENTRY, names the node too.
-        Each call builds anew."""
-        realization = self.realization
-        try:
-            return realization.cp_expr(model)
-        except TableLoweringError as exc:
-            if exc.node is not None:
-                raise
-            raise TableLoweringError(self.expr, exc.reason) from exc
-
-
-@dataclass(eq=False)
-class InputNode(Node):
-    """A symbol: input data. input is its variable and its value at each of that
-    variable's values, injected by the printer from the inputs, or None for a symbol
-    with no input, which raises when it is read. The node makes its own position, an
-    InputIndex on its variable, so the caller makes none."""
-
-    input: Input | None = None
-
-    @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
-        """Its own column: its values on its variable's position, made here from the
-        variable's lowest and highest values. Raises TableLoweringError naming the
-        symbol, so a parent that reads it is refused by the symbol's name, when it has
-        no input, when its variable is not an integer variable or its domain has gaps
-        (a position lookup for one comes with Stage 13), and when its values are not
-        one number per value of its variable."""
-        if self.input is None:
-            raise TableLoweringError(self.expr, "a symbol with no input")
-        var, values = self.input
-        if not isinstance(var, cp_model.IntVar):
-            raise TableLoweringError(
-                self.expr, f"a variable that is not an IntVar ({type(var).__name__})"
-            )
-        domain = list(var.proto.domain)  # its intervals, flattened: lowest first
-        if len(domain) != 2:
-            raise TableLoweringError(self.expr, "a variable whose domain has gaps")
-        lo, hi = domain
-        if len(values) != hi - lo + 1:
-            raise TableLoweringError(
-                self.expr,
-                f"{len(values)} values for a variable with {hi - lo + 1}, {lo} to {hi}",
-            )
-        index = InputIndex(var, size=len(values), lo=lo)
-        try:
-            return {self.expr: TableRealization(values=values, index=index)}
-        except (TypeError, ValueError) as exc:
-            raise TableLoweringError(
-                self.expr, f"values that are not one number each ({exc})"
-            ) from exc
-
-    def realize(self) -> TableRealization:
-        """Its column."""
-        (column,) = self.columns.values()
-        return self._finite(column)
-
-
-@dataclass(eq=False)
-class ConstantNode(Node):
-    """A node with no free symbol: a number, true or false, or an operation on
-    numbers. It is realized as its value on the UnitIndex position."""
-
-    def realize(self) -> TableRealization:
-        """Its value, one entry on the UnitIndex position."""
-        value = np.array([_constant(self.expr)])
-        return self._finite(TableRealization(values=value, index=UNIT))
-
-
 class TableLowering(Printer):
-    """Plans cost expressions as tables: a sympy Printer whose print of a node is its
-    Node. A Printer dispatches on the node's sympy class, the nearest class along its
-    MRO that has a print method, and falls back to emptyPrinter: here each print
-    method makes the node's Node over the Nodes of the node's children, which it
-    prints first. The nodes do the rest: nothing is realized by printing. It holds no
-    model, so planning cannot write to one.
+    """Lowers cost expressions to tables: a sympy Printer whose print of a node is the
+    node's realization, an AbstractRealization. A Printer dispatches on the node's
+    sympy class, the nearest class along its MRO that has a print method, and falls
+    back to emptyPrinter. A print method prints the node's operands first, which
+    returns their realizations, asks each for its table, and returns the node's own
+    realization to the node's parent: in this stage always one table over the node's
+    inputs. The printer makes the positions itself: an InputIndex on a symbol's
+    variable, and for an operation its inputs' positions combined.
 
-    inputs gives each symbol's variable and values, which the printer hands to the
-    symbol's InputNode; cap bounds the entries of one table, the length of its list,
-    and is handed to every node. A printer keeps the Nodes it has made, by their sympy
+    inputs gives each symbol's variable and values; cap bounds the entries of one
+    table, the length of its list. The printer holds no model, so lowering cannot
+    write to one. It keeps the realization of each node it has printed, by the sympy
     node: a subexpression shared by two parents, or by two calls of lower, is printed
-    once. So inputs and cap are read when a node is first printed: a printer is made
-    for one set of inputs, and a change to them afterwards does not reach a Node it
-    has kept.
+    once, and its parents read one realization. So inputs and cap are read when a node
+    is first printed: a printer is made for one set of inputs, and a change to them
+    afterwards does not reach a realization it has kept.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         super().__init__()
         self.inputs = inputs
         self.cap = cap
-        self._nodes: dict[sympy.Basic, Node] = {}
+        self._realizations: dict[sympy.Basic, AbstractRealization] = {}
 
-    def lower(self, root: sympy.Basic) -> Node:
-        """root as a plan: root's Node, over the graph of nodes under it. Nothing is
-        realized here, and root is not changed; the root's cp_expr reads it, which
-        realizes it, and through it every node under it."""
+    def lower(self, root: sympy.Basic) -> AbstractRealization:
+        """root's realization, with every node under root realized on the way; root
+        is not changed. Raises TableLoweringError, naming the node, for a node that
+        cannot be lowered. Its cp_expr builds it into a model."""
         return self._print(root)
 
-    def _print(self, expr: sympy.Basic, **kwargs: Any) -> Node:
-        """expr's Node, printed the first time it is met and kept."""
-        if expr not in self._nodes:
-            self._nodes[expr] = super()._print(expr, **kwargs)
-        return self._nodes[expr]
+    def _print(self, expr: sympy.Basic, **kwargs: Any) -> AbstractRealization:
+        """expr's realization, printed the first time expr is met and kept."""
+        if expr not in self._realizations:
+            self._realizations[expr] = super()._print(expr, **kwargs)
+        return self._realizations[expr]
 
-    def _node(self, expr: sympy.Basic, children: Iterable[sympy.Basic]) -> Node:
-        """expr's Node holding the Nodes of children, printed first: a ConstantNode
-        for a node with no free symbol, and a Node for any other."""
-        kind = Node if expr.free_symbols else ConstantNode
-        return kind(expr, tuple(self._print(child) for child in children), self.cap)
+    def _print_Symbol(self, expr: sympy.Symbol) -> TableRealization:
+        """A symbol's column: its values on its variable's position, an InputIndex
+        made here from the variable's lowest and highest values, so the caller makes
+        no position. Raises TableLoweringError naming the symbol when it has no input,
+        when its variable is not an integer variable or its domain has gaps (a
+        position lookup for one comes with Stage 13), when its values are not one
+        number per value of its variable, and when one is not finite."""
+        if expr not in self.inputs:
+            raise TableLoweringError(expr, "a symbol with no input")
+        var, values = self.inputs[expr]
+        if not isinstance(var, cp_model.IntVar):
+            raise TableLoweringError(
+                expr, f"a variable that is not an IntVar ({type(var).__name__})"
+            )
+        domain = list(var.proto.domain)  # its intervals, flattened: lowest first
+        if len(domain) != 2:
+            raise TableLoweringError(expr, "a variable whose domain has gaps")
+        lo, hi = domain
+        if len(values) != hi - lo + 1:
+            raise TableLoweringError(
+                expr,
+                f"{len(values)} values for a variable with {hi - lo + 1}, {lo} to {hi}",
+            )
+        index = InputIndex(var, size=len(values), lo=lo)
+        try:
+            column = TableRealization(values=values, index=index)
+        except (TypeError, ValueError) as exc:
+            raise TableLoweringError(
+                expr, f"values that are not one number each ({exc})"
+            ) from exc
+        return self._finite(expr, column)
 
-    def _print_Symbol(self, expr: sympy.Symbol) -> Node:
-        """An InputNode holding the symbol's input."""
-        return InputNode(expr, (), self.cap, input=self.inputs.get(expr))
+    def _print_Piecewise(self, expr: sympy.Piecewise) -> TableRealization:
+        """Its operands are its arms' values and conditions, value then condition: an
+        arm's ExprCondPair is not printed."""
+        return self._operation(expr, [part for pair in expr.args for part in pair.args])
 
-    def _print_Piecewise(self, expr: sympy.Piecewise) -> Node:
-        """Its children are its arms' values and conditions, value then condition: an
-        arm's ExprCondPair gets no Node."""
-        return self._node(expr, [part for pair in expr.args for part in pair.args])
+    def emptyPrinter(self, expr: sympy.Basic) -> TableRealization:
+        """Any other node, over its arguments."""
+        return self._operation(expr, expr.args)
 
-    def _print_RelayoutCharge(self, expr: RelayoutCharge) -> Node:
-        """Its children are its literal and its division: its prices are data."""
-        return self._node(expr, expr.args[:2])
+    def _operation(
+        self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
+    ) -> TableRealization:
+        """expr as one table: its value on the UnitIndex position when it has no free
+        symbol (a number, true or false, or an operation on numbers), and otherwise
+        one table over its inputs, their positions combined in the order of its
+        symbols sorted by sympy.default_sort_key, the last fastest.
 
-    def emptyPrinter(self, expr: sympy.Basic) -> Node:
-        """Any other node: a Node over its arguments."""
-        return self._node(expr, expr.args)
+        Raises TableLoweringError naming expr when that table would pass the cap,
+        before anything under expr is printed, so a table past the cap is never
+        evaluated. Under the cap it prints its operands first, so an operand with a
+        value that is not finite is refused at the operand, naming it, whether or not
+        expr's value depends on it; then expr is refused if a value of its own is not
+        finite.
+
+        Its list is its function (_evaluate) applied to its operands' tables, each
+        read at every entry of its own: an operand on expr's own position as it is,
+        and one on fewer positions at its own position (Index.on_grid), a constant at
+        every entry. Two symbols on one position move together. A condition is read
+        as one, and in a Mul the base of a factor with a negative rational exponent
+        is read in the factor's place, with the exponent: the one node read that is
+        not an operand."""
+        if not expr.free_symbols:
+            value = TableRealization(values=[_constant(expr)], index=UNIT)
+            return self._finite(expr, value)
+        symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
+        columns = [self._print(symbol).table() for symbol in symbols]
+        positions = list(dict.fromkeys(column.index for column in columns))
+        entries = math.prod(position.size for position in positions)
+        if entries > self.cap:
+            raise TableLoweringError(
+                expr,
+                f"one table over its inputs would hold {entries} entries, past the "
+                f"cap of {self.cap}",
+            )
+        index = positions[0]
+        for position in positions[1:]:
+            index = CombineIndex(index, position)
+        grid = _grid(positions)
+        arguments = []
+        forms: list[Form] = []
+        for operand in operands:
+            # prints the operand, which refuses its own value that is not finite
+            table = self._print(operand).table()
+            form: Form = CONDITION if _is_condition(operand) else None
+            if _divides(expr, operand):
+                table, form = self._print(operand.base).table(), operand.exp  # type: ignore[attr-defined]
+            if table.index == index:
+                arguments.append(table.values)
+            else:
+                at = table.index.on_grid(grid)
+                arguments.append(np.broadcast_to(table.values[at], (index.size,)))
+            forms.append(form)
+        values = _values(
+            expr, index.size, lambda: _evaluate(expr, tuple(forms), arguments)
+        )
+        return self._finite(expr, TableRealization(values=values, index=index))
+
+    def _finite(self, expr: sympy.Basic, table: TableRealization) -> TableRealization:
+        """table, refused naming expr when a value of it is not finite."""
+        if not table.finite:
+            raise TableLoweringError(expr, "a value that is not finite")
+        return table
 
 
 def _constant(expr: sympy.Basic) -> float:
