@@ -69,8 +69,10 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
     if loop_info is None:
         return ()
     path = _group_path(loop_info)
+    if not path:
+        return ()
     counts = loop_info.loop_count
-    if not path or len(counts) < len(path):
+    if len(counts) < len(path):
         return ()
     tiled = loop_info.loop_tiled_dims
     tiled_red = loop_info.loop_tiled_reduction_dims
@@ -144,6 +146,12 @@ def node_levels(op: Operation) -> tuple[LoopLevel, ...]:
             )
         )
     return tuple(levels)
+
+
+def is_looped(op: Operation) -> bool:
+    """True if a counted loop encloses ``op`` (it runs inside, or is stamped for, a
+    loop). An ``ExternKernel`` that keeps its stamp counts."""
+    return bool(enclosing_loops(op))
 
 
 def loop_depth(op: Operation) -> int:

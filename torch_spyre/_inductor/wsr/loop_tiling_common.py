@@ -46,7 +46,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from ..errors import Unsupported
 from ..logging_utils import get_logger
-from ..loop_facts import counted_loop_path, enclosing_loops
+from ..loop_facts import counted_loop_path, enclosing_loops, is_looped
 from ..propagate_hints import DimHint
 from ..pass_utils import (
     op_out_coords,
@@ -1171,7 +1171,7 @@ def _is_dense_full_buffer_view(
     ranges = tuple(consumer.data.ranges)
     reduction_ranges = tuple(getattr(consumer.data, "reduction_ranges", None) or ())
     extent_sets = [(ranges, reduction_ranges)]
-    if getattr(consumer, "loop_info", None) is not None:
+    if is_looped(consumer):
         extent_sets.append(_undivided_ranges(consumer))
 
     # Symbols number the live (possibly divided) ranges; extents come from
@@ -1486,11 +1486,7 @@ def _retile_load_index(
     # consumer still reaches the dense-full-view check above: one in another
     # loop group can read the whole buffer every iteration, its index traced
     # at full scale.
-    if (
-        consumer is not None
-        and not hasattr(consumer, "loop_info")
-        and not dense_full_view
-    ):
+    if consumer is not None and not is_looped(consumer) and not dense_full_view:
         for d in _squeezed_retile_dims(info, consumer):
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a

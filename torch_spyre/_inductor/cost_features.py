@@ -31,7 +31,7 @@ from .cost_model import (
     _select,
     max,
 )
-from .loop_facts import enclosing_loops
+from .loop_facts import enclosing_loops, is_looped
 from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
@@ -482,7 +482,7 @@ def _candidate_tiling(op, tiling: Mapping):
     The op must not already be coarse-tiled: its ``loop_info`` would describe a
     second loop nest this cannot compose with.
     """
-    if getattr(op, "loop_info", None) is not None:
+    if is_looped(op):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )
