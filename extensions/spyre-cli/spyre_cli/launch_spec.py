@@ -49,6 +49,7 @@ from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.kernel_launchspec import (
     LaunchSpec,
     UnboundSymbol,
+    UnresolvedExpression,
     load_launch_spec,
 )
 
@@ -134,6 +135,12 @@ def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:
             raise ValueError(
                 f"arg {arg.arg_index}: dimension '{sym}' is symbolic. "
                 f"Bind it with --bind {sym}=N"
+            ) from None
+        except UnresolvedExpression as expr:
+            raise ValueError(
+                f"arg {arg.arg_index}: dimension '{expr}' was recorded as an "
+                "expression, so the spec cannot size this tensor. Allocate it "
+                "yourself and launch through the SDK."
             ) from None
         tensors.append(
             _alloc(shape, getattr(torch, arg.dtype), spyre_layout(arg.layout))
@@ -289,6 +296,12 @@ def check_tensors_against_spec(
             problems.append(
                 f"{where}: dimension '{e}' is symbolic and unbound "
                 f"(known symbols: {sorted(spec.symbols) or 'none recorded'})"
+            )
+            continue
+        except UnresolvedExpression as e:
+            problems.append(
+                f"{where}: dimension '{e}' was recorded as an expression, so "
+                "its extent cannot be checked"
             )
             continue
 

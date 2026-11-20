@@ -133,7 +133,8 @@ class LaunchSpec:
 
         A dimension recorded as a name rather than an extent is symbolic and
         must be bound at launch, so each one gets an entry -- empty until the
-        producer can supply a range.
+        producer can supply a range. A dimension recorded as an expression is
+        not a symbol and gets none: there is nothing a caller could bind it to.
         """
         args = list(args)
         return cls(
@@ -144,7 +145,10 @@ class LaunchSpec:
             emitter=emitter,
             symbol_kinds=list(symbol_kinds or []),
             symbols={
-                dim: {} for arg in args for dim in arg.shape if not isinstance(dim, int)
+                dim: {}
+                for arg in args
+                for dim in arg.shape
+                if isinstance(dim, str) and dim.isidentifier()
             },
         )
 
@@ -205,6 +209,15 @@ class UnboundSymbol(Exception):
     """A shape names a symbol the caller did not bind."""
 
 
+class UnresolvedExpression(Exception):
+    """A dimension was recorded as an expression rather than a name or extent.
+
+    The producer folds the expressions it can prove equal to a name; one that
+    is left has no binding a caller could give, so it is refused rather than
+    evaluated.
+    """
+
+
 def resolve_shape(shape: Sequence, bindings: Optional[dict] = None) -> list[int]:
     """``shape`` with any symbol replaced by its binding.
 
@@ -212,13 +225,17 @@ def resolve_shape(shape: Sequence, bindings: Optional[dict] = None) -> list[int]
     validator and whoever builds tensors -- so the two cannot disagree about
     what a symbolic dimension means. Raises rather than defaulting: an unbound
     symbol means the caller never said what size to launch at, and picking one
-    silently is how a plausible-looking wrong shape gets built.
+    silently is how a plausible-looking wrong shape gets built. A dimension
+    recorded as an expression raises ``UnresolvedExpression``; binding the
+    expression's text, as if it were a name, is not accepted.
     """
     bindings = bindings or {}
     out = []
     for dim in shape:
         if isinstance(dim, int):
             out.append(dim)
+        elif not str(dim).isidentifier():
+            raise UnresolvedExpression(str(dim))
         elif dim in bindings:
             out.append(int(bindings[dim]))
         else:
