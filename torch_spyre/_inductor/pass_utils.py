@@ -3379,6 +3379,17 @@ def dense_relocation_serves_read(
         or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
     ):
         return None
+    # A read at a constant offset (a slice, `x[1:].reshape(4, 28, 16)`) is left to
+    # the sparse layout.  The relocated coordinates are right -- the stick carries
+    # the offset, `d0 + 1` -- but the restickify copies the whole buffer and the
+    # consumer then reads the copy at `Mod(c0, 64)`, dropping the offset, so every
+    # element comes out one stick position off.  Returning the target anyway
+    # silently produced wrong values on (5, 448)[1:].reshape(4, 28, 16), which main
+    # gets right through the sparse layout.
+    # TODO(#5872): carry the offset into the restickified buffer's read instead,
+    # and the relocation serves these too.
+    if dep.index.xreplace(dict.fromkeys(dep.index.free_symbols, 0)) != 0:
+        return None
     sizes = [int(concretize_expr(v)) for v in in_host.size]
     strides = [int(concretize_expr(v)) for v in in_host.stride]
     by_stride = sorted(range(len(sizes)), key=lambda d: -strides[d])

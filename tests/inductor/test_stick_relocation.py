@@ -280,6 +280,36 @@ class TestStickRelocation(unittest.TestCase):
                     out.cpu().float(), ref.float(), atol=5e-2, rtol=5e-2
                 )
 
+    def test_a_read_at_a_constant_offset_keeps_its_values(self):
+        # A sliced read is left to the sparse layout. The relocated coordinates do
+        # carry the slice offset on the stick (``d0 + 1``), but the restickify
+        # copies the whole buffer and the consumer then reads that copy at
+        # ``Mod(c0, 64)``, dropping the offset, so every element lands one stick
+        # position off. (5, 448)[1:] came back 1767 of 1792 elements wrong with no
+        # error raised; main gets it right through the sparse layout.
+        cases = {
+            "(5,448)[1:] -> (4,28,16)": ((5, 448), lambda t: t[1:].reshape(4, 28, 16)),
+            "(5,448)[1:] -> (4,112,4)": ((5, 448), lambda t: t[1:].reshape(4, 112, 4)),
+            # Without the slice the same reshape still takes the relocation.
+            "(4,448) -> (4,28,16)": ((4, 448), lambda t: t.reshape(4, 28, 16)),
+            # A slice whose reshape does not split the stick never needed it.
+            "(5,448)[1:] -> (4,7,64)": ((5, 448), lambda t: t[1:].reshape(4, 7, 64)),
+        }
+        for name, (shape, view) in cases.items():
+            with self.subTest(name):
+                torch.manual_seed(0)
+                x = torch.rand(*shape, dtype=torch.float16) + 0.5
+                fn = lambda t, v=view: v(t) + 1  # noqa: E731
+                # The reference in fp32: at fp16 the comparison threshold would sit
+                # on the ULP of these values and a third of them would "fail" on
+                # rounding alone.
+                ref = fn(x.float())
+                torch.compiler.reset()
+                with inductor_config.patch(force_disable_caches=True):
+                    out = torch.compile(fn, dynamic=False)(x.to("spyre"))
+                torch.spyre.synchronize()
+                torch.testing.assert_close(out.cpu().float(), ref, atol=5e-3, rtol=5e-3)
+
     def test_escaping_view_with_in_graph_consumer(self):
         # The view escapes and also feeds another op. Nothing is rewritten in the
         # graph, so the view stays a view of ``y``.
