@@ -678,19 +678,16 @@ def test_a_function_that_takes_scalars_only_is_evaluated_point_by_point():
 def test_a_coefficient_is_applied_before_the_rounding():
     """On a term, and on a sum: 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448,
     and 7 * (split ** 0.5 + split ** 0.7) is one list, rounded once."""
-    case = Case()
-    case.add_input("a", a=[1.0, 2.0, 4.0])
-    a = case.symbol("a")
-    on_sum = sympy.Mul(7, a**0.5 + a**0.7, evaluate=False)
-    for expr, expected in (
-        (7 * a**0.5, 10137),
-        (on_sum, round(COST_SCALE * 7 * (2**0.5 + 2**0.7))),
+    for on_sum, expected in (
+        (False, 10137),
+        (True, round(COST_SCALE * 7 * (2**0.5 + 2**0.7))),
     ):
+        case = Case()
+        case.add_input("a", a=[1.0, 2.0, 4.0])
+        a = case.symbol("a")
+        expr = sympy.Mul(7, a**0.5 + a**0.7, evaluate=False) if on_sum else 7 * a**0.5
         _, objective = case.lower(expr)
-        cost = case.model.new_int_var(0, 2**40, "cost")
-        case.model.add(cost == objective)
-        rows = dict((r[0], r[1]) for r in case.solutions([case.variables[0], cost]))
-        case.model.proto.constraints.pop()
+        rows = dict(case.solutions([case.variables[0], objective]))
         assert rows[1] == expected
 
 
@@ -1211,22 +1208,23 @@ def test_equal_values_share_a_rank():
     assert lowering._ranked(distinct) is distinct
 
 
-def test_a_product_under_a_power_is_exact_as_a_pair_of_ranks():
+def test_a_product_under_a_log_is_exact_as_a_pair_of_ranks():
     """floor(a/4) and floor(b/3) take 4 values each on menus of 12 and 9: the
     product's table is the pair of their ranks, 16 entries, where one table over
-    the divisions is 108; the power reads that pair as it is."""
+    the divisions is 108; the sum and the log above it read that pair as it is, a
+    function of one list adding no position."""
     case = Case()
     case.add_input("a", a=[float(v) for v in range(1, 13)])
     case.add_input("b", b=[float(v) for v in range(1, 10)])
     a, b = case.symbol("a"), case.symbol("b")
     product = sympy.floor(a / 4) * sympy.floor(b / 3)
-    plan = case.assert_exact(product**0.5, cap=64)
+    plan = case.assert_exact(sympy.log(product + 1), cap=64)
     index = plan.realization.index
     assert isinstance(index, CombineIndex) and index.size == 16
     assert isinstance(index.left, CompactIndex) and isinstance(index.right, CompactIndex)
     assert case.elements() == [9, 12, 16]
     with pytest.raises(TableLoweringError, match="past the cap of 15"):
-        Case.lower(case, product**0.5, cap=15)
+        Case.lower(case, sympy.log(product + 1), cap=15)
 
 
 # ------------------------------------------------ a Min/Max by rung (Stage 9)
@@ -1291,9 +1289,13 @@ def test_the_graph_of_the_plan_is_exact():
 # ------------------------------------------------------------- the fold (Stage 10)
 
 
-def _position(size: int) -> InputIndex:
+def _positions(*sizes: int) -> list[InputIndex]:
+    """One input position per size, on variables of one model."""
     model = cp_model.CpModel()
-    return InputIndex(model.new_int_var(0, size - 1, "p"), size=size)
+    return [
+        InputIndex(model.new_int_var(0, size - 1, f"p{i}"), size=size)
+        for i, size in enumerate(sizes)
+    ]
 
 
 def _max(ladder: list[float], *operands: tuple[Index, tuple[int, ...]]) -> TableRealization:
@@ -1305,7 +1307,7 @@ def _max(ladder: list[float], *operands: tuple[Index, tuple[int, ...]]) -> Table
 
 def test_a_fold_numbers_only_the_tuples_that_occur_together():
     """Two Max factors over one input: 3 tuples of rungs occur, of 9."""
-    p = _position(3)
+    (p,) = _positions(3)
     factors = [
         _max([1.0, 2.0, 3.0], (p, (0, 1, 2))),
         _max([1.0, 2.0, 3.0], (p, (2, 1, 0))),
@@ -1317,7 +1319,7 @@ def test_a_fold_numbers_only_the_tuples_that_occur_together():
 
 
 def test_a_constant_operand_seeds_the_start_state():
-    p = _position(3)
+    (p,) = _positions(3)
     factors = [
         _max([1.0, 2.0, 3.0], (UNIT, (1,)), (p, (0, 1, 2))),
         _max([5.0, 6.0], (p, (0, 0, 1))),
@@ -1327,17 +1329,19 @@ def test_a_constant_operand_seeds_the_start_state():
 
 
 def test_operands_sharing_an_input_join_one_group():
-    """Max(f(p), g(q)) * Max(h(q), k(r)): q joins the two factors, so p, q and r
-    are read in one group, whose step reads all three."""
-    p, q, r = _position(2), _position(2), _position(2)
+    """Max(f(p, q), g(r)) * Max(h(q)): f and h share q, so p and q are read in one
+    step of 4, and r in another."""
+    p, q, r = _positions(2, 2, 3)
     factors = [
-        _max([0.0, 1.0], (p, (0, 1)), (q, (0, 1))),
-        _max([0.0, 1.0], (q, (1, 0)), (r, (0, 1))),
+        _max([0.0, 1.0], (CombineIndex(p, q), (0, 1, 1, 0)), (r, (0, 0, 1))),
+        _max([0.0, 1.0], (q, (1, 0))),
     ]
     fold = fold_reachable(factors, cap=100)
     assert fold is not None
-    assert isinstance(fold.index, CompactIndex)
-    assert fold.index.parent.right.size == 8  # the group of p, q and r
+    last = fold.index.parent  # the state before the last step, combined with its group
+    first = last.left.parent
+    groups = sorted((first.right, last.right), key=lambda group: group.size)
+    assert groups[0] == r and {p, q} <= set(groups[1].steps()) and groups[1].size == 4
 
 
 def test_a_product_of_max_factors_is_folded_under_a_cap_their_crossed_ladders_pass():
@@ -1467,7 +1471,7 @@ def test_a_variable_with_gaps_in_its_domain_gets_a_position():
     case.inputs[g] = (var, [1, 2, 4])
     case.variables.append(var)
     case.values[var] = [1, 2, 4]
-    plan = case.assert_exact(g**0.5 + sympy.log(g))
+    plan = case.assert_exact(sympy.log(g + 1))
     assert isinstance(plan.realization.index, LocateIndex)
     assert case.elements() == [3, 3]
 
@@ -1497,11 +1501,11 @@ def test_a_failure_leaves_the_model_as_it_was():
     model = cp_model.CpModel()
     sym_map, buffer_map = _maps(model)
     split_a, tile_a, is_lx = sympy.symbols("split_a tile_a is_lx_a")
-    before = model.proto.SerializeToString()
+    before = str(model.proto)
     for refused in (split_a + sympy.Symbol("nowhere"), split_a**0.5 + 1e14 * tile_a**0.5):
         with pytest.raises(TableLoweringError):
             lower_cost_with_tables(model, sym_map, buffer_map, refused, cap=CAP)
-        assert model.proto.SerializeToString() == before
+        assert str(model.proto) == before
     objective = lower_cost_with_tables(
         model, sym_map, buffer_map, is_lx * split_a**0.5 + 7, cap=CAP
     )
@@ -1590,7 +1594,9 @@ EXAMPLES = [
     ),
     pytest.param(
         lambda: _with(
-            lambda s: (sympy.floor(s["a"] / 16) * sympy.floor(s["b"] / 32)) ** 0.5,
+            lambda s: sympy.log(
+                1 + sympy.floor(s["a"] / 16) * sympy.floor(s["b"] / 32)
+            ),
             a=128,
             b=128,
         ),
