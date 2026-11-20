@@ -49,6 +49,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -87,7 +88,7 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
-from .loop_node import LoopNode, all_ops
+from .loop_node import LoopNode, all_ops, replace_op
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -177,14 +178,14 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
-        #    (_insert_reduction_copy_op), which mutates directly into a
+        #    (_lower_reduction), which mutates directly into a
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
         #    producer's output would be read; or
         #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
         #    whose target is a locally-created graph-output buffer (e.g.
-        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_out's
         #    inserted coarse_tile_copy_* op reads the mutation op's own output
         #    the same way. The mutation target there is an ordinary
         #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
@@ -513,6 +514,11 @@ def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
         return {}
     current = _DECLARED_DIMS.get()
     return {str(s): current[str(s)] for s in expr.free_symbols if str(s) in current}
+
+
+def declared_dim_of(symbol) -> "tuple[int, int, int] | None":
+    """The ``(min, max, granularity)`` declared for one symbol, or None."""
+    return _DECLARED_DIMS.get().get(str(symbol))
 
 
 def substitute_declared_max(expr):
@@ -928,12 +934,25 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
         )
 
     user_min = _user_min_or_none(expr)
-    if user_min is not None:
-        if max_size % user_min != 0:
+    if user_min is not None and max_size % user_min != 0:
+        # "min divides max" only holds for a literal mark_dynamic(min=G),
+        # where min IS the granularity. A reserved_dims contract writes its
+        # own, independent min into the same ShapeEnv slot with no such
+        # requirement. Recognize that case via graph._spyre_dim_contracts
+        # (only that pass populates it) and fall back to auto-picking
+        # instead of raising. This whole disambiguation goes away once the
+        # symbolic-SDSC route it's guarding against is removed (TODO(issue#5890),
+        # tracked for a follow-up cleanup PR).
+        from .reserved_dims_contract import get_dim_contracts
+
+        if expr.free_symbols & get_dim_contracts(V.graph).keys():
+            user_min = None
+        else:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) must divide max={max_size}; "
                 f"got {max_size} % {user_min} = {max_size % user_min}"
             )
+    if user_min is not None:
         if max_size // user_min > max_buckets:
             raise Unsupported(
                 f"mark_dynamic(min={user_min}) produces {max_size // user_min} "
@@ -1139,7 +1158,7 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
 
     Returns the first candidate (the base buffer, with no view applied), or
     None if no candidate exists -- e.g. a coarse_tile copy buffer (see
-    coarse_tile.py's _insert_copy_op), which is synthesized purely at
+    loop_tiling_lowering.py's _insert_copy_out), which is synthesized purely at
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
@@ -1247,7 +1266,7 @@ def per_trip_index(
     advance from one counted-loop trip to the next, not an in-tile iteration
     axis. Codegen already applies that advance exactly once, through
     ``device_tile_advance_expr`` (see ``spyre_kernel.create_tensor_arg`` and
-    ``_general_tile_advance``), and pins the var to zero in the *base*
+    ``_index_tile_advance``), and pins the var to zero in the *base*
     coordinates so the raw unbacked symbol neither leaks into the OpSpec
     iteration space nor applies the same advance twice.
 
@@ -1857,9 +1876,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
     propagation runs, per passes.py's pass ordering) lists, per nesting
     level, the raw op.data.ranges positions this loop group tiles -- for the
-    innermost tile-body op itself, output_tiled_dims/tiled_dims_per_read are
-    both empty (this op's own write is already the tile-local slice, so it
-    has nothing further to report), so loop_tiled_dims is the only surviving
+    innermost tile-body op itself, this op's own write is already the
+    tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
     A raw tiled dim is a spurious "excess" batch var iff x's own read lacks
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
@@ -2003,10 +2021,32 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
+        # Check for the sub-stick-aligned view pattern: Mod(var, N) where N is
+        # smaller than the required elems_per_stick. This arises
+        # when a tensor whose innermost allocation stride is N (a sub-stick
+        # value, e.g. 32 for fp16 where elems_per_stick=64) is viewed into a
+        # wider shape -- the merged index produces Mod(var, N) instead of the
+        # required Mod(var, 64).
+        # Emit a targeted hint so the user knows to fix the allocation shape.
+        _sub_stick_hint = ""
+        if (
+            isinstance(stick_expr, sympy.Mod)
+            and len(stick_expr.args[0].free_symbols) == 1
+            and isinstance(stick_expr.args[1], sympy.Integer)
+            and int(stick_expr.args[1]) < elems_per_stick
+        ):
+            actual_stride = int(stick_expr.args[1])
+            _sub_stick_hint = (
+                f"The expression may result from a sub-stick-aligned allocation "
+                f"being viewed into a wider shape. The innermost allocation "
+                f"stride ({actual_stride}) is smaller than elems_per_stick "
+                f"({elems_per_stick}). Ensure the innermost allocation "
+                f"dimension is aligned to elems_per_stick ({elems_per_stick})."
+            )
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"with a constant offset.{_sub_stick_hint}"
         )
 
 
@@ -2158,97 +2198,6 @@ def try_device_coordinates(
         return None
 
 
-def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
-    """Locate a gather's index-entry dim on the output; the one coordinate search.
-
-    The entry dim is the index tensor's STICK dim (its rows are selected at
-    runtime), which on the gather output is a NON-stick dim (the row selector).
-    Multi-core work division splits this dim in whole index sticks, so a split
-    is only legal when the output can hold a stick-aligned slice -- i.e. when the
-    output extent is a whole multiple of the index ``eps``.
-
-    Returns ``(eps, out_pos, out_extent)`` -- the index elems_per_stick, the
-    entry dim's device position in the output layout, and the output
-    device_size there -- or ``None`` when ``op`` is not a gather-style indirect
-    access, the output layout is not yet a committed ``FixedTiledLayout``, or the
-    entry dim coincides with the output's own stick dim (a geometry the
-    stick-alignment padding does not cover). Valid from
-    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
-    committed.
-    """
-    subs = indirect_access_subs_from_op(op)
-    if not subs:
-        return None
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-
-    rw = op.get_read_writes()
-    out_dep = next(iter(rw.writes), None)
-    if out_dep is None:
-        return None
-
-    # Fail safe: callers use this only to *enable* a split / pad a paddable
-    # gather output. If the output can't be analysed (e.g. a scatter writes its
-    # destination indirectly, so device_coordinates can't resolve the entry
-    # coord), return None so the caller stays conservative rather than erroring.
-    try:
-        out_stl = _fixed_read_layout(op).device_layout
-        out_coords = device_coordinates(out_stl, out_dep, None)
-        for d in rw.reads:
-            if not (isinstance(d, MemoryDep) and d.name in index_names):
-                continue
-            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
-            stick_expr = device_coordinates(idx_stl, d, None)[-1]
-            if len(stick_expr.free_symbols) != 1:
-                continue
-            stick_var = next(iter(stick_expr.free_symbols))
-            eps = idx_stl.elems_per_stick()
-            # The entry dim must be a NON-stick dim of the output (exclude the
-            # last, stick, coordinate). On a scatter the entry coord is an
-            # IndirectAccess (its free symbol is the index buffer, not the
-            # iteration stick var), so no match -> None -> partial scatter stays
-            # forbidden, which is correct: its in-place dest can't be padded.
-            for pos, coord in enumerate(out_coords[:-1]):
-                if coord.free_symbols == {stick_var}:
-                    return eps, pos, int(out_stl.device_size[pos])
-    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
-        return None
-    return None
-
-
-def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
-    """The gather output's device layout grown so the entry dim is a whole stick.
-
-    The padding pass applies this returned layout; the coordinate search and the
-    size math both stay here. Returns ``None`` when there is nothing to do -- not
-    a paddable gather entry, or the entry dim is already stick-aligned. The
-    logical size is unchanged: only the physical ``device_size`` grows, and the
-    D2H copy extracts the logical view from the larger allocation.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return None
-    eps, out_pos, out_extent = found
-    if out_extent % eps == 0:
-        return None
-    out_stl = _fixed_read_layout(op).device_layout
-    device_size = list(out_stl.device_size)
-    device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
-    logger.info(
-        "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
-        "stick-aligned multi-core split",
-        op.get_name(),
-        out_pos,
-        out_extent,
-        device_size[out_pos],
-    )
-    return SpyreTensorLayout(
-        device_size,
-        list(out_stl.stride_map),
-        out_stl.device_dtype,
-        forward_valid_elements(out_stl),
-    )
-
-
 def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     """Device-coordinate lists for tensors shared across cores with runtime rows.
 
@@ -2268,7 +2217,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     subs = indirect_access_subs_from_op(op)
     if subs:
         ind_sizes = indirect_sizes_from_op(op)
-        for d in op.get_read_writes().reads:
+        for d in op_read_writes(op).reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))
                 coords = device_coordinates(layout.device_layout, d, ind_sizes)
@@ -2278,7 +2227,7 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     # way (integer row extent for coordinates, then xreplace to IndirectAccess).
     store_subs = indirect_store_subs_from_op(op)
     if store_subs:
-        write = next(iter(op.get_read_writes().writes))
+        write = next(iter(op_read_writes(op).writes))
         # Resolve the scatter destination's layout, leniently unwrapping the
         # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
         # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
@@ -2944,13 +2893,13 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Indirect gather index (e.g. x[i] where i comes from another tensor):
-        # the symbol is not a loop variable so it is absent from dep.ranges, but
-        # the tensor does vary.  Indirect-access tensors are always 1D on the
-        # host; len(host_size) == 1 is the load-bearing guard that prevents
-        # silent mis-resolution if that assumption is ever violated.
-        if is_indirect(var.name) and len(host_size) == 1:
-            return host_size[0], host_stride[0]
+        # Indirect gather index (e.g. x[..., i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges. It
+        # resolves to the one host dim whose coordinate carries it; more than one
+        # would be ambiguous.
+        dims = [d for d, c in enumerate(host_coords) if var in c.free_symbols]
+        if is_indirect(var.name) and len(dims) == 1:
+            return host_size[dims[0]], host_stride[dims[0]]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
@@ -3561,6 +3510,7 @@ def compute_restickify_needed(
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
 
+    sparse_target = None
     if is_sparse_stl(in_stl):
         # We want to test whether a sparse to dense conversion is possible.
         # But if there is a trailing 1 dim, the STL will create a sparse layout
@@ -3580,15 +3530,25 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expand_sparse keeps the stick on the input's own last host dim. When the
+            # consumer reads another stick (a stick-dim gather written into a wider
+            # stick at an offset, as in cat), restickify straight to that stick: a
+            # second, stick-padded restickify would write at offset 0 and past it.
+            expanded_idc = try_device_coordinates(
+                expanded_stl, in_dep, ind_sizes, op=op
+            )
+            if expanded_idc is not None and stick_compatible([expanded_idc, out_idc]):
+                return True, expanded_stl
+            sparse_target = expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
 
     arg = PropArg(in_dep, in_host, [in_stl])
-    return True, compute_restickify_target_layout(
+    target = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+    return True, sparse_target if target is None else target
 
 
 def compute_size1_restickify_target(
@@ -3747,8 +3707,7 @@ def replace_computed_buffer_body(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     _invalidate_body_caches(new_data)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
@@ -3864,8 +3823,7 @@ def redirect_computed_buffer_reads(
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf, layout_state=True)
 
-    op_idx = operations.index(op)
-    operations[op_idx] = new_buf
+    replace_op(operations, op, new_buf)
     _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
 
@@ -3906,7 +3864,7 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
-    arg_buf: Optional[Buffer] = None,
+    arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -3933,7 +3891,7 @@ def lower_pad_sequence(
     later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
-    coarse_tile copy buffer (see coarse_tile.py's _insert_copy_op), which is
+    coarse_tile copy buffer (see loop_tiling_lowering.py's _insert_copy_out), which is
     synthesized purely at the IR level after FX lowering completed.  In that
     case ``arg_buf`` (the buffer itself) must be given instead, and the pad is
     lowered by calling the constant_pad_nd lowering function directly against a
@@ -3944,6 +3902,11 @@ def lower_pad_sequence(
     a ``ComputedBuffer``, to recover the within-stick host dim from coordinate
     identity via ``_stick_host_dim`` -- see the device-layout-construction
     section below.
+
+    ``arg_buf`` may also be a ``ReinterpretView`` of a buffer, to pad that view
+    rather than the whole buffer; the padded buffer then has the view's shape.
+    ``insert_bmm_padding`` passes the part of y a matmul reads when y's buffer does
+    not hold K as one whole dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -4168,7 +4131,9 @@ def lower_pad_sequence(
         # an actual operand.
         from .lowering import lower_constant_pad_nd
 
-        arg_tb = TensorBox(StorageBox(arg_buf))
+        arg_tb = TensorBox(
+            arg_buf if isinstance(arg_buf, ReinterpretView) else StorageBox(arg_buf)
+        )
         with fx_graph.inserting_before(insert_before):
             pad_fx = fx_graph.create_node(
                 "call_function",

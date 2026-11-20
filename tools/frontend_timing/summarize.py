@@ -167,8 +167,8 @@ class Record:
         Pass counts are summed under their bare key: they are per-pass instances of
         the same measurement, and a compile total is what a dashboard wants. Stage
         counts are keyed by their region instead, because two stages can carry the
-        same key for different things -- the scratchpad records ``buffers`` on more
-        than one region -- and summing those would report a number that is neither.
+        same key for different things, and summing those would report a number that
+        is neither.
 
         Pipelines are skipped: they repeat the totals of the passes inside them.
         """

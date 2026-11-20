@@ -1430,7 +1430,7 @@ def _create_sdsc_tensors(
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
-        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # advance, stamped by loop_tiling_lowering.lower_loop_tiling (host-stride
         # terms) and substituted to device-stride terms, per-arg, by
         # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
         # levels is handled later, in compute_ops.generate_sdsc's
@@ -2008,11 +2008,31 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
-def _ref_arg(op_spec):
-    if op_spec.is_reduction:
-        return op_spec.args[0]
+def _merged_reduction_dim_order(op_spec, symbol_mapping):
+    """Union op_dim_order/op_stick_dim across every reduction operand.
 
-    return op_spec.args[-1]
+    A broadcast operand (e.g. an expand()'d reduction input) collapses the
+    dims it does not vary over to a constant, dropping them from its own
+    dim_order; a reduction's destination/accumulator likewise elides its own
+    stick to a constant. Basing op_dim_order on a single operand can
+    therefore miss dims that only appear on another operand, so this merges
+    the per-operand dim orders instead, keeping the first non-None stick
+    symbol seen.
+
+    Operands are visited in op_spec.args order. A dim shared by two operands
+    is assumed to appear in the same relative order in both; if they
+    disagree, the order from the first operand to mention it wins.
+    """
+    merged_order: list[Symbol] = []
+    merged_stick: Symbol | None = None
+    for arg in op_spec.args:
+        order, stick = _get_device_dim_order(arg, symbol_mapping)
+        if merged_stick is None:
+            merged_stick = stick
+        for sym in order:
+            if sym not in merged_order:
+                merged_order.append(sym)
+    return merged_order, merged_stick
 
 
 def _round_up_to_stick(
@@ -2436,8 +2456,24 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    if op_spec.is_reduction:
+        if (
+            not (is_matmul or is_pool or has_indirect_access)
+            and not is_conv
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
+            op_dim_order, op_stick_dim = _merged_reduction_dim_order(
+                op_spec, symbol_mapping
+            )
+        else:
+            op_dim_order, op_stick_dim = _get_device_dim_order(
+                op_spec.args[0], symbol_mapping
+            )
+    else:
+        op_dim_order, op_stick_dim = _get_device_dim_order(
+            op_spec.args[-1], symbol_mapping
+        )
 
     # A dtype conversion that changes the elements per stick (DL16TOFP32,
     # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
@@ -2558,41 +2594,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
-
-    # Grow a core-split index-entry iteration to the padded output device_size.
-    # The output's entry-dim device_size was rounded up to the index stick
-    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
-    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors puts each core's output base on a stick boundary
-    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
-    # grown iteration would dereference the index's padding lanes as table rows,
-    # and those hold whatever the index's producer left there.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    # Never iterate past the index's allocated entries: the padding
-                    # lanes past them are uninitialized and read as indices.
-                    idx_pos = next(
-                        i
-                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
-                        if c.free_symbols == {entry_c}
-                    )
-                    idx_eps = idx_arg.device_dtype.elems_per_stick()
-                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
-                    dev = min(int(out_arg.device_size[pos]), idx_extent)
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dim_splits[entry_mb] > 1
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
 
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if reinstated_unit_spatial:
