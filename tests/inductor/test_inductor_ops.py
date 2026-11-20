@@ -15265,6 +15265,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         cast the fp16 operand to FP8 before the lowering ran, the lowering's FP8
         operand check never fired, and the caller got an unrelated stick
         incompatibility error from the inserted cast.
+
+        The scaled_bmm cases overlap test_rejections[mat1_fp16 / mat2_fp16] in
+        fp8/test_scaled_bmm_semantics.py. They are kept because the path differs:
+        here the FP8 operand is quantized in the graph, there it is a graph input
+        that is already FP8.
         """
         a = torch.rand(mat1_shape, dtype=torch.float16)
         b = torch.rand(mat2_shape, dtype=torch.float16)
