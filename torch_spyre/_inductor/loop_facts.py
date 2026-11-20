@@ -99,7 +99,11 @@ def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
 
 def _in_built_node(op: Operation) -> bool:
     chain = getattr(op, "_loop_chain", ())
-    return bool(chain) and all(node.facts_recorded for node in chain)
+    return (
+        isinstance(chain, tuple)
+        and bool(chain)
+        and all(node.facts_recorded for node in chain)
+    )
 
 
 def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
