@@ -754,17 +754,51 @@ def _covers_whole_target(
 
     A cat operand writes a sub-range of the cat buffer and is a slice; a
     copy-back into a mutated graph input writes the whole target and is not.
-    A size that does not concretize is treated as a slice, which keeps the raise
-    rather than letting an unpadded write through.
+
+    Element count, not the size list: a copy-back through a reshaped view of the
+    same storage (a ``(4096,)`` input mutated as ``x.view(64, 64)``) covers the
+    whole buffer with a different shape, and comparing size lists would call it a
+    slice and raise where main does not.
+
+    The offset comes from the view being mutated, not from ``layout``, whose own
+    offset ``MutationLayoutSHOULDREMOVE`` never sets: a same-sized write partway
+    into the target is still a slice. Anything that does not concretize is treated
+    as a slice, which keeps the raise rather than letting an unpadded write
+    through.
     """
+
+    def numel(sizes) -> int:
+        n = 1
+        for s in sizes:
+            n *= int(concretize_expr(s))
+        return n
+
     try:
-        sizes = [int(concretize_expr(s)) for s in layout.size]
-        real_sizes = [int(concretize_expr(s)) for s in real.size]
-        offset = int(concretize_expr(layout.offset))
-        real_offset = int(concretize_expr(real.offset))
+        if numel(layout.size) != numel(real.size):
+            return False
+        return int(concretize_expr(_mutated_view_offset(layout))) == int(
+            concretize_expr(real.offset)
+        )
     except (TypeError, ValueError, AttributeError):
         return False
-    return sizes == real_sizes and offset == real_offset
+
+
+def _mutated_view_offset(layout: MutationLayoutSHOULDREMOVE) -> Expr:
+    """The storage offset of the view ``layout`` mutates.
+
+    ``layout.target`` is the mutated node: a ``StorageBox`` for a whole buffer, a
+    ``ReinterpretView`` for a slice of one, and the view's own layout carries the
+    offset that tells them apart.
+    """
+    target = getattr(layout, "target", None)
+    target_layout = (
+        target.get_layout()
+        if target is not None and hasattr(target, "get_layout")
+        else None
+    )
+    if target_layout is not None and hasattr(target_layout, "offset"):
+        return target_layout.offset
+    return getattr(layout, "offset", sympy.Integer(0))
 
 
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:

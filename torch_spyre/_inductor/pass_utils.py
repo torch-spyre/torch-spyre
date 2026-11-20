@@ -3379,16 +3379,26 @@ def dense_relocation_serves_read(
         or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
     ):
         return None
-    # A read at a constant offset (a slice, `x[1:].reshape(4, 28, 16)`) is left to
-    # the sparse layout.  The relocated coordinates are right -- the stick carries
-    # the offset, `d0 + 1` -- but the restickify copies the whole buffer and the
+    # A read at an offset (a slice, `x[1:].reshape(4, 28, 16)`) is left to the
+    # sparse layout.  The relocated coordinates are right -- the stick carries the
+    # offset, `d0 + 1` -- but the restickify copies the whole buffer and the
     # consumer then reads the copy at `Mod(c0, 64)`, dropping the offset, so every
     # element comes out one stick position off.  Returning the target anyway
     # silently produced wrong values on (5, 448)[1:].reshape(4, 28, 16), which main
     # gets right through the sparse layout.
+    #
+    # Only the loop variables and the indirect addresses are zeroed, not every
+    # free symbol: a dynamic slice start (`x[k:]`, index `448*d0 + 448*s1 + ...`)
+    # is just as much an offset, and zeroing `s1` too would read it as no offset
+    # at all and relocate it into the same wrong values.  What survives the
+    # substitution is the offset, constant or symbolic.
     # TODO(#5872): carry the offset into the restickified buffer's read instead,
     # and the relocation serves these too.
-    if dep.index.xreplace(dict.fromkeys(dep.index.free_symbols, 0)) != 0:
+    zeroed = dict.fromkeys(
+        (s for s in dep.index.free_symbols if s in dep.ranges or is_indirect(s.name)),
+        0,
+    )
+    if dep.index.xreplace(zeroed) != 0:
         return None
     sizes = [int(concretize_expr(v)) for v in in_host.size]
     strides = [int(concretize_expr(v)) for v in in_host.stride]
@@ -3421,8 +3431,32 @@ def dense_relocation_serves_read(
             continue
         if forbidden_stick_syms and forbidden_stick_syms & coords[-1].free_symbols:
             continue
+        if _is_factorized_stick(coords, op):
+            # The stick variable would also sit on an outer axis, so a matmul
+            # backend sees two contraction dims and produces wrong output -- the
+            # same rejection compute_restickify_needed makes for an input layout
+            # it can read (factorized_layout_mismatch).  That check runs off the
+            # input's own coordinates, which do not exist here (this path is only
+            # reached when the input cannot serve the read at all), so the
+            # relocated target is checked instead.
+            continue
         return target
     return None
+
+
+def _is_factorized_stick(coords: "list[sympy.Expr]", op: "Operation | None") -> bool:
+    """Whether ``coords`` puts a matmul's stick variable on an outer axis as well.
+
+    See ``is_factorized`` in ``compute_restickify_needed``: the backend reads that
+    as two contraction dims. Only matmuls care, so a non-matmul op is never
+    factorized by this test.
+    """
+    if op is None or not _is_matmul_op(op):
+        return False
+    stick_syms = coords[-1].free_symbols
+    if not stick_syms:
+        return False
+    return sum(bool(c.free_symbols & stick_syms) for c in coords[:-1]) > 1
 
 
 def _former_stick_dim_outermost(
@@ -3562,10 +3596,15 @@ def compute_restickify_needed(
             # stick_compatible check here was tried and reverted: it rejects the
             # sparse target for the yolo26 Detect head cat, which then fails with
             # a bare "Unexpected stick expression Mod(Mod(d1, 80), 64)" from
-            # codegen instead of the padding pass's own message.  A sparse target
-            # is paired with a sparse output by both layout rules' early return,
-            # and stick_compatible does not model that pairing.  Checking it
-            # properly is part of #5872's end state, not a local fix.
+            # codegen instead of the padding pass's own message.  stick_compatible
+            # does not model the pairing a sparse target is for.
+            #
+            # The gap this leaves, which #5872's end state closes rather than a
+            # local fix: a rule that relocated reaches _candidate_output_stls and
+            # can hand back a dense output, so when the relocation above is
+            # rejected for that output the sparse target returned here is not the
+            # sparse-output pairing the rules' early return produces.  Codegen
+            # reports such a pair rather than the beam search discarding it.
             return True, sparse
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
