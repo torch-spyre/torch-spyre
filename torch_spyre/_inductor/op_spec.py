@@ -278,6 +278,10 @@ class TensorArg:
         stride_map: The ``stride_map`` of the SpyreTensorLayout the coordinates were
                 derived from: each device dim's host stride, 0 for a dim holding no
                 host elements.  ``None`` when the arg was not built from a layout.
+        valid_elements: The ``valid_elements`` of the SpyreTensorLayout: maps each
+                group of device dims to its count of non-padding elements.  ``None``
+                when unknown (hand-built args, or a layout whose map is empty);
+                consumers must then fall back to logical sizes.
         allocation: dict tagging where this Tensor's data lives. Mirrors
                 layout.allocation and carries exactly one of three
                 mutually-exclusive keys:
@@ -336,6 +340,7 @@ class TensorArg:
     replicated_scalar: bool = False
     non_unified_shard_bytes: int = 0
     stride_map: list[int] | None = None
+    valid_elements: dict[tuple[int, ...], int] | None = None
 
     @property
     def non_unified(self) -> bool:
