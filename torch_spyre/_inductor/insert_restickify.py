@@ -522,6 +522,12 @@ def _transfer_loop_info(
         # reads them to pin a dim's split to 1, so a stale entry here blocks the
         # split this full, untiled copy needs to fit the per-core span limit
         # (issue #6277).
+        # TODO(#5863 8.3): this fixed full copy sits inside the loop body and runs on
+        # every trip. Once insert_restickify is node-aware, place it before the node
+        # (insert_before) so it runs once; an op outside every loop cannot carry a
+        # stale loop_tiled_dims. Stage 9 needs another source for the dims
+        # coarse_tile_local_dim_split_domains pins once loop_tiled_dims is deleted;
+        # test_embedding_restickify_table_no_span_overflow is the acceptance case.
         levels = len(getattr(consumer_li, "loop_count", []) or [])
         restick_buff.loop_info = dataclasses.replace(
             restick_buff.loop_info,
