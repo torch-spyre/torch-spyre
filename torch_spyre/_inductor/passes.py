@@ -620,7 +620,7 @@ class CustomPreSchedulingPasses:
             # `loop_info` stamped, to decide whether the per-trip advance
             # belongs on the restickify stage or stays on the consumer.
             # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's CoarseTileInfo in one deferred final
+            # for_each_tile level's LoopInfo in one deferred final
             # phase, so by the time insert_restickify runs, every tiled
             # stage's loop_info is already in place. If this pass ever
             # moved ahead of splice_while_loops' stamping, that check would

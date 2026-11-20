@@ -26,7 +26,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.dedup_constants import _drop_constant
-from torch_spyre._inductor.loop_info import copy_op_metadata
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.op_spec import ProvenanceTransform
 from torch_spyre._inductor.provenance import (
     _SPYRE_PROV_HISTORY_ATTR,

@@ -311,13 +311,13 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     """
     from torch._inductor.ir import ComputedBuffer
 
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_info import LoopInfo
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         solver_relayout_edge_context,
     )
 
     def tiled(group):
-        return CoarseTileInfo(
+        return LoopInfo(
             loop_group_id=group,
             loop_count=[4] * len(group),
             loop_tiled_dims=[[0]] * len(group),
@@ -668,7 +668,7 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
 def _consumer(name, data=None, carry_of=None, loop_info=None):
     """An op for the consumer rule: its name, IR data, loop metadata and,
     for a carry's storage or update, the carry record."""
-    from torch_spyre._inductor.loop_info import LoopCarryRecord
+    from torch_spyre._inductor.loop_node import LoopCarryRecord
 
     op = SimpleNamespace(get_name=lambda: name, data=data, loop_info=loop_info)
     if carry_of is not None:
@@ -711,7 +711,7 @@ def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
     loop's carry, so the solver may offer it a relayout copy. Another
     reduction kind, a sum inside a loop and a sum of any other producer keep
     the earlier answer (no relayout)."""
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_info import LoopInfo
 
     matmul = _consumer("mm")
     monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda o: o is matmul)
@@ -720,7 +720,7 @@ def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
     carry = _consumer("buf52", carry_of="buf52")
     update = _consumer("buf_update", carry_of="buf52")  # the record's other end
     plain = _consumer("buf7")
-    one_loop = CoarseTileInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]])
+    one_loop = LoopInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]])
     supported = lx_relayout._relayout_consumer_kind_supported
     assert supported(carry, total)
     assert not supported(plain, total)

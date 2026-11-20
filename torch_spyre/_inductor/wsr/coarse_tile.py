@@ -16,7 +16,7 @@
 
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
-trip count and gives every member a ``LoopShim``. This module keeps what that
+trip count and gives every member a ``LoopInfo``. This module keeps what that
 lowering shares with the ``for_each_tile`` lowering:
 
   - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
@@ -237,7 +237,7 @@ def _find_outside_consumers_planned(
     of objects (planning is zero-mutation, so there's no reason to carry
     object references past this stage), and looks up each candidate's outer loop-group key from
     name_to_group_outer_key (built once by the caller from the planned
-    CoarseTileInfo dict) instead of a not-yet-stamped op.loop_info attribute.
+    LoopInfo dict) instead of a not-yet-stamped op.loop_info attribute.
     """
     outer_key = group_loop_id[0]
     consumer_names: list[str] = []

@@ -31,7 +31,7 @@ from torch_spyre._inductor.loop_checker import (
     check_loops,
     find_violations,
 )
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,

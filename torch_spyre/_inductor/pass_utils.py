@@ -87,7 +87,6 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger, warn_once
 from .loop_facts import enclosing_loops
-from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops, replace_op
 from .pass_counters import (
     COUNTERS,
@@ -102,6 +101,76 @@ from .views import (
     build_alignment_inputs,
     compute_coordinates,
 )
+
+
+_SPYRE_METADATA_ATTRS = (
+    "dim_hints",
+    "work_div_loop_info",
+    "iteration_space_ownership",
+    "loop_info",
+    "_restickify_plan",
+    "_input_layout_overrides",
+    "_emit_set_layout",
+    # Links a tiled reduction op to its accumulation buffer; set by
+    # loop_tiling_lowering.lower_loop_tiling, read by finalize_layouts in
+    # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
+    "_tiled_reduction_accum_name",
+    # One immutable record shared by a for_each_tile carry's persistent
+    # storage and its in-loop update operation.
+    "_loop_carry_record",
+    # Ground-truth tiled-dim tag stamped by lower_tile_dim_marker
+    # (lowering.py) on a for_each_tile tile read; consumed and erased by
+    # _consume_tile_dim_markers (for_each_tile_lowering.py). Must survive
+    # while_loop_bridge.splice_while_loop's own redirect_computed_buffer_
+    # reads calls (e.g. "redirect while_loop carry/tile reads to persistent
+    # scratch"), which reconstruct the marker op before
+    # _consume_tile_dim_markers ever sees it -- confirmed empirically: the
+    # marker attribute was silently dropped there before this attr was
+    # added to this tuple, because copy_op_metadata only copies attrs
+    # listed here.
+    "tile_marker_dim",
+    # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
+    # since that module imports this one (through pass_utils).
+    "_work_division_chosen_with_tiling",
+)
+
+
+# Per-op layout state set by propagate_spyre_tensor_layouts and
+# nonstick_dim_order.  It describes ``src``'s own output and inputs, so it is
+# only valid on a rebuild of ``src`` that keeps its name, layout and body
+# (``copy_op_metadata(..., layout_state=True)``).  A new op built from another
+# op (a drain, a restore, an inserted copy) must not inherit it.
+_SPYRE_LAYOUT_STATE_ATTRS = (
+    "layouts",
+    "restick_cost_fn",
+    "committed_stl",
+)
+
+
+def copy_op_metadata(
+    src: "ComputedBuffer", dst: "ComputedBuffer", *, layout_state: bool = False
+) -> None:
+    """Copy non-provenance Spyre pass metadata from src to dst.
+
+    Call this whenever a pass reconstructs a ComputedBuffer to ensure
+    dim_hints, work-division hint metadata, and coarse-tiling attrs are not
+    silently dropped. Source provenance is owned by the helpers in
+    ``provenance.py`` and is deliberately excluded from this bulk copy.
+
+    Pass ``layout_state=True`` only when ``dst`` replaces ``src`` with the same
+    name, layout and body semantics (a name-swap or body-wrap rebuild): it also
+    copies the layout-propagation results in ``_SPYRE_LAYOUT_STATE_ATTRS``.
+    Without it, a rebuild after ``propagate_spyre_tensor_layouts`` loses them
+    and later passes fail (``KeyError`` in optimize_restickify,
+    ``FixedLayout`` without ``device_layout`` in insert_restickify).
+    """
+    attrs: tuple[str, ...] = _SPYRE_METADATA_ATTRS
+    if layout_state:
+        attrs = attrs + _SPYRE_LAYOUT_STATE_ATTRS
+    for attr in attrs:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
 _SHAPE_ENV_DEFAULT_LOWER = 2
