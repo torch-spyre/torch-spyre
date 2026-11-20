@@ -800,6 +800,16 @@ def generate_sdsc(
         }
         for c in range(sdsc_spec.num_cores)
     }
+    anchor_core = next(
+        (
+            c
+            for c in range(sdsc_spec.num_cores)
+            if not any(core_id_to_wk_slice[str(c)].values())
+        ),
+        None,
+    )
+    if anchor_core is None:
+        raise ValueError("No fold position owns the all-zero work slice")
     operation_work_division = TensorWorkDivision(
         {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
         {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
@@ -1000,12 +1010,12 @@ def generate_sdsc(
             continue
         nb = num_bytes(tensor.data_format)
         slice_offset_bytes = sum(tensor.offsets.values()) * nb
-        # core0_addr: compile-time address for core 0 including the tensor's
-        # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
-        core0_addr = (
+        # The kernel base belongs to the fold position owning work slice zero.
+        # A signed shift need not leave that position on physical core zero.
+        anchor_addr = (
             tensor.start_address
             + core_idx_to_slice_offset(
-                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                tensor, core_id_to_wk_slice[str(anchor_core)], sdsc_spec.work_slices
             )
             * nb
         )
@@ -1108,7 +1118,7 @@ def generate_sdsc(
             # base; otherwise a kernel_slice sym is registered for the combined offset.
             if total_slice_offset > 0:
                 offset_as_symbol(
-                    core0_addr,
+                    anchor_addr,
                     SymbolKind.kernel_slice(
                         arg_index=tensor.arg_index, offset=total_slice_offset
                     ),
@@ -1158,27 +1168,20 @@ def generate_sdsc(
                     )
                     * nb
                 )
-                if c == 0:
+                if c == anchor_core:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    # kernel / kernel_slice already registered above; skip c==0
-                else:
-                    if tensor.arg_index < 0:
-                        offset_as_symbol(addr, SymbolKind.pool())
-                    elif addr != core0_addr:
-                        # Only register a derived symbol when the core has a
-                        # distinct address from core 0.  When addr == core0_addr
-                        # (e.g. a non-split tensor where all cores share one
-                        # address) the sliced-base symbol already covers it and
-                        # we must not create a duplicate registration.
-                        _register_per_core_derived(
-                            tensor,
-                            c,
-                            addr,
-                            core0_addr,
-                            sliced_base_sym_idx,
-                            symbolic_split,
-                        )
+                elif tensor.arg_index < 0:
+                    offset_as_symbol(addr, SymbolKind.pool())
+                elif addr != anchor_addr:
+                    _register_per_core_derived(
+                        tensor,
+                        c,
+                        addr,
+                        anchor_addr,
+                        sliced_base_sym_idx,
+                        symbolic_split,
+                    )
             affine_strides.append([{} for _ in tiled_symbols])
         else:
             # Tiled HBM: symbol value = per-core iter-0 base address.
@@ -1191,25 +1194,20 @@ def generate_sdsc(
                     )
                     * nb
                 )
-                if c == 0:
+                if c == anchor_core:
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
-                    # kernel / kernel_slice already registered above; skip c==0
-                else:
-                    if tensor.arg_index < 0:
-                        offset_as_symbol(addr, SymbolKind.pool())
-                    elif addr != core0_addr:
-                        # Symbolic split on a non-tiled dim combined with
-                        # tiling on another dim still routes through the
-                        # helper; the split==tiled case is rejected above.
-                        _register_per_core_derived(
-                            tensor,
-                            c,
-                            addr,
-                            core0_addr,
-                            sliced_base_sym_idx,
-                            symbolic_split,
-                        )
+                elif tensor.arg_index < 0:
+                    offset_as_symbol(addr, SymbolKind.pool())
+                elif addr != anchor_addr:
+                    _register_per_core_derived(
+                        tensor,
+                        c,
+                        addr,
+                        anchor_addr,
+                        sliced_base_sym_idx,
+                        symbolic_split,
+                    )
             affine_strides.append(per_level_strides)
 
     def _start_addr_data(tensor):
@@ -1247,10 +1245,10 @@ def generate_sdsc(
                 if total_slice_offset > 0
                 else ("kernel", tensor.arg_index)
             )
-            core0_addr_lookup = (
+            anchor_addr_lookup = (
                 tensor.start_address
                 + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                    tensor, core_id_to_wk_slice[str(anchor_core)], sdsc_spec.work_slices
                 )
                 * nb
             )
@@ -1265,11 +1263,10 @@ def generate_sdsc(
             )
             if is_pool_tensor:
                 key: tuple | int = ("pool", addr)
-            elif c == 0:
+            elif c == anchor_core:
                 key = c0_slice_key
-            elif addr == core0_addr_lookup:
-                # Non-split tensor: all cores share core 0's address, so no
-                # derived symbol was registered, reuse the sliced-base key.
+            elif addr == anchor_addr_lookup:
+                # Every position with the anchor address shares its base symbol.
                 key = c0_slice_key
             elif symbolic_split is not None:
                 # Symbolic-dim split: c>0 registered a kernel_derived_symbolic
@@ -1486,8 +1483,10 @@ def generate_sdsc(
             extra["allocateNode_"] = alloc_node
         return extra
 
-    active_core_ids = sdsc_spec.completed_producer_cores or tuple(
-        range(sdsc_spec.num_cores)
+    active_core_ids = (
+        sdsc_spec.active_core_ids
+        or sdsc_spec.completed_producer_cores
+        or tuple(range(sdsc_spec.num_cores))
     )
     return (
         {
@@ -1508,7 +1507,9 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": len(active_core_ids),
+                # Use the positional fold span; correction symbols include
+                # inactive positions when physical core IDs are sparse.
+                "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
@@ -1529,6 +1530,7 @@ def generate_sdsc(
                         or dim not in sdsc_spec.window_dims
                     }
                     for core, slices in core_id_to_wk_slice.items()
+                    if int(core) in active_core_ids
                 },
                 "coreIdToDscSchedule": {
                     str(c): [[-1, 0, 0, 0]] for c in active_core_ids
@@ -1760,9 +1762,11 @@ def generate_sdsc(
                                                     tensor.work_division.num_cores
                                                     or sdsc_spec.num_cores
                                                 ).items()
-                                                if i != 0
-                                                or not sdsc_spec.completed_producer_cores
-                                                or int(core) in active_core_ids
+                                                if (
+                                                    not tensor.active_core_ids
+                                                    or int(core)
+                                                    in tensor.active_core_ids
+                                                )
                                             }
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None

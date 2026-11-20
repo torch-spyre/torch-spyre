@@ -33,9 +33,10 @@ SuperDSC (Super Design Space Config) is a JSON-based intermediate representation
 
 | Field | Purpose |
 |---|---|
-| `coreFoldProp_` | How the iteration space is divided across cores (for example `{"factor_": 2}` for a 2-core split). |
-| `numWkSlicesPerDim_` | Number of work slices per iteration dimension. `{"c0": 2, "c1": 1}` says dim `c0` is split two ways and dim `c1` is not split. |
-| `coreIdToWkSlice_` | Maps each core ID to the slice indices it owns. |
+| `coreFoldProp_` | Positional physical core span. It includes inactive positions in a clamshell placement. |
+| `numCoresUsed_` | Positional physical span for runtime correction symbols. The nested DSC count and `coreIdsUsed_` list the active cores. |
+| `numWkSlicesPerDim_` | Number of logical work slices per iteration dimension. `{"c0": 2, "c1": 1}` splits `c0` in two. |
+| `coreIdToWkSlice_` | Maps active physical core IDs to work slices. An LX shuffle uses the destination owner's slices for its output holders. |
 | `dscs_` | Array of `DesignSpaceConfig` entries, one per compute configuration. |
 
 Each `dscs_` entry is a complete description of one compute configuration:
@@ -133,6 +134,15 @@ SuperDSC artifacts have to be diffable and inspectable during development, which
 ### SuperDSC and KTIR
 
 SuperDSC is an IR that closely matches the hardware model. KernelTile IR (KTIR) is an MLIR-based representation that generalizes the concepts in SuperDSC (compute tiles, scratchpad staging, compile-time core partitioning) into a community specification for any dataflow accelerator. See [KTIR](ktir.md) for the KTIR path through the backend and [RFC 0682 - KTIR Spec](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) for the specification.
+
+## Physical-placement dependencies
+
+Physical placement can wrap an active core range across physical core ID
+zero. The front end remaps a source holder with the same shift and step
+as its producer. Destination work slices do not add dispatch cores.
+Wrapped placements — indirect access and wrapped cross-core reductions —
+require a recent backend build; older builds can fault or return
+incorrect values.
 
 ## Invocation
 

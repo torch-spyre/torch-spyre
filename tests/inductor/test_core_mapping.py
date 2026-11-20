@@ -141,6 +141,66 @@ def test_default_mapping_preserves_existing_core_order():
     assert _coordinates((2, 3), 12) == one_grid * 2
 
 
+@pytest.mark.parametrize(
+    "logical,physical,shift,step,expected",
+    [
+        (8, 32, 0, 1, tuple(range(8))),
+        (8, 32, -4, 1, (28, 29, 30, 31, 0, 1, 2, 3)),
+        (8, 32, -3, 3, (29, 0, 3, 6, 9, 12, 15, 18)),
+        (8, 32, 3, -2, (3, 1, 31, 29, 27, 25, 23, 21)),
+        (8, 32, 0, 4, (0, 4, 8, 12, 16, 20, 24, 28)),
+        (24, 32, -12, 1, tuple(range(20, 32)) + tuple(range(12))),
+    ],
+    ids=[
+        "dense",
+        "half-eight",
+        "positive-step",
+        "negative-step",
+        "step-four",
+        "half-twenty-four",
+    ],
+)
+def test_core_placement_maps_logical_owners_in_physical_order(
+    logical, physical, shift, step, expected
+):
+    placement = core_mapping_module.CorePlacement(logical, physical, shift, step)
+    assert placement.physical_ids == expected
+    assert placement.active_ids == tuple(sorted(expected))
+    assert placement.physical_span == (
+        logical if shift == 0 and step == 1 else physical
+    )
+    assert placement.remap_ids(tuple(range(logical))) == tuple(sorted(expected))
+    assert len(set(placement.physical_ids)) == logical
+    row = sympy.Symbol("row")
+    owner = core_mapping_module.place_core_map({row: _CORE_ID}, placement)[row]
+    for logical_id, physical_id in enumerate(expected):
+        assert int(owner.xreplace({_CORE_ID: physical_id})) == logical_id
+    if logical > 1:
+        assert placement.remap_ids((logical - 1, 0)) == tuple(
+            sorted((expected[-1], expected[0]))
+        )
+    with pytest.raises(ValueError, match="outside its logical domain"):
+        placement.remap_ids((logical,))
+
+
+@pytest.mark.parametrize(
+    "logical,physical,shift,step",
+    [
+        (9, 32, 0, 4),  # The ninth owner aliases physical core zero.
+        (2, 32, 0, 0),
+        (33, 32, 0, 1),
+        (8, 0, 0, 1),
+        (0, 32, 0, 1),
+        (17, 32, 0, -2),
+    ],
+)
+def test_core_placement_rejects_collisions_and_out_of_range_counts(
+    logical, physical, shift, step
+):
+    with pytest.raises(ValueError):
+        core_mapping_module.CorePlacement(logical, physical, shift, step)
+
+
 @pytest.mark.parametrize("slot", [sympy.Rational(1, 2), sympy.Symbol("unresolved")])
 def test_owner_slots_must_be_concrete_integers(slot):
     dim = sympy.Symbol("dim")

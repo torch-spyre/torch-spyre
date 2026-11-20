@@ -250,6 +250,7 @@ def enable_spyre_compile_fx_wrapper():
 
             try:
                 if uses_spyre:
+                    config.validate_core_placement()
                     torch.spyre._impl._lazy_init()
 
                     # AOTAutograd uses the dict passed via ``decompositions=``

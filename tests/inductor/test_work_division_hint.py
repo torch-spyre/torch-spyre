@@ -50,7 +50,11 @@ import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._C import DataFormats, SpyreTensorLayout
-from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
+from torch_spyre._inductor.codegen.superdsc import (
+    _core_placement,
+    compile_op_spec,
+    parse_op_spec,
+)
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
@@ -2157,6 +2161,105 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
 
 
 @config.patch(
+    {"sencores": 24, "sencores_physical": 32, "core_placement_mode": "clamshell"}
+)
+def test_clamshell_relayout_runs_on_twenty_four_owners_without_phantom_cores():
+    """A 12x2 source feeds a four-slice destination replicated on 24 owners."""
+    row, feature = Symbol("row"), Symbol("feature")
+    source = _view(
+        {0: 12, 1: 2},
+        {0: floor(_CORE_ID / 2), 1: Mod(_CORE_ID, 2)},
+        24,
+    )
+    destination = _view({0: 4}, {0: floor(_CORE_ID / 6)}, 24)
+    assert lx_relayout_module.movement_supported(source, destination, 24, 24)
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [24, 2, 64],
+        [row, floor(feature / 64), Mod(feature, 64)],
+        {row: (Integer(24), 4), feature: (Integer(128), 1)},
+        (),
+        8192,
+    )
+
+    root, allocations = _compile_spec(spec)
+    active = tuple(range(20, 32)) + tuple(range(12))
+    expected_ids = {str(core) for core in active}
+    assert root["coreFoldProp_"]["factor_"] == 32
+    assert root["numCoresUsed_"] == 32
+    assert set(root["coreIdToDsc_"]) == expected_ids
+    assert root["dscs_"][0]["shuffle"]["numCoresUsed_"] == 24
+    assert set(root["dscs_"][0]["shuffle"]["coreIdsUsed_"]) == set(active)
+    assert len(allocations) == 2
+    source_map, destination_map = [
+        allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
+    ]
+    assert set(source_map) == set(destination_map) == expected_ids
+    source_slices, destination_slices = [
+        argument.work_division.work_slices for argument in spec.args
+    ]
+    source_row = next(dim for dim, split in source_slices.items() if split == 12)
+    source_feature = next(dim for dim, split in source_slices.items() if split == 2)
+    destination_row = next(
+        dim for dim, split in destination_slices.items() if split == 4
+    )
+    _, symbols = parse_op_spec(spec)
+    source_row = symbols[source_row]
+    source_feature = symbols[source_feature]
+    destination_row = symbols[destination_row]
+    for logical_id, core in enumerate(active):
+        physical_id = str(core)
+        assert source_map[physical_id][str(source_row)] == logical_id // 2
+        assert source_map[physical_id][str(source_feature)] == logical_id % 2
+        assert destination_map[physical_id][str(destination_row)] == logical_id // 6
+        assert root["coreIdToWkSlice_"][physical_id] == destination_map[physical_id]
+    assert sorted(
+        destination_map[core][str(destination_row)] for core in expected_ids
+    ) == [label for label in range(4) for _ in range(6)]
+
+
+@config.patch(
+    {"sencores": 8, "sencores_physical": 32, "core_placement_mode": "clamshell"}
+)
+def test_sparse_contraction_dispatches_source_only_owners_without_extra_cores():
+    row, lane = Symbol("row"), Symbol("lane")
+    source = _view({0: 8}, {0: _CORE_ID}, 8)
+    destination = _view({0: 4}, {0: _CORE_ID}, 4)
+    assert lx_relayout_module.movement_supported(source, destination, 8, 4)
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [512, 64],
+        [row, lane],
+        {row: (Integer(512), 4), lane: (Integer(64), 1)},
+        (),
+        8192,
+    )
+    root, allocations = _compile_spec(spec)
+    source_ids = (28, 29, 30, 31, 0, 1, 2, 3)
+    destination_ids = (30, 31, 0, 1)
+    assert root["coreFoldProp_"]["factor_"] == 32
+    assert root["numCoresUsed_"] == 32
+    assert set(root["coreIdToDsc_"]) == {str(core) for core in source_ids}
+    assert root["dscs_"][0]["shuffle"]["numCoresUsed_"] == 8
+    source_map, destination_map = [
+        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+    ]
+    assert set(source_map) == {str(core) for core in source_ids}
+    assert set(destination_map) == {str(core) for core in destination_ids}
+    _, labels = parse_op_spec(spec)
+    row_label = str(labels[row])
+    for logical, physical in enumerate(source_ids):
+        assert source_map[str(physical)][row_label] == logical
+    for logical, physical in enumerate(destination_ids):
+        assert destination_map[str(physical)][row_label] == logical
+        assert root["coreIdToWkSlice_"][str(physical)][row_label] == logical
+    for physical in set(source_ids) - set(destination_ids):
+        assert root["coreIdToWkSlice_"][str(physical)][row_label] == 0
+
+
+@config.patch(
     {
         "sencores": 8,
         "lx_planning": True,
@@ -2863,6 +2966,7 @@ def test_for_each_tile_carried_sum_after_relayout_producer():
 @config.patch(
     {
         "sencores": 32,
+        "sencores_physical": 32,
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
@@ -2874,27 +2978,41 @@ def test_for_each_tile_carried_sum_after_relayout_producer():
     }
 )
 @pytest.mark.parametrize(
-    "k,out_split,consumer_out,matmul_reader",
+    "k,out_split,consumer_out,matmul_reader,placement,consumer_cores,relayout_supported",
     [
-        (2, 1, 1, False),
-        (4, 1, 1, False),
-        (4, 2, 2, False),
-        (2, 2, 1, False),
-        (4, 2, 1, False),
-        (2, 4, 1, False),
-        (2, 4, 2, True),
-        (8, 1, 1, False),
-        (16, 1, 1, False),
-        (32, 1, 1, False),
+        (2, 1, 1, False, "dense", 32, True),
+        (4, 1, 1, False, "dense", 32, True),
+        (4, 2, 2, False, "dense", 32, True),
+        (2, 2, 1, False, "dense", 32, True),
+        (4, 2, 1, False, "dense", 32, True),
+        (2, 4, 1, False, "dense", 32, True),
+        (2, 4, 2, True, "dense", 32, True),
+        (8, 1, 1, False, "dense", 32, True),
+        (16, 1, 1, False, "dense", 32, True),
+        (32, 1, 1, False, "clamshell", 32, True),
+        # 24/30 cannot broadcast evenly to 32 consumers; keep the HBM cases.
+        (24, 1, 1, False, "clamshell", 32, False),
+        (30, 1, 1, False, "clamshell", 32, False),
+        # Completed-reduction relayout requires the producer's full core domain.
+        (24, 1, 1, False, "clamshell", 24, True),
+        (30, 1, 1, False, "clamshell", 30, True),
     ],
 )
 @pytest.mark.parametrize("enabled", [False, True])
 def test_completed_reduction_relayout_device(
-    k, out_split, consumer_out, matmul_reader, enabled
+    k,
+    out_split,
+    consumer_out,
+    matmul_reader,
+    placement,
+    consumer_cores,
+    relayout_supported,
+    enabled,
 ):
     """Distinct exact sums catch copying a partial answer or an unwritten core."""
-    rows, reduction, columns = 512, max(256, 64 * k), max(128, 64 * out_split)
-    row_ids = torch.arange(rows)
+    rows = 512 if consumer_cores == 32 else 64 * consumer_cores
+    reduction, columns = max(256, 64 * k), max(128, 64 * out_split)
+    row_ids = torch.arange(rows) % 512
     tags = (2.0 ** (row_ids // 32 - 5) * (1 + 2 * ((row_ids // 16) % 2))).half()[
         :, None
     ]
@@ -2905,8 +3023,9 @@ def test_completed_reduction_relayout_device(
     x = tags.expand(rows, reduction).contiguous()
     weight = amplitudes[:, None].half() * column_tags / reduction
     expected = -tags * column_tags * mean_amplitude
+    # K=24/30 sum 1536/1920 fp32 terms; the reference matmul rounds.
     torch.testing.assert_close(
-        -(x.float() @ weight.float()), expected.float(), rtol=0, atol=0
+        -(x.float() @ weight.float()), expected.float(), rtol=2**-10, atol=0
     )
     rhs = torch.full((columns, 64), 1 / columns, dtype=torch.float16)
     if matmul_reader:
@@ -2917,7 +3036,9 @@ def test_completed_reduction_relayout_device(
     def fn(x, weight, rhs):
         with spyre_hint(work_div={"M": 32 // (k * out_split), "K": k, "N": out_split}):
             hidden = x @ weight
-        with spyre_hint(work_div={"M": 32 // consumer_out, "N": consumer_out}):
+        with spyre_hint(
+            work_div={"M": consumer_cores // consumer_out, "N": consumer_out}
+        ):
             return hidden @ rhs if matmul_reader else -hidden
 
     args = (
@@ -2928,11 +3049,22 @@ def test_completed_reduction_relayout_device(
     torch._dynamo.reset()
     torch._inductor.codecache.FxGraphCache.clear()
     with (
-        config.patch(lx_planner_relayout=enabled),
+        config.patch(
+            lx_planner_relayout=enabled,
+            # Completed-reduction candidates must use the full logical budget.
+            sencores=consumer_cores,
+            sencores_physical=32,
+            core_placement_mode=placement,
+        ),
         _emitted_kernels() as kernels,
         _capture_backend_output_dirs() as directories,
         _captured_completed_reduction_routes() as route_calls,
     ):
+        producer_cores = (32 // (k * out_split)) * k * out_split
+        producer_placement = _core_placement(producer_cores)
+        terminal_ids = producer_placement.remap_ids(
+            tuple(range(k - 1, producer_cores, k))
+        )
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
@@ -2944,28 +3076,27 @@ def test_completed_reduction_relayout_device(
         for root in json.loads(file.read_text()).values()
     ]
     assert all("prodConsList" not in root for root in roots)
-    copies = [
-        root
-        for root in roots
-        if "shuffle" in root["dscs_"][0]
-        and set(root["coreIdToDsc_"]) == {str(c) for c in range(k - 1, 32, k)}
-    ]
-    assert len(copies) == int(enabled)
-    if enabled:
-        # Restores the LX-only guarantee this test asserted before #4984,
-        # now via the real planner certification (is_lx_relayout_identity)
-        # rather than the removed debug JSON payload.
+    copies = [root for root in roots if "shuffle" in root["dscs_"][0]]
+    expect_copy = enabled and relayout_supported
+    assert len(copies) == int(expect_copy)
+    if expect_copy:
         copy = _assert_lx_only_relayout_kernels(kernels)
         routes = _matching_completed_reduction_routes(
             route_calls, copy.completed_producer_cores
         )
-        # copy.completed_producer_cores is the real emitted value, so this
-        # compares it against the formula instead of re-checking the match
-        # criterion that selected `routes` in the first place.
-        assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
+        assert sorted(map(int, routes)) == list(range(k - 1, producer_cores, k))
         assert collections.Counter(
-            c for readers in routes.values() for c in readers
-        ) == {core: out_split // consumer_out for core in range(32)}
+            core for readers in routes.values() for core in readers
+        ) == {core: out_split // consumer_out for core in range(consumer_cores)}
+        shuffle = copies[0]["dscs_"][0]["shuffle"]
+        source, destination = shuffle["scheduleTree_"]
+        source_ids = set(source["coordinates_"]["coreIdToWkSlice_"])
+        destination_ids = set(destination["coordinates_"]["coreIdToWkSlice_"])
+        assert source_ids == {str(core) for core in terminal_ids}
+        assert set(copies[0]["coreIdToDsc_"]) == source_ids | destination_ids
+        assert set(shuffle["coreIdsUsed_"]) == {
+            int(core) for core in source_ids | destination_ids
+        }
         assert "completed_producer_cores=" in "\n".join(code)
 
 
@@ -3020,12 +3151,69 @@ def test_completed_reduction_routes_survive_alignment_unchanged():
     assert set(root["dscs_"][0]) == {"shuffle"}
     assert spec.completed_producer_cores == (3, 7)
     assert "prodConsList" not in root
-    assert root["numCoresUsed_"] == 2
+    assert root["numCoresUsed_"] == 8
+    assert set(root["coreIdToDsc_"]) == {str(core) for core in range(8)}
     source_map, destination_map = [
         node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
     ]
     assert set(source_map) == {"3", "7"}
     assert set(destination_map) == {str(core) for core in range(8)}
+
+
+@config.patch(
+    {"sencores": 8, "sencores_physical": 32, "core_placement_mode": "clamshell"}
+)
+def test_completed_reduction_routes_remap_terminal_writers_to_physical_ids():
+    m, n = Symbol("m"), Symbol("n")
+    coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
+    source = _view({1: 2}, {1: floor(_CORE_ID / 4)}, 8)
+    destination = _view(
+        {1: 2, 2: 4},
+        {1: floor(_CORE_ID / 4), 2: Mod(_CORE_ID, 4)},
+        8,
+    )
+    routes = lx_relayout_module.derive_completed_reduction_routes(
+        source, destination, 4
+    )
+    assert routes == ((3, (0, 1, 2, 3)), (7, (4, 5, 6, 7)))
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [32, 8, 64],
+        coordinates,
+        {n: (Integer(256), 2), m: (Integer(64), 4)},
+        routes,
+        256,
+    )
+    root, allocations = _compile_spec(spec)
+    physical_ids = tuple((-(8 // 2) + core) % 32 for core in range(8))
+    terminal_ids = {str(physical_ids[logical]) for logical, _ in routes}
+    assert root["coreFoldProp_"]["factor_"] == 32
+    assert root["numCoresUsed_"] == 32
+    assert root["dscs_"][0]["shuffle"]["numCoresUsed_"] == 8
+    assert set(root["coreIdToDsc_"]) == {str(core) for core in physical_ids}
+    source_map, destination_map = [
+        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+    ]
+    assert set(source_map) == terminal_ids
+    assert set(destination_map) == {str(core) for core in physical_ids}
+    destination_splits = spec.args[-1].work_division.work_slices
+    _, labels = parse_op_spec(spec)
+    output_row = labels[
+        next(dim for dim, split in destination_splits.items() if split == 2)
+    ]
+    output_feature = labels[
+        next(dim for dim, split in destination_splits.items() if split == 4)
+    ]
+    for logical, physical in enumerate(physical_ids):
+        owner = destination_map[str(physical)]
+        assert owner[str(output_row)] == logical // 4
+        assert owner[str(output_feature)] == logical % 4
+        assert root["coreIdToWkSlice_"][str(physical)] == owner
+    for logical in (3, 7):
+        physical = str(physical_ids[logical])
+        assert source_map[physical][str(output_row)] == logical // 4
+    assert spec.completed_producer_cores == (3, 7)
 
 
 @config.patch({"sencores": 32})
@@ -3122,7 +3310,7 @@ def test_completed_reduction_gathers_finished_output_halves():
             )
     root, allocations = _compile_spec(spec)
     assert "prodConsList" not in root
-    assert root["numCoresUsed_"] == 16
+    assert root["numCoresUsed_"] == 32
     source_map, destination_map = [
         allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
     ]
@@ -3328,11 +3516,9 @@ def test_contraction_requires_disjoint_full_physical_spans(
 def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
     source_cores, destination_cores
 ):
-    """Keep tensor domains distinct while scheduling every required core.
+    """The destination owns the shuffle schedule; source holders still dispatch.
 
-    This regression covers the existing codegen behavior on main. This PR
-    does not change that path. C4 tracks replacing the shape-derived frame
-    correction with explicit domains end-to-end in torch-spyre#5716.
+    Expanding or contracting a copy must not relabel either tensor's domain.
     """
     row, feature = Symbol("row"), Symbol("feature")
     source = TensorWorkDivision(
@@ -3375,6 +3561,11 @@ def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
     assert parsed.num_cores == max(source_cores, destination_cores)
     assert parsed.work_slices == {r: destination_cores, f: 1}
     assert parsed.core_id_to_work_slice[f] == 0
+    assert parsed.active_core_ids == tuple(range(max(source_cores, destination_cores)))
+    assert [
+        int(parsed.core_id_to_work_slice[r].xreplace({_CORE_ID: core}))
+        for core in parsed.active_core_ids
+    ] == [core if core < destination_cores else 0 for core in parsed.active_core_ids]
     actual_source, actual_destination = [arg.work_division for arg in parsed.args]
     assert actual_source.num_cores == source_cores
     assert actual_source.work_slices == {r: source_cores // 2, f: 2}
@@ -3398,7 +3589,7 @@ def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
     "source_cores,destination_cores", [(32, 16), (16, 16), (16, 32)]
 )
 def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination_cores):
-    """Contraction repeats the operation frame, not tensor ownership domains."""
+    """The schedule follows destination slices over every source/destination core."""
     from torch_spyre._inductor.core_mapping import owner_slots, transfer_edges
 
     row, lane = Symbol("frame_row"), Symbol("frame_lane")
@@ -3460,7 +3651,7 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         ), "equal/expanded operation frame was repeated"
     assert [
         int(owner.xreplace({_CORE_ID: core})) for core in range(parsed.num_cores)
-    ] == [core % destination_cores for core in range(parsed.num_cores)]
+    ] == [core if core < destination_cores else 0 for core in range(parsed.num_cores)]
     for argument, physical_count, expected in zip(
         parsed.args, [source_cores, destination_cores], [source_owner, _CORE_ID]
     ):
