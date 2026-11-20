@@ -47,6 +47,11 @@ The child runs on one thread with ``compile_threads = 1``, so it starts no worke
 pool of its own (#4427's pool stays in the parent), and it never takes a lock that
 another thread of the parent could hold at fork time: such a lock stays held in
 the child, so a compile that needed it would hang and be killed by the timeout.
+Its LX planning solver gets the rank's share of the CPUs (the CPU count divided by
+the ranks on the host, at least two; the whole host when there is one rank): sized
+to the whole host on every rank, as each parent's is, the concurrent solvers starve
+each other, and a starved solve returns a worse plan for the same graph (slower
+kernels, not just a slower compile).
 
 Limits: Linux only (``os.fork``). Each child is a copy-on-write copy of the caller.
 For a vLLM engine with Granite 3.3 8B and 8 workers, the peak resident memory of the
@@ -349,16 +354,42 @@ def _no_device(*args: Any, **kwargs: Any) -> Any:
     raise RuntimeError("parallel precompile: a forked compile tried to use the device")
 
 
-def _child_setup() -> None:
+def _solver_cpu_share(workers: int) -> int:
+    """CPUs for one child's LX planning solver: the host's share per rank.
+
+    Every rank on the host forks ``workers`` children at once, and each child's
+    CP-SAT solve would otherwise take every CPU of the host, as the parent's
+    does. Starved solves return worse plans, not only later ones. The share is
+    per rank, not per child: on one rank the children keep the whole host, which
+    measured faster than a per-child share, while at four ranks on 64 CPUs the
+    per-rank share took the block warm-up from 338 s to 213 s.
+    """
+    from torch_spyre._inductor import config as spyre_config
+
+    ranks = 1
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            ranks = dist.get_world_size()
+    except Exception:  # noqa: BLE001 - no process group means one rank
+        ranks = 1
+    del workers  # the share is per rank; the workers stay in the signature for callers
+    return max(2, spyre_config.get_cpu_count() // max(1, ranks))
+
+
+def _child_setup(workers: int = 1) -> None:
     import torch
 
     import torch_spyre._C as spyre_c
     import torch_spyre.ops.eager as spyre_eager
+    from torch_spyre._inductor import config as spyre_config
 
     os.setsid()  # own process group, so a kill also stops dbo-opt
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     torch.set_num_threads(1)  # the parent's OpenMP pool does not survive fork()
     torch._inductor.config.compile_threads = 1  # the parent's worker pool is not ours
+    spyre_config.num_cpus = _solver_cpu_share(workers)
     for name in _DEVICE_ENTRY_POINTS:  # the device stays with the caller
         if hasattr(spyre_c, name):
             setattr(spyre_c, name, _no_device)
@@ -425,7 +456,7 @@ class _Pool:
                     os.close(read_fd)
                     _report_fd = write_fd
                     _install_output_report()
-                _child_setup()
+                _child_setup(self.workers)
                 compile_fn()
                 code = 0
             except BaseException:  # noqa: BLE001 - the caller compiles it again

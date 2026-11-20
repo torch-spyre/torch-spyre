@@ -361,3 +361,20 @@ def test_the_report_pass_sends_the_specs_once_and_only_in_a_child(monkeypatch):
     assert pickle.loads(os.read(read_fd, 1 << 16)) == [None]
     assert os.read(read_fd, 1) == b""  # the write end is closed
     os.close(read_fd)
+
+
+def test_a_child_solver_gets_its_share_of_the_cpus(monkeypatch):
+    import torch.distributed as dist
+
+    from torch_spyre._inductor import config as spyre_config
+
+    monkeypatch.setattr(spyre_config, "num_cpus", 64)  # get_cpu_count() honours it
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 4)
+    assert pp._solver_cpu_share(7) == 16  # 64 CPUs / 4 ranks, whatever the worker count
+    assert pp._solver_cpu_share(1) == 16
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    assert pp._solver_cpu_share(7) == 64  # one rank keeps the host
+    monkeypatch.setattr(spyre_config, "num_cpus", 1)
+    assert pp._solver_cpu_share(7) == 2  # never below two
