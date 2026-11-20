@@ -650,9 +650,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def linear_cost_only(cls) -> bool:
-        """The printer lowers linear terms only; the table lowering has no such
-        limit."""
-        return not config.cpsat_table_lowering
+        # True with the table lowering too, though it lowers more than linear terms:
+        # this is what makes the allocator withhold the cost expression under
+        # auto_coarse_tiling, and a tiling priced by it is one the allocator cannot
+        # apply (a per-core footprint the applied graph does not have).
+        return True
 
     def __init__(
         self,

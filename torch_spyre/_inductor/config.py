@@ -488,8 +488,7 @@ cpsat_time_limit_seconds: float = float(
 # Lower the CP-SAT cost objective from exact tables (cpsat_table_lowering.py) rather
 # than with the printer (cpsat_expr_printer.py). There is no fallback between them: an
 # objective the tables cannot lower raises TableLoweringError. The two lowerings can
-# reach different plans, and with the tables the solver also takes the cost expression
-# under auto_coarse_tiling. On in this branch, so that CI runs against the tables;
+# reach different plans. On in this branch, so that CI runs against the tables;
 # CPSAT_TABLE_LOWERING=0 selects the printer.
 cpsat_table_lowering: bool = os.environ.get("CPSAT_TABLE_LOWERING", "1") == "1"
 
