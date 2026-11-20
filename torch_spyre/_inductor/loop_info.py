@@ -113,6 +113,13 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    The four lists below (``tiled_dims_per_read``, ``output_tiled_dims``,
+    ``squeezed_advance_per_read``, ``squeezed_advance_output``) are written by the
+    ``for_each_tile`` lowering and read by NOTHING in the compiler since stage 7.4
+    part A: an access's advance is the loop variable's coefficient in its index
+    (``loop_facts.read_advance``). Part B stops writing them and deletes them; do
+    not add a reader.
+
     tiled_dims_per_read:
         One entry per read dependency in ``op.get_read_writes().reads`` (in
         that iteration order, filtered to ``MemoryDep`` -- same positional
@@ -161,10 +168,8 @@ class CoarseTileInfo:
         based dimension selection cannot be compared against, and picking
         the wrong device axis when the two happen to diverge silently
         advances the wrong dimension (see issue surfaced by
-        ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
-        ``SpyreKernel._general_tile_advance`` can add its device-address
-        contribution as an extra term via ``tiling_expr_to_device_expr``
-        rather than by substitution. An empty per-read list means that read
+        ``test_flash_tile_B``). (Historical: the kernel used to add this as an extra term; it now reads the
+        index.) An empty per-read list means that read
         has no such dims. The outer list may also be empty when no read in the
         operation needs squeezed-dimension metadata; that is complete "none
         needed" metadata, not a missing entry for every read.

@@ -40,6 +40,7 @@ from torch._inductor.virtualized import V
 
 
 from .constants import (
+    BATCH_MATMUL_OP,
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
@@ -92,9 +93,8 @@ from .pass_utils import (
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
-from .loop_checker import LoopAdvanceMismatch
+from .loop_facts import _loop_coefficient, advancing_levels, enclosing_loops
 from .loop_info import LoopShim
-from .loop_facts import _loop_coefficient, enclosing_loops, shim_advancing_levels
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -398,10 +398,15 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=False):
         # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
         # Spyre maps directly to fixed hardware ops via DtypeOpTable and
         # cannot honor compute-type promotion, so accept and ignore.
+        if src_dtype is None:
+            # OpsHandler.to_dtype declares src_dtype optional, and some upstream
+            # Inductor lowerings omit it. The hardware op is chosen from the
+            # (src_dtype, dtype) pair, so the conversion cannot be lowered (#5783).
+            raise Unsupported(f"type conversion to {dtype} without a source dtype")
         assert dtype != src_dtype
 
         if src_dtype == torch.bool:
@@ -625,7 +630,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_vars: dict[sympy.Symbol, TensorAccess] = {}
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
-        self._general_tile_advance_seen: dict[str, int] = {}
+        self._tile_advance_seen: dict[str, int] = {}
         # (node, its read/writes): the tile-advance builders run once per
         # argument of a node, so trace the node once. Keyed by identity,
         # holding the node.
@@ -760,7 +765,7 @@ class SpyreKernel(Kernel[CSEVariable]):
     def _tile_advance_read_writes(self, ir_node: Any) -> ReadWrites:
         """``ir_node.get_read_writes()``, traced once per kernel node.
 
-        ``_general_tile_advance`` and ``_index_tile_advance`` each run once per
+        ``_tile_advance`` and ``_index_tile_advance`` each run once per
         argument of a node; both share this trace.
         """
         cached = self._tile_advance_rw
@@ -769,131 +774,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         rw = ir_node.get_read_writes()
         self._tile_advance_rw = (ir_node, rw)
         return rw
-
-    def _general_tile_advance(
-        self, tensor: TensorAccess, is_input: bool, name: str
-    ) -> "sympy.Expr | None":
-        """This arg's device-element tile-advance expr.
-
-        Re-derives dep.index at this call (guaranteed final -- every pass
-        that could rewrite it via WrapperHandler has already run), builds
-        one substituted term per nesting level using that level's own
-        minted symbol (via _get_or_mint_level_symbol) and
-        CoarseTileInfo.tiled_dims_per_read/output_tiled_dims's per-level
-        (dim, extent) decision, reprojects each level's host-space term to
-        device-element space via views.tiling_expr_to_device_expr, and sums
-        every level into one combined Expr -- preserving the single-Expr-
-        per-arg contract compute_ops.py/superdsc.py/bundle.py depend on.
-
-        A read dim tiled down to extent 1 in dep's own iteration space has
-        no d{i} symbol at all (Inductor's SqueezeView.squeezer drops it
-        unconditionally -- see CoarseTileInfo.squeezed_advance_per_read's
-        docstring), so it cannot contribute via substitution into dep.index
-        like every other tiled dim here. Its (host_stride, extent) pairs
-        are added as independent terms (level_symbol * extent * host_stride,
-        already in host-element space) through the same
-        tiling_expr_to_device_expr projection instead.
-
-        This is the sole tile-advance mechanism. Returns None for ops
-        without loop_info/coarse tiling.
-        """
-        ir_node = self.current_node.node
-        loop_info = getattr(ir_node, "loop_info", None)
-        if loop_info is None:
-            return None
-
-        op_name = ir_node.get_operation_name()
-        squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
-        rw = self._tile_advance_read_writes(ir_node)
-
-        if is_input:
-            read_deps = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
-            scheduler = getattr(V.graph, "scheduler", None)
-            mutation_real_name = (
-                scheduler.mutation_real_name if scheduler is not None else {}
-            )
-            matching_idx = [
-                i for i, _ in _matching_read_deps(read_deps, name, mutation_real_name)
-            ]
-            if not matching_idx:
-                return None
-            # Positional tie-break: if this buffer is read more than once,
-            # consume matches in order across successive calls for the same
-            # name within this op's TensorArg construction. store()/
-            # store_reduction() reset this dict at the start of each op.
-            consumed = self._general_tile_advance_seen.get(name, 0)
-            if consumed >= len(matching_idx):
-                return None
-            self._general_tile_advance_seen[name] = consumed + 1
-            dep_idx = matching_idx[consumed]
-            if dep_idx >= len(loop_info.tiled_dims_per_read):
-                return None
-            dep = read_deps[dep_idx]
-            per_level_dims = loop_info.tiled_dims_per_read[dep_idx]
-            squeezed_advance_per_read = getattr(
-                loop_info, "squeezed_advance_per_read", None
-            )
-            if squeezed_advance_per_read and dep_idx < len(squeezed_advance_per_read):
-                squeezed_advance_per_level = squeezed_advance_per_read[dep_idx]
-        else:
-            write_deps = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
-            if not write_deps:
-                return None
-            dep = write_deps[0]
-            per_level_dims = loop_info.output_tiled_dims
-            squeezed_advance_per_level = (
-                getattr(loop_info, "squeezed_advance_output", None) or []
-            )
-
-        if not per_level_dims and not any(squeezed_advance_per_level):
-            return None
-
-        device_size = tensor.layout.device_layout.device_size
-        stride_map = tensor.layout.device_layout.stride_map
-
-        total_device_expr: "sympy.Expr | None" = None
-        n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))
-        for level_idx in range(n_levels):
-            dim_extent_pairs = (
-                per_level_dims[level_idx] if level_idx < len(per_level_dims) else []
-            )
-            squeezed_pairs = (
-                squeezed_advance_per_level[level_idx]
-                if level_idx < len(squeezed_advance_per_level)
-                else []
-            )
-            if not dim_extent_pairs and not squeezed_pairs:
-                continue
-            level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
-            host_expr = sympy.S.Zero
-            if dim_extent_pairs:
-                tiled_dim_extents = {
-                    self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
-                    for d, extent in dim_extent_pairs
-                }
-                subs = dict(tiled_dim_extents)
-                subs.update(
-                    {
-                        sym: sympy.Integer(0)
-                        for sym in dep.index.free_symbols
-                        if sym not in subs
-                    }
-                )
-                # xreplace is simultaneous: the level symbol can be the loop's
-                # own induction variable, which is also a free symbol of the index
-                # (zeroed here). A sequential substitution would zero the symbol it
-                # just introduced.
-                host_expr += dep.index.xreplace(subs)
-            for host_stride, extent in squeezed_pairs:
-                host_expr += level_symbol * extent * host_stride
-            device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
-            total_device_expr = (
-                device_expr
-                if total_device_expr is None
-                else total_device_expr + device_expr
-            )
-
-        return total_device_expr
 
     def _index_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
@@ -905,12 +785,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         ``dim_hints`` (``loop_var_ranges_from_dim_hints``, outermost first), which
         is what ``per_trip_index`` already reads; every op in a loop node that
         indexes with a node's induction variable lists it there (measured on 1,545
-        ops, none disagrees). Returns ``None`` when the op has no hinted variable
-        or no matching dependency, so the caller compares nothing. Otherwise the
-        advance and the dependency it was read from (for an error message).
-
-        Uses the same ``_tile_advance_symbols`` as the record-based builder, so the
-        two expressions are comparable term by term.
+        ops, none disagrees). Returns ``None`` when the op lists no loop variable
+        (it is in a loop but nothing it indexes moves with it) or has no matching
+        dependency; otherwise the advance and the dependency it was read from. A
+        count of loop variables that differs from the loop depth leaves the pairing
+        of variable to level unknown, which nothing can guess: that raises.
         """
         ir_node = self.current_node.node
         hinted = list(loop_var_ranges_from_dim_hints(ir_node))
@@ -918,16 +797,12 @@ class SpyreKernel(Kernel[CSEVariable]):
             return None
         if len(hinted) != len(enclosing_loops(ir_node)):
             # Level i's variable is the i-th hint only if there is one hint per
-            # level. A different count means the pairing is not known, so this op
-            # stays on the stored record rather than guess.
-            logger.debug(
-                "%s lists %d loop variables for %d loop levels; keeping its stored "
-                "advance",
-                ir_node.get_operation_name(),
-                len(hinted),
-                len(enclosing_loops(ir_node)),
+            # level.
+            raise RuntimeError(
+                f"{ir_node.get_operation_name()} lists {len(hinted)} loop "
+                f"variable(s) for {len(enclosing_loops(ir_node))} loop level(s): its "
+                "advances cannot be read from the index"
             )
-            return None
         reads_writes = self._tile_advance_read_writes(ir_node)
         if is_input:
             scheduler = getattr(V.graph, "scheduler", None)
@@ -936,8 +811,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             read_deps = [d for d in reads_writes.reads if isinstance(d, MemoryDep)]
             matches = _matching_read_deps(read_deps, name, mutation_real_name)
-            # _general_tile_advance has already consumed one match for this call.
-            consumed = self._general_tile_advance_seen.get(name, 0)
+            # _tile_advance has already consumed one match for this call.
+            consumed = self._tile_advance_seen.get(name, 0)
             dep = matches[consumed - 1][1] if 0 < consumed <= len(matches) else None
         else:
             writes = [d for d in reads_writes.writes if isinstance(d, MemoryDep)]
@@ -958,84 +833,100 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         return total, dep
 
-    def _shim_tile_advance(
+    def _tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
-        """The advance of an op the loop-tiling lowering made: the index's, alone.
+        """This arg's per-trip device-element advance, read from the index alone.
 
-        Such an op has a ``LoopShim`` for ``loop_info`` and no stored record, so
-        there is nothing to compare with and the stored-record builder must not
-        run. That builder is also what counts the reads of a buffer
-        (``_general_tile_advance_seen``) so that ``_index_tile_advance`` can pick
-        the dependency of THIS read; with it bypassed the count is kept here, the
-        same way, and a repeat load that consumes no new read answers ``None`` as it
-        does there. A shim op whose index gives no advance at all has no loop
-        variable the kernel can pair with its levels, which no valid lowering
-        produces: that is an error, not a zero.
+        Each level's loop variable's coefficient in ``dep.index`` (see
+        ``_index_tile_advance``); ``None`` for an op in no loop, an op that lists no
+        loop variable, and an arg that does not move.
+
+        The kernel counts the reads of a buffer (``_tile_advance_seen``) so that
+        ``_index_tile_advance`` picks the dependency of THIS read: the k-th load of
+        a buffer takes the k-th ``MemoryDep`` read of it, and a repeat load that
+        consumes no new read (``x + x`` is one dependency) answers ``None``.
         """
+        ir_node = self.current_node.node
+        if getattr(ir_node, "loop_info", None) is None:
+            return None
+        read_idx = None
         if is_input:
-            ir_node = self.current_node.node
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
                 scheduler.mutation_real_name if scheduler is not None else {}
             )
             read_deps = [
-                d for d in ir_node.get_read_writes().reads if isinstance(d, MemoryDep)
+                d
+                for d in self._tile_advance_read_writes(ir_node).reads
+                if isinstance(d, MemoryDep)
             ]
             matches = _matching_read_deps(read_deps, name, mutation_real_name)
-            consumed = self._general_tile_advance_seen.get(name, 0)
+            consumed = self._tile_advance_seen.get(name, 0)
             if consumed >= len(matches):
                 return None
-            self._general_tile_advance_seen[name] = consumed + 1
+            read_idx = matches[consumed][0]
+            self._tile_advance_seen[name] = consumed + 1
         indexed = self._index_tile_advance(tensor, is_input, name)
         if indexed is None:
-            raise RuntimeError(
-                f"{self.current_node.node.get_operation_name()} is a loop shim op "
-                f"but its {'read' if is_input else 'write'} of {name} has no "
-                "advance in the index: the op lists no loop variable for its levels"
-            )
+            if isinstance(ir_node.loop_info, LoopShim):
+                # The lowering lists the variable of every level on every member,
+                # so a shim op with no advance in its index is a bug, not a zero.
+                raise RuntimeError(
+                    f"{ir_node.get_operation_name()} is a loop shim op but its "
+                    f"{'read' if is_input else 'write'} of {name} has no advance in "
+                    "the index: the op lists no loop variable for its levels"
+                )
+            self._check_against_stored_record(ir_node, is_input, read_idx, None, name)
+            return None
         from_index, _ = indexed
-        return None if from_index == 0 else from_index
-
-    def _checked_tile_advance(
-        self, tensor: TensorAccess, is_input: bool, name: str
-    ) -> "sympy.Expr | None":
-        """The advance, read from the index and checked against the stored record.
-
-        An op that lists a loop variable in its ``dim_hints`` gets the advance from
-        the INDEX: each level's variable's coefficient in ``dep.index``. Until the
-        stored per-read fields are deleted (stage 7.4) the record is still built, and
-        the two must agree: a difference is a compiler bug (a pass edited one source
-        and not the other), so it raises instead of emitting a kernel that advances
-        by the wrong amount. Every other op keeps the record.
-        """
-        ir_node = self.current_node.node
-        if isinstance(getattr(ir_node, "loop_info", None), LoopShim):
-            return self._shim_tile_advance(tensor, is_input, name)
-        seen_before = self._general_tile_advance_seen.get(name, 0)
-        recorded = self._general_tile_advance(tensor, is_input, name)
-        if is_input and self._general_tile_advance_seen.get(name, 0) == seen_before:
-            # No new match was consumed: this is a repeat load of a buffer the op
-            # reads once (``x + x`` deduplicates to one dependency), and the
-            # record builder answers it with None. There is nothing to compare.
-            return recorded
-        indexed = self._index_tile_advance(tensor, is_input, name)
-        if indexed is None:
-            return recorded
-        from_index, dep = indexed
-        theirs = sympy.S.Zero if recorded is None else recorded
-        # The two builders give the same expression almost always, so compare
-        # structurally first: simplify is slow, and it can fail to prove two
-        # equal expressions with floor() equal, which would fail a correct compile.
-        if theirs != from_index and sympy.simplify(theirs - from_index) != 0:
-            node = self.current_node.node
-            raise LoopAdvanceMismatch(
-                f"{node.get_operation_name()} {'reads' if is_input else 'writes'} "
-                f"{name}: the stored record gives {theirs} and the index gives "
-                f"{from_index} (index {dep.index})"
-            )
+        self._check_against_stored_record(ir_node, is_input, read_idx, from_index, name)
         # "No advance" is None, not a zero: consumers test ``is not None``.
         return None if from_index == 0 else from_index
+
+    @staticmethod
+    def _check_against_stored_record(ir_node, is_input, read_idx, from_index, name):
+        """TEMPORARY (stage 7.4 part A; deleted with the lists in part B).
+
+        The stored per-read / output advance lists are no longer read, but they are
+        still written. Until they are deleted, the hardware CI suite compares them with
+        the index on every access, so a disagreement the local corpus did not show
+        fails loudly instead of changing a kernel silently. Two cases are newly
+        exposed by reading the index: an op that lists no loop variable (the record
+        decided before) and a record that says an access advances while the index
+        gives none (or the reverse).
+        """
+        li = getattr(ir_node, "loop_info", None)
+        if (
+            li is None
+            or isinstance(li, LoopShim)
+            or not hasattr(li, "tiled_dims_per_read")
+        ):
+            return
+        if is_input:
+            tiled = li.tiled_dims_per_read
+            squeezed = li.squeezed_advance_per_read
+            entry_t = (
+                tiled[read_idx]
+                if read_idx is not None and read_idx < len(tiled)
+                else []
+            )
+            entry_s = (
+                squeezed[read_idx]
+                if read_idx is not None and read_idx < len(squeezed)
+                else []
+            )
+        else:
+            entry_t, entry_s = li.output_tiled_dims, li.squeezed_advance_output
+        recorded = any(entry_t) or any(entry_s)
+        indexed = from_index is not None and from_index != 0
+        if recorded != indexed:
+            raise RuntimeError(
+                f"stage 7.4 check: {ir_node.get_operation_name()} "
+                f"{'reads' if is_input else 'writes'} {name}: the stored record says "
+                f"{'advance' if recorded else 'no advance'} and the index says "
+                f"{'advance' if indexed else 'no advance'}"
+            )
 
     def create_tensor_arg(
         self,
@@ -1098,17 +989,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
 
-        # A WhileLoop-splice loop variable describes the address advance from
-        # one counted-loop trip to the next, not an in-tile iteration axis.
-        # Its advance is already explicit in loop_info (tiled_dims_per_read/
-        # output_tiled_dims or squeezed_advance_per_read/squeezed_advance_
-        # output, stamped by the WhileLoop-lowering pass -- see
-        # _general_tile_advance's docstring), which that method folds into
-        # device_tile_advance_expr below. Pin every splice loop_var to trip
-        # zero in the base coordinates so the raw unbacked symbol neither
-        # leaks into the OpSpec iteration space nor applies the same
-        # advance a second time.
-        device_tile_advance_expr = self._checked_tile_advance(tensor, is_input, name)
+        # A loop variable describes the address advance from one counted-loop trip to
+        # the next, not an in-tile iteration axis. The advance is the variable's
+        # coefficient in the index, folded into device_tile_advance_expr below. Pin
+        # every loop variable to trip zero in the base coordinates so the raw
+        # unbacked symbol neither leaks into the OpSpec iteration space nor applies
+        # the same advance a second time.
+        device_tile_advance_expr = self._tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
@@ -1269,8 +1156,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     and arg.device_dtype
                     in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
                 )
+                or _is_sen1p5_bf16_matmul_input(op, arg)
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
+        _check_sen1p5_matmul_inputs(op, args)
 
         it_space = iteration_space(self.current_node)
 
@@ -1283,48 +1172,26 @@ class SpyreKernel(Kernel[CSEVariable]):
         # dim-index lists, outermost first — so we build outermost-first then
         # reverse to get innermost-first for tiled_symbols storage.
         #
-        # Each level that tiles at least one dim (output or reduction) gets a
-        # single minted symbol via _get_or_mint_level_symbol, shared with the
-        # same (op, level) symbol _general_tile_advance mints when building
-        # each TensorArg's device_tile_advance_expr -- so
-        # device_tile_advance_expr.coeff(sym) resolves to that level's own
-        # contribution regardless of how many host dims it tiles.
-        li = getattr(ir_node, "loop_info", None)
+        # Each level at which something moves gets a single minted symbol via
+        # _get_or_mint_level_symbol, shared with the same (op, level) symbol
+        # _index_tile_advance mints when building each TensorArg's
+        # device_tile_advance_expr -- so device_tile_advance_expr.coeff(sym)
+        # resolves to that level's own contribution regardless of how many host dims
+        # it tiles.
         loops = enclosing_loops(ir_node)
         raw_tiled_dims = [loop.tiled_dims for loop in loops]
         raw_tiled_red_dims = [loop.tiled_reduction_dims for loop in loops]
-        # A dim tiled down to a per-tile extent of 1 is squeezed out of the
-        # op's own iteration space entirely (no d{i} symbol survives), so it
-        # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
-        # only advance via squeezed_advance_per_read/squeezed_advance_output
-        # (see loop_tiling_lowering.py's _insert_copy_out, the "d not in
-        # squeeze_pos" branch). _general_tile_advance already mints/uses a
-        # level symbol from squeezed_advance_per_level regardless of
-        # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
-        # otherwise the minted symbol shows up in device_tile_advance_expr
-        # but never in OpSpec.tiled_symbols, and superdsc.py's affine-stride
-        # extraction (which only walks tiled_symbols) silently drops the
-        # advance, leaving the tensor's address pinned across that level's
-        # iterations instead of stepping through it.
-        # A LoopShim op stores no lists: its advances come from the index, so the
-        # squeezed lists are empty and the advancing levels are asked of the index.
-        is_shim = isinstance(li, LoopShim)
-        shim_levels = shim_advancing_levels(ir_node) if is_shim else frozenset()
-        raw_squeezed_advance_reads: list[list[list[tuple]]] = (
-            li.squeezed_advance_per_read if li is not None and not is_shim else []
-        )
-        raw_squeezed_advance_output: list[list[tuple]] = (
-            li.squeezed_advance_output if li is not None and not is_shim else []
-        )
-        # enclosing_loops gives one entry per nesting level, so the first two
-        # terms are both the loop depth; max() keeps a squeezed record that
-        # (malformed) runs deeper than the loop nest from being dropped.
-        n_levels = max(
-            len(raw_tiled_dims),
-            len(raw_tiled_red_dims),
-            max((len(levels) for levels in raw_squeezed_advance_reads), default=0),
-            len(raw_squeezed_advance_output),
-        )
+        # A dim tiled down to a per-tile extent of 1 is squeezed out of the op's own
+        # iteration space entirely (no d{i} symbol survives), so it is invisible to
+        # loop_tiled_dims/loop_tiled_reduction_dims and only advances through the
+        # index. A level is named if anything advances at it, whether the op tiles
+        # a dim there or not: otherwise the minted symbol shows up in
+        # device_tile_advance_expr but never in OpSpec.tiled_symbols, and
+        # superdsc.py's affine-stride extraction (which only walks tiled_symbols)
+        # silently drops the advance, leaving the tensor's address pinned across
+        # that level's iterations instead of stepping through it.
+        advancing = advancing_levels(ir_node)
+        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
 
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
@@ -1336,17 +1203,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             for lvl in range(n_levels):
                 level_syms: list = []
                 has_any_tiled_dim = (
-                    lvl in shim_levels
+                    lvl in advancing
                     or (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
                     or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
-                    or any(
-                        lvl < len(levels) and levels[lvl]
-                        for levels in raw_squeezed_advance_reads
-                    )
-                    or (
-                        lvl < len(raw_squeezed_advance_output)
-                        and raw_squeezed_advance_output[lvl]
-                    )
                 )
                 if has_any_tiled_dim:
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
@@ -1432,7 +1291,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # The registry is keyed by the inserted destination buffer (``buf3``),
         # while scheduler nodes have operation names (``op3``). Certify the
         # identity from its write, which is the stable link between them.
+        # Other writers of the destination, such as an LX context-switch
+        # restore from its HBM dump, do not read the plan's source.
         written = V.graph.scheduler.mutation_real_name
+        read_names = {
+            written.get(dep.name, dep.name)
+            for dep in self.current_node.read_writes.reads
+            if isinstance(dep, MemoryDep)
+        }
         relayout_plans = [
             plan
             for dep in self.current_node.read_writes.writes
@@ -1443,6 +1309,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
             is not None
+            and plan.source_name in read_names
         ]
         if len(relayout_plans) > 1:
             raise RuntimeError("one operation writes multiple LX relayout destinations")
@@ -1536,7 +1403,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
-        self._general_tile_advance_seen = {}
+        self._tile_advance_seen = {}
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
@@ -1667,7 +1534,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
     ) -> None:
         """Convert an RValue"""
-        self._general_tile_advance_seen = {}
+        self._tile_advance_seen = {}
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
         buf = V.graph.get_buffer(name)
@@ -2000,6 +1867,37 @@ def _indirect_syms_used(
     if dst_index is not None:
         syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
     return syms
+
+
+def _is_sen1p5_bf16_matmul_input(op: str, arg: TensorArg) -> bool:
+    """A BFLOAT16 matmul input on 1p5 (the output stays DLFloat16)."""
+    return (
+        _spyre_config.sen1p5
+        and op == BATCH_MATMUL_OP
+        and arg.is_input
+        and arg.device_dtype == DataFormats.BFLOAT16
+    )
+
+
+def _check_sen1p5_matmul_inputs(op: str, args: Sequence[TensorArg]) -> None:
+    """On 1p5 a matmul takes BFLOAT16 inputs only. An input that is already
+    BFLOAT16 on the device (a graph input or weight copied with
+    ``.to("spyre", device_layout=...)`` and a BFLOAT16 SpyreTensorLayout) is
+    used as it is. Any other input is refused here with a message, instead of
+    failing later in the backend compiler. The backend compiler does support
+    a DLFloat16-to-BFLOAT16 conversion op, but torch-spyre does not yet insert
+    it automatically before a 1p5 matmul."""
+    if not (_spyre_config.sen1p5 and op == BATCH_MATMUL_OP):
+        return
+    for arg in args:
+        if arg.is_input and arg.device_dtype != DataFormats.BFLOAT16:
+            raise Unsupported(
+                f"{op} on {arg.device_dtype} for sen1p5: matmul inputs must "
+                "be BFLOAT16 on the device; copy each operand with "
+                '.to("spyre", device_layout=...) and device_dtype '
+                "DataFormats.BFLOAT16 (an operand computed by another kernel "
+                "is not supported yet)"
+            )
 
 
 def _is_indirect_index_arg(

@@ -35,7 +35,7 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advance,
     read_advances_anywhere,
-    shim_advancing_levels,
+    advancing_levels,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
 from torch_spyre._inductor.propagate_hints import DimHint
@@ -140,18 +140,29 @@ def test_the_advancing_levels_of_a_shim_op_are_the_levels_any_access_moves_on():
     write = _dep("buf0", 4 * u0 + d0)
     hints = [_hint(u0, 2), _hint(u1, 4)]
     op = _op(_shim(levels=2), [read, other], [write], hints)
-    assert shim_advancing_levels(op) == frozenset({0, 1})
+    assert advancing_levels(op) == frozenset({0, 1})
     no_write_term = _op(_shim(levels=2), [read, other], [_dep("buf0", d0)], hints)
-    assert shim_advancing_levels(no_write_term) == frozenset({1})
+    assert advancing_levels(no_write_term) == frozenset({1})
     still = _op(_shim(levels=2), [other], [_dep("buf0", d0)], hints)
-    assert shim_advancing_levels(still) == frozenset()
-    assert shim_advancing_levels(_op(_shim(levels=2), [], [], hints)) == frozenset()
+    assert advancing_levels(still) == frozenset()
+    assert advancing_levels(_op(_shim(levels=2), [], [], hints)) == frozenset()
 
 
-def test_the_advancing_levels_of_a_coarsetileinfo_op_are_not_asked_of_the_index():
-    dep = _dep("arg0_1", 100 * u1 + d0)
-    op = _op(_equal_infos()[1], [dep], [], [_hint(u0, 2)])
-    assert shim_advancing_levels(op) == frozenset()
+def test_caller_supplied_reads_are_used_in_place_of_get_read_writes():
+    """scratchpad passes the memoized op_read_writes reads; the lookup must use them,
+    not re-trace the op."""
+    x, y = _dep("x", 128 * d0 + d1), _dep("y", 4 * u0 + d1)
+    op = _op(_shim(), [x, y], [], [_hint(u0, 8)])
+    op.get_read_writes = None  # would raise if called
+    assert read_advances_anywhere(op, y, reads=[x, y])
+    assert not read_advances_anywhere(op, x, reads=[x, y])
+    assert not read_advances_anywhere(op, _dep("z", u0), reads=[x, y])
+
+
+def test_an_output_with_no_memory_write_does_not_advance():
+    op = _op(_shim(), [_dep("x", 4 * u0)], [], [_hint(u0, 8)])
+    assert output_advance(op) == ()
+    assert output_advances_anywhere(op) is False
 
 
 def test_an_ordinary_hint_is_not_a_loop_variable():
@@ -169,9 +180,36 @@ def test_an_ordinary_hint_is_not_a_loop_variable():
     assert read_advance(op, dep) == (512,)
 
 
+def test_a_for_each_tile_op_that_lists_no_loop_variable_does_not_advance():
+    """It is inside the loop but indexes nothing with its variable (the loop's fill,
+    for one): zero at every level, not an error."""
+    dep = _dep("arg0_1", d0 + d1)
+    legacy = CoarseTileInfo(
+        loop_group_id=(3, 0),
+        loop_count=[sympy.Integer(8)] * 2,
+        loop_tiled_dims=[[], []],
+        loop_tiled_reduction_dims=[[], []],
+    )
+    op = _op(legacy, [dep], [], [])
+    assert read_advance(op, dep) == (0, 0)
+    assert read_advances_anywhere(op, dep) is False
+    assert advancing_levels(op) == frozenset()
+
+
 def test_a_shim_op_with_no_loop_variable_hint_is_loud():
+    """The lowering lists the variable of every level on every op it makes, so a shim
+    op that lists none is a compiler bug: pinning its address across trips would be
+    the wrong-value class of #5573."""
     dep = _dep("arg0_1", 512 * u0)
     op = _op(_shim(), [dep], [], [])
+    with pytest.raises(RuntimeError, match="loop variable"):
+        read_advance(op, dep)
+
+
+def test_a_loop_variable_count_that_differs_from_the_depth_is_loud():
+    """The pairing of variable to level is then unknown."""
+    dep = _dep("arg0_1", 512 * u0)
+    op = _op(_shim(levels=2), [dep], [], [_hint(u0, 8)])
     with pytest.raises(RuntimeError, match="loop variable"):
         read_advance(op, dep)
 
@@ -183,22 +221,22 @@ def test_a_non_affine_use_of_the_variable_is_unsupported():
         read_advance(op, dep)
 
 
-def test_a_coarsetileinfo_op_still_reads_its_lists():
-    """The existing path: the stored per-read pairs, substituted into the index."""
-    legacy = CoarseTileInfo(
+def test_a_coarsetileinfo_op_is_read_from_its_index_too():
+    """A ``for_each_tile`` op carries no more than the loop's own facts; whatever
+    stored lists it still has are ignored, so an empty record gives the same advance."""
+    info = CoarseTileInfo(
         loop_group_id=(3,),
         loop_count=[sympy.Integer(8)],
         loop_tiled_dims=[[1]],
         loop_tiled_reduction_dims=[[]],
-        tiled_dims_per_read=[[[(1, sympy.Integer(512))]]],
-        output_tiled_dims=[[(1, sympy.Integer(512))]],
     )
-    read, write = _dep("arg0_1", 1024 * d0 + d1), _dep("out", 1024 * d0 + d1)
-    op = _op(legacy, [read], [write])
+    read, write = _dep("arg0_1", 512 * u0 + d1), _dep("out", 256 * u0 + d1)
+    op = _op(info, [read], [write], [_hint(u0, 8)])
     assert read_advance(op, read) == (512,)
     assert read_advances_anywhere(op, read) is True
-    assert output_advance(op) == (512,)
+    assert output_advance(op) == (256,)
     assert output_advances_anywhere(op) is True
+    assert advancing_levels(op) == frozenset({0})
 
 
 # ---------------------------------------------------------------------------
@@ -283,18 +321,14 @@ def _kernel_for(op_loop_info, *, reads=()):
     """A kernel positioned on a stub op, with the real bookkeeping and a stub
     ``_index_tile_advance``."""
     kernel = spyre_kernel.SpyreKernel.__new__(spyre_kernel.SpyreKernel)
-    kernel._general_tile_advance_seen = {}
+    kernel._tile_advance_seen = {}
+    kernel._tile_advance_rw = None
     node = SimpleNamespace(
         loop_info=op_loop_info,
         get_operation_name=lambda: "op7",
         get_read_writes=lambda: SimpleNamespace(reads=list(reads), writes=[]),
     )
     kernel.current_node = SimpleNamespace(node=node)
-
-    def never(*args, **kwargs):
-        raise AssertionError("the stored-record builder ran for a shim op")
-
-    kernel._general_tile_advance = never
     return kernel
 
 
@@ -304,49 +338,124 @@ def _patched_v():
     )
 
 
-def test_the_kernel_skips_the_advance_check_for_a_shim_op():
-    """No stored record exists to compare with; the advance is the index's."""
+def test_the_kernel_takes_a_shim_ops_advance_from_the_index():
+    """No stored record exists; the advance is the index's."""
     kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", 512 * u0)])
     advance = 512 * sympy.Symbol("u0")
     kernel._index_tile_advance = lambda tensor, is_input, name: (advance, None)
     with _patched_v():
-        assert kernel._checked_tile_advance(None, True, "arg0_1") == advance
+        assert kernel._tile_advance(None, True, "arg0_1") == advance
 
 
 def test_a_zero_advance_of_a_shim_op_is_none():
     kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", d1)])
     kernel._index_tile_advance = lambda tensor, is_input, name: (sympy.S.Zero, None)
     with _patched_v():
-        assert kernel._checked_tile_advance(None, True, "arg0_1") is None
+        assert kernel._tile_advance(None, True, "arg0_1") is None
 
 
 def test_the_kernel_counts_each_read_of_a_shim_op_and_a_repeat_load_is_none():
     """``_index_tile_advance`` picks a read by how many the kernel has counted;
-    the record builder is bypassed, so the shim branch must count them itself, or
-    every read of a shim op would answer 'no advance'."""
+    the kernel counts them itself in ``_tile_advance``, or
+    every read would answer 'no advance'."""
     reads = [_dep("x", 512 * u0), _dep("x", 256 * u0)]
     kernel = _kernel_for(_shim(), reads=reads)
     seen_at_call = []
 
     def index_advance(tensor, is_input, name):
-        seen_at_call.append(kernel._general_tile_advance_seen.get(name, 0))
+        seen_at_call.append(kernel._tile_advance_seen.get(name, 0))
         return sympy.Integer(len(seen_at_call)) * sympy.Symbol("u0"), None
 
     kernel._index_tile_advance = index_advance
     with _patched_v():
-        first = kernel._checked_tile_advance(None, True, "x")
-        second = kernel._checked_tile_advance(None, True, "x")
-        third = kernel._checked_tile_advance(None, True, "x")  # nothing left to read
+        first = kernel._tile_advance(None, True, "x")
+        second = kernel._tile_advance(None, True, "x")
+        third = kernel._tile_advance(None, True, "x")  # nothing left to read
     assert seen_at_call == [1, 2]
     assert first == sympy.Symbol("u0") and second == 2 * sympy.Symbol("u0")
     assert third is None
+
+
+def test_a_for_each_tile_op_that_lists_no_loop_variable_has_no_advance():
+    """It is inside a loop but nothing it indexes moves with it (the loop's fill, for
+    one): the index gives no advance, which is "no advance", not an error."""
+    _, legacy = _equal_infos()
+    kernel = _kernel_for(legacy, reads=[_dep("arg0_1", 512 * u0)])
+    kernel._index_tile_advance = lambda tensor, is_input, name: None
+    with _patched_v():
+        assert kernel._tile_advance(None, True, "arg0_1") is None
 
 
 def test_a_shim_op_with_no_index_advance_is_loud():
     kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", 512 * u0)])
     kernel._index_tile_advance = lambda tensor, is_input, name: None
     with _patched_v(), pytest.raises(RuntimeError, match="loop variable"):
-        kernel._checked_tile_advance(None, True, "arg0_1")
+        kernel._tile_advance(None, True, "arg0_1")
+
+
+def test_a_write_takes_the_first_write_and_counts_no_read():
+    """A write is not matched against the buffer's reads: the counter only moves for
+    reads, so a read of the same buffer afterwards still takes its first match."""
+    kernel = _kernel_for(_shim(), reads=[_dep("buf", 512 * u0)])
+    seen = []
+
+    def index_advance(tensor, is_input, name):
+        seen.append((is_input, kernel._tile_advance_seen.get(name, 0)))
+        return sympy.Symbol("u0") * 4, None
+
+    kernel._index_tile_advance = index_advance
+    with _patched_v():
+        kernel._tile_advance(None, False, "buf")
+        kernel._tile_advance(None, True, "buf")
+    assert seen == [(False, 0), (True, 1)]
+
+
+def _stored(tiled=(), squeezed=(), out_tiled=(), out_squeezed=()):
+    return CoarseTileInfo(
+        loop_group_id=(3,),
+        loop_count=[sympy.Integer(8)],
+        loop_tiled_dims=[[]],
+        loop_tiled_reduction_dims=[[]],
+        tiled_dims_per_read=[list(tiled)],
+        squeezed_advance_per_read=[list(squeezed)],
+        output_tiled_dims=list(out_tiled),
+        squeezed_advance_output=list(out_squeezed),
+    )
+
+
+@pytest.mark.parametrize(
+    "stored, index_advance, fails",
+    [
+        ([(0, 64)], 512 * u0, False),  # both say advance
+        ([], sympy.S.Zero, False),  # both say pinned
+        ([(0, 64)], sympy.S.Zero, True),  # record advances, index pinned
+        ([], 512 * u0, True),  # index advances, record pinned
+        ([(0, 64)], None, True),  # op lists no loop variable, record advances
+    ],
+    ids=["agree_advance", "agree_pinned", "record_only", "index_only", "no_variable"],
+)
+def test_the_temporary_check_compares_the_stored_record_with_the_index(
+    stored, index_advance, fails
+):
+    """Stage 7.4 part A keeps the lists written and compares them with the index on
+    every access, so the hardware CI suite is the evidence that reading the index
+    changes nothing. Part B deletes the check with the lists."""
+    kernel = _kernel_for(_stored(tiled=[stored]), reads=[_dep("arg0_1", 512 * u0)])
+    kernel._index_tile_advance = lambda tensor, is_input, name: (
+        None if index_advance is None else (index_advance, None)
+    )
+    with _patched_v():
+        if fails:
+            with pytest.raises(RuntimeError, match="stage 7.4 check"):
+                kernel._tile_advance(None, True, "arg0_1")
+        else:
+            kernel._tile_advance(None, True, "arg0_1")
+
+
+def test_an_op_in_no_loop_has_no_advance():
+    kernel = _kernel_for(None, reads=[_dep("arg0_1", 512 * u0)])
+    with _patched_v():
+        assert kernel._tile_advance(None, True, "arg0_1") is None
 
 
 @pytest.mark.parametrize(
