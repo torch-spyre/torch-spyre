@@ -523,6 +523,41 @@ class _GatherScenarios:
             lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC
         )
 
+    def test_index_select_after_slice_indexed_dim(self):
+        """index_select(x[3:], 0, i) -- the slice offset on the indexed dim is
+        added to the indirect coordinate (IndirectAccess(i) + 3), issue #6210."""
+        x = self.to_spyre(torch.rand(20, 64, dtype=torch.float16))
+        i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"rows": 20, "cols": 64})
+        self.name_dims(i, {"P": 5})
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x[3:], 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_index_select_after_slice_inner_dim(self):
+        """x[:, 3:, :][:, i, :] -- sliced and indexed dim is not outermost
+        (issue #6210)."""
+        x = self.to_spyre(torch.rand(4, 10, 64, dtype=torch.float16))
+        i = torch.tensor([3, 0, 2, 1], dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"A": 4, "B": 10, "C": 64})
+        self.name_dims(i, {"P": 4})
+        self._stage_and_e2e(
+            lambda x, i: x[:, 3:, :][:, i, :], x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_embedding_after_slice(self):
+        """embedding(i, w[3:]) -- embedding table is a sliced view (issue #6210)."""
+        w = self.to_spyre(torch.rand(20, 64, dtype=torch.float16))
+        i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
+        self.name_dims(w, {"rows": 20, "cols": 64})
+        self.name_dims(i, {"P": 5})
+        self._stage_and_e2e(
+            lambda w, i: torch.nn.functional.embedding(i, w[3:]),
+            w,
+            i,
+            expect=GATHER_OP_SPEC,
+        )
+
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
         x, i = self._xi(P=32)

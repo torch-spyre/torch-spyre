@@ -69,6 +69,7 @@ from torch_spyre._inductor.op_spec import (  # noqa: E402
 from torch_spyre._inductor.pass_utils import (  # noqa: E402
     _non_indirect_coord_syms,
 )
+from torch_spyre._inductor.spyre_kernel import _sympy_literal  # noqa: E402
 from torch_spyre.execution.async_compile import SpyreAsyncCompile  # noqa: E402
 
 
@@ -159,6 +160,31 @@ class TestIndirectAccessAtom(IndirectAccessTestCase):
         self.assertEqual(len(out.atoms(IndirectAccess)), 2)
         self.assertNotIn(t0, out.free_symbols)
         self.assertNotIn(t1, out.free_symbols)
+
+    @staticmethod
+    def _reload(expr):
+        """Serialize through the real codegen and evaluate it the way the
+        generated kernel module does (sympify + the imported IndirectAccess)."""
+        source = _sympy_literal(expr)
+        namespace = {"sympify": sympy.sympify, "IndirectAccess": IndirectAccess}
+        return eval(source, namespace)  # noqa: S307
+
+    def test_bare_indirect_access_survives_codegen_round_trip(self):
+        ia = IndirectAccess(sympy.Symbol("arg1_1"))
+        reloaded = self._reload(ia)
+        self.assertIsInstance(reloaded, IndirectAccess)
+        self.assertEqual(reloaded, ia)
+
+    def test_offset_indirect_access_survives_codegen_round_trip(self):
+        """A sliced view's coordinate, IndirectAccess(idx) + 3 (issue #6210),
+        must re-parse to the real IndirectAccess class, not an undefined
+        function of the same name, or validation sees ``arg1_1`` as a loop
+        symbol."""
+        expr = IndirectAccess(sympy.Symbol("arg1_1")) + 3
+        reloaded = self._reload(expr)
+        self.assertTrue(reloaded.has(IndirectAccess))
+        self.assertEqual(reloaded, expr)
+        self.assertEqual(reloaded.as_coeff_Add()[0], 3)
 
 
 # ===========================================================================
