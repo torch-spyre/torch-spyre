@@ -55,6 +55,7 @@ from .. import config
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout, SpyreConstantFallback
 from ..loop_facts import counted_loop_path
+from ..loop_node import insert_after, move_after
 from ..loop_info import LoopCarryRecord, LoopShim
 from ..pass_utils import invalidate_op_read_writes, op_read_writes
 from ..propagate_hints import DimHint
@@ -672,7 +673,7 @@ def _insert_copy_out(
     copy_buf.operation_name = copy_name
     copy_buf.loop_info = _shim(group, tiled)  # type: ignore[attr-defined]
     V.graph.name_to_buffer[copy_name] = copy_buf
-    operations.insert(operations.index(tiled_op) + 1, copy_buf)
+    insert_after(operations, tiled_op, copy_buf)
     return copy_buf
 
 
@@ -730,12 +731,10 @@ def _insert_fill(
     # it (the scheduler's dead-node check); it is live code, not a leftover.
     fill_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
     V.graph.name_to_buffer[fill_name] = fill_buf
-    at = operations.index(accum)
     # The scalar was appended to the operations when it was created: move it to
     # just after the accumulator, then the fill after it.
-    operations.remove(scalar_op)
-    operations.insert(at + 1, scalar_op)
-    operations.insert(at + 2, fill_buf)
+    move_after(operations, accum, scalar_op)
+    insert_after(operations, scalar_op, fill_buf)
 
 
 def _lower_reduction(
@@ -749,8 +748,8 @@ def _lower_reduction(
     buf_name = op.get_name()
     assert fact.tiled is not None
     start = next(
-        i
-        for i, o in enumerate(operations)
+        o
+        for o in operations
         if isinstance(o, ComputedBuffer) and _outer_key(o) == group.index
     )
     accum = _allocate_full_buffer(
@@ -771,7 +770,7 @@ def _lower_reduction(
     combine = _make_combine_buffer(op, accum)
     combine.loop_info = _shim(group, fact.tiled)  # type: ignore[attr-defined]
     V.graph.name_to_buffer[combine.get_name()] = combine
-    operations.insert(operations.index(op) + 1, combine)
+    insert_after(operations, op, combine)
 
     # insert_restickify.finalize_layouts reads this to give the accumulator the
     # reduction's device layout.
@@ -862,8 +861,8 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
             and _outer_key(o) != group.index
         ]
         start = next(
-            i
-            for i, o in enumerate(operations)
+            o
+            for o in operations
             if isinstance(o, ComputedBuffer) and _outer_key(o) == group.index
         )
         full_buf = _allocate_full_buffer(
