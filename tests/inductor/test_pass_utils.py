@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import math
 import types
 
 import pytest
@@ -852,3 +853,28 @@ def test_compute_size1_restickify_layout_indirect_access():
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
     assert list(result.stride_map) == [1, 0]
+
+
+def _restickify_case(size, index, ranges, dim_order):
+    stride = [math.prod(size[i + 1 :]) for i in range(len(size))]
+    host = FixedLayout(torch.device("spyre"), torch.float16, size, stride)
+    dep = MemoryDep("x", index, tuple(ranges), tuple(ranges.values()))
+    stl = SpyreTensorLayout(size, stride, torch.float16, dim_order)
+    ic = pass_utils.host_coordinates(host, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
+    return stl, host, ic, idc, PropArg(dep, host, [stl])
+
+
+def test_restickify_refuses_new_stick_var_in_several_outer_dims():
+    # Host x[L=4, H=8, D=128] read as 1024*lq + k, k = 128*h + d; L is on the
+    # stick, so k sits in two outer device dims (H and D).  Rewriting one of
+    # them would count k twice, so the restickify is refused.
+    lq, k = sympy.symbols("lq k", integer=True, nonnegative=True)
+    stl, host, ic, idc, arg = _restickify_case(
+        [4, 8, 128], 1024 * lq + k, {lq: 4, k: 1024}, [2, 1, 0]
+    )
+    assert list(stl.device_size) == [8, 1, 128, 64]
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host, sympy.floor(k / 128), ic, idc, arg=arg
+    )
+    assert result is None
