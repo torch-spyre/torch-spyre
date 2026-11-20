@@ -375,6 +375,9 @@ def enable_spyre_context(
         # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
         # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
         "fallback_random": True,
+        # Spyre never fuses (SpyreHeuristics.can_fuse is False), and the reindex
+        # analysis asserts on a for_each_tile loop node (#6496).
+        "loop_reindexing_after_fusion": False,
     }
 
     from torch._inductor.ir import Loops

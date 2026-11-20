@@ -634,7 +634,9 @@ def test_destination_views_are_interned_by_ownership():
     assert _intern_view_group(groups, _QUARTER_MOD) == 0  # same owners -> same group
     assert _intern_view_group(groups, _HALF_ON_4) == 1  # different owners -> new group
     assert _intern_view_group(groups, _QUARTER_PLAIN) == 0
-    assert list(groups) == [_QUARTER_PLAIN, _HALF_ON_4]  # first spelling stays the key
+    # Keyed by physical ownership, which both spellings share.
+    assert list(groups) == [_QUARTER_PLAIN.partition_key, _HALF_ON_4.partition_key]
+    assert _QUARTER_MOD.partition_key == _QUARTER_PLAIN.partition_key
 
 
 def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
