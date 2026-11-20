@@ -158,10 +158,18 @@ def default_tensors(spec, tensors: Sequence) -> None:
 
     Outputs are left alone, and so are ``input_output`` arguments, whose
     starting value is part of what is being tested.
+
+    The ones are written by a copy from the host rather than ``fill_``. A
+    declared dynamic tensor bound below its maximum is allocated at the
+    reservation, so it is a partial view of its storage, and the device
+    ``fill_`` refuses partial views because it writes whole sticks. A host copy
+    writes the logical extent only, which is also how a caller's own data
+    arrives.
     """
     for arg in spec.args:
         if arg.role == "input":
-            tensors[arg.arg_index + spec.arg_offset].fill_(1.0)
+            tensor = tensors[arg.arg_index + spec.arg_offset]
+            tensor.copy_(torch.ones(tuple(tensor.shape), dtype=tensor.dtype))
 
 
 def _alloc(shape, dtype, layout):
