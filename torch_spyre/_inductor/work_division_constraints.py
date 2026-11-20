@@ -14,7 +14,7 @@
 
 """Op-specific work-division constraints, collected in one place.
 
-work_division.py's core algorithm (span reduction, priority-based
+work_division.py's core algorithm (span floors, priority-based
 distribution, the matmul cost model) is generic over the iteration space. A
 few ops/layouts additionally forbid splitting specific dims, or force a dim's
 split to an exact value, for reasons the generic algorithm has no way to know
@@ -61,6 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .loop_facts import enclosing_loops
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -252,12 +253,10 @@ def direct_read_source_stick_split_domains(
     full physical/logical ownership equivalence; this rule only keeps the work-
     division search from choosing a candidate that is known to be impossible.
     """
-    loop_info = getattr(ctx.op, "loop_info", None)
-    loop_counts = getattr(loop_info, "loop_count", ())
     try:
         loop_trips = 1
-        for count in loop_counts:
-            loop_trips *= concretize_expr(count)
+        for level in enclosing_loops(ctx.op):
+            loop_trips *= concretize_expr(level.trip_count)
     except Exception:
         return ConstraintResult()
     if loop_trips < _MIN_SOURCE_AWARE_DIRECT_READ_TRIPS:
@@ -377,19 +376,30 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     op_info = getattr(ctx.op.data, "op_info", None)
     if not isinstance(op_info, dict):
         return ConstraintResult()
+    # Convs record their geometry under conv_params, pools under pool_params; the
+    # same reasoning applies to both: a strided spatial split produces incorrect
+    # per-core addressing.
     conv_params = op_info.get("conv_params")
-    if not isinstance(conv_params, dict):
+    is_conv_op = isinstance(conv_params, dict)
+    window_params = conv_params if is_conv_op else op_info.get("pool_params")
+    if not isinstance(window_params, dict):
         return ConstraintResult()
 
-    stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
-    stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
+    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
+    # conv2d (#3284) and the pools record it as stride_h/stride_w. Accept either
+    # spelling so the strided-spatial-split block covers every windowed path.
+    stride_i = window_params.get("stride_i", window_params.get("stride_h", 1))
+    stride_j = window_params.get("stride_j", window_params.get("stride_w", 1))
     if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
         return ConstraintResult()
 
     write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
+    # Conv blocks both output spatial dims; a strided pool only needs the
+    # INNERMOST one blocked.
+    spatial = list(write.ranges)[-2:] if is_conv_op else list(write.ranges)[-1:]
     blocked = {
         sym
-        for sym in list(write.ranges)[-2:]
+        for sym in spatial
         if isinstance(sym, Symbol)
         and sym in ctx.it_space
         and concretize_expr(ctx.it_space[sym]) > 1
@@ -428,27 +438,6 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
         return ConstraintResult()
 
     return ConstraintResult(blocked=set(window_dims))
-
-
-# Generated scratch-copy ops (coarse_tile.py's _insert_reduce_copy_op) inherit their tiled dims from the sizing op they
-# copy for, but their own write is per-tile scratch reused in place and
-# never advances (see PropagationPlan(kind="loop_internal")) -- no sibling op
-# in the fused loop body depends on which cores a copy op's OWN internal
-# work is split across the way it depends on a self-planning op's shared
-# coarse-tile-local loop variable. A copy op's read, by contrast, is often
-# into the full, un-tiled source tensor, so splitting its tile-local dims
-# across cores is exactly what lets the normal per-core span-limit search
-# (raise_if_per_core_overflow) shrink that read's footprint -- pinning them
-# to 1 forecloses that and can make an otherwise-legal plan look
-# Unsupported (confirmed: test_copy_running_max_4d_H4_Lq4 fails with
-# "per-core tensor span ... exceeds hardware limit" once its read-copy op's
-# H/Lq dims are pinned, and passes once they aren't).
-#
-# These prefixes are matched cross-module against names coarse_tile.py
-# constructs via V.graph.qualify_name: "coarse_tile_reduce_copy_..." in
-# _insert_reduce_copy_op and its _insert_combine_op/reduction-drain
-# call sites. If the naming site changes, update this tuple to match.
-_GENERATED_COPY_OP_PREFIXES = ("coarse_tile_reduce_copy_",)
 
 
 # Set on an operation whose coarse tiling and core division were chosen by one
@@ -509,40 +498,30 @@ def coarse_tile_local_dim_split_domains(
     fused loop body could disagree about which core owns which slice of that
     dim (``committed_splits``/ownership is keyed by split count, so a split
     other than the deliberate, uniform value of 1 breaks that agreement).
-    ``work_distribution``/``span_reduction`` divide each op in the graph
+    ``work_distribution`` and the joint solve divide each op in the graph
     independently, so without this pin an op's own greedy, size-priority core
     search (``_default_split`` -> ``multi_dim_iteration_space_split``) could
     otherwise choose a split > 1 for a dim that must stay whole -- confirmed
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    Skips generated scratch-copy ops entirely (see
-    ``_GENERATED_COPY_OP_PREFIXES``): a copy op's own tile-local dims are not
-    shared, cross-op, ownership the way a self-planning op's loop variable
-    is, and pinning them can defeat the per-core span-limit search on a copy
-    whose read spans the full, un-tiled source tensor.
-
-    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
+    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``LoopInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
-    ``loop_tiled_dims`` is the primary source (not
-    ``tiled_dims_per_read``/``output_tiled_dims``): those are deliberately
-    zeroed for per-tile scratch that "must not advance" (the
-    ``_fixed_level_extents`` convention), which is correct for building
-    ``device_tile_advance_expr`` but leaves them carrying no "is this op's
-    own dim tiled" signal at all for such an op, exposing its dims to the
-    greedy search's independent, unpinned choice.
+    ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
+    loop-variable coefficient) says nothing about whether the op's own dim is
+    tiled, so it could not be used to keep a tiled dim whole.
     ``loop_tiled_dims`` has no such caveat where it is *computed* (both the
     self-planning path and generated-copy construction derive it from the
     op's own ranges), but it can be *inherited* un-remapped by nodes inserted
     after coarse tiling planned the loop group (``insert_restickify``,
-    ``_insert_combine_op``), so ``pin()`` skips positions outside
+    ``_make_combine_buffer``), so ``pin()`` skips positions outside
     ``ctx.op``'s own space rather than trusting them.
 
     Each raw position is translated to an ``ctx.it_space`` symbol via
     ``ctx.op``'s own raw->squeezed table (mirroring
     ``_raw_to_squeezed_pos``'s convention -- squeezed index ``i`` names
-    symbol ``d{i}``), the same bridge ``_tiled_dims_for_dep`` itself uses,
+    symbol ``d{i}``),
     rather than an independent survivor-count walk that silently assumes
     the raw numbering already matches ``ctx.op.data.ranges`` (that
     assumption is what this function's docstring above documents as
@@ -568,7 +547,7 @@ def coarse_tile_local_dim_split_domains(
 
     ``loop_tiled_reduction_dims`` can be non-empty on an op whose own
     ``data`` is a ``Pointwise`` with no ``reduction_ranges`` at all: a
-    reduction combine op (``_insert_combine_op``, coarse_tile.py)
+    reduction combine op (``_make_combine_buffer``, coarse_tile.py)
     deliberately inherits ``loop_tiled_reduction_dims`` verbatim from the
     ``Reduction`` op it combines into, purely so the scheduler places it in
     the same ``CountedLoopSchedulerNode`` -- the reduction dim has already
@@ -578,15 +557,12 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    loop_info = getattr(ctx.op, "loop_info", None)
-    if loop_info is None:
+    if getattr(ctx.op, "loop_info", None) is None:
         return ConstraintResult()
+    levels = enclosing_loops(ctx.op)
 
     if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
         return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
-
-    if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
-        return ConstraintResult()
 
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
     hinted_syms = _hinted_work_div_syms(ctx)
@@ -644,15 +620,15 @@ def coarse_tile_local_dim_split_domains(
 
     allowed_splits: dict[Symbol, frozenset[int]] = {}
     output_ranges = ctx.op.data.ranges
-    for level_dims in loop_info.loop_tiled_dims:
-        for pos in level_dims:
+    for level in levels:
+        for pos in level.tiled_dims:
             pin(pos, output_ranges)
 
     n_output_dims = len(output_ranges)
     reduction_ranges = getattr(ctx.op.data, "reduction_ranges", None)
     if reduction_ranges is not None:
-        for level_dims in loop_info.loop_tiled_reduction_dims:
-            for pos in level_dims:
+        for level in levels:
+            for pos in level.tiled_reduction_dims:
                 pin(n_output_dims + pos, reduction_ranges, raw_base=n_output_dims)
 
     return ConstraintResult(allowed_splits=allowed_splits)
@@ -799,13 +775,11 @@ def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
 
 
 def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict TopK search-space and result dims to supported factors.
+    """Restrict TopK K-splits to factors within the per-core result limit.
 
-    TopK hardware requires at most ``TOPK_MAX_K_PER_CORE`` result rows per
-    core. Although larger divisors also meet that limit, the 4D ``k=32``
-    result-axis regression showed they produce incorrect output mapping. Keep
-    only the smallest sufficient K split until larger factors have codegen
-    support and regression coverage.
+    The reduction/search axes stay unsplit. Expose every divisor of the output
+    K axis that fits within ``SENCORES`` and leaves at most
+    ``TOPK_MAX_K_PER_CORE`` results per core.
     """
     if (
         not isinstance(ctx.op.data, Reduction)
@@ -829,7 +803,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
+    allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
@@ -1037,8 +1011,8 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 
     A gather value table and scatter destination have one shared base on every
     core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    also stays unsplit. Other index-entry dims remain available for multicore
+    work.
     """
     return ConstraintResult(
         allowed_splits={
@@ -1105,8 +1079,8 @@ def overlapping_coordinate_extents(
 def _moves_coordinate(coordinate: Expr, var: Symbol, extent: int) -> bool:
     """Whether ``var`` changes ``coordinate`` (``floor(c/64)`` with ``c < 64`` does not)."""
     others = {v: 0 for v in coordinate.free_symbols if v != var}
-    base = coordinate.subs(others)
-    return extent > 1 and base.subs(var, 0) != base.subs(var, extent - 1)
+    base = coordinate.xreplace(others)
+    return extent > 1 and base.xreplace({var: 0}) != base.xreplace({var: extent - 1})
 
 
 def overlapping_window_split_domains(

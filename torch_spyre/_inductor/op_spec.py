@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import functools
 import math
 import threading
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function, sympify
+from sympy import Symbol, Expr, Function, Integer, sympify
+from sympy.core.parameters import global_parameters
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
@@ -44,6 +46,36 @@ class IndirectAccess(Function):
     @classmethod
     def eval(cls, name):  # noqa: ARG003
         return None  # keep unevaluated
+
+
+# Bounded so that a long-lived process compiling many shapes cannot grow it
+# without limit; a Granite 3.3 8B start parses about 105 distinct strings.
+@functools.lru_cache(maxsize=4096)
+def _cached_sympify(text: str, flags: tuple[bool, bool, bool]) -> Any:
+    # ``flags`` only keys the cache: sympify reads the same global parameters
+    # (evaluate, distribute, exp_is_pow), and each one changes its result.
+    return sympify(text)
+
+
+def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
+    """``sympify`` as imported by generated Spyre wrapper modules.
+
+    The wrapper emits ``sympify('<expr>')`` for every index expression, and each
+    load of a cached wrapper module re-parses those strings. A plain ``str``
+    argument is parsed once per process and the parsed expression is shared;
+    sympy expressions are immutable, so sharing them is safe. Anything else
+    goes straight to ``sympy.sympify``.
+    """
+    if not args and not kwargs and type(a) is str:
+        return _cached_sympify(
+            a,
+            (
+                global_parameters.evaluate,
+                global_parameters.distribute,
+                global_parameters.exp_is_pow,
+            ),
+        )
+    return sympify(a, *args, **kwargs)
 
 
 # --- Source-to-kernel provenance schema -------------------------------------
@@ -178,16 +210,21 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        # core_mapping imports this module's TensorWorkDivision.
-        from .core_mapping import same_owner_maps
+        key = self.ownership_key
+        return key is not None and key == other.ownership_key
 
-        return same_owner_maps(
-            self.work_slices,
-            self.core_id_to_work_slice,
-            self.physical_core_count,
-            other.work_slices,
-            other.core_id_to_work_slice,
-            other.physical_core_count,
+    @functools.cached_property
+    def ownership_key(self) -> "tuple | None":
+        """This division's :func:`~.core_mapping.ownership_key`, computed once.
+
+        Cached on the instance, so ``work_slices`` and ``core_id_to_work_slice``
+        must not be changed after the first ownership comparison.
+        """
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import ownership_key
+
+        return ownership_key(
+            self.work_slices, self.core_id_to_work_slice, self.physical_core_count
         )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
@@ -215,7 +252,7 @@ class TensorWorkDivision:
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                value = sympify(expression).subs(core_id, core)
+                value = sympify(expression).xreplace({core_id: Integer(core)})
                 if value.free_symbols or value.is_integer is not True:
                     raise ValueError(
                         f"core {core} owns non-integral {dim} slot {value}"
@@ -243,6 +280,9 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
+        stride_map: The ``stride_map`` of the SpyreTensorLayout the coordinates were
+                derived from: each device dim's host stride, 0 for a dim holding no
+                host elements.  ``None`` when the arg was not built from a layout.
         allocation: dict tagging where this Tensor's data lives. Mirrors
                 layout.allocation and carries exactly one of three
                 mutually-exclusive keys:
@@ -256,9 +296,9 @@ class TensorArg:
                   docs/source/compiler/hbm_pool_planning.md.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
-            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
-            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
-            level, substituted with that level's own minted symbol, reprojected to
+            SpyreKernel._index_tile_advance from the coefficient of each loop's
+            variable in the access's index: one term per nesting level, in that
+            level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
             ops without loop_info/coarse tiling.
@@ -279,6 +319,10 @@ class TensorArg:
             one MEMORY_FILL (``spyre_constant_tensor`` -> ``spyre_fill_tensor``),
             and False everywhere else. The KTIR emitter reads it to widen a
             scalar operand's read to its whole stick; see ``_reads_every_lane``.
+        non_unified_shard_bytes: Device bytes of one shard when the tensor is
+            sharded storage (core c reads or writes only chunk c, through its
+            own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
+            0 for ordinary storage. Checked against the real tensor at launch.
     """
 
     is_input: bool
@@ -295,6 +339,12 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
     replicated_scalar: bool = False
+    non_unified_shard_bytes: int = 0
+    stride_map: list[int] | None = None
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
 
 def is_lx_relayout_identity(
@@ -347,7 +397,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            to its own nesting level's trip count (LoopInfo.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without
@@ -369,8 +419,8 @@ class OpSpec:
         default_factory=dict
     )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
-    # Populated by compute_symbolic_bounds during
-    # create_op_spec; empty for concrete dims.
+    # create_op_spec no longer populates it (it refuses mark_dynamic(max=...)
+    # sizes outside for_each_tile), so it is empty in every compile.
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
@@ -427,6 +477,16 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        count_symbol_bounds: For a symbolic ``count``, the ``(max_value,
+            tile_size)`` of each symbol in it, keyed by name. Resolved by the
+            scheduler while the ShapeEnv exists and carried from there, because
+            codegen also runs in a reload phase where it is gone. Empty for a
+            concrete count.
+        count_symbol_sources: For a symbolic ``count``, the ``(arg_index,
+            dim_index)`` each symbol's value is read from at launch, keyed by
+            name. Resolved during kernel codegen, where the launch argument
+            ordering is still live. A symbol that cannot be placed is left out,
+            and bundle generation then refuses to declare a parameter for it.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -439,6 +499,25 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+def walk_loop_specs(specs):
+    """Every LoopSpec in a spec tree, outer before inner.
+
+    Lives here rather than in either consumer because kernel codegen and bundle
+    generation both walk the same tree for the same reason, and a second copy is
+    a second thing to keep in step.
+    """
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            yield spec
+            yield from walk_loop_specs(spec.body)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

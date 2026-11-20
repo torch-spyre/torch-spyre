@@ -16,11 +16,20 @@
 
 #include "spyre_storage_impl.h"
 
+#include <utility>
+
 namespace spyre {
 
 SpyreStorageImpl::SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
                                    c10::DeviceAllocator* allocator,
                                    bool resizable)
     : c10::StorageImpl(use_byte_size_t(), size_bytes, allocator, resizable) {}
+
+SpyreStorageImpl::SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
+                                   c10::DataPtr data_ptr,
+                                   c10::DeviceAllocator* allocator)
+    : c10::StorageImpl(use_byte_size_t(), std::move(size_bytes),
+                       std::move(data_ptr), allocator,
+                       /*resizable=*/false) {}
 
 }  // namespace spyre

@@ -133,7 +133,7 @@ extra HBM round-trips.
 ## Pipeline position
 
 Scratchpad planning runs at the end of `CustomPreSchedulingPasses`,
-after work division has stamped per-op core splits:
+after the work-division passes:
 
 ```
 deadcode_elimination
@@ -153,20 +153,47 @@ insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 256 MB span
-cost_model_matmul_division            # work-division: matmul cost model
-work_distribution                     # work-division: default distributor
+cost_model_matmul_division            # work-division: matmul cost model (*)
+work_distribution                     # work-division: default distributor (*)
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
 ```
 
+(*) Run by `_distribute_work`, which leaves them to the LX solve when it
+chooses the splits itself (see below).
+
+Every candidate split the planner considers must keep each op's per-core
+span under 256 MB. Those minimum splits, the
+[span floors](work_division_planning.md#span-floors), do not constrain the
+order: the planner computes them when it builds each op's split menu, in
+the candidate's own frame, so a coarse tiling that shrinks a span relaxes
+them.
+
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Scratchpad planning reads the
-  symbol-keyed `iteration_space_ownership` committed by work division to
-  compute per-core buffer sizes. Work division also decides whether adjacent
-  ops have compatible core splits.
-  Incompatible splits trigger `core_div_mismatch` and disqualify shared
-  buffers from LX (see [Current limitations](#current-limitations)).
+- **Each op needs a committed split wherever the planner reads one.**
+  Placement-only planning sizes per-core buffers from the symbol-keyed
+  `iteration_space_ownership` that work division commits, and checks
+  whether adjacent ops have compatible core splits. Incompatible splits
+  trigger `core_div_mismatch` and disqualify shared buffers from LX (see
+  [Current limitations](#current-limitations)). So without
+  co-optimization, and for the pruned exhaustive search, which seeds its
+  candidates from the committed split, `cost_model_matmul_division` and
+  `work_distribution` run first.
+
+  The co-optimizing solve (CP-SAT with ortools, or simulated annealing)
+  chooses the split of every op it can enumerate, and would overwrite a
+  split committed up front. When `solve_decides_work_division()` holds,
+  `_distribute_work` only records the ops it would have divided
+  (`defer_work_division`). The allocator commits the pass's split for one
+  of those ops only where it still reads it:
+
+  - when it pins the op to a fixed division (a hint, indirect access, a
+    host buffer, a layout group, an op it cannot enumerate);
+  - after the solve, for an op the solve committed no split to;
+  - before the greedy fallback, when the solve fails.
+
+  Every op still ends with a committed split, and a pinned op keeps the one
+  the pass would have given it.
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
 
@@ -469,7 +496,8 @@ slot is a search heuristic, not an ownership proof or a performance guarantee.
 | Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
 | Fewer-core complete partitions | `torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection` | integral core ratio; complete disjoint partitions; larger domain uses every compute core; physical spans stay separate | `test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
 | Persistent external cache scatter | `torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer` | fresh immutable matmul source; one external indirect overwrite; no source alias or cache read; mutation order and lifetime preserved | `test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source` | `test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias` |
-| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
+| Post-loop sum of a loop carry | `torch_spyre._inductor.scratchpad.lx_relayout._relayout_consumer_kind_supported` | co-optimizing solve that decides relayouts; carry storage with an FX origin and no writer after its loop; a sum outside every loop; in-loop accesses keep the carry's own ownership; movement, capacity and price gates unchanged | `test_solver_relayout_candidates.py::test_a_sum_takes_a_relayout_only_from_a_loop_carry`; `test_solver_relayout_candidates.py::test_an_edge_needs_an_fx_origin_at_both_ends` | `test_solver_relayout_e2e.py::test_post_loop_sum_reads_a_relayout_of_a_grouped_carry` |
+| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition`; `test_solver_relayout_e2e.py::test_gate_up_halves_read_the_matmul_output_in_place` |
 | Full-parent copy for local subranges | `torch_spyre._inductor.scratchpad.lx_relayout.materialize_lx_relayouts` | complete parent copied once per destination group; every partial reader re-certified against the destination view; positive disjoint LX spans | `test_subrange_transfer.py::test_gate_up_siblings_have_distinct_copy_identity`; `test_solver_relayout_decision.py::test_copy_is_sized_by_the_destination_span_not_the_source_share` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
 | Pointwise persistent-scatter materializer | `torch_spyre._inductor.scratchpad.lx_relayout._pointwise_scatter_materializer` | ownership flag ON; one certified compact parent subrange; complete scatter read; persistent-scatter storage, alias and ordering checks | `test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission` | None |
 | Direct cache-snapshot subrange read | `torch_spyre._inductor.scratchpad.lx_relayout._local_lx_scatter_geometry` | single-writer complete immutable snapshot; one direct partial read; other reads are scatter indices; standard 128-byte sticks; zero inner origin and exact rectangle size; external mutation target and final same-core ownership checks preserved | `test_solver_relayout_candidates.py::test_direct_cache_snapshot_scatter_geometry` | None |

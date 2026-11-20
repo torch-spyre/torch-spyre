@@ -29,6 +29,7 @@ graph output) or inserts a spyre.restickify copy in the required layout.
 
 import sympy
 import torch
+from torch._inductor.virtualized import V
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -59,40 +60,11 @@ from .pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
-    padded_entry_output_stl,
     per_trip_index,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
-from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
-
-
-def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
-    """Grow a gather output's index-entry dim to the index stick multiple.
-
-    Multi-core work division splits the index-entry dim in whole index sticks.
-    When the entry count is a partial last stick (e.g. 40 over a 32-int32 index
-    stick), the per-core base is stick-aligned for the index tensor but
-    element-aligned for the shorter output, so the two disagree and the split
-    miscompiles. ``padded_entry_output_stl`` returns the output layout grown so
-    that dim spans whole sticks (or None when there is nothing to pad); applying
-    it aligns the output base and gives the later cores an in-bounds place to
-    write. The logical size is unchanged: the D2H copy extracts the logical view
-    from the (larger) physical allocation.
-
-    No-op on a single core, on an already stick-aligned count, or on an in-place
-    (mutation) destination this pass cannot safely resize.
-    """
-    if config.sencores <= 1:
-        return False
-    if isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
-        return False
-    padded_stl = padded_entry_output_stl(op)
-    if padded_stl is None:
-        return False
-    op.layout = _fixed_tiled(_real_layout(op), padded_stl)
-    return True
 
 
 def _scatter_access_subs_and_sizes(
@@ -134,19 +106,26 @@ def _scatter_access_subs_and_sizes(
 
     # Compute device coordinates to find the actual device dimension for each
     # scatter symbol, then look up its size from coord_layout.device_size.
+    # Symbol sizes come from the layout the write index was built against: for
+    # a mutation through a view, that is the view's layout, not the allocation.
+    op_layout = getattr(scatter_op, "layout", None)
+    size_layout = coord_layout
+    if isinstance(op_layout, MutationLayoutSHOULDREMOVE):
+        size_layout = op_layout.target.get_layout()
+
     sizes: dict[sympy.Symbol, int] = {}
-    if coord_layout.size and coord_layout.stride:
+    if size_layout.size and size_layout.stride:
         # For each scatter symbol, find which host dimension it multiplies
-        # (by matching the stride of that dimension in coord_layout.stride).
+        # (by matching the stride of that dimension in size_layout.stride).
         for sym in access_subs:
             # Extract the coefficient of this symbol in write_dep.index
             coeff = write_dep.index.coeff(sym)
             if coeff is not None:
                 # Find which host dimension has this stride
-                for dim_idx, stride in enumerate(coord_layout.stride):
+                for dim_idx, stride in enumerate(size_layout.stride):
                     if stride == coeff:
-                        if 0 <= dim_idx < len(coord_layout.size):
-                            sizes[sym] = coord_layout.size[dim_idx]
+                        if 0 <= dim_idx < len(size_layout.size):
+                            sizes[sym] = size_layout.size[dim_idx]
                         break
 
     return access_subs, sizes
@@ -423,7 +402,12 @@ def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
     target = op.layout.target
     while isinstance(target, ReinterpretView):
         target = target.data
-    return target.get_name(), target
+    name = target.get_name()
+    # The reference held by the mutation layout dates from lowering, so its
+    # layout may still be uncommitted. Resolve the name against the graph to
+    # get the live buffer, which is also the one a copy-back mutates.
+    live = V.graph.try_get_buffer(name)
+    return name, target if live is None else live
 
 
 def _get_indirect_access_dim_order_requirements(
@@ -449,7 +433,6 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
     """Post-insert_restickify fixups for indirect-access ops.
 
     Handles IA-specific fixups that require committed FixedTiledLayout:
-      - pad gather output's index-entry dim for stick-aligned multi-core split
       - materialize unaligned scatter source when it cuts through an index stick
 
     Gather value tensor dim reordering is handled by reorder_nonstick_dims
@@ -466,8 +449,6 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
         if not requirement:
             continue
         dep_names = requirement[0]
-
-        _pad_output_for_stick_aligned_split(original_op)
 
         op = original_op
         if is_scatter:

@@ -35,6 +35,7 @@ import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan, scan_op
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._pytree import (
     keystr,
@@ -45,8 +46,11 @@ from torch.utils._pytree import (
 )
 
 from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 
-__all__ = ["Gather", "for_each_tile"]
+__all__ = ["Gather", "Slice", "for_each_tile"]
+
+logger = get_inductor_logger("wsr.for_each_tile")
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,23 @@ class Gather:
 
     axis: int
     index: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Slice:
+    """Tile spec for a SLICED operand with its own extent, decoupled from `tile_size`.
+
+    A plain `int` `dims` entry narrows the operand into `tile_size`-wide contiguous
+    views, `tile_size` shared by every such entry in the same `for_each_tile()` call.
+    `Slice(dim, extent)` is the same narrowing, but with its own `extent` -- for an
+    operand that needs a different per-trip width than the rest, e.g. one row of a
+    per-step scale/lookup table alongside operands tiled at a much larger `tile_size`.
+    Trip count is still `shape[dim] // extent`, and must still agree with every other
+    tiled operand's trip count.
+    """
+
+    dim: int
+    extent: int
 
 
 class Kind(enum.Enum):
@@ -100,7 +121,7 @@ class TileSpec:
         return self.tile_size[self.dim] if self.tile_size else 1
 
 
-DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+DimSpec = Union[int, None, Gather, Slice]  # noqa: UP007  # needs runtime presence
 
 
 def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
@@ -308,6 +329,11 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
     # dim 0, and with a 2-page gather, but not with y[6, 5].
     num_tiles: int | None = None
     num_tiles_of: int | None = None
+    # Whether any operand actually narrows by the shared `tile_size`: a plain `int`
+    # dims entry does, but Slice carries its own extent and Gather always reads one
+    # pool row, so both leave `tile_size` unread. Kind.SLICE alone can't tell these
+    # apart -- a Slice entry produces it too -- so this is tracked separately.
+    tile_size_used = False
 
     for k, (o, d) in enumerate(zip(operands, per_operand)):
         if not isinstance(o, torch.Tensor):
@@ -343,6 +369,7 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                 idx,
             )
         elif isinstance(d, int) and not isinstance(d, bool):
+            tile_size_used = True
             axis = utils.canonicalize_dim(o.ndim, d)
             length = o.shape[axis]
             if length % tile_size != 0:
@@ -351,16 +378,51 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"which is not a multiple of tile_size={tile_size} (ragged tiles "
                     f"are not supported)"
                 )
+            # Also state it as a fact. The check above guards it, but recording
+            # Mod(length, tile_size) in the shape env is what lets the
+            # simplifier fold tile_size * (length // tile_size) back to length
+            # when the length is symbolic. A SymInt passes isinstance(length,
+            # int), so this must not be guarded by it.
+            torch._check(length % tile_size == 0)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
                 _tile_size_vector(o.shape, axis, tile_size),
                 length // tile_size,
             )
+        elif isinstance(d, Slice):
+            bad_extent = (
+                not isinstance(d.extent, int)
+                or isinstance(d.extent, bool)
+                or d.extent <= 0
+            )
+            if bad_extent:
+                raise ValueError(
+                    f"for_each_tile() Slice extent for operand {k} must be a "
+                    f"positive int, got {d.extent!r}"
+                )
+            axis = utils.canonicalize_dim(o.ndim, d.dim)
+            length = o.shape[axis]
+            if length % d.extent != 0:
+                raise ValueError(
+                    f"for_each_tile() operand {k} has size {length} along dim "
+                    f"{d.dim}, which is not a multiple of Slice extent={d.extent} "
+                    f"(ragged tiles are not supported)"
+                )
+            # Same reasoning as the plain-int branch above: record it as a fact so
+            # the simplifier can fold extent * (length // extent) back to length for
+            # a symbolic length too.
+            torch._check(length % d.extent == 0)
+            spec = TileSpec(
+                Kind.SLICE,
+                axis,
+                _tile_size_vector(o.shape, axis, d.extent),
+                length // d.extent,
+            )
         else:
             raise ValueError(
-                f"for_each_tile() dims entry {k} must be an int, None or Gather, "
-                f"got {d!r}"
+                f"for_each_tile() dims entry {k} must be an int, None, Gather or "
+                f"Slice, got {d!r}"
             )
 
         if num_tiles is None:
@@ -378,13 +440,15 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
             "for_each_tile() needs at least one sliced or gathered operand; a "
             "counter-only loop cannot be traced (see torch-spyre#3965, I1)"
         )
-    # With no sliced operand nothing reads tile_size: a gathered step takes one pool
-    # row, and the trip count comes from the index table. Silently ignoring the
-    # argument would let a wrong one look right.
-    if tile_size != 1 and all(s.kind is not Kind.SLICE for s in specs):
+    # With no plain-int dims entry nothing reads tile_size: a gathered step takes one
+    # pool row and a Slice entry carries its own extent, so the trip count comes from
+    # the index table or the extent instead. Silently ignoring the argument would let
+    # a wrong one look right.
+    if tile_size != 1 and not tile_size_used:
         raise ValueError(
-            f"for_each_tile() got tile_size={tile_size} with no sliced operand; a "
-            f"gathered step takes one pool row, so tile_size must be 1"
+            f"for_each_tile() got tile_size={tile_size} but no operand has a plain "
+            f"int dims entry; a gathered step takes one pool row and a Slice entry "
+            f"carries its own extent, so neither reads tile_size and it must be 1"
         )
     return specs, num_tiles
 
@@ -405,14 +469,27 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
             raise AssertionError("GATHER spec without an index table")
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
-    # Splitting dim 0 is always expressible in strides, so this is a view.
+    # Trim to a whole number of tiles, then split. Both are views, so nothing
+    # copies, and for a concrete length the trim drops nothing.
+    #
+    # The trim is what keeps the extent a literal when the length is symbolic:
+    # given S a view cannot prove (S // G) * G == S and re-derives the extent as
+    # S // (S // G), which is 100 at S=100. Given G * (S // G) the trailing
+    # factor cancels by gcd to the literal G.
     #
     # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
     # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    return torch.unflatten(moved, 0, (moved.shape[0] // spec.extent, spec.extent))
+    #
+    # Traced, the trim is one aten.slice.Tensor over the whole length, so the FX
+    # graph does differ. Inductor's slice lowering returns the input itself for
+    # it (start 0, step 1, the size provably within the end), so no kernel or
+    # view is emitted.
+    tiles = spec.num_tiles
+    trimmed = moved.narrow(0, 0, tiles * spec.extent)
+    return torch.unflatten(trimmed, 0, (tiles, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
@@ -438,7 +515,37 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
     output ((3, 8, 2) -> (8, 6)). Avoiding this copy requires destination-aware
     lowering that writes tile i into its final slice, separately for each output leaf.
+
+    For dim == 0 this folds with `as_strided` rather than `flatten`. Both give
+    the identical tensor, but on a symbolic leading extent `flatten` (and
+    `reshape`, and `view`) walk the dims and add `Ne(count, 1)`, which splits the
+    compiled artifact at a single tile. `as_strided` does not.
+
+    That removes one source of the split, not the split itself: torch's own
+    tensor-metadata extraction evaluates the same predicate eagerly further down,
+    so a single-tile call still compiles separately.
     """
+    # as_strided takes the strides on trust, so only take it when the leading
+    # axes are PROVABLY contiguous. statically_known_true so the test itself
+    # installs no guard. Otherwise flatten: slower to specialise, never wrong.
+    # as_strided keeps the storage offset, and a fold that only merges the two
+    # leading axes is an ordinary view, so eager and autograd see the same
+    # tensor either way.
+    if dim == 0:
+        if statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
+            folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
+            return ys.as_strided(folded, ys.stride()[1:])
+        # Eager only: a logger call while Dynamo traces is a graph break, which a
+        # fullgraph compile turns into an error. A traced fold of scan's stacked
+        # output always has provably contiguous leading axes, so the traced path
+        # does not reach this branch for an output for_each_tile builds itself.
+        if not torch.compiler.is_dynamo_compiling():
+            logger.debug(
+                "for_each_tile output fold: leading axes of shape %s, strides %s "
+                "are not provably contiguous, folding with flatten",
+                tuple(ys.shape),
+                tuple(ys.stride()),
+            )
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
 
@@ -463,11 +570,16 @@ def for_each_tile(
         operands: flat sequence of every input -- sliced, gathered and invariant.
         dims: per-operand tile spec as a tuple, or a single spec broadcast to all of
             them. ``int d`` slices the operand into ``tile_size``-wide contiguous views
-            along ``d``; ``None`` passes it whole every step; ``Gather(axis, index)``
-            takes one pool row per step.
-        tile_size: the tile's size along each tiled axis. The loop's trip count is
-            derived: ``shape[dim] // tile_size`` per sliced operand, ``len(index)`` per
-            gathered one. All of them must agree.
+            along ``d``, ``tile_size`` shared by every such entry; ``None`` passes it
+            whole every step; ``Gather(axis, index)`` takes one pool row per step;
+            ``Slice(dim, extent)`` is the same contiguous slicing as ``int d``, but
+            with its own ``extent`` instead of sharing ``tile_size`` -- for an operand
+            that needs a different per-trip width than the rest, e.g. one row of a
+            per-step scale/lookup table alongside operands tiled much wider.
+        tile_size: the tile's size along each tiled axis for every plain ``int d`` dims
+            entry. The loop's trip count is derived: ``shape[dim] // tile_size`` per
+            such sliced operand, ``shape[dim] // extent`` per ``Slice``, ``len(index)``
+            per gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Output tiles may be a tensor or a

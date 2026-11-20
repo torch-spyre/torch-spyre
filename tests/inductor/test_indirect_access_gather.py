@@ -47,7 +47,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch._inductor.utils import run_and_get_code
+from torch._dynamo.utils import counters
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -77,6 +78,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
+from torch_spyre._inductor.work_division_constraints import ConstraintResult  # noqa: E402
 from utils_inductor import mock_backend_compiler
 
 
@@ -1083,6 +1085,7 @@ class _GatherMulticoreScenarios:
             device_size=[V, stick_count, eps],
             stride_map=[E, eps, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): V, (1, 2): E},
         )
         table = torch.rand(V, E, dtype=torch.float16).to("spyre", device_layout=stl)
         token_ids = torch.randint(0, V, (2, 128), dtype=torch.int64).to("spyre")
@@ -1098,7 +1101,8 @@ class _GatherMulticoreScenarios:
     # table, silently returning wrong results. Shapes are chosen so the planner
     # *would* prefer K (its largest output-coordinate dim) if the guard were
     # absent. Aligned c0 sizes split in whole sticks; partial-stick c0 sizes stay
-    # unsplit because restickify must pad them. c1 always stays unsplit.
+    # unsplit, since the last core would read the index's padding lanes as rows.
+    # c1 always stays unsplit.
     #
     # After the work-division check each scenario runs through the shared
     # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
@@ -1181,7 +1185,7 @@ class _GatherMulticoreScenarios:
 
     def test_work_division_index_split_partial_stick(self):
         """Non-stick-aligned index (P=40 = one full stick + a partial second):
-        restickify pads the entry dim, so planning keeps it on one core."""
+        the entry dim stays on one core."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1218,6 +1222,98 @@ class _GatherMulticoreScenarios:
         _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
         self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_partial_stick_unsplit_by_indirect_rule(self):
+        """The indirect-access rule alone keeps a partial-stick entry dim unsplit.
+
+        The planner sees a gather's only direct input, the index, whose stick dim
+        differs from the output's, so the restickify-padding rule also blocks the
+        dim. With that rule disabled the entry dim must still stay on one core.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(40) % 128).int().to("spyre")
+            return x, i
+
+        no_restickify_rule = patch(
+            "torch_spyre._inductor.work_division_constraints."
+            "restickify_padding_blocked_vars",
+            return_value=ConstraintResult(),
+        )
+        with no_restickify_rule:
+            _, source_codes = run_and_get_code(
+                torch.compile(self._gather_fn, dynamic=False), *make()
+            )
+        self.assert_entry_dim_unsplit(source_codes[0], index_size=40, data_size=64)
+
+    # -- index padding: lanes past the index length are never dereferenced --
+    def _gather_with_index_padding(self, dtype, pad):
+        """A partial-stick index whose padding lanes hold ``pad`` gathers exactly.
+
+        The index is the first 67 entries of a 96-entry device tensor, so its
+        third stick holds 29 padding lanes set to ``pad``. A gather that iterated
+        the whole last index stick would take them as table rows and, for an
+        invalid row, fault the card. The table values are exact in DLFloat16,
+        so the result is compared exactly.
+        """
+        n, cols = 67, 64
+        table = (torch.arange(n * cols) % 251).to(dtype).reshape(n, cols)
+        logical = torch.arange(n - 1, -1, -1, dtype=torch.int32)
+        padded = torch.cat([logical, torch.full((96 - n,), pad, dtype=torch.int32)])
+        fn = torch.compile(lambda t, i: torch.index_select(t, 0, i[:n]), dynamic=False)
+        got = fn(table.to("spyre"), padded.to("spyre")).cpu()
+        torch.testing.assert_close(got, table[logical.long()], atol=0, rtol=0)
+
+    def test_gather_index_padding_negative_fp16(self):
+        self._gather_with_index_padding(torch.float16, -1)
+
+    def test_gather_index_padding_past_table_fp16(self):
+        self._gather_with_index_padding(torch.float16, 1000)
+
+    def test_gather_index_padding_negative_fp32(self):
+        self._gather_with_index_padding(torch.float32, -1)
+
+    def test_gather_index_padding_past_table_fp32(self):
+        self._gather_with_index_padding(torch.float32, 1000)
+
+    # -- partial-stick gather output: same layout as a fresh tensor --------
+    def _gather_feeds_graph_compiled_on_fresh_tensor(self, entries):
+        """A partial-stick gather output reuses a graph compiled on a fresh tensor.
+
+        The consumer is compiled first on a fresh tensor of the output's shape,
+        as a decoder block is during warmup. The Dynamo layout guard compares
+        whole device layouts, so a gather output padded past its entry count
+        recompiles the consumer. The table is two sticks wide, so an output whose
+        layout does not describe its allocation reads the second stick column
+        from the wrong addresses.
+        """
+        cols = 128
+        table = torch.rand(300, cols, dtype=torch.float16).to("spyre")
+        rows = torch.randint(0, 300, (entries,), dtype=torch.int32)
+        expected = table.cpu()[rows.long()]
+        gather = torch.compile(lambda t, i: torch.index_select(t, 0, i), dynamic=False)
+        consumer = torch.compile(lambda hidden: hidden * 2.0, dynamic=False)
+        with fresh_cache():
+            gathered = gather(table, rows.to("spyre"))
+            consumer(torch.zeros(entries, cols, dtype=torch.float16).to("spyre"))
+            counters.clear()
+            doubled = consumer(gathered)
+        self.assertEqual(
+            counters["stats"]["unique_graphs"],
+            0,
+            "the consumer recompiled for the gather output's layout",
+        )
+        torch.testing.assert_close(gathered.cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(doubled.cpu(), expected * 2.0, atol=0, rtol=0)
+
+    def test_gather_one_partial_stick_feeds_graph_compiled_on_fresh_tensor(self):
+        """P=4: a single partial index stick, as in a small decode bucket."""
+        self._gather_feeds_graph_compiled_on_fresh_tensor(4)
+
+    def test_gather_partial_last_stick_feeds_graph_compiled_on_fresh_tensor(self):
+        """P=40: one full index stick plus a partial second."""
+        self._gather_feeds_graph_compiled_on_fresh_tensor(40)
 
     # -- shared value table: cross-core read correctness ------------------
     def test_gather_cross_core_shared_value(self):
@@ -1265,12 +1361,9 @@ class _EmbeddingAllIndexBucketsScenario:
     """torch.embedding over every partial-stick index-stick count at sencores=32.
 
     The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
-    sticks -- and at SENCORES=32 the entry dim splits core_split(sticks, 32) ==
-    sticks ways, i.e. the stick count is also the core count.
-    For each count s:
+    sticks. For each count s:
       N = s*32 - offset  (offset ∈ [1,31] seeded from s)
-      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
-      → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
+      → N is non-stick-aligned, so the entry dim stays on one core
       → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
 
@@ -1306,11 +1399,9 @@ def _make_index_sticks_test(sticks: int):
     def test(self):
         self._run_for_index_sticks(sticks)
 
-    # `sticks` index sticks == `sticks` cores at SENCORES=32 (core_split == sticks).
     test.__name__ = test.__qualname__ = f"test_gather_{sticks:02d}_index_sticks"
     test.__doc__ = (
-        f"Classify + e2e torch.embedding across {sticks} partial index stick(s) "
-        f"({sticks} cores at SENCORES=32)."
+        f"Classify + e2e torch.embedding across {sticks} partial index stick(s)."
     )
     return test
 
