@@ -1,72 +1,185 @@
-# Weekly documentation maintenance.
-#
-# Runs the weekly-doc-maintenance skill on a schedule: it audits docs/source
-# against the current code for drift, consistency, and flow, applies the safe
-# fixes, proposes larger reorganizations in the PR body, and opens a pull
-# request. The prose is humanized and carries no Claude attribution.
-#
-# Activation: add an ANTHROPIC_API_KEY repository secret (or swap in
-# claude_code_oauth_token). Until that secret exists the Claude step fails
-# fast and no PR is opened. Run it on demand from the Actions tab
-# (workflow_dispatch) to test before relying on the schedule.
-name: Weekly Doc Maintenance
+name: weekly-doc-maintenance
 
+# Runs the weekly-doc-maintenance skill: Claude audits docs/source against the
+# code and edits files in the checkout. Claude has no push token and no gh
+# access. The steps after it check that only docs/source changed, build the docs
+# with the same command as docs.yaml, commit through the API with the spyre-bot
+# app token (signed, and the PR triggers the normal checks), and open the PR.
+#
+# The job does nothing until the ANTHROPIC_API_KEY secret is set. It also skips
+# while an earlier weekly PR is still open, so it never overwrites review edits.
 on:
   schedule:
-    - cron: 17 7 * * 1   # Mondays at 07:17 UTC
-  workflow_dispatch: null
-
-permissions:
-  contents: write
-  pull-requests: write
+    - cron: 17 7 * * 1   # Mondays 07:17 UTC
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Which part of the docs to audit.
+        type: choice
+        options:
+          - ops-table
+          - full
+        default: ops-table
 
 concurrency:
   group: weekly-doc-maintenance
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   doc-maintenance:
-    # Never run on forks; only the canonical repository.
-    if: github.repository == 'torch-spyre/torch-spyre'
+    if: github.repository == 'torch-spyre/torch-spyre' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BRANCH: bot/weekly-doc-maintenance
+      # A scheduled run reads the scope from a repository variable, so it can be
+      # widened to "full" without a code change.
+      SCOPE: ${{ inputs.scope || vars.DOC_MAINTENANCE_SCOPE || 'ops-table' }}
+      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - name: Check that the API key is configured
+        id: gate
+        run: |
+          if [ "${HAS_API_KEY}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ANTHROPIC_API_KEY is not set; skipping."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        if: steps.gate.outputs.enabled == 'true'
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+
+      - name: Skip while the previous weekly PR is open
+        if: steps.gate.outputs.enabled == 'true'
+        id: open-pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          OPEN="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" \
+            --state open --json url --jq '.[0].url // ""')"
+          if [ -n "${OPEN}" ]; then
+            echo "::notice::Weekly doc PR still open (${OPEN}); skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No credentials are left in the checkout, so nothing Claude runs can push.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: steps.open-pr.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: steps.open-pr.outputs.run == 'true'
         with:
           python-version: '3.12'
 
       - name: Install docs dependencies
+        if: steps.open-pr.outputs.run == 'true'
         run: pip install -r docs/requirements.txt
 
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Run weekly documentation maintenance
-        uses: anthropics/claude-code-action@v1
+      - name: Run the weekly-doc-maintenance skill
+        if: steps.open-pr.outputs.run == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@c84e279f859e2591391e95bd309286eb111c345f # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           prompt: |
             Invoke the weekly-doc-maintenance skill and follow it exactly.
-
-            Audit docs/source against the current code for drift, consistency,
-            and flow. Apply the safe drift and consistency fixes inline. Do not
-            reorganize pages on your own; describe any larger reorganization in
-            the pull request body under "Proposed reorganization (for review)".
-            Rebuild the docs with make html in docs/ and keep the build clean.
-
-            Then open one pull request against main from a branch named
-            docs/weekly-drift-<date>, committing with git commit -s. Humanize
-            all prose, and include no Claude attribution: no "Generated with
-            Claude Code" line and no Co-Authored-By Claude trailer in the commit
-            message or the pull request body. If nothing needs changing, open no
-            pull request.
+            The audit scope for this run is: ${{ env.SCOPE }}.
+            Edit files under docs/source only. Do not commit, push, or open a
+            pull request; the workflow does that after you finish. Return the
+            pull request title and body in the structured output.
           claude_args: |
-            --allowedTools "Read,Edit,Write,Bash(git:*),Bash(gh pr:*),Bash(make:*),Bash(python3:*),Bash(pip:*),Bash(grep:*),Bash(ls:*),Bash(sed:*),Bash(find:*)"
             --max-turns 80
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(python -m sphinx:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(grep:*),Bash(ls:*),Bash(find:*)"
+            --disallowedTools "Bash(git push:*),Bash(git commit:*),Bash(git remote:*),Bash(git config:*),Bash(gh:*),Bash(curl:*),Bash(pip:*),WebFetch,WebSearch"
+            --json-schema '{"type":"object","properties":{"changed":{"type":"boolean"},"title":{"type":"string"},"body":{"type":"string"}},"required":["changed","title","body"]}'
+
+      - name: Check that only docs/source changed
+        if: steps.open-pr.outputs.run == 'true'
+        id: diff
+        run: |
+          set -euo pipefail
+          git status --porcelain --untracked-files=all > "${RUNNER_TEMP}/status.txt"
+          if [ ! -s "${RUNNER_TEMP}/status.txt" ]; then
+            echo "No changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat "${RUNNER_TEMP}/status.txt"
+          OUTSIDE="$(cut -c4- "${RUNNER_TEMP}/status.txt" | grep -v '^docs/source/' || true)"
+          if [ -n "${OUTSIDE}" ]; then
+            echo "::error::Changes outside docs/source: ${OUTSIDE}"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # Same command as the Build docs check in docs.yaml.
+      - name: Build docs
+        if: steps.diff.outputs.changed == 'true'
+        run: python -m sphinx docs/source docs/build/html -W --keep-going
+
+      - name: Open the PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_TITLE: ${{ fromJSON(steps.claude.outputs.structured_output).title }}
+          PR_BODY: ${{ fromJSON(steps.claude.outputs.structured_output).body }}
+        run: |
+          set -euo pipefail
+          # The commit is made through the API, as in refresh-test-timings.yaml:
+          # GitHub signs it for the app token, which main's required_signatures
+          # expects. The branch is reset to main's head each run.
+          BASE_SHA="$(git rev-parse HEAD)"
+          git add -A docs/source
+          python3 - "${BASE_SHA}" > "${RUNNER_TEMP}/tree.json" <<'PYEOF'
+          import json, subprocess, sys
+          base = sys.argv[1]
+          out = subprocess.run(
+              ["git", "diff", "--cached", "--name-status", "--no-renames", base],
+              check=True, capture_output=True, text=True,
+          ).stdout
+          tree = []
+          for line in out.splitlines():
+              status, path = line.split("\t", 1)
+              entry = {"path": path, "mode": "100644", "type": "blob"}
+              if status == "D":
+                  entry["sha"] = None
+              else:
+                  with open(path, encoding="utf-8") as f:
+                      entry["content"] = f.read()
+              tree.append(entry)
+          json.dump({"base_tree": base, "tree": tree}, sys.stdout)
+          PYEOF
+          TREE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" \
+            --input "${RUNNER_TEMP}/tree.json" --jq .sha)"
+          COMMIT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" -f tree="${TREE_SHA}" \
+            -f 'parents[]='"${BASE_SHA}" \
+            -f message="$(printf '%s\n\nSigned-off-by: spyre-bot[bot] <spyre-bot[bot]@users.noreply.github.com>' "${PR_TITLE}")" \
+            --jq .sha)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" >/dev/null
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '%s\n\n---\nGenerated by Claude Code in the weekly-doc-maintenance workflow (scope: %s, run %s). Review every change against the code before merging.\n' \
+            "${PR_BODY}" "${SCOPE}" "${RUN_URL}" > "${RUNNER_TEMP}/body.md"
+          gh pr create --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --base main \
+            --title "${PR_TITLE}" --body-file "${RUNNER_TEMP}/body.md"
