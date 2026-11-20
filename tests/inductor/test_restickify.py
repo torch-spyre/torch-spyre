@@ -2811,11 +2811,15 @@ _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
 
 
-def test_size1_grow_prepends_size64_gap_dim():
+def _size1_collapsed_buf():
+    """A stub buffer with the [7,67,1] size-1 collapsed layout.
+
+    _pad_elided_dim reads buf.get_layout() and get_name() and writes buf.layout;
+    this stub is all the ComputedBuffer surface it touches.
+    """
     from torch_spyre._C import DataFormats, ElementArrangement
     from torch_spyre._C import SpyreTensorLayout as _CSpyreTensorLayout
     from torch_spyre._inductor.ir import FixedTiledLayout
-    from torch_spyre._inductor.padding import _pad_elided_dim
 
     # _C.SpyreTensorLayout takes device_size LITERALLY (unlike torch.spyre's
     # SpyreTensorLayout, which treats the first arg as a host shape and re-derives
@@ -2831,8 +2835,6 @@ def test_size1_grow_prepends_size64_gap_dim():
         DEVICE, torch.float16, list(_SIZE1_HOST_SIZE), list(_SIZE1_HOST_STRIDE), stl
     )
 
-    # _pad_elided_dim reads buf.get_layout() and writes buf.layout; a 2-line stub
-    # is all the ComputedBuffer surface it touches.
     class _StubBuf:
         def __init__(self, layout):
             self.layout = layout
@@ -2840,18 +2842,139 @@ def test_size1_grow_prepends_size64_gap_dim():
         def get_layout(self):
             return self.layout
 
-    buf = _StubBuf(layout)
-    _pad_elided_dim(buf)
+        def get_name(self):
+            return "buf0"
+
+    return _StubBuf(layout)
+
+
+class _StubGraph:
+    def __init__(self, outputs):
+        self._outputs = outputs
+        self.operations = []
+
+    def get_output_names(self):
+        return self._outputs
+
+
+def test_size1_grow_inserts_size64_gap_dim_outside_stick():
+    from torch_spyre._inductor.padding import _pad_elided_dim
+
+    buf = _size1_collapsed_buf()
+    _pad_elided_dim(buf, None, _StubGraph([]))
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map 0) is prepended; the original
-    # device dims follow unchanged.
-    assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    # A size-64 gap dim (stride_map 0) goes just outside the stick dim, so its
+    # slices are one stick apart; the original device dims are unchanged.
+    *outer, stick = _SIZE1_COLLAPSED_DEVICE_SIZE
+    *outer_map, stick_map = _SIZE1_COLLAPSED_STRIDE_MAP
+    assert list(dl.device_size) == [*outer, _SIZE1_STICK, stick]
+    assert list(dl.stride_map) == [*outer_map, 0, stick_map]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
-    # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
+    # in spyre_tensor_impl.cpp); the gap dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])
     assert alloc_bytes == 64 * 8576 == 548864
+
+
+def test_size1_grow_prepends_size64_gap_dim_for_graph_output():
+    from torch_spyre._inductor.padding import _pad_elided_dim
+
+    # The host<->device copy cannot place an inner gap dim on every graph output,
+    # so a graph output keeps it outermost.
+    buf = _size1_collapsed_buf()
+    _pad_elided_dim(buf, None, _StubGraph(["buf0"]))
+
+    dl = buf.layout.device_layout
+    assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
+    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
+
+
+def _transpose_reader_graph(include_reader=True):
+    """A padded buffer ``buf0`` (host [64, 128]), the size-1 restickify padding it,
+    and optionally a second restickify ``buf2`` that reads ``buf0`` transposed.
+
+    The padding restickify appears in ``graph.operations`` as a different object
+    with the same name, as after its read is redirected to a padded clone.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch_spyre._C import SpyreTensorLayout as _CSpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    def tiled(size, stride):
+        # The default device layout of the host tensor, as the compiler builds it.
+        stl = _CSpyreTensorLayout(size, stride, torch.float16, [0, 1])
+        return FixedTiledLayout(DEVICE, torch.float16, size, stride, stl)
+
+    def op(name, layout):
+        data = MagicMock(spec=Pointwise)
+        buf = ComputedBuffer(name=name, layout=layout, data=data)
+        buf.operation_name = name
+        return buf
+
+    c0, c1 = sympy.symbols("c0 c1", integer=True, nonnegative=True)
+    padded = op("buf0", tiled([64, 128], [128, 1]))
+    transposed = tiled([128, 64], [64, 1])
+    padding_restickify = op("buf1", transposed)
+    padding_restickify_copy = op("buf1", transposed)
+    reader = op("buf2", transposed)
+    read_writes = {
+        "buf0": SimpleNamespace(
+            reads=[], writes=[MemoryDep("buf0", 128 * c0 + c1, (c0, c1), (64, 128))]
+        ),
+        "buf1": SimpleNamespace(
+            reads=[MemoryDep("buf0", 128 * c0 + c1, (c0, c1), (64, 128))],
+            writes=[MemoryDep("buf1", 64 * c1 + c0, (c0, c1), (64, 128))],
+        ),
+        "buf2": SimpleNamespace(
+            reads=[MemoryDep("buf0", 128 * c1 + c0, (c0, c1), (128, 64))],
+            writes=[MemoryDep("buf2", 64 * c0 + c1, (c0, c1), (128, 64))],
+        ),
+    }
+    operations = [padded, padding_restickify_copy] + (
+        [reader] if include_reader else []
+    )
+
+    class _Graph(_StubGraph):
+        def get_buffer(self, name):
+            return {
+                "buf0": padded,
+                "buf1": padding_restickify_copy,
+                "buf2": reader,
+            }.get(name)
+
+    graph = _Graph([])
+    graph.operations = operations
+    return padded, padding_restickify, graph, read_writes
+
+
+@pytest.mark.parametrize("include_reader", [True, False])
+def test_size1_grow_keeps_gap_dim_outermost_when_another_restickify_reads(
+    include_reader,
+):
+    """A buffer that another restickify also reads keeps its gap dim outermost: an
+    inner gap dim faults the device there (cat(...).sum(-1) on a trailing size-1
+    dim). The padding restickify itself does not count as another reader."""
+    import torch_spyre._inductor.padding as padding
+
+    buf, restickify, graph, read_writes = _transpose_reader_graph(include_reader)
+    with patch.object(padding, "op_read_writes", lambda op: read_writes[op.get_name()]):
+        assert (
+            padding._read_by_other_restickify(buf, restickify, graph) is include_reader
+        )
+        padding._pad_elided_dim(buf, restickify, graph)
+
+    dl = buf.layout.device_layout
+    if include_reader:
+        assert list(dl.device_size) == [_SIZE1_STICK, 2, 64, 64]
+        assert list(dl.stride_map) == [0, 64, 128, 1]
+    else:
+        assert list(dl.device_size) == [2, 64, _SIZE1_STICK, 64]
+        assert list(dl.stride_map) == [64, 128, 0, 1]
 
 
 def _size1_restickify_op_spec():
@@ -2863,7 +2986,7 @@ def _size1_restickify_op_spec():
     from torch_spyre._C import DataFormats
     from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
-    def tensor_arg(is_input, arg_index, device_size, coords):
+    def tensor_arg(is_input, arg_index, device_size, stride_map, coords):
         return TensorArg(
             is_input=is_input,
             arg_index=arg_index,
@@ -2871,6 +2994,7 @@ def _size1_restickify_op_spec():
             device_size=list(device_size),
             device_coordinates=list(coords),
             allocation={"hbm": 0x400000000 + arg_index * 0x1000},
+            stride_map=list(stride_map),
         )
 
     c = sympy.Symbol("c")
@@ -2880,6 +3004,7 @@ def _size1_restickify_op_spec():
         is_input=True,
         arg_index=0,
         device_size=[67, 1, 1, 64],
+        stride_map=[7, 0, 469, 0],
         coords=[c, sympy.Integer(0), sympy.Integer(0), sympy.Integer(0)],
     )
     # Intact OUTPUT: the grow prepended an outermost size-64, symbol-less gap dim;
@@ -2888,6 +3013,7 @@ def _size1_restickify_op_spec():
         is_input=False,
         arg_index=1,
         device_size=[64, 67, 1, 64],
+        stride_map=[0, 7, 469, 1],
         coords=[sympy.Integer(0), c, sympy.Integer(0), sympy.Mod(c, 64)],
     )
     return OpSpec(
@@ -2922,6 +3048,34 @@ def test_size1_restore_reuses_prepended_dim():
     assert op_spec.iteration_space[shared] == (_SIZE1_STICK, 1)
 
 
+def test_size1_restore_binds_inner_gap_dim():
+    import sympy
+
+    from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
+
+    # The gap dim just outside the stick dim, as _pad_elided_dim places it for a
+    # buffer that is not a graph output: the restore binds that dim, not dim 0.
+    op_spec = _size1_restickify_op_spec()
+    out_arg = op_spec.args[1]
+    c = next(iter(op_spec.iteration_space))
+    out_arg.device_size = [67, 1, 64, 64]
+    out_arg.stride_map = [7, 469, 0, 1]
+    out_arg.device_coordinates = [
+        c,
+        sympy.Integer(0),
+        sympy.Integer(0),
+        sympy.Mod(c, 64),
+    ]
+
+    _restickify_restore_elided_dim(op_spec)
+
+    assert list(out_arg.device_size) == [67, 1, 64, 64]
+    (shared,) = out_arg.device_coordinates[2].free_symbols
+    assert shared.name.startswith("rs")
+    assert out_arg.device_coordinates[0] == c
+    assert op_spec.iteration_space[shared] == (_SIZE1_STICK, 1)
+
+
 def test_size1_restore_asserts_when_phantom_absent():
     from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
 
@@ -2932,10 +3086,63 @@ def test_size1_restore_asserts_when_phantom_absent():
     out_arg = op_spec.args[1]
     # Drop the prepended gap dim to simulate the un-grown STL.
     out_arg.device_size = [67, 1, 64]
+    out_arg.stride_map = out_arg.stride_map[1:]
     out_arg.device_coordinates = out_arg.device_coordinates[1:]
 
     with pytest.raises(AssertionError, match="padding-prepended"):
         _restickify_restore_elided_dim(op_spec)
+
+
+def _sum_plus_dense(rows):
+    """``x.sum(-1) + y[64, rows]``: ``x.sum(-1)`` is sparse (one value per stick),
+    so ``y`` is restickified from it to dense: a size-1 restickify whose target
+    needs exactly one size-64 gap dim; a second multiplied the allocation and the
+    sweep by 64 (#6105).
+    Exact: the values are small integers, sums stay under 1024.
+    """
+    x = ((torch.arange(rows * 64) * 7 + 3) % 5 - 2).to(torch.float16).reshape(rows, 64)
+    y = ((torch.arange(64 * rows) * 3 + 1) % 257).to(torch.float16).reshape(64, rows)
+    return (lambda a, b: a.sum(-1) + b), x, y
+
+
+def _restickify_output_sizes(fn, *args):
+    """Run ``fn`` compiled and return (CPU result, the device size of every
+    size-1 restickify's output after the padding pass)."""
+    import torch_spyre._inductor.padding as _padding
+    from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+    sizes = []
+    run_one_pass = CustomPreSchedulingPasses._run_one_pass
+
+    def capturing_run_one_pass(self, graph, pipeline, pass_fn, pass_name):
+        run_one_pass(self, graph, pipeline, pass_fn, pass_name)
+        if pass_fn is not _padding.insert_restickify_padding:
+            return
+        for op in graph.operations:
+            if _padding.is_restickify_op(op, graph):
+                sizes.append(list(op.get_layout().device_layout.device_size))
+
+    with patch.object(
+        CustomPreSchedulingPasses, "_run_one_pass", capturing_run_one_pass
+    ):
+        result = _compile_and_run(fn, args, DEVICE)
+    return result, sizes
+
+
+def test_sparse_to_dense_restickify_has_one_size64_dim():
+    fn, x, y = _sum_plus_dense(256)
+    result, sizes = _restickify_output_sizes(fn, x, y)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
+    # One gap dim, just outside the stick dim: [4, 64, 64], not [64, 64, 4, 64].
+    assert sizes == [[4, 64, 64]]
+
+
+def test_sparse_to_dense_restickify_above_4mib():
+    # 8 MiB of sparse data. With two gap dims each core swept 64 x 64 x rows / 64
+    # sticks, over the backend's 256 MiB address offset above 4 MiB.
+    fn, x, y = _sum_plus_dense(65536)
+    result = _compile_and_run(fn, (x, y), DEVICE)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
 
 
 def test_round_up_to_stick_geometry():

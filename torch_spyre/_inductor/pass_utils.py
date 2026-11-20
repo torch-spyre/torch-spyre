@@ -292,6 +292,24 @@ def prepend_dim_valid_elements(
     return shifted
 
 
+def insert_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    dim: int,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new device dimension at index ``dim``.
+
+    Shifts the existing dim indices at or after ``dim`` by +1. The new dim has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 if d >= dim else d for d in key): val
+        for key, val in stl.valid_elements.items()
+    }
+    shifted[(dim,)] = new_dim_size
+    return shifted
+
+
 def restickify_valid_elements(
     stl: SpyreTensorLayout,
     old_sd_outer_dim: int,
@@ -1294,6 +1312,38 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
         sizes = {**(sizes or {}), **loop_var_ranges}
 
     return host_coordinates(eff, output_dep, sizes)
+
+
+def restickify_sweep_dim(
+    device_size: Sequence[int],
+    stride_map: Sequence[int] | None,
+    device_coords: Sequence[Expr],
+    elems_per_stick: int,
+) -> int | None:
+    """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
+
+    When the host dim on one side of a restickify has size 1, the padding pass
+    (``_pad_elided_dim``) gives the other, intact operand a size-``elems_per_stick``
+    dim that holds no data (``stride_map`` 0) and that nothing indexes (coordinate
+    0): just outside the stick dim, or outermost for a graph output.  Codegen
+    (``_restickify_restore_elided_dim``) later binds a loop variable to it, and the
+    kernel sweeps all its slices on every core.  Work division and codegen both
+    find the dim through this rule, so the span check counts the same dim the
+    kernel sweeps.  It is the innermost non-stick dim of that kind.  Without a
+    stride map there is no gap dim to find.
+    """
+    if stride_map is None:
+        return None
+    return next(
+        (
+            i
+            for i in range(len(device_size) - 2, -1, -1)
+            if device_size[i] == elems_per_stick
+            and stride_map[i] == 0
+            and device_coords[i] == 0
+        ),
+        None,
+    )
 
 
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
@@ -3280,15 +3330,12 @@ def is_sparse_stl(stl) -> bool:
 
 
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
-    """Returns STL to transform the input into the canonical representation the output.
+    """The canonical dense STL of ``output``, and whether ``in_stl`` needs a restickify
+    into it.
 
-    If the input is sparse and the canonical output is not, an extra stick-size dimension
-    is added to the front of the canonical output representation so that restickify can
-    transpose the sparse stick dimension to make it contiguous. The index expression already
-    does the required slicing on the result.
-
-    If the input is not sparse or the output is also sparse no transformation is required
-    the canonical output STL is returned.
+    A sparse input restickifies into the dense canonical layout. That restickify is
+    size-1 on the sparse side, so the padding pass gives the target the size-64 gap
+    dim its sweep needs (``_pad_elided_dim``), as for any other size-1 restickify.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -3304,18 +3351,7 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
         assert not out_is_sparse
 
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-    if restick:
-        eps = in_stl.elems_per_stick()
-        out_stl = SpyreTensorLayout(
-            [eps] + out_stl.device_size,
-            [c_stride[0] * c_size[0]] + out_stl.stride_map,
-            out_stl.device_dtype,
-            prepend_dim_valid_elements(out_stl, eps),
-        )
-        return True, out_stl
-
-    return False, out_stl
+    return restick, out_stl
 
 
 def sparse_stl_from_host(
