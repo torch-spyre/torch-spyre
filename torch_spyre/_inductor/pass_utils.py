@@ -2833,6 +2833,56 @@ def _zero_outer_dim_for_stick(stl: SpyreTensorLayout, idc: list) -> int | None:
     return next((j for j in zeros if j in stick_key), next(iter(zeros), None))
 
 
+def _stick_group_constant_outer_dim(stl: SpyreTensorLayout, idc: list) -> int | None:
+    """Pick the stick's outer device dim when the access fixes it at a constant.
+
+    Rows [64, 66) of a tensor whose stick spans rows read one 64-row chunk: the
+    chunk's device coordinate is the constant 1, so it neither carries the stick
+    variable nor is zero.  The dim is still the outer part of the stick, which is
+    the other member of the stick's valid_elements group (issue #4883).
+
+    Returns None unless exactly one such dim exists.
+    """
+    stick_dim = len(stl.device_size) - 1
+    stick_key = next((k for k in stl.valid_elements if stick_dim in k), ())
+    dims = [j for j in stick_key if j != stick_dim and not idc[j].free_symbols]
+    return dims[0] if len(dims) == 1 else None
+
+
+def _single_index_stick_host_dim(
+    stl: SpyreTensorLayout,
+    host_coords: list,
+    host_size: list[int],
+    host_stride: list[int],
+) -> int | None:
+    """Return the host dim of stl's stick when the access reads it at one index.
+
+    A single row of a tensor whose stick spans rows reads the stick's host dim at
+    a constant, so the stick coordinate has no variable to locate that dim by.
+    It is the host dim that holds the stick's valid elements and strides like the
+    stick (issue #4883).  A stick with one valid element is not such a read: it
+    is the size-1 contraction dim of a matmul, and returns None.
+
+    Returns None unless exactly one host dim qualifies.
+    """
+    stick_dim = len(stl.device_size) - 1
+    stick_valid = next(
+        (v for k, v in stl.valid_elements.items() if stick_dim in k), None
+    )
+    if stick_valid is None or stick_valid <= 1:
+        return None
+    dims = [
+        d
+        for d, (coord, size, stride) in enumerate(
+            zip(host_coords, host_size, host_stride)
+        )
+        if size == stick_valid
+        and stride == stl.stride_map[-1]
+        and not sympy.sympify(coord).free_symbols
+    ]
+    return dims[0] if len(dims) == 1 else None
+
+
 def restickify_device_size(
     old_device_size: list,
     old_sd_outer_dim: int,
@@ -2979,12 +3029,22 @@ def compute_restickify_target_layout(
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
     else:
-        # Constant stick expression: the old stick dim has no variable (size-1
-        # contraction dim in matmul).  Callers are responsible for rejecting this
-        # case for non-matmul ops before calling here.
-        old_sd_host_size, old_sd_host_stride = 1, 1
         old_var_outer_dims = []
         old_var = None
+        single = _single_index_stick_host_dim(stl, ic, host_size, host_stride)
+        if single is not None:
+            # A single index into the stick's host dim (one row of a tensor whose
+            # stick spans rows).  Only a stick-aligned index reads whole sticks;
+            # an index inside a stick reads one lane of each and cannot be moved.
+            if sympy.sympify(ic[single]) % stick_size != 0:
+                return None
+            old_sd_host_size = host_size[single]
+            old_sd_host_stride = host_stride[single]
+        else:
+            # Constant stick expression: the old stick dim has no variable
+            # (size-1 contraction dim in matmul).  Callers are responsible for
+            # rejecting this case for non-matmul ops before calling here.
+            old_sd_host_size, old_sd_host_stride = 1, 1
     if len(old_var_outer_dims) > 1:
         return None
     old_device_size = list(stl.device_size)
@@ -2993,6 +3053,9 @@ def compute_restickify_target_layout(
         iter(old_var_outer_dims),
         _zero_outer_dim_for_stick(stl, idc),
     )
+    if old_sd_outer_dim is None:
+        # The stick's host dim is read from a stick-aligned offset.
+        old_sd_outer_dim = _stick_group_constant_outer_dim(stl, idc)
     if old_sd_outer_dim is None:
         return None
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
