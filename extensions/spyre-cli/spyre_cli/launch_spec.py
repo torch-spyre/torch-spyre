@@ -233,6 +233,13 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
     layout differs is packed differently along the sticks: the launch will
     succeed and return wrong data, which is exactly what the spec exists to
     prevent, so this is reported like any other mismatch.
+
+    Size-1 device dimensions are left out of the comparison. Such a dimension is
+    always indexed at 0, so its stride never contributes to an address, and two
+    layouts that differ only in them place every element in the same place: a
+    keepdim reduction's output is recorded as ``[1, 1, 512, 64]`` while
+    ``torch.empty((512, 1))`` gets ``[1, 512, 64]``, and either launches
+    correctly.
     """
     want = spyre_layout(arg.layout)
     if want is None:
@@ -240,9 +247,15 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
     got = device_layout_of(tensor)
     if got is None:
         return None
-    if list(got.device_size) == list(want.device_size) and list(got.stride_map) == list(
-        want.stride_map
-    ):
+
+    def placement(layout) -> list:
+        return [
+            (int(size), int(stride))
+            for size, stride in zip(layout.device_size, layout.stride_map)
+            if int(size) != 1
+        ]
+
+    if placement(got) == placement(want):
         return None
 
     def describe_layout(layout) -> str:
