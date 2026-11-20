@@ -1,0 +1,59 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/workload-serve.json",
+ "title": "llm/serve: online requests against a running server",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "endpoint": {
+   "enum": [
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/pooling"
+   ]
+  },
+  "input_len": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "output_len": {
+   "type": "integer",
+   "minimum": -1
+  },
+  "card": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9-]*$"
+  },
+  "sampling": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "temperature": {
+     "type": "number",
+     "minimum": 0
+    },
+    "top_p": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "max_tokens": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "ignore_eos": {
+     "type": "boolean"
+    }
+   }
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "endpoint"
+ ]
+}

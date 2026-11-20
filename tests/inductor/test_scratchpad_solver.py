@@ -37,7 +37,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -277,7 +277,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     @staticmethod
     def _tiled(loop_count):
-        return CoarseTileInfo(
+        return LoopInfo(
             loop_group_id=(0,) * len(loop_count),
             loop_count=loop_count,
             loop_tiled_dims=[[] for _ in loop_count],

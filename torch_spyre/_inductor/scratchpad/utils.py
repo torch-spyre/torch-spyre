@@ -33,7 +33,7 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advances_anywhere,
 )
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,

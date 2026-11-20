@@ -69,7 +69,8 @@ from torch_spyre._inductor.codegen.superdsc import (
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim, copy_op_metadata
+from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import (
@@ -547,7 +548,7 @@ def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
     op.name = name
     if loop_group_id is not None:
         counts = loop_count if isinstance(loop_count, list) else [loop_count]
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=loop_group_id,
             loop_count=counts,
             loop_tiled_dims=[],
@@ -735,13 +736,13 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
 
 
 # ===========================================================================
-# 0. CoarseTileInfo dataclass
+# 0. LoopInfo dataclass
 # ===========================================================================
 
 
-class TestCoarseTileInfo(unittest.TestCase):
+class TestLoopInfo(unittest.TestCase):
     def test_fields(self):
-        info = CoarseTileInfo(
+        info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
@@ -751,7 +752,7 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_tiled_dims, [[0]])
 
     def test_nested(self):
-        info = CoarseTileInfo(
+        info = LoopInfo(
             loop_group_id=(0, 0),
             loop_count=[Integer(4), Integer(2)],
             loop_tiled_dims=[[0], [1]],
@@ -4742,7 +4743,7 @@ def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
     op.layout = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = CoarseTileInfo(
+    op.loop_info = LoopInfo(
         loop_group_id=loop_group_id,
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
@@ -4788,7 +4789,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = CoarseTileInfo(
+    op.loop_info = LoopInfo(
         loop_group_id=loop_group_id,
         loop_count=[Integer(4)],
         loop_tiled_dims=[[0]],
@@ -4887,7 +4888,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
 
 class TestReadCopyElisionProof(unittest.TestCase):
     def test_record_is_frozen(self):
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 
         record = ReadCopyElisionRecord(
             consumer_name="op0",
@@ -4902,7 +4903,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
     def test_graph_output_copy_is_not_elided(self):
         from torch._inductor.ir import ComputedBuffer
 
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
         from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
 
         copy_op = MagicMock(spec=ComputedBuffer)
@@ -4933,7 +4934,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
         from torch._inductor.dependencies import StarDep
         from torch._inductor.ir import ComputedBuffer
 
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
         from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
 
         copy_op = MagicMock(spec=ComputedBuffer)
@@ -4985,9 +4986,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
         dep = MemoryDep(name="weight", index=index(u0), var_names=var_names, size=size)
-        info = CoarseTileInfo(
-            loop_group_id=(0,), loop_count=[trips], loop_tiled_dims=[[]]
-        )
+        info = LoopInfo(loop_group_id=(0,), loop_count=[trips], loop_tiled_dims=[[]])
         op = SimpleNamespace(
             loop_info=info,
             dim_hints=[
@@ -5198,7 +5197,7 @@ def _make_full_buffer_read_fixture():
     )
     tiled_op.operation_name = "tiled_op0"
     tiled_op.origins = OrderedSet()
-    tiled_op.loop_info = CoarseTileInfo(
+    tiled_op.loop_info = LoopInfo(
         loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
     )
     V.graph.name_to_buffer["tiled_op0"] = tiled_op
@@ -5426,7 +5425,7 @@ def _make_tiled_reduction_op(
     op.get_layout.return_value = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = CoarseTileInfo(
+    op.loop_info = LoopInfo(
         loop_group_id=loop_group_id,
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
@@ -5542,7 +5541,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=loop_tiled_dims,
@@ -6344,13 +6343,13 @@ class TestSymbolKind(unittest.TestCase):
         self.assertNotIn("input_arg_extract", op1_operand)
 
 
-class TestCoarseTileInfoReductionField(unittest.TestCase):
-    """CoarseTileInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
+class TestLoopInfoReductionField(unittest.TestCase):
+    """LoopInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
 
     def test_field_present_and_defaults_to_empty(self):
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.loop_info import LoopInfo
 
-        info = CoarseTileInfo(
+        info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
@@ -6358,9 +6357,9 @@ class TestCoarseTileInfoReductionField(unittest.TestCase):
         self.assertEqual(info.loop_tiled_reduction_dims, [])
 
     def test_field_can_be_set(self):
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.loop_info import LoopInfo
 
-        info = CoarseTileInfo(
+        info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[]],
@@ -6370,9 +6369,9 @@ class TestCoarseTileInfoReductionField(unittest.TestCase):
 
     def test_nested_parallel_shape(self):
         """For a two-level nest, both fields have two sub-lists."""
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.loop_info import LoopInfo
 
-        info = CoarseTileInfo(
+        info = LoopInfo(
             loop_group_id=(0, 0),
             loop_count=[Integer(2), Integer(4)],
             loop_tiled_dims=[[0], []],
@@ -6701,7 +6700,7 @@ class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
         self.assertFalse(hasattr(dst, "_coarse_tile_dim_advance"))
 
     def test_copy_op_metadata_invalidates_read_copy_elision_record(self):
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 
         src = SimpleNamespace()
         src._read_copy_elision_record = ReadCopyElisionRecord(
@@ -8413,7 +8412,7 @@ class TestDerivedBases(unittest.TestCase):
     def test_group_idx_offset_avoids_existing_loop_group_ids(self):
         op = _make_op(_make_pointwise([Integer(64)]), "op0")
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 0)
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=(3,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
         )
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
@@ -8582,7 +8581,7 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         """An op stamped the way ``_stamp_direct_loop_info`` stamps a loop body
         op: ``loop_info`` plus a DimHint carrying the trip count."""
         op = self._bare(name)
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=(0,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
         )
         op.dim_hints = [
@@ -8625,7 +8624,7 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
         apply_tilings({"op1": self._SPEC}, _graph(ops))
-        self.assertIsInstance(ops[1].loop_info, LoopShim)
+        self.assertTrue(ops[1].loop_info.strict_loop_vars)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))
         self.assertEqual(self._state(ops[:1]), loop_before)

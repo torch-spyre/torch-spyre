@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A shape-set dataset drives the load: one record per selected row (expand: per_record).
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-all}
+spec:
+  type: perf
+  level: kernel
+  tier: extended
+  system: kernel-demo-fp16
+  workload:
+    type: kernel/op
+    all_ops: true
+    expand: per_record
+    inputs: [{name: shapes, dataset: ops-extended}]
+    load: {executor: iterations, iterations: 15, warmup_iterations: 3}
+  metrics: [kernel.total_duration]
+  run: {repeats: 1, timeout: 240m, est: 180m, isolation: process}
+  variants:
+    - name: op_all_fp16_shapeset-ops-extended

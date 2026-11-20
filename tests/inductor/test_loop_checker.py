@@ -31,7 +31,7 @@ from torch_spyre._inductor.loop_checker import (
     check_loops,
     find_violations,
 )
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,
@@ -225,14 +225,28 @@ class TestMembership(unittest.TestCase):
         tree = [_node("n0", [_LoopOp("a", (0,)), _Op("mid"), _LoopOp("b", (0,))])]
         problems = find_violations(tree)
         self.assertEqual(len(problems), 1)
-        self.assertIn(
-            "mid is in the body of n0 between two of its members", problems[0]
-        )
+        self.assertIn("mid is in the body of n0 but is not a member", problems[0])
 
-    def test_a_non_member_at_the_head_or_tail_is_allowed(self):
-        # The allocator's hoisted clone lands here; peel_non_members moves it out
-        # at the hand-off.
+    def test_a_non_member_at_the_head_or_tail_is_reported(self):
+        """The hand-off used to move such an op out of the node (stage 8.5 removed
+        that repair), so it is a violation: the node would run it every trip."""
         tree = [_node("n0", [_Op("head"), _LoopOp("a", (0,)), _Op("tail")])]
+        problems = find_violations(tree)
+        self.assertEqual(len(problems), 2)
+        self.assertIn("head is in the body of n0", problems[0])
+        self.assertIn("tail is in the body of n0", problems[1])
+
+    def test_an_extern_kernel_at_the_head_or_tail_is_allowed(self):
+        tree = [
+            _node(
+                "n0",
+                [
+                    _ExternLoopOp("head", (0,)),
+                    _LoopOp("a", (0,)),
+                    _ExternLoopOp("t", (0,)),
+                ],
+            )
+        ]
         self.assertEqual(find_violations(tree), [])
 
     def test_an_extern_kernel_between_two_members_is_allowed(self):

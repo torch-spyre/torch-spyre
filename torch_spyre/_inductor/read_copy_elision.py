@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import copy
+from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -39,7 +40,8 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .loop_facts import read_advance
-from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
+from .loop_info import LoopInfo
+from .pass_utils import copy_op_metadata
 from .loop_node import remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
@@ -51,6 +53,29 @@ from .pass_utils import (
     per_core_views_equal,
     replace_computed_buffer_body,
 )
+
+
+@dataclass(frozen=True)
+class ReadCopyElisionRecord:
+    """Direct-read form saved while a consumer is redirected through a copy.
+
+    Coarse tiling keeps the copy authoritative until layout selection, work
+    division, and LX planning finish.  A later pass may restore
+    ``direct_inner_fn`` only when the final physical plan proves that reading
+    ``source_name`` directly is equivalent.  The record is deliberately not
+    copied by :func:`copy_op_metadata`: rebuilding the consumer body
+    invalidates the saved direct form unless that pass explicitly recreates
+    the record.
+    """
+
+    consumer_name: str
+    copy_name: str
+    source_name: str
+    direct_inner_fn: object
+    # Intermediate copies that become dead only if the deferred proposal is
+    # accepted, ordered from the replacement consumer back toward the source.
+    orphaned_copy_names: tuple[str, ...] = ()
+
 
 logger = get_inductor_logger("read_copy_elision")
 
@@ -127,7 +152,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
 
 
 def _loop_advance_bound(
-    op: ComputedBuffer, dep: MemoryDep, loop_info: CoarseTileInfo
+    op: ComputedBuffer, dep: MemoryDep, loop_info: LoopInfo
 ) -> tuple[int, int] | None:
     """Inclusive address change across loop trips, in source elements.
 
@@ -310,8 +335,12 @@ def _prove_matmul_direct_read(
         idx for idx, dep in enumerate(copy_reads) if dep.name == record.source_name
     ]
     current_loop_info = getattr(consumer, "loop_info", None)
-    if len(copy_source_indices) > 1 or not isinstance(
-        current_loop_info, CoarseTileInfo
+    # A strict LoopInfo (made by the loop-tiling lowering) is declined on purpose: it
+    # has no saved direct form, so its copy stays.
+    if (
+        len(copy_source_indices) > 1
+        or not isinstance(current_loop_info, LoopInfo)
+        or current_loop_info.strict_loop_vars
     ):
         return None, "copy reads its source more than once, or consumer is not looped"
     # The direct read keeps the staged copy's loop term in its index (the consumer
