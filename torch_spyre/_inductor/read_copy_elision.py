@@ -40,7 +40,7 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .loop_facts import read_advance
-from .loop_info import CoarseTileInfo
+from .loop_info import LoopInfo
 from .pass_utils import copy_op_metadata
 from .loop_node import remove_op
 from .pass_utils import (
@@ -152,7 +152,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
 
 
 def _loop_advance_bound(
-    op: ComputedBuffer, dep: MemoryDep, loop_info: CoarseTileInfo
+    op: ComputedBuffer, dep: MemoryDep, loop_info: LoopInfo
 ) -> tuple[int, int] | None:
     """Inclusive address change across loop trips, in source elements.
 
@@ -335,8 +335,12 @@ def _prove_matmul_direct_read(
         idx for idx, dep in enumerate(copy_reads) if dep.name == record.source_name
     ]
     current_loop_info = getattr(consumer, "loop_info", None)
-    if len(copy_source_indices) > 1 or not isinstance(
-        current_loop_info, CoarseTileInfo
+    # A strict LoopInfo (made by the loop-tiling lowering) is declined on purpose: it
+    # has no saved direct form, so its copy stays.
+    if (
+        len(copy_source_indices) > 1
+        or not isinstance(current_loop_info, LoopInfo)
+        or current_loop_info.strict_loop_vars
     ):
         return None, "copy reads its source more than once, or consumer is not looped"
     # The direct read keeps the staged copy's loop term in its index (the consumer

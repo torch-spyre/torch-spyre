@@ -147,7 +147,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
-from torch_spyre._inductor.loop_info import COUNTED_LOOP_INFO
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 from torch_spyre._inductor.padding import is_restickify_op
@@ -342,7 +342,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), COUNTED_LOOP_INFO)
+    return isinstance(getattr(op, "loop_info", None), LoopInfo)
 
 
 def _sibling_pinned_divisions(
@@ -370,7 +370,7 @@ def _sibling_pinned_divisions(
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
-    ``CoarseTileInfo.loop_count`` is one entry per nesting level, outermost
+    ``LoopInfo.loop_count`` is one entry per nesting level, outermost
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a

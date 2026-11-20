@@ -43,7 +43,7 @@ from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
@@ -76,7 +76,7 @@ class _Op:
     def __init__(self, name, gid=None, counts=None, reads=(), writes=None):
         self._name = name
         if gid is not None:
-            self.loop_info = CoarseTileInfo(
+            self.loop_info = LoopInfo(
                 loop_group_id=tuple(gid),
                 loop_count=list(counts),
                 loop_tiled_dims=[[] for _ in gid],
@@ -327,7 +327,7 @@ class TestCollapse(unittest.TestCase):
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
         ext = MagicMock(spec=ExternKernel)
-        ext.loop_info = CoarseTileInfo((0,), [4], [[]], [[]])
+        ext.loop_info = LoopInfo((0,), [4], [[]], [[]])
         ext.get_name.return_value = "ext"
         a = _Op("a", (0,), [4])
         out = _round_trip(self, [ext, a])

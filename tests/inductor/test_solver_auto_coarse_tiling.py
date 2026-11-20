@@ -45,7 +45,7 @@ from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
 
 from utils_inductor import expects_raise
@@ -96,11 +96,11 @@ _TILING_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
 _Counts = tuple[int, ...]
 
 
-def _counts(info: CoarseTileInfo) -> _Counts:
+def _counts(info: LoopInfo) -> _Counts:
     return tuple(int(count) for count in info.loop_count)
 
 
-def _describe(tiling: dict[str, CoarseTileInfo]) -> str:
+def _describe(tiling: dict[str, LoopInfo]) -> str:
     """One line per tiled op: its loop path, trip counts and tiled dims."""
     return "\n".join(
         f"  {name}: loop_group_id={info.loop_group_id} "
@@ -109,19 +109,19 @@ def _describe(tiling: dict[str, CoarseTileInfo]) -> str:
     )
 
 
-def _nests(tiling: dict[str, CoarseTileInfo]) -> dict[int, dict[str, CoarseTileInfo]]:
+def _nests(tiling: dict[str, LoopInfo]) -> dict[int, dict[str, LoopInfo]]:
     """The tiled ops grouped into loop nests, keyed by outermost loop id.
 
     ``loop_group_id[0]`` names an op's outermost loop, so ops sharing it sit in
     one nest however deep each of them goes.
     """
-    nests: dict[int, dict[str, CoarseTileInfo]] = {}
+    nests: dict[int, dict[str, LoopInfo]] = {}
     for name, info in tiling.items():
         nests.setdefault(info.loop_group_id[0], {})[name] = info
     return nests
 
 
-def _nest_mismatch(nest: dict[str, CoarseTileInfo], expected: _Counts) -> Optional[str]:
+def _nest_mismatch(nest: dict[str, LoopInfo], expected: _Counts) -> Optional[str]:
     """Why ``nest`` is not a loop nest with trip counts ``expected``, or None.
 
     The longest ``loop_group_id`` in ``nest`` is its path.  Every op must sit
@@ -257,7 +257,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     substituting this subclass for it.  ``coarse_tile`` stamps ``loop_info``
     well before the scheduler is built, so reading it here sees the final plan.
 
-    ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``: the loops
+    ``tiling`` maps every coarse-tiled op to its ``LoopInfo``: the loops
     codegen will emit, whichever pass stamped them. ``core_splits`` maps each
     of them to its committed core division over its output: the split factor
     of each dim, keyed by that dim's stride in the output index.
@@ -266,7 +266,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     its ``read_advances`` entries.
     """
 
-    tiling: dict[str, CoarseTileInfo] = {}
+    tiling: dict[str, LoopInfo] = {}
     read_advances: dict[str, list[tuple]] = {}
     read_names: dict[str, list[str]] = {}
     core_splits: dict[str, dict[int, int]] = {}
@@ -337,7 +337,7 @@ class AutomatedCoarseTilingTests(
         *,
         layout_solver: str,
         auto_tiling: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, LoopInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # Only a joint solver chooses tilings; elsewhere the flag is inert.
         if auto_tiling and layout_solver not in _TILING_SOLVERS:

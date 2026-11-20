@@ -1233,11 +1233,11 @@ def _insert_mutation_relayout_copy(
     # loop so other carry readers observe the preceding iteration's updates.
     loop_info = getattr(mutation_op, "loop_info", None)
     if loop_info is not None:
-        from .loop_info import CoarseTileInfo
+        from .loop_info import LoopInfo
 
         for copy_op in (buf_tmp, buf_copyback):
             depth = len(loop_info.loop_count)
-            copy_op.loop_info = CoarseTileInfo(
+            copy_op.loop_info = LoopInfo(
                 loop_group_id=loop_info.loop_group_id,
                 loop_count=list(loop_info.loop_count),
                 loop_tiled_dims=[[] for _ in range(depth)],

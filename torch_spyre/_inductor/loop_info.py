@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Coarse-tiling loop metadata attached to ir.Operation objects.
+"""The per-op loop record, ``ir.Operation.loop_info``.
 
-``CoarseTileInfo`` is stamped onto ``ComputedBuffer`` ops by ``coarse_tile()``
-and consumed by the scheduler, kernel codegen, and buffer-propagation pass.
+``LoopInfo`` is stamped onto ``ComputedBuffer`` ops by the ``for_each_tile`` lowering
+and by the loop-tiling lowering (span-overflow and allocator tiling), and read through
+the ``loop_facts`` accessors. It is the last per-op copy of the loop's facts; item 9 of
+#5863 replaces it with the enclosing ``LoopNode``.
 """
 
 from __future__ import annotations
@@ -30,8 +32,8 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class CoarseTileInfo:
-    """Loop metadata stamped on a ``ComputedBuffer`` by the ``for_each_tile`` lowering.
+class LoopInfo:
+    """Loop metadata stamped on a ``ComputedBuffer`` by a loop lowering.
 
     It holds the loop's own facts only. An access's per-trip advance is the loop
     variable's coefficient in the access's index (``loop_facts.read_advance``).
@@ -54,40 +56,16 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    strict_loop_vars:
+        True on an op the loop-tiling lowering made: its ``dim_hints`` list the
+        loop variable of EVERY level, so an op that lists none is a compiler bug
+        and not a loop-invariant op. False on a ``for_each_tile`` op, where an op
+        that lists no loop variable (the loop's fill, say) simply does not move
+        with the loop. Read by ``loop_facts`` and the kernel's advance lookup.
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Op-metadata helpers
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class LoopShim:
-    """TEMPORARY, deleted with ``loop_info.py`` at stage 9.
-
-    What the loop-tiling lowering (``wsr/loop_tiling_lowering.py``) stamps as an
-    op's ``loop_info`` instead of a ``CoarseTileInfo``, for the readers that have
-    not yet moved to the ``LoopNode``. It holds the plan's own content: which loop
-    the op is in, how many trips, and which dim is tiled at each level. It holds
-    NOTHING about advances: the four advance fields of ``CoarseTileInfo`` are
-    absent on purpose, so a reader that wants them either has a shim branch
-    (``loop_facts`` derives a shim op's advances from the op's own index) or fails
-    in a test instead of reading an empty list.
-    """
-
-    loop_group_id: tuple[int, ...]
-    loop_count: list[sympy.Expr]
-    loop_tiled_dims: list[list[int]]
-    loop_tiled_reduction_dims: list[list[int]]
-
-
-# What a reader tests ``loop_info`` against when it needs the loop's own facts (group
-# id, count, tiled dims) and nothing about advances. ``isinstance(x, CoarseTileInfo)``
-# alone reads as False for a ``LoopShim``; stage 9 deletes this with the shim.
-COUNTED_LOOP_INFO = (CoarseTileInfo, LoopShim)
+    strict_loop_vars: bool = False
