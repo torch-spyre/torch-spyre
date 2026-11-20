@@ -61,6 +61,8 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
+| `benchmeta.py` | a vLLM bench's `env`/`phases`/`host_resources`/`outputs`/`compile_summary` sidecars -> `run.*`/`subject.*` run props (key list in its docstring) |
+| `vllm_trace.py` | `python -m spyre_clickhouse_ingest vllm-trace <run_dir>`: one profiled run's analyzer JSON -> `report_kind=vllm-trace` rows (`trace_phase`, `trace_step`, `trace_kernel`, `compile_pass`; all in `benchmark_excluded_record_types`), linked to the artifact by a performance verdict. Per-step arrays are the `trace_bundle.py` path (`step_trace`); `trace_step` is the analyzer's per-kind mean |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
 | `reference.py` | `bench-reference` bundles: file format and validation, identity, approval rules, lifecycle, and the writer that runs at approval (docs/references.md) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |

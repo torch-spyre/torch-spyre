@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|relay} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|relay|vllm-trace} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
@@ -29,6 +29,7 @@ def main(argv=None):
         "dispatch",
         "relay",
         "bench-verdicts",
+        "vllm-trace",
     )
     if not argv or argv[0] not in commands:
         sys.exit(
@@ -41,6 +42,8 @@ def main(argv=None):
         from .ci_run_timings import main as run
     elif command == "dispatch":
         from .dispatch import main as run
+    elif command == "vllm-trace":
+        from .vllm_trace import main as run
     elif command == "relay":
         from .relay import main as run
     elif command == "bench-verdicts":
