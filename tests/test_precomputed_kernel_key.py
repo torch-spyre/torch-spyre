@@ -563,6 +563,9 @@ class TestEmittedSdscCall(unittest.TestCase):
         kernel = MagicMock()
         kernel._kernel_uses_hbm_pool.return_value = uses_pool
         kernel.pool_size = pool_size
+        # A MagicMock's launch_args() would be truthy and emit its repr; a real
+        # kernel with no recorded arguments returns [] and emits nothing.
+        kernel.launch_args.return_value = []
         with (
             _env(precomputed_kernel_key=mode, ktir_emitter=False, **config),
             V.set_graph_handler(graph),
@@ -584,7 +587,14 @@ class TestEmittedSdscCall(unittest.TestCase):
         calls = []
 
         class _FakeAsyncCompile:
-            def sdsc(self, kernel_name, specs, pool_size=0, precomputed_key=None):
+            def sdsc(
+                self,
+                kernel_name,
+                specs,
+                pool_size=0,
+                precomputed_key=None,
+                launch_args=None,
+            ):
                 calls.append((kernel_name, specs, pool_size, precomputed_key))
 
         namespace = spec_eval_namespace()
