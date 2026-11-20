@@ -69,7 +69,8 @@ from torch_spyre._inductor.codegen.superdsc import (
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim, copy_op_metadata
+from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import (
@@ -4887,7 +4888,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
 
 class TestReadCopyElisionProof(unittest.TestCase):
     def test_record_is_frozen(self):
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 
         record = ReadCopyElisionRecord(
             consumer_name="op0",
@@ -4902,7 +4903,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
     def test_graph_output_copy_is_not_elided(self):
         from torch._inductor.ir import ComputedBuffer
 
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
         from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
 
         copy_op = MagicMock(spec=ComputedBuffer)
@@ -4933,7 +4934,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
         from torch._inductor.dependencies import StarDep
         from torch._inductor.ir import ComputedBuffer
 
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
         from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
 
         copy_op = MagicMock(spec=ComputedBuffer)
@@ -6701,7 +6702,7 @@ class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
         self.assertFalse(hasattr(dst, "_coarse_tile_dim_advance"))
 
     def test_copy_op_metadata_invalidates_read_copy_elision_record(self):
-        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 
         src = SimpleNamespace()
         src._read_copy_elision_record = ReadCopyElisionRecord(

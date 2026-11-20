@@ -1922,7 +1922,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
@@ -2602,7 +2602,7 @@ class TestDrainMaterialization(unittest.TestCase):
         records are captured); only the returned one is a graph-output carry
         and therefore the only one the drain plan can apply to.
         """
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
 
         output_names = set(graph.get_output_names())
         storages = []
@@ -2626,7 +2626,7 @@ class TestDrainMaterialization(unittest.TestCase):
 
     @staticmethod
     def _all_carry_records(graph):
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
 
         records = []
         for op in graph.operations:

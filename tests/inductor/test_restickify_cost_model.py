@@ -464,7 +464,8 @@ def staged_transport_graph(monkeypatch):
     from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
     from torch._inductor.virtualized import ops
     from torch_spyre._inductor.ir import FixedTiledLayout
-    from torch_spyre._inductor.loop_info import CoarseTileInfo, ReadCopyElisionRecord
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
     from torch_spyre._inductor.propagate_hints import DimHint
 

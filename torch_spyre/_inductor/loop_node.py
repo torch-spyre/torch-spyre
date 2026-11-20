@@ -36,13 +36,50 @@ from __future__ import annotations
 import contextlib
 import contextvars
 from collections.abc import Iterable, Iterator, Mapping, MutableSequence
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import sympy
 from torch._inductor import dependencies, ir
 from torch.utils._ordered_set import OrderedSet
 
 from .loop_facts import counted_loop_path
+
+if TYPE_CHECKING:
+    import torch.fx
+
+
+@dataclass(frozen=True)
+class LoopCarryRecord:
+    """Identity contract for one accumulator carried through a counted loop.
+
+    ``for_each_tile`` lowering declares the carry with this record;
+    ``loop_carries.apply_loop_carries`` then rewrites the update as an
+    in-place write into the carry's initial storage.  Recording both ends
+    lets scratchpad planning distinguish that closed, compiler-created
+    mutation from an arbitrary user mutation, which must remain in HBM.
+
+    ``loop_origin`` is the exact FX ``while_loop`` HOP node the carry belonged
+    to, captured and validated at the splice site (see
+    ``wsr/while_loop_bridge._validated_loop_origin``) before the WhileLoop IR
+    node is deleted.  It is optional internal compiler metadata: ``None``
+    whenever the origin could not be proven (nested loops, loops inside an
+    ``invoke_subgraph``, or a chained carry whose origins gather an earlier
+    loop's node), in which case the post-loop materialization plan declines
+    and the carry keeps today's HBM behavior.  No other consumer of this
+    record reads the field.
+
+    ``storage_view`` is the view the update writes through when the carry's
+    initial value is a view of the storage (a transposed init), else None.
+    ``loop_carries.apply_loop_carries`` uses it as the mutation target, as the
+    splice did when it made the write in place itself.
+    """
+
+    storage_name: str
+    update_name: str
+    loop_origin: "torch.fx.Node | None" = None
+    storage_view: Any = field(default=None, compare=False, repr=False)
+
 
 # Set to False only by the no-behaviour-change test, to compare the pipeline
 # with and without nodes.  With it off, ``collapse`` builds nothing, so no

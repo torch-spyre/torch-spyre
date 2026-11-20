@@ -668,7 +668,7 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
 def _consumer(name, data=None, carry_of=None, loop_info=None):
     """An op for the consumer rule: its name, IR data, loop metadata and,
     for a carry's storage or update, the carry record."""
-    from torch_spyre._inductor.loop_info import LoopCarryRecord
+    from torch_spyre._inductor.loop_node import LoopCarryRecord
 
     op = SimpleNamespace(get_name=lambda: name, data=data, loop_info=loop_info)
     if carry_of is not None:

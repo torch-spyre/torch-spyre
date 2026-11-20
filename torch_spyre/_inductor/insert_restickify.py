@@ -27,7 +27,7 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_facts import counted_loop_path, enclosing_loops
-from .loop_info import ReadCopyElisionRecord
+from .read_copy_elision import ReadCopyElisionRecord
 from .loop_node import move_after, move_before
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger

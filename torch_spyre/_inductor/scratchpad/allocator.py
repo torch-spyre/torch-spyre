@@ -147,11 +147,9 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
-from torch_spyre._inductor.loop_info import (
-    COUNTED_LOOP_INFO,
-    LoopCarryRecord,
-    ReadCopyElisionRecord,
-)
+from torch_spyre._inductor.loop_info import COUNTED_LOOP_INFO
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,

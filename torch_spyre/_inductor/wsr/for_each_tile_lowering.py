@@ -2390,7 +2390,7 @@ def _is_declared_carry_update(op: Any) -> bool:
     No known graph reaches this check: it restores the earlier behaviour (a
     carry update was never a candidate) and has no test that depends on it.
     """
-    from torch_spyre._inductor.loop_info import LoopCarryRecord
+    from torch_spyre._inductor.loop_node import LoopCarryRecord
 
     record = getattr(op, "_loop_carry_record", None)
     return isinstance(record, LoopCarryRecord) and record.update_name == op.get_name()
@@ -2416,10 +2416,8 @@ def _contract_cross_scope_input_materializations(
     from torch._inductor.ir import FixedLayout
 
     from torch_spyre._inductor.constants import MATMUL_REDUCTION_OPS
-    from torch_spyre._inductor.loop_info import (
-        CoarseTileInfo,
-        ReadCopyElisionRecord,
-    )
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
     from torch_spyre._inductor.wsr.loop_tiling_common import (
         _rescale_index,
@@ -2837,7 +2835,7 @@ def _contract_exact_stride_input_materializations(
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
 
-    from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.wsr.loop_tiling_common import (
         _AddLoopTermHandler,
         _NameSwapHandler,

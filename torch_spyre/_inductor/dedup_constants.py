@@ -22,7 +22,7 @@ from torch._inductor.virtualized import V
 
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
-from .loop_info import ReadCopyElisionRecord
+from .read_copy_elision import ReadCopyElisionRecord
 from .loop_node import OpsView, remove_op
 from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance

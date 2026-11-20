@@ -56,7 +56,8 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout, SpyreConstantFallback
 from ..loop_facts import counted_loop_path
 from ..loop_node import insert_after, move_after
-from ..loop_info import LoopCarryRecord, LoopShim
+from ..loop_info import LoopShim
+from ..loop_node import LoopCarryRecord
 from ..pass_utils import invalidate_op_read_writes, op_read_writes
 from ..propagate_hints import DimHint
 from .coarse_tile import (
