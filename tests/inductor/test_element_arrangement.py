@@ -25,22 +25,33 @@ Tests all 4 conversion cases:
 """
 
 import math
+from unittest import mock
 
 import pytest
+import sympy
 import torch
 from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.exc import InductorError
-from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch_spyre._inductor.constants import DEVICE_NAME
-from utils_inductor import (
-    cached_randn,
-    shapes2key,
-    expects_raise,
-    strict_xfail,
+from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+from torch._inductor.virtualized import V
+from torch_spyre._C import (
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_spyre_tensor_layout,
 )
+from torch_spyre._inductor.constants import DEVICE_NAME
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.element_arrangement import validate_ops
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import spyre_hint
 from torch_spyre._inductor.wsr import propagate_named_dims as pnd
+from utils_inductor import (
+    cached_randn,
+    expects_raise,
+    shapes2key,
+    strict_xfail,
+)
 
 EA = ElementArrangement
 
@@ -1521,6 +1532,17 @@ class TestEAShuffle:
             ((x16.float() * 2.0) * y32 + x16.float()) + y32
         ),
     }
+
+    # Reduction ops mixing a staggered operand with a STANDARD one.
+    MIXED_EA_REDUCTIONS = {
+        "sum_dim0": lambda x16, y32: x16.float().sum(dim=0) + y32.sum(dim=0),
+        "sum_dim1": lambda x16, y32: x16.float().sum(dim=-1) + y32.sum(dim=-1),
+        "mean_dim0": lambda x16, y32: x16.float().mean(dim=0) + y32.mean(dim=0),
+        "mean_dim1": lambda x16, y32: x16.float().mean(dim=-1) + y32.mean(dim=-1),
+        "sum_mixed_add_dim0": lambda x16, y32: (x16.float() + y32).sum(dim=0),
+        "sum_mixed_add_dim1": lambda x16, y32: (x16.float() + y32).sum(dim=-1),
+    }
+
     # Shapes with only the stick dim need the virtual mb=1 row for an fp32 -> fp32
     # shuffle once the row has more than one fp32 stick pair. (64, 448) is an odd
     # number of pairs with enough rows, and (64, 151936) is wide with both sides of
@@ -1634,3 +1656,91 @@ class TestEAShuffle:
                 fp16,
                 reset_dynamo=True,
             )
+
+    @_FP16
+    @pytest.mark.parametrize(
+        "shape", [(2, 64), (4, 128), (64, 256)], ids=lambda s: shapes2key((s,))
+    )
+    @pytest.mark.parametrize("program", list(MIXED_EA_REDUCTIONS))
+    def test_mixed_ea_reduction(self, program, shape, fp16):
+        """A reduction op on a staggered and a STANDARD operand matches the CPU."""
+        self._check(self.MIXED_EA_REDUCTIONS[program], shape, fp16, reset_dynamo=True)
+
+    @expects_raise
+    @_FP16
+    @pytest.mark.parametrize(
+        "shape, match",
+        [
+            pytest.param(s, m, id=shapes2key((s,)))
+            for s, m in _MIXED_EA_REJECTED.items()
+        ],
+    )
+    def test_mixed_ea_reduction_rejected(self, shape, match, fp16):
+        """Staggered fp32 reduction operands rejected by compiler fail cleanly."""
+        with pytest.raises((InductorError, BackendCompilerFailed), match=match):
+            self._check(
+                self.MIXED_EA_REDUCTIONS["sum_mixed_add_dim0"],
+                shape,
+                fp16,
+                reset_dynamo=True,
+            )
+
+
+class TestEAValidateOps:
+    """Unit tests for the validate_ops pass on Pointwise and Reduction ops."""
+
+    @staticmethod
+    def _make_mock_op(op_type, inputs, op_name="add"):
+        """Create a mock ComputedBuffer with either Pointwise or Reduction data."""
+        mock_data = mock.MagicMock(spec=op_type)
+        origin_node = mock.MagicMock()
+        origin_node.target.name.return_value = f"aten::{op_name}.Tensor"
+        mock_data.origins = {origin_node}
+        mock_op = mock.MagicMock(spec=ComputedBuffer)
+        mock_op.data = mock_data
+        sym = sympy.Symbol("i")
+        read_deps = [MemoryDep(name, sym, (sym,), (64,)) for name in inputs]
+        mock_op.get_read_writes.return_value = mock.MagicMock(reads=read_deps)
+        return mock_op
+
+    @staticmethod
+    def _make_mock_graph(operations, buffer_eas):
+        mock_graph = mock.MagicMock()
+        mock_graph.operations = operations
+        buffers = {}
+        for name, ea in buffer_eas.items():
+            buf = mock.MagicMock()
+            layout = mock.MagicMock(spec=SpyreTensorLayout)
+            layout.element_arrangement = ea
+            buf.layouts = [layout]
+            buffers[name] = buf
+        mock_graph.get_buffer.side_effect = lambda n: buffers.get(n)
+        return mock_graph
+
+    @pytest.mark.parametrize("op_cls", [Pointwise, Reduction])
+    def test_validate_ops_compatible(self, op_cls):
+        """All-standard and standard+one-staggered (broadcast) pass validation."""
+        op = self._make_mock_op(op_cls, ["buf0", "buf1"])
+        graph = self._make_mock_graph(
+            [op], {"buf0": EA.STANDARD, "buf1": EA.DL16_TO_FP32}
+        )
+        with V.set_graph_handler(graph):
+            validate_ops(graph)
+
+    @pytest.mark.parametrize("op_cls", [Pointwise, Reduction])
+    def test_validate_ops_incompatible_raises(self, op_cls):
+        """Multiple distinct staggered EAs raise Unsupported."""
+        op = self._make_mock_op(op_cls, ["buf0", "buf1"])
+        graph = self._make_mock_graph(
+            [op], {"buf0": EA.DL16_TO_FP32, "buf1": EA.FP32_TO_DL16}
+        )
+        with V.set_graph_handler(graph):
+            with pytest.raises(Unsupported, match="Incompatible ElementArrangement"):
+                validate_ops(graph)
+
+    def test_validate_ops_layernorm_exx2_allowed(self):
+        """Layernorm ops legitimately mixing EXX2 pass validation."""
+        op = self._make_mock_op(Pointwise, ["buf0", "buf1"], op_name="layernormnorm")
+        graph = self._make_mock_graph([op], {"buf0": EA.STANDARD, "buf1": EA.EXX2})
+        with V.set_graph_handler(graph):
+            validate_ops(graph)

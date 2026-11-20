@@ -34,6 +34,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
+    Reduction,
     Scatter,
     StorageBox,
     TensorBox,
@@ -45,6 +46,7 @@ from .constants import STAGGERED_EAS, is_ea_compatible
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_node import move_before
 from .pass_utils import (
     indirect_info_from_op,
     origin_in_graph,
@@ -175,8 +177,7 @@ def _insert_shuffle_op(
             inherit_origins=False,
         )
     # Move the copy to just before ``before_op``.
-    graph.operations.remove(shuffle_buf)
-    graph.operations.insert(graph.operations.index(before_op), shuffle_buf)
+    move_before(graph.operations, before_op, shuffle_buf)
     return shuffle_buf
 
 
@@ -215,11 +216,12 @@ def validate_ops(graph: GraphLowering) -> None:
 
     This pass needs to be run after propagate_spyre_tensor_layouts so that it
     has all the required SpyreTensorLayouts. It only reads the graph. A mixed
-    STANDARD/staggered pointwise op is accepted here; ``insert_ea_shuffle``
-    later shuffles the operands that broadcast cannot reconcile.
+    STANDARD/staggered pointwise or reduction op is accepted here;
+    ``insert_ea_shuffle`` later shuffles the operands that broadcast cannot
+    reconcile.
     """
     for op in graph.operations:
-        if not isinstance(getattr(op, "data", None), Pointwise):
+        if not isinstance(getattr(op, "data", None), (Pointwise, Reduction)):
             continue
 
         inputs = _memory_reads(op)
@@ -298,13 +300,15 @@ def _log_op(graph: GraphLowering, op, stls, targets) -> None:
 
 
 def _log_ea_graph(graph: GraphLowering, marked: list) -> None:
-    """DEBUG: every pointwise op with the shuffles marked on it."""
+    """DEBUG: every pointwise or reduction op with the shuffles marked on it."""
     if not logger.isEnabledFor(logging.DEBUG):
         return
     targets = {op.get_name(): t for op, t in marked}
     lines = ["EA shuffle graph:"]
     for op in graph.operations:
-        if isinstance(op, ComputedBuffer) and isinstance(op.data, Pointwise):
+        if isinstance(op, ComputedBuffer) and isinstance(
+            op.data, (Pointwise, Reduction)
+        ):
             stls = _operand_stls(graph, op, indirect_info_from_op(op)[0])
             if stls:
                 name = op.get_name()
@@ -319,7 +323,7 @@ def _check_staggered_eas(op, stls: dict[str, SpyreTensorLayout]) -> None:
     staggered = {s.element_arrangement for s in stls.values()} & STAGGERED_EAS
     if len(staggered) > 1:
         raise Unsupported(
-            f"Cannot shuffle {op.get_name()}: multi-arg pointwise with multiple "
+            f"Cannot shuffle {op.get_name()}: multi-arg op with multiple "
             f"staggered EAs not supported: {sorted(e.name for e in staggered)}"
         )
 
@@ -370,7 +374,10 @@ def _mark_mismatched_ea(
     """
     marked = []
     for op in graph.operations:
-        if not (isinstance(op, ComputedBuffer) and isinstance(op.data, Pointwise)):
+        if not (
+            isinstance(op, ComputedBuffer)
+            and isinstance(op.data, (Pointwise, Reduction))
+        ):
             continue
         out_stl = _committed_stl(graph, op.get_name())
         indirect_names, _, _ = indirect_info_from_op(op)
