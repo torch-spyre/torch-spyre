@@ -1244,7 +1244,7 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
     ("execution_mode", "T"),
     _cases(
         eager=STAGGERED_UPCAST,
-        compiled=STAGGERED_UPCAST,
+        compiled=TOPK_STAGGERED_INPUT,
         decode_compiled=TIED_TOPK_COMPILED,
         decode_eager=_xfail(
             InductorError,
