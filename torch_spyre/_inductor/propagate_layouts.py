@@ -106,6 +106,7 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     non_stick_reduction_vars,
+    output_is_indirectly_mutated,
     op_read_writes,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -831,13 +832,19 @@ def _reduction_layout_from_stl(
         # the stick for a prod (#4409): the widest dim the reshape leaves alone is
         # often the reduced one, and the check below would then decline to
         # preserve the layout while the input was still restickified onto it.
-        relocated = dense_relocation_serves_read(
-            stl,
-            in_layout,
-            dep,
-            forbidden_stick_syms=non_stick_reduction_vars(
-                data.reduction_type, dep, output_dep
-            ),
+        # This site probes without op (above), so the relocation cannot apply
+        # output_is_indirectly_mutated itself; it is applied here instead.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(
+                stl,
+                in_layout,
+                dep,
+                forbidden_stick_syms=non_stick_reduction_vars(
+                    data.reduction_type, dep, output_dep
+                ),
+            )
         )
         if relocated is not None:
             stl = relocated
@@ -933,6 +940,7 @@ def _default_pointwise_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     aten_op,
+    op: "Operation | None" = None,
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for the default single-arg pointwise case.
 
@@ -997,7 +1005,12 @@ def _default_pointwise_layout(
         # target it picks against this output (stick_compatible) and reports the
         # restickify infeasible when they disagree, so a mismatch costs a
         # discarded candidate rather than a wrong layout.
-        relocated = dense_relocation_serves_read(stl, in_layout, dep)
+        # As at the reduction site: probed without op, so the gate is applied here.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(stl, in_layout, dep)
+        )
         if relocated is not None:
             stl = relocated
             in_device_coords = try_device_coordinates(stl, dep, None)
@@ -1099,7 +1112,9 @@ def _single_arg_op_layout(
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
             return [_qfp8wt_stl(output, in_layout)]
 
-    return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
+    return _default_pointwise_layout(
+        stl, dep, in_layout, output, output_dep, aten_op, op
+    )
 
 
 def _clone_layout(

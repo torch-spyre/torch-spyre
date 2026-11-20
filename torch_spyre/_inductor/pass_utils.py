@@ -3335,6 +3335,56 @@ def non_stick_reduction_vars(
     return reduced_loop_vars((in_dep,), out_dep)
 
 
+def output_is_indirectly_mutated(op: "Operation | None") -> bool:
+    """Whether another op scatters into ``op``'s output with an indirect index.
+
+    ``index_put_`` on a view of ``op``'s output is lowered as a second op whose
+    ``MutationLayoutSHOULDREMOVE`` targets that output and whose write index
+    carries an indirect symbol (``d1 + 1024*tmp0``). The dim that index selects
+    has to stay off the stick. When it is the stick, ``nonstick_dim_order``
+    re-tiles the destination so each entry sits on a stick of its own, and
+    ``compute_size1_restickify_target`` cannot build that re-tile out of a
+    relocated layout: ``(8, 32, 32)`` written as ``(8, 1024)`` raised "cannot
+    re-tile buf1: no size-1 stick target", where main compiles through the
+    sparse layout and reaches the backend. Relocating onto the dim the scatter
+    indexes is the one choice the relocation must not make here, and the reshape
+    leaves no other dim alone, so these reads are left to the sparse layout
+    exactly as main leaves them.
+
+    The mutating op is already in the graph when its target's layout is decided,
+    so this looks forward without needing a second pass.
+
+    TODO(#5872): forbid only the dim the scatter indexes and relocate onto
+    another, instead of declining whenever the output is scattered into.
+    """
+    get_name = getattr(op, "get_name", None)
+    if get_name is None:
+        return False
+    out_name = get_name()
+    try:
+        operations = list(V.graph.operations)
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+    for other in operations:
+        layout = getattr(other, "layout", None)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        # The target is the buffer, or any depth of MutableBox/BaseView around
+        # it; both wrapper families expose the next layer as ``.data``.
+        target, target_name = layout.target, None
+        while target is not None and target_name is None:
+            getter = getattr(target, "get_name", None)
+            target_name = getter() if getter is not None else None
+            target = getattr(target, "data", None)
+        if target_name != out_name:
+            continue
+        # Dep.is_indirect() is torch's own test and is False for a StarDep,
+        # which carries no index at all.
+        if any(write.is_indirect() for write in other.get_read_writes().writes):
+            return True
+    return False
+
+
 def dense_relocation_serves_read(
     stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3377,6 +3427,7 @@ def dense_relocation_serves_read(
         or stl.element_arrangement != ElementArrangement.STANDARD
         or is_sparse_stl(stl)
         or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
+        or output_is_indirectly_mutated(op)
     ):
         return None
     # A read at an offset (a slice, `x[1:].reshape(4, 28, 16)`) is left to the

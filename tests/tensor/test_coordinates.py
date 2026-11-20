@@ -23,8 +23,9 @@ import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import FixedLayout
+from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, MutationLayoutSHOULDREMOVE
 from torch._inductor.virtualized import V
 from torch_spyre._C import (
     DataFormats,
@@ -44,6 +45,7 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     is_stick_expr_offset_free,
     non_stick_reduction_vars,
+    output_is_indirectly_mutated,
     restickify_dense_stl_to_sparse,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -2087,6 +2089,73 @@ class TestReshapeReadCoordinates(TestCase):
             r for r, (exact, ok) in default.items() if exact and ok and not whole[r][1]
         ]
         self.assertGreater(len(lost), 0)
+
+
+class TestOutputIsIndirectlyMutated(TestCase):
+    """``output_is_indirectly_mutated``: the scatter destination gate.
+
+    A relocation must not put the stick on the dim a scatter indexes: the
+    indirect-access pass then re-tiles the destination to one entry per stick,
+    and that re-tile cannot be built from a relocated layout -- ``(8, 32, 32)``
+    written as ``(8, 1024)`` by ``index_put_`` raised "cannot re-tile buf1: no
+    size-1 stick target" where main compiles through the sparse layout
+    (``test_index_put_view_n_32_32``). The mutating op is already in the graph
+    when its target's layout is chosen, which is what this reads; pinned here
+    because a device test cannot tell a declined relocation from a read the
+    relocation never served.
+    """
+
+    # `d1 + 1024*tmp0` is the write index index_put_ lowers to on an [8, 1024]
+    # view: `tmp0` selects the row, so the row dim must stay off the stick.
+    _INDIRECT = sympy.Symbol("d1") + 1024 * sympy.Symbol("tmp0")
+    _DIRECT = sympy.Symbol("d1") + 1024 * sympy.Symbol("d0")
+
+    def setUp(self):
+        # A real GraphLowering, because MutationLayoutSHOULDREMOVE's constructor
+        # calls V.graph.mark_buffer_mutated.
+        ctx = V.set_graph_handler(GraphLowering(torch.fx.symbolic_trace(lambda: None)))
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        V.graph.operations = []
+
+    @staticmethod
+    def _op(name):
+        return SimpleNamespace(get_name=lambda: name)
+
+    def _add_mutation(self, target_name, index):
+        """Put an op mutating ``target_name`` at ``index`` in the graph."""
+        target = InputBuffer(
+            name=target_name,
+            layout=FixedLayout(
+                torch.device("cpu"), torch.float16, [8, 1024], [1024, 1]
+            ),
+        )
+        write = MemoryDep("buf1", index, (sympy.Symbol("d1"),), (sympy.Integer(1024),))
+        V.graph.operations.append(
+            SimpleNamespace(
+                layout=MutationLayoutSHOULDREMOVE(target),
+                get_read_writes=lambda: ReadWrites(set(), {write}, set()),
+            )
+        )
+
+    def test_an_indirect_write_into_the_output_is_seen(self):
+        self._add_mutation("buf0", self._INDIRECT)
+        self.assertTrue(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_a_direct_write_into_the_output_is_not(self):
+        """Only an indirect index needs the re-tile; a plain view write does not."""
+        self._add_mutation("buf0", self._DIRECT)
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_a_scatter_into_another_buffer_is_not(self):
+        """The gate is per output: it must not decline every op in the graph."""
+        self._add_mutation("buf7", self._INDIRECT)
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
+
+    def test_no_op_and_no_mutation_decline_nothing(self):
+        """The host-only callers pass no op, and must still get a relocation."""
+        self.assertFalse(output_is_indirectly_mutated(None))
+        self.assertFalse(output_is_indirectly_mutated(self._op("buf0")))
 
 
 if __name__ == "__main__":
