@@ -924,6 +924,11 @@ class MutantTests(unittest.TestCase):
         code, out, _ = plan_main(*argv, "--max-age", "30d", st=stores.MemoryStore(results=[old]))
         self.assertEqual(json.loads(out)["cases"][0]["action"], "reuse")
 
+    def test_max_age_must_be_a_positive_duration(self):
+        for bad in ("7 days", "0d", "soon"):
+            code, _, err = plan_main("--purpose", "nightly", "--reuse", "if_valid", "--max-age", bad)
+            self.assertEqual(code, 2, bad)
+
     def test_verdict_artifact_without_verdict_rows_says_so(self):
         from spyre_bench import verdict as verdict_cmd
 

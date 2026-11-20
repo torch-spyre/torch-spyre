@@ -515,12 +515,11 @@ def run_case(rec, ctx, popen):
 
 
 def cv_pct(repeats):
-    """Largest coefficient of variation (percent) of the per-repeat medians across metrics, or None below two repeats."""
-    per = {}
-    for r in repeats:
-        if r["status"] == "ok":
-            for m, vals in r["samples"].items():
-                per.setdefault(m, []).append(statistics.median(vals))
+    """Largest coefficient of variation (percent) of the per-repeat medians across metrics, or None below two repeats.
+
+    Cold repeats are left out of any metric that also has warm ones, matching the aggregate.
+    """
+    per = engine.per_repeat_values([r for r in repeats if r["status"] == "ok"])
     cvs = [
         statistics.stdev(v) / abs(statistics.fmean(v)) * 100 for v in per.values() if len(v) > 1 and statistics.fmean(v)
     ]
@@ -556,14 +555,15 @@ def build_case_result(cat, rec, outcome, ctx):
     policy = cat.policy.spec if cat.policy else None
     if policy and purpose in policy["purposes"]:
         ok = [r for r in outcome["_repeats"] if r["status"] == "ok"]
+        warm_ok = [r for r in ok if r["props"].get("run.cache") != "cold"]  # cold repeats discard nothing by design
         facts = {
             "measured": any(r["samples"] for r in ok),
             "gates_pass": True,
             "qualified": envf.get("qualified") is True,
             "clean": clean,
-            "repeats": len(ok),
+            "repeats": len(warm_ok or ok),
             "cv_pct": cv_pct(outcome["_repeats"]),
-            "warmup_discarded": max([r["warmup_discarded"] for r in ok] or [0]),
+            "warmup_discarded": min([r["warmup_discarded"] for r in warm_ok or ok] or [0]),
             "placement": bool(placement_["nodes"]),
         }
         state, reasons = engine.validity_of(policy, purpose, facts)

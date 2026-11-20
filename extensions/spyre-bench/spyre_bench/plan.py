@@ -107,6 +107,8 @@ def build_request(a):
     mode = cliutil.pick(a.reuse, "BENCH_REUSE")
     force = cliutil.csv(cliutil.pick(a.force, "BENCH_FORCE", ""))
     max_age = cliutil.pick(a.max_age, "BENCH_MAX_AGE")
+    if max_age and not engine.seconds(max_age):
+        raise UsageError(f"--max-age {max_age!r}: use a positive duration such as 7d, 12h or 30m")
     if mode or force or max_age:
         if mode and mode not in REUSE_MODES:
             raise UsageError(f"--reuse {mode!r}: one of {', '.join(REUSE_MODES)}")
