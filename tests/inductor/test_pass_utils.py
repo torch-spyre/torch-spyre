@@ -44,7 +44,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.propagate_layouts import _compact_broadcast_device_dims
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
-from utils_inductor import DEVICE
+from utils_inductor import DEVICE, expects_raise
 
 
 @pytest.mark.parametrize("folded_axis", ["new", "old", None])
@@ -855,3 +855,165 @@ def test_compute_size1_restickify_layout_indirect_access():
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
     assert list(result.stride_map) == [1, 0]
+
+
+# --- _var_valid_elements: the element count of one loop variable -------------
+#
+# A valid_elements group counts a HOST dim, not a variable.  Each case is a
+# layout (device_size, valid_elements, idc) and the variable whose count is read.
+
+_VAR_NAMES = ("d0", "d1", "d3", "d4", "k", "lq")
+
+_STAGGERED = ([2, 64, 2, 1, 64], {(0,): 2, (1,): 64, (2, 4): 128, (3,): 1})
+_MATMUL_SPLIT_K = ([16, 4096, 64], {(0,): 16, (1,): 4096, (2,): 64})
+_FACTORIZED_FIXTURE = ([8, 1, 128, 64], {(0,): 8, (1, 3): 4, (2,): 128})
+
+
+def _var_layout(device_size, valid_elements, idc):
+    syms = {n: sympy.Symbol(n, integer=True, nonnegative=True) for n in _VAR_NAMES}
+    stl = types.SimpleNamespace(device_size=device_size, valid_elements=valid_elements)
+    return stl, [sympy.sympify(e, locals=syms) for e in idc], syms
+
+
+@pytest.mark.parametrize(
+    "layout,idc,var,expected",
+    [
+        # The group holds only d1's dims; the constant dim 0 is d1's stick-count
+        # dim, so the count is the group's 67 (stick expression d1 + 3).
+        pytest.param(
+            ([2, 67, 64], {(0, 2): 67, (1,): 67}),
+            ["0", "d0", "d1 + 3"],
+            "d1",
+            67,
+            id="pad_fused_67",
+        ),
+        pytest.param(
+            ([1, 67, 64], {(0, 2): 64, (1,): 67}),
+            ["0", "d0", "d1"],
+            "d1",
+            64,
+            id="pad_fused_64",
+        ),
+        # K = 8 heads * 128 is split over two groups after collapse: 16 * 64.
+        pytest.param(
+            _MATMUL_SPLIT_K,
+            ["floor(d1/128)", "d0", "Mod(d1, 64)"],
+            "d1",
+            1024,
+            id="matmul_split_k",
+        ),
+        pytest.param(
+            _MATMUL_SPLIT_K,
+            ["floor(d1/128)", "d0", "Mod(d1, 64)"],
+            "d0",
+            4096,
+            id="matmul_new_var",
+        ),
+        # One host dim (256) split over two loop variables; d4 has 64 of it.  The
+        # other variable's coordinate 2*d1 + d3 does not contain d4.
+        pytest.param(
+            ([128, 4, 1, 64], {(0,): 128, (1, 3): 256, (2,): 1}),
+            ["d0", "2*d1 + d3", "0", "d4"],
+            "d4",
+            64,
+            id="rope_compound_other",
+        ),
+        pytest.param(
+            _STAGGERED,
+            ["d1", "d0", "d3", "0", "d4"],
+            "d4",
+            64,
+            id="staggered_old",
+        ),
+        pytest.param(
+            _STAGGERED,
+            ["d1", "d0", "d3", "0", "d4"],
+            "d0",
+            64,
+            id="staggered_new",
+        ),
+        # A variable in two dims of one group: the group's count, not None.
+        pytest.param(
+            ([8, 2, 64], {(1, 2): 128}),
+            ["d0", "floor(k/64)", "Mod(k, 64)"],
+            "k",
+            128,
+            id="two_dims_one_group",
+        ),
+        # A dim pinned to 0 by a slice is still part of the host dim: 128, not 64.
+        pytest.param(
+            _STAGGERED,
+            ["d1", "d0", "0", "0", "d4"],
+            "d4",
+            128,
+            id="pinned_slice",
+        ),
+        # A valid layout of host [L=4, H=8, D=128] with L on the stick.
+        pytest.param(
+            _FACTORIZED_FIXTURE,
+            ["floor(k/128)", "0", "Mod(k, 128)", "lq"],
+            "k",
+            1024,
+            id="factorized_layout_k",
+        ),
+        pytest.param(
+            _FACTORIZED_FIXTURE,
+            ["floor(k/128)", "0", "Mod(k, 128)", "lq"],
+            "lq",
+            4,
+            id="factorized_layout_lq",
+        ),
+    ],
+)
+def test_var_valid_elements_count(layout, idc, var, expected):
+    stl, idc_exprs, syms = _var_layout(*layout, idc)
+    assert pass_utils._var_valid_elements(stl, idc_exprs, syms[var]) == expected
+
+
+@expects_raise
+@pytest.mark.parametrize(
+    "layout,idc,var,message",
+    [
+        # 100 of 128 positions valid, shared with d3: the count is not recoverable.
+        pytest.param(
+            ([2, 64], {(0, 1): 100}),
+            ["d3", "d4"],
+            "d4",
+            "padded",
+            id="padded_shared_group",
+        ),
+        # The variable is inside a compound coordinate.
+        pytest.param(
+            ([4, 64], {(0,): 4, (1,): 64}),
+            ["2*d1 + d3", "d0"],
+            "d3",
+            "compound",
+            id="compound_with_var",
+        ),
+        pytest.param(
+            ([4, 64], {(0, 1): 256}),
+            ["2*d1 + d3", "d3"],
+            "d3",
+            "compound",
+            id="compound_stick",
+        ),
+        pytest.param(
+            ([4, 64], {(0,): 4}),
+            ["d0", "d1"],
+            "d1",
+            "no valid_elements group",
+            id="dim_without_group",
+        ),
+        pytest.param(
+            ([4, 64], {(0,): 4, (1,): 64}),
+            ["d0", "d1"],
+            "d3",
+            "is in no device dim",
+            id="variable_in_no_dim",
+        ),
+    ],
+)
+def test_var_valid_elements_rejects(layout, idc, var, message):
+    stl, idc_exprs, syms = _var_layout(*layout, idc)
+    with pytest.raises(AssertionError, match=message):
+        pass_utils._var_valid_elements(stl, idc_exprs, syms[var])

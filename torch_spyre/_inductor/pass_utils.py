@@ -2921,75 +2921,51 @@ def restickify_device_size(
     return new_device_size
 
 
-def _ve_for_stick_var(stl: SpyreTensorLayout, idc: list, var) -> int | None:
-    """Valid element count of the stick variable ``var``, from device geometry only.
+def _var_valid_elements(stl: SpyreTensorLayout, idc: list, var) -> int:
+    """Number of valid elements of the loop variable ``var``, from valid_elements.
 
-    The stick's valid_elements group counts one host dim, but its dims can belong
-    to more than one loop variable.  Four cases, each with the test that has it:
+    A valid_elements group counts one HOST dim, not a variable, so a variable's
+    count is read from the groups its device dims are in:
 
-    * Group holds only ``var`` (the usual case): the count is the group's value.
-    * Group also holds a dim of ANOTHER variable: one host dim is split over two
-      loop variables (host index = 64 * d3 + d4), so the group's 128 is d3's 2
-      times d4's 64.  Divide the other variable's dims out to get 64.
-      test_single_arg_size1_after_staggered_ea.
-    * Group holds a dim with a CONSTANT coordinate: that is ``var``'s own
-      stick-count dim (or padding), not another variable, so do not divide it
-      out.  test_pad_fused_into_matmul_producer (stick expression ``d1 + 3``,
-      group (0, 2) = 67); dividing there turned 67 into 34.
+    * The group holds only ``var``'s dims.  A constant-coordinate dim counts as
+      ``var``'s (its own stick-count dim, padding, or a slice that pins it).  The
+      group's count is exact, padding included.  device_size [2, 67, 64],
+      valid_elements {(0, 2): 67}, idc [0, d0, d1 + 3]: d1 has 67.
+    * ``var`` is in several groups: multiply them.  A split K, device_size
+      [16, 4096, 64], valid_elements {(0,): 16, (1,): 4096, (2,): 64},
+      idc [floor(d1/128), d0, Mod(d1, 64)]: d1 has 16 * 64 = 1024.
+    * The group also holds a dim of ANOTHER variable (one host dim split over two
+      loop variables).  Only a full group can be divided: its capacity over the
+      other variable's device sizes.  device_size [2, 64, 2, 1, 64],
+      valid_elements {(2, 4): 128, ...}, idc [d1, d0, d3, 0, d4]: d4 has 64.
 
-    * ``var`` in SEVERAL groups: multiply the groups' counts, each handled as
-      above.  test_matmul_weight_with_factorized_contraction_dim: after
-      collapse_valid_elements, K (1024 = 8 heads * 128) sits in groups of 16 and
-      64, so its count is 16 * 64.
-
-    Returns None only if a dim carrying ``var`` is in no group.
+    Raises AssertionError rather than guess: a compound coordinate containing
+    ``var`` (2 * d1 + d3), a padded group shared with another variable, or a dim
+    of ``var`` in no group.
     """
-    dims = [d for d in range(len(idc)) if var in idc[d].free_symbols]
-    if not dims:
-        return None
+    dims = [d for d, e in enumerate(idc) if var in e.free_symbols]
+    assert dims, f"{var} is in no device dim: idc={idc}"
+    for d in dims:
+        # An offset such as d1 + 3 is fine; a second variable is not.
+        assert idc[d].free_symbols == {var}, f"compound coordinate {idc[d]} for {var}"
     keys: list[tuple[int, ...]] = []
     for d in dims:
         key = next((k for k in stl.valid_elements if d in k), None)
-        if key is None:
-            return None
+        assert key is not None, f"dim {d} of {var} has no valid_elements group"
         if key not in keys:
             keys.append(key)
     total = 1
     for key in keys:
-        # A constant coordinate carries no other variable (it is the stick-count
-        # dim of ``var`` itself, or padding), so only dims of a different variable
-        # divide.
-        others = math.prod(
-            stl.device_size[d]
-            for d in key
-            if idc[d].free_symbols and var not in idc[d].free_symbols
+        val = stl.valid_elements[key]
+        others = [d for d in key if d not in dims and idc[d].free_symbols]
+        if not others:
+            total *= val
+            continue
+        cap = math.prod(stl.device_size[d] for d in key)
+        assert val == cap, (
+            f"group {key} is padded ({val}/{cap}) and shared with another variable"
         )
-        total *= -(-stl.valid_elements[key] // others)
-    return total
-
-
-def _ve_for_var(valid_elements: dict, idc: list, var) -> int | None:
-    """Total valid element count for ``var`` across all VE groups it spans.
-
-    For the NEW stick variable, which may be carried by several device dims in
-    different groups (a variable factorized over two host dims, such as K = heads
-    * head_dim): multiply each distinct group's count once.  None if a dim has no
-    group.  test_compute_restickify_target_layout_factorized_new_sd (currently
-    skipped: its fixture is invalid).
-    """
-    dims = [j for j in range(len(idc)) if var in idc[j].free_symbols]
-    if not dims:
-        return None
-    seen_keys: set[tuple[int, ...]] = set()
-    total = 1
-    for d in dims:
-        for key, val in valid_elements.items():
-            if d in key and key not in seen_keys:
-                seen_keys.add(key)
-                total *= val
-                break
-        else:
-            return None
+        total *= cap // math.prod(stl.device_size[d] for d in others)
     return total
 
 
@@ -3005,18 +2981,12 @@ def restickify_device_size_new(
     """Computes the new device size after a restickify, from device geometry only.
 
     The element counts of the old and new stick variables come from
-    ``valid_elements`` (see ``_ve_for_stick_var`` and ``_ve_for_var``).  An
-    ``old_var`` of None is a constant stick and a ``new_var`` of None a size-1
-    restickify; each has one element.
+    ``valid_elements`` (see ``_var_valid_elements``).  An ``old_var`` of None is a
+    constant stick and a ``new_var`` of None a size-1 restickify; each has one
+    element.
     """
-    old_var_elems = _ve_for_stick_var(stl, idc, old_var) if old_var is not None else 1
-    new_var_elems = (
-        _ve_for_var(stl.valid_elements, idc, new_var) if new_var is not None else 1
-    )
-    assert old_var_elems is not None and new_var_elems is not None, (
-        "valid_elements gives no count for a stick variable: "
-        f"ve={dict(stl.valid_elements)} idc={idc} old_var={old_var} new_var={new_var}"
-    )
+    old_var_elems = 1 if old_var is None else _var_valid_elements(stl, idc, old_var)
+    new_var_elems = 1 if new_var is None else _var_valid_elements(stl, idc, new_var)
     new_device_size = list(stl.device_size)
     new_device_size[-1] = stick_size
     new_device_size[old_sd_outer_dim] = (new_var_elems + stick_size - 1) // stick_size
