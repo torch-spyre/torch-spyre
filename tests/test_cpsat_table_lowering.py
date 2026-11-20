@@ -720,11 +720,11 @@ def test_the_naive_lowering_explodes_past_the_cap():
     assert index.size == 4620
 
 
-# ----------------------------------------------------- one function for each class
+# ---------------------------------------------------------------- a node's function
 
 
 def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
-    """The expressions lambdified from here on, the lowering's functions forgotten."""
+    """The expressions lambdified from here on."""
     calls: list[sympy.Basic] = []
     lambdify = sympy.lambdify
 
@@ -733,13 +733,14 @@ def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
         return lambdify(args, expr, **kwargs)
 
     monkeypatch.setattr(sympy, "lambdify", counting)
-    lowering._lambdified.cache_clear()
     return calls
 
 
-def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
-    """Forty terms of one shape make hundreds of nodes and a few functions: every node
-    of one class and form of operands shares one."""
+def test_a_node_lambdifies_its_function_once_and_nothing_keeps_it(monkeypatch):
+    """Each node lambdifies its own function, its class over placeholders, once, when
+    it is realized: forty terms of one shape make hundreds of nodes and a few distinct
+    functions. Nothing is kept between lowerings, so a second lowering lambdifies as
+    many again."""
     case = Case()
     case.add_input("a", a=[float(v) for v in range(1, 65)])
     case.add_input("b", b=[float(v) for v in range(1, 9)])
@@ -757,8 +758,12 @@ def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
     nodes = _nodes(case, expr)
     nodes[expr].cp_expr(case.model)
     computed = [n for n in nodes.values() if type(n) is Node]
-    assert len(computed) > 300
-    assert len(calls) == len({str(c) for c in calls}) <= 12
+    assert len(calls) == len(computed) > 300
+    assert len({str(c) for c in calls}) <= 12
+    nodes[expr].cp_expr(cp_model.CpModel())  # a realization is kept by its node
+    assert len(calls) == len(computed)
+    _nodes(case, expr)[expr].cp_expr(cp_model.CpModel())
+    assert len(calls) == 2 * len(computed)
     np.testing.assert_allclose(
         nodes[expr].realization.values, _stage_1(nodes[expr]), rtol=1e-12
     )
@@ -769,7 +774,6 @@ def test_a_function_takes_its_operands_by_their_own_names():
     per argument: seconds for a Min or Max of a few dozen operands. Plain symbols
     whose names are identifiers are taken as they are, so the function's parameters
     are the placeholders' own names, and a Min of 35 is quick to lambdify."""
-    lowering._lambdified.cache_clear()
     func = lowering._lambdified(sympy.Min, (None,) * 35)
     assert list(inspect.signature(func).parameters) == [
         f"operand{i}" for i in range(35)

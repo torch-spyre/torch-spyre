@@ -36,8 +36,8 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 
 One table per node, and the root read as one lookup. A node's list is its function
 applied to its operands' lists, each read at every entry of the node's table. The
-function is the node's sympy class over placeholders, lambdified once for each class and
-form of operands and shared by every node of them (``_lambdified``). It lowers an
+function is the node's sympy class over placeholders, lambdified when the node is
+realized (``_lambdified``): nothing is kept once a lowering is done. It lowers an
 expression whose inputs fit the cap together and refuses anything wider. Nothing imports
 it yet.
 """
@@ -48,7 +48,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from typing import Any, TypeAlias, cast
 
 import numpy as np
@@ -243,11 +243,10 @@ CONDITION = "condition"
 Form: TypeAlias = "str | sympy.Rational | None"
 
 
-@lru_cache(maxsize=1024)
 def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     """The function of a node of sympy class func whose operands take forms,
-    lambdified with the numpy module over one placeholder per operand. lambdify runs
-    once for each class and forms, and every node of them shares the function.
+    lambdified with the numpy module over one placeholder per operand. A node calls it
+    once, when it is realized, and nothing keeps the function after that.
 
     The placeholders are plain symbols, operand0, operand1, ..., whose names are
     Python identifiers, so lambdify takes them as they are. It renames every argument
