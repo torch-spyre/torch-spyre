@@ -2962,6 +2962,8 @@ def _var_valid_elements(stl: SpyreTensorLayout, idc: list, var) -> int:
             total *= val
             continue
         cap = math.prod(stl.device_size[d] for d in key)
+        # A padded group shared with another variable is rejected: the count says
+        # how many positions are valid but not which variable's range is short.
         assert val == cap, (
             f"group {key} is padded ({val}/{cap}) and shared with another variable"
         )
