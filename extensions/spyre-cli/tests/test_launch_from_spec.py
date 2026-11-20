@@ -206,7 +206,7 @@ def test_a_folder_without_a_spec_is_launched_from_the_arguments(tmp_path, made):
 
     launched = []
     with mock.patch.object(
-        core, "_launch", side_effect=lambda p, t: launched.append(t)
+        core, "_launch", side_effect=lambda p, t, symbol_kinds=None: launched.append(t)
     ):
         launch_from_cli(str(tmp_path), ["10x512@fp16"], ["10x512@fp16"])
 

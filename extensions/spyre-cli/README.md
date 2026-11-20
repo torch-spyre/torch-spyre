@@ -105,8 +105,9 @@ Bind the return value and keep it in scope until the outputs have been read
 back. Dropping it frees the JobPlan while the launch is still in flight, and the
 device then reports what looks like a hardware error.
 
-`spyre_cli.launch` takes the tensors you hand it and does not consult a launch
-spec, so on this path:
+`spyre_cli.launch` takes the tensors you hand it. From the folder's launch spec
+it reads only the runtime-slot descriptors, so that each slot is resolved by
+its kind; it does not check the tensors against the spec, so on this path:
 
 1. You need to pass the right input and output list.
 2. If the shapes don't match, there is no error - the code will silently work.
