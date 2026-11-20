@@ -556,6 +556,13 @@ contract as the call without `device_layout=`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
   over it. An op whose own iteration space depends on the declared dimension
   outside any loop is refused at compile time, see the next section.
+- Eager ops (`x.clone()`, `x + 1`, `x.copy_(...)`, ...) work on a declared tensor
+  but do not use the declaration: each one runs a fixed-size kernel, compiled
+  once for every distinct size, and returns a regular tensor of the current
+  size. The dimension is dynamic only inside a `torch.compile` function that you
+  write yourself (see the next section). Carrying the declaration over to the
+  result is tracked in
+  [#6490](https://github.com/torch-spyre/torch-spyre/issues/6490).
 
 #### Compiled graphs over a declared dimension
 

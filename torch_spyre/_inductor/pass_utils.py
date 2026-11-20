@@ -1266,7 +1266,7 @@ def per_trip_index(
     advance from one counted-loop trip to the next, not an in-tile iteration
     axis. Codegen already applies that advance exactly once, through
     ``device_tile_advance_expr`` (see ``spyre_kernel.create_tensor_arg`` and
-    ``_general_tile_advance``), and pins the var to zero in the *base*
+    ``_index_tile_advance``), and pins the var to zero in the *base*
     coordinates so the raw unbacked symbol neither leaks into the OpSpec
     iteration space nor applies the same advance twice.
 
@@ -1876,9 +1876,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
     propagation runs, per passes.py's pass ordering) lists, per nesting
     level, the raw op.data.ranges positions this loop group tiles -- for the
-    innermost tile-body op itself, output_tiled_dims/tiled_dims_per_read are
-    both empty (this op's own write is already the tile-local slice, so it
-    has nothing further to report), so loop_tiled_dims is the only surviving
+    innermost tile-body op itself, this op's own write is already the
+    tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
     A raw tiled dim is a spurious "excess" batch var iff x's own read lacks
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
