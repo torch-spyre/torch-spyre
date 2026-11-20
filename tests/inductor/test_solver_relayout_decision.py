@@ -82,18 +82,18 @@ _PER_CORE = 16  # P is 64 bytes sliced 4 ways
     "cap,costs,expected",
     [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
 )
-def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+def test_relayout_shortlist_prices_the_consumer(cap, costs, expected):
     """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
-    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
-    candidates = [
-        _candidate("C", 0, 500, group=0, j=0),
-        _candidate("C", 0, 1000, group=1, j=1),
-    ]
-    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
-    kept = CoOptimizingAllocator._cap_relayout_groups(
-        "P", "C", candidates, divisions, costs
-    )
-    assert [c.group for c in kept] == expected
+    with config.patch(lx_solver_relayout_groups_per_edge=cap):
+        candidates = [
+            _candidate("C", 0, 500, group=0, j=0),
+            _candidate("C", 0, 1000, group=1, j=1),
+        ]
+        divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+        kept = CoOptimizingAllocator._cap_relayout_groups(
+            "P", "C", candidates, divisions, costs
+        )
+        assert [c.group for c in kept] == expected
 
 
 def test_relayout_consumer_costs_prices_the_lx_source_only(monkeypatch):
@@ -166,37 +166,35 @@ def test_relayout_consumer_costs_prices_the_lx_source_only(monkeypatch):
         (0, (1,), [0, 1, 2]),
     ],
 )
-def test_relayout_full_replica_preserves_sibling_pins(
-    monkeypatch, cap, pinned, expected
-):
-    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
-    candidates = [
-        _candidate("C", 0, 100, group=0, j=0),
-        _candidate("C", 0, 200, group=1, j=1),
-        replace(
-            _candidate("C", 0, 1000, group=2, j=2),
-            destination_view=PerCoreView((), (), num_cores=4),
-            destination_footprint_bytes=64,
-        ),
-    ]
-    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 3
-    kept = CoOptimizingAllocator._cap_relayout_groups(
-        "P",
-        "C",
-        candidates,
-        divisions,
-        pinned_consumer_divisions=frozenset(pinned),
-    )
-    assert [c.group for c in kept] == expected
-    assert all(any(c is original for original in candidates) for c in kept)
+def test_relayout_full_replica_preserves_sibling_pins(cap, pinned, expected):
+    with config.patch(lx_solver_relayout_groups_per_edge=cap):
+        candidates = [
+            _candidate("C", 0, 100, group=0, j=0),
+            _candidate("C", 0, 200, group=1, j=1),
+            replace(
+                _candidate("C", 0, 1000, group=2, j=2),
+                destination_view=PerCoreView((), (), num_cores=4),
+                destination_footprint_bytes=64,
+            ),
+        ]
+        divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 3
+        kept = CoOptimizingAllocator._cap_relayout_groups(
+            "P",
+            "C",
+            candidates,
+            divisions,
+            pinned_consumer_divisions=frozenset(pinned),
+        )
+        assert [c.group for c in kept] == expected
+        assert all(any(c is original for original in candidates) for c in kept)
 
 
 @pytest.mark.parametrize("tiled", [True, False])
-def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(monkeypatch, tiled):
+@config.patch(lx_solver_relayout_groups_per_edge=1)
+def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(tiled):
     """A sibling parent's free division keeps its group past the cap only when
     this parent is coarse-tiled, the same-tile-group case #5057 needs. Group 1
     is the costlier one, so the cap keeps it only if it is pinned."""
-    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", 1)
     loop_info = (
         CoarseTileInfo(
             loop_group_id=(0,),
@@ -361,42 +359,42 @@ def test_relayout_solve_uses_available_parallel_search_workers(
     original = cp_model.CpSolver.Solve
     workers = []
 
-    monkeypatch.setattr(config, "num_cpus", num_cpus)
-    monkeypatch.setattr(
-        ilp_solver_ortools.torch,
-        "are_deterministic_algorithms_enabled",
-        lambda: deterministic,
-    )
+    with config.patch(num_cpus=num_cpus):
+        monkeypatch.setattr(
+            ilp_solver_ortools.torch,
+            "are_deterministic_algorithms_enabled",
+            lambda: deterministic,
+        )
 
-    def solve(solver, model, *args, **kwargs):
-        workers.append(solver.parameters.num_search_workers)
-        assert solver.parameters.share_level_zero_bounds
-        return original(solver, model, *args, **kwargs)
+        def solve(solver, model, *args, **kwargs):
+            workers.append(solver.parameters.num_search_workers)
+            assert solver.parameters.share_level_zero_bounds
+            return original(solver, model, *args, **kwargs)
 
-    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
-    _solve("cpsat", buffers, expr=_objective(buffers))
-    assert workers == [expected_workers]
+        monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+        _solve("cpsat", buffers, expr=_objective(buffers))
+        assert workers == [expected_workers]
 
 
-def test_cpu_count_setting_overrides_detection(monkeypatch):
+@config.patch(num_cpus=3)
+def test_cpu_count_setting_overrides_detection():
     """A set ``num_cpus`` is returned as is, before any detection runs."""
-    monkeypatch.setattr(config, "num_cpus", 3)
     assert config.get_cpu_count() == 3
 
 
-def test_cpu_count_detects_when_the_setting_is_unset(monkeypatch):
+def test_cpu_count_detects_when_the_setting_is_unset():
     """None means "detect"; a set 0 is not a CPU count either, so it detects the
     same count, and a patched count lasts only as long as its patch."""
-    monkeypatch.setattr(config, "num_cpus", None)
-    detected = config.get_cpu_count()
-    assert detected >= 1
-    monkeypatch.setattr(config, "num_cpus", 0)
-    assert config.get_cpu_count() == detected
-    monkeypatch.setattr(config, "num_cpus", None)
-    with config.patch(num_cpus=detected + 1):
-        assert config.get_cpu_count() == detected + 1
-    assert config.num_cpus is None
-    assert config.get_cpu_count() == detected
+    with config.patch(num_cpus=None):
+        detected = config.get_cpu_count()
+        assert detected >= 1
+    with config.patch(num_cpus=0):
+        assert config.get_cpu_count() == detected
+    with config.patch(num_cpus=None):
+        with config.patch(num_cpus=detected + 1):
+            assert config.get_cpu_count() == detected + 1
+        assert config.num_cpus is None
+        assert config.get_cpu_count() == detected
 
 
 def _inductor_cache_key_config():
@@ -452,12 +450,12 @@ def test_each_cache_key_ignore_prefix_matches_only_known_settings():
     }
 
 
-def test_cpu_count_is_read_per_call(monkeypatch):
+def test_cpu_count_is_read_per_call():
     """No cached count: a patched ``num_cpus`` takes effect on the next call."""
-    monkeypatch.setattr(config, "num_cpus", 5)
-    assert config.get_cpu_count() == 5
-    monkeypatch.setattr(config, "num_cpus", 7)
-    assert config.get_cpu_count() == 7
+    with config.patch(num_cpus=5):
+        assert config.get_cpu_count() == 5
+    with config.patch(num_cpus=7):
+        assert config.get_cpu_count() == 7
 
 
 @pytest.mark.parametrize(
@@ -467,6 +465,7 @@ def test_cpu_count_is_read_per_call(monkeypatch):
         ("50000 100000\n", 1),  # a fractional quota still gets one worker
     ],
 )
+@config.patch(num_cpus=None)
 def test_cpu_count_detects_the_cgroup_quota(monkeypatch, cpu_max, expected):
     """Without a setting, the cgroup v2 quota wins over the host's CPU count."""
     import builtins
@@ -479,12 +478,12 @@ def test_cpu_count_detects_the_cgroup_quota(monkeypatch, cpu_max, expected):
             return io.StringIO(cpu_max)
         return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(config, "num_cpus", None)
     monkeypatch.setattr(builtins, "open", fake_open)
     monkeypatch.setattr(config.os, "cpu_count", lambda: 32)
     assert config.get_cpu_count() == expected
 
 
+@config.patch(num_cpus=None)
 def test_cpu_count_without_a_quota_is_at_least_one(monkeypatch):
     """An unlimited cgroup (``max``) falls through to the host count, never 0."""
     import builtins
@@ -497,7 +496,6 @@ def test_cpu_count_without_a_quota_is_at_least_one(monkeypatch):
             return io.StringIO("max 100000\n")
         return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(config, "num_cpus", None)
     monkeypatch.setattr(builtins, "open", fake_open)
     assert config.get_cpu_count() >= 1
 

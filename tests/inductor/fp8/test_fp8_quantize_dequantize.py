@@ -970,20 +970,98 @@ class TestRoundtripScale:
             msg=f"scale={scale_val}: roundtrip differs",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3037: output is NaN, "
-        "not 0: the device computes reciprocal(0) as NaN instead of +inf, so the clamp "
-        "to 448 never happens (dequantize(448, scale=0) alone gives 0 correctly)",
-    )
     def test_zero_scale(self):
-        """scale=0: output must be all zero."""
-        x = torch.full((2, 8), 1.0, dtype=FP16, device=DEVICE)
+        """scale=0: output must be all zero for positive, negative, and zero inputs."""
+        x = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+            device=DEVICE,
+        )
         scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
         out = _compile(_quant_dequant_fn)(x, scale).cpu()
         assert not out.isnan().any()
         assert (out == 0.0).all()
+
+    def test_zero_scale_raw_quantize(self):
+        """scale=0 raw quantize: safe reciprocal substitutes 1.0, giving FP8(clamp(x))."""
+        x_cpu = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+        )
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        q = _compile(_quantize_fn)(x, scale).cpu()
+        assert not q.isnan().any()
+        torch.testing.assert_close(
+            q.float(),
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_zero_scale_weight(self):
+        """scale=0 weight roundtrip: output must be all zero."""
+        x = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+            device=DEVICE,
+        )
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        w_out = _compile(_weight_quant_dequant_fn)(x, scale).cpu()
+        assert not w_out.isnan().any()
+        assert (w_out == 0.0).all()
+
+    def test_zero_scale_raw_quantize_weight(self):
+        """scale=0 raw weight quantize: stick-aligned K=128 gives FP8(clamp(x))."""
+        x_cpu = torch.zeros((2, 128), dtype=FP16)
+        x_cpu[0, 0] = 1.0
+        x_cpu[0, 1] = -1.0
+        x_cpu[0, 2] = 0.0
+        x_cpu[1, 0] = 2.0
+        x_cpu[1, 1] = -2.0
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor(0.0, dtype=FP16, device=DEVICE)
+        q = _compile(lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s))(
+            x, scale
+        ).cpu()
+        q_f = q.float()
+        assert not q_f.isnan().any()
+        torch.testing.assert_close(
+            q_f,
+            torch.clamp(x_cpu, -FP8_MAX, FP8_MAX).float(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_zero_scale_mixed_per_row(self):
+        """Per-row scale with one zero row: row0 (scale=0) gives 0, row1 scales normally."""
+        x_cpu = torch.tensor(
+            [
+                [-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 3.0],
+                [0.0, 1.0, -1.0, 2.0, -2.0, 0.0, 4.0, -4.0],
+            ],
+            dtype=FP16,
+        )
+        x = x_cpu.to(DEVICE)
+        scale = torch.tensor([[0.0], [2.0]], dtype=FP16, device=DEVICE)
+        out = _compile(_quant_dequant_fn)(x, scale).cpu()
+        assert not out.isnan().any()
+        assert (out[0] == 0.0).all()
+        torch.testing.assert_close(
+            out[1],
+            _roundtrip_ref(x_cpu[1], torch.tensor(2.0, dtype=FP16)),
+            atol=0.0,
+            rtol=0.0,
+        )
 
     def test_inf_scale(self):
         """scale=Inf: x/Inf -> 0 -> FP8(0) -> 0. Must not produce NaN."""

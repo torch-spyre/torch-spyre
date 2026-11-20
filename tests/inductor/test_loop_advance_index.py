@@ -14,13 +14,12 @@
 
 """Reading a loop access's advance from its index (stage 7.2).
 
-``test_loop_advance_check.py`` pins the decision logic with both builders replaced.
 This file tests the index-based builder and what it relies on, with real sympy
 indexes, real dependencies and the real device projection:
 
 * ``_loop_coefficient``: the loop variable's step in an index, and what it refuses;
-* ``_matching_read_deps``: which read an access is, shared with the stored-record
-  builder so the two cannot pick different reads (a read through a mutation alias
+* ``_matching_read_deps``: which read an access is, the kernel counts the reads of a buffer so the k-th load takes the k-th
+  read (a read through a mutation alias
   is the case that used to differ);
 * ``SpyreKernel._index_tile_advance``: dependency choice, level mapping and the
   projection to device elements;
@@ -117,8 +116,9 @@ class TestMatchingReadDeps:
 def _kernel(*, reads=(), writes=(), hints=(), levels=1, consumed=None):
     """A kernel whose current node has the given dependencies and loop hints."""
     kernel = spyre_kernel.SpyreKernel.__new__(spyre_kernel.SpyreKernel)
-    kernel._general_tile_advance_seen = dict(consumed or {})
+    kernel._tile_advance_seen = dict(consumed or {})
     kernel._tile_advance_symbols = {}
+    kernel._tile_advance_rw = None
     node = SimpleNamespace(
         dim_hints=[
             DimHint(
@@ -208,12 +208,14 @@ class TestIndexTileAdvance:
         kernel = _kernel(reads=[_dep("buf", D1)], hints=[], consumed={"buf": 1})
         assert kernel._index_tile_advance(TENSOR, True, "buf") is None
 
-    def test_a_hint_count_that_differs_from_the_depth_keeps_the_record(self):
-        """Level i's variable is the i-th hint only with one hint per level."""
+    def test_a_hint_count_that_differs_from_the_depth_is_refused(self):
+        """Level i's variable is the i-th hint only with one hint per level; with
+        another count the pairing is unknown, which nothing can guess."""
         kernel = _kernel(
             reads=[_dep("buf", 64 * U0 + D1)], hints=[U0], levels=2, consumed={"buf": 1}
         )
-        assert kernel._index_tile_advance(TENSOR, True, "buf") is None
+        with pytest.raises(RuntimeError, match="advances cannot be read"):
+            kernel._index_tile_advance(TENSOR, True, "buf")
 
     def test_a_non_affine_index_is_refused_not_read_as_no_advance(self):
         kernel = _kernel(

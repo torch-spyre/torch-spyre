@@ -65,6 +65,7 @@
 /Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
 
 /extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
+/extensions/spyre-bench/        @ashokponkumar @jabostian @anubhavjana @n-marion
 
 # tools -- default tools owners
 /tools/                 @ani300 @dgrove-oss @tardieu @mudhakar

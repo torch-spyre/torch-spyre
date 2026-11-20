@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Benchmarks here declare `identity: {mode: ingest}`: validate and explain work as-is; ids need spyre-bench[ingest].
+# Environments and NodeClasses are central: validate with --central examples/central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: ingest-demo}
+spec:
+  packs: [{name: kernel, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}

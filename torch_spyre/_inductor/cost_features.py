@@ -35,6 +35,7 @@ from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
     apply_splits_from_index_coeff,
+    device_coordinates,
     iteration_space_from_op,
     loop_var_ranges_from_dim_hints,
     op_read_writes,
@@ -63,6 +64,10 @@ def feature_memo() -> Iterator[None]:
     pricing one consumer across its divisions. Only the parts that do not
     depend on the division are reused, so every result is what an unscoped call
     returns. A nested scope shares the outer one.
+
+    An op's reads need no scope: ``op_read_writes`` memoizes them for every
+    caller, the post-pass cost report included, under its own contract (an
+    in-place edit of an op's reads must call ``invalidate_op_read_writes``).
     """
     if _FEATURE_MEMO.get() is not None:
         yield
@@ -87,9 +92,11 @@ def _memoized(key: tuple, compute: Callable[[], _T]) -> _T:
 def _read_device_coordinates(src, read, op):
     """``device_coordinates(src, read, None, op=op)``, reused inside
     :func:`feature_memo`: a function of the op and the read (``src`` is the
-    read buffer's layout, fixed while nothing mutates the graph)."""
-    from .pass_utils import device_coordinates
+    read buffer's layout, fixed while nothing mutates the graph).
 
+    ``compute_coordinates`` has a memo of its own, but it declines a symbolic
+    range or a dynamic size, and it sits below the index concretization and
+    the stick-expression check that every call here would repeat."""
     # Outside a scope, exactly the plain call: the key needs the op's name,
     # which only a scoped caller (the allocator, over real ops) promises.
     if _FEATURE_MEMO.get() is None:
@@ -100,19 +107,6 @@ def _read_device_coordinates(src, read, op):
             lambda: tuple(device_coordinates(src, read, None, op=op)),
         )
     )
-
-
-def _read_writes(op):
-    """``op``'s read/write dependencies: the planner's per-op memo
-    (``op_read_writes``) inside :func:`feature_memo`, the real
-    ``get_read_writes()`` outside it.
-
-    Only the planner promises nothing rewrites an op's loads without
-    invalidating that memo; the post-pass report (``cost_model_pass``) and the
-    cost dump extract after every pass, so they re-derive the reads."""
-    if _FEATURE_MEMO.get() is None:
-        return op.get_read_writes()
-    return op_read_writes(op)
 
 
 def _int(x, default: int = 1) -> int:
@@ -161,7 +155,7 @@ def _resolved_work_slices(op, work_slices=None) -> dict:
     """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
     the explicit candidate during LX planning, else the committed ownership."""
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -396,46 +390,19 @@ def _level_loop_vars(op, levels) -> list:
     ]
 
 
-def _stamped_advances(tiled, squeezed, n_levels: int) -> list[bool] | None:
-    """Per-level "this dependency's address advances" verdict stamped by the lowering.
-
-    ``tiled`` is one dependency's ``CoarseTileInfo.tiled_dims_per_read`` entry (or
-    ``output_tiled_dims``) and ``squeezed`` the parallel
-    ``squeezed_advance_per_read`` entry (or ``squeezed_advance_output``).  The
-    ``for_each_tile`` lowering decides advancement per dependency
-    (``_stamp_direct_loop_info``: a nonzero coefficient on the loop variable), and
-    ``insert_restickify`` rewrites the verdict when it moves an advance onto a copy;
-    code generation reads only these stamps.  A level advances when either list names
-    something at that level; an empty level is the explicit "pinned" verdict.
-    ``None`` when the stamp is missing or does not cover every level.
-    """
-    if tiled is None or len(tiled) != n_levels:
-        return None
-    if squeezed and len(squeezed) != n_levels:
-        return None
-    return [
-        bool(tiled[lv]) or bool(squeezed and squeezed[lv]) for lv in range(n_levels)
-    ]
-
-
-def _loop_var_advances(index, loop_vars, stamped=None) -> list[bool]:
+def _loop_var_advances(index, loop_vars) -> list[bool]:
     """Per level: does a dependency at ``index`` advance with that level's loop?
 
-    A complete stamped verdict decides for every level, with or without a paired
-    ``for_each_tile`` loop variable (``_stamped_advances``); the tiled dims of every
-    level are handled by ``_loop_factor_for_index`` itself.  Without a stamp, only a
-    level with a paired loop variable can say yes, by the lowering's own rule: the
-    address advances iff the index has a nonzero coefficient on the loop variable.  A
-    loop variable that is merely a free symbol of the index does not advance the
-    address; the tested example is the synthetic index ``4096*FloorDiv(u0, 2)``
-    (coefficient 0).  No lowered kernel is known to produce such a read; following the
-    lowering's rule keeps the price consistent with what the lowering stamps.
+    Only a level with a paired loop variable can say yes, by the lowering's own rule:
+    the address advances iff the index has a nonzero coefficient on the loop
+    variable (the tiled dims of every level are handled by ``_loop_factor_for_index``
+    itself).  A loop variable that is merely a free symbol of the index does not
+    advance the address; the tested example is the synthetic index
+    ``4096*FloorDiv(u0, 2)`` (coefficient 0).
     """
     advances = []
     for lv, var in enumerate(loop_vars):
-        if stamped is not None:
-            advances.append(stamped[lv])
-        elif var is None:
+        if var is None:
             advances.append(False)
         else:
             try:
@@ -565,7 +532,7 @@ def _row_split(op, default: int, work_slices=None) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -730,7 +697,7 @@ def _transport_read_geometry(op, work_slices=None):
             and not getattr(op, "op_it_space_splits", None)
         ):
             return None, None
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         if len(rw.reads) != 1 or len(rw.writes) != 1:
             return None, None
         read, write = next(iter(rw.reads)), next(iter(rw.writes))
@@ -907,7 +874,7 @@ def _read_run_bytes(op, read, work_slices=None):
     try:
         from torch._inductor.virtualized import V
 
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write = next(iter(rw.writes))
         src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
         it_space = iteration_space_from_op(op)
@@ -980,7 +947,7 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -1054,7 +1021,7 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
     "" -> ordinary contiguous access; the default bw_peak + turnaround applies.
     """
     try:
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         it_space = iteration_space_from_op(op)
 
@@ -1247,8 +1214,7 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
-    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
-    records.
+    the graph returns.
 
     ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
     "interior write", and unlike the input side an output arg has no naming-convention
@@ -1328,7 +1294,7 @@ def _indirect_write_elems(op, out_elems: int) -> int | None:
     try:
         if not isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
             return None
-        rw = _read_writes(op)
+        rw = op_read_writes(op)
         writes = list(rw.writes)
         if len(writes) != 1 or not writes[0].is_indirect():
             return None
@@ -1480,28 +1446,17 @@ def extract_op_features(
     # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
     # set above, from the committed loop_info or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
-    _li = getattr(op, "loop_info", None)
     _rw = None
     try:
-        _rw = _read_writes(op)
+        _rw = op_read_writes(op)
         _write_index = next(iter(_rw.writes)).index
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
     if _levels and _write_index is not None:
-        _write_advances = _loop_var_advances(
-            _write_index,
-            _loop_vars,
-            _stamped_advances(
-                getattr(_li, "output_tiled_dims", None),
-                getattr(_li, "squeezed_advance_output", None),
-                len(_levels),
-            ),
-        )
+        _write_advances = _loop_var_advances(_write_index, _loop_vars)
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
         out_factor = _select(tiles_out_dim, 1, loop_trip)
-    _stamped_reads = getattr(_li, "tiled_dims_per_read", None) or []
-    _squeezed_reads = getattr(_li, "squeezed_advance_per_read", None) or []
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -1634,22 +1589,13 @@ def extract_op_features(
     # No dependencies change during feature extraction. Reuse the output snapshot,
     # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = (_rw if _rw is not None else _read_writes(op)).reads
+        reads = (_rw if _rw is not None else op_read_writes(op)).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
-    # The lowering stamps one verdict per MemoryDep read, in read order; StarDep and
-    # WeakDep have no index and no entry.
-    n_indexed_reads = sum(_dep_index(dep) is not None for dep in reads)
-    stamps_cover_reads = len(_stamped_reads) == n_indexed_reads and (
-        not _squeezed_reads or len(_squeezed_reads) == n_indexed_reads
-    )
-    indexed_pos = -1
     for dep in reads:
         name = getattr(dep, "name", "?")
         index = _dep_index(dep)
-        if index is not None:
-            indexed_pos += 1
         # Broadcast heuristic: the read index references fewer loop variables than
         # the output rank -> it is loaded ONCE and reused across the broadcast dim, so
         # it is counted at its own (small) device size, not the output size. This
@@ -1663,22 +1609,11 @@ def extract_op_features(
         except Exception:  # noqa: BLE001
             broadcast = False
         # One verdict per read and level: does this read's address advance with
-        # that level's for_each_tile variable? The lowering stamps it, else its
-        # own coefficient rule decides (``_loop_var_advances``). It sets both the
+        # that level's loop variable (``_loop_var_advances``)? It sets both the
         # read's loop factor and its loop-delivery eligibility, so the two prices
         # cannot disagree about one read.
         read_advances = (
-            _loop_var_advances(
-                index,
-                _loop_vars,
-                _stamped_advances(
-                    _stamped_reads[indexed_pos],
-                    _squeezed_reads[indexed_pos] if _squeezed_reads else None,
-                    len(_levels),
-                )
-                if stamps_cover_reads
-                else None,
-            )
+            _loop_var_advances(index, _loop_vars)
             if (_levels and index is not None)
             else []
         )
