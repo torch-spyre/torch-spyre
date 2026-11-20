@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 import pytest
 import sympy
+from sympy.core.relational import Relational
 from sympy.logic.boolalg import Boolean
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
@@ -247,6 +248,18 @@ def test_the_printer_evaluates_only_the_classes_it_did():
     assert printer._candidate_values(sympy.Abs(x - 3) + y) is None
     assert printer._candidate_values(x * resident) is None
     assert printer._candidate_values(x * y) is not None
+
+
+def test_every_class_the_printer_evaluates_has_a_function():
+    """The printer's list of classes is its own and grows as the printer is taught
+    more cases. Each class on it, and each relational sympy can make, must have a
+    function in the core: a miss raises NotImplementedError, a RuntimeError, which the
+    solver's fallback answers with a solve that has no cost objective."""
+    relationals = set(Relational.ValidRelationOperator.values())
+    classes = set(cpsat_expr_printer._CANDIDATE_CLASSES) - {Relational} | relationals
+    assert len(classes) == len(cpsat_expr_printer._CANDIDATE_CLASSES) - 1 + 6
+    for cls in classes:
+        assert any(base in NUMPY_FUNC_MAP for base in cls.__mro__), cls.__name__
 
 
 def test_the_printer_lowers_the_same_costs_through_the_core():

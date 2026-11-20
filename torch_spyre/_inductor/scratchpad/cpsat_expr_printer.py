@@ -75,8 +75,10 @@ _operator_map = {
 
 
 # The classes whose value over a buffer's candidates _evaluate_candidates computes with
-# the numpy core. The core has functions for more (floor, log, ...): a node of any other
-# class is left to its print method.
+# the numpy core. The list is the printer's own, and grows as the printer is taught
+# more cases: it is not the core's map, which has functions for more (floor, log, ...).
+# A node of any other class is left to its print method. Every class here needs a
+# function in the core.
 _CANDIDATE_CLASSES = (
     sympy.Add,
     sympy.Mul,
