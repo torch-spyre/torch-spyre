@@ -2921,6 +2921,26 @@ def _host_size_stride_for_expr(
     offset_diff = (coord - expr).xreplace({var: 0})
     if sympy.Mod(offset_diff, stick_size) != 0:
         return None
+    if coord.free_symbols - {var}:
+        # The host dim is split over several loop variables (64 * d3 + d4), so var
+        # owns only part of it.
+        if not config.allow_restickify_split_host_dim:
+            return None
+        # var's extent is the next larger coefficient divided by its own (or the
+        # host dim size, when var is the outermost part), and its stride is
+        # scaled by its own coefficient.
+        coeffs = {v: sympy.expand(coord).coeff(v) for v in coord.free_symbols}
+        rest = sympy.expand(coord - sum(c * v for v, c in coeffs.items()))
+        if rest.free_symbols or not all(
+            c.is_Integer and c > 0 for c in coeffs.values()
+        ):
+            return None
+        c_var = int(coeffs[var])
+        bigger = [int(c) for v, c in coeffs.items() if v != var and c > c_var]
+        span = min(bigger) if bigger else host_size[d]
+        if span % c_var:
+            return None
+        return span // c_var, host_stride[d] * c_var
     return host_size[d], host_stride[d]
 
 

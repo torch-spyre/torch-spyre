@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import dataclasses
+import itertools
+import math
 import types
 
 import pytest
@@ -33,6 +35,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 
 import torch_spyre._inductor.pass_utils as pass_utils
+from torch_spyre._inductor import config
 from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.pass_utils import (
@@ -852,3 +855,99 @@ def test_compute_size1_restickify_layout_indirect_access():
     # maps to no host stride.
     assert list(result.device_size) == [512, 64]
     assert list(result.stride_map) == [1, 0]
+
+
+def _covers_each_host_element_once(stl, numel, *, skip_stick=False):
+    """True if the layout addresses every host element exactly once, nothing else.
+
+    For layouts without padding.  A size-1 restickify holds one element per
+    stick, so its stick is left out with skip_stick.
+    """
+    sizes, strides = list(stl.device_size), list(stl.stride_map)
+    if skip_stick:
+        sizes, strides = sizes[:-1], strides[:-1]
+    addresses = [
+        sum(i * s for i, s in zip(index, strides))
+        for index in itertools.product(*(range(n) for n in sizes))
+    ]
+    return sorted(addresses) == list(range(numel))
+
+
+def _restickify_case(size, index, ranges, dim_order):
+    stride = [math.prod(size[i + 1 :]) for i in range(len(size))]
+    host = FixedLayout(torch.device("spyre"), torch.float16, size, stride)
+    dep = MemoryDep("x", index, tuple(ranges), tuple(ranges.values()))
+    stl = SpyreTensorLayout(size, stride, torch.float16, dim_order)
+    ic = pass_utils.host_coordinates(host, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
+    return stl, host, ic, idc, PropArg(dep, host, [stl])
+
+
+def _split_host_dim_case():
+    # Host x[1, 2, 64, 128]; the last host dim (128) is read as 64*d3 + d4, so
+    # the stick variable d4 owns 64 of its 128 elements (as in RoPE).
+    d0, d1, d3, d4 = sympy.symbols("d0 d1 d3 d4", integer=True, nonnegative=True)
+    case = _restickify_case(
+        [1, 2, 64, 128],
+        8192 * d1 + 128 * d0 + 64 * d3 + d4,
+        {d0: 64, d1: 2, d3: 2, d4: 64},
+        [0, 1, 2, 3],
+    )
+    return case, d0
+
+
+def test_restickify_refuses_split_host_dim_by_default():
+    (stl, host, ic, idc, arg), d0 = _split_host_dim_case()
+    assert not config.allow_restickify_split_host_dim
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host, d0, ic, idc, arg=arg
+    )
+    assert result is None
+
+
+def test_size1_restickify_refuses_split_host_dim_by_default():
+    (stl, host, ic, idc, arg), _ = _split_host_dim_case()
+    assert not config.allow_restickify_split_host_dim
+    result = pass_utils.compute_size1_restickify_layout(stl, host, ic, idc, arg=arg)
+    assert result is None
+
+
+@config.patch(allow_restickify_split_host_dim=True)
+def test_restickify_counts_only_stick_var_part_of_split_host_dim():
+    (stl, host, ic, idc, arg), d0 = _split_host_dim_case()
+    assert list(stl.device_size) == [2, 64, 2, 1, 64]
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host, d0, ic, idc, arg=arg
+    )
+    assert result is not None
+    assert list(result.device_size) == [2, 64, 2, 1, 64]
+    assert list(result.stride_map) == [8192, 1, 64, 8192, 128]
+    assert _covers_each_host_element_once(result, 16384)
+
+
+@config.patch(allow_restickify_split_host_dim=True)
+def test_size1_restickify_counts_only_stick_var_part_of_split_host_dim():
+    (stl, host, ic, idc, arg), _ = _split_host_dim_case()
+    result = pass_utils.compute_size1_restickify_layout(stl, host, ic, idc, arg=arg)
+    assert result is not None
+    assert list(result.device_size) == [2, 64, 2, 64, 64]
+    assert _covers_each_host_element_once(result, 16384, skip_stick=True)
+
+
+@config.patch(allow_restickify_split_host_dim=True)
+def test_restickify_split_host_dim_rope_layout():
+    # Host x[1, 128, 256], last dim read as 128*d1 + 64*d3 + d4 (RoPE pairs).
+    d0, d1, d3, d4 = sympy.symbols("d0 d1 d3 d4", integer=True, nonnegative=True)
+    stl, host, ic, idc, arg = _restickify_case(
+        [1, 128, 256],
+        256 * d0 + 128 * d1 + 64 * d3 + d4,
+        {d0: 128, d1: 2, d3: 2, d4: 64},
+        [0, 1, 2],
+    )
+    assert list(stl.device_size) == [128, 4, 1, 64]
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host, d0, ic, idc, arg=arg
+    )
+    assert result is not None
+    assert list(result.device_size) == [64, 4, 2, 64]
+    assert _covers_each_host_element_once(result, 32768)
