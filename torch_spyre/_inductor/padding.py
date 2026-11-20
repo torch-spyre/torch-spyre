@@ -694,15 +694,21 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
     which it never did.
 
-    Every restickify ``is_restickify_coords`` recognizes counts.  It already
-    returns ``False`` when the two within-stick coordinates carry the same
-    symbols, so what reaches the raise is either one operand elided (exactly one
-    coordinate is symbol-free, the case the codegen assert covers) or the two on
-    different dims, which is what a dense stick relocation produces.  Neither can
-    have its old-stick dim padded in place.  Cases such as
-    ``torch.cat([a, b], -1).sum(-1)`` on ``(32, 8, 16, 1)`` and the copy-back into
-    a mutated graph input compile correctly and do not reach here, because
-    ``is_restickify_coords`` rejects them first.
+    Two shapes of restickify reach the raise.  One operand elided (exactly one
+    within-stick coordinate is symbol-free) is the case the codegen assert covers,
+    and it raises wherever it appears, as on main.  The two coordinates on
+    different dims is what a dense stick relocation produces, and it raises only
+    when the write really is into a sub-range of the target: a cat operand covers
+    ``[1, 80, 6400]`` of a ``[1, 80, 8400]`` buffer, where the old-stick dim
+    cannot be padded in place.
+
+    A write that covers the whole target is not a slice and compiles, even with
+    the two coordinates on different dims -- a copy-back into a mutated graph
+    input whose target layout is transposed covers ``[64, 64]`` of ``[64, 64]``.
+    Raising unconditionally instead broke exactly that
+    (``test_infeasible_target_layout_preserves_copy_back``), while narrowing it to
+    the elided case let a relocated write into a cat slice through, where codegen
+    emitted wrong addresses rather than raising.
 
     TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
     copy it into the slice (see the TODO in ``_pad_restickify_output``); then
@@ -731,16 +737,34 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
-    # Unconditional: see the docstring.  is_restickify_coords has already ruled
-    # out the two coordinates carrying the same symbols, so this is either an
-    # elided operand or a dense relocation's two dims, and neither can be padded
-    # in place.  Narrowing it to the elided case let a relocated write through,
-    # and codegen emitted wrong addresses instead of raising.
+    elided = bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols)
+    if not elided and _covers_whole_target(layout, real):
+        return
     raise Unsupported(
         f"insert_restickify_padding: restickify written into a slice of "
         f"another buffer on {op.get_name()} (for example torch.cat of "
         f"tensors that need a restickify) cannot be padded in place"
     )
+
+
+def _covers_whole_target(
+    layout: MutationLayoutSHOULDREMOVE, real: FixedTiledLayout
+) -> bool:
+    """Whether the mutating write spans all of the buffer it writes into.
+
+    A cat operand writes a sub-range of the cat buffer and is a slice; a
+    copy-back into a mutated graph input writes the whole target and is not.
+    A size that does not concretize is treated as a slice, which keeps the raise
+    rather than letting an unpadded write through.
+    """
+    try:
+        sizes = [int(concretize_expr(s)) for s in layout.size]
+        real_sizes = [int(concretize_expr(s)) for s in real.size]
+        offset = int(concretize_expr(layout.offset))
+        real_offset = int(concretize_expr(real.offset))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return sizes == real_sizes and offset == real_offset
 
 
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
