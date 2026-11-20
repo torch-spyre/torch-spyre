@@ -1453,6 +1453,12 @@ def lower_mean_default(x, *, dtype=None):
 
 def _lower_sum_impl(x, axis, keepdim, dtype=None):
     comp_dtype = _promoted_dtype(x, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT)
+    # When the caller requests a wider float output dtype (e.g. fp16.sum(dtype=fp32)),
+    # widen comp_dtype so the accumulation runs in that wider type rather than reducing
+    # in fp16 and upcasting only after.  This avoids large precision loss on fp16 inputs
+    # (max abs err ~50 on (8, 4096) inputs before this fix).
+    if dtype is not None and dtype.is_floating_point:
+        comp_dtype = torch.promote_types(comp_dtype, dtype)
 
     if dtype is not None:
         result_dtype = dtype
