@@ -14,6 +14,7 @@
 """Unit tests for the ``deadcode_elimination`` IR pass."""
 
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import torch
@@ -21,7 +22,9 @@ from torch import fx
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
+    IndexPutFallback,
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
@@ -29,12 +32,16 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from torch_spyre.constants import DEVICE_NAME
 
 from torch_spyre._inductor import deadcode_elimination as dce_module
+from torch_spyre._inductor.ir import AllGatherKernel, AllReduceKernel, WaitKernel
 from torch_spyre._inductor.wsr import for_each_tile_lowering
 from torch_spyre._inductor.deadcode_elimination import deadcode_elimination
+
+_c10d = torch.ops._c10d_functional
 
 
 class TestDeadMutationElimination(unittest.TestCase):
@@ -175,6 +182,161 @@ class TestDeadMutationElimination(unittest.TestCase):
         self.assertIn("producer", survivors)
 
 
+class TestMutatingFallbackElimination(unittest.TestCase):
+    """A mutating ``ExternKernel`` is judged by the mutation it declares.
+
+    An ``IndexPutFallback`` owns no output buffer and is no ``FallbackKernel``,
+    so judging side effects by class alone reads it as pure and drops the write.
+    A ``FallbackKernel`` is excluded: the one name it declares does not cover
+    all it does, so ``has_side_effects`` stays the decider for it.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(V.set_fake_mode(FakeTensorMode()))
+        stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
+
+    def _index_put(self, target_name):
+        """``target[index] = values`` as the lowering's mutating fallback."""
+        # Same buffer fixture as the class above.
+        make = TestDeadMutationElimination._make_buffer
+        target = make(target_name)
+        values = make("values")
+        index = make("index")
+        fallback = IndexPutFallback(
+            torch.ops.aten.index_put_.default,
+            TensorBox(StorageBox(target)),
+            [TensorBox(StorageBox(index))],
+            TensorBox(StorageBox(values)),
+            False,
+        )
+        self.assertEqual(
+            fallback.get_mutation_names(), [target_name], "fixture drifted"
+        )
+        return [target, values, index, fallback], fallback.get_name()
+
+    def _run(self, operations, output_names):
+        V.graph.operations = list(operations)
+        V.graph.get_output_names = lambda: list(output_names)
+        deadcode_elimination(V.graph)
+        return {op.get_name() for op in V.graph.operations}
+
+    def test_mutating_fallback_into_live_target_is_kept(self):
+        """The write reaches a graph output, so the op and its reads stay."""
+        ops, name = self._index_put("live_target")
+
+        survivors = self._run(ops, output_names=["live_target"])
+
+        self.assertIn(name, survivors)
+        self.assertIn("values", survivors)
+
+    def test_mutating_fallback_into_dead_target_is_collected(self):
+        """Nothing reads the destination, so the write is still dropped."""
+        ops, name = self._index_put("dead_target")
+
+        survivors = self._run(ops, output_names=[])
+
+        self.assertNotIn(name, survivors)
+        self.assertNotIn("values", survivors)
+
+    def test_impure_fallback_into_dead_target_is_kept(self):
+        """An impure fallback stays although the buffer it writes is dead.
+
+        ``normal_`` is a Spyre fallback op: it mutates its argument and also
+        advances the generator, so the write going unread does not make the
+        call dead. Judging it by the one name it declares would drop it and
+        shift the RNG stream for every random op after it.
+        """
+        target = TestDeadMutationElimination._make_buffer("rng_target")
+        before = len(V.graph.operations)
+        FallbackKernel.create(
+            torch.ops.aten.normal_.default, TensorBox(StorageBox(target))
+        )
+        ops = V.graph.operations[before:]
+        self.assertEqual(
+            [list(op.get_mutation_names()) for op in ops],
+            [["rng_target"]],
+            "fixture drifted",
+        )
+        self.assertTrue(all(op.has_side_effects() for op in ops), "not impure")
+
+        survivors = self._run([target, *ops], output_names=[])
+
+        self.assertLessEqual({op.get_name() for op in ops}, survivors)
+
+
+class TestUnusedCollectiveIsKept(unittest.TestCase):
+    """An unused collective or wait survives, and so does what it reads.
+
+    Every rank takes part in a collective, so dropping one on a rank whose
+    result goes unread would leave the other ranks waiting for it. The nodes
+    are built with the upstream ``_CollectiveKernel`` factories, as the
+    lowerings build them, so they are ``FallbackKernel``s whose
+    ``has_side_effects()`` is True; this pins that the pass honours it.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # The factories run the op's Meta impl under the graph's fake mode.
+        stack.enter_context(V.set_fake_mode(FakeTensorMode()))
+        stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        # process_kernel reads the FX node being lowered (newer torch checks
+        # its target); a lowering always has one, so provide the graph's own.
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
+
+    def _collective_ops(self, build):
+        """Run ``build`` and return the operations it registered."""
+        before = len(V.graph.operations)
+        build()
+        return V.graph.operations[before:]
+
+    def test_unused_all_reduce_is_kept(self):
+        producer = TestDeadMutationElimination._make_buffer("producer")
+        operand = TensorBox(StorageBox(producer))
+        ops = self._collective_ops(
+            lambda: AllReduceKernel.create_inplace(
+                _c10d.all_reduce_.default, operand, "sum", "group0"
+            )
+        )
+        names = {op.get_name() for op in ops}
+
+        V.graph.operations = [producer, *ops]
+        V.graph.get_output_names = lambda: []
+        deadcode_elimination(V.graph)
+        survivors = {op.get_name() for op in V.graph.operations}
+
+        self.assertEqual(survivors, {"producer"} | names)
+
+    def test_unused_all_gather_and_wait_are_kept(self):
+        producer = TestDeadMutationElimination._make_buffer("producer")
+        operand = TensorBox(StorageBox(producer))
+
+        def build():
+            gathered = AllGatherKernel.create_out_of_place(
+                _c10d.all_gather_into_tensor.default, operand, 2, "group0"
+            )
+            WaitKernel.create_wait(
+                _c10d.wait_tensor.default, TensorBox.create(gathered)
+            )
+
+        ops = self._collective_ops(build)
+        self.assertEqual(
+            [type(op) for op in ops], [AllGatherKernel, WaitKernel], "fixture drifted"
+        )
+
+        V.graph.operations = [producer, *ops]
+        V.graph.get_output_names = lambda: []
+        deadcode_elimination(V.graph)
+        survivors = {op.get_name() for op in V.graph.operations}
+
+        self.assertEqual(survivors, {"producer"} | {op.get_name() for op in ops})
+
+
 class TestForEachTileCarryIsCollected(unittest.TestCase):
     """A ``for_each_tile`` carry nobody reads is collected.
 
@@ -208,8 +370,13 @@ class TestForEachTileCarryIsCollected(unittest.TestCase):
         X = cached_xavier((M, K)).to(DEVICE_NAME)
         Y = cached_xavier((K, N)).to(DEVICE_NAME)
         # Patch the post-splice call site: the pipeline's own earlier call runs
-        # before the carry scaffolding exists.
-        with patch.object(for_each_tile_lowering, "deadcode_elimination", record):
+        # before the carry scaffolding exists. The cache is off because a compile
+        # served from the FX graph cache never runs the splice, so the recorder
+        # would see nothing (the test passed on a cold cache and failed on a warm one).
+        with (
+            patch.object(for_each_tile_lowering, "deadcode_elimination", record),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             torch.compile(split_m_fn, backend="inductor", fullgraph=True)(X, Y)
 
         self.assertTrue(tallies, "post-splice deadcode_elimination never ran")

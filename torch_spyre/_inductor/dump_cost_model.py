@@ -17,6 +17,7 @@
 import os
 
 from .cost_model import explain
+from .loop_node import all_ops
 from .cost_features import (
     _int as _int,
     _prod_ints as _prod_ints,
@@ -33,7 +34,6 @@ from .cost_features import (
     _tiled_symbols_per_level as _tiled_symbols_per_level,
     _dep_index as _dep_index,
     _level_loop_vars as _level_loop_vars,
-    _stamped_advances as _stamped_advances,
     _loop_var_advances as _loop_var_advances,
     _loop_factor_for_index as _loop_factor_for_index,
     _tiled_flag as _tiled_flag,
@@ -124,14 +124,15 @@ def dump_cost_model(operations: list) -> None:
     """Print per-op cost features + predicted latency; no-op unless SPYRE_DUMP_COST.
 
     Treats the whole op list as one bundle (matching full fusion, e.g. softmax);
-    for single-op example programs this is just that op.
+    for single-op example programs this is just that op. A LoopNode's body ops
+    are dumped in program order, as the flat list was.
     """
     if not cost_dump_enabled():
         return
     from .dump_common import banner, emit
 
     try:
-        feats = extract_features(operations)
+        feats = extract_features(list(all_ops(operations)))
         _record_last_io(feats)
         bar = banner("Cost model features + prediction (after pre-scheduling)")
         emit(f"{bar}\n{explain(feats)}\n")

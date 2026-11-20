@@ -1541,6 +1541,141 @@ def test_shared_producer_gets_two_restickify_nodes():
     )
 
 
+def _stale_read_writes_memos(run, prefill_before=()):
+    """Run ``run()`` and, after every pre-scheduling pass, compare each memoized
+    op_read_writes entry with a fresh extraction. Returns ``(checked, stale)``:
+    the per-pass count of entries compared, and the entries that differed.
+
+    Before each pass named in ``prefill_before`` every op's memo is filled, as an
+    earlier pass may have done (``splice_while_loops`` does for tiled ops), so an
+    in-place edit that pass makes is checked even on a graph where nothing
+    memoizes before it."""
+    from torch._inductor.ir import ComputedBuffer
+
+    from torch_spyre._inductor.loop_node import all_ops
+    from torch_spyre._inductor.pass_utils import op_read_writes
+    from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+    run_one_pass = CustomPreSchedulingPasses._run_one_pass
+    checked: dict[str, int] = {}
+    stale: list[str] = []
+
+    def checking_run_one_pass(self, graph, pipeline, pass_fn, pass_name):
+        if pass_name in prefill_before:
+            for op in all_ops(graph.operations):
+                if isinstance(op, ComputedBuffer):
+                    op_read_writes(op)
+        run_one_pass(self, graph, pipeline, pass_fn, pass_name)
+        for op in all_ops(graph.operations):
+            cached = op.__dict__.get("_ts_cached_read_writes")
+            if cached is None or not isinstance(op, ComputedBuffer):
+                continue
+            checked[pass_name] = checked.get(pass_name, 0) + 1
+            if cached != op.get_read_writes():
+                stale.append(f"{op.get_name()} after {pass_name}")
+
+    with patch.object(
+        CustomPreSchedulingPasses, "_run_one_pass", checking_run_one_pass
+    ):
+        run()
+    return checked, stale
+
+
+def test_no_pass_leaves_a_stale_read_writes_memo():
+    """op_read_writes memoizes on the op instance and is filled from the layout
+    passes onwards, so a pass that changes what an op reads in place must call
+    invalidate_op_read_writes. After every pre-scheduling pass, each memoized
+    entry must still equal a fresh extraction. insert_restickify is the case
+    this graph exercises: it rewires each transpose's read to its restickify
+    buffer on the same instance."""
+    (x, za, zb), fn = _shared_producer_two_restickify_case()
+    checked, stale = _stale_read_writes_memos(
+        lambda: _compile_and_run(fn, (x, za, zb), DEVICE)
+    )
+    # Not vacuous: entries exist by the time insert_restickify edits the ops.
+    assert checked.get("insert_restickify"), checked
+    assert not stale, stale
+
+
+def test_eager_view_input_rewrite_keeps_read_writes_memos_valid():
+    """propagate_spyre_tensor_layouts rewrites a sub-region view input's host
+    layout in place, to its base's size with the view's stride and offset, and
+    leaves readers' memos alone. That is only sound while the rewrite keeps every
+    read index, so check memos filled before the pass against fresh ones."""
+    import torch_spyre._inductor.propagate_layouts as _propagate_layouts
+
+    torch.manual_seed(0)
+    base = torch.randn(130, 256, dtype=torch.float16)
+    view = base.to(DEVICE)[2:]
+    assert view._base is not None and view.storage_offset() != 0
+
+    def fn(x):
+        return x * 2 + 1
+
+    out: dict[str, torch.Tensor] = {}
+    rewritten: list[str] = []
+    rewrite = _propagate_layouts._eager_view_input_layout
+
+    def recording_rewrite(real_input, ptl, name):
+        new_layout = rewrite(real_input, ptl, name)
+        if new_layout is not None:
+            rewritten.append(name)
+        return new_layout
+
+    def run():
+        torch._dynamo.reset()
+        with patch.object(
+            _propagate_layouts, "_eager_view_input_layout", recording_rewrite
+        ):
+            out["y"] = torch.compile(fn)(view).cpu()
+
+    pass_name = "propagate_spyre_tensor_layouts"
+    checked, stale = _stale_read_writes_memos(run, prefill_before=(pass_name,))
+    # Not vacuous: the input was rewritten after its reader was memoized.
+    assert rewritten, rewritten
+    assert checked.get(pass_name), checked
+    assert not stale, stale
+    torch.testing.assert_close(out["y"], fn(base[2:]), atol=0.1, rtol=0.1)
+
+
+def test_copy_back_elision_leaves_no_stale_read_writes_memo():
+    """Eliding a copy-back points its producer at the input's mutation layout
+    in place, after propagate_spyre_tensor_layouts has memoized the producer,
+    and leaves the memo alone: the elision requires the same host layout, so
+    the write index must not change."""
+    import torch_spyre._inductor.propagate_layouts as _propagate_layouts
+
+    torch.manual_seed(1)
+    x, y, z, w = (torch.randn(128, 128, dtype=torch.float16) for _ in range(4))
+
+    def fn(x, y, z, w):
+        torch.mm(x, y, out=z)
+        return z + w
+
+    expected = fn(x, y, z.clone(), w)
+    out: dict[str, torch.Tensor] = {}
+    removed: list[int] = []
+    resolve = _propagate_layouts._resolve_copy_back_candidates
+
+    def counting_resolve(operations):
+        before = len(operations)
+        resolve(operations)
+        removed.append(before - len(operations))
+
+    def run():
+        with patch.object(
+            _propagate_layouts, "_resolve_copy_back_candidates", counting_resolve
+        ):
+            out["y"] = _compile_and_run(fn, (x, y, z, w), DEVICE)
+
+    checked, stale = _stale_read_writes_memos(run)
+    # Not vacuous: the copy-back was elided after its producer was memoized.
+    assert sum(removed) == 1, removed
+    assert checked.get("propagate_spyre_tensor_layouts"), checked
+    assert not stale, stale
+    torch.testing.assert_close(out["y"], expected, atol=0.1, rtol=0.1)
+
+
 # ------- Restickify padding: strict (distinct values + torch.equal) ---------
 #
 # The tolerance-based tests above compare ``randn`` data with atol=rtol=0.1,
@@ -1625,7 +1760,12 @@ def test_strict_senuint32_transpose_clone():
 
     x = torch.randint(0, 1000, (64, 64), dtype=torch.int64)
     base = _CSTL(list(x.size()), torch.int64)
-    stl = _CSTL(list(base.device_size), list(base.stride_map), DataFormats.SENUINT32)
+    stl = _CSTL(
+        list(base.device_size),
+        list(base.stride_map),
+        DataFormats.SENUINT32,
+        base.valid_elements,
+    )
     xd = x.to("spyre", device_layout=stl)
     assert torch.equal(xd.cpu(), x), "SENUINT32 round trip is not exact"
 
@@ -1686,6 +1826,40 @@ SPLIT_T0_LAST = [
 def test_strict_transpose_0_last_clone(shape, dtype):
     x = _arange(*shape, dtype=dtype)
     _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
+# Regression coverage for issue #5216: the second half of x.split(704, dim=-1)
+# reads the source at host offset 704, which simplifies the device stick
+# expression Mod(d0 + 704, stick_size) down to Mod(d0, stick_size) because 704
+# is an exact multiple of every supported stick size (32 and 64 elements) --
+# but compute_restickify_target_layout's coord/expr offset-compatibility check
+# compared the chunk's raw, unreduced offset (704) against the already-reduced
+# expression's offset (0) and rejected the restickify as misaligned even though
+# 704 is itself stick-aligned. The downstream .transpose(0, 1) forces the stick
+# onto a different axis than the source, so this is the only geometry that
+# reaches that check (a pointwise/sum consumer with no transpose keeps the same
+# stick axis and never needs a restickify, regardless of chunk offset).
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+def test_split_offset_transpose_restickify(dtype):
+    # Small dyadic values survive device conversion exactly for every dtype
+    # here; a wrong row or chunk must fail an exact comparison, not hide in a
+    # tolerance.
+    gen = torch.Generator().manual_seed(5216)
+    if dtype.is_floating_point:
+        x = torch.randint(-16, 17, (256, 1408), generator=gen).to(dtype) / 8
+    else:
+        x = torch.randint(-1000, 1000, (256, 1408), generator=gen, dtype=dtype)
+
+    def fn(t):
+        chunks = t.split(704, dim=-1)
+        return torch.stack([c.transpose(0, 1) for c in chunks])
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to(DEVICE)).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
 
 
 # -------- torch.cat on the target-model shapes (#1094) ----------
@@ -2621,17 +2795,17 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 #
 # A restickify whose old stick has host size 1 collapses one operand's
 # within-stick coordinate to a constant, so that operand's STL carries the old
-# stick as a size-1 ``stride_map == -1`` singleton dim, while the restore
+# stick as a size-1 ``stride_map == 0`` singleton dim, while the restore
 # (_restickify_restore_elided_dim) rebuilds the descriptor to sweep a full
 # 64-plane stick.  The grow is two coupled halves: padding._pad_elided_dim
-# prepends an outermost size-64 ``-1`` gap dim to the (intact) operand's STL so
+# prepends an outermost size-64 ``0`` gap dim to the (intact) operand's STL so
 # the allocation covers the sweep, and the restore REUSES that dim (binds the
 # shared iteration symbol to it) rather than inserting its own, keeping the
 # descriptor total equal to the grown allocation.  These tests pin each half
 # against the real STL / OpSpec APIs, without a device (the functional
 # lane-displacement checks are the *_stick_crossing_* tests above).
 _SIZE1_COLLAPSED_DEVICE_SIZE = [67, 1, 1, 64]
-_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, -1, 1]
+_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, 0, 1]
 _SIZE1_HOST_SIZE = [1, 67, 7]
 _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
@@ -2650,6 +2824,7 @@ def test_size1_grow_prepends_size64_gap_dim():
         list(_SIZE1_COLLAPSED_DEVICE_SIZE),
         list(_SIZE1_COLLAPSED_STRIDE_MAP),
         DataFormats.SEN169_FP16,
+        {(0,): 67, (1, 3): 7, (2,): 1},
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(
@@ -2669,10 +2844,10 @@ def test_size1_grow_prepends_size64_gap_dim():
     _pad_elided_dim(buf)
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map -1) is prepended; the original
+    # An outermost size-64 gap dim (stride_map 0) is prepended; the original
     # device dims follow unchanged.
     assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
     # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])
@@ -2836,9 +3011,15 @@ def test_nonstick_reorder_pointwise_into_matmul():
     x = torch.randn(2, 55, 99, dtype=torch.float16)
     w = torch.randn(2, 99, 128, dtype=torch.float16)
 
+    # Transfer x with identity dim order so device_size=[55, 2, 2, 64] —
+    # the NDO pass must move 55 into the sandwich slot rather than the
+    # default layout doing it automatically.
+    x_layout = SpyreTensorLayout(
+        [2, 55, 99], [55 * 99, 99, 1], torch.float16, [0, 1, 2]
+    )
     spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
         fn,
-        x.to(DEVICE),
+        x.to(device_layout=x_layout),
         w.to(DEVICE),
     )
     cpu_result = fn(x, w)
@@ -3041,6 +3222,7 @@ def test_compute_restickify_target_layout_factorized_new_sd():
         [8, 2, 1, 64],
         [128, 64, 1024, 1],
         DataFormats.SEN169_FP16,
+        {(0,): 8, (2,): 1, (1, 3): 128},
     )
     # host_coords (ic): L maps to lq, H to floor(k/128), D to Mod(k, 128).
     ic = [lq, sympy.floor(k / 128), sympy.Mod(k, 128)]
@@ -3058,7 +3240,7 @@ def test_compute_restickify_target_layout_factorized_new_sd():
     # so the old code returned None here.  The new code must succeed.
     target_stick_expr = sympy.floor(k / 128)
     result = compute_restickify_target_layout(
-        stl, host, target_stick_expr, ic, idc, arg=arg, reduction_type="test", label="x"
+        stl, host, target_stick_expr, ic, idc, arg=arg, label="x"
     )
     assert result is not None, (
         "compute_restickify_target_layout returned None for factorized "

@@ -136,14 +136,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
-            "that differ from the CPU result (#2847)"
-        ),
-    )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
         """Eager fp32→fp16 cast on a Spyre tensor."""
@@ -164,7 +156,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
@@ -194,15 +185,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc02_half")
@@ -221,15 +203,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
         x = cached_randn(
@@ -340,14 +313,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="exp3du_x")
@@ -361,14 +326,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="exp4du_x")
@@ -516,7 +473,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -529,14 +485,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
         x = cached_randn((2, 4, 16), differentiation="imp3du_x")
@@ -549,14 +497,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "about half the elements come back wrong when the last dim (16) "
-            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
-        ),
-    )
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
         x = cached_randn((2, 2, 4, 16), differentiation="imp4du_x")
@@ -766,6 +706,52 @@ class TestImplicitPromotion(unittest.TestCase):
             return a + scalar_fp32
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_fp16_with_0dim_fp32_tensor_keeps_fp16(self):
+        """fp16 tensor (op) 0-dim fp32 tensor gives eager's dtype and values (#6061).
+
+        Torch keeps the result fp16 because a 0-dim tensor does not promote a
+        dimensioned one of the same category. The lowerings used to broadcast
+        first and return fp32, which was also read back permuted (#4393).
+        ``compare_with_cpu`` does not check dtype, so it is checked here.
+        """
+        ops = {
+            "add": torch.add,
+            "sub": torch.sub,
+            "mul": torch.mul,
+            "div": torch.div,
+            "floor_divide": torch.floor_divide,
+            "maximum": torch.maximum,
+            "minimum": torch.minimum,
+            "eq": torch.eq,
+            "ne": torch.ne,
+            "lt": torch.lt,
+            "le": torch.le,
+            "gt": torch.gt,
+            "ge": torch.ge,
+        }
+        # Whole numbers >= 1: exact in fp16 and never zero, so division is safe
+        # in either operand order and comparisons have no rounding edge cases.
+        x = (torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)) + 1).to(
+            torch.float16
+        )
+        s = torch.tensor(3.0, dtype=torch.float32)
+        for name, op in ops.items():
+            for order in ("tensor_first", "scalar_first"):
+
+                def fn(a, b, op=op, order=order):
+                    return op(a, b) if order == "tensor_first" else op(b, a)
+
+                expected = fn(x, s)
+                for mode in ("compiled", "eager"):
+                    with self.subTest(op=name, order=order, mode=mode):
+                        run = torch.compile(fn) if mode == "compiled" else fn
+                        got = run(x.to("spyre"), s.to("spyre")).cpu()
+                        self.assertEqual(got.dtype, expected.dtype)
+                        # Device fp16 division can be 1 ulp off; every other op is
+                        # exact. A permuted readback would be off by whole numbers.
+                        tol = 1e-2 if name == "div" else 0
+                        torch.testing.assert_close(got, expected, atol=tol, rtol=tol)
 
 
 class TestDataTransfer(unittest.TestCase):
@@ -977,6 +963,48 @@ class TestUnsupportedGates(unittest.TestCase):
         x = torch.randn(2, 2, dtype=torch.float64)
         with self.assertRaises(RuntimeError):
             x.to("spyre")
+
+    def test_kernel_to_dtype_without_src_dtype_raises_unsupported(self):
+        """A kernel cast without src_dtype is rejected with Unsupported (#5783).
+
+        OpsHandler.to_dtype declares src_dtype optional, and some upstream
+        Inductor lowerings omit it. Spyre picks the hardware op from the
+        (src_dtype, dtype) pair, so it must reject the cast with a clear
+        message instead of failing with TypeError.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        for kwargs in ({}, {"use_compute_types": False}, {"src_dtype": None}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(Unsupported, "without a source dtype"):
+                    SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
+
+    @_rejected(r"aten::sort\.values_stable", "#4500")
+    def test_compiled_conversion_of_multi_output_op_does_not_crash(self):
+        """A dtype conversion of a multi-output op's result compiles (#5831).
+
+        argsort lowers through aten.sort, whose FX node carries a (values,
+        indices) tuple as meta["val"]. split_multi_ops called .to() on it and
+        crashed with "'tuple' object has no attribute 'to'". With the fix the
+        graph compiles, and the run stops at aten.sort, which has no Spyre
+        kernel yet (#4500).
+
+        TODO(#4500): once aten.sort is supported, drop @_rejected so the
+        compiled result is compared with the CPU.
+
+        Caches are off: a cached graph would skip split_multi_ops and hide the
+        bug.
+        """
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float16)
+
+        def fn(a):
+            return torch.argsort(a, dim=1).to(torch.float16)
+
+        with torch._inductor.config.patch(force_disable_caches=True):
+            out = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+        torch.testing.assert_close(out, fn(x))
 
 
 class TestModelIntegration(unittest.TestCase):

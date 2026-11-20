@@ -31,7 +31,8 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
-from .loop_info import ReadCopyElisionRecord
+from .read_copy_elision import ReadCopyElisionRecord
+from .loop_node import move_before
 from .errors import Unsupported
 from .pass_utils import (
     replace_computed_buffer_body,
@@ -450,23 +451,36 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
-def _lower_fx_node(node, gl, ops, idx):
+def _lower_fx_node(node, gl, ops, before):
     """Lower an FX node to a buffer and insert it into operations list.
+
+    A lowering may register more than one operation: a host fallback registers
+    a FallbackKernel and then the MultiOutput that reads it, and a lowering can
+    realize helper buffers before its result. register_operation appends them
+    all at the end of gl.operations, after the consumer being split, so all of
+    them are moved to just before ``before`` in registration order to keep the list
+    in topological order.
 
     Args:
         node: FX node to lower
         gl: GraphLowering instance
         ops: Operations list to insert into
-        idx: Index position for insertion
+        before: The op being split; the new ops go right before it, in the list
+            that holds it (the loop body, when it is in one)
 
     Returns:
         The created buffer
     """
+    start = len(gl.operations)
     tb = gl.run_node(node)
     gl.env[node] = tb  # run_node does not record it in the env
+    # buf is the lowering's result, not every operation it registered: for a
+    # host fallback it is the MultiOutput, registered after its FallbackKernel.
+    # new_ops below holds all of them, so the whole group moves together.
     buf = tb.data.data
-    gl.operations.remove(buf)
-    ops.insert(idx, buf)
+    new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
+    for new_op in new_ops:
+        move_before(ops, before, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
     return buf
 
@@ -477,7 +491,7 @@ def _make_intermediate_bufs(
     vid_to_bufname,
     layout,
     operations,
-    insert_idx,
+    before,
     gl,
     orig_node,
     orig_buffer,
@@ -502,7 +516,7 @@ def _make_intermediate_bufs(
         vid_to_bufname: Mapping from value ID to buffer name (updated)
         layout: Layout of the original fused operation
         operations: List of operations to insert into
-        insert_idx: Starting index for insertion
+        before: The op being split; the new buffers go right before it
         gl: GraphLowering instance
         orig_node: Original FX node being split
         orig_buffer: Original ComputedBuffer being split
@@ -561,13 +575,11 @@ def _make_intermediate_bufs(
                 inherit_origins=False,
             )
             # Move the buffer to our desired position, then continue with it wrapped.
-            gl.operations.remove(new_buf)
-            operations.insert(insert_idx, new_buf)
+            move_before(operations, before, new_buf)
             buf_name = new_buf.get_name()
             vid_to_bufname[vid] = buf_name
             # Track this materialized constant for the handler's constant_map.
             constant_map[(fill_value, out_dtype)] = buf_name
-            insert_idx += 1
             continue
 
         def assert_fx_node(v):
@@ -588,14 +600,17 @@ def _make_intermediate_bufs(
             new_node = gl.graph.create_node("call_function", target, args, clean_kw)
         _set_split_child_provenance(orig_node, new_node, target)
 
-        # Propagate metadata for shape inference
-        if input_nodes and "val" in input_nodes[0].meta:
-            new_node.meta["val"] = input_nodes[0].meta["val"].to(out_dtype)
+        # Propagate metadata for shape inference. The input's val is a tuple
+        # when the input is a multi-output op (aten.sort for argsort, topk,
+        # min/max with indices); fall back to the original node's val then.
+        input_val = input_nodes[0].meta.get("val") if input_nodes else None
+        if isinstance(input_val, torch.Tensor):
+            new_node.meta["val"] = input_val.to(out_dtype)
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
-        # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
-        new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
+        # Lower the FX node; _lower_fx_node moves what it registers before ``before``.
+        new_buf = _lower_fx_node(new_node, gl, operations, before)
         # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
@@ -613,7 +628,6 @@ def _make_intermediate_bufs(
         if op_name not in op_queues:
             op_queues[op_name] = collections.deque()
         op_queues[op_name].append(buf_name)
-        insert_idx += 1
 
     return constant_map, op_queues
 
@@ -894,9 +908,7 @@ def split_multi_ops(graph: GraphLowering):
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
 
-        try:
-            insert_idx = operations.index(op)
-        except ValueError:
+        if op not in operations:
             continue
 
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
@@ -948,7 +960,7 @@ def split_multi_ops(graph: GraphLowering):
             bufname_map,
             layout,
             operations,
-            insert_idx,
+            op,
             gl,
             orig_node,
             op,

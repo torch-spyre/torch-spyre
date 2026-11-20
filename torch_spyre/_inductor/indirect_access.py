@@ -98,7 +98,7 @@ def get_indirect_dim_symbols(
     for i in range(len(index_arg.device_coordinates) - 2, -1, -1):
         coord = index_arg.device_coordinates[i]
         if hasattr(coord, "free_symbols"):
-            expr = coord.subs(symbol_mapping)
+            expr = coord.xreplace(symbol_mapping)
             for sym in expr.free_symbols:
                 if sym not in seen:
                     seen.add(sym)
@@ -143,7 +143,7 @@ def _get_index_active_dims_for_value(
     for coord in index_arg.device_coordinates:
         if not hasattr(coord, "free_symbols"):
             continue
-        for sym in coord.subs(symbol_mapping).free_symbols:
+        for sym in coord.xreplace(symbol_mapping).free_symbols:
             if sym not in seen:
                 seen.add(sym)
                 active.append(sym)

@@ -30,14 +30,14 @@ from torch_spyre._inductor.loop_facts import (
     loop_depth,
     scheduler_enclosing_loops,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.scheduler import _loop_count, _loop_group_id
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 
 
 def _info(gid, counts, tiled=None, tiled_red=None):
     n = len(counts) if hasattr(counts, "__len__") else 0
-    return CoarseTileInfo(
+    return LoopInfo(
         loop_group_id=gid,
         loop_count=counts,
         loop_tiled_dims=tiled if tiled is not None else [[] for _ in range(n)],
@@ -120,7 +120,7 @@ def test_scheduler_node_without_scheduler_nodes_yields_empty():
 
 def test_default_tiled_reduction_dims_is_still_a_loop():
     # Like test_restickify_cost_model: loop_tiled_reduction_dims left empty.
-    op = _op(CoarseTileInfo((0,), [32], [[]]))
+    op = _op(LoopInfo((0,), [32], [[]]))
     (lvl,) = enclosing_loops(op)
     assert lvl.trip_count == 32
     assert lvl.tiled_dims == () and lvl.tiled_reduction_dims == ()
@@ -137,7 +137,7 @@ def test_agrees_with_existing_readers():
         _op(_info((0,), [4], [[1]], [[]])),
         _op(_info((0, 1), [2, 8], [[0], [1]], [[], [0]])),
         _op(_info((3, 0, 2), [2, 3, 4], [[0], [], [1]], [[], [], []])),
-        _op(CoarseTileInfo((0,), [32], [[]])),
+        _op(LoopInfo((0,), [32], [[]])),
     ]
     for op in ops:
         path = counted_loop_group_path(op)
@@ -187,3 +187,61 @@ def test_scheduler_loop_count_missing_depth_is_loud():
     assert _loop_group_id(short) is None
     with pytest.raises(AssertionError, match="no loop_count for depth 0"):
         _loop_count(short, 0)
+
+
+class TestBroadcastBatchVars:
+    """``pass_utils.broadcast_batch_vars`` reads the tiled dims through the
+    accessors.
+
+    It is kept on purpose, and so is this test. ``find_matmul_generated_var``
+    calls it when given ``op`` (``propagate_layouts`` and ``read_copy_elision``
+    both pass it) as a second line of defence for when
+    ``coarse_tile._check_matmul_broadcast_batch_tiling``, which rejects its input
+    first, is loosened or bypassed. No compiled test reaches it (265 matmul,
+    attention and loop tests never called it), so it is pinned here on stand-in
+    deps: a ``SimpleNamespace`` index cannot tell a real ``MemoryDep`` from a stub.
+    """
+
+    @staticmethod
+    def _op(loop_info):
+        return SimpleNamespace(
+            loop_info=loop_info,
+            data=SimpleNamespace(ranges=[sympy.Integer(8), sympy.Integer(16)]),
+        )
+
+    @staticmethod
+    def _info(tiled):
+        return LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[tiled],
+            loop_tiled_reduction_dims=[[]],
+        )
+
+    @staticmethod
+    def _deps(x_vars):
+        d0, d1 = sympy.symbols("d0 d1")
+        out = SimpleNamespace(var_names=[d0, d1], index=d0 * 16 + d1)
+        x = SimpleNamespace(index=sum(x_vars, sympy.Integer(0)))
+        return x, out, d0, d1
+
+    def test_a_tiled_dim_x_is_broadcast_over_is_returned(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        d0, d1 = sympy.symbols("d0 d1")
+        x, out, _, _ = self._deps([d1])  # x has no d0: broadcast over dim 0
+        assert broadcast_batch_vars(self._op(self._info([0])), x, out) == {d0}
+
+    def test_a_tiled_dim_x_also_carries_is_not_returned(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        d0, d1 = sympy.symbols("d0 d1")
+        x, out, _, _ = self._deps([d0, d1])
+        assert broadcast_batch_vars(self._op(self._info([0])), x, out) == set()
+
+    def test_an_untiled_op_returns_nothing(self):
+        from torch_spyre._inductor.pass_utils import broadcast_batch_vars
+
+        x, out, _, _ = self._deps([sympy.Symbol("d1")])
+        assert broadcast_batch_vars(self._op(self._info([])), x, out) == set()
+        assert broadcast_batch_vars(self._op(None), x, out) == set()

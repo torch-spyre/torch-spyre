@@ -21,6 +21,7 @@
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/as_strided_cpu_dispatch.h>
+#include <ATen/ops/as_strided_native.h>
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
@@ -30,9 +31,48 @@
 
 #include <vector>
 
+#include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
+
+// A view over sharded storage must reproduce the base tensor exactly. The
+// storage's DataPtr context carries the sharding record of the base tensor,
+// and the sharded copy path maps view elements onto shards through that
+// record; any other view -- even a contiguous prefix slice from offset zero,
+// which passes the copy path's contiguity checks -- would read the wrong
+// elements (the first N elements of every shard instead of the shards that
+// back the view). Identity views (alias, detach, as_strided of the base
+// tensor itself) keep the mapping and are allowed.
+//
+// Templated over both int64_t and SymInt element types so the symbolic
+// alias path is guarded too; comparisons stay symbolic and are guarded by
+// expect_true.
+template <typename SizeVec, typename StrideVec>
+static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
+                               const StrideVec& strides,
+                               const c10::SymInt& storage_offset) {
+  if (!spyre_is_sharded(self)) return;
+  // Rank mismatch must fail before the comparison loop: SymBool's operator&
+  // does not short-circuit, so folding the rank check into the chain below
+  // would let a rank-increasing view (e.g. unsqueeze) index past the base
+  // tensor's sizes/strides, and SymIntArrayRef::operator[] is unchecked in
+  // release builds.
+  const bool same_rank = static_cast<int64_t>(sizes.size()) == self.dim() &&
+                         static_cast<int64_t>(strides.size()) == self.dim();
+  c10::SymBool identity = storage_offset == self.sym_storage_offset();
+  if (same_rank) {
+    for (const auto i : c10::irange(self.dim())) {
+      identity = identity & (c10::SymInt(sizes[i]) == self.sym_sizes()[i]) &
+                 (c10::SymInt(strides[i]) == self.sym_strides()[i]);
+    }
+  }
+  TORCH_CHECK(same_rank && identity.expect_true(__FILE__, __LINE__),
+              "views of sharded Spyre tensors are not supported: only views "
+              "that reproduce the base tensor exactly (same sizes, strides "
+              "and storage offset) keep the element-to-shard mapping. Copy "
+              "the tensor to the CPU and take the view there instead.");
+}
 
 //
 // templated for ArrayRef<int64_t> and SmallVector<int64_t> use cases
@@ -44,6 +84,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   // caller should make sure that sizes and strides are valid for self
   // (storage is sufficient, strides are non-negative, strides and sizes array
   // size is the same)
+  check_sharded_view(self, sizes, strides, self.storage_offset());
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout stl = orig_impl->spyre_layout;
   at::Tensor self_;
@@ -70,6 +111,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   // caller should make sure that sizes and strides are valid for self
   // (storage is sufficient, strides are non-negative, strides and sizes array
   // size is the same)
+  check_sharded_view(self, sizes, strides, self.sym_storage_offset());
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout stl = orig_impl->spyre_layout;
   at::Tensor self_;
@@ -121,12 +163,24 @@ at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
   return as_strided_with_layout(self, size, stride, storage_offset_, stl);
 }
 
+// In-place as_strided_ changes tensor metadata without going through the
+// view constructors, so it needs its own guard; the copy path additionally
+// validates the tensor against the recorded allocation shape.
+const at::Tensor& spyre_as_strided_(
+    const at::Tensor& self, c10::SymIntArrayRef size,
+    c10::SymIntArrayRef stride, std::optional<c10::SymInt> storage_offset_) {
+  check_sharded_view(self, size, stride,
+                     storage_offset_.value_or(self.sym_storage_offset()));
+  return at::native::as_strided__symint(self, size, stride, storage_offset_);
+}
+
 at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   c10::IntArrayRef stride,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout) {
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   auto storage_offset = storage_offset_.value_or(self.storage_offset());
+  check_sharded_view(self, size, stride, storage_offset);
   auto result = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
       self.dtype());
@@ -175,6 +229,8 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   }
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
+  check_sharded_view(self, size, stride,
+                     self.sym_storage_offset() + offset_increment);
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
       c10::Storage(self.storage()), self.key_set(), self.dtype());
   auto* spyre_tensor_impl_ =
@@ -225,6 +281,7 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
   new_strides.push_back(original_stride);
 
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  check_sharded_view(self, new_sizes, new_strides, self.storage_offset());
   at::Tensor result = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
       self.dtype());
@@ -246,6 +303,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_reshape_alias", TORCH_FN(spyre_reshape_alias));
   m.impl("alias", TORCH_FN(spyre_alias));
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
+  m.impl("as_strided_", TORCH_FN(spyre_as_strided_));
   m.impl("unfold", TORCH_FN(spyre_unfold));
 }
 

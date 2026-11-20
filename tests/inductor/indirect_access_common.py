@@ -89,10 +89,15 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
     stick_count = (last + eps - 1) // eps
     device_size = [*lead, stick_count, eps]
     stride_map = [math.prod(shape[k + 1 :]) for k in range(len(lead))] + [eps, 1]
+    n = len(device_size)
     return SpyreTensorLayout(
         device_size=device_size,
         stride_map=stride_map,
         device_dtype=get_device_dtype(dtype),
+        valid_elements={
+            **{(i,): lead[i] for i in range(len(lead))},
+            (n - 2, n - 1): last,
+        },
     )
 
 
@@ -127,7 +132,7 @@ def capture_op_specs():
     """
     captured: list[list] = []
 
-    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0, precomputed_key=None):  # noqa: ARG001
         captured.append(list(specs))
         return _NoopRunner()
 
@@ -143,7 +148,7 @@ def capture_sdsc_calls():
     """
     calls: list[tuple[str, list]] = []
 
-    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0, precomputed_key=None):  # noqa: ARG001
         calls.append((kernel_name, list(specs)))
         return _NoopRunner()
 
