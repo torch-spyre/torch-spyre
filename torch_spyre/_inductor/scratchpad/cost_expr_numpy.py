@@ -45,6 +45,12 @@ def _fold(binary: Callable[[Any, Any], Any]) -> Callable[..., Any]:
     return lambda *values: reduce(binary, values)
 
 
+def _floats(function: Callable[..., Any]) -> Callable[..., Any]:
+    """function over its operands as floats. numpy's log, exp and rint have no loop for
+    a column of exact ints, which is how the printer holds a buffer's candidates."""
+    return lambda *values: function(*(np.asarray(v, dtype=float) for v in values))
+
+
 def _piecewise(*parts: Any) -> Any:
     """A Piecewise from its arms' values and conditions, value then condition, in
     order: each entry takes the first arm whose condition holds, and NaN where none
@@ -63,14 +69,15 @@ def _relayout_charge(is_lx: Any, division: Any, *prices: Any) -> Any:
     """``RelayoutCharge(is_lx, division, *prices)``: is_lx times the price at the
     division, 0 at a division past the prices, the division rounded to the nearest
     integer as the class's own ``_imp_`` rounds it."""
-    index = np.rint(division)
+    index = _floats(np.rint)(division)
     priced = [index == i for i in range(len(prices))]
     return is_lx * (np.select(priced, prices, default=0.0) if priced else 0.0)
 
 
 # Add, Mul, Pow and the relationals are Python's own: a numpy array takes them entry by
 # entry, and a plain int stays exact at any size, where np.add(2**62, 2**62) wraps.
-# floor, ceiling, log and exp are numpy's, which take floats and not exact ints.
+# floor and ceiling are numpy's, and round a column of exact ints or of floats alike.
+# log and exp are numpy's over floats, so their operands are made floats first.
 NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Add: lambda *values: sum(values),
     sympy.Mul: lambda *values: math.prod(values),
@@ -80,8 +87,8 @@ NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Max: _fold(np.maximum),
     sympy.floor: np.floor,
     sympy.ceiling: np.ceil,
-    sympy.log: np.log,
-    sympy.exp: np.exp,
+    sympy.log: _floats(np.log),
+    sympy.exp: _floats(np.exp),
     sympy.Eq: operator.eq,
     sympy.Ne: operator.ne,
     sympy.Lt: operator.lt,

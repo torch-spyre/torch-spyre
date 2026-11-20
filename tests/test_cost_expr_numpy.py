@@ -23,7 +23,6 @@ from typing import Any
 import numpy as np
 import pytest
 import sympy
-from sympy.core.relational import Relational
 from sympy.logic.boolalg import Boolean
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
@@ -84,8 +83,9 @@ EXPRESSIONS = [
 ]
 
 
-# Expressions of the classes whose functions take floats: the table lowering's, which
-# the printer leaves to its print methods.
+# Expressions of the classes whose values are floats, or that the printer has no print
+# method for: the table lowering's, and the printer's where one buffer's candidates
+# decide the node.
 FLOAT_EXPRESSIONS = [
     sympy.Abs(x - y),
     sympy.floor(x / 4) + sympy.ceiling(y / 4),
@@ -95,10 +95,12 @@ FLOAT_EXPRESSIONS = [
 ]
 
 
+@pytest.mark.parametrize("dtype", [float, object])
 @pytest.mark.parametrize("expr", FLOAT_EXPRESSIONS, ids=str)
-def test_a_node_over_floats_is_sympys_value_at_every_entry(expr):
-    """Over a menu held as a float array, as the table lowering holds a list."""
-    env = {s: np.asarray(menu, dtype=float) for s, menu in MENU.items()}
+def test_a_node_over_floats_is_sympys_value_at_every_entry(expr, dtype):
+    """Over a menu held as a float array, as the table lowering holds a list, and as
+    an object array of exact ints, as the printer holds its candidates."""
+    env = {s: np.asarray(menu, dtype=dtype) for s, menu in MENU.items()}
     got = np.broadcast_to(_value(expr, env), (4,))
     for i in range(4):
         exact = _sympy_value(expr, {s: menu[i] for s, menu in MENU.items()})
@@ -117,6 +119,8 @@ def test_a_relayout_charge_is_its_literal_times_the_price_at_its_division():
     assert list(numpy_eval(expr, [is_lx, division, *prices])) == expected
     lists = [np.full(10, price) for price in prices]
     assert list(numpy_eval(expr, [is_lx, division, *lists])) == expected
+    exact = np.asarray([0, 1, 2, 3, 4] * 2, dtype=object)  # the printer's column
+    assert list(numpy_eval(expr, [is_lx, exact, *prices])) == expected
     unpriced = RelayoutCharge(sympy.Symbol("is_lx"), sympy.Symbol("division"))
     assert list(numpy_eval(unpriced, [is_lx, division])) == [0.0] * 10
 
@@ -236,39 +240,41 @@ def test_the_printer_evaluates_its_candidates_through_the_core(monkeypatch):
             assert values[i] == exact, (expr, i)
 
 
-def test_the_printer_evaluates_only_the_classes_it_did():
-    """The core has functions the printer does not use. A node of a class outside the
-    printer's own list, here Abs, has no candidate values, and neither has a node
-    above it, so the printer lowers them as it did before the core. A free decision,
-    here a residency literal, stops the evaluation the same way."""
+def test_the_printer_evaluates_every_class_the_core_has_a_function_for():
+    """The printer keeps no list of its own: a node has candidate values when the core
+    has a function for its class, here the classes with no print method (Abs, floor,
+    ceiling, exp, ITE) and those the print methods lower another way (log, Not). A
+    node of a class the core has no function for, here Mod, has none, and neither has
+    a node above it. A free decision, here a residency literal, stops the evaluation
+    the same way."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    printer, _ = _printer(cp_model.CpModel())
+    printer, (wrapper,) = _printer(cp_model.CpModel())
+    for expr in FLOAT_EXPRESSIONS:
+        owner, values = printer._candidate_values(expr)
+        assert owner is wrapper
+        values = np.broadcast_to(values, (4,))
+        for i in range(4):
+            exact = _sympy_value(expr, {s: menu[i] for s, menu in MENU.items()})
+            assert values[i] == pytest.approx(exact, rel=1e-12), (expr, i)
     resident = sympy.Symbol("resident", integer=True)
-    assert printer._candidate_values(sympy.Abs(x - 3)) is None
-    assert printer._candidate_values(sympy.Abs(x - 3) + y) is None
+    assert printer._candidate_values(sympy.Mod(x, 3)) is None
+    assert printer._candidate_values(sympy.Mod(x, 3) + y) is None
     assert printer._candidate_values(x * resident) is None
     assert printer._candidate_values(x * y) is not None
 
 
-def test_every_class_the_printer_evaluates_has_a_function():
-    """The printer's list of classes is its own and grows as the printer is taught
-    more cases. Each class on it, and each relational sympy can make, must have a
-    function in the core: a miss raises NotImplementedError, a RuntimeError, which the
-    solver's fallback answers with a solve that has no cost objective."""
-    relationals = set(Relational.ValidRelationOperator.values())
-    classes = set(cpsat_expr_printer._CANDIDATE_CLASSES) - {Relational} | relationals
-    assert len(classes) == len(cpsat_expr_printer._CANDIDATE_CLASSES) - 1 + 6
-    for cls in classes:
-        assert any(base in NUMPY_FUNC_MAP for base in cls.__mro__), cls.__name__
-
-
 def test_the_printer_lowers_the_same_costs_through_the_core():
     """Each expression that is a cost, not a condition, lowered by the printer has,
-    at every candidate of the division, the value sympy computes there."""
+    at every candidate of the division, the value sympy computes there. The printer's
+    rewrite drops a floor, and a log's floats make too wide a table to lower."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
     model = cp_model.CpModel()
     printer, (wrapper,) = _printer(model)
-    exprs = [expr for expr in EXPRESSIONS if not isinstance(expr, Boolean)]
+    exprs = [
+        expr
+        for expr in EXPRESSIONS + FLOAT_EXPRESSIONS
+        if not isinstance(expr, Boolean) and not expr.has(sympy.floor, sympy.log)
+    ]
     costs = [printer.convert(expr) for expr in exprs]
     for i in range(4):
         fixed = model.clone()

@@ -74,25 +74,6 @@ _operator_map = {
 }
 
 
-# The classes whose value over a buffer's candidates _evaluate_candidates computes with
-# the numpy core. The list is the printer's own, and grows as the printer is taught
-# more cases: it is not the core's map, which has functions for more (floor, log, ...).
-# A node of any other class is left to its print method. Every class here needs a
-# function in the core.
-_CANDIDATE_CLASSES = (
-    sympy.Add,
-    sympy.Mul,
-    sympy.Pow,
-    sympy.Min,
-    sympy.Max,
-    sympy.core.relational.Relational,
-    sympy.And,
-    sympy.Or,
-    sympy.Piecewise,
-    sympy.KroneckerDelta,
-)
-
-
 def _eq_fact(rel):
     """``(lhs, number)`` for ``Eq``/``Ne`` with a numeric side, else None."""
     lhs, rhs = rel.args
@@ -298,9 +279,10 @@ class _SympyExprToCpSat(Printer):
         owner = owners[0] if owners else None
         if any(other is not owner for other in owners):
             return None
-        if not isinstance(expr, _CANDIDATE_CLASSES):
-            return None
-        return owner, numpy_eval(expr, [value[1] for value in evaluated])
+        try:
+            return owner, numpy_eval(expr, [value[1] for value in evaluated])
+        except NotImplementedError:
+            return None  # No function in the core: left to the print method.
 
     def _division_table(self, expr):
         evaluated = self._candidate_values(expr)
