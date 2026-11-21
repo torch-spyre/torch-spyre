@@ -368,13 +368,111 @@ def test_a_child_solver_gets_its_share_of_the_cpus(monkeypatch):
 
     from torch_spyre._inductor import config as spyre_config
 
-    monkeypatch.setattr(spyre_config, "num_cpus", 64)  # get_cpu_count() honours it
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 4)
-    assert pp._solver_cpu_share(7) == 16  # 64 CPUs / 4 ranks, whatever the worker count
-    assert pp._solver_cpu_share(1) == 16
-    monkeypatch.setattr(dist, "is_initialized", lambda: False)
-    assert pp._solver_cpu_share(7) == 64  # one rank keeps the host
-    monkeypatch.setattr(spyre_config, "num_cpus", 1)
-    assert pp._solver_cpu_share(7) == 2  # never below two
+    monkeypatch.setattr(pp, "_host_cpus", lambda: 64)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    with spyre_config.patch(num_cpus=None):  # nothing explicit: autodetected host
+        assert pp._solver_cpu_share(7) == 16  # 64 CPUs / 4 local ranks, any workers
+        assert pp._solver_cpu_share(1) == 16
+        monkeypatch.delenv("LOCAL_WORLD_SIZE")
+        monkeypatch.setattr(dist, "is_available", lambda: True)
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+        assert pp._solver_cpu_share(7) == 8  # no local count: the process group's size
+        monkeypatch.setattr(dist, "is_initialized", lambda: False)
+        assert pp._solver_cpu_share(7) == 64  # one rank keeps the host
+        monkeypatch.setattr(pp, "_host_cpus", lambda: 1)
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+        assert pp._solver_cpu_share(7) == 2  # never below two
+    with spyre_config.patch(num_cpus=6):
+        assert pp._solver_cpu_share(7) == 6  # an explicit SPYRE_NUM_CPUS is the budget
+
+
+def test_a_time_limited_solve_is_counted_not_failed(monkeypatch):
+    def compile_in_child(*args, **kwargs):
+        pp._time_limited += 1  # what the solver hook does in the child
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", compile_in_child)
+    with pp.fork_inner_compiles(1) as pool:
+        spyre_inductor._spyre_inner_compile("g", graph_id=4)
+        spyre_inductor._spyre_inner_compile("g", graph_id=5)
+    assert (pool.ok, pool.failed, pool.time_limited) == (2, 0, 2)
+    assert pp._time_limited == 0  # the parent's counter is untouched
+
+
+def test_the_solver_hook_counts_feasible_plans_under_a_time_limit(monkeypatch):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad import allocator
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+
+    monkeypatch.setattr(
+        CpSatLayoutSolver,
+        "_solve_and_record",
+        lambda self, solver, model, **kw: solver.status,
+    )
+    monkeypatch.setattr(allocator, "_cpsat_solver_class", lambda: CpSatLayoutSolver)
+    monkeypatch.setattr(pp, "_time_limited", 0)
+    monkeypatch.setattr(pp, "_label", "graph 7 (9 nodes)")
+    warnings = []
+    monkeypatch.setattr(pp.logger, "warning", lambda *a: warnings.append(a))
+    pp._count_time_limited_solves()  # what a child does at setup
+    assert allocator._cpsat_solver_class() is CpSatLayoutSolver  # the first plan asks
+    assert allocator._cpsat_solver_class() is CpSatLayoutSolver  # and it hooks once
+    parameters = types.SimpleNamespace(max_time_in_seconds=60.0, num_search_workers=16)
+    solver = types.SimpleNamespace(
+        status=cp_model.FEASIBLE, parameters=parameters, WallTime=lambda: 60.2
+    )
+    solve = CpSatLayoutSolver._solve_and_record
+    assert solve(None, solver, None, objective=True) == cp_model.FEASIBLE
+    solver.status = cp_model.OPTIMAL  # proven: not counted
+    assert solve(None, solver, None) == cp_model.OPTIMAL
+    solver.status, parameters.max_time_in_seconds = cp_model.FEASIBLE, 0  # no limit set
+    assert solve(None, solver, None) == cp_model.FEASIBLE
+    assert pp._time_limited == 1
+    assert len(warnings) == 1 and warnings[0][1] == "graph 7 (9 nodes)"
+
+
+def test_a_collective_under_lx_context_switching_warns_once(monkeypatch):
+    from torch_spyre._inductor import config as spyre_config
+
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    y = g.call_function(torch.ops._c10d_functional.all_reduce.default, (x, "sum", "tp"))
+    g.output((y,))
+    with_collective = torch.fx.GraphModule(torch.nn.Module(), g)
+    warnings = []
+    monkeypatch.setattr(pp.logger, "warning", lambda *a: warnings.append(a))
+    monkeypatch.setattr(pp, "_warned_collectives", False)
+    with spyre_config.patch(enable_lx_context_switching=False):
+        pp._warn_collectives_in_lx(with_collective)
+    assert not warnings  # the workaround is in place
+    with spyre_config.patch(enable_lx_context_switching=True):
+        pp._warn_collectives_in_lx(_graph_with_outputs(((2,), torch.float32)))
+        assert not warnings  # no collective, nothing to warn about
+        pp._warn_collectives_in_lx(with_collective)
+        pp._warn_collectives_in_lx(with_collective)
+    assert len(warnings) == 1 and "6563" in warnings[0][0]
+
+
+def test_the_probe_computes_the_key_a_real_compile_writes(monkeypatch):
+    """Pins ``_fx_cache_key`` to the key ``compile_fx_inner`` writes: a torch upgrade
+    that changed the key would otherwise turn every probe into a silent miss."""
+    from torch._inductor.codecache import FxGraphCache
+    from torch._inductor.utils import fresh_cache
+
+    original = spyre_inductor._spyre_inner_compile
+    keys = []
+
+    def record(*args, **kwargs):
+        keys.append(pp._fx_cache_key(*args, **kwargs))
+        assert not pp._fx_cache_holds(*args, **kwargs)  # a fresh cache misses
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", record)
+    x = torch.rand(8, 64, dtype=torch.float16).to("spyre")
+    with fresh_cache():
+        torch._dynamo.reset()
+        torch.compile(lambda t: t + 1)(x)
+        assert keys and all(keys)
+        for key in keys:  # the compile wrote its entry under exactly this key
+            key_dir = FxGraphCache._get_tmp_dir_for_key(key)
+            assert os.path.isdir(key_dir) and os.listdir(key_dir)

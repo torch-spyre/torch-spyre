@@ -39,6 +39,16 @@ for that report before it allocates. A child that reports nothing (its compile h
 the cache, or failed) gets default-layout zeros, and the graphs downstream of it
 compile again in the second run.
 
+The stand-ins are zeros, so the traced forward must not branch on tensor values or
+take shapes from them (an ``.item()``, a data-dependent mask): the parent would then
+trace other graphs than the real run does, which costs a recompile in the second run
+but no wrong answers. The first call of a stand-in blocks until its child has
+reported, so the parent's trace serializes on each child's frontend (Dynamo through
+the pre-scheduling passes); only LX planning and dbo-opt overlap, which is where most
+of a compile's time goes, so frontend-bound graphs gain little. The pipe's writer is
+our own forked child, so the specs it pickles and the layout repr the parent evaluates
+are trusted input.
+
 What a child may use: the compile itself (Python, the Inductor and Spyre lowering
 code, CP-SAT, and dbo-opt as a subprocess). What it may not use: the device. Every
 Python entry point of the Spyre runtime (start, allocation, copies, fills, streams,
@@ -47,11 +57,21 @@ The child runs on one thread with ``compile_threads = 1``, so it starts no worke
 pool of its own (#4427's pool stays in the parent), and it never takes a lock that
 another thread of the parent could hold at fork time: such a lock stays held in
 the child, so a compile that needed it would hang and be killed by the timeout.
-Its LX planning solver gets the rank's share of the CPUs (the CPU count divided by
-the ranks on the host, at least two; the whole host when there is one rank): sized
-to the whole host on every rank, as each parent's is, the concurrent solvers starve
-each other, and a starved solve returns a worse plan for the same graph (slower
-kernels, not just a slower compile).
+Its LX planning solver gets the rank's share of the CPUs: the autodetected CPU count
+divided by the ranks on this host (``LOCAL_WORLD_SIZE``, else the process group's
+size), at least two; an explicit ``SPYRE_NUM_CPUS`` is this process's budget already
+and is used as it is. Sized to the whole host on every rank, as each parent's is, the
+concurrent solvers starve each other, and a starved solve returns a worse plan for the
+same graph (slower kernels, not just a slower compile). A solve that stops at
+``cpsat_time_limit_seconds`` returns the best plan found so far, and the FX graph
+cache keeps that plan: the child counts such solves and exits with code 3, the pool
+reports them in ``time_limited`` and in its summary line, so a slow kernel can be
+traced back to a starved warm-up. With ``enable_lx_context_switching`` on (the
+default) the LX planner may keep an all-reduce input in LX, and the wrapper a child
+caches then calls the collective on a buffer it never allocated, a ``NameError`` in
+the second run (torch-spyre#6563): the first graph with a collective logs a warning
+once, naming ``ENABLE_LX_CONTEXT_SWITCHING=0`` as the workaround until the planner is
+fixed.
 
 Limits: Linux only (``os.fork``). Each child is a copy-on-write copy of the caller.
 For a vLLM engine with Granite 3.3 8B and 8 workers, the peak resident memory of the
@@ -354,6 +374,31 @@ def _no_device(*args: Any, **kwargs: Any) -> Any:
     raise RuntimeError("parallel precompile: a forked compile tried to use the device")
 
 
+def _host_cpus() -> int:
+    """The CPUs this process may use, as torch-spyre's config autodetects them."""
+    from torch_spyre._inductor import config as spyre_config
+
+    return spyre_config.get_cpu_count()
+
+
+def _local_ranks() -> int:
+    """Ranks on this host: ``LOCAL_WORLD_SIZE`` when set (vLLM's workers set it),
+    else the process group's size, else one. The global world size would over-divide
+    the CPUs of a host that holds only some of the ranks."""
+    try:
+        return max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "")))
+    except ValueError:
+        pass
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return max(1, dist.get_world_size())
+    except Exception:  # noqa: BLE001 - no process group means one rank
+        pass
+    return 1
+
+
 def _solver_cpu_share(workers: int) -> int:
     """CPUs for one child's LX planning solver: the host's share per rank.
 
@@ -362,20 +407,106 @@ def _solver_cpu_share(workers: int) -> int:
     does. Starved solves return worse plans, not only later ones. The share is
     per rank, not per child: on one rank the children keep the whole host, which
     measured faster than a per-child share, while at four ranks on 64 CPUs the
-    per-rank share took the block warm-up from 338 s to 213 s.
+    per-rank share took the block warm-up from 338 s to 213 s. An explicit
+    ``SPYRE_NUM_CPUS`` (``config.num_cpus``) is already this process's budget, so
+    it is used as it is; only the autodetected host count is divided.
     """
     from torch_spyre._inductor import config as spyre_config
 
-    ranks = 1
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            ranks = dist.get_world_size()
-    except Exception:  # noqa: BLE001 - no process group means one rank
-        ranks = 1
     del workers  # the share is per rank; the workers stay in the signature for callers
-    return max(2, spyre_config.get_cpu_count() // max(1, ranks))
+    if spyre_config.num_cpus is not None and spyre_config.num_cpus > 0:
+        return spyre_config.num_cpus
+    return max(2, _host_cpus() // _local_ranks())
+
+
+_TIME_LIMITED_EXIT = 3  # a child's exit code: compiled, but a solve hit its time limit
+_time_limited = 0  # in a child: LX planning solves that stopped at their time limit
+_label = ""  # in a child: the graph it compiles, for its log lines
+_warned_collectives = False  # the torch-spyre#6563 warning goes out once per process
+
+
+def _count_time_limited_solves() -> None:
+    """Child: count the LX planning solves that stop at ``cpsat_time_limit_seconds``.
+
+    CP-SAT then returns the best feasible plan it found (status ``FEASIBLE``, not
+    ``OPTIMAL``), and the FX graph cache keeps that plan for every later start. The
+    allocator imports the solver module lazily, so the hook sits on its accessor and
+    reaches the solver class when the first plan asks for it.
+    """
+    from torch_spyre._inductor.scratchpad import allocator
+
+    original = allocator._cpsat_solver_class
+
+    def solver_class() -> type:
+        cls = original()
+        _hook_time_limited_solves(cls)
+        return cls
+
+    allocator._cpsat_solver_class = solver_class
+
+
+def _hook_time_limited_solves(cls: type) -> None:
+    """Wrap ``cls._solve_and_record``, the one way the CP-SAT solver solves, to count
+    the solves that stopped at their time limit and warn about each; once per class.
+    A solver class without it (the greedy fallback) is left alone."""
+    solve = getattr(cls, "_solve_and_record", None)
+    if solve is None or getattr(solve, "_counts_time_limited", False):
+        return
+    try:
+        from ortools.sat.python import cp_model  # loaded along with the solver class
+    except ImportError:  # pragma: no cover - no CP-SAT, nothing to count
+        return
+
+    def solve_and_record(self: Any, solver: Any, model: Any, **kwargs: Any) -> int:
+        status = solve(self, solver, model, **kwargs)
+        limit = solver.parameters.max_time_in_seconds
+        if status == cp_model.FEASIBLE and limit:
+            global _time_limited
+            _time_limited += 1
+            logger.warning(
+                "parallel precompile: an LX planning solve of %s stopped at its %.0f s "
+                "time limit after %.1f s on %d CPUs; the plan it caches may be slower "
+                "than a finished one",
+                _label or "a graph",
+                limit,
+                solver.WallTime(),
+                solver.parameters.num_search_workers,
+            )
+        return status
+
+    solve_and_record._counts_time_limited = True  # type: ignore[attr-defined]
+    cls._solve_and_record = solve_and_record
+
+
+def _graph_label(gm: Any, kwargs: dict) -> str:
+    nodes = len(gm.graph.nodes) if hasattr(gm, "graph") else 0
+    return f"graph {kwargs.get('graph_id', '?')} ({nodes} nodes)"
+
+
+def _warn_collectives_in_lx(gm: Any) -> None:
+    """Warn once when a graph with a collective compiles in a child while LX context
+    switching is on: the planner may keep the collective's input in LX, and the
+    cached wrapper then names a buffer it never allocated (torch-spyre#6563)."""
+    global _warned_collectives
+    if _warned_collectives or not hasattr(gm, "graph"):
+        return
+    from torch_spyre._inductor import config as spyre_config
+
+    if not spyre_config.enable_lx_context_switching:
+        return
+    if not any(
+        node.op == "call_function" and "_c10d_functional" in str(node.target)
+        for node in gm.graph.nodes
+    ):
+        return
+    _warned_collectives = True
+    logger.warning(
+        "parallel precompile: a graph with a collective compiles in a child while LX "
+        "context switching is on; the LX planner may keep an all-reduce input in LX, "
+        "and the second run then fails with a NameError in the generated wrapper "
+        "(torch-spyre#6563). Set ENABLE_LX_CONTEXT_SWITCHING=0 for this process until "
+        "the planner is fixed."
+    )
 
 
 def _child_setup(workers: int = 1) -> None:
@@ -390,6 +521,7 @@ def _child_setup(workers: int = 1) -> None:
     torch.set_num_threads(1)  # the parent's OpenMP pool does not survive fork()
     torch._inductor.config.compile_threads = 1  # the parent's worker pool is not ours
     spyre_config.num_cpus = _solver_cpu_share(workers)
+    _count_time_limited_solves()
     for name in _DEVICE_ENTRY_POINTS:  # the device stays with the caller
         if hasattr(spyre_c, name):
             setattr(spyre_c, name, _no_device)
@@ -397,7 +529,11 @@ def _child_setup(workers: int = 1) -> None:
 
 
 class _Pool:
-    """At most ``workers`` children at once. A child is killed after ``timeout_s``."""
+    """At most ``workers`` children at once. A child is killed after ``timeout_s``.
+
+    ``submitted``, ``ok`` and ``failed`` count the children; ``time_limited`` the ok
+    ones whose LX planning stopped at its time limit (``_count_time_limited_solves``).
+    """
 
     def __init__(self, workers: int, timeout_s: float) -> None:
         self.workers = workers
@@ -408,6 +544,7 @@ class _Pool:
         self.ok = 0
         self.failed = 0
         self.submitted = 0
+        self.time_limited = 0
 
     @staticmethod
     def _kill(pid: int) -> None:
@@ -428,17 +565,22 @@ class _Pool:
             if done:
                 del self.running[pid]
                 finished = True
-                if status == 0:
+                exited = status >= 0 and os.WIFEXITED(status)
+                code = os.WEXITSTATUS(status) if exited else -1
+                if code in (0, _TIME_LIMITED_EXIT):
                     self.ok += 1
+                    self.time_limited += code == _TIME_LIMITED_EXIT
                 else:
                     self.failed += 1
         return finished
 
-    def submit(self, compile_fn: Callable[[], Any], report: bool = False) -> int:
+    def submit(
+        self, compile_fn: Callable[[], Any], report: bool = False, label: str = ""
+    ) -> int:
         """Fork a child for ``compile_fn``; returns its pid.
 
         With ``report`` the child gets a pipe to send its graph's output specs
-        through (see ``report``).
+        through (see ``report``). ``label`` names the graph in the child's log lines.
         """
         while len(self.running) >= self.workers:
             if not self._reap():
@@ -451,6 +593,8 @@ class _Pool:
         if pid == 0:  # child: compile, then exit without returning to the caller
             code = 1
             try:
+                global _label
+                _label = label
                 if report:
                     global _report_fd
                     os.close(read_fd)
@@ -458,7 +602,7 @@ class _Pool:
                     _install_output_report()
                 _child_setup(self.workers)
                 compile_fn()
-                code = 0
+                code = _TIME_LIMITED_EXIT if _time_limited else 0
             except BaseException:  # noqa: BLE001 - the caller compiles it again
                 logger.warning("parallel precompile: a compile failed", exc_info=True)
             finally:
@@ -470,7 +614,10 @@ class _Pool:
         return pid
 
     def report(self, pid: int) -> Optional[list]:
-        """Wait for the child's output specs; None if it exited without reporting."""
+        """Wait for the child's output specs; None if it exited without reporting.
+
+        The writer is our own forked child, so its pickled specs are trusted.
+        """
         fd = self.reports.pop(pid, None)
         if fd is None:
             return None
@@ -510,12 +657,12 @@ class _Pool:
         self.wait()
 
 
-def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
-    """Whether the local FX graph cache already holds this inner compile's graph.
+def _fx_cache_key(*args: Any, **kwargs: Any) -> Optional[str]:
+    """The local FX graph cache key of this inner compile's graph, or None.
 
     Mirrors the key ``compile_fx_inner`` computes, after the rebinding of
     ``get_decomp_fn`` that ``_spyre_inner_compile`` applies. A key-less or
-    uncacheable graph, or anything unexpected, counts as a miss.
+    uncacheable graph, or anything unexpected, gives None.
     """
     try:
         from torch._inductor import config
@@ -524,7 +671,7 @@ def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
         from torch_spyre._inductor.decompositions import get_spyre_decomp_table
 
         if config.force_disable_caches or not config.fx_graph_cache:
-            return False
+            return None
         gm = kwargs["gm"] if "gm" in kwargs else args[0]
         example_inputs = (
             kwargs["example_inputs"] if "example_inputs" in kwargs else args[1]
@@ -555,9 +702,21 @@ def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
         key_info, _ = FxGraphCache.prepare_key(
             gm, example_inputs, graph_kwargs, inputs_to_check, False
         )
-        if key_info is None:
-            return False
-        key_dir = FxGraphCache._get_tmp_dir_for_key(key_info[0])
+        return key_info[0] if key_info else None
+    except Exception:
+        return None
+
+
+def _fx_cache_holds(*args: Any, **kwargs: Any) -> bool:
+    """Whether the local FX graph cache already holds this inner compile's graph
+    (see ``_fx_cache_key``); anything unexpected counts as a miss."""
+    key = _fx_cache_key(*args, **kwargs)
+    if key is None:
+        return False
+    try:
+        from torch._inductor.codecache import FxGraphCache
+
+        key_dir = FxGraphCache._get_tmp_dir_for_key(key)
         return os.path.isdir(key_dir) and any(True for _ in os.scandir(key_dir))
     except Exception:
         return False
@@ -572,7 +731,9 @@ def fork_inner_compiles(
     Yields the pool. Leaving the block waits for every child, or kills them all if
     the block raised. With ``placeholders`` the stand-ins return zero tensors in
     the layouts the children report instead of raising, so a traced forward runs
-    to its end.
+    to its end: a forward that branches on tensor values traces other graphs than
+    the real run (a recompile in the second run, nothing wrong); see the module
+    docstring for the contract and the serialization on each child's frontend.
     """
     import torch_spyre._inductor as spyre_inductor
 
@@ -585,12 +746,14 @@ def fork_inner_compiles(
             # torch-spyre's Tensor.to) reaches the inner compile on every start, and
             # the FX graph cache answers it in place faster than a fork.
             return original(*args, **kwargs)
-        if not placeholders:
-            pool.submit(lambda: original(*args, **kwargs))
-            return _StandIn(pool)
         gm = kwargs.get("gm", args[0] if args else None)
+        _warn_collectives_in_lx(gm)
+        label = _graph_label(gm, kwargs)
+        if not placeholders:
+            pool.submit(lambda: original(*args, **kwargs), label=label)
+            return _StandIn(pool)
         outputs = _output_metadata(gm)
-        pid = pool.submit(lambda: original(*args, **kwargs), report=True)
+        pid = pool.submit(lambda: original(*args, **kwargs), report=True, label=label)
         return _StandIn(pool, outputs, pid)
 
     started = time.time()
@@ -605,8 +768,10 @@ def fork_inner_compiles(
         pool.wait()
         pool.open = False
     logger.info(
-        "parallel precompile: %d compiles ok, %d failed, %d workers, %.1f s",
+        "parallel precompile: %d compiles ok (%d with an LX planning solve at its time "
+        "limit), %d failed, %d workers, %.1f s",
         pool.ok,
+        pool.time_limited,
         pool.failed,
         pool.workers,
         time.time() - started,
