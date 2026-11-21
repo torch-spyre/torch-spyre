@@ -20,7 +20,7 @@ machinery, eager-mode dispatch, streams, and multi-card support.
 :width: 45%
 :align: center
 
-The PyTorch Dispatcher routes each operation to the correct device implementation. When a `torch.add` call carries Spyre tensors, the Dispatcher looks up `SPYRE` in its dispatch table and calls the registered `spyre__add_Tensor` kernel. Torch-Spyre registers all its eager runtime kernels in this table via `TORCH_LIBRARY_IMPL`.
+The PyTorch Dispatcher routes each operation to the correct device implementation. When a `torch.add` call carries Spyre tensors, the Dispatcher looks up the `PrivateUse1` (`spyre`) entry for `aten::add.Tensor` and calls the kernel registered there. Torch-Spyre fills these entries from Python with `torch.library.register_kernel` (`torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py`; `aten.add` is in `COMPILED_OPS`, so its kernel compiles the single op), from the decomposition auto-install in `decompositions.py`, and from C++ with `TORCH_LIBRARY_IMPL` for the memory and view kernels (`spyre_mem.cpp`, `spyre_views.cpp`).
 :::
 
 ## Device Registration

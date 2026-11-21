@@ -51,17 +51,17 @@ demanded by that layer's type system:
 
 | Layer | Loop identity | Form |
 |---|---|---|
-| 1, pre-scheduling IR pass | `loop_info: CoarseTileInfo` on `ir.Operation`, with the loop's ops wrapped in a `LoopNode` | Per-op tag plus a structural node |
+| 1, pre-scheduling IR pass | `loop_info: LoopInfo` on `ir.Operation`, with the loop's ops wrapped in a `LoopNode` | Per-op tag plus a structural node |
 | 2, scheduler | `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) | Perimeter wrapper |
 | 3, codegen output | `LoopSpec` | Serializable tree node |
 
 :::{figure} ../_static/images/coarse-tiling-layers.svg
-:alt: Three layers of coarse-tiling loop IR: the pre-scheduling pass stamps CoarseTileInfo and divides ranges, the pre-fusion pass wraps runs in CountedLoopSchedulerNode, and codegen emits a LoopSpec that serializes to scf.for
+:alt: Three layers of coarse-tiling loop IR: the pre-scheduling pass stamps LoopInfo and divides ranges, the pre-fusion pass wraps runs in CountedLoopSchedulerNode, and codegen emits a LoopSpec that serializes to scf.for
 :width: 100%
 :align: center
 
 The three layers, from the pre-scheduling IR pass through the pre-fusion
-scheduler pass to codegen. Layer 1 stamps `loop_info` (`CoarseTileInfo`) on
+scheduler pass to codegen. Layer 1 stamps `loop_info` (`LoopInfo`) on
 each `ir.Operation`, divides the tiled dimension by `K`, and wraps the loop's
 ops in a `LoopNode` so the loop is a structural unit from the first pass after
 the splice. Layer 2 hands each `LoopNode` to Inductor's scheduler as one
@@ -128,11 +128,12 @@ immediately after `splice_while_loops` runs, before any later pass touches
 it:
 
 ```python
-op.loop_info = CoarseTileInfo(
+op.loop_info = LoopInfo(
     loop_group_id=(0,),            # depth-1 path: single loop level
     loop_count=[8],                # trip_count=8 (1024 rows / 128-row tiles)
     loop_tiled_dims=[[0]],         # dim 0 (rows) is tiled
     loop_tiled_reduction_dims=[[]],  # no reduction dims (pointwise op)
+    strict_loop_vars=False,        # stamped by the for_each_tile lowering
 )
 ```
 
@@ -141,8 +142,8 @@ is not stored: `_stamp_direct_loop_info` also appends a `DimHint` with
 `loop_var=u0` and `loop_var_range=8` to the op's `dim_hints`, and every reader
 takes an access's advance from the coefficient of `u0` in that access's index
 (`loop_facts.read_advance`, `SpyreKernel._index_tile_advance`). The
-span-overflow lowering stamps a `LoopShim` with the same four fields and
-follows the same rule (see [Layer 1](#layer-1-pre-scheduling-ir-pass) below),
+span-overflow lowering stamps the same `LoopInfo` record, with
+`strict_loop_vars=True`, and follows the same rule (see [Layer 1](#layer-1-pre-scheduling-ir-pass) below),
 so both frontends share every downstream layer.
 
 `while_loop_body_graph_0_0_op9` (`z_tile = y_tile * c_tile`) is tiled
@@ -198,8 +199,8 @@ while_loop_body_graph_0_0_op8: ComputedBuffer     # y_tile = a_tile + b_tile
                                        device_dtype=DataFormats.SEN169_FP16))
   allocation={'lx': 0}
   dim_hints=[DimHint(dim_names=[], split_count=1, loop_var=u0, is_reduction=False, hint_id=0, loop_var_range=8)]
-  loop_info=CoarseTileInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
-      loop_tiled_reduction_dims=[[]])
+  loop_info=LoopInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
+      loop_tiled_reduction_dims=[[]], strict_loop_vars=False)
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -219,8 +220,8 @@ while_loop_body_graph_0_0_op9: ComputedBuffer     # z_tile = y_tile * c_tile
                                        device_dtype=DataFormats.SEN169_FP16))
   allocation={'lx': 262144}
   dim_hints=[DimHint(dim_names=[], split_count=1, loop_var=u0, is_reduction=False, hint_id=0, loop_var_range=8)]
-  loop_info=CoarseTileInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
-      loop_tiled_reduction_dims=[[]])
+  loop_info=LoopInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
+      loop_tiled_reduction_dims=[[]], strict_loop_vars=False)
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -237,8 +238,8 @@ while_loop_body_graph_0_0_op9: ComputedBuffer     # z_tile = y_tile * c_tile
 while_loop_body_graph_0_0_op15: ComputedBuffer    # identity copy: z_tile → z
   layout=MutationLayoutSHOULDREMOVE('spyre:0', torch.float16, size=[128, 4096], stride=[4096, 1])
   dim_hints=[DimHint(dim_names=[], split_count=1, loop_var=u0, is_reduction=False, hint_id=0, loop_var_range=8)]
-  loop_info=CoarseTileInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
-      loop_tiled_reduction_dims=[[]])
+  loop_info=LoopInfo(loop_group_id=(0,), loop_count=[8], loop_tiled_dims=[[0]],
+      loop_tiled_reduction_dims=[[]], strict_loop_vars=False)
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -540,10 +541,10 @@ same `LoopSchedulerNode`.
 flowchart TD
     subgraph L1["Layer 1: pre-scheduling IR passes"]
         FET["for_each_tile"] --> SWL["splice_while_loops"]
-        SWL --> SDLI["_stamp_direct_loop_info<br/>(CoarseTileInfo)"]
+        SWL --> SDLI["_stamp_direct_loop_info<br/>(LoopInfo)"]
         SOG["span_overflow_groups"] --> VAL["validate_coarse_tile_groups<br/>reject_nested_loops"]
         VAL --> TG["tile_groups<br/>build_loop_tiling_plan"]
-        TG --> LLT["lower_loop_tiling<br/>(LoopShim)"]
+        TG --> LLT["lower_loop_tiling<br/>(LoopInfo, strict_loop_vars)"]
         LLT --> RLN["request_loop_nodes<br/>build_pending_loop_nodes"]
         SDLI --> LN["LoopNode"]
         RLN --> LN
@@ -562,21 +563,21 @@ flowchart TD
 ### Attribute contract on `ir.Operation`
 
 Each `ir.Operation` inside a counted loop carries a `loop_info` attribute that
-holds the loop's own facts. The `for_each_tile` lowering
-(`_stamp_direct_loop_info` in `for_each_tile_lowering.py`) stamps a
-`CoarseTileInfo`. The span-overflow lowering (`loop_tiling_lowering.py`)
-stamps a `LoopShim`, a frozen dataclass with the same four fields. Both are
+holds the loop's own facts. Both lowerings stamp the same record, `LoopInfo`,
 defined in `torch_spyre/_inductor/loop_info.py` and attached with `setattr`; no
-Inductor base class is modified. A reader that needs only the loop facts tests
-`loop_info` against `COUNTED_LOOP_INFO`, the tuple of both classes.
+Inductor base class is modified. The `for_each_tile` lowering
+(`_stamp_direct_loop_info` in `for_each_tile_lowering.py`) stamps it with
+`strict_loop_vars=False`; the span-overflow lowering (`loop_tiling_lowering.py`)
+stamps it with `strict_loop_vars=True`.
 
 ```python
 @dataclass
-class CoarseTileInfo:
+class LoopInfo:
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    strict_loop_vars: bool = False
 ```
 
 | Field | Type | Meaning |
@@ -585,8 +586,9 @@ class CoarseTileInfo:
 | `loop_count` | `list[sympy.Expr]` | Trip counts, one per nesting level from outermost to innermost. For a flat (depth-1) group this is a 1-element list `[K]`. For a two-level nested group it is `[K1, K2]`. All ops sharing the same `loop_group_id` must agree on the count at every level. |
 | `loop_tiled_dims` | `list[list[int]]` | Per-level positional indices into `data.ranges` (the output iteration space) that are divided by the corresponding count. An empty sub-list means the op is loop-invariant at that level in the output space. |
 | `loop_tiled_reduction_dims` | `list[list[int]]` | Per-level positional indices into `data.reduction_ranges` that are tiled at that level. Parallel to `loop_tiled_dims`. An empty sub-list means no reduction dim is tiled at that level. |
+| `strict_loop_vars` | `bool` | True on an op the loop-tiling lowering made: its `dim_hints` list the loop variable of every level, so an op that lists none is a compiler bug. False on a `for_each_tile` op, where an op that lists no loop variable (the loop's fill, for example) does not move with the loop. Read by `loop_facts` and the kernel's advance lookup. |
 
-Neither record stores how an access advances from one trip to the next. An
+The record does not store how an access advances from one trip to the next. An
 access's per-trip advance is the coefficient of the level's loop variable in
 the access's index. `loop_facts.read_advance(op, dep)` and
 `loop_facts.output_advance(op)` read it (through `_loop_coefficient`, which
@@ -693,7 +695,7 @@ supported in this release", #6088) for a group with more than one level.
      mutates a buffer, or that already carries a loop-variable hint, raises
      `Unsupported`.
    - Each tiled member's ranges are divided by the trip count and every member
-     gets a `LoopShim`.
+     gets a `LoopInfo` with `strict_loop_vars=True`.
    - `_lower_reduction` handles each `reduction` member; `_insert_copy_out`
      drains each `copy_out` member into a full buffer.
    - `_patch_retiled_load_indexes` rewrites the stale stride coefficients of
@@ -747,7 +749,7 @@ the output, filled once before the loop, and a combine op inside the loop:
    `_coarse_tile_force_live` (see the DCE subsection of the appendix).
 3. `_make_combine_buffer` builds a `coarse_tile_combine_<buf>` pointwise op that
    folds each trip's partial result into `accum_full` in place
-   (`MutationLayoutSHOULDREMOVE`). It carries the loop's `LoopShim` and is
+   (`MutationLayoutSHOULDREMOVE`). It carries the loop's `LoopInfo` and is
    inserted right after the reduction.
 4. The reduction records `_tiled_reduction_accum_name`, which
    `finalize_layouts` (`insert_restickify.py`) reads to give the accumulator
@@ -1020,7 +1022,7 @@ longer populates it: it refuses a `mark_dynamic(max=...)` size outside a
 
 `OpSpec.tiled_symbol_trip_counts` maps each minted level symbol appearing
 in `tiled_symbols` to that level's own trip count
-(`CoarseTileInfo.loop_count` for that level); it lets downstream codegen
+(`LoopInfo.loop_count` for that level); it lets downstream codegen
 recover a level's full (untiled) extent as `(per-step device-element
 advance) * trip_count` without a separately tracked extent field on
 `TensorArg`. Only correct when a symbol belongs to exactly one nesting
@@ -1034,9 +1036,9 @@ each level, the coefficient of the level's loop variable in the access's
 (`tiling_expr_to_device_expr`), and multiplies it by that level's symbol from
 `_get_or_mint_level_symbol`. The result is `None` for an op in no loop, an op
 that lists no loop variable, and an access whose index does not move with the
-loop. An op stamped with a `LoopShim` that has no advance in its index raises
-`RuntimeError`, because the span-overflow lowering lists the loop variable on
-every member. Each level's term is picked out by `expr.coeff(sym)` on that
+loop. An op whose `LoopInfo` has `strict_loop_vars=True` and that has no
+advance in its index raises `RuntimeError`, because the span-overflow lowering
+lists the loop variable on every member. Each level's term is picked out by `expr.coeff(sym)` on that
 level's own symbol, not by list position the way `tiled_symbols` is; because
 each level has its own symbol, two levels that tile the same host dim stay
 separate addends.
@@ -1240,11 +1242,11 @@ landed.
 
 | File | Role |
 |---|---|
-| `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` and `LoopShim` dataclasses, `COUNTED_LOOP_INFO`, `LoopCarryRecord`; `copy_op_metadata` |
+| `torch_spyre/_inductor/loop_info.py` | Layer 1: the `LoopInfo` dataclass, the per-op loop record stamped by both lowerings |
 | `torch_spyre/_inductor/loop_facts.py` | Layer 1: loop-structure accessors (`enclosing_loops`, `scheduler_enclosing_loops`) and the index-derived advances (`read_advance`, `output_advance`, `advancing_levels`) |
 | `torch_spyre/_inductor/loop_node.py` | Layer 1: `LoopNode` structural node; `collapse` wraps each loop's ops, `request_loop_nodes`/`build_pending_loop_nodes` wrap the span-overflow groups, `OpsView` presents the body flat to passes, the edit helpers (`insert_before`, `insert_after`, `move_before`, `move_after`, `remove_op`, `top_level_entry`) place ops relative to loops, `expand`/`peel_non_members` for the scheduler hand-off |
 | `torch_spyre/_inductor/loop_scheduler.py` | Layer 2: `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) and the per-compile `Scheduler` patches; `SCHEDULE_LOOP_NODES`, `loop_scheduler_supported` |
-| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Layer 1 (span-overflow path): `tile_groups`, `build_loop_tiling_plan` (`LoopTilingPlan`), `lower_loop_tiling`; divides ranges, stamps `LoopShim`, inserts copy-outs and reduction accumulators, adds the loop terms to the indexes |
+| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Layer 1 (span-overflow path): `tile_groups`, `build_loop_tiling_plan` (`LoopTilingPlan`), `lower_loop_tiling`; divides ranges, stamps `LoopInfo` (`strict_loop_vars=True`), inserts copy-outs and reduction accumulators, adds the loop terms to the indexes |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: helpers shared by both lowerings: `validate_coarse_tile_groups`, `reject_nested_loops`, `resolve_level_positions`, `_divide_reduction_ranges`, `_allocate_full_buffer`, `_make_combine_buffer`, `_patch_consumers` |
 | `torch_spyre/_inductor/wsr/loop_tiling_common.py` | Layer 1: `_divide_ranges`, `_patch_retiled_load_indexes`, `_AddLoopTermHandler`, `_ReadThroughLayout`, `_hint_ranges_pos` |
 | `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |

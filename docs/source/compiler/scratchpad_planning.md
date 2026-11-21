@@ -162,6 +162,7 @@ _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-sticki
 plan_sharded_hbm
 cost_model_matmul_division            # work-division: matmul cost model (*)
 work_distribution                     # work-division: default distributor (*)
+report_output_layouts                 # forked compile child only: report output specs
 _maybe_scratchpad_planning            # THIS PASS, gated by config.lx_planning
 elide_proven_read_copies
 ```
@@ -287,16 +288,38 @@ stuck on HBM. That mismatch is what motivates co-optimization (below).
 
 Scratchpad planning has three layers with separate concerns:
 
-:::{figure} ../_static/images/lx/allocator-architecture.svg
-:alt: ScratchpadAllocator delegates to a pluggable MemoryPlanSolver and runs optional graph passes around it
-:width: 480px
-:align: center
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TD
+    G["Lowered graph"] --> SEL{"select_allocator<br/>co_optimizing_lx_planning?"}
+    SEL -- "0" --> SA["ScratchpadAllocator<br/>(LX placement only)"]
+    SEL -- "1 (default)" --> CO["CoOptimizingAllocator<br/>(work division and LX placement)"]
+    SA --> PA
+    CO --> PA
+    subgraph PA ["plan_allocation"]
+        direction TB
+        P1["pre_optimization_passes<br/>(none registered)"] --> P2["_prepare_buffers<br/>(LifetimeBoundBuffer list)"]
+        P2 --> P3["_build_solver, _solve"]
+        P3 --> P4["_finalize_lx_relayout_allocation<br/>_post_solve"]
+        P4 --> P5["_push_allocation<br/>(LX addresses onto layouts)"]
+        P5 --> P6["post_optimization_passes<br/>(LxContextSwitchingPass when<br/>ENABLE_LX_CONTEXT_SWITCHING=1)"]
+    end
+    P3 -.-> SOL
+    subgraph SOL ["Solver (config.layout_solver)"]
+        direction TB
+        S1["cpsat (default): CpSatLayoutSolver"]
+        S2["simulated_annealing:<br/>SimulatedAnnealingLayoutSolver, or<br/>SaCoOptimizingSolver when co-optimizing"]
+        S3["greedy, firstfit, bestfit:<br/>placement only; co-optimizing wraps them in<br/>ExhaustiveSearchSolver (ALLOW_EXHAUSTIVE_SEARCH=1)"]
+    end
+```
 
-`ScratchpadAllocator` runs pre-passes (clone insertion), gathers
-`LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. `CoOptimizingAllocator`
-extends this flow with a split-search step before the solver runs.
-:::
+`select_allocator` chooses the allocator and the solver. Both allocators run the
+same `plan_allocation` sequence: they gather `LifetimeBoundBuffer`s, hand them to
+the solver, and write the chosen LX addresses onto buffer layouts.
+`CoOptimizingAllocator` overrides `_prepare_buffers`, `_solve`,
+`_finalize_lx_relayout_allocation` and `_post_solve`, so the solver also chooses
+each op's work division. The simulated-annealing co-optimizer is built without
+post-optimization passes.
 
 The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 

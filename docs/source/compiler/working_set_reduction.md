@@ -330,7 +330,7 @@ returned `[1024, 4096]` output.
 This is the same tiling shape as the
 [Small Example](coarse_tiling_loops.md#small-example) in the companion
 document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
-same downstream mechanism (`loop_info: CoarseTileInfo`, a `CountedLoopSchedulerNode`,
+same downstream mechanism (`loop_info: LoopInfo`, a `CountedLoopSchedulerNode`,
 a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
 captured IR/OpSpec/`bundle.mlir` for this exact example, which the
 [implementation reference](coarse_tiling_loops.md) quotes at length.
@@ -388,7 +388,7 @@ recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `while_loop_bridge.py`) are described in detail in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
 which covers everything past "a run of ops carries a `loop_info:
-CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
+LoopInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
 and the `LoopSpec` codegen tree (Layer 3).
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, after
