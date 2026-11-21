@@ -68,42 +68,42 @@ spec:
     - {id: llm.model_pinned, phase: post, reason: MODEL_UNPINNED, check: "run.quality.model_revision is recorded"}
     - {id: llm.determinism, phase: post, reason: SEED_UNPINNED, check: "a greedy case ran at temperature 0; a sampled case recorded run.quality.seed"}
   metrics:
-    - {name: llm.ttft.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
+    - {name: llm.ttft.mean, class: latency_ttft, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
-    - {name: llm.ttft.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+    - {name: llm.ttft.p99, class: latency_ttft, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
-    - {name: llm.itl.median, unit: s, direction: lower_is_better, category: performance, statistic: median, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.itl.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.tpot.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+    - {name: llm.itl.median, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: median, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.itl.p99, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.tpot.p99, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_per_output_token}
-    - {name: llm.e2el.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
-    - {name: llm.e2el.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative}
-    - {name: llm.output_throughput, unit: "{token}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
-    - {name: llm.request_throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
-    - {name: llm.goodput_at_slo, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value,
+    - {name: llm.e2el.mean, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.e2el.p99, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative}
+    - {name: llm.output_throughput, class: throughput, unit: "{token}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.request_throughput, class: throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.goodput_at_slo, class: throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value,
        compare: relative, description: "requests/s meeting every bound of the workload's slo"}
-    - {name: llm.batch_latency.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
-    - {name: llm.startup.cold, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 1}}
-    - {name: llm.startup.warm, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.eval.exact_match, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.parity.greedy_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}
-    - {name: llm.eval.acc, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.acc_norm, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.f1, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.exact_match_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.batch_latency.mean, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.startup.cold, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 1}}
+    - {name: llm.startup.warm, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.eval.exact_match, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.greedy_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}
+    - {name: llm.eval.acc, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.acc_norm, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.f1, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.exact_match_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "standard error of llm.eval.exact_match as the harness reports it"}
-    - {name: llm.eval.acc_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.acc_norm_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.f1_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.n_samples, unit: "{record}", direction: none, category: diagnostic, statistic: value, compare: exact,
+    - {name: llm.eval.acc_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.acc_norm_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.f1_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.n_samples, class: diagnostic, unit: "{record}", direction: none, category: diagnostic, statistic: value, compare: exact,
        description: "records the harness scored; compared with the input's expect.records by llm.records_complete"}
-    - {name: llm.eval.error_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.eval.error_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of requests that errored or came back empty"}
-    - {name: llm.eval.truncated_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.eval.truncated_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of generations that hit max_tokens or a prompt cut by max_model_len"}
-    - {name: llm.parity.mean_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.parity.max_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: max, compare: absolute}
-    - {name: llm.parity.tie_adjusted_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
-    - {name: llm.parity.ref_coverage, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
-    - {name: llm.eval.invalid_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.parity.mean_abs_prob_err, class: quality_score, unit: "1", direction: lower_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.max_abs_prob_err, class: quality_score, unit: "1", direction: lower_is_better, category: quality, statistic: max, compare: absolute}
+    - {name: llm.parity.tie_adjusted_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.parity.ref_coverage, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.eval.invalid_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of answers the scorer could not parse; a failed request counts here when the harness has no error counter"}
