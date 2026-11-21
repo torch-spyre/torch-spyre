@@ -532,3 +532,42 @@ def test_the_legacy_secure_setting_keeps_its_exact_values(monkeypatch, raw, secu
     monkeypatch.delenv("CLICKHOUSE_V2_SECURE", raising=False)
     assert client.ClickHouseEnv.secure() is secure
     assert client.ClickHouseEnv.v2_secure() is secure  # unset: the legacy value
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT extract(DAY FROM ts) FROM spyre_v2.t",
+        "SELECT trim(BOTH ' ' FROM name) FROM spyre_v2.t",
+        "SELECT a IS NOT DISTINCT FROM b FROM spyre_v2.t",
+        "SELECT a IS DISTINCT FROM b FROM spyre_v2.t",
+        "SELECT * FROM spyre_v2.t ORDER BY a WITH FILL FROM 1 TO 9",
+        "SHOW COLUMNS FROM t FROM spyre_v2",
+    ],
+)
+def test_from_keywords_that_are_not_a_from_list_stay_on_v2(routed, sql):
+    c, legacy, v2 = routed
+    assert c.route(sql=sql) is v2
+
+
+def test_a_comma_listed_unqualified_table_beside_a_v2_one_is_named(routed):
+    c, *_ = routed
+    with pytest.raises(client.CrossHostStatement, match="'t' unqualified"):
+        c.route(sql="SELECT * FROM spyre_v2.a, t")
+
+
+@pytest.mark.parametrize(
+    "sql,kept",
+    [
+        ("SELECT 'a\\'b -- not a comment' FROM t", "'a\\'b -- not a comment'"),
+        ('SELECT "x\\"y /* not */" FROM t', '"x\\"y /* not */"'),
+    ],
+)
+def test_backslash_escapes_keep_a_quote_inside_its_literal(sql, kept):
+    assert kept in client._strip_comments(sql)
+
+
+def test_a_heredoc_hides_what_looks_like_a_legacy_table(routed):
+    c, legacy, v2 = routed
+    assert client._strip_comments("SELECT $$ FROM spyre.u $$ x") == "SELECT '' x"
+    assert c.route(sql="SELECT $$ JOIN spyre.u $$ FROM spyre_v2.t") is v2
