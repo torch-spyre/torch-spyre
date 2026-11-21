@@ -65,10 +65,12 @@ class ClickHouseEnv:
         """CLICKHOUSE_DB, the connection's own database."""
         return cls.get("CLICKHOUSE_DB", cls.DEFAULT_DB)
 
+    OFF = ("0", "false", "no", "off")
+
     @classmethod
     def secure(cls) -> bool:
-        """CLICKHOUSE_SECURE=0 drops to plain HTTP, to reach a local box with no TLS."""
-        return cls.get("CLICKHOUSE_SECURE", "1") not in ("0", "false", "no")
+        """CLICKHOUSE_SECURE=0 (or false/no/off, any case) drops to plain HTTP, for a local box."""
+        return cls.get("CLICKHOUSE_SECURE", "1").lower() not in cls.OFF
 
     @classmethod
     def target_database(cls) -> str:
@@ -87,7 +89,7 @@ class ClickHouseEnv:
     @classmethod
     def v2_secure(cls) -> bool:
         raw = cls.get("CLICKHOUSE_V2_SECURE").lower()
-        return cls.secure() if not raw else raw not in ("0", "false", "no", "off")
+        return cls.secure() if not raw else raw not in cls.OFF
 
     @classmethod
     def v2_databases(cls) -> tuple:
@@ -122,11 +124,8 @@ class WriterClient:
     """
 
     SCHEMA_VERBS = frozenset(
-        "CREATE ALTER DROP TRUNCATE RENAME EXCHANGE ATTACH DETACH UNDROP REPLACE GRANT REVOKE".split()
-    )
-    _LEAD = re.compile(
-        r"\s*(?:(?:--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*([A-Za-z]+)",
-        re.DOTALL,
+        "CREATE ALTER DROP TRUNCATE RENAME EXCHANGE ATTACH DETACH UNDROP REPLACE RESTORE GRANT "
+        "REVOKE".split()
     )
     # Every client call that takes statement text as its first argument.
     _GUARDED = frozenset(
@@ -144,10 +143,18 @@ class WriterClient:
             return
         if not isinstance(sql, str):
             raise SchemaStatementOnWriter("statement is not text; refused on a writer")
-        m = cls._LEAD.match(sql.lstrip("\ufeff"))
-        if m and m.group(1).upper() in cls.SCHEMA_VERBS:
+        lead = _strip_comments(sql).lstrip(" \t\r\n\ufeff\xa0")
+        words = [w.upper() for w in re.findall(r"[A-Za-z]+", lead)[:2]]
+        verb = (
+            " ".join(words)
+            if words == ["SYSTEM", "RESTORE"]
+            else words[0]
+            if words
+            else ""
+        )
+        if lead[:1].isalpha() and verb in cls.SCHEMA_VERBS | {"SYSTEM RESTORE"}:
             raise SchemaStatementOnWriter(
-                f"{m.group(1).upper()} on a writer connection; use "
+                f"{verb} on a writer connection; use "
                 "ClickHouse.connect(role='schema') (CLICKHOUSE_SCHEMA_USER/PASSWORD)"
             )
 
@@ -179,10 +186,49 @@ _SQL_TOKEN = re.compile(
 _DB_KEYWORDS = frozenset("FROM USE DATABASE JOIN INTO TABLE EXISTS IN".split())
 
 
+def _strip_comments(sql: str) -> str:
+    """`sql` with comments blanked (`/* */` nests in ClickHouse; `--`, `#`) and `$$..$$` heredocs
+    turned into empty literals; quoted text is kept as it is."""
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if sql.startswith("$$", i):
+            end = sql.find("$$", i + 2)
+            out.append("''")
+            i = n if end < 0 else end + 2
+        elif c in "'\"`":
+            j = i + 1
+            while j < n and sql[j] != c:
+                j += 2 if sql[j] == "\\" else 1
+            out.append(sql[i : j + 1])
+            i = j + 1
+        elif sql.startswith("--", i) or c == "#":
+            end = sql.find("\n", i)
+            out.append(" ")
+            i = n if end < 0 else end
+        elif sql.startswith("/*", i):
+            depth, j = 0, i
+            while j < n:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                    if depth == 0:
+                        break
+                else:
+                    j += 1
+            out.append(" ")
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _sql_tokens(sql: str) -> list[tuple[str, str]]:
     """(kind, text) with comments and blanks dropped, quoted identifiers unquoted."""
     out = []
-    for m in _SQL_TOKEN.finditer(sql):
+    for m in _SQL_TOKEN.finditer(_strip_comments(sql)):
         t = m.group(0)
         if t.isspace() or t.startswith(("--", "#", "/*")):
             continue
@@ -205,8 +251,8 @@ class RoutedClient:
     `FROM/USE/DATABASE db`, a table-function argument (`merge(db, ...)`), a string that is exactly
     a database name compared with a database column (`database = 'db'`, either side, `IN`,
     `LIKE`), or a database-like parameter (`{db:String}`, `{x:Identifier}`). One that also names a
-    table on the legacy host raises CrossHostStatement. Everything else, unqualified and system
-    statements included, stays on the legacy host.
+    table on the legacy host, or reads an unqualified table, raises CrossHostStatement. Everything
+    else, unqualified and system statements included, stays on the legacy host.
     """
 
     _ROUTED_BY_SQL = WriterClient._GUARDED - {"command", "query"}
@@ -265,11 +311,20 @@ class RoutedClient:
             and self._is_db_column(after[1])
         )
 
-    def _hits(self, sql: str) -> tuple[bool, bool]:
-        """(names a v2 database, names a qualified table elsewhere) for one statement."""
+    def _hits(self, sql: str) -> tuple[bool, bool, bool]:
+        """(names a v2 database, names a qualified table elsewhere, reads an unqualified
+        table) for one statement."""
         toks = _sql_tokens(sql)
         first = toks[0][1].upper() if toks and toks[0][0] == "word" else ""
-        v2 = other = False
+        v2 = other = bare = False
+        ctes = {
+            toks[k][1]
+            for k in range(len(toks) - 2)
+            if toks[k][0] == "word"
+            and toks[k + 1][0] == "word"
+            and toks[k + 1][1].upper() == "AS"
+            and toks[k + 2] == ("sym", "(")
+        }
         in_from: dict[int, bool] = {}  # paren depth -> inside that depth's FROM list
         func: dict[int, str] = {}  # paren depth -> the function that opened it
         depth = 0
@@ -300,19 +355,37 @@ class RoutedClient:
                     in_from[depth] = True
                 elif up == "SELECT" or up in self._ENDS_FROM:
                     in_from[depth] = False
+            after_join = prev == "JOIN" and prev2 != "ARRAY"
+            listed = in_from.get(depth, False) and i > 0 and toks[i - 1] == ("sym", ",")
             if kind == "str":
+                db_of = text.split(".", 1)[0]
                 if text in self._names and (table_arg or self._is_db_literal(toks, i)):
                     v2 = True
+                elif table_arg and "." in text:
+                    v2, other = (
+                        v2 or db_of in self._names,
+                        other or db_of not in self._names,
+                    )
+            elif (
+                kind == "word"
+                and not qualified
+                and (prev == "FROM" or after_join or listed)
+                and text not in self._names
+                and text not in ctes
+                and nxt[:1] != [("sym", "(")]
+                and text.upper() not in ("SELECT", "INFILE")
+            ):
+                bare = True
             elif kind == "word" and text in self._names:
                 if qualified or table_arg or prev in _DB_KEYWORDS:
                     v2 = True
             elif kind == "word" and qualified and text.lower() != "system":
-                after_join = prev == "JOIN" and prev2 != "ARRAY"
-                listed = in_from.get(depth, False) and toks[i - 1] == ("sym", ",")
                 create_as = first == "CREATE" and prev == "AS"
-                renamed = first in ("RENAME", "EXCHANGE") and prev in ("TO", "AND")
+                renamed = (
+                    first in ("RENAME", "EXCHANGE") and prev in ("TO", "AND")
+                ) or (first == "CREATE" and prev == "TO")
                 if (
-                    prev in ("INTO", "TABLE", "FROM", "IN")
+                    prev in ("INTO", "TABLE", "FROM", "IN", "VIEW", "DICTIONARY")
                     or after_join
                     or listed
                     or create_as
@@ -320,7 +393,7 @@ class RoutedClient:
                     or table_arg
                 ):
                     other = True
-        return v2, other
+        return v2, other, bare
 
     def route(self, table=None, database=None, sql=None, parameters=None):
         """The backend client for one statement."""
@@ -328,11 +401,16 @@ class RoutedClient:
             return self.v2
         if isinstance(table, str) and self._hits(f"INTO {table}")[0]:
             return self.v2
+        v2 = other = False
         if isinstance(sql, str):
-            v2, other = self._hits(sql)
+            v2, other, bare = self._hits(sql)
             if v2 and other:
                 raise CrossHostStatement(
                     "statement names tables on both hosts; copy through the client instead"
+                )
+            if v2 and bare:
+                raise CrossHostStatement(
+                    "statement reads an unqualified table beside a v2 one; qualify it"
                 )
             if v2:
                 return self.v2
@@ -349,6 +427,10 @@ class RoutedClient:
             )
             for k, v in parameters.items()
         ):
+            if other:
+                raise CrossHostStatement(
+                    "a parameter names a v2 database in a statement on legacy tables"
+                )
             return self.v2
         return self.legacy
 

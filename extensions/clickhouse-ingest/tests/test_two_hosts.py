@@ -477,3 +477,55 @@ def test_a_bad_v2_setting_stops_the_ingest_before_any_write(env, tmp_path, monke
     monkeypatch.setenv("CLICKHOUSE_V2_USER", "v2-writer")
     with pytest.raises(SystemExit, match="CLICKHOUSE_V2_PASSWORD"):
         _results(tmp_path, monkeypatch, lambda kw: None)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE VIEW spyre.v AS SELECT * FROM spyre_v2.t",
+        "CREATE MATERIALIZED VIEW spyre_v2.mv TO spyre.t AS SELECT * FROM spyre_v2.s",
+        "SELECT * FROM t JOIN spyre_v2.u USING k",
+        "SELECT * FROM spyre_v2.u WHERE k IN (SELECT k FROM t)",
+        "INSERT INTO spyre_v2.x SELECT * FROM test_runs",
+        "SELECT * FROM spyre_v2.t /* /* nested */ */ JOIN spyre.u USING k",
+        "SELECT * FROM clusterAllReplicas('c', 'spyre_v2.t') JOIN spyre.u USING k",
+    ],
+)
+def test_views_mv_targets_unqualified_tables_and_nested_comments_cross_hosts(
+    routed, sql
+):
+    c, *_ = routed
+    with pytest.raises(client.CrossHostStatement):
+        c.route(sql=sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM clusterAllReplicas('c', 'spyre_v2.t')",
+        "SELECT * FROM spyre_v2.t /* /* */ JOIN spyre.u USING k */",
+        "WITH x AS (SELECT 1) SELECT * FROM spyre_v2.a JOIN x USING k",
+        "SELECT * FROM spyre_v2.a, numbers(3)",
+        "SELECT $$ it's $$ FROM spyre_v2.t",
+    ],
+)
+def test_string_table_arguments_ctes_and_heredocs_stay_on_v2(routed, sql):
+    c, legacy, v2 = routed
+    assert c.route(sql=sql) is v2
+
+
+def test_a_v2_parameter_in_a_statement_on_legacy_tables_is_refused(routed):
+    c, *_ = routed
+    with pytest.raises(client.CrossHostStatement):
+        c.route(
+            sql="SELECT * FROM spyre.t WHERE x = {db:String}",
+            parameters={"db": "spyre_v2"},
+        )
+
+
+@pytest.mark.parametrize("raw", ["False", "OFF", " no ", "0"])
+def test_the_legacy_and_v2_secure_parsers_agree(monkeypatch, raw):
+    monkeypatch.setenv("CLICKHOUSE_SECURE", raw)
+    monkeypatch.delenv("CLICKHOUSE_V2_SECURE", raising=False)
+    assert client.ClickHouseEnv.secure() is False
+    assert client.ClickHouseEnv.v2_secure() is False
