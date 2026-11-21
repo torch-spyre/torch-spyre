@@ -239,6 +239,12 @@ class TestResultWriter(RunWriter):
         )
 
     @classmethod
+    def rows_of_file(cls, client, db, run_id, component, source_file) -> int:
+        """How many outcome rows this run holds for one source file, any attempt."""
+        params = {"component": component, "run_id": run_id, "sf": source_file}
+        return cls.fact_table.count_rows(client, db, cls._FILE, params)
+
+    @classmethod
     def replace_attempt(
         cls, client, db, component, run_id, cases, source_file, *a, **kw
     ) -> int:

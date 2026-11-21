@@ -668,8 +668,9 @@ was first sent with, so a batch that did land is a no-op; it drops the file once
 stored and keeps it otherwise (one attempt per run). A `held` batch is also refused when it is
 older than `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600 s, the server's
 `replicated_deduplication_window_seconds`), since the server may have evicted its token. A window
-the login cannot read (prod readers get 497 on `system.merge_tree_settings`) is taken as the server
-default, 10000 blocks, with one warning. `test_case_runs`, `capability_runs` and `artifact_results`
+the login cannot read in `system.merge_tree_settings` (prod readers get 497 there) is read through
+`getMergeTreeSetting()`, and only when that fails too is taken as 10000 blocks, the 26.3 server
+default, with one warning. `test_case_runs`, `capability_runs` and `artifact_results`
 are never replayed: their writers also skip repeated cases, replace older attempts and feed the
 counters and the verdict, so re-run the ingest for that file instead.
 
@@ -681,7 +682,8 @@ The JSON file flattens cells to text; replay turns top-level DateTime, Date, UUI
 columns (through `Nullable`/`LowCardinality`) back into those types from `system.columns` and
 sends through the normal client. Naive datetimes are parked with the writer's UTC offset, so
 replay stores the same instant on any host. A column that nests one of those types (Array, Map,
-Tuple) or a String cell the spool wrote from bytes (`b'...'`) is refused and the file is kept.
+Tuple) or a String value, nested ones included, that the spool wrote from bytes (`b'...'`) is
+refused and the file is kept.
 
 The spool refuses a directory that is a symlink or owned by another user. The spool directory is `CH_WRITE_SPOOL`, else `$RUNNER_TEMP/ch-spool`; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
 
@@ -698,8 +700,13 @@ rows written by two calls are never merged; the quorum never degrades. The CI wo
 there; 300 s in the library).
 
 Each call retries up to `CH_WRITE_DEADLINE_S`. Once one call in a process has spent its deadline
-(parked, or failed with no spool), every later call gets one attempt and parks at once, so an
-outage costs one deadline per process, not one per table and file.
+(parked, or failed with no spool), later calls get one attempt each, so an outage costs one
+deadline per process, not one per table and file. The next call that stores its rows ends that,
+and so does one more deadline passing; the state is shared by a process's threads under a lock. A
+long-lived caller that writes in-process (a web server calling `dispatch.request`) holds the
+request for up to one deadline: set `CH_WRITE_DEADLINE_S` low there (a few seconds) and
+`CH_WRITE_RESILIENCE=off` in its environment to opt out; with no `CH_WRITE_SPOOL` it fails the
+write instead of parking.
 
 Rows that cannot land are parked in the spool and the insert raises `BatchParked`. The results
 ingest then marks the file and withholds the artifact verdict of its run (the first terminal
@@ -712,15 +719,18 @@ append a rows-free list of the parked tables to `$GITHUB_STEP_SUMMARY`, then:
 - exit 75 (EX_TEMPFAIL) for a v2-only run, or for any run when `CH_WRITE_STRICT=1`.
 
 `relay` and `bench-verdicts` keep their own status: a park there is a failed write that their own
-retry handles. The v2-artifact action treats 75 as recorded with rows parked and still sets its
-outputs. The ingest composite actions upload `spool list` output as a `ch-spool-manifest-*`
-artifact, never the spool itself, which holds full rows and dies with an ephemeral runner: re-run
-the job, or set `CH_WRITE_SPOOL` to a persistent directory on a self-hosted runner and
-`spool replay` there.
+retry handles. Commands that do not catch `BatchParked` (`artifacts`, `ci-run-timings`, ...) end
+with it, so the v2-artifact action reports a parked artifact row through its "not recorded" branch
+(`strict` fails the step). The ingest composite actions upload `spool list` output as a
+`ch-spool-manifest-*` artifact, never the spool itself, which holds full rows and dies with an
+ephemeral runner: re-run the job, or set `CH_WRITE_SPOOL` to a persistent directory on a
+self-hosted runner and `spool replay` there. A job's manifests list each parked batch once, and
+an action whose own install failed only warns.
 
-A re-run of a v2 test-results file converges at any attempt, including the first or none: it
-always takes the replace path, whose writer skips the cases already stored, so a file that parked
-or failed part way is finished. With `--run-attempt` the new attempt is inserted before the old
+A re-run of a v2 test-results file converges at any attempt: it takes the replace path, whose
+writer skips the cases already stored, so a file that parked or failed part way is finished.
+Without `--run-attempt` a file that already holds as many rows as it has cases keeps its first
+write (as before: nothing tells the runs apart); one with fewer is finished. With `--run-attempt` the new attempt is inserted before the old
 one is deleted, so an insert that parks or fails leaves the previous attempt whole; artifact
 verdicts follow the same order. Benchmark reports are still skipped once any of their rows are
 stored, so a report of more than one batch that parks after its first batch is not finished by a

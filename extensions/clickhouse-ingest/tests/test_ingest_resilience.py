@@ -75,7 +75,12 @@ def ingest(monkeypatch, tmp_path, schema_gen, engine="MergeTree", *extra, files=
 
 
 def v1_only(log):
-    v2 = ("spyre_v2", "FROM system.tables", "merge_tree_settings")
+    v2 = (
+        "spyre_v2",
+        "FROM system.tables",
+        "merge_tree_settings",
+        "getMergeTreeSetting",
+    )
     return [e for e in log if not any(m in str(e) for m in v2)]
 
 
@@ -165,3 +170,85 @@ def test_a_file_with_rows_already_stored_still_takes_the_replace_path(
     )
     ingest(monkeypatch, tmp_path, "v2", files=2)
     assert len(calls) == 2  # a part-stored file is finished, not skipped
+
+
+PERF_XML = (
+    '<?xml version="1.0"?><testsuites><testsuite name="s" timestamp="2026-01-01T00:00:00Z">'
+    '<testcase classname="benchmark" name="perf_op-alpha_wall_clock_ms_1_8" time="1.0"/>'
+    "</testsuite></testsuites>"
+)
+
+
+def perf_ingest(monkeypatch, tmp_path, insert_benchmarks):
+    (tmp_path / "report.xml").write_text(PERF_XML)
+    live = Logged()
+    monkeypatch.setenv("CLICKHOUSE_HOST", "ch.invalid")
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    monkeypatch.setattr(results, "get_client", lambda: live)
+    monkeypatch.setattr(results, "insert_benchmarks", insert_benchmarks)
+    results.main(
+        ["--xml-dir", str(tmp_path), "--schema", "v2", "--run-id", RUN, "--trigger-type", "perf",
+         "--arch", "x86_64", "--artifact", WHEEL, "--repository", "torch-spyre/torch-spyre",
+         "--sha", "ab12"]
+    )  # fmt: skip
+    return live
+
+
+def test_a_parked_benchmark_report_withholds_the_perf_verdict(
+    monkeypatch, tmp_path, capsys
+):
+    def parks(*a, **k):
+        raise BatchParked("benchmark_runs: 1 parked, 0 stored", 0, 1)
+
+    live = perf_ingest(monkeypatch, tmp_path, parks)
+    assert not any(e[0] == "insert" and e[2] == "artifact_results" for e in live.log)
+    assert "verdict withheld" in capsys.readouterr().err
+    live = perf_ingest(monkeypatch, tmp_path, lambda *a, **k: 1)
+    assert any(e[0] == "insert" and e[2] == "artifact_results" for e in live.log)
+
+
+def test_a_both_schema_cli_run_that_parks_exits_clean_with_a_warning(
+    monkeypatch, tmp_path, capsys
+):
+    from spyre_clickhouse_ingest import __main__ as cli
+
+    def parks(*a, **k):
+        writes._parked["spyre_v2.test_case_runs"] = 2
+        raise BatchParked("test_case_runs: 2 parked, 0 stored", 0, 2)
+
+    monkeypatch.setattr(results, "replace_case_attempt", parks)
+    (tmp_path / "junit.xml").write_text(XML)
+    monkeypatch.setenv("CLICKHOUSE_HOST", "ch.invalid")
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    monkeypatch.setattr(results, "get_client", lambda: Logged())
+    args = ["--xml-dir", str(tmp_path), "--run-id", RUN, "--trigger-type", "regression",
+            "--arch", "x86_64"]  # fmt: skip
+    assert cli.main(["results", "--schema", "both", *args]) in (0, None)
+    assert "::warning" in capsys.readouterr().out
+    monkeypatch.setattr(results, "replace_case_attempt", parks)
+    assert cli.main(["results", "--schema", "v2", *args]) == writes.EXIT_PARKED
+
+
+def test_without_an_attempt_a_complete_file_is_skipped_and_a_partial_one_finished(
+    monkeypatch, tmp_path
+):
+    from spyre_clickhouse_ingest.writer import TestResultWriter
+
+    calls = []
+    monkeypatch.setattr(
+        results, "replace_case_attempt", lambda *a, **k: calls.append(a) or 0
+    )
+    for stored, replaced in ((2, 0), (1, 1)):  # XML holds two cases
+        calls.clear()
+        monkeypatch.setattr(
+            TestResultWriter, "rows_of_file", classmethod(lambda cls, *a: stored)
+        )
+        (tmp_path / "junit-0.xml").unlink(missing_ok=True)
+        live = Logged()
+        (tmp_path / "junit.xml").write_text(XML)
+        monkeypatch.setenv("CLICKHOUSE_HOST", "ch.invalid")
+        monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+        monkeypatch.setattr(results, "get_client", lambda: live)
+        results.main(["--xml-dir", str(tmp_path), "--schema", "v2", "--run-id", RUN,
+                      "--trigger-type", "regression", "--arch", "x86_64"])  # fmt: skip
+        assert len(calls) == replaced, stored

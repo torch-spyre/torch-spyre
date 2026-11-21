@@ -64,6 +64,7 @@ from spyre_clickhouse_ingest import (
 )
 from spyre_clickhouse_ingest.batching import BatchParked, insert_chunks
 from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.writer import TestResultWriter
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
 from spyre_clickhouse_ingest.offline import main as offline_main
@@ -2369,11 +2370,19 @@ def main(argv=None, assigned_trust=""):
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
+                    elif not args.run_attempt and TestResultWriter.rows_of_file(
+                        client,
+                        v2db,
+                        _v2_run_id,
+                        component_of(args, COMPONENT_DEFAULT),
+                        xml_path.name,
+                    ) >= len(cases):
+                        # No attempt to tell runs apart: a complete file keeps its first write.
+                        print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        # Always the replace path: the writer skips cases already stored, so a
-                        # re-run finishes a file that parked or failed part way, at any attempt.
-                        # Insert, then drop the earlier attempts: one that parks or fails keeps
-                        # the previous attempt (see replace_attempt).
+                        # The replace path: the writer skips cases already stored, so a re-run
+                        # finishes a file that parked or failed part way. Insert, then drop the
+                        # earlier attempts: one that parks or fails keeps the previous attempt.
                         _n = replace_case_attempt(
                             client,
                             v2db,

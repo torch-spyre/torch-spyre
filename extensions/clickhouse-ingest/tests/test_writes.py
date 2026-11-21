@@ -484,7 +484,9 @@ def test_the_hw_script_exits_75_for_a_v2_only_park_and_0_beside_v1(
 # ── what replay refuses or restores ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("table", sorted(writes.NO_REPLAY))
+@pytest.mark.parametrize(
+    "table", ["test_case_runs", "capability_runs", "artifact_results"]
+)
 def test_tables_whose_writers_do_more_than_insert_are_never_replayed(tmp_path, table):
     spool = Spool(tmp_path / "sp")
     spool.put(table, ["a"], [[1]], f"{table}-tok", "db")
@@ -549,3 +551,98 @@ def test_the_engine_cache_is_per_database():
     c = TwoDbs()
     assert writes.insert(c, "t", ROWS, ["a", "b"], "v2") == 7
     assert writes.insert(c, "t", ROWS, ["a", "b"], "v1") is None
+
+
+def test_a_stored_insert_ends_the_outage_for_the_rest_of_the_process(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    with pytest.raises(BatchFailed):
+        writes.insert(Fake(script=[err(285)] * 1000), "t", ROWS, ["a", "b"], "db")
+    assert writes.insert(Fake(), "t", ROWS, ["a", "b"], "db") == 7  # recovered
+    flaky = Fake(script=[err(285)] * 2)
+    assert writes.insert(flaky, "t", ROWS, ["a", "b"], "db") == 7  # full retries again
+    assert len(flaky.inserts) == 3
+
+
+def test_a_spent_deadline_expires_after_one_deadline(monkeypatch):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    with pytest.raises(BatchFailed):
+        writes.insert(Fake(script=[err(285)] * 1000), "t", ROWS, ["a", "b"], "db")
+    time.sleep(0.06)
+    flaky = Fake(script=[err(285)])
+    assert writes.insert(flaky, "t", ROWS, ["a", "b"], "db") == 7
+    assert len(flaky.inserts) == 2
+
+
+def test_a_long_lived_threaded_process_recovers_after_an_outage(monkeypatch):
+    import threading
+
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    down = {"on": True}
+
+    class Cluster(Fake):
+        def insert(self, table, data, column_names=None, database=None, settings=None):
+            self.inserts.append(settings)
+            if down["on"]:
+                raise err(285)
+
+    def request(results):
+        try:
+            results.append(
+                writes.insert(Cluster(), "dispatch_requests", [[1]], ["a"], "db")
+            )
+        except BatchFailed:
+            results.append("failed")
+
+    during: list = []
+    threads = [threading.Thread(target=request, args=(during,)) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert during == ["failed"] * 8
+    down["on"] = False
+    after: list = []
+    threads = [threading.Thread(target=request, args=(after,)) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert after == [1] * 8 and writes._state["spent"] is None
+    tokens = writes._calls[("db", "dispatch_requests")]
+    assert tokens == 16  # scope numbers are unique across threads
+
+
+def test_the_window_is_read_through_get_merge_tree_setting_when_the_table_does_not_say(
+    capsys,
+):
+    class Setting(NoWindow):
+        def command(self, sql, *a, **k):
+            assert "getMergeTreeSetting('replicated_deduplication_window')" in sql
+            return "0"
+
+    assert writes.window(Setting(), "t", "db") == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_bytes_inside_an_array_of_strings_are_refused(tmp_path):
+    spool = park(tmp_path, rows=[[1, ["ok", str(b"\x00raw")]]])
+    fake = Fake()
+    fake.columns = [("a", "UInt32"), ("b", "Array(String)")]
+    assert "bytes" in writes.replay(fake, next(spool.pending()))
+    assert fake.inserts == []
+
+
+def test_an_artifact_row_that_parks_fails_the_artifacts_command(monkeypatch):
+    from spyre_clickhouse_ingest import artifacts
+    from spyre_clickhouse_ingest import client as ch
+
+    def parks(*a, **k):
+        writes._parked["spyre_v2.artifacts"] = 1
+        raise BatchParked("artifacts: 1 row(s) parked, 0 stored", 0, 1)
+
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    monkeypatch.setattr(ch.ClickHouse, "connect", classmethod(lambda cls, **k: Fake()))
+    monkeypatch.setattr(artifacts, "ensure", parks)
+    # Not 75: the v2-artifact action reports it through its "not recorded" branch.
+    with pytest.raises(BatchParked):
+        cli.main(
+            ["artifacts", "ensure", "--artifact", "wheel:pkg==1.0", "--arch", "x86_64"]
+        )

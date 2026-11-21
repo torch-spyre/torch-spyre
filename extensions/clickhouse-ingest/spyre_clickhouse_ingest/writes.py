@@ -28,6 +28,7 @@ import datetime
 import decimal
 import os
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,8 +47,8 @@ from .resilience import (
 )
 
 EXIT_PARKED = 75
-# The server default of replicated_deduplication_window (26.3); assumed when a login may not read
-# system.merge_tree_settings. A table's own setting is still read from system.tables.
+# replicated_deduplication_window's server default (10000 on 26.3, the tests' image), assumed when
+# the setting is readable neither in system.merge_tree_settings nor through getMergeTreeSetting().
 DEFAULT_WINDOW = 10000
 # Fact tables whose writers also dedup per case, replace older attempts and feed counters and
 # verdicts: a replay would skip all of that, so a parked batch of these is re-ingested instead.
@@ -62,15 +63,32 @@ _parked: dict[str, int] = {}  # table -> rows; bounded by the tables a process w
 _spools: dict[str, Spool | None] = {}
 _calls: dict[tuple[str, str], int] = {}
 _process = uuid.uuid4().hex
-_state = {"spent": False, "v1": False}
+# "spent": when a call last used up its deadline; cleared by the next call that stores its rows.
+_state: dict = {"spent": None, "v1": False}
+_lock = threading.Lock()
 
 
 def reset() -> None:
     """Forget this process's parked rows, spools, call counts and spent deadline (tests)."""
-    _parked.clear()
-    _spools.clear()
-    _calls.clear()
-    _state.update(spent=False, v1=False)
+    with _lock:
+        _parked.clear()
+        _spools.clear()
+        _calls.clear()
+        _state.update(spent=None, v1=False)
+
+
+def _spent_recently(deadline_s: float) -> bool:
+    """An outage is still being paid for: a call spent its deadline less than one deadline ago."""
+    with _lock:
+        spent = _state["spent"]
+        if spent is not None and time.monotonic() - spent >= deadline_s:
+            _state["spent"] = spent = None
+        return spent is not None
+
+
+def _mark_spent(spent: bool) -> None:
+    with _lock:
+        _state["spent"] = time.monotonic() if spent else None
 
 
 def note_v1_written() -> None:
@@ -140,6 +158,15 @@ def window(backend, table: str, database: str | None) -> int:
     cache = _cache(backend, "_ch_write_windows")
     found = dedup_window(backend, table, database, cache)
     if found is None:
+        try:  # readable by logins that may not read system.merge_tree_settings
+            found = cache[(database or "", table)] = int(
+                backend.command(
+                    "SELECT getMergeTreeSetting('replicated_deduplication_window')"
+                )
+            )
+        except Exception:  # noqa: BLE001 -- older servers lack the function
+            pass
+    if found is None:
         print(
             f"[warn] dedup window of {table} unreadable; assuming the server default "
             f"{DEFAULT_WINDOW}",
@@ -181,8 +208,9 @@ def spool_from_env() -> Spool | None:
 def scope_for(database: str | None, table: str) -> str:
     """Unique per call in this process, so identical rows of two calls are never merged."""
     key = (database or "", table)
-    _calls[key] = _calls.get(key, 0) + 1
-    return f"{_process}:{key[0]}.{table}#{_calls[key]}"
+    with _lock:
+        _calls[key] = n = _calls.get(key, 0) + 1
+    return f"{_process}:{key[0]}.{table}#{n}"
 
 
 def insert(
@@ -203,7 +231,7 @@ def insert(
         return None
     policy = Policy.from_env()
     policy.batch_rows, policy.degrade_to = batch_rows, None
-    if _state["spent"]:
+    if _spent_recently(policy.deadline_s):
         policy.deadline_s = 0.0
     try:
         out = resilient_insert(
@@ -220,13 +248,14 @@ def insert(
             feeds_views=found.feeds_views,
         )
     except WriteFailed as err:
-        _state["spent"] = True
+        _mark_spent(True)
         stored = err.outcome.stored if err.outcome else 0
         raise BatchFailed(f"{table}: {err}", stored) from err
+    _mark_spent(bool(out.spooled))
     if out.spooled:
-        _state["spent"] = True
         name = f"{database}.{table}" if database else table
-        _parked[name] = _parked.get(name, 0) + out.spooled
+        with _lock:
+            _parked[name] = _parked.get(name, 0) + out.spooled
         raise BatchParked(
             f"{table}: {out.spooled} row(s) parked, {out.stored} stored",
             out.stored,
@@ -245,10 +274,12 @@ def finish(rc):
     A run that also wrote the v1 rows (authoritative) stays clean with a warning, unless
     CH_WRITE_STRICT is set.
     """
-    if not _parked:
+    with _lock:
+        totals, v1 = dict(_parked), _state["v1"]
+        _parked.clear()
+        _state["v1"] = False  # one run per finish
+    if not totals:
         return rc
-    totals = dict(_parked)
-    _parked.clear()
     where = spool_dir() or "(no spool)"
     lines = [f"{t}: {n} row(s) parked" for t, n in sorted(totals.items())]
     print(
@@ -266,7 +297,7 @@ def finish(rc):
             pass
     if rc not in (0, None):
         return rc
-    if _state["v1"] and not _flag("CH_WRITE_STRICT"):
+    if v1 and not _flag("CH_WRITE_STRICT"):
         print(
             "::warning title=ClickHouse::v2 rows parked, not stored; v1 rows were written"
         )
@@ -331,7 +362,6 @@ _PARSE = (
     ("Decimal", decimal.Decimal),
 )
 _NESTED = ("Array(", "Map(", "Tuple(", "Nested(", "Variant(", "Dynamic", "JSON")
-_TEXT = ("String", "FixedString(")
 
 
 def _unwrap(kind: str) -> str:
@@ -342,6 +372,15 @@ def _unwrap(kind: str) -> str:
             if kind.startswith(wrapper) and kind.endswith(")"):
                 kind, changed = kind[len(wrapper) : -1], True
     return kind
+
+
+def _bytes_text(v) -> bool:
+    """A cell, or a value inside it, that the spool wrote from bytes as `b'...'` text."""
+    if isinstance(v, str):
+        return v[:2] in ("b'", 'b"')
+    if isinstance(v, dict):
+        return any(_bytes_text(x) for kv in v.items() for x in kv)
+    return isinstance(v, list) and any(_bytes_text(x) for x in v)
 
 
 def _typed(backend, item: SpoolItem) -> tuple[list, str]:
@@ -360,9 +399,7 @@ def _typed(backend, item: SpoolItem) -> tuple[list, str]:
         kind = _unwrap(types.get(col, ""))
         if kind.startswith(_NESTED) and any(k in kind for k, _ in _PARSE):
             return [], f"column {col} nests {kind}, which the spool flattened to text"
-        if kind.startswith(_TEXT) and any(
-            isinstance(r[i], str) and r[i][:2] in ("b'", 'b"') for r in item.rows
-        ):
+        if "String" in kind and any(_bytes_text(r[i]) for r in item.rows):
             return [], f"column {col} holds bytes that the spool wrote as text"
         parsers.append(next((f for k, f in _PARSE if kind.startswith(k)), None))
     rows = [
