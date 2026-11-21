@@ -22,6 +22,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -68,6 +69,16 @@ static std::vector<int64_t> compute_host_stride(
     stride *= host_size[i];
   }
   return host_stride;
+}
+
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
+    const std::vector<int64_t>& device_size) {
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
+  for (int64_t d = 0; d < static_cast<int64_t>(device_size.size()); ++d)
+    valid_elements[{d}] = device_size[d];
+
+  return valid_elements;
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -254,8 +265,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
-  impl->dma_sizes = this->dma_sizes;
-  impl->dma_strides = this->dma_strides;
   impl->reserved_dims = this->reserved_dims;
   copy_tensor_metadata(
       /*src_impl=*/this,
@@ -286,8 +295,6 @@ void SpyreTensorImpl::shallow_copy_from(
     const at::intrusive_ptr<at::TensorImpl>& impl) {
   auto spyre_impl = static_cast<SpyreTensorImpl*>(impl.get());
   at::TensorImpl::shallow_copy_from(impl);
-  this->dma_sizes = spyre_impl->dma_sizes;
-  this->dma_strides = spyre_impl->dma_strides;
   this->spyre_layout = spyre_impl->spyre_layout;
   this->reserved_dims = spyre_impl->reserved_dims;
 }
@@ -344,28 +351,22 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   }
 }
 
-std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_privateuseone());
-  SpyreTensorImpl* impl;
-  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_sizes;
-  }
-  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
+int64_t valid_element_count(const SpyreTensorLayout& stl) {
+  int64_t count = 1;
+  for (const auto& [dims, valid] : stl.valid_elements) count *= valid;
+  return count;
 }
 
-std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_privateuseone());
-  SpyreTensorImpl* impl;
-  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_strides;
+std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl) {
+  std::vector<StickPair> pairs;
+  for (const auto& [dims, count] : stl.valid_elements) {
+    TORCH_CHECK(dims.size() == 1 || dims.size() == 2,
+                "valid_elements key with ", dims.size(),
+                " dims is not supported; only singleton {j} and stick-pair "
+                "{outer, inner} keys are valid");
+    if (dims.size() == 2) pairs.push_back({dims[0], dims[1], count});
   }
-  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
-}
-
-bool SpyreTensorImpl::has_intact_reservation() const {
-  return !reserved_dims.empty() && storage_offset() == 0 &&
-         sizes() == c10::IntArrayRef(dma_sizes) &&
-         strides() == c10::IntArrayRef(dma_strides);
+  return pairs;
 }
 
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
@@ -374,7 +375,7 @@ std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
     return std::nullopt;
   }
   auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-  if (impl == nullptr || !impl->has_intact_reservation()) {
+  if (impl == nullptr || impl->reserved_dims.empty()) {
     return std::nullopt;
   }
   return impl->reserved_dims;

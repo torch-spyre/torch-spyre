@@ -110,17 +110,18 @@ class TestReservationResizeGuard(TestCase):
             self.x_dev.resize_((1024,))
 
     def test_resize_after_in_place_transpose_rejected(self) -> None:
-        # t_() swaps the axes but leaves the reservation's dim index alone,
-        # so resize_ would validate the wrong axis. It must refuse.
+        # t_() swaps the axes and leaves the reservation's dim index alone. The
+        # per-dim check still refuses the resize, since dim 1 would change; this
+        # is no longer the axis-identity guard.
         d = self.x_dev.detach()
         d.t_()
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "may only change the reserved dim"):
             d.resize_((1024, 140))
 
     def test_resize_after_in_place_rank_change_rejected(self) -> None:
         d = self.x_dev.detach()
         d.unsqueeze_(0)
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "may only change the reserved dim"):
             d.resize_((1, DIM_MAX, 1024))
 
     def test_resize_after_valid_resize_still_allowed(self) -> None:

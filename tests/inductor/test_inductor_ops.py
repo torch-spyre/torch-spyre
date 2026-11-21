@@ -461,8 +461,8 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
 def _valid_elements_from_host(sizes, strides, device_size, stride_map):
     """Compute valid_elements by mapping device dims to host dims.
 
-    Mirrors the C++ get_dim_map logic: maps each device dim to the host dim
-    with the largest host stride <= stride_map[j], then groups device dims
+    Maps each device dim to the host dim with the largest host stride
+    <= stride_map[j], then groups device dims
     by their host dim.  The value for each group is the host dimension's
     element count.  Use this for manually-constructed device layouts where
     the 4-arg dim_order constructor is not available.

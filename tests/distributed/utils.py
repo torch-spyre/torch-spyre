@@ -115,8 +115,14 @@ def _overpadded_collective_tensor(values, padded_width, device):
     # Match the materialized input in Granite's compiled logits allgather:
     # logical [1, 24640], device [416, 1, 64], stride map [64, 0, 1].
     # The compiler retains the projection's 26624-element physical allocation.
+    # The valid extents are the logical row: values.numel() elements over the
+    # stick pair {0, 2}, and the size-1 dim {1} holds one. The padding sticks
+    # beyond them are not valid.
     layout = SpyreTensorLayout(
-        [padded_width // 64, 1, 64], [64, 0, 1], DataFormats.SEN169_FP16, {}
+        [padded_width // 64, 1, 64],
+        [64, 0, 1],
+        DataFormats.SEN169_FP16,
+        {(0, 2): values.numel(), (1,): 1},
     )
     tensor = spyre_empty_with_layout(
         values.shape, values.stride(), values.dtype, layout, device=device
