@@ -35,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import CeilDiv, FloorDiv, Mod
 from torch._inductor.virtualized import V
 
 
@@ -107,6 +107,7 @@ from .op_spec import (
     walk_loop_specs,
 )
 from .op_spec_validation import validate_op_specs
+from .codegen.kernel_launchspec import LaunchArg, LaunchArgLayout
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
@@ -646,6 +647,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
         # values match .run() positional args.
         self._live_call_arg_names: list[str] | None = None
+        # Per-argument HOST shape/dtype for the launch spec, keyed by arg_index.
+        self._launch_args: dict[int, LaunchArg] = {}
         # The op names of the scheduler nodes codegenned into this kernel, set by
         # the scheduler before any spec is built; empty means "unknown", which
         # makes every buffer look non-local.  Read by create_tensor_arg for
@@ -1326,6 +1329,76 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if name in self.args.output_buffers:
                     self.args.output_buffers[name] = REMOVED
 
+    @staticmethod
+    def _fold_exact_divisions(expr: sympy.Expr) -> sympy.Expr:
+        """``expr`` with each ``x // d`` the ShapeEnv proves exact made a division.
+
+        A ``for_each_tile`` output's extent is ``G * (n // G)``, the tile count
+        times the tile. The loop guards ``n % G == 0``, so that is ``n``, but
+        neither inductor's ``sizevars.simplify`` nor ``ShapeEnv.simplify`` uses
+        the divisibility to cancel it, and the launch spec would record an
+        expression a launcher has no binding for. Replacing ``FloorDiv(x, d)``
+        by ``x / d`` where ``Mod(x, d) == 0`` is provable is exact, and sympy
+        then cancels the product to ``n``.
+        """
+        sizevars = V.graph.sizevars
+        exact = {
+            fd: fd.args[0] / fd.args[1]
+            for fd in expr.atoms(FloorDiv)
+            if sizevars.statically_known_equals(Mod(fd.args[0], fd.args[1]), 0)
+        }
+        return expr.xreplace(exact) if exact else expr
+
+    def _record_launch_spec_arg(self, name: str, tensor_arg) -> None:
+        """Record one argument's HOST shape and dtype for the launch spec.
+
+        Called from ``codegen_kernel`` as each ``arg_index`` is assigned, which
+        is the last point where this is knowable: the host view lives on the
+        buffer's ``FixedTiledLayout`` (which augments inductor's host
+        ``FixedLayout`` with the device one), and ``TensorArg`` keeps only the
+        device half.
+
+        Symbolic dims are recorded as the symbol's name and kept off
+        ``TensorArg`` by design so as not to invalidate every cached kernel.
+        """
+        try:
+            buf = V.graph.try_get_buffer(name)
+            if buf is None:
+                return
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                return
+
+            shape: list = []
+            for dim in layout.size:
+                if isinstance(dim, (int, sympy.Integer)):
+                    shape.append(int(dim))
+                else:
+                    # A free symbol (mark_dynamic/dynamic=True): name it and let
+                    # the launcher bind it, rather than baking in a hint. A dim
+                    # that is still an expression after folding is recorded as
+                    # written, and the reader refuses it rather than guess.
+                    shape.append(str(self._fold_exact_divisions(dim)))
+
+            record = LaunchArg(
+                arg_index=tensor_arg.arg_index,
+                role="input" if tensor_arg.is_input else "output",
+                shape=shape,
+                dtype=str(layout.dtype).removeprefix("torch."),
+                layout=LaunchArgLayout.from_device_layout(layout.device_layout),
+            )
+        except Exception:  # noqa: BLE001 - no spec is better than a failed compile
+            logger.debug("could not record launch arg for %s", name, exc_info=True)
+            return
+        self._launch_args[tensor_arg.arg_index] = record
+
+    def launch_args(self) -> list[LaunchArg]:
+        """The recorded per-argument host records, in ``arg_index`` order.
+
+        Populated after ``codegen_kernel`` is run.
+        """
+        return [self._launch_args[i] for i in sorted(self._launch_args)]
+
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
         scheduler = getattr(V.graph, "scheduler", None)
@@ -1705,6 +1778,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if "hbm_pool" in tensor_arg.allocation:
                 continue  # pooled after preparation; addressed inside the pool
             tensor_arg.arg_index = actuals.index(name)
+            self._record_launch_spec_arg(name, tensor_arg)
             if _spyre_config.bundle_symbolic_args:
                 # On the symbolic path the HBM address is provided at runtime
                 # via input_arg_extract; start_address is never used as a
