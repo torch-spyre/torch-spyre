@@ -104,16 +104,6 @@ _TAKE_FLAT_RESTICKIFY = rejection(
     "compile take on a flattened 2-D source: AssertionError restickify op_spec has 3 args.",
     r"restickify op_spec has 3 args",
 )
-_REMAINDER = rejection(
-    4416,
-    "aten::remainder.Tensor_out is not registered on Spyre.",
-    r"Could not run 'aten::remainder.Tensor_out'",
-)
-_REMAINDER_COMPILED = rejection(
-    4416,
-    "compile take_along_dim: fused gather kernel contains the unimplemented operation remainder.",
-    r"unimplemented operation remainder",
-)
 _GATHER_OUT = rejection(
     4328,
     "aten::gather.out is not registered on Spyre.",
@@ -494,8 +484,9 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_api_take_along_dim_argmax(self, execution_mode):
         """take_along_dim(x, argmax, dim=0); pick argmax rows."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4416
-        _xfail_existing(execution_mode, eager=_REMAINDER, compiled=_REMAINDER_COMPILED)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
+        _xfail_existing(execution_mode, eager=_GATHER_OUT, compiled=_DXP_STANDALONE)
         x = cached_randn((32, 64), differentiation="api18", dtype=torch.float16)
         idx = x.argmax(dim=0, keepdim=True)
         compare_mode(
