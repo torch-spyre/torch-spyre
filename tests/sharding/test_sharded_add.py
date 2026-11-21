@@ -349,6 +349,103 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
         torch.compile(lambda x, y: x + y, dynamic=False)(a, a)
 
 
+# ---------------------------------------------------------------------------
+# verify_non_unified_split: the committed work split must be the shard dim.
+#
+# Pure-python unit tests on the codegen guard (no device needed). The guard
+# checks the committed division against each sharded arg's recorded shard
+# dim (TensorArg.non_unified_shard_dim); the earlier stride-distance
+# arithmetic only held when the shard dim was the innermost non-stick
+# device dim, so it was replaced by the dim-identity check these tests
+# pin. The e2e behavior (a re-divided op is rejected at compile) is covered
+# by the tests above through the full pipeline.
+# ---------------------------------------------------------------------------
+
+
+def _split_spec(num_cores=8):
+    """An SDSCSpec whose work division splits ``mb`` 8 ways, core c -> c."""
+    import sympy
+
+    from torch_spyre._inductor.codegen.superdsc import SDSCSpec
+    from torch_spyre._C import DataFormats
+
+    core_id = sympy.Symbol("core_id")
+    return SDSCSpec(
+        opfunc="add",
+        execution_unit="sfp",
+        data_format=DataFormats.SEN169_FP16,
+        num_inputs=2,
+        iteration_space={sympy.Symbol("mb"): 32, sympy.Symbol("out"): 128},
+        num_cores=num_cores,
+        work_slices={sympy.Symbol("mb"): num_cores, sympy.Symbol("out"): 1},
+        core_id_to_work_slice={
+            sympy.Symbol("mb"): sympy.Mod(core_id, num_cores),
+            sympy.Symbol("out"): sympy.Integer(0),
+        },
+        padding={},
+        layouts={},
+        args=[],
+        constants={},
+        coordinate_masking={},
+    )
+
+
+def _shard_arg(shard_dim, arg_index=0):
+    from torch_spyre._inductor.codegen.superdsc import SDSCArgs
+
+    return SDSCArgs(
+        layout="OUTPUT",
+        dim_order=[],
+        data_format=None,
+        scales={},
+        strides={},
+        offsets={},
+        max_dim_sizes={},
+        allocation={},
+        start_address=0,
+        backGap={},
+        arg_index=arg_index,
+        non_unified_shard_bytes=1024,
+        non_unified_shard_dim=shard_dim,
+    )
+
+
+def test_verify_non_unified_split_passes_on_the_shard_dim():
+    import sympy
+
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+
+    verify_non_unified_split(_split_spec(), [_shard_arg(sympy.Symbol("mb"))])
+
+
+def test_verify_non_unified_split_rejects_a_split_on_another_dim():
+    import sympy
+
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # A later pass re-divided the op on ``out`` while the tensors are
+    # sharded on ``mb``: each core's work slice would straddle shards.
+    spec = _split_spec()
+    spec.work_slices = {sympy.Symbol("mb"): 1, sympy.Symbol("out"): 8}
+    spec.core_id_to_work_slice = {
+        sympy.Symbol("mb"): sympy.Integer(0),
+        sympy.Symbol("out"): sympy.Mod(sympy.Symbol("core_id"), 8),
+    }
+    with pytest.raises(Unsupported, match="sharded on"):
+        verify_non_unified_split(spec, [_shard_arg(sympy.Symbol("mb"))])
+
+
+def test_verify_non_unified_split_rejects_an_arg_without_a_shard_dim():
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # A sharded arg whose producer was not admitted by the sharded
+    # planner carries no shard dim; the guard must fail closed.
+    with pytest.raises(Unsupported, match="records no shard dim"):
+        verify_non_unified_split(_split_spec(), [_shard_arg(None)])
+
+
 @requires_emulation
 @pytest.mark.parametrize(
     "fn, other, match",

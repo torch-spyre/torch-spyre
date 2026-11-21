@@ -99,6 +99,10 @@ class SDSCArgs:
     device_tile_advance_expr: Expr | None = None
     # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
     non_unified_shard_bytes: int = 0
+    # SDSC-dim symbol of the shard dim (already mapped to the dim label),
+    # when this arg is sharded storage; None otherwise. Read only by the
+    # codegen guard verify_non_unified_split.
+    non_unified_shard_dim: Symbol | None = None
 
     @property
     def non_unified(self) -> bool:
@@ -2043,6 +2047,14 @@ def _create_sdsc_tensors(
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
             non_unified_shard_bytes=arg.non_unified_shard_bytes,
+            non_unified_shard_dim=(
+                # Map the planner's raw pinned symbol to the emitted dim
+                # label, the same rename every other symbol gets, so the
+                # guard can compare it against work_slices' keys.
+                symbol_mapping.get(arg.non_unified_shard_dim, arg.non_unified_shard_dim)
+                if arg.non_unified_shard_dim is not None
+                else None
+            ),
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)

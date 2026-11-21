@@ -289,28 +289,34 @@ def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
                 f"non-unified kernel maps core {c} to slice {got} of dim "
                 f"{d}; it must own shard {c}"
             )
-    # The split dim must be the shard dim: in the unified address model
-    # (compute_ops.core_idx_to_slice_offset), core c's slice starts
-    # c * strides[dim] / work_slices[dim] elements in; that must be exactly c
-    # shards, so each core's tile is one chunk.
-    # Local import: compute_ops imports this module, so a module-level
-    # import would be circular.
-    from .codegen.compute_ops import num_bytes
-
+    # The split dim must be the shard dim. Non-unified args are NOT addressed
+    # by the unified model (compute_ops.core_idx_to_slice_offset never runs for
+    # them -- each core starts from its own symbolic shard address), so the
+    # shard binding cannot be re-derived from the emitted strides: the earlier
+    # version computed the slice-to-slice distance as strides[dim]/n and
+    # required it to equal one shard, which holds only when the shard dim is
+    # the innermost non-stick device dim (measured: (32,128) fp16 Shard(0)
+    # splits mb 8 ways with strides[mb]=2048, one slice 512 bytes, one shard
+    # 1024). Instead each sharded arg carries the shard dim's symbol
+    # (TensorArg.non_unified_shard_dim, derived from the tensor's placement
+    # against the iteration space the SDSC is emitted from), and the
+    # committed split is checked against it directly. With exactly one dim
+    # split n ways, core c on slice c, and that dim the shard dim, core c's
+    # work slice is shard c's element set by construction -- the shard is the
+    # tensor divided n ways on its shard dim, which the planner already
+    # checked divides evenly.
     for tensor in shard_kernel_args:
-        stride = tensor.strides.get(dim)
-        if stride is None or tensor.scales.get(dim, 0) <= 0:
+        shard_dim = tensor.non_unified_shard_dim
+        if shard_dim is None:
             raise Unsupported(
-                f"non-unified kernel splits {dim}, which tensor arg "
-                f"{tensor.arg_index} does not index"
+                f"non-unified kernel splits {dim}, but tensor arg "
+                f"{tensor.arg_index} records no shard dim (its producer was "
+                "not admitted by the sharded planner)"
             )
-        nbytes = num_bytes(tensor.data_format)
-        slice_bytes = int(stride) // n * nbytes
-        if slice_bytes != tensor.non_unified_shard_bytes:
+        if shard_dim != dim:
             raise Unsupported(
-                f"non-unified kernel splits {dim}: one slice is {slice_bytes} "
-                f"bytes of tensor arg {tensor.arg_index}, but one shard is "
-                f"{tensor.non_unified_shard_bytes}"
+                f"non-unified kernel splits {dim}, but tensor arg "
+                f"{tensor.arg_index} is sharded on {shard_dim}"
             )
 
 
