@@ -165,10 +165,12 @@ thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
 // Per device:
 // - Stream 0: Default stream (always available, priority 0)
 // - Streams 1-32: Low priority streams (priority 0)
-// - Streams 33-64: High priority streams (priority -1)
+// - Streams 33-63: High priority streams (priority -1)
+// - Stream 64: Dedicated DMA stream (SPYRE_DMA_STREAM prototype)
 // - Stream 65+: Host compute streams (priority -1)
 constexpr int kStreamsPerDevice = 32;
-constexpr int kHighPriorityStreamsPerDevice = 32;
+constexpr int kHighPriorityStreamsPerDevice = 31;  // 33-63 inclusive
+constexpr c10::StreamId kDmaStreamId = 64;
 constexpr int kHostComputeStreamStartPerDevice = 65;
 constexpr int kDefaultHostComputeStreams = 4;
 constexpr int kMaxHostComputeStreams = 8;
@@ -513,9 +515,13 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  // Two-stream overlap topology:
+  // Two-stream overlap topology (default):
   //   S_dev  = this stream (the default) — Compute (+ D2H).
-  //   S_prep = the persistent host-compute stream — HostCompute + separate H2D.
+  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  // Three-stream topology (SPYRE_DMA_STREAM=1):
+  //   S_dev  = this stream — Compute (+ D2H).
+  //   S_prep = host-compute stream (ID 65) — HostCompute only.
+  //   S_dma  = dedicated DMA stream (ID 64) — standalone & unbatched H2D.
   // Batched correction uploads instead travel with their compute on S_dev.
   // HostCompute runs inline on the caller; only uploads and compute are queued.
   // S_dev compute can overlap preparation for subsequent launches. Every op
@@ -540,6 +546,12 @@ void SpyreStream::launch(const JobPlan& plan,
   // This switch controls stream splitting only: eligible correction batching is
   // enabled in both topologies, including the single-stream path.
   const bool should_split = get_hazard_tracker_enabled();
+  const bool use_dma_stream =
+      should_split && (std::getenv("SPYRE_DMA_STREAM") != nullptr);
+  const SpyreStream s_dma =
+      use_dma_stream ? SpyreStream(c10::Stream(c10::Stream::UNSAFE, device(),
+                                               kDmaStreamId))
+                     : s_prep;
   for (size_t i = 0; i < plan.steps.size(); ++i) {
     const auto& step = plan.steps[i];
     const auto kind = classifyStep(*step);
@@ -563,9 +575,17 @@ void SpyreStream::launch(const JobPlan& plan,
           end - i <= max_corrections && end < plan.steps.size() &&
           classifyStep(*plan.steps[end]) == StepKind::Compute;
     }
-    const SpyreStream& target =
-        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
-    step->construct(ctx, target);
+    if (auto* hc = dynamic_cast<const JobPlanStepHostCompute*>(step.get())) {
+      const SpyreStream& prep_target = should_split ? s_prep : s_dev;
+      const SpyreStream* dma_target = use_dma_stream ? &s_dma : nullptr;
+      hc->construct(ctx, prep_target, dma_target);
+    } else {
+      const SpyreStream& target =
+          (use_dma_stream && kind == StepKind::H2D)            ? s_dma
+          : (should_split && step->role() == StreamRole::Prep) ? s_prep
+                                                               : s_dev;
+      step->construct(ctx, target);
+    }
   }
   TORCH_CHECK(ctx.program_corrections.empty(),
               "Program correction has no consuming compute step");
@@ -591,6 +611,13 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
 
   // Register default stream (ID 0).
   pool.stream_handle_map[0] = runtime->getDefaultStream();
+
+  // Register dedicated DMA stream (ID 64) for SPYRE_DMA_STREAM.
+  // Always created so the handle is ready if the flag is set at launch time.
+  pool.stream_handle_map[kDmaStreamId] =
+      runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
+                            flex::RuntimeStreamMode::STRICT_ORDERING,
+                            /*track_hazards=*/get_hazard_tracker_enabled());
 
   // Register host compute streams (IDs 65+)
   int num_host_streams = getNumHostComputeStreams();
@@ -800,6 +827,11 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       collect(pool.low_priority_streams);
       collect(pool.high_priority_streams);
       collect(pool.host_compute_streams);
+      // Always sync the DMA stream (present once pool is initialized).
+      auto dma_it = pool.stream_handle_map.find(kDmaStreamId);
+      if (dma_it != pool.stream_handle_map.end()) {
+        handles_to_sync.push_back(dma_it->second);
+      }
     }  // lock released
 
     c10::DeviceGuard guard(dev);

@@ -14,9 +14,17 @@
 
 # Owner(s): ["module: stream"]
 
+import os
+import subprocess
+import sys
+
 import torch
 import torch_spyre
 from torch.testing._internal.common_utils import run_tests, TestCase
+
+# Stream ID constants mirrored from spyre_stream.cpp.
+_DMA_STREAM_ID = 64
+_HIGH_PRIORITY_STREAMS_PER_DEVICE = 31  # IDs 33-63 inclusive
 
 
 class TestSpyreStream(TestCase):
@@ -327,6 +335,61 @@ class TestStreamCompatibility(TestCase):
         # Both should return valid streams
         self.assertIsNotNone(legacy_current)
         self.assertIsNotNone(modern_current)
+
+
+class TestThreeStreamTopology(TestCase):
+    """Tests for the SPYRE_DMA_STREAM prototype."""
+
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("spyre")
+
+    def test_dma_stream_id_not_in_high_priority_pool(self):
+        """ID 64 is reserved for the DMA stream and must not be handed out as a
+        high-priority stream. Exhaust the entire high-priority pool and verify
+        the DMA stream ID never appears."""
+        seen_ids = set()
+        # kHighPriorityStreamsPerDevice is 31 (IDs 33-63). Pull one more than
+        # that to force a full round-robin cycle.
+        for _ in range(_HIGH_PRIORITY_STREAMS_PER_DEVICE + 1):
+            s = torch_spyre._C.get_stream_from_pool(self.device, priority=-1)
+            seen_ids.add(s.id())
+        self.assertNotIn(
+            _DMA_STREAM_ID,
+            seen_ids,
+            f"Stream ID {_DMA_STREAM_ID} should be reserved for DMA, "
+            "not returned from the high-priority pool.",
+        )
+
+    def test_three_stream_correct_results(self):
+        """With SPYRE_HAZARD_TRACKER=1 and SPYRE_DMA_STREAM=1 in an isolated
+        subprocess, verify that hazard tracking initializes properly and a
+        compiled op produces correct results across the 3-stream topology."""
+        code = (
+            "import torch\n"
+            "import torch_spyre\n"
+            "assert torch_spyre._C.get_hazard_tracker_enabled(), "
+            "'Hazard tracker must be enabled'\n"
+            "x_cpu = torch.randn(64, dtype=torch.float16)\n"
+            "cpu_result = torch.abs(x_cpu)\n"
+            "compiled_abs = torch.compile(torch.abs, backend='inductor')\n"
+            "spyre_result = compiled_abs(x_cpu.to('spyre')).cpu()\n"
+            "torch.testing.assert_close(spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True)\n"
+        )
+        env = os.environ.copy()
+        env["SPYRE_HAZARD_TRACKER"] = "1"
+        env["SPYRE_DMA_STREAM"] = "1"
+        res = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            res.returncode,
+            0,
+            msg=f"3-stream subprocess test failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+        )
 
 
 if __name__ == "__main__":
