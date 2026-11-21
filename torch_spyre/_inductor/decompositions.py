@@ -1986,6 +1986,112 @@ def spyre_pow_tensor_scalar(
     return torch.exp(e * torch.log(input))
 
 
+def _fp32_matmul_tile_rows(x: torch.Tensor, y: torch.Tensor) -> int:
+    """Rows of M per step, so that one step's fp32 product fits the budget.
+
+    The largest divisor of M whose ``[..., tm, N, K]`` product fits
+    ``config.fp32_matmul_product_bytes``; M itself when the whole product fits.
+    ``for_each_tile`` needs equal tiles, so an M with no large divisor (a prime
+    M) runs many small steps.
+    """
+    *batch, m, k = x.shape
+    n = y.shape[-1]
+    row_bytes = math.prod(batch) * n * k * torch.float32.itemsize
+    max_rows = config.fp32_matmul_product_bytes // row_bytes
+    if max_rows == 0:
+        # TODO: tile N or the batch dims as well.
+        raise Unsupported(
+            f"fp32 matmul {list(x.shape)} @ {list(y.shape)}: one row of M needs a "
+            f"{row_bytes}-byte product, over SPYRE_FP32_MATMUL_PRODUCT_BYTES="
+            f"{config.fp32_matmul_product_bytes}"
+        )
+    return next(t for t in range(min(max_rows, m), 0, -1) if m % t == 0)
+
+
+def _check_fp32_matmul_k(x: torch.Tensor, y: torch.Tensor) -> None:
+    """Refuse a K that does not fill whole sticks of the upcast operands.
+
+    The K-sum reduces the stick dim of the multiply. When an operand was
+    upcast from fp16 on the device, that dim is staggered (DL16_TO_FP32), and
+    the reduction of a staggered stick dim that ends inside a stick masks the
+    wrong lanes and returns wrong values with no error. The decomposition sees
+    only dtypes, not element arrangements, so every K that is not a multiple
+    of the fp16 stick width is refused, fp32 operands passed in included.
+    """
+    k = x.shape[-1]
+    stick = get_elem_in_stick(torch.float16)
+    if k % stick:
+        # TODO: support a K that is not a multiple of the stick width. Needs
+        # the reduction of a staggered, stick-unaligned dim (#4014), or a K
+        # pad applied after layout propagation, where the arrangement is known.
+        raise Unsupported(
+            f"fp32 matmul {list(x.shape)} @ {list(y.shape)}: K={k} is not a "
+            f"multiple of {stick}"
+        )
+
+
+def _fp32_mul_sum_matmul(x: torch.Tensor, yt: torch.Tensor, tile_rows: int):
+    """``x @ yt.mT`` for fp32 ``x`` ``[..., M, K]`` and ``yt`` ``[..., N, K]``.
+
+    Multiplies ``[..., M, 1, K] * [..., 1, N, K]`` and sums over K, which keeps
+    K the innermost dim of both operands. Runs ``tile_rows`` rows of M per step.
+    """
+
+    def mul_sum(x_rows, yt):
+        return (x_rows.unsqueeze(-2) * yt.unsqueeze(-3)).sum(-1)
+
+    m_dim = x.dim() - 2
+    if tile_rows == x.shape[m_dim]:
+        return mul_sum(x, yt)
+    _, out = for_each_tile(
+        lambda _, tiles: (None, mul_sum(*tiles)),
+        (x, yt),
+        dims=(m_dim, None),
+        tile_size=tile_rows,
+        out_dim=m_dim,
+    )
+    return out
+
+
+@register_spyre_decompositions([torch.ops.aten.mm.default, torch.ops.aten.bmm.default])
+def spyre_fp32_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """fp32 ``mm``/``bmm``: fp32 accumulation and result on the vector unit.
+
+    The device matmul takes fp16 operands only. An fp32 matmul instead
+    multiplies elementwise and sums over K (:func:`_fp32_mul_sum_matmul`),
+    materializing an fp32 ``[..., M, N, K]`` product; M is tiled with
+    ``for_each_tile`` so that each step's product fits
+    ``config.fp32_matmul_product_bytes``. Other dtypes, and K = 1 (which the
+    lowerings already turn into a ``mul``), keep the matmul. K must be a
+    multiple of the fp16 stick width (:func:`_check_fp32_matmul_k`).
+    """
+    if x.dtype != torch.float32 or y.dtype != torch.float32 or x.shape[-1] == 1:
+        return NotImplemented
+    _check_fp32_matmul_k(x, y)
+    return _fp32_mul_sum_matmul(x, y.transpose(-1, -2), _fp32_matmul_tile_rows(x, y))
+
+
+@register_spyre_decompositions([torch.ops.aten.mm.dtype, torch.ops.aten.bmm.dtype])
+def spyre_fp16_matmul_fp32_out(
+    x: torch.Tensor, y: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """fp16 ``mm``/``bmm`` with ``out_dtype=torch.float32``.
+
+    Upcasts both operands and computes as :func:`spyre_fp32_matmul` does, with
+    the same restriction on K. The upcasts run before any M loop, so the loop
+    body reads fp32 tiles and holds no conversion. Other dtype pairs are not
+    decomposed and fail as upstream does.
+    """
+    if out_dtype != torch.float32 or x.dtype != torch.float16 or y.dtype != x.dtype:
+        return NotImplemented
+    if x.shape[-1] == 1:
+        return x.float() * y.float()
+    _check_fp32_matmul_k(x, y)
+    return _fp32_mul_sum_matmul(
+        x.float(), y.transpose(-1, -2).float(), _fp32_matmul_tile_rows(x, y)
+    )
+
+
 @register_spyre_decompositions([torch.ops.aten.linear.default])
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
