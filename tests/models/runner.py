@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -179,6 +179,18 @@ def to_device(x: Any, device: torch.device) -> Any:
     if isinstance(x, (tuple, list)):
         return type(x)(to_device(y, device) for y in x)
     return x
+
+
+def first_tensor_dtype(out: Any) -> Optional[torch.dtype]:
+    """Return the dtype of the first tensor in an op output, or None if none."""
+    if torch.is_tensor(out):
+        return out.dtype
+    if isinstance(out, (tuple, list)):
+        for x in out:
+            dt = first_tensor_dtype(x)
+            if dt is not None:
+                return dt
+    return None
 
 
 def _normalize_out(out: Any) -> Any:
@@ -459,10 +471,14 @@ def run_test(
     test_sample: SampleInput,
     device: torch.device,
     compile_backend: str,
-    rtol: float,
-    atol: float,
+    tolerance: Callable[[Optional[torch.dtype]], Tuple[float, float]],
     description: str = "",
 ) -> None:
+    """Run op on CPU and device and compare the results.
+
+    tolerance maps the dtype of the reference output (None when the output
+    holds no tensor) to the (rtol, atol) pair used for the comparison.
+    """
     op_name = op.aten_name
     adapter = OP_REGISTRY[op_name]
 
@@ -488,6 +504,7 @@ def run_test(
             test_out = test_sample.input
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
+    rtol, atol = tolerance(first_tensor_dtype(ref_out_cpu))
 
     # Check if the operation specifies CPU device
     FACTORY_METHODS = {
