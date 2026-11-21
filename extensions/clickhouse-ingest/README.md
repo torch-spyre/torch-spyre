@@ -542,7 +542,8 @@ a view cannot serve, so they cannot be filtered by a view. The follow-up is torc
 ## Logins and hosts
 
 `ClickHouse.connect()` returns a **writer** client by default. It refuses `CREATE`, `ALTER`,
-`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `REPLACE`, `GRANT` and `REVOKE` before
+`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `REPLACE`, `RESTORE`,
+`SYSTEM RESTORE`, `GRANT` and `REVOKE`, after any leading comments (nested `/* */` included), before
 they reach the server (`SchemaStatementOnWriter`); reads, inserts, `DELETE FROM` and
 `INSERT ... SELECT` pass. This catches mistakes; the writer login's grants are the real boundary.
 DDL (the applier, the sandbox tools, the ensure-table steps of the dispatch, model-ops and
@@ -553,7 +554,7 @@ ingest code and `.github/scripts` for DDL sent on a writer.
 |---|---|
 | `CLICKHOUSE_USER` / `CLICKHOUSE_PASS` | the writer login (legacy host) |
 | `CLICKHOUSE_SCHEMA_USER` / `CLICKHOUSE_SCHEMA_PASSWORD` | the schema login; unset falls back to the writer login with one warning |
-| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones |
+| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones (`_SECURE` and `CLICKHOUSE_SECURE` read `0/false/no/off` in any case as off) |
 | `CLICKHOUSE_V2_USER` / `CLICKHOUSE_V2_PASSWORD` | the writer login on the v2 host; unset uses the legacy writer pair |
 | `CLICKHOUSE_V2_SCHEMA_USER` / `CLICKHOUSE_V2_SCHEMA_PASSWORD` | the schema login on the v2 host; unset tries the schema pair, then the v2 writer pair |
 | `CH_V2_DATABASES` | comma list of the databases the v2 host serves (default `spyre_v2`); `CLICKHOUSE_DB_V2` is always included |
@@ -565,8 +566,10 @@ With it, a connection whose database is a v2 database goes to the v2 host, and a
 `FROM db`, `USE db`, `merge(db, ...)`, `database = 'db'` or `LIKE`, a `{db:String}` or
 `{x:Identifier}` parameter, or an insert's `database=`), ignoring comments and string literals.
 Database names are matched case-sensitively, as ClickHouse does. A statement naming qualified
-tables on both hosts raises `CrossHostStatement`. An unqualified statement always goes to the
-legacy host, so v2 code must keep qualifying its tables. Every v2 setting is checked by
+tables on both hosts raises `CrossHostStatement`, as does one that reads an unqualified table
+beside a v2 one, a view or materialized-view target on the other host, or a v2 parameter in a
+statement on legacy tables. An unqualified statement always goes to the legacy host, so v2 code
+must keep qualifying its tables. Every v2 setting is checked by
 `connect()`, so a bad one stops the process before it writes anything; the v2 client itself
 opens on first use and, if it cannot, raises `V2Unavailable`, which the ingests catch as a v2
 failure while the v1 rows still land. `CH_V2_DATABASES` may not name `CLICKHOUSE_DB` unless that

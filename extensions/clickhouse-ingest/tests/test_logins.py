@@ -142,6 +142,10 @@ def test_connect_hands_out_a_guarded_client_by_default(captured):
         "REPLACE TABLE t AS SELECT 1",
         "\ufeffCREATE TABLE t (a Int8)",
         "#! note\nCREATE TABLE t (a Int8)",
+        "/* /* */ SELECT */ DROP TABLE t",
+        "\xa0DROP TABLE t",
+        "RESTORE TABLE t FROM Disk('b', 'f')",
+        "SYSTEM RESTORE REPLICA t",
     ],
 )
 def test_a_writer_connection_never_sends_schema_statements(sql):
