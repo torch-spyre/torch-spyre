@@ -19,7 +19,7 @@ EA shuffle
 
 **Shuffle:** Apply or restore STANDARD element arrangement in a D2H or H2D copy
 of a tensor whose SpyreTensorLayout has a staggered element arrangement
-(`DL16_TO_FP32` or `FP32_TO_DL16`).
+(`DL16_TO_FP32`, `FP32_TO_DL16` or `QFP8CH`).
 
 | Copy | Host | Device | Operation |
 | :--- | :--- | :--- | :--- |
@@ -56,7 +56,7 @@ generate_dci
        3. dimwise_ea[i] = identity_dim_ea(...)   for every host dim
           ea_shuffle(...)                        overwrites the stick dim
             -> ea_shuffle_fp16tofp32   (DL16_TO_FP32)
-            -> ea_shuffle_fp32tofp16   (FP32_TO_DL16)
+            -> ea_shuffle_fp32tofp16   (FP32_TO_DL16, QFP8CH)
   -> reverse dimwise_ea (the DCI shapes are innermost first)
   -> host2device ? dci.output_dimwise_ea_ : dci.input_dimwise_ea_
 ```
@@ -359,6 +359,39 @@ stick, 44 columns) host columns 32..43 are mapped to device positions 4..7,
   rejected at compile time with `cannot rescale device layout`, before any
   copy. The shuffle does not see these tensors.
 
+### EA QFP8CH
+
+`spyre::quantize_fp8_with_scale` (activation FP8 quantization) turns two fp16
+sticks (64 elements each) into one fp8 stick of 128 elements. Like
+`FP32_TO_DL16`, it interleaves the groups of the two halves inside a single
+stick, but its groups hold 8 elements:
+
+```text
+Columns:  [ 0..7 ] [ 8..15 ] ... [ 56..63 ] [ 64..71 ] ... [ 120..127 ]
+Groups:   [  G0  ] [  G1   ] ... [  G7   ] [  G8   ] ... [  G15    ]
+          |<------- half 0 -------->|<--------- half 1 --------->|
+
+Pos:      [ 0..7 ] [ 8..15 ] [ 16..23 ] [ 24..31 ] ... [ 112..119 ] [ 120..127 ]
+Groups:   [  G0  ] [  G8   ] [  G1    ] [  G9    ] ... [  G7     ] [  G15     ]
+```
+
+```
+host_col = (stick * 128) + (half_in_stick * 64) + (group_in_half * 8) + elem_in_group
+```
+
+`ea_shuffle` therefore calls `ea_shuffle_fp32tofp16` with 8 elements per group:
+
+| Piece | `subElems_` | `subStride_` | Meaning of the stride |
+| :--- | :---: | :---: | :--- |
+| `elem_in_group` | 8 | 1 | Next element in the stick. |
+| `group_in_half` | 8 | 16 | Skips the group of the other half. |
+| `half_in_stick` | 2 | 8 | Moves by one group. |
+| `stick` | N | 128 | Next fp8 stick. |
+
+As for `FP32_TO_DL16`, a partly filled last stick (for example 16 or 100
+columns) is handled by the same `p(c)` over the allocated extent, in both
+directions.
+
 ### Supported inputs
 
 | Conversion | Stick dim | Result |
@@ -383,5 +416,11 @@ identity entry.
   `DL16_TO_FP32` result) computes its device offset in standard order, so the
   shuffle treats sticks 1 and 2 as a pair instead of sticks (0, 1) and (2, 3)
   and produces wrong data without an error. See issue [#5556][issue-5556].
+* **Slices of the device tensor:** the `dimwise_ea` entries describe the whole
+  device tensor, not the slice, so a copy of a device slice (for example
+  `y[1:3]`, `y[:, :64]` or `y[1]`) can fail in the data conversion or move the
+  wrong elements. `generate_dci` rejects such copies, in both directions, for
+  every staggered arrangement: `Copying a slice of a device tensor with element
+  arrangement ... is not supported`. Copy the whole tensor instead.
 
 [issue-5556]: https://github.com/torch-spyre/torch-spyre/issues/5556
