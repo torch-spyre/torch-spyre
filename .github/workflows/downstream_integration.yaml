@@ -49,7 +49,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   downstream-integration:
-    name: Integration (${{ matrix.repo }})${{ matrix.wait == 'true' && '' || ' - dispatched, not awaited' }}
+    name: Integration (${{ matrix.repo }})${{ matrix.name_suffix }}
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 270
@@ -60,15 +60,19 @@ jobs:
         include:
           - repo: hf-adapters
             wait: 'true'
+            name_suffix: ''
+            context_suffix: ''
             extra_inputs: '{}'
           # Informational: dispatched and linked in the run summary, never awaited, so a slow or hung run cannot hold this workflow open or leave a pending status.
           - repo: spyre-inference
             wait: 'false'
+            name_suffix: ' - dispatched, not awaited'
+            context_suffix: ' (not awaited)'
             extra_inputs: '{"image_rpms":"true"}'
     env:
       GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
-      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.wait == 'true' && '' || ' (not awaited)' }}
+      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.context_suffix }}
     steps:
       - name: Report pending
         if: matrix.wait == 'true'
