@@ -40,6 +40,7 @@ from torch._prims_common import (
 
 from .constants import (
     DEVICE_NAME,
+    BF16_TOPK_MAX_DIM,
     FP16_TOPK_MAX_DIM,
     FP8_E4M3FN_MAX,
     FP8_E4M3FN_MIN,
@@ -1859,15 +1860,20 @@ def spyre_topk(
         raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
-    # The index is counted in the input dtype, so a longer fp16 search dim returns
-    # wrong indices without an error (#5847). The way around it is to search in
-    # float32, but the device float16 to float32 cast is not reliable yet (it
-    # permutes elements within a stick pair, #5856), so reject instead.
+    # The index is counted in the input dtype, so a longer fp16 or bf16 search dim
+    # returns wrong indices without an error (#5847). The way around it is to
+    # search in float32, but the device float16 to float32 cast is not reliable
+    # yet (it permutes elements within a stick pair, #5856), so reject instead.
     n = input.size(dim)
-    if input.dtype == torch.float16 and n > FP16_TOPK_MAX_DIM:
+    max_dim = {
+        torch.float16: FP16_TOPK_MAX_DIM,
+        torch.bfloat16: BF16_TOPK_MAX_DIM,
+    }.get(input.dtype)
+    if max_dim is not None and n > max_dim:
+        name = str(input.dtype).removeprefix("torch.")
         raise Unsupported(
-            f"topk along a float16 dim of size {n}: the indices are held in float16, "
-            f"which is exact only up to {FP16_TOPK_MAX_DIM}; use a float32 input"
+            f"topk along a {name} dim of size {n}: the indices are held in {name}, "
+            f"which is exact only up to {max_dim}; use a float32 input"
         )
     # sorted=False is a no-op: our reduction always returns sorted output.
     # Index stays in the input dtype (not int64) all the way out; topkindex's
