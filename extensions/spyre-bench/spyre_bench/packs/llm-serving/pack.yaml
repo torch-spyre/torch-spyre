@@ -87,23 +87,23 @@ spec:
     - {name: llm.startup.warm, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
     - {name: llm.eval.exact_match, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
     - {name: llm.parity.greedy_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}
-    - {name: llm.eval.acc, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.acc_norm, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.f1, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.eval.exact_match_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.eval.acc, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.acc_norm, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.f1, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.exact_match_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "standard error of llm.eval.exact_match as the harness reports it"}
-    - {name: llm.eval.acc_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.acc_norm_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.f1_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
-    - {name: llm.eval.n_samples, unit: "{record}", direction: none, category: diagnostic, statistic: value, compare: exact,
+    - {name: llm.eval.acc_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.acc_norm_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.f1_stderr, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.n_samples, class: diagnostic, unit: "{record}", direction: none, category: diagnostic, statistic: value, compare: exact,
        description: "records the harness scored; compared with the input's expect.records by llm.records_complete"}
-    - {name: llm.eval.error_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.eval.error_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of requests that errored or came back empty"}
-    - {name: llm.eval.truncated_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.eval.truncated_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of generations that hit max_tokens or a prompt cut by max_model_len"}
-    - {name: llm.parity.mean_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.parity.max_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: max, compare: absolute}
-    - {name: llm.parity.tie_adjusted_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
-    - {name: llm.parity.ref_coverage, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
-    - {name: llm.eval.invalid_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+    - {name: llm.parity.mean_abs_prob_err, class: quality_score, unit: "1", direction: lower_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.max_abs_prob_err, class: quality_score, unit: "1", direction: lower_is_better, category: quality, statistic: max, compare: absolute}
+    - {name: llm.parity.tie_adjusted_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.parity.ref_coverage, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.eval.invalid_frac, class: diagnostic, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
        description: "share of answers the scorer could not parse; a failed request counts here when the harness has no error counter"}
