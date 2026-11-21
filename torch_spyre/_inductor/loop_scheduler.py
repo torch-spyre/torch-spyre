@@ -327,8 +327,8 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     No pass produces such an op today: across the seven graphs of
     ``test_loop_scheduler_equivalence.py`` this check never fires.  It guards a
     future pass that places an op between two members without stamping its
-    ``loop_info``.  Ops at the head or tail of a body are not refused: they
-    are moved out at the hand-off (``loop_node.peel_non_members``).
+    ``loop_info``.  An op at the head or tail of a body is refused the same way
+    (before stage 8.5 the hand-off moved such an op out of the node).
     """
     paths = {op.get_name(): counted_loop_path(op) for op in kernels}
     # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on

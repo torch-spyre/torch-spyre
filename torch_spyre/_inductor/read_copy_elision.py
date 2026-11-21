@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import copy
+from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -38,8 +39,10 @@ from .constants import MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
-from .loop_facts import read_advance
-from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
+from .loop_facts import enclosing_loops, read_advance
+from .loop_info import LoopInfo
+from .pass_utils import copy_op_metadata
+from .loop_node import record_loop_info, remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -50,6 +53,29 @@ from .pass_utils import (
     per_core_views_equal,
     replace_computed_buffer_body,
 )
+
+
+@dataclass(frozen=True)
+class ReadCopyElisionRecord:
+    """Direct-read form saved while a consumer is redirected through a copy.
+
+    Coarse tiling keeps the copy authoritative until layout selection, work
+    division, and LX planning finish.  A later pass may restore
+    ``direct_inner_fn`` only when the final physical plan proves that reading
+    ``source_name`` directly is equivalent.  The record is deliberately not
+    copied by :func:`copy_op_metadata`: rebuilding the consumer body
+    invalidates the saved direct form unless that pass explicitly recreates
+    the record.
+    """
+
+    consumer_name: str
+    copy_name: str
+    source_name: str
+    direct_inner_fn: object
+    # Intermediate copies that become dead only if the deferred proposal is
+    # accepted, ordered from the replacement consumer back toward the source.
+    orphaned_copy_names: tuple[str, ...] = ()
+
 
 logger = get_inductor_logger("read_copy_elision")
 
@@ -125,9 +151,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _loop_advance_bound(
-    op: ComputedBuffer, dep: MemoryDep, loop_info: CoarseTileInfo
-) -> tuple[int, int] | None:
+def _loop_advance_bound(op: ComputedBuffer, dep: MemoryDep) -> tuple[int, int] | None:
     """Inclusive address change across loop trips, in source elements.
 
     The step per trip at each level is the loop variable's coefficient in
@@ -146,8 +170,8 @@ def _loop_advance_bound(
         return None
     lo = 0
     hi = 0
-    for level_idx, trip_expr in enumerate(loop_info.loop_count):
-        trip_count = _trip_count_bound(trip_expr)
+    for level_idx, level in enumerate(enclosing_loops(op)):
+        trip_count = _trip_count_bound(level.trip_count)
         if trip_count is None or trip_count < 1:
             return None
         step = _static_int(steps[level_idx]) if level_idx < len(steps) else 0
@@ -309,8 +333,12 @@ def _prove_matmul_direct_read(
         idx for idx, dep in enumerate(copy_reads) if dep.name == record.source_name
     ]
     current_loop_info = getattr(consumer, "loop_info", None)
-    if len(copy_source_indices) > 1 or not isinstance(
-        current_loop_info, CoarseTileInfo
+    # A strict LoopInfo (made by the loop-tiling lowering) is declined on purpose: it
+    # has no saved direct form, so its copy stays.
+    if (
+        len(copy_source_indices) > 1
+        or not isinstance(current_loop_info, LoopInfo)
+        or current_loop_info.strict_loop_vars
     ):
         return None, "copy reads its source more than once, or consumer is not looped"
     # The direct read keeps the staged copy's loop term in its index (the consumer
@@ -356,7 +384,7 @@ def _prove_matmul_direct_read(
             return None, "source stick dimension is not the matmul output dimension"
 
     local_bounds = _affine_bounds(source_dep)
-    advance_bounds = _loop_advance_bound(direct_op, source_dep, resolved_loop_info)
+    advance_bounds = _loop_advance_bound(direct_op, source_dep)
     # A non-contiguous graph-input view can address a larger backing span than
     # its logical numel (for example, an active KV-cache prefix whose head
     # stride still reflects the maximum cache length).  Bound the generated
@@ -529,6 +557,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             reason="read advancing input directly from HBM",
         )
         replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
+        record_loop_info(replacement)
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):
             if hasattr(direct_op, attr):
                 setattr(replacement, attr, getattr(direct_op, attr))
@@ -536,7 +565,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             del replacement._read_copy_elision_record  # type: ignore[attr-defined]
         V.graph.name_to_buffer[replacement.get_name()] = replacement
         graph.removed_buffers.add(copy_op.get_name())
-        operations.remove(copy_op)
+        remove_op(operations, copy_op)
         for orphan_name in record.orphaned_copy_names:
             orphan = next(
                 (
@@ -552,7 +581,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 and not _copy_readers(operations, orphan_name)
             ):
                 graph.removed_buffers.add(orphan_name)
-                operations.remove(orphan)
+                remove_op(operations, orphan)
         logger.info(
             "removed read copy %s; %s reads %s directly",
             copy_op.get_name(),
