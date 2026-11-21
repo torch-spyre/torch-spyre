@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Each selected score against the Result of another case (the reference system's run), in combined standard errors.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: quality-vs-reference}
+spec:
+  select: {benchmarks: [eval-questions]}
+  metric: llm.eval.exact_match
+  vary: [system.backend]
+  reference: {case: eval_questions_demoa_ref_l8, tolerance: {stderr: 3, abs: 0.02}}

@@ -76,7 +76,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_facts import read_advances_anywhere
-from .loop_node import move_before
+from .loop_node import move_before, record_loop_info
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -578,6 +578,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                     # are indexed against the matmul's dims, not the copy's; clear them
                     # (or place the copy before the node) when padding is node-aware.
                     new_op.loop_info = dataclasses.replace(op.loop_info)  # type: ignore[attr-defined]
+                    record_loop_info(new_op)
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is

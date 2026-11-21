@@ -66,6 +66,7 @@ from torch_spyre._C import SpyreTensorLayout
 
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..loop_facts import counted_loop_path
 from ..loop_node import move_before
 from ..pass_utils import (
     op_out_coords,
@@ -878,8 +879,8 @@ def _find_outside_consumers(
             continue
         if not _reads_buffer(op, buf_name):
             continue
-        li = getattr(op, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
+        path = counted_loop_path(op, include_extern=True)
+        if not path or path[0] != outer_key:
             consumers.append(op)
 
     is_graph_output = buf_name in _graph_output_names()

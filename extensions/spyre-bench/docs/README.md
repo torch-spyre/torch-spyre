@@ -213,6 +213,19 @@ A public definition names a dataset by an opaque slug (`slot-95`), never by its 
 - The file is a trusted input: whoever can write the store path decides what is public (a duplicate key is not an error: the
   last one wins). Keep that path write-restricted.
 - `dataset.json` is not part of any identity. The store namespace is configured per deployment, never in a public file.
+- `spyre-bench dataset add|list|check` creates, lists and verifies all of this in one command: [dataset-add.md](dataset-add.md).
+
+## Metric context
+
+Every metric belongs to a metric class that lists the facets its numbers must carry; see
+[metric-context.md](metric-context.md). `validate` warns when a Benchmark does not declare a required author-only facet.
+
+## Kernel pack: dtypes, MoE metrics, trace roles
+
+A kernel `op` workload accepts `dtype` `fp32`, `bf16`, `fp16`, `fp8`, `int32` and `int8`; `df16` is the device-side name
+of `fp16` and is written `fp16`. The pack registers `kernel.moe.fetch_bytes` and `kernel.moe.loop_trips` (class
+`kernel_time`) and the `role.moe.*` run properties that name which stored trace signal plays which role. A role with no
+stored signal reads as not captured, never as zero (`spyre_bench.trace_signals`). A sample is in `examples/moe-demo`.
 
 ## Cost hints, not scheduling
 
@@ -425,6 +438,208 @@ one occurs (exit 1); exit 2 for bad flags or a store failure, never a silent pas
 the measured values. Output: `verdict_schema: bench.verdict/1` with `summary`, `benchmarks[]` (worst status per
 benchmark: regressed, suspected, improved, no_baseline, pass) and `verdicts[]`.
 
+Each verdict also carries `anchored`, the metric's verdict against the accepted baseline of its series
+(`v_benchmark_anchored_verdicts`): `status` (`regressed`, `suspected`, `improved`, `unchanged`, `no_anchor`), `reason`
+(`anchor_regressed`, `anchor_improved`, `anchor_unchanged`, `no_anchor`, or a cap such as `single_run`), the anchor `version`,
+the values, and for a metric over the anchor's floor `since_ts`, `n_exceeding_runs` and `days_exceeding`. `summary.anchored`
+counts the statuses. It is null for a metric with no anchored row, and absent altogether when the store has no anchored view.
+The rolling verdict answers "got worse recently"; the anchored one "worse than the accepted normal, and since when", so a
+persistent regression stays visible after the rolling baseline has absorbed it. `--no-anchor` leaves it out and
+`--fail-on-anchored regressed` gates on it (exit 1; exit 2 when the store has no anchored view, never a silent pass); like `--fail-on` nothing gates by default.
+
+## Accepting a new normal
+
+```bash
+spyre-bench accept --run-dir results/bench --reason "driver 2.4 is the new normal" [--window N] [--benchmark UUID] [--metric M] [--dry-run]
+```
+
+Proposes a stored run as the new anchor of its series. It reads the run's samples from `v_benchmark_series_runs`, refuses a
+run that is not baseline-eligible (suspect, invalidated or off-purpose) or has a non-finite sample (exit 1, nothing proposed), and writes one
+`reference-request-<key>-<run>.json` (never replacing an existing file) (`bench.reference-request/1`, role `anchor`) per scope (component, arch, backend, source job)
+under `--out` (default `BENCH_OUT/accept`). Series of the scope that the run does not replace are carried over from the
+current anchor with their own time, so a partial accept does not reset them. An anchor needs at least 3 samples; a series
+that stores one sample per run needs `--window N`, which pools the series' newest N eligible runs up to the accepted one
+(`accept` refuses and says so otherwise). The request is the input of the reference
+machinery (reference bundle, approval, tag move): the engine writes no rows and moves no tag, so the anchor changes when the
+reference is approved, and until then `verdict` keeps comparing with the old one. `--reason` is required and recorded.
+Each value carries a `case` block (`component`, `name`, `tags`, `disc`, `disc_keys`, and `id_profile` when the Result
+has one) that rebuilds its `benchmark_id`: taken from the Results of `--run-dir` when given, else from the registered
+case; `accept` refuses, naming the ids, when a block cannot rebuild its id. `anchor` is `{role, run_id, as_of}`
+(`from_run_id` repeats `run_id` for the reference side that reads it). `reference create --from-request` consumes the file.
+Exit 1 not eligible or no case data, 2 bad flags, 5 store failure.
+
+## Uploading results
+
+```bash
+spyre-bench upload results/bench                       # seal and check; prints what would be sent (dry run)
+spyre-bench upload results/bench --apply --wait        # put it in the results inbox and wait for the relay
+spyre-bench upload bundle.tgz --apply                  # send a bundle sealed elsewhere, unchanged
+```
+
+`upload` is for results measured outside CI: a lab host, a developer machine, a partner's machine. The engine writes
+no rows. The command seals the run directory (every `result.json` under it) into a `bench` bundle through the
+ingest's offline module, checks it, and prints the run key, case and repeat counts, both digests and a receipt id
+(`RCPT-...`). Without `--apply` nothing leaves the machine (the sealed bundle is written to `RESULTS_DIR/upload/bundle.tgz`, or `--out`). With it, the bundle is put in the Artifactory inbox
+(`--base-url`, `--repo`, `--root` or `ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`; `ARTIFACTORY_TOKEN` or `~/.netrc`) and the relay records it; `--wait [MIN]` polls for
+its outcome. The dashboard's upload page takes the same bundle if you have a login. `--via api` is refused: the
+dashboard accepts a browser login only.
+
+| Flag | Effect |
+|---|---|
+| `--seal-trust lab\|external` | where the results came from (default `external`); the receiving channel records the trust and a label can only lower it |
+| `--redact-host`, `--redact-user` | leave the sealing host and user out of the bundle |
+| `--ended-at`, `--arch`, `--test-type perf\|quality` | end time (ISO-8601 with a zone), where it ran (default `run.json`; required when it records none: it is never guessed from the host), the tier |
+| `--out` | where to write the sealed bundle (default `RESULTS_DIR/upload/bundle.tgz`) |
+
+Rules that follow from the receiving side:
+
+- **Upgrade the connected ingest first.** The sealing host's ingest must not be newer than the receiving one, and
+  `upload` needs one that knows `bench` bundles; an older one is reported with that advice.
+- **Times carry a zone.** A time without one is read as UTC, whatever the sealing machine's zone; pass `--ended-at`
+  with an explicit zone when the tests ran elsewhere.
+- **The whole ingest package must be installed** (`spyre-bench[ingest]`, or its wheel in an air-gapped kit). The
+  vendored identity module that derives benchmark ids (see the adapter contract) is not enough, because sealing reads
+  `bundle.schema.json` beside the offline module.
+- **Re-sending is safe.** The run key is the engine run id and the results digest (`content_sha256`) ignores the
+  sealing host and time, so sealing the same results again is the same run even though the bundle digest differs; the
+  receiving side skips repeats it has and rejects a repeat whose content changed.
+- **Seal flags apply to a results directory.** Given an already sealed bundle, `--redact-*`, `--seal-trust`, `--arch`,
+  `--test-type`, `--ended-at` and `--out` are refused instead of ignored; `--wait` needs `--apply`.
+- **Keys the receiving channel owns** (`run.trust` and others) are dropped from the sealed copy, with a warning.
+
+Exit codes: 0 sent or dry run, 2 invalid input, missing configuration or a rejected bundle, 5 the transfer failed or
+the relay did not answer within `--wait` (status `waiting`: the bundle is in the inbox but not yet confirmed).
+Bundle format and trust rules: `extensions/clickhouse-ingest/docs/bench-bundles.md`.
+
+## Invalidations
+
+```bash
+spyre-bench invalidate (--run ID [--benchmark ID [--repeat N]] | --node N | --device SERIAL | --placement ID) [--from T --to T] \
+    --reason-code C --reason TEXT [--state suspect|invalidated] [--apply [--confirm [TOKEN]]]
+spyre-bench invalidate restore ID --reason-code C --reason TEXT [--apply]    # also: set ID --state ..., list, show ID
+```
+
+The default is a preview: the store is read and the runs, series, benchmarks, repeats and verdict changes are printed;
+nothing is written. `--apply` records one event through a `bench-invalidation` bundle and the ingest (which owns the
+matching view, the state machine and the 50-run confirmation threshold). Needs `spyre-bench[ingest,clickhouse]`. Exit 0
+ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incident-runbook.md](incident-runbook.md).
+
+## References
+
+`spyre-bench reference` turns a run into a comparison target, seals it as a `bench-reference` bundle, submits it for
+approval and compares later runs with it, informationally and never as a baseline: [`references.md`](references.md).
+
+## Quality
+
+A quality Benchmark (`type: quality`) records a score over n samples: accuracy of an eval, or agreement with a reference
+output. Its result is advisory and carries no clean-node or timing requirement; what makes a score trustworthy is the
+data behind it.
+
+### What a quality command writes
+
+The command writes the usual `metrics.json` sidecar into `{repeat_dir}`. For the `llm/lm-eval` workload:
+
+| Key | Meaning |
+|---|---|
+| `samples["llm.eval.exact_match"]` (or `acc`, `acc_norm`, `f1`) | the score, one value per repeat |
+| `samples["llm.eval.<metric>_stderr"]` | the harness's standard error; without it the engine derives a binomial one from `llm.eval.n_samples` |
+| `samples["llm.eval.n_samples"]`, `error_frac`, `truncated_frac` | what was scored, how many requests failed, how many generations were cut |
+| `props["run.quality.dataset_digest"]` | digest of the question list that was scored |
+| `props["run.quality.harness"]`, `harness_version`, `protocol` | the harness, its version, and the digest the harness computed over task version, prompt and filter pipeline. Recorded, never authored |
+| `props["run.quality.model_revision"]` | the model commit |
+| `props["run.quality.temperature"]`, `seed` | how it sampled; `seed` is a run attribute, never identity |
+
+Per-question 0/1 vectors do not go in `samples`: the views reduce an array to one number. Keep them as an attachment next
+to the Result and record its digest in `run.quality.samples_digest`.
+
+### Gates and the quality ValidityPolicy
+
+A `ValidityPolicy` with `applies_to: [quality]` replaces the clean, qualification, cv and warm-up requirements with
+`requires.gates`, a list of pack gates evaluated for the row. A policy is either perf or quality; mixed lists are rejected,
+and Project `validity_policy` names the perf one. A quality case is judged by the quality policy, so the same purposes
+(`pr`, `nightly`, `reference`, ...) can list different gates for the two kinds.
+
+| Gate | Fails when | Caps at | Reason |
+|---|---|---|---|
+| `llm.dataset_digest` | the reported digest differs from the input's `expect.selection_digest` | invalid | `dataset_mismatch` (`dataset_unreported`; `dataset_unpinned` suspect when the input declares none) |
+| `llm.records_complete` | `n_samples` differs from `expect.records` | invalid | `records_incomplete` (`records_unreported`; `records_undeclared` suspect) |
+| `llm.no_errors` | `error_frac` is not 0 | invalid | `infrastructure` |
+| `llm.no_truncation` | `truncated_frac` is above 1% | suspect | `truncation` |
+| `llm.harness_pinned` | harness version or protocol is not recorded | suspect | `protocol_unpinned` |
+| `llm.model_pinned` | no model revision | suspect | `model_unpinned` |
+| `llm.determinism` | a greedy case sampled, or a sampled case has no seed | suspect | `sampling_in_greedy_case`, `seed_unpinned` |
+
+A gate whose input the command did not report caps at suspect with an `*_unreported` or `*_undeclared` reason
+(`errors_unreported`, `truncation_unreported`, `records_undeclared`, `dataset_unpinned`) rather than passing; `llm.determinism`
+also reports `sampling_in_greedy_case` and `sampling_mismatch` (the temperature that ran is not the one declared). Only the first
+input of a workload that carries `expect` is checked.
+
+A purpose with `reference: true` still needs `floor: valid` and `baseline: true`, but may leave out the clean and
+qualification requirements as long as it lists the five data gates `dataset_digest`, `records_complete`, `no_errors`,
+`harness_pinned` and `model_pinned`. `max_cv_pct` and `discard_warmup` are rejected on a quality row. A greedy case
+(`eval.temperature: 0`) must not set `eval.seed`.
+
+### Comparing a score with a reference
+
+An Analysis with a `reference` block compares each selected Result with a reference, in combined standard errors:
+
+```yaml
+kind: Analysis
+metadata: {name: quality-vs-reference}
+spec:
+  select: {benchmarks: [eval-questions]}
+  metric: llm.eval.exact_match
+  vary: [system.backend]
+  reference: {case: eval_questions_demoa_ref_l8, tolerance: {stderr: 3, abs: 0.02}}
+```
+
+`reference` is the Result of one case (`case`), or an inline `value` with its `stderr` or `n` and an abstract `label`.
+Per row: `pass`, `improved`, `regressed`, `suspected` (`single_run`), `no_power`, `no_stderr`, `invalid`. The allowance is the
+larger of `stderr` x combined standard error and `abs`. `regressed` needs a shortfall past the allowance and at least four
+combined standard errors; a smaller shortfall past it is `suspected`. When `abs` is set and the run cannot resolve it
+(1.645 combined standard errors above `abs`) the row is `no_power`. A Result whose validity is `invalid` or `suspect` is
+reported as such and is never `regressed`. See `examples/quality-demo` and `spyre-bench analyze`.
+
+With more than one repeat the engine aggregates the median of the per-repeat scores and of their standard errors; repeats are
+not pooled, so for a greedy case (the same samples again) the standard error stays the single-run one, and for a sampled
+case it is conservative. A Result no policy judged is reported `suspected` (`validity_unjudged`), and so is every row compared
+with a reference Result that is not `valid` (`reference_not_valid`). At p = 0 or 1 the binomial standard error uses a half-count
+shrink so a perfect score is never taken to have zero noise.
+
+Ingest: a quality case that uses the `generic` identity profile is handed to the ingest with `--trigger-type quality`
+(the `{test_type}` ingest token).
+
+### Adding a quality benchmark, dataset or metric
+
+`examples/quality-demo` is a runnable catalog of one quality case and its reference case; start from it.
+
+1. **The question list.** Declare an `Asset` with `integrity.files` (a sha256 per file) and a `Dataset` over it with a named
+   subset (`limit`, `order`). A subset is a fixed list, never "whatever the loader yields first": the same questions in the
+   same order are what make two runs comparable. A new file digest is a new input identity, hence a new series.
+2. **The Benchmark.** `type: quality`, a `llm/lm-eval` (or `llm/parity`) workload whose `inputs[].expect` states how many
+   records the run must score (`records`) and the digest of the selection (`selection_digest`, `sha256:...`). Set
+   `eval.temperature: 0` for a greedy case and leave `seed` out; a sampled case sets both and the gate `llm.determinism`
+   needs the seed recorded. List the metrics the case records under `metrics.required`.
+3. **The command.** `run.command` writes `metrics.json` into `{repeat_dir}` (see "What a quality command writes"). Report the
+   dataset digest of what it actually scored and every pin it knows; leave out what it does not know rather than guessing,
+   because a missing pin is what the gates look for. A command that cannot count errors must not write `error_frac`.
+4. **A metric.** Register it in the pack (`metrics:`) with a unit, a `direction`, `category: quality` for a score and
+   `diagnostic` for what supports one (standard error, counts, error shares), and the `statistic`. A score needs a
+   direction to be compared; a diagnostic has none and is never judged. Name the standard error `<metric>_stderr` so the
+   engine finds it, or let it derive a binomial one from `llm.eval.n_samples`.
+5. **Which gates.** The quality ValidityPolicy (central) lists gates per purpose. Start a new case under `pr` with
+   `llm.records_complete` and add the others as the command learns to report what they check. A quality reference purpose
+   must list the five data gates.
+6. **Identity.** With the `generic` ingest profile every prop of the benchmarks file is an identity key; list the same keys,
+   sorted, as `identity.discriminators` and keep seeds, concurrency and anything else about the run out of it. The id of the
+   engine and of the ingest must agree; a test that derives both for each case catches drift.
+7. **Judge it.** Add an `Analysis` with a `reference` block and run `spyre-bench analyze`. Use `abs` for the smallest change
+   that matters in practice and read `no_power` as "this many questions cannot resolve it".
+
+Per-architecture differences (which cases run, card limits, models to skip) belong in data next to the product repo's
+definitions, selected by an architecture name that only names a file. Nothing in a command, Makefile or workflow branches on it.
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
@@ -470,7 +685,8 @@ label is a series label; a row without the label counts as `none`.
 
 **Observation.** `spyre_bench.placement.verify_pinning(request, pid, device_numa)` reads `/proc` and `/sys` (Linux
 only), compares every thread of the process tree with the requested set and returns the `run.exec.*` properties;
-`placement.validity_facts` feeds `engine.validity_of`. The tree is the root's descendants plus every process in its
+`placement.validity_facts` feeds `engine.validity_of`. `run` calls it for every repeat of a case that asks for pinning
+(or verification) and launches the tree under the requested policy first (`pinning_run`, `pinning_plan`). The tree is the root's descendants plus every process in its
 process group, session or (non-root) cgroup, so a re-parented worker is still judged; start your benchmark in its own
 session or cgroup so unrelated processes do not count. In the root cgroup (a private cgroup namespace) a cgroup
 cannot tie a worker to the root, so any process outside the tree that was re-parented to pid 1 makes the result
@@ -500,6 +716,15 @@ spyre-bench validate examples/pinning-demo
 spyre-bench analyze pinning-effect --catalog examples/pinning-demo --results results.json [--json]
 ```
 
-`examples/pinning-demo` is the end-to-end pattern: one latency Benchmark at two output lengths, node-a and node-b
-Environments with and without `device_local` pinning, and the `pinning-effect` Analysis. The Results come from the
-launcher; the tests build synthetic ones.
+`examples/pinning-demo` is the end-to-end pattern: a latency Benchmark at two output lengths (single process and
+two ranks), node-a and node-b Environments with and without `device_local` pinning, a stub command and the
+`pinning-effect` Analysis; `run` applies the request and records the placement. See [pinning.md](pinning.md) for the
+user guide (policies, per-device lists, `{pin_wrapper}`, reading the effect table, `unknown`/`suspect`), the measurement
+matrix script `scripts/bench-pinning-matrix` and the developer notes.
+
+`relax:` on an Analysis lets `compare` combine cells that differ in the attributes it names (`subject.id`, `env.id`,
+`env.node`, `env.label.<k>`, a trailing `*` allowed, a bare `*` relaxes nothing), for a comparison whose point is that
+difference, such as card count. Everything not named stays strict, but relaxing `env.id` also stops comparing the rest of
+the environment fingerprint (kernel, driver). `derive` pairs stay strict. `examples/trace-demo` scales a decode Benchmark
+over 1, 2 and 4 cards (`decode-scaling`) and keeps a per-card controlled-set query (`rank-spread`, evaluated on stored rows
+where `run.rank` is a property of each per-rank row; validate with `--pack examples/packs/trace-example`).

@@ -61,7 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .loop_facts import enclosing_loops
+from .loop_facts import enclosing_loops, is_looped
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -557,7 +557,7 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    if getattr(ctx.op, "loop_info", None) is None:
+    if not is_looped(ctx.op):
         return ConstraintResult()
     levels = enclosing_loops(ctx.op)
 

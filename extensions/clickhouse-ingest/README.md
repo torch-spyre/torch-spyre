@@ -66,6 +66,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
+| `bench_verdicts.py` | read-only verdict reader for one run or artifact (`python -m spyre_clickhouse_ingest bench-verdicts`): verdict, baseline, repeats/CV, trust, validity and invalidation per benchmark metric, as JSON or markdown; the advisory check poster is `.github/scripts/bench_check.py` |
 
 ## Naming an artifact (simple -> advanced)
 
@@ -114,6 +115,13 @@ run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-
 `<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
 scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
 `ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--purpose nightly|weekly|merge|on-demand|pr-check|...` records why a perf `report.xml` run happened as the
+run prop `run.purpose` on `benchmark_runs` (lower-cased; it never enters the benchmark id). Only `nightly`,
+`weekly` and `merge` runs join the rolling verdict baselines (`benchmark_baseline_purposes`); a run with another
+purpose is judged but capped at `suspected`, and a run without the prop stays eligible. It is accepted for the
+`--xml-dir`/`--xml-file` path only; the other input kinds refuse it rather than drop it. On that path it exits 2
+when no row could carry it (`--schema` without v2, `CLICKHOUSE_DB_V2` unset, v2 benchmark tables absent) and
+warns per file when the file is a plain test report or was already ingested.
 `--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
 Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
@@ -239,8 +247,7 @@ covers an isolated lab, an air-gapped host, a person testing by hand, or a vLLM 
 disconnected system.
 - `--offline` writes a **bundle** instead of connecting.
 - `--upload` puts the bundle in the Artifactory inbox.
-- The `v2-results-relay` job (spyre-frameworks, every 15 minutes) records it with
-  `results --from-bundle`.
+- A scheduled `relay` job (every 15 minutes) records it with `results --from-bundle`.
 
 The recording goes through the path a connected run takes: `results` for JUnit, and `vllm.py`
 for vLLM bench JSON (the module spyre-inference's live perf ingest uses). So the rows link to the
@@ -253,7 +260,23 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | write + upload | `results --offline --upload [--wait] <the usual flags>` |
 | upload one | `results --upload <dir\|tgz> [--as-folder] [--wait]` |
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
+| compatibility | `results --check [<dir\|tgz>]` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
+
+### The relay
+
+`python -m spyre_clickhouse_ingest relay [--apply]` is the job that records the inbox. It needs no checkout of any
+other repository: it lists the inbox with Artifactory AQL (`ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`, a path template with `{arch}`; `ARTIFACTORY_TOKEN`, with `ARTIFACTORY_USER` for basic
+auth), ingests each bundle with `results --from-bundle --strict --channel-trust <trust of the uploading account>`, and
+moves it to `processed/` or `rejected/` (+ `REJECTED.json`). Without `--apply` it ingests with `--dry-run` and moves
+nothing. Each ingested bundle also gets one `published` row in `result_uploads` (written before the move, keyed by the
+run, so a repeat or a race adds nothing), which lets the dashboard retract a relay upload like any other. An
+Artifactory account listed with `--ci-account` is recorded as trust `ci`, every other as `external`; a bundle's run key
+never decides trust. `--trusted-job-prefix` (repeatable) limits which CI-looking run keys are accepted.
+`--backfill-processed` writes the missing rows for bundles already in `processed/`; `--no-record-uploads` skips the
+row when the login lacks INSERT on `result_uploads`. A bundle whose row cannot be written is reported
+`unrecordable`, stays in the inbox and is retried.
 
 A **connected** run records every kind directly with the same flags, no `--offline`:
 
@@ -263,6 +286,7 @@ A **connected** run records every kind directly with the same flags, no `--offli
 | vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
 | sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
 | benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+| bench | `results --bench-dir <dir> --trigger-type perf\|quality --channel-trust ci --workflow <series> <the usual flags>` ([bench bundles](docs/bench-bundles.md)) |
 
 vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
 temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
@@ -286,6 +310,55 @@ On a host without network access, use either:
   `python -m spyre_clickhouse_ingest results --offline ...`;
 - or just `spyre_clickhouse_ingest/offline.py` with `bundle.schema.json` beside it:
   `python offline.py --offline ...` (same flags).
+
+### Sealing for a site without a route to the database
+
+- **Repeatable.** Sealing the same results twice gives the same bundle sha256 (and the same
+  `.tgz` bytes) on the same host with the same kit version (the host and user in `runner`, and
+  `producer.version`, are part of the digest unless redacted or the same), so a retried seal is a duplicate upload, not a second run. The seal time is not
+  recorded; `ended_at` is the last JUnit suite's end, or `--ended-at`, or absent.
+- **Redaction.** `bundle.json` records the sealing host and user under `runner`;
+  `--redact-host` and `--redact-user` leave them out. `--redact-host` also blanks the
+  `hostname` attribute (either quote style) of JUnit `<testsuite>` elements in `results/*.xml`,
+  byte for byte otherwise, and reports how many it blanked and which files still contain the
+  host name (for example in `system-out`). `--redact-host` scans only `results/`, not `attachments/`. Redaction does not cover JUnit `<properties>`, `system-out`,
+  `run_url` or attachments, and the host-name check does not read non-ASCII-compatible XML
+  (such as UTF-16) or reliably tell a short host name from other text; the digest also depends on `producer.version` and, in a `.tgz`,
+  on the zlib build. An `--append-to-run` round carries the run's earlier trust forward when it has none of its
+  own, records the lower of the two when it has both, and writes nothing when neither exists. If the first round had no trust, a later round's own
+  trust is recorded as it is. A duplicate or dry run prints no receipt. `--check` stands alone
+  and needs a path or none.
+- **Trust label.** `--seal-trust lab|external` (default `external`) is recorded as `trust` in
+  `bundle.json`. It is a claim: the receiving channel decides the level, and the lower of the
+  two is recorded as `run.trust` on the run's verdict.
+  - `--channel-trust ci|lab|external` is the trusted-operator flag for `--from-bundle` and the
+    direct vllm/sendnn/benchmarks/tables ingests: whoever can run the ingest can assert a
+    level, as they can already write the database. It is an error with `--offline`/`--upload`,
+    `--validate-only`, `--check` and on the direct JUnit path.
+  - A labelled bundle with no channel level is recorded as `external`; a bundle with neither
+    a label nor a channel level records no `run.trust`, as before. A bundle can lower its
+    trust, never raise it; `ci` is refused in a bundle.
+  - Rejected: a `run.trust` key in the `props` or `run_props` of benchmark rows or table rows,
+    in `--bundle-prop`, and in `--result-prop`. Accepted, because it never reaches the
+    verdict: a JUnit `<property>` (it becomes a `test_case_runs` prop), a capability `sig`
+    entry (part of the capability identity) and `tags` (tag values).
+  - An `--append-to-run` round reads the run's earlier `run.trust` from
+    `v_artifact_results_published`, so retracted rounds do not count. `artifact_results` is
+    append-only, so no merge can drop an older verdict's trust.
+- **Time zones.** A JUnit timestamp without a zone is read as UTC (a warning says so whenever
+  a time is taken from such a file), whatever the sealing host's zone; the dashboard reads it
+  the same way, so the sealing host's zone does not matter.
+  For `--offline`, `--triggered-at`/`--ended-at` must carry a zone, and an end before the
+  start is clamped to the start with a warning.
+- **Compatibility.** `results --check` prints the schema versions, kinds and trust labels this
+  ingest accepts. `results --check <bundle>` also says whether it can read that bundle (exit 2
+  and a message naming the side to upgrade when not). A sealed bundle carries `producer`
+  (kit name and version) for this. An ingest older than the kit refuses `trust` and `producer`
+  as unknown keys: upgrade the connected side first.
+- **Receipt.** `results --from-bundle` adds `receipt` to its report and prints it to stderr,
+  `RCPT-XXXX-XXXX-XXXX-XXXX`, the first 16 hex digits of sha256(`<bundle sha256>` NUL
+  `<upload_id>`), grouped. `upload_id` comes from `--bundle-prop upload_id=<id>` (empty
+  otherwise), so the site can recompute it from the digest it sealed.
 
 ### The bundle
 
@@ -322,7 +395,7 @@ Everything else is optional (`--offline` writes most of it):
 | `kind`, `perf` | `junit`; for vllm, `{model, tensor_parallel, input_len, output_len, cards, head_sha, head_branch, state}` |
 | `run_url`, `workflow`, `runner`, `env`, `notes`, `uploader`, `sealed_at`, `tag_family`, `tags` | unset (tags for Jenkins keys only) |
 
-The bundle sha256 covers every file's path and content, bundle.json included. Ingest refuses a
+The bundle sha256 covers every file's path and content, bundle.json included. The sha256 values are written by the sealer into the bundle, so they catch accidental corruption, not tampering: anyone who edits the files can recompute them. Ingest refuses a
 run_key that already has another run's or bundle's results. The verdict's `props` carry
 `source=bundle`, `uploader` (the Artifactory account that uploaded it), `bundle_sha256` and
 `bundle_url`; `bundle_url` is also the `run_url` when the bundle names none.
@@ -464,6 +537,106 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 `oss_ci_benchmark_v3_by_tag` when it was retracted after a 15-minute refresh appended them. Its
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
+
+## Write resilience
+
+`resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
+a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet except the `spool` command and there is no
+probe.** It is a building block with deliberately small promises.
+
+What it promises:
+
+- **Nothing is lost silently.** A batch it cannot land inside the call's deadline is parked as a
+  file in the `Spool`. If the spool is full, cannot be written, or a batch may be stored and there
+  is no spool, the call raises (`SpoolFull`, `WriteAmbiguous`, `WriteUnavailable`; all subclasses of
+  `WriteFailed`) instead of dropping it. Each carries `.outcome`: rows `stored`, rows `spooled`,
+  `ambiguous` batches, and `unwritten`, the batch numbers that are neither stored nor parked. A
+  fatal error is re-raised as it is, with `.outcome` and `.maybe_stored` set.
+- **A Replicated table with a deduplication window is exactly-once inside that window, for a
+  resend of the same rows in the same batches.** Every batch is sent with an
+  `insert_deduplication_token` derived from the table, the caller's `scope` and the content of the
+  batch's rows in order (canonical JSON; a cell type with no stable encoding raises `TypeError`).
+  Nothing else feeds it: not the batch's position in the call, not the process, not the hash seed.
+  So a rerun under the same `scope`, `batch_rows` and rows resends the same tokens, and a second
+  sender is harmless. Three limits follow. A rerun with a different `CH_WRITE_BATCH_ROWS` (or rows
+  in another order, or one more row) cuts different batches and gets different tokens, so it
+  doubles whatever the first run stored. Two loads that are meant to be separate but carry
+  identical rows need different `scope`s (`new_scope()`), or the second is deduplicated away.
+  Inside one call, identical batches are told apart by their occurrence.
+- **Tokens only help where ClickHouse deduplicates.** That is a Replicated table whose
+  `replicated_deduplication_window` is nonzero, inside the window (a block count; the `_seconds`
+  window also applies). Pass `dedup_window=0` to `resilient_insert` for a table without one and it
+  is treated like a plain table: no token is sent and a batch that may be stored is parked, never
+  resent. `dedup_window(client, table, database, cache)` reads the setting from `system.tables`
+  (`engine_full`, else the server's MergeTree default) once per table; `None` (unreadable or not
+  passed) assumes a nonzero window. A non-Replicated table reads as 0.
+- **A plain table never has a batch sent again by the retry loop once a send may have stored it.**
+  It is parked with `"ambiguous": true` for a person. This holds inside one call only:
+  `resilient_insert` does not look for an existing parked file, so rerunning a plain-table load
+  with the same `scope` while a parked batch exists sends it again, and a process killed between
+  a send and the park leaves no record. Do not rerun a plain-table load until its parked batches
+  are dealt with.
+- **A batch refused before any write is retried inside the call that made it**, and may drop to a
+  lower quorum only for a table that allows it. Retries wait a random time (full jitter) up to a
+  doubling ceiling. The deadline (`CH_WRITE_DEADLINE_S`) is one budget for the whole call, counted
+  from its first failed attempt, not one per batch. `CH_WRITE_*` values that are not finite numbers
+  in range (nan, inf, zero or negative waits, an absurd batch size) fall back to the default with
+  one warning on stderr.
+- **Error classes.** A code that proves nothing was written (quorum not met, read-only replica,
+  too many parts, too many simultaneous queries) is retried; with a materialized view on the table
+  all but the last are treated as ambiguous. A timeout, Keeper or network error, a memory limit, or
+  a code this module has not seen is ambiguous: resent only under a token, else parked. Schema,
+  syntax, parse, permission and constraint errors are fatal. A reply from a balancer (no
+  ClickHouse error code on the HTTP error, or 408/429/5xx in its text) is ambiguous; this does not
+  need `show_clickhouse_errors`, because the driver sets no `code` when the server did not answer.
+  Code 164 is fatal when its text says the user is in readonly mode and a retry otherwise; with the
+  text hidden it is retried until the deadline.
+
+What it does not promise:
+
+- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
+  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
+  window has not passed; neither is small enough to ship without a probe.
+- No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
+  on a plain table.
+- `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
+  285 or 286 from the view's target after the source block landed, so on a plain table a first such
+  error is held, not retried. Pass `feeds_views=False` to `resilient_insert` (the one place the knob
+  lives) for a table with no dependent view. Replicated inserts also send
+  `deduplicate_blocks_in_dependent_materialized_views=1` so a retry reaches a view target that
+  missed the block (checked on single-node chdb 26.9; the view target needs its own dedup window,
+  and Keeper-backed Replicated tables and servers older than 26.2, where the default is 0, are not
+  verified).
+- `async_insert` and `insert_quorum`: the server default is `async_insert=1` with
+  `async_insert_deduplicate=0`. A deduplicating insert sends `async_insert_deduplicate=1` and
+  `wait_for_async_insert=1`, and a Replicated insert sends `insert_quorum` when the policy has one;
+  tests check that these settings are sent, not that a real cluster honours them for an
+  asynchronous, quorum insert. Whether a retried async batch is deduplicated by token on a
+  Keeper-backed cluster is not verified here.
+- A probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
+  sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per batch,
+  so counting rows by key would call a lost batch stored.
+
+Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 and its files are
+0600 plain JSON: they hold row data.
+
+```text
+python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
+python -m spyre_clickhouse_ingest spool list --fail-if-pending   # same; exit 75 if anything is parked
+python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
+```
+
+A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
+rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
+to send. `put` and `drop` take a lock file in the directory, so processes sharing it leave one
+file per token and a `held` flag is never cleared (flock on a local filesystem; not guaranteed on
+NFS). `drop` matches by token suffix. `list` prints to stderr any quarantined `.corrupt` file (one
+that would not parse as a batch), any file it could not read (left in place, not renamed), and
+leftover `.tmp` files; all of them count toward the size cap, and the quarantined ones hold row
+data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
+opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
+a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
+The spool refuses a directory that is a symlink or owned by another user. The spool directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
 
 ## What is deliberately NOT here
 
