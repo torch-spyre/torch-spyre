@@ -374,17 +374,19 @@ class TestRecompileCheckOnDevice(_Base):
         self.assertEqual(_reports(caught), [])
 
     def test_lost_declaration_recompile_is_reported_in_all_mode(self):
-        # A view drops the declaration, so the next block sees an ordinary
-        # tensor. Under dynamic=None, the supported setting, its second size
-        # is an automatic-dynamic recompile. Only all mode reports it, since
-        # the input no longer carries a declaration. Spyre may then refuse
-        # that compile (an unbounded size outside a loop); the report is made
-        # before the compile either way.
+        # A view that changes the geometry drops the declaration (one with the
+        # same geometry keeps it), so the next block sees an ordinary tensor.
+        # view(1, -1, 64) does that and keeps each row one stick wide. Under
+        # dynamic=None, the supported setting, its second size is an
+        # automatic-dynamic recompile. Only all mode reports it, since the input
+        # no longer carries a declaration. Spyre may then refuse that compile
+        # (an unbounded size outside a loop); the report is made before the
+        # compile either way.
         @torch.compile(dynamic=None)
         def block(h):
             return h * 2.0
 
-        first, second = (x.view(-1, 64) for x in _declared(128, 192))
+        first, second = (x.view(1, -1, 64) for x in _declared(128, 192))
         with _mode("all"), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             block(first)
