@@ -49,7 +49,7 @@ spec:
 
 The Workload type's schema (from the pack) rejected a value. The path says which field; the list says what is allowed.
 
-```yaml validated base=docs-benchmark as=ops/op-x.yaml expect="error:is not one of ['fp32', 'bf16', 'fp16', 'fp8']"
+```yaml validated base=docs-benchmark as=ops/op-x.yaml expect="error:is not one of ['fp32', 'bf16', 'fp16', 'fp8', 'int32', 'int8']"
 apiVersion: bench/v1alpha1
 kind: Benchmark
 metadata: {name: op-x}
