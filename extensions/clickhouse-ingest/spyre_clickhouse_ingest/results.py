@@ -650,12 +650,54 @@ def _bench_backend(rec: dict) -> str:
     return "spyre"
 
 
-def _bench_entries(records: list) -> list:
+def _purpose_value(raw: str) -> str:
+    """The validated, lower-cased run purpose, or '' when none was given."""
+    value = (raw or "").strip().lower()
+    if value and not (
+        len(value) <= 32
+        and value[0].isalpha()
+        and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
+    ):
+        raise SystemExit(
+            f"--purpose {raw!r}: use lower-case letters, digits, '-' or '_' (at most 32)"
+        )
+    return value
+
+
+def _purpose_props(args) -> dict:
+    """run.purpose as a run-level prop; baseline eligibility reads it (schema 62/85)."""
+    value = _purpose_value(getattr(args, "purpose", ""))
+    return {"run.purpose": value} if value else {}
+
+
+def _refuse_purpose(why: str) -> None:
+    """--purpose that cannot reach benchmark_runs.props is an error, not a silent drop."""
+    print(f"  [error] --purpose cannot be recorded: {why}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _purpose_state(args) -> dict:
+    return args.__dict__.setdefault("_purpose_state", {"rows": 0, "skips": 0})
+
+
+def _purpose_skipped(args, why: str) -> None:
+    if getattr(args, "purpose", ""):
+        _purpose_state(args)["skips"] += 1
+        print(
+            f"  [warn] --purpose {args.purpose} not recorded for this file: {why}",
+            file=sys.stderr,
+        )
+
+
+def _bench_entries(records: list, run_props: dict | None = None) -> list:
     """This producer's perf records in the shared writer's entry shape.
 
     Measurements become single-element ARRAYS: benchmark_runs stores a metric's samples, and
     this harness reports one pre-averaged value per metric, so `iterations` carries the n
     behind it.
+
+    `run_props` (e.g. run.purpose) is merged into every entry's run-level props; it never
+    reaches the benchmark identity.
 
     Dropped from v2 deliberately: regression_status and ratio (verdicts with no recorded
     baseline -- derived in v_benchmark_metric_verdicts / v_benchmark_backend_compare instead), and
@@ -687,6 +729,7 @@ def _bench_entries(records: list) -> list:
                 "iterations": int(num_runs) if num_runs is not None else 0,
                 "disc": rec,
                 "disc_keys": _V2_BENCH_ID_KEYS,
+                **({"run_props": dict(run_props)} if run_props else {}),
             }
         )
     return entries
@@ -1591,8 +1634,14 @@ def _admitted_legs(legs: dict):
 
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
-    run_url = _opt(args, "run_url") or _gha_run_url(args)
     result_props = dict(_opt(args, "result_props") or [])
+    if "run.trust" in result_props:
+        raise SystemExit(
+            "run.trust is assigned by the receiving channel, not passed in"
+        )
+    run_url = _opt(args, "run_url") or _gha_run_url(args)
+    if _opt(args, "assigned_trust"):
+        result_props["run.trust"] = args.assigned_trust
     source = result_props.pop("source", "") or (
         "jenkins" if _opt(args, "jenkins_run_key") else "gha"
     )
@@ -1749,6 +1798,13 @@ def build_parser() -> argparse.ArgumentParser:
         "tags it as options.ci_tags() spells, beside any --tag.",
     )
     parser.add_argument(
+        "--purpose",
+        default="",
+        help="Why this run happened (nightly | weekly | merge | on-demand | pr-check | ...); "
+        "recorded as the run prop run.purpose on benchmark_runs. Only nightly, weekly and "
+        "merge runs join verdict baselines (benchmark_baseline_purposes); empty records none.",
+    )
+    parser.add_argument(
         "--jenkins-run-key",
         default="",
         help="This leg's own Jenkins externalizable id, e.g. 'Spyre/component-build#417'. "
@@ -1841,16 +1897,38 @@ def _ingest_kind(argv, args) -> int:
     with tempfile.TemporaryDirectory(prefix="results-") as tmp:
         off.out = str(Path(tmp) / "bundle")
         try:
-            args.from_bundle = str(offline.write(off))
+            off.seal_trust = ""
+            off.ended_at = off.ended_at or offline._now()
+            args.from_bundle = str(offline.write(off, validate_times=False))
         except offline.BundleError as err:
             print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
             return err.code
         return bundle.ingest(args)
 
 
-def main(argv=None):
+def main(argv=None, assigned_trust=""):
+    """`assigned_trust` is for bundle.write_junit only: no command-line flag can set it."""
     args = build_parser().parse_args(argv)
-    if args.offline or args.validate_only or args.upload:
+    args.assigned_trust = assigned_trust
+    args.purpose = _purpose_value(args.purpose)
+    if args.purpose and (
+        args.offline
+        or args.validate_only
+        or args.upload
+        or args.check is not None
+        or args.from_bundle
+        or args.kind != "junit"
+        or args.vllm_results_dir
+        or args.sendnn_report
+        or args.benchmarks_dir
+        or args.tables_dir
+        or getattr(args, "bench_dir", "")
+    ):
+        sys.exit(
+            "--purpose is recorded for the perf report.xml ingest only (--xml-dir/--xml-file); "
+            "refusing to drop it for this input kind"
+        )
+    if args.offline or args.validate_only or args.upload or args.check is not None:
         return offline_main(argv)
     if args.from_bundle:
         from spyre_clickhouse_ingest.bundle import ingest
@@ -1862,8 +1940,13 @@ def main(argv=None):
         or args.sendnn_report
         or args.benchmarks_dir
         or args.tables_dir
+        or getattr(args, "bench_dir", "")
     ):
         return _ingest_kind(argv, args)
+    if args.channel_trust:
+        raise SystemExit(
+            "--channel-trust applies to --from-bundle and the vllm/sendnn/benchmarks/tables direct ingests"
+        )
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot
@@ -1871,6 +1954,8 @@ def main(argv=None):
     args.write_v1 = args.schema in ("v1", "both")
     args.write_v2 = args.schema in ("v2", "both")
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+    if args.purpose and not args.write_v2:
+        _refuse_purpose("--schema must include v2 (v1 rows carry no run props)")
 
     # Validate backfill CLI once before any connect / XML write. Invalid values must
     # fail even when the dir has only test-result XML, and must not let a preceding
@@ -1918,6 +2003,8 @@ def main(argv=None):
         )
     client.command("SELECT 1")
     print("Connected.\n")
+    if args.purpose and not v2db:
+        _refuse_purpose("CLICKHOUSE_DB_V2 is unset, so no v2 row would be written")
 
     # No schema mutation here, deliberately. This used to ALTER benchmark_runs on EVERY run to
     # add workflow/platform -- a migration in the wrong place: it demanded DDL rights on every
@@ -1949,6 +2036,8 @@ def main(argv=None):
 
     # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
     bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
+    if args.purpose and not bench_ready:
+        _refuse_purpose("the v2 benchmark tables are absent or incomplete")
 
     for xml_path in xml_files:
         print(f"Processing: {xml_path.name}")
@@ -1997,6 +2086,7 @@ def main(argv=None):
                     print(
                         f"  Already ingested kernels — skipping {run_meta['source_file']}"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                     continue
 
             run_id = uuid.uuid4().int >> 64
@@ -2018,6 +2108,7 @@ def main(argv=None):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
+                    _purpose_skipped(args, "no v2 run id could be derived")
                 elif benchmarks_already_ingested(
                     client,
                     v2db,
@@ -2030,17 +2121,19 @@ def main(argv=None):
                         f"  v2: already ingested kernel report for "
                         f"run_id={_v2_run_id} — skipping"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                 else:
                     _n = insert_benchmarks(
                         client,
                         v2db,
                         component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
-                        _bench_entries(kernels),
+                        _bench_entries(kernels, _purpose_props(args)),
                         report_kind="kernel",
                         source_file=run_meta["source_file"],
                     )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                    _purpose_state(args)["rows"] += _n if args.purpose else 0
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
@@ -2080,6 +2173,7 @@ def main(argv=None):
                     print(
                         f"  Already ingested benchmark — skipping {run_meta['source_file']}"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                     continue
 
             # benchmark_runs.run_id is UInt64 — use a random 64-bit int
@@ -2102,6 +2196,7 @@ def main(argv=None):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
+                    _purpose_skipped(args, "no v2 run id could be derived")
                 elif benchmarks_already_ingested(
                     client,
                     v2db,
@@ -2114,17 +2209,19 @@ def main(argv=None):
                         f"  v2: already ingested benchmark report for "
                         f"run_id={_v2_run_id} — skipping"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                 else:
                     _n = insert_benchmarks(
                         client,
                         v2db,
                         component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
-                        _bench_entries(benchmarks),
+                        _bench_entries(benchmarks, _purpose_props(args)),
                         report_kind="benchmark",
                         source_file=run_meta["source_file"],
                     )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                    _purpose_state(args)["rows"] += _n if args.purpose else 0
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
@@ -2133,6 +2230,7 @@ def main(argv=None):
 
         else:
             print("  Detected: test-result XML")
+            _purpose_skipped(args, "it is a test-result report, not a perf report")
             run, cases = parse_test_xml(xml_path)
             if run is None:
                 continue
@@ -2285,6 +2383,10 @@ def main(argv=None):
         args.tag_date = (run_started or datetime.now(UTC)).date()
     verdicts_recorded = _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
+    state = _purpose_state(args)
+    if args.purpose and not state["rows"] and not state["skips"]:
+        # Every file took a path that wrote no perf row and said nothing about the purpose.
+        _refuse_purpose("no perf row was written, so run.purpose is recorded nowhere")
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
     print(f"  Benchmarks ingested:  {total_benchmarks}")
