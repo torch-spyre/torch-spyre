@@ -2997,6 +2997,10 @@ class KtirBuilder:
         mixed-radix number the plan's divisions describe: ``(id // inner) % div``.
         A term whose factor is trivial is not emitted, so a single divided symbol
         uses the id itself and the undivided case emits nothing at all.
+
+        The division and remainder are signed, as Triton's are. The id is never
+        negative, so the two forms agree, and dbo-opt works out each core's offset
+        into a symbolic start address only through the signed ones.
         """
         if not self.plan.divisions:
             return []
@@ -3006,9 +3010,9 @@ class KtirBuilder:
         for division in self.plan.divisions:
             index = tile_id
             if division.inner > 1:
-                index = self.val(arith.DivUIOp(index, self.icst_index(division.inner)))
+                index = self.val(arith.DivSIOp(index, self.icst_index(division.inner)))
             if division.inner * division.div != self.plan.grid[0]:
-                index = self.val(arith.RemUIOp(index, self.icst_index(division.div)))
+                index = self.val(arith.RemSIOp(index, self.icst_index(division.div)))
             portions.append(index)
         return portions
 
