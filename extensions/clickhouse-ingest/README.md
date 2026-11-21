@@ -465,6 +465,106 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Write resilience
+
+`resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
+a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet except the `spool` command and there is no
+probe.** It is a building block with deliberately small promises.
+
+What it promises:
+
+- **Nothing is lost silently.** A batch it cannot land inside the call's deadline is parked as a
+  file in the `Spool`. If the spool is full, cannot be written, or a batch may be stored and there
+  is no spool, the call raises (`SpoolFull`, `WriteAmbiguous`, `WriteUnavailable`; all subclasses of
+  `WriteFailed`) instead of dropping it. Each carries `.outcome`: rows `stored`, rows `spooled`,
+  `ambiguous` batches, and `unwritten`, the batch numbers that are neither stored nor parked. A
+  fatal error is re-raised as it is, with `.outcome` and `.maybe_stored` set.
+- **A Replicated table with a deduplication window is exactly-once inside that window, for a
+  resend of the same rows in the same batches.** Every batch is sent with an
+  `insert_deduplication_token` derived from the table, the caller's `scope` and the content of the
+  batch's rows in order (canonical JSON; a cell type with no stable encoding raises `TypeError`).
+  Nothing else feeds it: not the batch's position in the call, not the process, not the hash seed.
+  So a rerun under the same `scope`, `batch_rows` and rows resends the same tokens, and a second
+  sender is harmless. Three limits follow. A rerun with a different `CH_WRITE_BATCH_ROWS` (or rows
+  in another order, or one more row) cuts different batches and gets different tokens, so it
+  doubles whatever the first run stored. Two loads that are meant to be separate but carry
+  identical rows need different `scope`s (`new_scope()`), or the second is deduplicated away.
+  Inside one call, identical batches are told apart by their occurrence.
+- **Tokens only help where ClickHouse deduplicates.** That is a Replicated table whose
+  `replicated_deduplication_window` is nonzero, inside the window (a block count; the `_seconds`
+  window also applies). Pass `dedup_window=0` to `resilient_insert` for a table without one and it
+  is treated like a plain table: no token is sent and a batch that may be stored is parked, never
+  resent. `dedup_window(client, table, database, cache)` reads the setting from `system.tables`
+  (`engine_full`, else the server's MergeTree default) once per table; `None` (unreadable or not
+  passed) assumes a nonzero window. A non-Replicated table reads as 0.
+- **A plain table never has a batch sent again by the retry loop once a send may have stored it.**
+  It is parked with `"ambiguous": true` for a person. This holds inside one call only:
+  `resilient_insert` does not look for an existing parked file, so rerunning a plain-table load
+  with the same `scope` while a parked batch exists sends it again, and a process killed between
+  a send and the park leaves no record. Do not rerun a plain-table load until its parked batches
+  are dealt with.
+- **A batch refused before any write is retried inside the call that made it**, and may drop to a
+  lower quorum only for a table that allows it. Retries wait a random time (full jitter) up to a
+  doubling ceiling. The deadline (`CH_WRITE_DEADLINE_S`) is one budget for the whole call, counted
+  from its first failed attempt, not one per batch. `CH_WRITE_*` values that are not finite numbers
+  in range (nan, inf, zero or negative waits, an absurd batch size) fall back to the default with
+  one warning on stderr.
+- **Error classes.** A code that proves nothing was written (quorum not met, read-only replica,
+  too many parts, too many simultaneous queries) is retried; with a materialized view on the table
+  all but the last are treated as ambiguous. A timeout, Keeper or network error, a memory limit, or
+  a code this module has not seen is ambiguous: resent only under a token, else parked. Schema,
+  syntax, parse, permission and constraint errors are fatal. A reply from a balancer (no
+  ClickHouse error code on the HTTP error, or 408/429/5xx in its text) is ambiguous; this does not
+  need `show_clickhouse_errors`, because the driver sets no `code` when the server did not answer.
+  Code 164 is fatal when its text says the user is in readonly mode and a retry otherwise; with the
+  text hidden it is retried until the deadline.
+
+What it does not promise:
+
+- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
+  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
+  window has not passed; neither is small enough to ship without a probe.
+- No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
+  on a plain table.
+- `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
+  285 or 286 from the view's target after the source block landed, so on a plain table a first such
+  error is held, not retried. Pass `feeds_views=False` to `resilient_insert` (the one place the knob
+  lives) for a table with no dependent view. Replicated inserts also send
+  `deduplicate_blocks_in_dependent_materialized_views=1` so a retry reaches a view target that
+  missed the block (checked on single-node chdb 26.9; the view target needs its own dedup window,
+  and Keeper-backed Replicated tables and servers older than 26.2, where the default is 0, are not
+  verified).
+- `async_insert` and `insert_quorum`: the server default is `async_insert=1` with
+  `async_insert_deduplicate=0`. A deduplicating insert sends `async_insert_deduplicate=1` and
+  `wait_for_async_insert=1`, and a Replicated insert sends `insert_quorum` when the policy has one;
+  tests check that these settings are sent, not that a real cluster honours them for an
+  asynchronous, quorum insert. Whether a retried async batch is deduplicated by token on a
+  Keeper-backed cluster is not verified here.
+- A probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
+  sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per batch,
+  so counting rows by key would call a lost batch stored.
+
+Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 and its files are
+0600 plain JSON: they hold row data.
+
+```text
+python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
+python -m spyre_clickhouse_ingest spool list --fail-if-pending   # same; exit 75 if anything is parked
+python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
+```
+
+A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
+rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
+to send. `put` and `drop` take a lock file in the directory, so processes sharing it leave one
+file per token and a `held` flag is never cleared (flock on a local filesystem; not guaranteed on
+NFS). `drop` matches by token suffix. `list` prints to stderr any quarantined `.corrupt` file (one
+that would not parse as a batch), any file it could not read (left in place, not renamed), and
+leftover `.tmp` files; all of them count toward the size cap, and the quarantined ones hold row
+data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
+opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
+a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
+The spool refuses a directory that is a symlink or owned by another user. The spool directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+
 ## What is deliberately NOT here
 
 - **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share
