@@ -360,7 +360,7 @@ def guarded_insert(
     policy: Policy | None = None,
     limits: Limits | None = None,
     replicated: bool = False,
-    dedup_window: int | None = None,
+    dedup_window: int | None | Callable[[], int | None] = None,
     database: str | None = None,
     spool: Spool | None = None,
     sleep: Callable[[float], None] | None = None,
@@ -371,6 +371,9 @@ def guarded_insert(
 ) -> Outcome:
     """`resilient_insert` behind the host's breaker and budget.
 
+    `dedup_window` may be a callable: it is called only when the breaker lets the call through,
+    so a dead host is not asked for it.
+
     While the breaker is open every batch goes straight to the spool (WriteUnavailable without
     one). A call that ends on a host failure opens it; a success closes it. Same returns and
     raises as `resilient_insert`.
@@ -379,7 +382,6 @@ def guarded_insert(
     limits = limits or Limits.from_env()
     breaker = breaker or Breaker()
     now = clock or time.monotonic
-    meta = {"host": host, "token_sent": bool(replicated and dedup_window != 0)}
     mode = breaker.acquire(now())
     if mode == Breaker.OPEN:
         if spool is None:
@@ -393,7 +395,7 @@ def guarded_insert(
             raise exc
         return _park_all(
             spool, table, rows, columns, scope, database, max(1, policy.batch_rows),
-            meta, log,
+            {"host": host, "token_sent": replicated}, log,
         )  # fmt: skip
     watched = Watched(client, breaker, limits, feeds_views, now, log)
     try:
@@ -403,6 +405,8 @@ def guarded_insert(
         breaker.charge(0.0, now(), limits)  # publishes the budget
         deadline = min(deadline, breaker.remaining(now()))
         call_policy = dataclasses.replace(policy, deadline_s=deadline)
+        window = dedup_window() if callable(dedup_window) else dedup_window
+        token_sent = bool(replicated and window != 0)
         return resilient_insert(
             watched,
             table,
@@ -411,9 +415,9 @@ def guarded_insert(
             scope=scope,
             policy=call_policy,
             replicated=replicated,
-            dedup_window=dedup_window,
+            dedup_window=window,
             database=database,
-            spool=_HostSpool(spool, host, meta["token_sent"]) if spool else None,  # type: ignore[arg-type]
+            spool=_HostSpool(spool, host, token_sent) if spool else None,  # type: ignore[arg-type]
             sleep=sleep,
             clock=clock,
             rng=rng,

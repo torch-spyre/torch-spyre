@@ -807,3 +807,41 @@ def test_the_cells_the_token_accepts_survive_the_spool(tmp_path):
     spool = Spool(tmp_path / "sp")
     spool.put("t", ["a", "b", "c"], [row], "t-1")
     assert next(spool.pending()).rows == [row]
+
+
+def test_an_enum_and_numpy_scalars_survive_the_spool(tmp_path):
+    import enum
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    class Scalar:
+        __module__ = "numpy"
+
+        def __init__(self, v):
+            self.v = v
+
+        def item(self):
+            return self.v
+
+    spool = Spool(tmp_path / "sp")
+    spool.put(
+        "t", list("abcd"), [[Color.RED, Scalar(7), Scalar(1.5), Scalar(True)]], "t-1"
+    )
+    assert next(spool.pending()).rows == [["red", 7, 1.5, True]]
+
+
+def test_a_dead_host_is_not_asked_for_the_dedup_window(tmp_path):
+    from spyre_clickhouse_ingest.breaker import Breaker, guarded_insert
+    from spyre_clickhouse_ingest.resilience import Policy
+
+    breaker = Breaker()
+    breaker.trip(0.0, 10**9)
+    asked = []
+    guarded_insert(
+        Cluster(), "t", [[1]], ["a"], scope="s", replicated=True,
+        dedup_window=lambda: asked.append(1), breaker=breaker,
+        spool=Spool(tmp_path / "sp"), policy=Policy(), clock=lambda: 5.0,
+        log=lambda m: None,
+    )  # fmt: skip
+    assert asked == []

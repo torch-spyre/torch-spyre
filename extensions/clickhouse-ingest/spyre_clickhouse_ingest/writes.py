@@ -366,9 +366,7 @@ def policy_for(table: str, batch_rows: int) -> Policy:
     return policy
 
 
-def window_of(
-    backend, table: str, database: str | None, cached_only: bool = False
-) -> int | None:
+def window_of(backend, table: str, database: str | None) -> int | None:
     """The table's dedup window, read once per client (an unreadable one for LOOKUP_FAILURE_TTL_S);
     None (unknown) assumes a nonzero one."""
     cache = getattr(backend, "_spyre_windows", None)
@@ -382,8 +380,6 @@ def window_of(
     hit = cache.get(key)
     if hit and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
-    if cached_only:
-        return None
     window = dedup_window(backend, table, database)
     cache[key] = (
         window,
@@ -412,7 +408,6 @@ def try_insert(
         else client
     )
     breaker = breaker_for(client, table, database)
-    blocked = breaker.blocked(time.monotonic())  # a dead host is not asked again
     out = guarded_insert(
         client,
         table,
@@ -421,7 +416,7 @@ def try_insert(
         scope=ambient_scope(),
         policy=policy_for(table, batch_rows),
         replicated=True,
-        dedup_window=window_of(backend, table, database, cached_only=blocked),
+        dedup_window=lambda: window_of(backend, table, database),
         database=database,
         spool=spool_from_env(),
         feeds_views=found.feeds_views,
