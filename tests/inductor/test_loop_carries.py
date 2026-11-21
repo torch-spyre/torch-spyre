@@ -41,7 +41,7 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.deadcode_elimination import deadcode_elimination
 from torch_spyre._inductor.loop_carries import apply_loop_carries
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import LoopNode
 from torch_spyre._inductor.pass_utils import redirect_computed_buffer_reads
 

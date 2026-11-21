@@ -213,7 +213,7 @@ def test_redirect_computed_buffer_reads_keeps_layout_state():
 
 def test_copy_op_metadata_layout_state_is_opt_in():
     """A new op built from another op must not inherit the source's layouts."""
-    from torch_spyre._inductor.loop_info import copy_op_metadata
+    from torch_spyre._inductor.pass_utils import copy_op_metadata
 
     src = _layout_state_marked_op()
     default = types.SimpleNamespace()

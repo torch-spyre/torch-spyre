@@ -384,6 +384,7 @@ def test_the_extractor_scales_a_per_trip_body_matmul_by_its_trip(monkeypatch):
 
     def loop(tiled_out):
         return SimpleNamespace(
+            loop_group_id=(0,),
             loop_count=[16],
             loop_tiled_dims=[tiled_out],
             loop_tiled_reduction_dims=[[]],
@@ -522,6 +523,7 @@ def _looped_op(trips, tiled_out, hints, write_index, read_indices, data=None):
         data=data,
         dim_hints=list(hints),
         loop_info=SimpleNamespace(
+            loop_group_id=tuple(range(len(trips))),
             loop_count=list(trips),
             loop_tiled_dims=[list(level) for level in tiled_out],
             loop_tiled_reduction_dims=[[] for _ in trips],

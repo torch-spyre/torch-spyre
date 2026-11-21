@@ -27,8 +27,8 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_facts import counted_loop_path, enclosing_loops
-from .loop_info import ReadCopyElisionRecord
-from .loop_node import insert_after
+from .read_copy_elision import ReadCopyElisionRecord
+from .loop_node import move_after, move_before, record_loop_info
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -538,6 +538,7 @@ def _transfer_loop_info(
         # takes its extent from the tile, while this fixed copy takes the whole
         # operand's, which may be symbolic (a reserved pool).
         _pin_fixed_copy_extent_to_declared_max(restick_buff)
+    record_loop_info(restick_buff)
 
 
 def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:
@@ -658,13 +659,6 @@ def insert_restickify_on_node_inputs(
     edge_swaps: list[tuple] = []
     name_map: dict[str, str] = {}
     moved_terms: dict[str, sympy.Expr] = {}
-    try:
-        op_index = operations.index(op)
-    except ValueError:
-        raise AssertionError(
-            f"Consumer op {op.get_name()} not found in operations list"
-        ) from None
-
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         old_name_buf = V.graph.try_get_buffer(old_name)
@@ -683,10 +677,10 @@ def insert_restickify_on_node_inputs(
             name_map[old_name] = new_name
 
         # lower_restickify calls pw.realize() which appends restick_buff to operations.
-        # Move it to just before the consumer op to preserve topological order.
-        operations.remove(restick_buff)
-        operations.insert(op_index, restick_buff)
-        op_index += 1  # consumer shifted right by 1
+        # Move it to just before the consumer op to preserve topological order: in the
+        # consumer's loop body when the consumer is a body op, before the node when
+        # the consumer is a node.
+        move_before(operations, op, restick_buff)
 
         source_group_id = counted_loop_path(old_name_buf, include_extern=True)
         consumer_group_id = counted_loop_path(op, include_extern=True)
@@ -1079,15 +1073,13 @@ def _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback) -> None:
     """Put ``buf_tmp`` right before ``mutation_op`` and ``buf_copyback`` right after.
 
     ``_create_restickify_node`` appends both nodes at the end of ``operations``, so
-    they are taken out first. Each goes next to the mutation op in the list that
-    holds it: the copy-back is placed with ``insert_after``, not at a flat index
+    they are moved from there. Each goes next to the mutation op in the list that
+    holds it: the copy-back is placed with ``move_after``, not at a flat index
     ``index(mutation_op) + 2``, which puts it before whatever follows the mutation,
     and that is outside the loop when the mutation is the last op of a loop body.
     """
-    operations.remove(buf_tmp)
-    operations.insert(operations.index(mutation_op), buf_tmp)
-    operations.remove(buf_copyback)
-    insert_after(operations, mutation_op, buf_copyback)
+    move_before(operations, mutation_op, buf_tmp)
+    move_after(operations, mutation_op, buf_copyback)
 
 
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:

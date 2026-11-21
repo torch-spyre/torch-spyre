@@ -130,7 +130,12 @@ line-length = 88
 
 [tool.mypy]
 ignore_missing_imports = true
-exclude=["tests/inductor", "captured"]
+# tests/inductor and tests/sharding are excluded because pytest requires
+# their per-directory conftest.py, which mypy (run over the whole `tests`
+# tree without package __init__.py files) rejects as a duplicate module of
+# tests/conftest.py. Naming the modules explicitly would need __init__.py
+# files that change the tests' import style (top-level `device_env` etc.).
+exclude=["tests/inductor", "tests/sharding", "captured"]
 
 [[tool.mypy.overrides]]
 module = ["torch_spyre._inductor.*"]
