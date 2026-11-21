@@ -873,6 +873,52 @@ def lower_layernormscale(x, eps):
     return pw
 
 
+def _peel(node):
+    """Unwrap TensorBox/StorageBox/MutableBox layers to reach the underlying Buffer."""
+    while isinstance(node, ir.MutableBox):
+        node = node.data
+    while isinstance(node, ir.StorageBox):
+        node = node.data
+    return node
+
+
+def _peel_through_views(node):
+    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
+
+    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
+    _peel stops at the view instead of reaching the Buffer underneath it.
+    """
+    node = _peel(node)
+    while isinstance(node, ir.BaseView):
+        node = _peel(node.data)
+    return node
+
+
+def _materialize_if_view(x):
+    """Materialize view-backed inputs into a contiguous Pointwise buffer before topk.
+
+    When a tensor is reshaped or viewed across dimensions, its non-reduction
+    coordinates are factorized across multiple host dimensions in the underlying
+    storage. TopK reductions require standard restickification to transpose the
+    stick to a non-reduction dimension; factorized view coordinates prevent
+    finding a single carrier host dimension. Materializing the view into a clean
+    Pointwise buffer gives it a canonical dense layout so restickify succeeds.
+    """
+    if isinstance(_peel(x), ir.BaseView):
+        loader = x.make_loader()
+        pw = Pointwise.create(
+            device=x.get_device(),
+            dtype=x.get_dtype(),
+            inner_fn=lambda idx: loader(idx),
+            ranges=list(x.get_size()),
+            origin_node=x.get_origin_node(),
+            traceback=x.get_traceback(),
+        )
+        pw.realize()
+        return pw
+    return x
+
+
 def _topk_reduction_kwargs(x, k, dim):
     """Build Reduction.create kwargs for topk along an arbitrary dim/rank.
 
@@ -906,6 +952,7 @@ def _topk_reduction_kwargs(x, k, dim):
 
 @register_spyre_lowering(torch.ops.spyre.topkvalue)
 def lower_topkvalue(x, k, dim):
+    x = _materialize_if_view(x)
     result = Reduction.create(
         reduction_type="topkvalue",
         input_node=x,
@@ -917,6 +964,7 @@ def lower_topkvalue(x, k, dim):
 
 @register_spyre_lowering(torch.ops.spyre.topkindex)
 def lower_topkindex(x, k, dim):
+    x = _materialize_if_view(x)
     result = Reduction.create(
         reduction_type="topkindex",
         input_node=x,
@@ -1992,27 +2040,6 @@ def lower_empty(size, device, dtype=None):
     return ir.TensorBox.create(
         SpyreEmptyFallback(op_overload, list(size), device, dtype)
     )
-
-
-def _peel(node):
-    """Unwrap TensorBox/StorageBox/MutableBox layers to reach the underlying Buffer."""
-    while isinstance(node, ir.MutableBox):
-        node = node.data
-    while isinstance(node, ir.StorageBox):
-        node = node.data
-    return node
-
-
-def _peel_through_views(node):
-    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
-
-    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
-    _peel stops at the view instead of reaching the Buffer underneath it.
-    """
-    node = _peel(node)
-    while isinstance(node, ir.BaseView):
-        node = _peel(node.data)
-    return node
 
 
 def _copy_back_candidate(dst, src) -> bool:
