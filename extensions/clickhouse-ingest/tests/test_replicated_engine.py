@@ -70,6 +70,10 @@ def server(tmp_path_factory):
         pytest.skip("no container runtime with a ClickHouse image")
     cfg = tmp_path_factory.mktemp("chcfg") / "keeper.xml"
     cfg.write_text(KEEPER)
+    # Rootless podman maps the server's own uid: it must be able to read the mounted file.
+    cfg.chmod(0o644)
+    for d in (cfg.parent, cfg.parent.parent):
+        d.chmod(0o755)
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
