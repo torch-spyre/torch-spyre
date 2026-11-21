@@ -1109,6 +1109,38 @@ class _ScatterScenarios:
 
             self._assert_compiled_matches_cpu(kernel, out, src, idx)
 
+    def test_index_add_sliced_view(self):
+        """index_add_ into out[3:]: both the gather read and the scatter write go
+        through IndirectAccess(idx) + 3 (issue #6210)."""
+        out, src, idx = self._index_add_operands(
+            M=16,
+            N=64,
+            P=4,
+            data_dtype=torch.float32,
+            nonzero_dest=True,
+            idx=torch.tensor([5, 0, 9, 2]),
+        )
+
+        def kernel(out, src, idx):
+            res = out.clone()
+            res[3:].index_add_(0, idx, src)
+            return res
+
+        self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_reduce_sliced_view(self):
+        """Reproducer from issue #6210: index_reduce_ (mean) on out[:, 3:, :]."""
+        base = (torch.rand(4, 10, 5, dtype=torch.float32) + 0.5).to("spyre")
+        idx = torch.tensor([0, 1, 2, 3], dtype=torch.int64).to("spyre")
+        src = (torch.rand(4, 4, 5, dtype=torch.float32) + 0.5).to("spyre")
+
+        def kernel(x, i, s):
+            out = x.clone()
+            out[:, 3:, :].index_reduce_(1, i, s, reduce="mean", include_self=True)
+            return out
+
+        self._assert_compiled_matches_cpu(kernel, base, idx, src)
+
     def test_index_add_3d(self):
         """3-D destination [M, A, B], scatter-add along dim 0."""
         M, A, B, P = 128, 8, 64, 3
