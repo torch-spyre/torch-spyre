@@ -38,6 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .parallel_precompile import report_output_layouts
 from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
@@ -652,6 +653,9 @@ class CustomPreSchedulingPasses:
             plan_sharded_hbm,
             _distribute_work,
             #
+            # The graph outputs' layouts are final here. A forked precompile child
+            # reports them to its parent before the planning below (parallel_precompile).
+            report_output_layouts,
             # LX Planning
             _maybe_scratchpad_planning,
             # Preserve copies through physical planning, then remove only
