@@ -3035,6 +3035,36 @@ def lower_qfp8ch(x):
     return pw
 
 
+def _pad_qfp8wt_k(x):
+    """Zero-pad the fp16 K of a [K, N] scaled_mm weight to the fp8 stick (#2831).
+
+    batchmatmulfp8 reads K in whole fp8 sticks, and insert_bmm_padding would pad
+    the weight after this op, in fp8, which dbo-opt cannot fill. Returns the
+    input and the valid K, or ``(x, None)`` when it is left unpadded.
+    """
+    node = V.graph.current_node
+    if node is None:
+        return x, None
+    size = x.get_size()
+    if len(size) != 2 or not all(isinstance(s, (int, sympy.Integer)) for s in size):
+        return x, None
+    k, n = int(size[0]), int(size[1])
+    eps = get_elem_in_stick(torch.float8_e4m3fn)
+    k_pad = -(-k // eps) * eps
+    # Pad only for scaled_mm's mat2: a returned padded weight reads back wrong,
+    # since the DMA takes K from the host size. N > 128 with N % 128 != 0
+    # computes wrong values (#5924), so leave it failing loudly.
+    if k_pad == k or (n > eps and n % eps) or not node.users:
+        return x, None
+    if not all(
+        u.target is torch.ops.spyre.scaled_mm.default
+        and (u.args[1] if len(u.args) > 1 else u.kwargs.get("mat2")) is node
+        for u in node.users
+    ):
+        return x, None
+    return lower_constant_pad_nd(x, [0, 0, 0, k_pad - k], 0.0), k
+
+
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """
@@ -3044,6 +3074,7 @@ def lower_qfp8wt(x):
     """
 
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
+    x, valid_k = _pad_qfp8wt_k(x)
     x_loader = x.make_loader()
 
     def inner_fn(index):
@@ -3066,6 +3097,11 @@ def lower_qfp8wt(x):
     pw.freeze_layout_with_stride_order(
         ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
     )
+    if valid_k is not None:
+        # Rows valid_k.. are zero; insert_bmm_padding keys on this.
+        buf = V.graph.get_buffer(pw.get_name())
+        buf.spyre_qfp8wt_valid_k = valid_k
+        return lowering.slice_(pw, 0, 0, valid_k)
     return pw
 
 
