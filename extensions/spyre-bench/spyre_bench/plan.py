@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-from spyre_bench import cliutil, engine, ingest_adapter, planfile, store as stores
+from spyre_bench import cliutil, engine, ingest_adapter, pinning_plan, planfile, store as stores
 from spyre_bench.cliutil import UsageError
 
 REUSE_MODES = ("never", "if_valid", "prefer", "only")
@@ -128,11 +128,67 @@ def build_request(a):
             req["budget"] = {"device_hours": float(budget)}
         except ValueError:
             raise UsageError(f"--budget {budget!r} is not a number of device-hours") from None
+    pin = build_pinning(a)
+    if pin:
+        req["cpu_pinning"] = pin
     sets = parse_sets([cliutil.env("BENCH_SET", "")] + (a.set or []))
     if sets:
         req["overrides"] = {**(req.get("overrides") or {}), **sets}
     check_budget(req)
     return req
+
+
+PIN_OPT_INT = ("cores_per_device", "reserve")
+PIN_OPT_ASSIGN = ("cores_per_device", "spread", "smt", "reserve", "reserve_cpus", "spread_scope", "llc_align")
+PIN_OPT_TOP = ("layout", "launcher")
+
+
+def build_pinning(a):
+    """The request-level cpu_pinning block from --cpu-pinning/--cpu-set/--pin-opt and their BENCH_* twins, or None.
+
+    It replaces the Environment's own host.cpu_pinning for this plan. Options are KEY=VALUE: layout, launcher, the
+    generator knobs (cores_per_device, spread, smt, reserve, reserve_cpus, spread_scope, llc_align) and cpus_by_device
+    (CPU lists separated by `;`).
+    """
+    policy = cliutil.pick(a.cpu_pinning, "BENCH_CPU_PINNING")
+    cpus = cliutil.pick(a.cpu_set, "BENCH_CPU_SET")
+    opts = cliutil.csv(cliutil.env("BENCH_PIN_OPTS", "")) + list(a.pin_opt or [])
+    required = cliutil.flag_on(a.require_pinning, "BENCH_REQUIRE_PINNING")
+    if not policy:
+        if cpus or opts or required:
+            raise UsageError("--cpu-set, --pin-opt and --require-pinning need --cpu-pinning (BENCH_CPU_PINNING)")
+        return None
+    if policy not in pinning_plan.POLICIES:
+        raise UsageError(f"--cpu-pinning {policy!r}: one of {', '.join(pinning_plan.POLICIES)}")
+    pin = {"policy": policy}
+    if cpus:
+        pin["cpus"] = cpus
+    assign = {}
+    for item in opts:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise UsageError(f"--pin-opt {item!r}: use KEY=VALUE")
+        if key in PIN_OPT_ASSIGN:
+            if key in PIN_OPT_INT:
+                if not value.isdigit():
+                    raise UsageError(f"--pin-opt {key}: an integer")
+                value = int(value)
+            elif key == "llc_align":
+                if value not in ("true", "false"):
+                    raise UsageError("--pin-opt llc_align: true or false")
+                value = value == "true"
+            assign[key] = value
+        elif key in PIN_OPT_TOP:
+            pin[key] = value
+        elif key == "cpus_by_device":
+            pin[key] = [x for x in value.split(";") if x]
+        else:
+            raise UsageError(f"--pin-opt {key!r}: unknown option")
+    if assign:
+        pin["assign"] = assign
+    if required:
+        pin["require_verified"] = True
+    return pin
 
 
 def check_budget(req):
@@ -189,11 +245,13 @@ def case_values(cat, c):
     return values
 
 
-def decorate(cat, rec, errors):
+def decorate(cat, rec, errors, request=None):
     """Add what `run` needs beyond the engine record: ids' profile, labels, pinning, the command templates."""
     c = next(x for x in cat.cases if x["name"] == rec["name"])
     ingest = cat.ingest_inputs(c)
     env = cat.effective("Environment", rec["environment"]) if rec.get("environment") else None
+    if env is not None:
+        env = engine.overlay_pinning(env, (request or {}).get("cpu_pinning"))
     command = c["run"].get("command")
     if command:
         command, errs = planfile.render_case_tokens(command, case_values(cat, c), f"case {c['name']}")
@@ -208,6 +266,7 @@ def decorate(cat, rec, errors):
         "benchmark": c["benchmark"],
         "id_mode": rec.get("id_mode", "engine"),
         "id_profile": ingest["profile"] if ingest else None,
+        **({"test_type": c["type"]} if c["type"] != "perf" else {}),
         "labels": cat.env_labels(env) if env else {},
         "pinning": engine.pin_block(env),
         "command": command or None,
@@ -230,7 +289,7 @@ def make_plan(cat, request, leg, st, now, store_name="none"):
         )
     body = engine.plan(cat, request, eleg, existing, st.invalidations([r["run_id"] for r in existing]), now)
     errors = []
-    records = [decorate(cat, r, errors) for r in body["cases"]]
+    records = [decorate(cat, r, errors, request) for r in body["cases"]]
     if errors:
         raise UsageError("\n".join(dict.fromkeys(errors)))
     counts = {"run": 0, "reuse": 0, "skip": 0}
@@ -295,6 +354,22 @@ def parser():
     ap.add_argument("--reference-node", action="store_true", help="this leg is a reference node")
     ap.add_argument("--env-id", help="env_id of this leg, required for exact-environment reuse")
     ap.add_argument("--store", choices=("none", "clickhouse"), help="reuse lookup source (BENCH_STORE, default none)")
+    ap.add_argument(
+        "--cpu-pinning",
+        choices=pinning_plan.POLICIES,
+        help="request this CPU pinning policy, replacing the Environment's own (BENCH_CPU_PINNING)",
+    )
+    ap.add_argument("--cpu-set", help="CPU list for --cpu-pinning explicit (BENCH_CPU_SET)")
+    ap.add_argument(
+        "--pin-opt",
+        action="append",
+        help="KEY=VALUE for the pinning request: layout, launcher, cores_per_device, spread, smt, ... (BENCH_PIN_OPTS)",
+    )
+    ap.add_argument(
+        "--require-pinning",
+        action="store_true",
+        help="cap the result at suspect unless verified (BENCH_REQUIRE_PINNING)",
+    )
     ap.add_argument("--out", help="write plan.json here (BENCH_PLAN_OUT)")
     ap.add_argument("--json", action="store_true", help="print the plan document instead of the table")
     ap.add_argument("--now", help=argparse.SUPPRESS)
