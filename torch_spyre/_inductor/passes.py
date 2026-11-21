@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import inspect
 import logging
 import time
@@ -88,7 +89,9 @@ from .work_division import (
 )
 from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
+    defer_span_overflow_tiling,
     scratchpad_planning,
+    solve_decides_span_overflow_tiling,
     solve_decides_work_division,
 )
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
@@ -393,6 +396,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     span_overflow_groups,
     validate_coarse_tile_groups,
     tile_groups,
+    defer_span_overflow_tiling,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -400,6 +404,11 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Requires FixedTiledLayout (device_layout) on all ops.
     Loops built from for_each_tile (splice_while_loops) are intentionally
     absent: they have already run pre-stickification.
+
+    The planner (``span_overflow_groups``) decides every tiling. Under CP-SAT
+    (``solve_decides_span_overflow_tiling``) each group the solve can take is
+    left to it (``defer_span_overflow_tiling``), which applies the tiling after
+    the solve; the pass applies the rest now.
 
     Uses tile_groups: layout propagation has already
     committed every op's device layout by this point, so a read-copy here
@@ -411,14 +420,43 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups, dim_hint_assignments = span_overflow_groups(graph)
     if not groups:
         return
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    reject_nested_loops(groups, "span-overflow coarse tiling")
+    if solve_decides_span_overflow_tiling():
+        groups = defer_span_overflow_tiling(
+            graph,
+            groups,
+            dim_hint_assignments,
+            apply=functools.partial(
+                _apply_span_overflow_groups,
+                dim_hint_assignments=dim_hint_assignments,
+            ),
+        )
+    _apply_span_overflow_groups(graph, groups, dim_hint_assignments)
+
+
+def _apply_span_overflow_groups(
+    graph: GraphLowering,
+    groups: list[tuple],
+    dim_hint_assignments: list[tuple[Operation, list]],
+) -> None:
+    """Tile ``groups`` with the planner's hints: the groups the pass keeps, or
+    those a failed solve hands back (``apply_deferred_span_overflow_tiling``)."""
+    if not groups:
+        return
     # span_overflow_groups is a pure planning step: it decides each op's
     # dim_hints but does not set them.  Apply them now, before
     # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
     # those consume (the plan's hint lookups), not something they produce.
+    # Only the members of ``groups``: an op left to the solve carries no hints.
+    members = {id(op) for group_ops, _levels in groups for op in group_ops}
     for op, dim_hints in dim_hint_assignments:
-        op.dim_hints = dim_hints  # type: ignore[attr-defined]
+        if id(op) in members:
+            op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any groups already
-    # stamped by splice_while_loops (for_each_tile).
+    # stamped by splice_while_loops (for_each_tile), or by this pass when a
+    # failed solve applies the groups left to it.
     # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
         counted_loop_path(op, include_extern=True)[0]
@@ -426,10 +464,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         if counted_loop_path(op, include_extern=True)
     ]
     group_idx_offset = max(used_ids, default=-1) + 1
-    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    reject_nested_loops(groups, "span-overflow coarse tiling")
     request_loop_nodes(
         graph,
         tile_groups(
@@ -640,7 +675,8 @@ class CustomPreSchedulingPasses:
             #
             # Working Set Reduction (device-layout-aware, post-stickification)
             # These passes require FixedTiledLayout.device_layout (device_size,
-            # stride_map, elems_per_stick) for physical span arithmetic.
+            # stride_map, elems_per_stick) for physical span arithmetic. Under
+            # CP-SAT, LX planning tiles the groups it can (see the pass).
             _maybe_coarse_tile_span_overflow,
             #
             # Core Division

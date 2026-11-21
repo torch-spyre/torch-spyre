@@ -940,9 +940,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         splits the output alone.
 
         Adds nothing when no buffer carries a non-empty spec, which is every
-        path except the joint solve with ``auto_coarse_tiling`` on; the tiling
-        variables then stay ``None`` and every method that reads them is a
-        no-op.
+        path except the joint solve with ``auto_coarse_tiling`` on, or with
+        span-overflow tilings the pass left to it (one per op, so no choice);
+        the tiling variables then stay ``None`` and every method that reads
+        them is a no-op.
         """
         UNTILED_ID = 0
         divided = {
