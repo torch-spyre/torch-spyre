@@ -16,8 +16,10 @@
 
 `CH_WRITE_RESILIENCE=auto` (default; `off` disables) applies it when the target's engine is
 Replicated*. A plain table, or one whose engine cannot be read, returns None and the caller keeps
-its own path. Rows that cannot land are parked in the spool; the call raises BatchParked and the
-CLI exits EXIT_PARKED after writing a rows-free summary.
+its own path. Rows that cannot land are parked in the spool and the call raises BatchParked. Once
+one call has parked, later calls in the process get one attempt each, so an outage costs one
+CH_WRITE_DEADLINE_S, not one per call. `finish` turns a clean run that parked rows into
+EXIT_PARKED, unless the run also wrote the authoritative v1 rows (see `finish`).
 """
 
 from __future__ import annotations
@@ -44,16 +46,36 @@ from .resilience import (
 )
 
 EXIT_PARKED = 75
+# The server default of replicated_deduplication_window (26.3); assumed when a login may not read
+# system.merge_tree_settings. A table's own setting is still read from system.tables.
+DEFAULT_WINDOW = 10000
+# Fact tables whose writers also dedup per case, replace older attempts and feed counters and
+# verdicts: a replay would skip all of that, so a parked batch of these is re-ingested instead.
+NO_REPLAY = frozenset({"test_case_runs", "capability_runs", "artifact_results"})
 _ENGINE_SQL = (
     "SELECT engine, length(dependencies_table) FROM system.tables "
     "WHERE database = {db:String} AND name = {t:String}"
 )
 _ENGINE_SQL_CURRENT = _ENGINE_SQL.replace("{db:String}", "currentDatabase()")
 
-_parked: list[tuple[str, int]] = []
+_parked: dict[str, int] = {}  # table -> rows; bounded by the tables a process writes
 _spools: dict[str, Spool | None] = {}
 _calls: dict[tuple[str, str], int] = {}
 _process = uuid.uuid4().hex
+_state = {"spent": False, "v1": False}
+
+
+def reset() -> None:
+    """Forget this process's parked rows, spools, call counts and spent deadline (tests)."""
+    _parked.clear()
+    _spools.clear()
+    _calls.clear()
+    _state.update(spent=False, v1=False)
+
+
+def note_v1_written() -> None:
+    """The run also writes the authoritative v1 rows: a park alone does not fail it."""
+    _state["v1"] = True
 
 
 def _env(name: str) -> str:
@@ -72,6 +94,10 @@ class Target:
 def _backend(client, table: str, database: str | None):
     route = getattr(client, "route", None)
     return route(table=table, database=database) if callable(route) else client
+
+
+def _flag(name: str) -> bool:
+    return _env(name).lower() not in ("", "0", "false", "no", "off")
 
 
 def _cache(backend, name: str) -> dict:
@@ -107,6 +133,29 @@ def target(backend, table: str, database: str | None) -> Target | None:
         return None
     cache[key] = found
     return found
+
+
+def window(backend, table: str, database: str | None) -> int:
+    """The table's dedup window, or DEFAULT_WINDOW (logged once) when it cannot be read."""
+    cache = _cache(backend, "_ch_write_windows")
+    found = dedup_window(backend, table, database, cache)
+    if found is None:
+        print(
+            f"[warn] dedup window of {table} unreadable; assuming the server default "
+            f"{DEFAULT_WINDOW}",
+            file=sys.stderr,
+        )
+        found = cache[(database or "", table)] = DEFAULT_WINDOW
+    return found
+
+
+def _aware(row):
+    """Naive datetimes as aware local time: the same instant the driver sends, and the spool
+    then records the offset, so a replay on another host's time zone stores the same value."""
+    return [
+        c.astimezone() if isinstance(c, datetime.datetime) and c.tzinfo is None else c
+        for c in row
+    ]
 
 
 def spool_dir() -> str:
@@ -148,32 +197,36 @@ def insert(
     if not database and "." in table:
         database, _, table = table.partition(".")
     backend = _backend(client, table, database)
+    database = database or getattr(backend, "database", None) or None
     found = target(backend, table, database)
     if found is None:
         return None
     policy = Policy.from_env()
     policy.batch_rows, policy.degrade_to = batch_rows, None
+    if _state["spent"]:
+        policy.deadline_s = 0.0
     try:
         out = resilient_insert(
             backend,
             table,
-            rows,
+            [_aware(r) for r in rows],
             columns,
             scope=scope_for(database, table),
             policy=policy,
             replicated=True,
-            dedup_window=dedup_window(
-                backend, table, database, _cache(backend, "_ch_write_windows")
-            ),
+            dedup_window=window(backend, table, database),
             database=database,
             spool=spool_from_env(),
             feeds_views=found.feeds_views,
         )
     except WriteFailed as err:
+        _state["spent"] = True
         stored = err.outcome.stored if err.outcome else 0
         raise BatchFailed(f"{table}: {err}", stored) from err
     if out.spooled:
-        _parked.append((f"{database}.{table}" if database else table, out.spooled))
+        _state["spent"] = True
+        name = f"{database}.{table}" if database else table
+        _parked[name] = _parked.get(name, 0) + out.spooled
         raise BatchParked(
             f"{table}: {out.spooled} row(s) parked, {out.stored} stored",
             out.stored,
@@ -182,17 +235,19 @@ def insert(
     return out.stored
 
 
-def parked() -> list[tuple[str, int]]:
-    return list(_parked)
+def parked() -> dict[str, int]:
+    return dict(_parked)
 
 
 def finish(rc):
-    """`rc`, or EXIT_PARKED when it is success and rows were parked; reports and forgets them."""
+    """Report and forget parked rows; `rc`, or EXIT_PARKED for a clean run that parked them.
+
+    A run that also wrote the v1 rows (authoritative) stays clean with a warning, unless
+    CH_WRITE_STRICT is set.
+    """
     if not _parked:
         return rc
-    totals: dict[str, int] = {}
-    for table, n in _parked:
-        totals[table] = totals.get(table, 0) + n
+    totals = dict(_parked)
     _parked.clear()
     where = spool_dir() or "(no spool)"
     lines = [f"{t}: {n} row(s) parked" for t, n in sorted(totals.items())]
@@ -209,37 +264,56 @@ def finish(rc):
                 fh.write(f"\nSpool: `{where}`\n")
         except OSError:
             pass
-    return EXIT_PARKED if rc in (0, None) else rc
+    if rc not in (0, None):
+        return rc
+    if _state["v1"] and not _flag("CH_WRITE_STRICT"):
+        print(
+            "::warning title=ClickHouse::v2 rows parked, not stored; v1 rows were written"
+        )
+        return rc
+    return EXIT_PARKED
+
+
+def run_cli(main, *args):
+    """`main(*args)`'s exit status, with parked rows folded in by `finish`."""
+    try:
+        rc = main(*args)
+    except SystemExit as stop:
+        rc = stop.code
+    return finish(rc)
 
 
 def replay(client, item: SpoolItem) -> str:
     """Send one parked batch again under its original token: "sent", or why it was not.
 
     Only a Replicated table with a nonzero dedup window qualifies, so a batch that did land is a
-    no-op. A batch that may be stored is also refused when the window is unreadable or the
-    batch is older than CH_WRITE_REPLAY_MAX_AGE_S (default 3600), since ClickHouse may have
-    evicted its token.
+    no-op. A batch that may be stored is also refused when it is older than
+    CH_WRITE_REPLAY_MAX_AGE_S (default 3600, the server's replicated_deduplication_window_seconds),
+    since ClickHouse may have evicted its token. Tables in NO_REPLAY are never replayed. Replay
+    before any re-run of the same ingest: a re-run sends the rows again under new tokens.
     """
     check_token(item.token)
+    if item.table in NO_REPLAY:
+        return (
+            f"{item.table} is not replayed: re-run the ingest for this file (a replay would "
+            "skip the per-case dedup, the older-attempt delete, the counters and the verdict)"
+        )
     backend = _backend(client, item.table, item.database)
     found = target(backend, item.table, item.database)
     if found is None:
         return "not a Replicated table, or its engine is unreadable: check by hand"
-    window = dedup_window(
-        backend, item.table, item.database, _cache(backend, "_ch_write_windows")
-    )
-    if window == 0:
+    if window(backend, item.table, item.database) == 0:
         return "the table deduplicates nothing (window 0): check by hand"
     if item.ambiguous:
-        if window is None:
-            return "may be stored and the dedup window is unreadable: check by hand"
         max_age = float(_env("CH_WRITE_REPLAY_MAX_AGE_S") or 3600)
         age = time.time() - (item.created or 0)
         if age > max_age:
             return f"may be stored and is {age / 3600:.1f} h old: check by hand"
     settings = _settings(Policy.from_env(), item.token, True, False, found.feeds_views)
     try:
-        rows = _typed(backend, item)
+        rows, why = _typed(backend, item)
+        if why:
+            return f"{why}: check by hand"
         kw = {"database": item.database} if item.database else {}
         backend.insert(
             item.table, rows, column_names=list(item.columns), settings=settings, **kw
@@ -256,10 +330,22 @@ _PARSE = (
     ("UUID", uuid.UUID),
     ("Decimal", decimal.Decimal),
 )
+_NESTED = ("Array(", "Map(", "Tuple(", "Nested(", "Variant(", "Dynamic", "JSON")
+_TEXT = ("String", "FixedString(")
 
 
-def _typed(backend, item: SpoolItem) -> list:
-    """The parked rows with their top-level DateTime, Date, UUID and Decimal cells restored."""
+def _unwrap(kind: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        for wrapper in ("Nullable(", "LowCardinality("):
+            if kind.startswith(wrapper) and kind.endswith(")"):
+                kind, changed = kind[len(wrapper) : -1], True
+    return kind
+
+
+def _typed(backend, item: SpoolItem) -> tuple[list, str]:
+    """(rows with DateTime, Date, UUID and Decimal cells restored, why they cannot be)."""
     where = (
         "database = {db:String}" if item.database else "database = currentDatabase()"
     )
@@ -270,12 +356,17 @@ def _typed(backend, item: SpoolItem) -> list:
         ).result_rows
     )
     parsers = []
-    for col in item.columns:
-        kind = types.get(col, "")
-        for wrapper in ("Nullable(", "LowCardinality("):
-            kind = kind[len(wrapper) :] if kind.startswith(wrapper) else kind
+    for i, col in enumerate(item.columns):
+        kind = _unwrap(types.get(col, ""))
+        if kind.startswith(_NESTED) and any(k in kind for k, _ in _PARSE):
+            return [], f"column {col} nests {kind}, which the spool flattened to text"
+        if kind.startswith(_TEXT) and any(
+            isinstance(r[i], str) and r[i][:2] in ("b'", 'b"') for r in item.rows
+        ):
+            return [], f"column {col} holds bytes that the spool wrote as text"
         parsers.append(next((f for k, f in _PARSE if kind.startswith(k)), None))
-    return [
+    rows = [
         [f(v) if f and isinstance(v, str) else v for f, v in zip(parsers, row)]
         for row in item.rows
     ]
+    return rows, ""

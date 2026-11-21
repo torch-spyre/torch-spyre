@@ -198,6 +198,7 @@ def main() -> None:
 
     # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
     if args.write_v1:
+        writes.note_v1_written()
         ensure_extra_columns(get_client(role="schema"), table=args.table)
         if already_ingested(client, run_id, component, table=args.table):
             print(
@@ -269,8 +270,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit as stop:
-        sys.exit(writes.finish(stop.code))
-    sys.exit(writes.finish(0))
+    sys.exit(writes.run_cli(main))

@@ -662,23 +662,24 @@ python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], 
 
 `replay` resends a batch only to a Replicated table with a nonzero dedup window, under the token it
 was first sent with, so a batch that did land is a no-op; it drops the file once the batch is
-stored and keeps it otherwise (one attempt per run). A `held` batch is also refused when the
-window cannot be read or the batch is older than `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600 s),
-since the server may have evicted its token. The JSON file flattens cells to text; replay turns
-top-level DateTime, Date, UUID and Decimal columns back into those types from `system.columns`
-and sends through the normal client, so run it on a host in the same time zone as the original
-writer (a naive datetime is read as local time).
+stored and keeps it otherwise (one attempt per run). A `held` batch is also refused when it is
+older than `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600 s, the server's
+`replicated_deduplication_window_seconds`), since the server may have evicted its token. A window
+the login cannot read (prod readers get 497 on `system.merge_tree_settings`) is taken as the server
+default, 10000 blocks, with one warning. `test_case_runs`, `capability_runs` and `artifact_results`
+are never replayed: their writers also skip repeated cases, replace older attempts and feed the
+counters and the verdict, so re-run the ingest for that file instead.
 
-A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
-rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
-to send. `put` and `drop` take a lock file in the directory, so processes sharing it leave one
-file per token and a `held` flag is never cleared (flock on a local filesystem; not guaranteed on
-NFS). `drop` matches by token suffix. `list` prints to stderr any quarantined `.corrupt` file (one
-that would not parse as a batch), any file it could not read (left in place, not renamed), and
-leftover `.tmp` files; all of them count toward the size cap, and the quarantined ones hold row
-data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
-opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
-a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
+**Replay first, then re-run; never replay after a re-run.** A re-run sends the same rows again
+under new tokens, so replaying the parked batch afterwards would double them. The same holds for a
+bench-reference write: its retry resumes the write, so drop its parked batches instead.
+
+The JSON file flattens cells to text; replay turns top-level DateTime, Date, UUID and Decimal
+columns (through `Nullable`/`LowCardinality`) back into those types from `system.columns` and
+sends through the normal client. Naive datetimes are parked with the writer's UTC offset, so
+replay stores the same instant on any host. A column that nests one of those types (Array, Map,
+Tuple) or a String cell the spool wrote from bytes (`b'...'`) is refused and the file is kept.
+
 The spool refuses a directory that is a symlink or owned by another user. The spool directory is `CH_WRITE_SPOOL`, else `$RUNNER_TEMP/ch-spool`; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
 
 ### In the ingests
@@ -689,22 +690,39 @@ engine is Replicated (one `system.tables` read per client and table, which also 
 materialized view reads the table). A plain table, a table the login cannot see and a failed
 lookup keep the existing `insert_chunks` path, and the legacy v1 inserts never look: their
 statements are the same as without this module. Every call gets its own token scope, so identical
-rows written by two calls are never merged; the quorum never degrades.
+rows written by two calls are never merged; the quorum never degrades. The CI workflows read
+`vars.CH_WRITE_RESILIENCE`, `vars.CH_WRITE_STRICT` and `vars.CH_WRITE_DEADLINE_S` (default 120 s
+there; 300 s in the library).
+
+Each call retries up to `CH_WRITE_DEADLINE_S`. Once one call in a process has spent its deadline
+(parked, or failed with no spool), every later call gets one attempt and parks at once, so an
+outage costs one deadline per process, not one per table and file.
 
 Rows that cannot land are parked in the spool and the insert raises `BatchParked`. The results
 ingest then marks the file and withholds the artifact verdict of its run (the first terminal
 verdict wins, and one built from the files that did land could be green); `--strict` fails on a
-withheld verdict. The CLI and the hw-diagnostics script exit 75 (EX_TEMPFAIL) after a clean run
-that parked rows and append a rows-free list of the parked tables to `$GITHUB_STEP_SUMMARY`. The
-ingest composite actions upload `spool list` output as a `ch-spool-manifest-*` artifact, never the
-spool itself, which holds full rows and dies with an ephemeral runner: re-run the job, or set
-`CH_WRITE_SPOOL` to a persistent directory on a self-hosted runner and `spool replay` there.
+withheld verdict. After a clean run that parked rows, the CLI and the hw-diagnostics script
+append a rows-free list of the parked tables to `$GITHUB_STEP_SUMMARY`, then:
 
-A re-run of a v2 test-results file converges: with `--run-attempt`, a file counts as ingested
-only while no rows of an earlier attempt remain, and the new attempt is inserted before the old
-one is deleted, so an insert that parks or fails leaves the previous attempt whole. Artifact
-verdicts follow the same order. A run that stops between deleting old rows and rebuilding
-`run_case_counters` still leaves the counters stale, as before.
+- exit 0 with a `::warning` when the run also wrote the v1 rows (`--schema both`), since v1 is
+  authoritative;
+- exit 75 (EX_TEMPFAIL) for a v2-only run, or for any run when `CH_WRITE_STRICT=1`.
+
+`relay` and `bench-verdicts` keep their own status: a park there is a failed write that their own
+retry handles. The v2-artifact action treats 75 as recorded with rows parked and still sets its
+outputs. The ingest composite actions upload `spool list` output as a `ch-spool-manifest-*`
+artifact, never the spool itself, which holds full rows and dies with an ephemeral runner: re-run
+the job, or set `CH_WRITE_SPOOL` to a persistent directory on a self-hosted runner and
+`spool replay` there.
+
+A re-run of a v2 test-results file converges at any attempt, including the first or none: it
+always takes the replace path, whose writer skips the cases already stored, so a file that parked
+or failed part way is finished. With `--run-attempt` the new attempt is inserted before the old
+one is deleted, so an insert that parks or fails leaves the previous attempt whole; artifact
+verdicts follow the same order. Benchmark reports are still skipped once any of their rows are
+stored, so a report of more than one batch that parks after its first batch is not finished by a
+re-run. A run that stops between deleting
+old rows and rebuilding `run_case_counters` still leaves the counters stale, as before.
 
 ## What is deliberately NOT here
 

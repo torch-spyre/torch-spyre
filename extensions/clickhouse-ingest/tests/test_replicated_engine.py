@@ -119,8 +119,7 @@ def clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path / "spool"))
     monkeypatch.setenv("CH_WRITE_BACKOFF_S", "0.01")
     monkeypatch.setenv("CH_WRITE_BACKOFF_MAX_S", "0.01")
-    monkeypatch.setattr(writes, "_parked", [])
-    monkeypatch.setattr(writes, "_spools", {})
+    writes.reset()
 
 
 def replicated(server, name, columns="a UInt32, b String", order="a"):
@@ -330,13 +329,12 @@ class Failing:
 
 
 def ingest(client, db, run, cases, attempt, source="f.xml"):
-    """What results.py does for one file."""
+    """What results.py does for one file: always the replace path."""
     from spyre_clickhouse_ingest.writer import TestResultWriter as W
 
-    if not W.already_ingested(client, db, run, "comp", source, attempt=attempt):
-        W.replace_attempt(
-            client, db, "comp", run, cases, source, attempt=attempt, arch="x86_64"
-        )
+    W.replace_attempt(
+        client, db, "comp", run, cases, source, attempt=attempt, arch="x86_64"
+    )
 
 
 def state(server, db, run):
@@ -408,3 +406,56 @@ def test_a_failed_insert_leaves_the_previous_attempt_whole(server, ingest_db):
         ingest(WriterClient(Failing(server, table="test_case_runs")), ingest_db, run,
                case_rows(4, "failed"), 2)  # fmt: skip
     assert state(server, ingest_db, run) == ({1: 4}, 4)
+
+
+@pytest.mark.parametrize("attempt", [0, 1])
+def test_a_first_attempt_that_failed_part_way_is_finished_by_the_rerun(
+    server, ingest_db, attempt
+):
+    run = f"00000000-0000-4000-8000-0000000000c{attempt}"
+    flaky = Failing(server, table="test_case_runs", after=1)  # the second batch fails
+    with pytest.raises(Exception):
+        ingest(WriterClient(flaky), ingest_db, run, case_rows(5003), attempt)
+    assert 0 < sum(state(server, ingest_db, run)[0].values()) < 5003
+    ingest(WriterClient(server), ingest_db, run, case_rows(5003), attempt)
+    assert state(server, ingest_db, run) == ({attempt: 5003}, 5003)
+
+
+def test_a_replay_after_a_rerun_is_refused_and_doubles_nothing(server, monkeypatch):
+    server.command("CREATE DATABASE IF NOT EXISTS rr")
+    server.command("DROP TABLE IF EXISTS rr.test_case_runs SYNC")
+    server.command(
+        "CREATE TABLE rr.test_case_runs (a UInt32, b String) ENGINE = "
+        "ReplicatedMergeTree('/t/rr_tcr/{shard}', '{replica}') ORDER BY a"
+    )
+    monkeypatch.setenv("CH_WRITE_QUORUM", "2")
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.2")
+    with pytest.raises(BatchParked):
+        writes.insert(WriterClient(server), "test_case_runs", ROWS, ["a", "b"], "rr")
+    monkeypatch.delenv("CH_WRITE_QUORUM")
+    writes.reset()
+    writes.insert(
+        WriterClient(server), "test_case_runs", ROWS, ["a", "b"], "rr"
+    )  # the re-run
+    spool = Spool(os.environ["CH_WRITE_SPOOL"])
+    connect = lambda database="": WriterClient(server)  # noqa: E731
+    assert spool_cli.replay(spool, None, connect=connect) == 1
+    assert server.command("SELECT count() FROM rr.test_case_runs") == 10
+    assert len(spool.items()) == 1  # kept for a person, with the reason printed
+
+
+def test_a_naive_datetime_lands_as_a_direct_insert_would_store_it(server):
+    name = replicated(
+        server, f"when_{uuid.uuid4().hex[:8]}", "id UInt32, at DateTime64(3)", "id"
+    )
+    server.command(
+        f"CREATE TABLE default.{name}_control (id UInt32, at DateTime64(3)) ENGINE = MergeTree ORDER BY id"
+    )
+    row = [1, dt.datetime(2026, 11, 13, 1, 2, 3, 456000)]
+    writes.insert(WriterClient(server), name, [row], ["id", "at"], "default")
+    server.insert(f"default.{name}_control", [row], column_names=["id", "at"])
+    read = "SELECT id, at FROM default.%s"
+    assert (
+        server.query(read % name).result_rows
+        == server.query(read % f"{name}_control").result_rows
+    )

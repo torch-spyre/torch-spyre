@@ -32,7 +32,10 @@ V2_INPUTS = (
     "clickhouse-v2-pass",
 )
 SCHEMA_INPUTS = ("clickhouse-schema-user", "clickhouse-schema-pass")
-VARS = ("CH_REQUIRE_V2_HOST", "CH_V2_DATABASES")
+VARS = (
+    "CH_REQUIRE_V2_HOST", "CH_V2_DATABASES", "CH_WRITE_RESILIENCE", "CH_WRITE_STRICT",
+    "CH_WRITE_DEADLINE_S",
+)  # fmt: skip
 # Ingest actions whose script runs ensure-table DDL.
 DDL_ACTIONS = {
     "ingest-hw-diagnostics-to-clickhouse",

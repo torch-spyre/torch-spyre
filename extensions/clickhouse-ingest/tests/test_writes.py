@@ -15,7 +15,9 @@
 """Replicated inserts through classify/retry/park; plain and v1 inserts keep their path."""
 
 import datetime
+import sys
 import time
+from pathlib import Path
 
 import pytest
 from clickhouse_connect.driver.exceptions import DatabaseError
@@ -72,9 +74,7 @@ def clean(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CH_WRITE_BACKOFF_S", "0.001")
     monkeypatch.setenv("CH_WRITE_BACKOFF_MAX_S", "0.001")
-    monkeypatch.setattr(writes, "_parked", [])
-    monkeypatch.setattr(writes, "_spools", {})
-    monkeypatch.setattr(writes, "_calls", {})
+    writes.reset()
 
 
 ROWS = [[i, f"r{i}"] for i in range(7)]
@@ -147,7 +147,7 @@ def test_past_the_deadline_without_a_spool_the_batch_fails(monkeypatch):
     with pytest.raises(BatchFailed) as e:
         writes.insert(Fake(script=[err(285)] * 50), "t", ROWS, ["a", "b"], "db")
     assert not isinstance(e.value, BatchParked)
-    assert writes.parked() == []
+    assert writes.parked() == {}
 
 
 def test_past_the_deadline_with_a_spool_rows_park_and_the_cli_exits_75(
@@ -168,7 +168,7 @@ def test_past_the_deadline_with_a_spool_rows_park_and_the_cli_exits_75(
 
 
 def test_a_worse_exit_status_is_kept():
-    writes._parked.append(("t", 1))
+    writes._parked["t"] = 1
     assert writes.finish(2) == 2
 
 
@@ -229,7 +229,7 @@ def test_the_v1_hw_insert_stays_a_plain_insert():
 
 def test_the_cli_turns_a_clean_run_that_parked_rows_into_75(monkeypatch):
     def run(argv):
-        writes._parked.append(("t", 1))
+        writes._parked["t"] = 1
 
     monkeypatch.setattr("spyre_clickhouse_ingest.ci_run_timings.main", run)
     assert cli.main(["ci-run-timings"]) == writes.EXIT_PARKED
@@ -237,7 +237,7 @@ def test_the_cli_turns_a_clean_run_that_parked_rows_into_75(monkeypatch):
 
 def test_the_cli_maps_a_clean_system_exit_after_a_park(monkeypatch):
     def run(argv):
-        writes._parked.append(("t", 1))
+        writes._parked["t"] = 1
         raise SystemExit(0)
 
     monkeypatch.setattr("spyre_clickhouse_ingest.ci_run_timings.main", run)
@@ -288,7 +288,7 @@ def test_replay_restores_the_cell_types_json_flattened(tmp_path):
     assert item.rows[0][1] == str(when)
     fake = Fake()
     fake.columns = [("a", "UInt32"), ("b", "Nullable(DateTime64(3))")]
-    assert writes._typed(fake, item) == [[1, when], [2, None]]
+    assert writes._typed(fake, item) == ([[1, when], [2, None]], "")
 
 
 def test_replay_keeps_the_file_when_the_batch_does_not_land(tmp_path, capsys):
@@ -315,15 +315,25 @@ def test_replay_refuses_a_resend_that_could_double(
     assert fake.inserts == []
 
 
-def test_an_ambiguous_batch_is_refused_when_the_window_is_unreadable(tmp_path):
-    class NoWindow(Fake):
-        def query(self, sql, parameters=None):
-            if "engine_full" in sql:
-                raise err(497)
-            return super().query(sql, parameters)
+class NoWindow(Fake):
+    """A login that may not read system.merge_tree_settings (497), as prod read users."""
 
+    def query(self, sql, parameters=None):
+        if "engine_full" in sql:
+            self.queries.append(sql)
+            raise err(497)
+        return super().query(sql, parameters)
+
+
+def test_an_unreadable_window_is_the_server_default_read_once(tmp_path, capsys):
+    c = NoWindow()
+    for _ in range(2):
+        writes.insert(c, "t", ROWS, ["a", "b"], "db")
+    assert "insert_deduplication_token" in c.inserts[0][3]
+    assert sum("engine_full" in q for q in c.queries) == 1
+    assert capsys.readouterr().err.count("assuming the server default") == 1
     spool = park(tmp_path, ambiguous=True)
-    assert "unreadable" in writes.replay(NoWindow(), next(spool.pending()))
+    assert writes.replay(NoWindow(), next(spool.pending())) == "sent"
 
 
 def test_a_batch_refused_before_any_write_replays_at_any_age(tmp_path):
@@ -344,3 +354,198 @@ def test_the_spool_defaults_to_the_runner_temp_dir(tmp_path, monkeypatch):
     assert writes.spool_dir() == str(tmp_path / "ch-spool")
     monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path / "x"))
     assert writes.spool_dir() == str(tmp_path / "x")
+
+
+# ── one deadline per process ────────────────────────────────────────────────────
+
+
+def test_after_one_call_spends_its_deadline_later_calls_get_one_attempt(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    first = Fake(script=[err(285)] * 1000)
+    with pytest.raises(BatchParked):
+        writes.insert(first, "t", ROWS, ["a", "b"], "db")
+    assert len(first.inserts) > 1
+    second = Fake(script=[err(285)] * 1000)
+    with pytest.raises(BatchParked):
+        writes.insert(second, "u", ROWS, ["a", "b"], "db")
+    assert len(second.inserts) == 1
+    healthy = Fake()
+    assert (
+        writes.insert(healthy, "v", ROWS, ["a", "b"], "db") == 7
+    )  # one try still lands
+    writes.reset()
+    third = Fake(script=[err(285)] * 1000)
+    with pytest.raises(BatchParked):
+        writes.insert(third, "w", ROWS, ["a", "b"], "db")
+    assert len(third.inserts) > 1
+
+
+def test_a_failure_without_a_spool_also_spends_the_deadline(monkeypatch):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    with pytest.raises(BatchFailed):
+        writes.insert(Fake(script=[err(285)] * 1000), "t", ROWS, ["a", "b"], "db")
+    second = Fake(script=[err(285)] * 1000)
+    with pytest.raises(BatchFailed):
+        writes.insert(second, "u", ROWS, ["a", "b"], "db")
+    assert len(second.inserts) == 1
+
+
+def test_parked_rows_are_one_entry_per_table(monkeypatch, tmp_path):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.001")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    for _ in range(3):
+        with pytest.raises(BatchParked):
+            writes.insert(Fake(script=[err(285)] * 9), "t", ROWS, ["a", "b"], "db")
+    assert writes.parked() == {"db.t": 21}
+
+
+# ── exit status policy ──────────────────────────────────────────────────────────
+
+
+def test_a_park_beside_written_v1_rows_warns_and_exits_clean(capsys, monkeypatch):
+    writes.note_v1_written()
+    writes._parked["t"] = 1
+    assert writes.finish(0) == 0
+    assert "::warning" in capsys.readouterr().out
+    writes._parked["t"] = 1
+    monkeypatch.setenv("CH_WRITE_STRICT", "1")
+    assert writes.finish(0) == writes.EXIT_PARKED
+
+
+def test_a_v2_only_run_that_parked_exits_75():
+    writes._parked["t"] = 1
+    assert writes.finish(None) == writes.EXIT_PARKED
+
+
+@pytest.mark.parametrize("command", ["relay", "bench-verdicts"])
+def test_the_relay_and_bench_verdicts_keep_their_own_status(monkeypatch, command):
+    module = {"relay": "relay", "bench-verdicts": "bench_verdicts"}[command]
+
+    def run(argv):
+        writes._parked["t"] = 1
+        return 0
+
+    monkeypatch.setattr(f"spyre_clickhouse_ingest.{module}.main", run)
+    assert cli.main([command]) == 0
+
+
+def test_the_hw_script_exits_75_for_a_v2_only_park_and_0_beside_v1(
+    monkeypatch, tmp_path
+):
+    import runpy
+
+    from spyre_clickhouse_ingest import client as ch
+    from spyre_clickhouse_ingest import hw_diagnostics as hw
+    from spyre_clickhouse_ingest import hw_schema
+
+    script = (
+        Path(__file__).resolve().parents[3] / ".github/scripts/ingest_hw_diagnostics.py"
+    )
+
+    class Live:
+        def command(self, sql, *a, **k):
+            return 1
+
+        def query(self, sql, *a, **k):
+            class R:
+                result_rows = [(0,)]
+
+            return R()
+
+        def insert(self, *a, **k):
+            pass
+
+    def parks(client, rows, table="", resilient=False):
+        if resilient:
+            writes._parked[table] = len(rows)
+            raise BatchParked("parked", 0, len(rows))
+
+    monkeypatch.setattr(ch, "get_client", lambda **k: Live())
+    monkeypatch.setattr(hw, "load_records", lambda p: [{"suite_name": "s"}])
+    monkeypatch.setattr(hw, "filter_suite_records", lambda r: r)
+    monkeypatch.setattr(hw, "build_row", lambda rec, ctx: ["row"])
+    monkeypatch.setattr(hw, "insert_rows", parks)
+    monkeypatch.setattr(hw_schema, "ensure_extra_columns", lambda *a, **k: None)
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    run = "00000000-0000-4000-8000-000000000001"
+    (tmp_path / "x.json").write_text("[]")
+    for schema_gen, code in (("v2", writes.EXIT_PARKED), ("both", 0)):
+        writes.reset()
+        monkeypatch.setattr(sys, "argv", [str(script), "--json-file", str(tmp_path / "x.json"),
+                            "--run-id", run, "--schema", schema_gen])  # fmt: skip
+        with pytest.raises(SystemExit) as e:
+            runpy.run_path(str(script), run_name="__main__")
+        assert (e.value.code or 0) == code, schema_gen
+
+
+# ── what replay refuses or restores ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("table", sorted(writes.NO_REPLAY))
+def test_tables_whose_writers_do_more_than_insert_are_never_replayed(tmp_path, table):
+    spool = Spool(tmp_path / "sp")
+    spool.put(table, ["a"], [[1]], f"{table}-tok", "db")
+    c = Fake()
+    assert "re-run the ingest" in writes.replay(c, next(spool.pending()))
+    assert c.inserts == [] and c.queries == []
+
+
+def test_a_nested_typed_column_is_refused_not_resent_as_text(tmp_path):
+    spool = park(tmp_path)
+    fake = Fake()
+    fake.columns = [("a", "UInt32"), ("b", "Array(DateTime64(3))")]
+    assert "nests Array(DateTime64(3))" in writes.replay(fake, next(spool.pending()))
+    assert fake.inserts == []
+
+
+def test_bytes_the_spool_wrote_as_text_are_refused(tmp_path):
+    spool = park(tmp_path, rows=[[1, str(b"\x00raw")]])
+    fake = Fake()
+    assert "bytes" in writes.replay(fake, next(spool.pending()))
+    assert fake.inserts == []
+
+
+def test_nested_wrappers_are_unwrapped():
+    assert writes._unwrap("LowCardinality(Nullable(DateTime64(3, 'UTC')))") == (
+        "DateTime64(3, 'UTC')"
+    )
+
+
+def test_a_naive_datetime_is_parked_with_its_offset(monkeypatch, tmp_path):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.001")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    when = datetime.datetime(2026, 11, 13, 1, 2, 3)
+    with pytest.raises(BatchParked):
+        writes.insert(Fake(script=[err(285)] * 9), "t", [[1, when]], ["a", "b"], "db")
+    item = next(Spool(tmp_path / "ch-spool").pending())
+    fake = Fake()
+    fake.columns = [("a", "UInt32"), ("b", "DateTime")]
+    restored = writes._typed(fake, item)[0][0][1]
+    assert restored.tzinfo is not None and restored == when.astimezone()
+
+
+def test_the_database_of_an_unqualified_insert_is_recorded(monkeypatch, tmp_path):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.001")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    with pytest.raises(BatchParked):
+        writes.insert(
+            Fake(script=[err(285)] * 9), "result_invalidations", ROWS, ["a", "b"]
+        )
+    assert next(Spool(tmp_path / "ch-spool").pending()).database == "db"
+
+
+def test_the_engine_cache_is_per_database():
+    class TwoDbs(Fake):
+        def query(self, sql, parameters=None):
+            if "length(dependencies_table)" in sql:
+                self.engine = (
+                    "ReplicatedMergeTree" if parameters["db"] == "v2" else "MergeTree"
+                )
+            return super().query(sql, parameters)
+
+    c = TwoDbs()
+    assert writes.insert(c, "t", ROWS, ["a", "b"], "v2") == 7
+    assert writes.insert(c, "t", ROWS, ["a", "b"], "v1") is None

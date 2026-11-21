@@ -233,7 +233,13 @@ runs:
         repeat --tag-prop "${TAG_PROPS}"
 
         out="$(mktemp)"
-        if "${VENV}/bin/python" -m spyre_clickhouse_ingest artifacts "${cmd}" "${args[@]}" > "${out}"; then
+        rc=0
+        "${VENV}/bin/python" -m spyre_clickhouse_ingest artifacts "${cmd}" "${args[@]}" > "${out}" || rc=$?
+        # 75: the id is resolved and recorded, but rows were parked (see the manifest step).
+        if [ "${rc}" = 75 ]; then
+          echo "::warning title=v2 artifact::${ARTIFACT} recorded with rows parked, not stored"
+        fi
+        if [ "${rc}" = 0 ] || [ "${rc}" = 75 ]; then
           "${VENV}/bin/python" - "${out}" >> "$GITHUB_OUTPUT" <<'PY'
         import json, sys
         r = json.load(open(sys.argv[1]))
@@ -263,14 +269,13 @@ runs:
         source "${RUNNER_TEMP}/v2-artifact-venv/bin/activate"
         CH_WRITE_SPOOL="${spool}" python3 -m spyre_clickhouse_ingest spool list \
           > "${RUNNER_TEMP}/ch-spool-manifest.jsonl" || true
-        echo "parked=true" >> "$GITHUB_OUTPUT"
+        { echo "parked=true"; echo "id=$(date +%s)-${RANDOM}${RANDOM}"; } >> "$GITHUB_OUTPUT"
         echo "::warning title=ClickHouse::rows were parked, not stored; see the step summary"
 
     - name: Upload the parked-rows manifest
       if: always() && steps.ch-spool.outputs.parked == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ch-spool-manifest-artifact-${{ github.job }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+        name: ch-spool-manifest-artifact-${{ github.job }}-${{ github.run_attempt }}-${{ steps.ch-spool.outputs.id }}
         path: ${{ runner.temp }}/ch-spool-manifest.jsonl
         retention-days: 7
-        overwrite: true

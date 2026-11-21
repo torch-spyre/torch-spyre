@@ -52,6 +52,10 @@ def main(argv=None):
         from .offline import main as run
     else:
         from .results import main as run
+    if command in ("relay", "bench-verdicts"):
+        return run(
+            rest
+        )  # a park there is a failed write, retried by their own loop or caller
     try:
         rc = run(rest)
     except SystemExit as stop:

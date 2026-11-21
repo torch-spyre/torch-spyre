@@ -24,6 +24,10 @@ env:
   # Read by the ingest library: fail when a v2 database has no v2 host; the v2 database list.
   CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
   CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+  # Kill switch, red-on-park and the per-call retry deadline of the v2 write path.
+  CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+  CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+  CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
 
 jobs:
   ingest:

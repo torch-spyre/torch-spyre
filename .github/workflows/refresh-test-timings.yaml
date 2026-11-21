@@ -46,6 +46,10 @@ jobs:
       CLICKHOUSE_V2_PASSWORD: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
       CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
       CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+      # Kill switch, red-on-park and the per-call retry deadline of the v2 write path.
+      CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+      CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+      CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
     steps:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token

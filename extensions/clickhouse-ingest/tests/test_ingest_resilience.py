@@ -54,8 +54,7 @@ class Logged(LiveClient):
 def clean(monkeypatch):
     for name in ("CH_WRITE_RESILIENCE", "CH_WRITE_SPOOL", "RUNNER_TEMP"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(writes, "_parked", [])
-    monkeypatch.setattr(writes, "_calls", {})
+    writes.reset()
 
 
 def ingest(monkeypatch, tmp_path, schema_gen, engine="MergeTree", *extra, files=1):

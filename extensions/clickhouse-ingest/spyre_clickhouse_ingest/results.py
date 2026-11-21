@@ -54,7 +54,6 @@ from spyre_clickhouse_ingest import (
     insert_benchmarks,
     promote_xpass,
     capability_declaration,
-    cases_already_ingested,
     replace_case_attempt,
     benchmarks_already_ingested,
     component_of,
@@ -64,6 +63,7 @@ from spyre_clickhouse_ingest import (
     tables_present,
 )
 from spyre_clickhouse_ingest.batching import BatchParked, insert_chunks
+from spyre_clickhouse_ingest import writes
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
 from spyre_clickhouse_ingest.offline import main as offline_main
@@ -1973,6 +1973,8 @@ def main(argv=None, assigned_trust=""):
     args.write_v1 = args.schema in ("v1", "both")
     args.write_v2 = args.schema in ("v2", "both")
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+    if args.write_v1:
+        writes.note_v1_written()
     if args.purpose and not args.write_v2:
         _refuse_purpose("--schema must include v2 (v1 rows carry no run props)")
 
@@ -2367,18 +2369,11 @@ def main(argv=None, assigned_trust=""):
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
-                    elif cases_already_ingested(
-                        client,
-                        v2db,
-                        _v2_run_id,
-                        component_of(args, COMPONENT_DEFAULT),
-                        xml_path.name,
-                        attempt=args.run_attempt,
-                    ):
-                        print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        # Insert, then drop the earlier attempts: one that parks or fails
-                        # keeps the previous attempt (see replace_attempt).
+                        # Always the replace path: the writer skips cases already stored, so a
+                        # re-run finishes a file that parked or failed part way, at any attempt.
+                        # Insert, then drop the earlier attempts: one that parks or fails keeps
+                        # the previous attempt (see replace_attempt).
                         _n = replace_case_attempt(
                             client,
                             v2db,
