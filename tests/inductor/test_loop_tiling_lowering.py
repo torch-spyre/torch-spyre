@@ -39,7 +39,7 @@ from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     build_loop_tiling_plan,
 )
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, loop_member_view
 from test_span_overflow_gate import (
     _relative_error,
     CASES,
@@ -247,9 +247,9 @@ def test_the_new_lowering_stamps_strict_loop_info_and_no_stored_lists(case):
 
     def spy(graph):
         infos.extend(
-            getattr(op, "loop_member", None)
+            loop_member_view(op)
             for op in all_ops(graph.operations)
-            if getattr(op, "loop_member", None) is not None
+            if loop_member_view(op) is not None
         )
         return original(graph)
 
@@ -341,7 +341,7 @@ def _allocator_post_call_state():
                         bool(getattr(op, JOINT_TILING_AND_DIVISION_ATTR, False)),
                     )
                     for op in all_ops(graph.operations)
-                    if getattr(op, "loop_member", None) is not None
+                    if loop_member_view(op) is not None
                 }
             )
 
@@ -405,10 +405,7 @@ def test_no_for_each_tile_op_has_strict_loop_vars():
 
     def spy(graph):
         kinds.extend(
-            {
-                getattr(op, "loop_member", None).strict_loop_vars
-                for op in all_ops(node.body)
-            }
+            {loop_member_view(op).strict_loop_vars for op in all_ops(node.body)}
             for node in _nodes_of(graph.operations)
         )
         return original(graph)

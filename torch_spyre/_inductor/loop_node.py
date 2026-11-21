@@ -171,7 +171,7 @@ class LoopNode(ir.Operation):
         # and an access need not move with the loop), so the lowering that divided
         # it records it here.
         # INVARIANT (stage 9.3a): ``tiling`` is written only by ``_fill_tiling`` /
-        # ``record_loop_info`` (from the op's ``loop_member``), and each leaf op's
+        # ``record_member`` / ``_wrap`` (from the op's ``loop_member``), and each leaf op's
         # ``_loop_chain`` only by ``_set_chain``, which the node builder (``_wrap``),
         # the edit helpers below and ``expand`` call. A new edit site calls one of
         # those helpers; it never assigns either directly.
@@ -546,12 +546,17 @@ def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
     target._loop_chain = tuple(getattr(source, "_loop_chain", ()))  # type: ignore[attr-defined]
 
 
-def record_loop_info(op: ir.Operation) -> None:
-    """``op.loop_member`` was (re)written after the op was placed: make the nodes
-    around it hold the new tiled dims. A pass that stamps an op it has already
-    put in a body calls this right after the stamp (the loop checker, rule 6,
-    reports a node that disagrees with the stamp)."""
-    _fill_tiling(op, overwrite=True)
+def _drop_spent_records(entry: ir.Operation) -> None:
+    """Remove a lowering's ``loop_member`` from the leaf ops under ``entry`` that sit
+    in built nodes: the nodes hold the facts, so the record would be read by nothing."""
+    for leaf in all_ops([entry]):
+        chain = getattr(leaf, "_loop_chain", ())
+        if (
+            chain
+            and all(node.facts_recorded for node in chain)
+            and hasattr(leaf, "loop_member")
+        ):
+            del leaf.loop_member  # type: ignore[attr-defined]
 
 
 def _fill_tiling(entry: ir.Operation, overwrite: bool = False) -> None:
@@ -583,6 +588,21 @@ def _adopt(operations: list[ir.Operation], entry: ir.Operation) -> None:
     assert chain is not None
     _set_chain(entry, tuple(chain))
     _fill_tiling(entry)
+    _drop_spent_records(entry)
+    _take_donor_tiling(entry)
+
+
+def _take_donor_tiling(entry: ir.Operation) -> None:
+    """An op built by ``copy_op_metadata`` from a member (``_member_like``) that is now
+    in the same nodes tiles what the member tiles."""
+    for leaf in all_ops([entry]):
+        donor = getattr(leaf, "_member_like", None)
+        if donor is None:
+            continue
+        del leaf._member_like  # type: ignore[attr-defined]
+        for node in getattr(leaf, "_loop_chain", ()):
+            if donor.get_name() in node.tiling and leaf.get_name() not in node.tiling:
+                node.tiling[leaf.get_name()] = node.tiling[donor.get_name()]
 
 
 def insert_before(
@@ -661,6 +681,8 @@ def replace_op(
     # ``new`` may reuse ``old``'s name (replace_computed_buffer_body does) with a
     # different stamp; its stamp is the authority.
     _fill_tiling(new, overwrite=True)
+    _drop_spent_records(new)
+    _take_donor_tiling(new)
 
 
 def top_level_entry(
@@ -735,6 +757,8 @@ def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
     node.body.insert(0, op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
+    _drop_spent_records(op)
+    _take_donor_tiling(op)
 
 
 def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
@@ -750,6 +774,8 @@ def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
     node.body.append(op)
     _set_chain(op, _chain_of(node))
     _fill_tiling(op)
+    _drop_spent_records(op)
+    _take_donor_tiling(op)
 
 
 def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
@@ -879,7 +905,8 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
 
 def _record_node_facts(operations: list[ir.Operation]) -> None:
     """Fill every node's per-member tiling and every leaf's node chain, after the
-    nodes were built from the ops' ``loop_member``."""
+    nodes were built from the ops' ``loop_member``, then drop that record from the
+    ops the nodes hold."""
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
@@ -889,6 +916,11 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
             getattr(getattr(leaf, "loop_member", None), "strict_loop_vars", False)
             for leaf in all_ops(node.body)
         )
+        # The nodes own the facts now: the lowering's record is spent. Removing it
+        # means nothing after the build can read it by accident.
+        for leaf in all_ops(node.body):
+            if hasattr(leaf, "loop_member"):
+                del leaf.loop_member  # type: ignore[attr-defined]
 
 
 def collapse(

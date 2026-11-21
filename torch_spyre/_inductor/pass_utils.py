@@ -171,6 +171,12 @@ def copy_op_metadata(
     for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+    if getattr(src, "_loop_chain", ()):
+        # ``src`` is a member of built loop nodes (they, not an attribute, hold
+        # that). ``dst`` is a copy of it: when a loop_node helper places ``dst``
+        # in those nodes it becomes a member that tiles what ``src`` tiles, unless
+        # the pass clears this (a drain or a hoisted clone is not a member).
+        dst._member_like = src  # type: ignore[attr-defined]
 
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).

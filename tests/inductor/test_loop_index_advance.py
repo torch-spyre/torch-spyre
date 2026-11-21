@@ -76,6 +76,7 @@ from torch_spyre._inductor.padding import restride_loop_step
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 from test_loop_advance import CORPUS
+from utils_inductor import loop_member_view
 
 
 d1, d2 = (sympy_index_symbol(f"d{i}") for i in (1, 2))
@@ -126,7 +127,7 @@ class _Probe:
 
     def _record(self, kernel, tensor, is_input, name, result):
         node = kernel.current_node.node
-        info = getattr(node, "loop_member", None)
+        info = loop_member_view(node)
         if info is None:
             return
         dep = self._dep(kernel, node, is_input, name)

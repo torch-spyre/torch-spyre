@@ -34,7 +34,6 @@ Each compiles on the device with the flow-through on and off.
 """
 
 import contextlib
-import copy
 import unittest
 
 import regex as re
@@ -53,12 +52,17 @@ from torch_spyre._inductor import config, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import work_division
 from torch_spyre._inductor.ir import SpyreConstantFallback
-from torch_spyre._inductor.loop_facts import is_looped
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
+)
 from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,
     insert_after,
     insert_at_start,
+    record_member,
     remove_op,
 )
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
@@ -127,9 +131,7 @@ def _recording_deferral(record: dict):
         real(graph)
         record["deferred"] = set(work_division.deferred_work_division(graph))
         record["body_ops"] = {
-            op.get_name()
-            for op in all_ops(graph.operations)
-            if hasattr(op, "loop_member")
+            op.get_name() for op in all_ops(graph.operations) if is_looped(op)
         }
 
     with mock.patch.object(ts_passes, "defer_work_division", defer):
@@ -403,10 +405,13 @@ def _inject_dead_body_copy(record: dict):
         )
         buf.origins = src.origins
         buf.operation_name = name
-        buf.loop_member = copy.deepcopy(src.loop_member)
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
         insert_after(real, src, buf)
+        record_member(
+            buf,
+            [(x.tiled_dims, x.tiled_reduction_dims) for x in enclosing_loops(src)],
+        )
         record["name"] = name
 
     return dce
@@ -543,17 +548,18 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
     real = ts_passes._hand_off_loop_nodes
 
     def hand_off(graph):
-        # Put the body's constant (it keeps the body's loop_member) at the head
+        # Put the body's constant (dedup hoisted it out of the body) at the head
         # of the LoopNode's body, after the pass loop and before the hand-off.
         # Production keeps it outside (see the test above; the passes'
         # re-collapse moves it out again), so this is what reaches the
         # scheduler's own hoisting rule on a real compile.
         node = next(op for op in graph.operations if isinstance(op, LoopNode))
+        # The body's ``torch.full((M, N), 0.5)`` (``_scaled_split_k_fn``); the graph's
+        # other constants are not from the loop body.
         constant = next(
             op
             for op in graph.operations
-            if isinstance(op, SpyreConstantFallback)
-            and getattr(op, "loop_member", None) is not None
+            if isinstance(op, SpyreConstantFallback) and op.constant_args[0] == 0.5
         )
         remove_op(graph.operations, constant)
         insert_at_start(node, constant)
@@ -686,9 +692,9 @@ def test_structured_and_span_overflow_loops_in_one_graph():
                     type(n).__name__,
                     sorted(
                         {
-                            leaf.node.loop_member.loop_group_id
+                            counted_loop_path(leaf.node)
                             for leaf in n.get_nodes()
-                            if getattr(leaf.node, "loop_member", None) is not None
+                            if counted_loop_path(leaf.node)
                         }
                     ),
                 )

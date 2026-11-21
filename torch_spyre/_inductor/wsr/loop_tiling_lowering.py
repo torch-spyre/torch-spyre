@@ -54,7 +54,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .. import config
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout, SpyreConstantFallback
-from ..loop_facts import counted_loop_path
+from ..loop_facts import counted_loop_path, is_looped
 from ..loop_node import insert_after, move_after
 from ..loop_node import LoopMember
 from ..loop_node import LoopCarryRecord
@@ -443,7 +443,7 @@ def _apply_carries(edits: list[_CarryEdit]) -> None:
 
 
 def _outer_key(op: Any) -> int | None:
-    group = getattr(getattr(op, "loop_member", None), "loop_group_id", None)
+    group = counted_loop_path(op, include_extern=True)
     return group[0] if group else None
 
 
@@ -808,11 +808,7 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
     trip = sympy.Integer(group.trip_count)
     names = [o.op_name for o in group.ops]
     members = _resolve(operations, names)
-    already = [
-        m.get_operation_name()
-        for m in members
-        if getattr(m, "loop_member", None) is not None
-    ]
+    already = [m.get_operation_name() for m in members if is_looped(m)]
     if already:
         raise Unsupported(
             f"lower_loop_tiling: group {group.index} would overwrite the existing "

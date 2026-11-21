@@ -203,7 +203,7 @@ class TestFormatOperations(_Graph):
         text = format_operations(ops)
         self.assertEqual(text, "".join(format_operations([op]) for op in ops))
         self.assertTrue(text.startswith("a: ComputedBuffer\n  buffer=a\n  layout="))
-        self.assertIn("\n  loop_member=LoopMember(loop_group_id=(0,)", text)
+        self.assertIn("\n  loop_levels=[((0,),", text)
         self.assertTrue(text.endswith("\n\n"))
         self.assertNotIn("LoopNode", text)
 

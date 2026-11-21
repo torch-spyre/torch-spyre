@@ -264,15 +264,14 @@ class TestMembership(unittest.TestCase):
         self.assertEqual(find_violations(tree), [])
 
 
-class TestNodeFactsRule(unittest.TestCase):
-    """Rule 6: the facts the nodes hold equal the stamp, for nodes the pipeline built."""
+class TestNodeChainRule(unittest.TestCase):
+    """Rule 6: an op in nodes the pipeline built points at them and carries no
+    ``loop_member`` (the nodes own the facts once they are built)."""
 
     def _built(self):
         from types import SimpleNamespace
 
-        from torch_spyre._inductor.loop_node import collapse
-
-        from torch_spyre._inductor.loop_node import LoopMember
+        from torch_spyre._inductor.loop_node import LoopMember, collapse
 
         a, b = _LoopOp("a", (0,)), _LoopOp("b", (0,))
         for op in (a, b):
@@ -286,44 +285,45 @@ class TestNodeFactsRule(unittest.TestCase):
         collapse(graph)
         return graph, a, b
 
-    def test_agreeing_node_and_stamp_are_clean(self):
-        graph, *_ = self._built()
+    def test_a_built_node_is_clean_and_its_members_lose_the_record(self):
+        graph, a, b = self._built()
         self.assertEqual(find_violations(graph.operations), [])
+        self.assertFalse(hasattr(a, "loop_member"))
+        self.assertFalse(hasattr(b, "loop_member"))
 
-    def test_a_stamp_changed_after_the_node_was_built_is_reported(self):
-        graph, a, b = self._built()
-        a.loop_member.loop_tiled_dims = [[1]]
-        (problem,) = find_violations(graph.operations)
-        self.assertIn("a: loop_member says", problem)
-        self.assertIn("but its nodes say", problem)
-
-    def test_a_stamp_written_after_placement_without_record_loop_info_is_reported(self):
+    def test_a_record_written_after_the_build_is_reported(self):
         from torch_spyre._inductor.loop_node import LoopMember
-        from torch_spyre._inductor.loop_node import insert_before
 
         graph, a, b = self._built()
-        late = _Op("late")
-        insert_before(graph.operations, b, late)
-        # Unstamped, it is a non-member in the body (rule 5), not a rule-6 case.
-        (problem,) = find_violations(graph.operations)
-        self.assertIn("late is in the body", problem)
-        late.loop_member = LoopMember(
+        a.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[]],
         )
         (problem,) = find_violations(graph.operations)
-        self.assertIn("late: stamped with a loop_member", problem)
-        self.assertIn("record_loop_info", problem)
+        self.assertIn("a: carries a loop_member inside built nodes", problem)
+        self.assertIn("record_member", problem)
 
     def test_an_op_with_no_recorded_chain_is_reported(self):
         graph, a, b = self._built()
         del a._loop_chain
-        (problem,) = find_violations(graph.operations)
-        self.assertIn("a: its recorded node chain", problem)
+        problems = find_violations(graph.operations)
+        self.assertTrue(
+            any("a: its recorded node chain" in problem for problem in problems),
+            problems,
+        )
 
-    def test_a_hand_built_node_is_not_compared(self):
+    def test_an_unstamped_op_placed_by_a_helper_is_a_rule_5_case_not_rule_6(self):
+        from torch_spyre._inductor.loop_node import insert_before
+
+        graph, a, b = self._built()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("late is in the body", problem)
+
+    def test_a_hand_built_node_is_not_checked(self):
         tree = [_node("n0", [_LoopOp("a", (0,))])]
         tree[0].body[0].loop_member.loop_tiled_dims = [[1]]
         self.assertEqual(find_violations(tree), [])

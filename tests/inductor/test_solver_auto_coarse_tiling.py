@@ -48,7 +48,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.pass_utils import PerCoreView
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, loop_member_view
 from torch_spyre._inductor.loop_facts import read_advance
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
@@ -275,13 +275,9 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
         # Leaf ops: graph.operations keeps its LoopNodes after the pipeline
-        # (they reach the scheduler as nodes); a LoopNode has no loop_member.
-        tiled = [
-            op
-            for op in all_ops(graph.operations)
-            if getattr(op, "loop_member", None) is not None
-        ]
-        type(self).tiling = {op.get_name(): op.loop_member for op in tiled}
+        # (they reach the scheduler as nodes); a LoopNode is not an op in a loop.
+        tiled = [op for op in all_ops(graph.operations) if loop_member_view(op)]
+        type(self).tiling = {op.get_name(): loop_member_view(op) for op in tiled}
         # Per op, the advance of each read per trip at each level, from the record or
         # the index, whichever the op carries.
         type(self).read_advances = {

@@ -707,7 +707,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     clone keeps today's metadata-copy behavior.
     """
 
-    for attr in ("loop_member", "_loop_carry_record"):
+    for attr in ("loop_member", "_loop_carry_record", "_member_like"):
         if hasattr(op, attr):
             delattr(op, attr)
 

@@ -92,7 +92,7 @@ def _levels(loop_member) -> tuple[LoopLevel, ...]:
     )
 
 
-def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
+def pending_levels(op: Operation) -> tuple[LoopLevel, ...]:
     """The levels ``op.loop_member`` (the per-op stamp) describes; ``()`` if none or
     malformed. Readers use :func:`enclosing_loops`; this is the stamp itself, for
     the loop checker's comparison with the nodes and for an op no node holds."""
@@ -124,7 +124,7 @@ def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
     """
     if _in_built_node(op):
         return node_levels(op)
-    return stamped_levels(op)
+    return pending_levels(op)
 
 
 def node_levels(op: Operation) -> tuple[LoopLevel, ...]:

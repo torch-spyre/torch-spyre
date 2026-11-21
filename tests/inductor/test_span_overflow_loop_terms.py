@@ -309,7 +309,7 @@ from test_span_overflow_gate import (  # noqa: E402
     compile_span_overflow,
     normalise,
 )
-from utils_inductor import expects_raise  # noqa: E402
+from utils_inductor import expects_raise, loop_member_view  # noqa: E402
 
 # The gate's cases that write each tile through a copy-out, and all of them (the
 # K-tiled matmul carries an accumulator instead, stage 7a.3).
@@ -350,7 +350,7 @@ def _recording(run):
         seen.extend(
             _Looped(op)
             for op in graph.operations
-            if getattr(op, "loop_member", None) is not None
+            if loop_member_view(op) is not None
             and hasattr(op, "data")
             and op.loop_member.loop_group_id[0] >= group_idx_offset
         )
@@ -483,11 +483,11 @@ def test_the_memoized_read_writes_see_the_term():
 
     def fill_the_memo_then_tile(graph, groups, group_idx_offset=0):
         for op in graph.operations:
-            if getattr(op, "loop_member", None) is not None and hasattr(op, "data"):
+            if loop_member_view(op) is not None and hasattr(op, "data"):
                 op_read_writes(op)
         result = original(graph, groups, group_idx_offset)
         for op in graph.operations:
-            if getattr(op, "loop_member", None) is not None and hasattr(op, "data"):
+            if loop_member_view(op) is not None and hasattr(op, "data"):
                 reads_writes = op_read_writes(op)
                 memoized[op.get_operation_name()] = " ".join(
                     str(d.index)
@@ -521,7 +521,7 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         for op in graph.operations:
-            info = getattr(op, "loop_member", None)
+            info = loop_member_view(op)
             if info is None:
                 continue
             for hint in getattr(op, "dim_hints", None) or ():

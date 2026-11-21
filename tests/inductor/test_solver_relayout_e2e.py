@@ -869,12 +869,13 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
     """
     from torch_spyre._inductor.loop_node import LoopMember
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+    from utils_inductor import loop_member_view
 
     groups_seen = set()
 
     def assert_same_scope(producer, consumer):
-        prod_info = getattr(producer, "loop_member", None)
-        cons_info = getattr(consumer, "loop_member", None)
+        prod_info = loop_member_view(producer)
+        cons_info = loop_member_view(consumer)
         if prod_info is None and cons_info is None:
             return
         assert isinstance(prod_info, LoopMember)
@@ -910,7 +911,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
             **kwargs,
         )
         for op in [consumer_op, *(op_by_name.get(name) for name in parent_names)]:
-            info = getattr(op, "loop_member", None)
+            info = loop_member_view(op)
             if isinstance(info, LoopMember):
                 groups_seen.add(info.loop_group_id)
         for parent, candidates in out.items():

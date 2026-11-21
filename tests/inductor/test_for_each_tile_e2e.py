@@ -64,6 +64,7 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
@@ -1320,7 +1321,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
             if name in region.unstamped:
                 continue
             self.assertEqual(
-                op.loop_member.loop_group_id[0],
+                counted_loop_path(op, include_extern=True)[0],
                 region.loop_group_id,
                 f"{name} is stamped by another loop than its region's",
             )
@@ -1328,8 +1329,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         strays = [
             op.get_operation_name()
             for op in outside
-            if getattr(op, "loop_member", None) is not None
-            and op.loop_member.loop_group_id[0] == region.loop_group_id
+            if counted_loop_path(op, include_extern=True)[:1] == (region.loop_group_id,)
         ]
         self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
 
@@ -1369,7 +1369,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         (region,) = regions
         self._assert_region_is_whole(operations, region)
         depths = {
-            len(op.loop_member.loop_count)
+            len(counted_loop_path(op, include_extern=True))
             for op in operations[region.start : region.stop]
             if op.get_operation_name() not in region.unstamped
         }
