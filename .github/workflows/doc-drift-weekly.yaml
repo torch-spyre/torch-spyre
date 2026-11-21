@@ -79,7 +79,11 @@ jobs:
 
       # Edit and Write are allowed under docs/source only; with no matching
       # allow rule a headless run denies the call. The deny rules are a second
-      # layer. There is no Bash tool: the publish job builds the docs.
+      # layer. There is no Bash tool: the publish job builds the docs. Reads of
+      # the process environment (/proc), the runner temp directory and dot
+      # directories in the home directory are denied, so the agent cannot read
+      # ANTHROPIC_API_KEY. The secret scan in publish is the check that does
+      # not depend on these rules.
       - name: Run the weekly-doc-maintenance skill
         if: steps.gate.outputs.run == 'true'
         id: claude
@@ -95,7 +99,7 @@ jobs:
           claude_args: |
             --max-turns 80
             --allowedTools "Read,Glob,Grep,Edit(docs/source/**)"
-            --disallowedTools "Bash,WebFetch,WebSearch,Edit(.git/**),Edit(.github/**),Edit(.claude/**),Edit(**/*.py)"
+            --disallowedTools "Bash,WebFetch,WebSearch,Edit(.git/**),Edit(.github/**),Edit(.claude/**),Edit(**/*.py),Read(//proc/**),Read(//sys/**),Read(//home/runner/work/_temp/**),Read(~/.*/**)"
             --json-schema '{"type":"object","properties":{"changed":{"type":"boolean"},"title":{"type":"string"},"body":{"type":"string"}},"required":["changed","title","body"]}'
 
       - name: Collect the changed doc files
@@ -112,25 +116,31 @@ jobs:
           import json, os, shutil, sys
           status_file, out = sys.argv[1:]
           entries = [e for e in open(status_file, "rb").read().decode().split("\0") if e]
-          changed, deleted = [], []
+          changed, ignored = [], []
           for e in entries:
               code, path = e[:2], e[3:]
-              if "D" in code:
-                  deleted.append(path)
-              else:
-                  changed.append(path)
-                  dest = os.path.join(out, "files", path)
-                  os.makedirs(os.path.dirname(dest), exist_ok=True)
-                  shutil.copyfile(path, dest, follow_symlinks=False)
+              # Files the action leaves outside docs/source are never published.
+              if not path.startswith("docs/source/"):
+                  ignored.append(path)
+                  continue
+              # The agent has no tool that deletes or renames a file.
+              if "D" in code or "R" in code:
+                  sys.exit(f"::error::Unexpected deletion or rename: {path!r}")
+              changed.append(path)
+              dest = os.path.join(out, "files", path)
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.copyfile(path, dest, follow_symlinks=False)
+          for path in ignored:
+              print(f"::warning::Ignoring a change outside docs/source: {path}")
           result = json.loads(os.environ.get("RESULT") or "{}")
           json.dump(
-              {"changed": changed, "deleted": deleted,
+              {"changed": changed,
                "title": result.get("title", ""), "body": result.get("body", "")},
               open(os.path.join(out, "manifest.json"), "w"),
           )
-          print("\n".join(changed + [f"deleted: {p}" for p in deleted]) or "No changes.")
+          print("\n".join(changed) or "No changes under docs/source.")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"changed={'true' if changed or deleted else 'false'}\n")
+              f.write(f"changed={'true' if changed else 'false'}\n")
           PYEOF
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -183,11 +193,6 @@ jobs:
               if os.path.islink(path):
                   sys.exit(f"::error::Target is a symlink: {path!r}")
               shutil.copyfile(f, path)
-          for path in manifest["deleted"]:
-              check(path)
-              if os.path.islink(path) or not os.path.isfile(path):
-                  sys.exit(f"::error::Cannot delete: {path!r}")
-              os.remove(path)
 
           # Every file in the artifact must be listed in the manifest.
           listed = set(manifest["changed"])
@@ -204,11 +209,45 @@ jobs:
           python-version: '3.12'
 
       - name: Install docs dependencies
-        run: pip install -r docs/requirements.txt
+        run: pip install -r docs/requirements.txt regex==2026.7.19
 
       # Same command as the Build docs check in docs.yaml. No token exists yet.
       - name: Build docs
         run: python -m sphinx docs/source docs/build/html -W --keep-going
+
+      # The artifact text is published under the app's name, so fail the run if
+      # it contains anything that looks like a credential. The match is never
+      # printed. Mentions in the PR title and body are neutralized with a
+      # zero-width space after the @, so a bad run cannot notify anyone.
+      - name: Scan for secrets and prepare the PR text
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/doc-changes" "${RUNNER_TEMP}" <<'PYEOF'
+          import json, os, sys
+          import regex
+          src, tmp = sys.argv[1:]
+          manifest = json.load(open(os.path.join(src, "manifest.json")))
+          secret = regex.compile(
+              r"sk-ant-[A-Za-z0-9_-]{8,}|gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+              r"|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}"
+          )
+          texts = {"PR title": manifest["title"], "PR body": manifest["body"]}
+          for path in manifest["changed"]:
+              texts[path] = open(path, encoding="utf-8", errors="replace").read()
+          found = [name for name, text in texts.items() if secret.search(text)]
+          if found:
+              sys.exit(f"::error::Possible credential in: {', '.join(found)}")
+
+          def no_mentions(text):
+              return regex.sub(r"(?<![\w`])@(?=[A-Za-z0-9])", "@\u200b", text)
+
+          scope = os.environ["SCOPE"]
+          title = no_mentions(manifest["title"].strip().splitlines()[0] if manifest["title"].strip() else "")
+          if not title:
+              title = f"docs: weekly drift and consistency maintenance ({scope})"
+          open(os.path.join(tmp, "title.txt"), "w").write(title)
+          open(os.path.join(tmp, "body.md"), "w").write(no_mentions(manifest["body"]))
+          PYEOF
 
       # The token is limited to this repository and to what the next step uses,
       # below the app's full permission set.
@@ -244,14 +283,9 @@ jobs:
                   input=json.dumps(blob), check=True, capture_output=True, text=True,
               ).stdout.strip()
               tree.append({"path": path, "mode": "100644", "type": "blob", "sha": sha})
-          for path in manifest["deleted"]:
-              tree.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
           json.dump({"base_tree": base, "tree": tree}, sys.stdout)
           PYEOF
-          TITLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "${MANIFEST}")"
-          if [ -z "${TITLE}" ]; then
-            TITLE="docs: weekly drift and consistency maintenance (${SCOPE})"
-          fi
+          TITLE="$(cat "${RUNNER_TEMP}/title.txt")"
           TREE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" \
             --input "${RUNNER_TEMP}/tree.json" --jq .sha)"
           COMMIT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" -f tree="${TREE_SHA}" \
@@ -266,8 +300,6 @@ jobs:
               -f sha="${COMMIT_SHA}" >/dev/null
           fi
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "${MANIFEST}" \
-            > "${RUNNER_TEMP}/body.md"
           printf '\n---\nGenerated by Claude Code in the weekly-doc-maintenance workflow (scope: %s, run %s). Review every change against the code before merging.\n' \
             "${SCOPE}" "${RUN_URL}" >> "${RUNNER_TEMP}/body.md"
           gh pr create --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --base main \

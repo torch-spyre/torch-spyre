@@ -18,6 +18,8 @@ decide.
 - Change only `.md`, `.rst`, and `.svg` files under `docs/source/`. Never
   modify code, tests, CI, skills, or the Python under `docs/source/` (`conf.py`,
   `_ext/`). The workflow rejects any other changed file and fails the run.
+- Do not delete or rename files. The workflow fails the run on a deletion or a
+  rename under `docs/source/`. Propose removals in the PR body instead.
 - Do not commit, push, or open a pull request. In the workflow, a
   separate job applies the changed doc files to a fresh checkout, builds the
   docs, commits, and opens the PR. When run by hand, leave the changes in the
