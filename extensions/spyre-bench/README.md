@@ -41,6 +41,7 @@ spyre-bench plan --catalog examples/run-demo --central examples/central --purpos
     --reference-node --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan.json
 spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
 spyre-bench verdict --run-id <uuid> --store clickhouse --json
+spyre-bench upload results/bench                 # seal and check a lab run; --apply sends it to the inbox
 ```
 
 The `runners` declared by the kernel and comms packs name entry points supplied by the producer packages, not shipped here; `run` executes each Benchmark's own `run.command`.
