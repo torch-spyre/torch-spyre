@@ -183,7 +183,8 @@ _SQL_TOKEN = re.compile(
     r"""[A-Za-z_][\w$]*|\d+|\s+|.""",
     re.DOTALL,
 )
-_DB_KEYWORDS = frozenset("FROM USE DATABASE JOIN INTO TABLE EXISTS IN".split())
+# Words after which a bare v2 database name is the database itself (`SHOW TABLES FROM db`, `USE db`).
+_DB_KEYWORDS = frozenset("FROM USE DATABASE INTO TABLE EXISTS IN".split())
 
 
 def _strip_comments(sql: str) -> str:
