@@ -29,6 +29,18 @@
     "batch_size": {
      "type": "integer",
      "minimum": 1
+    },
+    "temperature": {
+     "type": "number",
+     "minimum": 0,
+     "description": "0 = greedy; a greedy case must not set seed"
+    },
+    "max_gen_toks": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "apply_chat_template": {
+     "type": "boolean"
     }
    },
    "required": [
