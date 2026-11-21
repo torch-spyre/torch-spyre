@@ -24,13 +24,15 @@
 Standard library only (Python 3.9+), with no package import: it runs from a copied wheel
 (`pip install --no-deps`) or as this file plus bundle.schema.json beside it
 (`python offline.py --offline ...`). `results --from-bundle <x>` (bundle.py) is the online
-half, which the v2-results relay runs. See the README, "Offline results bundles".
+half, which the v2-results relay runs. The sha256s in a bundle are self-attested: they detect
+accidental corruption, not tampering. See the README, "Offline results bundles".
 """
 
 import argparse
 import base64
 import contextlib
 import getpass
+import gzip
 import hashlib
 import json
 import math
@@ -48,10 +50,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as etree
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+KIT = "spyre-clickhouse-ingest"
+# What a sealer may claim about its own source; `ci` is assigned by the receiving channel only.
+TRUST_LABELS = ("lab", "external")
+CHANNEL_TRUST = ("external", "lab", "ci")  # least to most trusted
+DEFAULT_TRUST = "external"
+NO_LABEL = "none"
 BUNDLE_FILE = "bundle.json"
 FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
@@ -63,9 +71,34 @@ KINDS = {
     "sendnn": ".txt",
     "benchmarks": ".json",
     "tables": ".json",
+    "bench": ".json",
+    "bench-definitions": ".json",
+    "bench-qualification": ".json",
+    "bench-invalidation": ".json",
+    "bench-placement": ".json",
 }
+# bundle kind -> result_uploads.format, where they differ.
+UPLOAD_FORMAT: dict = {}
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
+# Kinds that record no result of a tested artifact: they name no artifact, tier or arch, and only a
+# CI-trusted channel (a lab one too, for bench-invalidation) may ingest them (bundle.py).
+ADMIN_KINDS = (
+    "bench-definitions",
+    "bench-qualification",
+    "bench-invalidation",
+    "bench-placement",
+)
+# Keys the receiving channel sets itself; a bundle that carries one is refused, never overwritten.
+RESERVED_RUN_KEYS = (
+    "run.ref_only", "run.record_type",
+    "run.trust", "run.actor", "run.channel", "run.upload_id", "run.writer", "run.bundle_sha256",
+    "run.content_sha256", "run.row_sha256", "run.on_behalf_of", "run.lib_ref", "upload_id", "round",
+)  # fmt: skip
+RESERVED_PREFIXES = ("claim.",)
+BENCH_API = "bench/"
+MAX_REPEAT = 65535
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # A benchmarks bundle's tiers: perf numbers, or accuracy evals.
 BENCHMARK_TEST_TYPES = ("perf", "quality")
 VLLM_COMPONENT = "spyre-inference"
@@ -98,6 +131,94 @@ class BundleError(Exception):
     def __init__(self, message: str, code: int = REJECTED):
         super().__init__(message)
         self.code = code
+
+
+def current_user() -> str:
+    """The login name; a container UID with no passwd entry falls back to $USER/$LOGNAME, then the uid."""
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return (
+            os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or str(getattr(os, "getuid", lambda: "unknown")())
+        )
+
+
+def kit_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(KIT)
+    except Exception:  # noqa: BLE001 -- running from a bare offline.py
+        return "unknown"
+
+
+def effective_trust(label: str = "", channel: str = "") -> str:
+    """The trust recorded: '' when neither the bundle nor the channel says. Otherwise the
+    channel's level (the lowest, `external`, when a labelled bundle arrives without one),
+    lowered by the bundle's label if that is lower. A bundle never raises its trust."""
+    if not (label or channel):
+        return ""
+    levels = [t for t in (label, channel or DEFAULT_TRUST) if t]
+    return min(levels, key=CHANNEL_TRUST.index)
+
+
+def receipt_id(content_sha256: str, upload_id: str = "") -> str:
+    """RCPT-XXXX-XXXX-XXXX-XXXX, from the bundle digest and the upload id; recomputable by
+    whoever holds both."""
+    h = (
+        hashlib.sha256(f"{content_sha256}\0{upload_id}".encode())
+        .hexdigest()[:16]
+        .upper()
+    )
+    return "RCPT-" + "-".join(h[i : i + 4] for i in range(0, 16, 4))
+
+
+def preflight(path: Path = None) -> dict:
+    """What this ingest accepts, and when `path` names a bundle, whether it can read it."""
+    out = {
+        "kit": KIT, "kit_version": kit_version(), "schema_versions": [SCHEMA_VERSION],
+        "kinds": list(KINDS), "trust_labels": list(TRUST_LABELS),
+    }  # fmt: skip
+    if path is None:
+        return out
+    with opened(path) as root:
+        f = root / BUNDLE_FILE
+        if not f.is_file():
+            raise BundleError(f"no {BUNDLE_FILE} in {path}", INCOMPLETE)
+        try:
+            meta = json.loads(f.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise BundleError(f"{BUNDLE_FILE} is not JSON: {err}") from None
+        invalid = ""
+        try:
+            check(root)
+        except BundleError as err:
+            invalid = str(err)
+    if not isinstance(meta, dict):
+        raise BundleError(f"{BUNDLE_FILE} is not a JSON object")
+    version = meta.get("schema_version", SCHEMA_VERSION)
+    unknown = sorted(set(meta) - set(schema()["properties"]))
+    producer = meta.get("producer") if isinstance(meta.get("producer"), dict) else {}
+    out["bundle"] = {"schema_version": version, "producer": producer,
+                     "kind": meta.get("kind", "junit"), "trust": meta.get("trust", "")}  # fmt: skip
+    problems = []
+    if not isinstance(version, int) or version > SCHEMA_VERSION:
+        problems.append(
+            f"schema_version {version!r} is newer than this ingest ({SCHEMA_VERSION}): "
+            "upgrade the connected ingest, or re-seal with an older kit"
+        )
+    if unknown:
+        problems.append(
+            f"fields this ingest does not know: {unknown}: upgrade the connected ingest, "
+            "or re-seal with an older kit"
+        )
+    if invalid and not problems:
+        problems.append(f"does not validate: {invalid}")
+    out["compatible"] = not problems
+    out["problems"] = problems
+    return out
 
 
 def schema() -> dict:
@@ -252,6 +373,13 @@ def digest(root: Path) -> str:
     return hashlib.sha256("".join(lines).encode()).hexdigest()
 
 
+def content_digest(root: Path) -> str:
+    """The results' identity without bundle.json, so sealing the same results again (a new
+    sealed time, another host) keeps it; the idempotency key of a bench upload."""
+    lines = [f"{p}\0{sha256(root / p)}\n" for p in bundle_files(root)]
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
 def count_cases(path: Path) -> int:
     """testcase elements in one XML; raises BundleError when it does not parse."""
     try:
@@ -323,7 +451,12 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
 
 
 def _finite(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    try:
+        return (
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+        )
+    except OverflowError:  # an integer too large for a float
+        return False
 
 
 def benchmark_entries(path: Path) -> list:
@@ -356,6 +489,10 @@ def benchmark_entries(path: Path) -> list:
             raise BundleError(f"{where}: unknown key(s) {sorted(unknown)}")
         for key in ("props", "run_props"):
             m = b.get(key, {})
+            if isinstance(m, dict) and "run.trust" in m:
+                raise BundleError(
+                    f"{where}: run.trust is assigned by the receiving channel"
+                )
             if not isinstance(m, dict) or not all(
                 isinstance(v, (str, int, float)) and not isinstance(v, bool)
                 for v in m.values()
@@ -403,6 +540,12 @@ def check_tables(root: Path, meta: dict, results: list) -> None:
             table, rows = load_rows(root / p)
         except RowError as err:
             raise BundleError(str(err)) from None
+        if any(
+            isinstance(r, dict)
+            and any("run.trust" in (r.get(k) or {}) for k in ("props", "run_props"))
+            for r in rows
+        ):
+            raise BundleError(f"{p}: run.trust is assigned by the receiving channel")
         if table in loaded:
             raise BundleError(f"{table} appears twice")
         loaded[table] = rows
@@ -452,6 +595,299 @@ def check_sendnn(root: Path, meta: dict, results: list) -> None:
             )
 
 
+def _reserved(mapping, where: str) -> None:
+    for k in mapping:
+        if k in RESERVED_RUN_KEYS or str(k).startswith(RESERVED_PREFIXES):
+            raise BundleError(
+                f"{where}: {k!r} is set by the receiving channel, not carried in a bundle"
+            )
+
+
+def _strmap(value, where: str) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(
+        isinstance(v, (str, int, float)) and not isinstance(v, bool)
+        for v in value.values()
+    ):
+        raise BundleError(f"{where}: maps names to strings or numbers")
+    return {str(k): str(v) for k, v in value.items()}
+
+
+def bench_result(path: Path) -> dict:
+    """A bench Result file, checked for shape (the receiving side recomputes every id)."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise BundleError(f"{path.name}: not JSON: {err}") from None
+    where = path.name
+    if not (
+        isinstance(data, dict)
+        and data.get("kind") == "Result"
+        and str(data.get("apiVersion", "")).startswith(BENCH_API)
+        and isinstance(data.get("status"), dict)
+    ):
+        raise BundleError(
+            f"{where}: not a bench Result (apiVersion {BENCH_API}*, kind Result)"
+        )
+    st = data["status"]
+    case = st.get("case")
+    if not isinstance(case, dict):
+        raise BundleError(f"{where}: status.case is missing")
+    for key in ("component", "name"):
+        if not isinstance(case.get(key), str) or not case[key].strip():
+            raise BundleError(f"{where}: status.case.{key} is required")
+    if not isinstance(case.get("disc_keys", []), list) or not all(
+        isinstance(k, str) for k in case.get("disc_keys", [])
+    ):
+        raise BundleError(f"{where}: status.case.disc_keys is a list of strings")
+    if not isinstance(case.get("tags", []), list):
+        raise BundleError(f"{where}: status.case.tags is a list")
+    _strmap(case.get("disc"), f"{where} status.case.disc")
+    _strmap(case.get("props"), f"{where} status.case.props")
+    subject = st.get("subject")
+    if not (
+        isinstance(subject, dict) and UUID_RE.match(str(subject.get("artifact_id", "")))
+    ):
+        raise BundleError(f"{where}: status.subject.artifact_id is required")
+    env = st.get("environment")
+    if not (isinstance(env, dict) and UUID_RE.match(str(env.get("env_id", "")))):
+        raise BundleError(f"{where}: status.environment.env_id is required")
+    version = env.get("fingerprint_version", 1)
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or not 0 < version <= 65535
+    ):
+        raise BundleError(f"{where}: status.environment.fingerprint_version is a count")
+    _strmap(env.get("fingerprint"), f"{where} status.environment.fingerprint")
+    _strmap(env.get("labels"), f"{where} status.environment.labels")
+    _reserved(st.get("run_props") or {}, f"{where} status.run_props")
+    _strmap(st.get("run_props"), f"{where} status.run_props")
+    reps = st.get("repeats")
+    if not isinstance(reps, list) or not reps:
+        raise BundleError(f"{where}: status.repeats needs at least one repeat")
+    seen = set()
+    for i, r in enumerate(reps):
+        at = f"{where} repeats[{i}]"
+        n = r.get("run.repeat") if isinstance(r, dict) else None
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= MAX_REPEAT:
+            raise BundleError(f"{at}: run.repeat is a count")
+        if n in seen:
+            raise BundleError(f"{at}: run.repeat {n} appears twice")
+        seen.add(n)
+        _reserved(r.get("props") or {}, f"{at} props")
+        _strmap(r.get("props"), f"{at} props")
+        _strmap(r.get("clean"), f"{at} clean")
+        if r.get("started_at") is not None:
+            try:
+                if not 1970 <= _ts(str(r["started_at"])).year <= 2299:
+                    raise ValueError("out of range")
+            except ValueError:
+                raise BundleError(f"{at}: started_at is not an ISO-8601 time") from None
+        n_it = r.get("iterations", 0)
+        if not isinstance(n_it, int) or isinstance(n_it, bool) or not 0 <= n_it < 2**32:
+            raise BundleError(f"{at}: iterations is a count")
+        pl_ = r.get("placement") or {}
+        links = pl_.get("links", []) if isinstance(pl_, dict) else None
+        if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+            raise BundleError(f"{at}: placement.links is a list of strings")
+        samples = r.get("samples") or {}
+        if not isinstance(samples, dict):
+            raise BundleError(f"{at}: samples maps a metric to its values")
+        if r.get("status", "ok") == "ok" and not samples:
+            raise BundleError(f"{at}: an ok repeat needs samples")
+        for k, v in samples.items():
+            values = v if isinstance(v, list) else [v]
+            if not values or not all(_finite(x) for x in values):
+                raise BundleError(f"{at}: samples[{k!r}] must be finite numbers")
+        pl = r.get("placement") or {}
+        if not isinstance(pl, dict) or not isinstance(pl.get("nodes", []), list):
+            raise BundleError(f"{at}: placement.nodes is a list")
+        devs = pl.get("devices", [])
+        if not isinstance(devs, list) or not all(isinstance(d, dict) for d in devs):
+            raise BundleError(f"{at}: placement.devices is a list of objects")
+    return data
+
+
+def bench_case_key(result: dict) -> str:
+    c = result["status"]["case"]
+    return json.dumps(
+        [c["component"].strip().lower(), c["name"].strip().lower(),
+         sorted(str(t).strip().lower() for t in c.get("tags") or []),
+         sorted((c.get("disc") or {}).items())], default=str,
+    )  # fmt: skip
+
+
+def check_bench(root: Path, meta: dict, results: list) -> None:
+    """Each results/*.json is one case's Result (apiVersion bench/*), for a perf or quality tier."""
+    if meta["test_type"] not in BENCHMARK_TEST_TYPES:
+        raise BundleError(
+            f"a bench bundle is test_type {' or '.join(BENCHMARK_TEST_TYPES)}"
+        )
+    cases, subjects = set(), set()
+    for p in results:
+        result = bench_result(root / p)
+        key = bench_case_key(result)
+        if key in cases:
+            raise BundleError(f"{p}: the same case appears in two Results")
+        cases.add(key)
+        subjects.add(result["status"]["subject"]["artifact_id"])
+    named = meta.get("artifact_id")
+    if len(subjects) > 1 or (named and subjects != {named}):
+        raise BundleError(
+            f"the Results name subject artifact(s) {sorted(subjects)}; bundle artifact_id {named!r}"
+        )
+
+
+def _records(path: Path, key: str) -> list:
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise BundleError(f"{path.name}: not JSON: {err}") from None
+    rows = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise BundleError(f'{path.name}: needs a non-empty "{key}" list')
+    if not all(isinstance(r, dict) for r in rows):
+        raise BundleError(f'{path.name}: "{key}" holds objects')
+    return rows
+
+
+DEFINITION_KINDS = ("Environment", "NodeClass")
+INVALIDATION_SCOPES = ("run", "run_benchmark", "node", "device", "placement")
+INVALIDATION_STATES = ("suspect", "invalidated", "restored")
+
+
+def check_admin(root: Path, meta: dict, results: list) -> None:
+    """One results/*.json holding the records of a definitions, qualification or invalidation bundle."""
+    kind = meta["kind"]
+    if len(results) != 1:
+        raise BundleError(f"a {kind} bundle holds exactly one results/*.json")
+    path = root / results[0]
+    if kind == "bench-definitions":
+        for i, r in enumerate(_records(path, "records")):
+            at = f"{path.name} records[{i}]"
+            if r.get("kind") not in DEFINITION_KINDS:
+                raise BundleError(
+                    f"{at}: kind {r.get('kind')!r}; only {', '.join(DEFINITION_KINDS)} have a table so far"
+                )
+            for key in ("name", "spec_digest"):
+                if not isinstance(r.get(key), str) or not r[key].strip():
+                    raise BundleError(f"{at}: {key} is required")
+            spec = r.get("spec", {})
+            if not isinstance(spec, dict) or not all(
+                isinstance(spec.get(k, {}), dict)
+                for k in ("labels", "policy", "host_profile", "qualification")
+            ):
+                raise BundleError(
+                    f"{at}: spec is an object whose labels, policy, host_profile and qualification are objects"
+                )
+        source = json.loads(path.read_text()).get("source", {})
+        if not isinstance(source, dict):
+            raise BundleError(f"{path.name}: source is an object")
+    elif kind == "bench-qualification":
+        for i, r in enumerate(_records(path, "records")):
+            at = f"{path.name} records[{i}]"
+            if not (isinstance(r.get("node"), str) and r["node"]):
+                raise BundleError(f"{at}: node is required")
+            for key in ("env_id", "evidence_run_id"):
+                if not UUID_RE.match(str(r.get(key, ""))):
+                    raise BundleError(f"{at}: {key} is a UUID")
+            if r.get("outcome") not in ("pass", "fail"):
+                raise BundleError(f"{at}: outcome is pass or fail")
+            for key in ("qualified_at", "expires_at"):
+                if not _date_time(str(r.get(key, ""))):
+                    raise BundleError(f"{at}: {key} is an ISO-8601 time with a zone")
+            if r.get("metric") is not None and not (
+                isinstance(r["metric"], str) and r["metric"]
+            ):
+                raise BundleError(
+                    f"{at}: metric names the canary metric the CV is recomputed from"
+                )
+    elif kind == "bench-placement":
+        for i, u in enumerate(_records(path, "updates")):
+            at = f"{path.name} updates[{i}]"
+            if not UUID_RE.match(str(u.get("run_id", ""))):
+                raise BundleError(f"{at}: run_id is a UUID")
+            reps = u.get("repeats")
+            if reps is not None and not (
+                isinstance(reps, list)
+                and reps
+                and all(
+                    isinstance(n, int)
+                    and not isinstance(n, bool)
+                    and 0 <= n <= MAX_REPEAT
+                    for n in reps
+                )
+            ):
+                raise BundleError(
+                    f"{at}: repeats is a non-empty list of counts (absent: every repeat of the run)"
+                )
+            _strmap(u.get("clean"), f"{at} clean")
+            _reserved(u.get("clean") or {}, f"{at} clean")
+            for key in ("nodes", "links"):
+                if key in u and not (
+                    isinstance(u[key], list) and all(isinstance(x, str) for x in u[key])
+                ):
+                    raise BundleError(f"{at}: {key} is a list of strings")
+            if "devices" in u and not (
+                isinstance(u["devices"], list)
+                and all(isinstance(d, dict) for d in u["devices"])
+            ):
+                raise BundleError(f"{at}: devices is a list of objects")
+            if not any(k in u for k in ("clean", "nodes", "devices", "links")):
+                raise BundleError(
+                    f"{at}: nothing to update (clean, nodes, devices or links)"
+                )
+    else:
+        for i, e in enumerate(_records(path, "events")):
+            at = f"{path.name} events[{i}]"
+            if not UUID_RE.match(str(e.get("invalidation_id", ""))):
+                raise BundleError(f"{at}: invalidation_id is a UUID")
+            if e.get("scope_kind") not in INVALIDATION_SCOPES:
+                raise BundleError(f"{at}: scope_kind is one of {INVALIDATION_SCOPES}")
+            if e.get("state") not in INVALIDATION_STATES:
+                raise BundleError(f"{at}: state is one of {INVALIDATION_STATES}")
+            if not (isinstance(e.get("reason_code"), str) and e["reason_code"]):
+                raise BundleError(f"{at}: reason_code is required")
+            scope = e.get("scope") or {}
+            if not isinstance(scope, dict):
+                raise BundleError(f"{at}: scope is an object")
+            need = {"run": ("run_id",), "run_benchmark": ("run_id", "benchmark_id"),
+                    "node": ("node",), "device": ("device_serial",),
+                    "placement": ("placement_id",)}[e["scope_kind"]]  # fmt: skip
+            for key in need:
+                if not scope.get(key):
+                    raise BundleError(
+                        f"{at}: scope_kind {e['scope_kind']} needs scope.{key}"
+                    )
+            for key in ("run_id", "benchmark_id"):
+                if scope.get(key) is not None and not UUID_RE.match(str(scope[key])):
+                    raise BundleError(f"{at}: scope.{key} is a UUID")
+            if e["scope_kind"] == "run" and (
+                scope.get("benchmark_id") or scope.get("repeat") is not None
+            ):
+                raise BundleError(
+                    f"{at}: a run scope names neither benchmark_id nor repeat"
+                )
+            rep_n = scope.get("repeat")
+            if rep_n is not None and (
+                not isinstance(rep_n, int)
+                or isinstance(rep_n, bool)
+                or not 0 <= rep_n <= MAX_REPEAT
+            ):
+                raise BundleError(f"{at}: scope.repeat is a count")
+            for key in ("window_from", "window_to"):
+                if e.get(key) and not _date_time(str(e[key])):
+                    raise BundleError(f"{at}: {key} is an ISO-8601 time with a zone")
+            from .bench_invalidation import InvalidationError, normalize
+
+            try:
+                normalize(e)
+            except InvalidationError as err:
+                raise BundleError(f"{at}: {err}") from None
+
+
 def check(root: Path) -> dict:
     """Validate the bundle at `root` offline; returns bundle.json with test_type filled in."""
     path = root / BUNDLE_FILE
@@ -472,7 +908,11 @@ def check(root: Path) -> dict:
     if errors:
         raise BundleError("; ".join(errors))
     meta = normalized(meta)
-    if not specs(meta):
+    kind = meta.get("kind", "junit")
+    admin = kind in ADMIN_KINDS
+    if admin and (specs(meta) or meta.get("test_type") or meta.get("create_artifact")):
+        raise BundleError(f"a {kind} bundle names no artifact or test_type")
+    if not admin and not specs(meta):
         raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
@@ -480,9 +920,10 @@ def check(root: Path) -> dict:
         errors.append(
             "create_artifact records an image: it needs image (by digest) and arch"
         )
-    kind = meta.get("kind", "junit")
     meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
-    if not meta["test_type"]:
+    if admin:
+        meta.pop("test_type")
+    elif not meta["test_type"]:
         errors.append("test_type is required (the tier: unit, regression, fvt, ...)")
     if kind == "vllm" and (meta["test_type"], meta.get("component", VLLM_COMPONENT)) != (
         "perf", VLLM_COMPONENT,
@@ -539,6 +980,10 @@ def check(root: Path) -> dict:
         check_benchmarks(root, meta, results)
     elif kind == "tables":
         check_tables(root, meta, results)
+    elif kind == "bench":
+        check_bench(root, meta, results)
+    elif admin:
+        check_admin(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -578,6 +1023,8 @@ def opened(path: Path):
                     tar.extractall(tmp, filter="data")
                 except TypeError:
                     tar.extractall(tmp)
+        except getattr(tarfile, "FilterError", ()) as err:
+            raise BundleError(f"{path.name}: unsafe member ({err})") from None
         except tarfile.TarError as err:
             raise BundleError(f"{path.name}: not a tar archive ({err})") from None
         top = Path(tmp)
@@ -592,27 +1039,169 @@ def opened(path: Path):
         yield top
 
 
+def _plain(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.mtime, info.uid, info.gid, info.uname, info.gname, info.mode = (
+        0,
+        0,
+        0,
+        "",
+        "",
+        0o644,
+    )
+    return info
+
+
 def pack(root: Path, tgz: Path) -> Path:
-    with tarfile.open(tgz, "w:gz") as tar:
+    """A .tgz of the bundle whose bytes depend on its content alone (no times, owners or modes)."""
+    with contextlib.ExitStack() as stack:
+        raw = stack.enter_context(tgz.open("wb"))
+        gz = stack.enter_context(
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0)
+        )
+        tar = stack.enter_context(tarfile.open(fileobj=gz, mode="w"))
         for p in [BUNDLE_FILE, *bundle_files(root)]:
-            tar.add(root / p, arcname=p)
+            tar.add(root / p, arcname=p, filter=_plain)
     return tgz
 
 
-def _earliest_suite(paths) -> str:
-    """The earliest <testsuite timestamp>, as UTC; pytest writes it naive, in local time."""
-    stamps = []
+def _suite_end(start: datetime, text: str) -> datetime:
+    """`start` plus the suite's time; `start` itself when the time is unusable."""
+    try:
+        seconds = float(text or 0)
+        if math.isfinite(seconds) and seconds >= 0:
+            return start + timedelta(seconds=seconds)
+    except (ValueError, OverflowError):
+        pass
+    return start
+
+
+def _suite_window(paths) -> tuple:
+    """(first start, last end, zone-less count) over the <testsuite>s' timestamps and times, as
+    UTC. A zone-less timestamp is read as UTC, as the dashboard reads it."""
+    starts, ends, naive, dropped = [], [], 0, 0
     for xml in paths:
         with contextlib.suppress(etree.ParseError, OSError):
             for suite in etree.parse(xml).getroot().iter("testsuite"):
-                with contextlib.suppress(ValueError):
-                    ts = datetime.fromisoformat(suite.get("timestamp", ""))
-                    stamps.append(ts if ts.tzinfo else ts.astimezone())
+                text = suite.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    naive += ts.tzinfo is None
+                    ts = (
+                        ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    ).astimezone(timezone.utc)
+                except (ValueError, OverflowError):
+                    dropped += bool(text)
+                    continue
+                starts.append(ts)
+                ends.append(_suite_end(ts, suite.get("time", "0")))
+    if dropped:
+        print(
+            f"[warn] {dropped} JUnit timestamp(s) could not be read and were ignored "
+            "(Python before 3.11 reads only some ISO-8601 forms)",
+            file=sys.stderr,
+        )
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
     return (
-        min(stamps).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        if stamps
+        min(starts).strftime(fmt) if starts else "",
+        max(ends).strftime(fmt) if ends else "",
+        naive,
+    )
+
+
+_SUITE_TAG = re.compile(rb"<testsuite\b(?:\"[^\"]*\"|'[^']*'|[^>\"'])*>")
+_HOSTNAME = re.compile(rb"(\shostname\s*=\s*)(?:\"[^\"]+\"|'[^']+')")
+
+
+def _scrub_hostnames(root: Path, host: str) -> tuple:
+    """Blank every non-empty hostname attribute of the <testsuite> tags in results/*.xml, byte
+    for byte otherwise. Returns (attributes blanked, files that still mention `host`)."""
+    blanked, mentions = 0, []
+    for p in sorted((root / "results").iterdir()):
+        data = p.read_bytes()
+        new, n = data, 0
+        if p.suffix.lower() == ".xml":
+
+            def tag(m):
+                nonlocal n
+                out, k = _HOSTNAME.subn(rb'\1""', m.group(0))
+                n += k
+                return out
+
+            new = _SUITE_TAG.sub(tag, data)
+        if n:
+            p.chmod(p.stat().st_mode | 0o200)
+            p.write_bytes(new)
+            blanked += n
+        if any(n.encode() in new for n in {host, host.split(".")[0]} if n):
+            mentions.append(p.name)
+    return blanked, mentions
+
+
+def _unreserved(bag, dropped: list) -> None:
+    for k in [
+        k for k in bag if k in RESERVED_RUN_KEYS or str(k).startswith(RESERVED_PREFIXES)
+    ]:
+        dropped.append(k)
+        del bag[k]
+
+
+def bench_inputs(src: Path, stage: Path) -> tuple:
+    """(staged Result files, attachments, facts) from a run directory, a folder of Results or one
+    Result. The engine writes channel-owned keys (run.trust) into its Results; a sealed copy drops
+    them, since the receiving channel assigns them."""
+    if src.is_file():
+        found = [src]
+    else:
+        found = sorted(
+            p
+            for p in src.rglob("result.json")
+            if "ingest" not in p.relative_to(src).parts
+        )
+        found = found or sorted(src.glob("*.json"))
+    paths, subjects, runs, dropped = [], set(), set(), []
+    for p in found:
+        try:
+            data = json.loads(p.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise BundleError(f"{p}: not JSON: {err}") from None
+        if not (isinstance(data, dict) and data.get("kind") == "Result"):
+            if src.is_file():
+                raise BundleError(f"{p}: not a bench Result")
+            continue
+        st = data.get("status") if isinstance(data.get("status"), dict) else {}
+        _unreserved(st.get("run_props") or {}, dropped)
+        for r in st.get("repeats") or []:
+            if isinstance(r, dict):
+                _unreserved(r.get("props") or {}, dropped)
+        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        meta_block = (
+            data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        )
+        name = str(meta_block.get("name") or p.parent.name)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:80]
+        out = stage / f"{slug}-{hashlib.sha256(text.encode()).hexdigest()[:8]}.json"
+        out.write_text(text)
+        paths.append(out)
+        subjects.add(str((st.get("subject") or {}).get("artifact_id", "")))
+        runs.add(name.split(".")[0])
+    if not paths:
+        raise BundleError(f"no bench Result (kind Result) found under {src}")
+    if dropped:
+        print(
+            f"[warn] dropped channel-owned key(s) from the sealed Results: {sorted(set(dropped))}",
+            file=sys.stderr,
+        )
+    if len(subjects) > 1:
+        raise BundleError(
+            f"the Results name different subject artifacts: {sorted(subjects)}"
+        )
+    one = next(iter(runs))
+    key = (
+        f"{MANUAL_PREFIX}spyre-bench:{one}"
+        if len(runs) == 1 and UUID_RE.match(one)
         else ""
     )
+    return paths, [], {"artifact_id": next(iter(subjects)), "run_key": key}
 
 
 def _arch(value: str) -> str:
@@ -620,14 +1209,27 @@ def _arch(value: str) -> str:
     return "x86_64" if a in ("amd64", "x86", "x86-64") else a
 
 
-def write(args) -> Path:
+def write(args, validate_times: bool = True) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
     if getattr(args, "benchmarks_dir", ""):
         kind = "benchmarks"
     if getattr(args, "tables_dir", ""):
         kind = "tables"
-    if kind == "tables":
+    if getattr(args, "bench_dir", ""):
+        kind = "bench"
+    admin = kind in ADMIN_KINDS
+    staged = None
+    if kind == "bench":
+        if not args.bench_dir:
+            raise BundleError("--kind bench needs --bench-dir")
+        staged = Path(tempfile.mkdtemp(prefix="bench-stage-"))
+        results, extra, bench = bench_inputs(Path(args.bench_dir), staged)
+    elif admin:
+        if not getattr(args, "records_file", ""):
+            raise BundleError(f"--kind {kind} needs --records-file")
+        results, extra = [Path(args.records_file)], []
+    elif kind == "tables":
         if not args.tables_dir:
             raise BundleError("--kind tables needs --tables-dir")
         results, extra = sorted(Path(args.tables_dir).glob("*.json")), []
@@ -658,24 +1260,69 @@ def write(args) -> Path:
         "artifact_id": (args.artifact_id or "").strip(),
         "artifact": (args.artifact or "").strip(),
     }
-    meta = {"schema_version": SCHEMA_VERSION, **({"kind": kind} if kind != "junit" else {}),
-            **normalized(named), "arch": _arch(args.arch)}  # fmt: skip
+    if kind == "bench" and not any(named.values()):
+        named["artifact_id"] = bench["artifact_id"]
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        **({"kind": kind} if kind != "junit" else {}),
+    }
+    if not admin:
+        meta.update(normalized(named), arch=_arch(args.arch))
     for key, value in (
-        ("component", args.component), ("test_type", args.trigger_type),
-        ("run_key", args.jenkins_run_key), ("run_url", args.run_url), ("workflow", args.workflow),
-        ("tag_family", args.tag_family),
+        ("component", args.component), ("test_type", args.trigger_type or ("perf" if kind == "bench" else "")),
+        ("run_key", args.jenkins_run_key or (bench["run_key"] if kind == "bench" else "")),
+        ("run_url", args.run_url), ("workflow", args.workflow), ("tag_family", args.tag_family),
     ):  # fmt: skip
-        if value:
+        if value and not (admin and key != "run_url"):
             meta[key] = value
     if args.tags:
         meta["tags"] = list(args.tags)
     if args.perf:
         meta["perf"] = dict(args.perf)
-    started = args.triggered_at or (_earliest_suite(results) if kind == "junit" else "")
-    if started:
-        meta["started_at"] = started
-    meta["ended_at"] = _now()
-    meta["runner"] = {"host": socket.gethostname(), "user": getpass.getuser()}
+    first, last, naive = _suite_window(results) if kind == "junit" else ("", "", 0)
+    if naive and not (args.triggered_at and getattr(args, "ended_at", "")):
+        print(
+            f"[warn] {naive} JUnit timestamp(s) carry no time zone; read as UTC "
+            "(--triggered-at / --ended-at override)",
+            file=sys.stderr,
+        )
+    given_end = getattr(args, "ended_at", "")
+    for flag, value in (
+        ("--triggered-at", args.triggered_at),
+        ("--ended-at", given_end),
+    ):
+        if validate_times and value and not _date_time(value):
+            raise BundleError(f"{flag} {value!r} is not an ISO-8601 time with a zone")
+    if args.triggered_at or first:
+        meta["started_at"] = args.triggered_at or first
+    if given_end or last:
+        meta["ended_at"] = given_end or last
+    if (
+        _date_time(meta.get("ended_at", ""))
+        and _date_time(meta.get("started_at", ""))
+        and _ts(meta["ended_at"]) < _ts(meta["started_at"])
+    ):
+        if given_end:
+            raise BundleError("--ended-at is before the start time")
+        print(
+            f"[warn] the last suite ends before the start time {meta['started_at']}; "
+            "ended_at set to the start",
+            file=sys.stderr,
+        )
+        meta["ended_at"] = meta["started_at"]
+    trust = getattr(args, "seal_trust", DEFAULT_TRUST)
+    if (
+        trust and trust != NO_LABEL and not admin
+    ):  # a CI-owned bundle carries no label that could lower its channel
+        meta["trust"] = trust
+    meta["producer"] = {"name": KIT, "version": kit_version()}
+    runner = {}
+    if not getattr(args, "redact_host", False):
+        runner["host"] = socket.gethostname()
+    if not getattr(args, "redact_user", False):
+        runner["user"] = current_user()
+    if runner:
+        meta["runner"] = runner
     out = (
         Path(args.out)
         if args.out
@@ -687,7 +1334,25 @@ def write(args) -> Path:
         raise BundleError(f"{root} is not empty")
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
-        shutil.copy2(p, root / "results" / p.name)
+        shutil.copy2(
+            p,
+            root
+            / "results"
+            / ("invalidation.json" if kind == "bench-invalidation" else p.name),
+        )
+    if staged:
+        shutil.rmtree(staged, ignore_errors=True)
+    if getattr(args, "redact_host", False):
+        blanked, mentions = _scrub_hostnames(root, socket.gethostname())
+        print(
+            f"[info] blanked {blanked} testsuite hostname attribute(s)", file=sys.stderr
+        )
+        if mentions:
+            print(
+                f"[warn] the sealing host name is still in {mentions}; --redact-host "
+                "only blanks the testsuite hostname attribute",
+                file=sys.stderr,
+            )
     if extra:
         (root / "attachments").mkdir(exist_ok=True)
         for p in extra:
@@ -707,21 +1372,31 @@ def write(args) -> Path:
         f"[info] wrote {out}: {len(meta['files'])} file(s), bundle sha256 {dig}",
         file=sys.stderr,
     )
-    print(
-        f"[info] inbox path: {upload_path(checked, dig, args.inbox, args.root)}{'.tgz' if tgz else '/'}",
-        file=sys.stderr,
-    )
+    if not admin:
+        print(
+            f"[info] inbox path: {upload_path(checked, dig, args.inbox, args.root)}{'.tgz' if tgz else '/'}",
+            file=sys.stderr,
+        )
     return out
 
 
 def report(path: Path) -> dict:
     """What `--validate-only` prints: the bundle's run identity and where it uploads."""
     with opened(path) as root:
-        meta, dig = check(root), digest(root)
+        meta, dig, content = check(root), digest(root), content_digest(root)
+    if meta.get("kind") in ADMIN_KINDS:
+        return {
+            "status": "valid",
+            "kind": meta["kind"],
+            "bundle_sha256": dig,
+            "content_sha256": content,
+        }
     key = run_key(meta)
     out = {"status": "valid", "kind": meta.get("kind", "junit"), "test_type": meta["test_type"],
            "run_key": key or f"{MANUAL_PREFIX}<uploader>:{dig}", "bundle_sha256": dig,
            "upload_path": upload_path(meta, dig)}  # fmt: skip
+    if meta.get("kind") == "bench":
+        out["content_sha256"] = content
     if key and meta.get("arch"):
         with contextlib.suppress(ImportError):
             from spyre_clickhouse_ingest.identity import RunId
@@ -803,6 +1478,10 @@ def upload(path: Path, args) -> str:
     results = setting(args.root, "--root", ENV_ROOT)
     with opened(path) as root:
         meta, dig = check(root), digest(root)
+        if meta.get("kind") in ADMIN_KINDS:
+            raise BundleError(
+                f"a {meta['kind']} bundle is ingested by its CI job, not uploaded to the inbox"
+            )
         dest = upload_path(meta, dig, args.inbox, results)
         if args.as_folder:
             # bundle.json last: the relay takes a folder only once it is there.
@@ -896,6 +1575,21 @@ def add_offline_options(parser) -> None:
     g.add_argument("--root", default="",
                    help=f"results folder template with {{arch}}; default ${ENV_ROOT}")  # fmt: skip
     g.add_argument("--kind", choices=tuple(KINDS), default="junit")
+    g.add_argument("--ended-at", default="",
+                   help="--offline: ISO-8601 end time; default the last JUnit suite's end, else none")  # fmt: skip
+    g.add_argument("--seal-trust", choices=(*TRUST_LABELS, NO_LABEL), default=DEFAULT_TRUST,
+                   help=f"--offline: where the results came from (default {DEFAULT_TRUST}); "
+                   "the receiving channel decides the trust it records, and never accepts `ci` from a bundle; "
+                   f"`{NO_LABEL}` writes no label, for a CI job whose channel is trusted")  # fmt: skip
+    g.add_argument("--redact-host", action="store_true",
+                   help="--offline: leave the sealing host out of bundle.json and blank the JUnit testsuite hostname")  # fmt: skip
+    g.add_argument("--redact-user", action="store_true",
+                   help="--offline: leave the sealing user out of bundle.json")  # fmt: skip
+    g.add_argument("--channel-trust", choices=CHANNEL_TRUST, default="",
+                   help="--from-bundle: the trust the receiving channel assigns (ci, lab, external); "
+                   "the bundle's own label can only lower it")  # fmt: skip
+    g.add_argument("--check", nargs="?", const=True, default=None, metavar="BUNDLE",
+                   help="print what this ingest accepts; with BUNDLE, whether it can read that bundle")  # fmt: skip
     g.add_argument(
         "--vllm-results-dir", default="", help="vLLM bench *.json (implies --kind vllm)"
     )
@@ -908,6 +1602,17 @@ def add_offline_options(parser) -> None:
         "--benchmarks-dir",
         default="",
         help='--kind benchmarks: *.json of {"benchmarks": [...]} rows (implies --kind benchmarks)',
+    )
+    g.add_argument(
+        "--bench-dir",
+        default="",
+        help="--kind bench: an engine results directory (its result.json files), a folder of "
+        "Results or one Result file (implies --kind bench)",
+    )
+    g.add_argument(
+        "--records-file",
+        default="",
+        help="--kind bench-definitions|bench-qualification|bench-invalidation: the records JSON",
     )
     g.add_argument(
         "--tables-dir",
@@ -981,6 +1686,20 @@ def main(argv=None) -> int:
     if ignored:
         print(f"[warn] not recorded in a bundle: {' '.join(ignored)}", file=sys.stderr)
     try:
+        if args.channel_trust:
+            raise BundleError(
+                "--channel-trust applies to --from-bundle, not sealing or uploading"
+            )
+        if args.check is not None:
+            if args.offline or args.from_bundle or args.upload or args.validate_only:
+                raise BundleError(
+                    "--check stands alone: drop --offline/--upload/--from-bundle"
+                )
+            if args.check == "":
+                raise BundleError("--check wants a bundle path, or none at all")
+            out = preflight(Path(args.check) if isinstance(args.check, str) else None)
+            print(json.dumps(out, sort_keys=True))
+            return 0 if out.get("compatible", True) else REJECTED
         if args.validate_only:
             if not args.from_bundle:
                 raise BundleError("--validate-only needs --from-bundle <dir|tgz>")
