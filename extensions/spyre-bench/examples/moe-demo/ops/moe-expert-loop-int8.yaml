@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: moe-expert-loop-int8, owner: example-team}
+spec:
+  type: perf
+  level: kernel
+  tier: extended
+  system: moe-demo-fp16
+  workload:
+    type: kernel/op
+    op: moe_expert_loop
+    dtype: int8
+    shape: [512, 1024, 256]
+    load: {executor: iterations, iterations: 50, warmup_iterations: 5}
+  metrics: [kernel.time.mean]
+  context: {timer: wall}
+  run: {repeats: 3, timeout: 60m, est: 20m, isolation: process}
+  variants:
+    - name: moe_loop_int8
+      workload:
+        flags: {experts: 128, top_k: 8, phase: decode, tile_tokens: 512, expert_concurrency: 1}
+    - name: moe_loop_int32_index
+      workload:
+        op: moe_route_index
+        dtype: int32
+        flags: {experts: 128, top_k: 8, phase: decode}

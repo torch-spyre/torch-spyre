@@ -1,0 +1,33 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/comms/workload-collective.json",
+ "title": "comms/collective",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "op": {
+   "enum": [
+    "allreduce",
+    "allgather",
+    "reducescatter",
+    "alltoall",
+    "broadcast",
+    "sendrecv"
+   ]
+  },
+  "algorithm": {
+   "type": "string"
+  },
+  "protocol": {
+   "type": "string"
+  },
+  "msg_bytes": {
+   "type": "integer",
+   "minimum": 1
+  }
+ },
+ "required": [
+  "op",
+  "msg_bytes"
+ ]
+}
