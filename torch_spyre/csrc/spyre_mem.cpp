@@ -886,19 +886,29 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       const int64_t next_stride = dma_size * dma_stride;
       int64_t cpu_product = 1;
       int64_t dev_product = 1;
-      int64_t cpu_min_stride = dma_stride;
+      // The host stride comes from the host dims alone: a host source with
+      // gaps between rows has a larger stride than the device, and seeding
+      // the minimum with dma_stride would cap it at the device stride. A
+      // size-1 dim's stride is arbitrary, so it is skipped.
+      std::optional<int64_t> cpu_min_stride;
       int64_t dev_min_stride = dma_stride;
       for (int j = 0; j < host_rank; j++) {
         if (dev_strides[j] >= dma_stride && dev_strides[j] < next_stride) {
           cpu_product *= cpu_sizes[j];
-          cpu_min_stride = std::min(cpu_min_stride, cpu_strides[j]);
+          if (cpu_sizes[j] != 1) {
+            cpu_min_stride = std::min(cpu_min_stride.value_or(cpu_strides[j]),
+                                      cpu_strides[j]);
+          }
           dev_product *= dev_sizes[j];
           dev_min_stride = std::min(dev_min_stride, dev_strides[j]);
         }
       }
       cpu_product = std::min(cpu_product, dma_size);
       adjusted_cpu_sizes.push_back(cpu_product);
-      adjusted_cpu_strides.push_back(cpu_min_stride);
+      // The dma_stride fallback mixes device and host units, but it is only
+      // taken when every matched host dim has size 1. Such a dim is never
+      // stepped, so its stride is not used.
+      adjusted_cpu_strides.push_back(cpu_min_stride.value_or(dma_stride));
       dev_product = std::min(dev_product, dma_size);
       adjusted_dev_sizes.push_back(dev_product);
       adjusted_dev_strides.push_back(dev_min_stride);
@@ -959,7 +969,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     // Create a dst_stride_map that reflects cpu_sizes and cpu_strides.
     // This is done in 3 passes.
 
-    // Pass 1: Fill dst_stride_map with the min of stride_map and cpu_strides.
+    // Pass 1: Fill dst_stride_map with the host stride of the matching DMA
+    // dim. These are host strides, so the H2D conversion below is not
+    // applied again to a sliced device tensor.
     std::map<int64_t, int> dma_stride_to_j;
     for (int i = 0; i < dma_rank; i++) {
       if (dma_sizes[i] == 1) continue;
@@ -980,7 +992,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       }
       if (dma_stride_to_j.find(device_stride) != dma_stride_to_j.end()) {
         const int j = dma_stride_to_j[device_stride];
-        dst_stride_map[i] = std::min(device_stride, cpu_strides[j]);
+        dst_stride_map[i] = cpu_strides[j];
       }
     }
 
@@ -1034,92 +1046,40 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   if (host2device) {
     // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-    // sliced and/or expanded.
-    if (cpu_strides != dev_strides) {
+    // sliced and/or expanded. A sliced device tensor already has host strides
+    // in its stride_map (see pass 1 above), so it is not converted again.
+    if (!dev_sliced && cpu_strides != dev_strides) {
       // In these cases we update the stride_map of the SpyreTensorLayout to
-      // reflect the cpu_strides instead of the dma_strides.
+      // reflect the cpu_strides instead of the dev_strides.
+      //
+      // A device dim j tiled from host dim i has
+      //   stride_map[j] = step * dev_strides[i],
+      // where step is how many elements of dim i one index of j covers. The
+      // same step on the host is step * cpu_strides[i]. Converting each entry
+      // this way handles a sliced host dim of any width and a dense one alike.
+      // Scaling by the ratio of whole host and device rows instead truncated a
+      // non-whole ratio, such as 10240 / 8192 for base[:, 0:8192] of a
+      // [N, 10240] tensor (issue 6326). An expanded host dim converts to 0, but
+      // copies of stride-0 sources are still wrong in some cases (issue 6543).
       //
       // Note that these updates are only applied to the local copy of the
       // SpyreTensorLayout. The SpyreTensorImpl for the dev_tensor is not
       // modified.
       const int host_rank = cpu_sizes.size();
-
-      std::vector<int64_t> dst_stride_map = stl.stride_map;
-      std::vector<int64_t> dst_strides = dev_strides;
-
-      // Adjust the dst_stride_map and dst_strides for all expanded dimension by
-      // dividing all other stride values greater than expanded stride value by
-      // the amount expanded.
       const std::vector<std::vector<int>> tile_map =
           get_tile_map(dev_sizes, dev_strides, stl.device_size, stl.stride_map);
 
-      std::map<int64_t, int64_t> expands;
-      for (int i = 0; i < host_rank; i++) {
-        const int64_t cpu_stride = cpu_strides[i];
-        const int64_t dev_stride = dev_strides[i];
-        if (cpu_stride == 0) {
-          const int64_t expand = cpu_sizes[i];
-          expands.insert({dev_stride, expand});
-          for (const int& j : tile_map[i]) {
-            dst_stride_map[j] = 0;
-          }
-        }
-      }
-
-      for (int i = 0; i < device_rank; i++) {
-        if (dst_stride_map[i] <= 0) continue;
-        for (const auto& [stride, expand] : expands) {
-          if (stl.stride_map[i] <= stride) continue;
-          dst_stride_map[i] /= expand;
-        }
-      }
-
+      std::vector<int64_t> dst_stride_map = stl.stride_map;
       for (int i = 0; i < host_rank; i++) {
         const int64_t dev_stride = dev_strides[i];
-        for (const auto& [stride, expand] : expands) {
-          if (dev_stride <= stride) continue;
-          dst_strides[i] /= expand;
-        }
-      }
-
-      stl.stride_map = dst_stride_map;
-
-      // Adjust the dst_stride_map for all sliced dimension by multiplying all
-      // other stride values greater than or equal to the sliced stride value
-      // by the amount sliced.
-      std::vector<int64_t> cpu_order(host_rank);
-      std::iota(cpu_order.begin(), cpu_order.end(), 0);
-      std::sort(cpu_order.begin(), cpu_order.end(),
-                [&cpu_strides, &cpu_sizes](int64_t i1, int64_t i2) {
-                  if (cpu_strides[i1] == cpu_strides[i2]) {
-                    if (cpu_sizes[i1] == 1 && cpu_sizes[i2] == 1) {
-                      return i1 < i2;
-                    }
-                    return cpu_sizes[i1] == 1;
-                  }
-                  return cpu_strides[i1] < cpu_strides[i2];
-                });
-
-      std::multimap<int64_t, int64_t> slices;
-      int64_t current_slices = 1;
-      for (const auto& i : cpu_order) {
-        const int64_t cpu_stride = cpu_strides[i];
-        const int64_t dev_stride = dst_strides[i];
-        TORCH_CHECK(
-            dev_stride > 0,
-            "Invalid destination stride. Expected > 0, got: ", dev_stride);
-        const int64_t slice = cpu_stride / dev_stride / current_slices;
-        if (slice > 1) {
-          slices.insert({dev_stride, slice});
-          current_slices *= slice;
-        }
-      }
-
-      for (int i = 0; i < device_rank; i++) {
-        if (dst_stride_map[i] <= 0) continue;
-        for (const auto& [stride, slice] : slices) {
-          if (stl.stride_map[i] < stride) continue;
-          dst_stride_map[i] *= slice;
+        for (const int& j : tile_map[i]) {
+          const int64_t device_stride = stl.stride_map[j];
+          if (device_stride <= 0) continue;
+          TORCH_CHECK(dev_stride > 0 && device_stride % dev_stride == 0,
+                      "Invalid stride map entry ", device_stride,
+                      " for device dimension ", j, ": not a multiple of host ",
+                      "dimension ", i, "'s device stride ", dev_stride);
+          dst_stride_map[j] = device_stride / dev_stride * cpu_strides[i];
         }
       }
 
