@@ -39,10 +39,10 @@ from .constants import MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
-from .loop_facts import read_advance
+from .loop_facts import enclosing_loops, read_advance
 from .loop_info import LoopInfo
 from .pass_utils import copy_op_metadata
-from .loop_node import remove_op
+from .loop_node import record_loop_info, remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -151,9 +151,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _loop_advance_bound(
-    op: ComputedBuffer, dep: MemoryDep, loop_info: LoopInfo
-) -> tuple[int, int] | None:
+def _loop_advance_bound(op: ComputedBuffer, dep: MemoryDep) -> tuple[int, int] | None:
     """Inclusive address change across loop trips, in source elements.
 
     The step per trip at each level is the loop variable's coefficient in
@@ -172,8 +170,8 @@ def _loop_advance_bound(
         return None
     lo = 0
     hi = 0
-    for level_idx, trip_expr in enumerate(loop_info.loop_count):
-        trip_count = _trip_count_bound(trip_expr)
+    for level_idx, level in enumerate(enclosing_loops(op)):
+        trip_count = _trip_count_bound(level.trip_count)
         if trip_count is None or trip_count < 1:
             return None
         step = _static_int(steps[level_idx]) if level_idx < len(steps) else 0
@@ -386,7 +384,7 @@ def _prove_matmul_direct_read(
             return None, "source stick dimension is not the matmul output dimension"
 
     local_bounds = _affine_bounds(source_dep)
-    advance_bounds = _loop_advance_bound(direct_op, source_dep, resolved_loop_info)
+    advance_bounds = _loop_advance_bound(direct_op, source_dep)
     # A non-contiguous graph-input view can address a larger backing span than
     # its logical numel (for example, an active KV-cache prefix whose head
     # stride still reflects the maximum cache length).  Bound the generated
@@ -559,6 +557,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             reason="read advancing input directly from HBM",
         )
         replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
+        record_loop_info(replacement)
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):
             if hasattr(direct_op, attr):
                 setattr(replacement, attr, getattr(direct_op, attr))

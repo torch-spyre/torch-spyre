@@ -28,7 +28,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_facts import counted_loop_path, enclosing_loops
 from .read_copy_elision import ReadCopyElisionRecord
-from .loop_node import move_after, move_before
+from .loop_node import move_after, move_before, record_loop_info
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -538,6 +538,7 @@ def _transfer_loop_info(
         # takes its extent from the tile, while this fixed copy takes the whole
         # operand's, which may be symbolic (a reserved pool).
         _pin_fixed_copy_extent_to_declared_max(restick_buff)
+    record_loop_info(restick_buff)
 
 
 def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:

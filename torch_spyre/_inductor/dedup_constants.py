@@ -296,6 +296,7 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
         # ``operations[:] = ...`` would only move it to the head of its own body.
         operations.hoist_to_front(constants)
     else:
+        # No nodes (the view branch above is the nested graph): a plain list.
         non_constants = [
             op for op in operations if not isinstance(op, SpyreConstantFallback)
         ]
