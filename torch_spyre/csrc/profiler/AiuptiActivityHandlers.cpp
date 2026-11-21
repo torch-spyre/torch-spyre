@@ -317,6 +317,64 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuSubmitFill";
     case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
       return "aiuIssueBarrier";
+    // Stream and launch CBIDS
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNCHRONIZE:
+      return "aiuStreamSynchronize";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_IDLE_WAIT:
+      return "aiuStreamIdleWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_ASYNC_FILL:
+      return "aiuStreamAsyncFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_COMPUTE:
+      return "aiuStreamHostCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_CALLBACK:
+      return "aiuStreamHostCallback";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_NULL_OP:
+      return "aiuStreamNullOp";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_WAIT:
+      return "aiuStreamEventWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_SIGNAL:
+      return "aiuStreamEventSignal";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNC_FILL:
+      return "aiuStreamSyncFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COMPUTE:
+      return "aiuStreamCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COPY_RAW:
+      return "aiuStreamCopyRaw";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_H2D:
+      return "aiuStreamDMAH2D";
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_D2H:
+      return "aiuStreamDMAD2H";
+
+    // Scheduler process and schedule CBIDS
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PROCESS_OPERATION:
+      return "aiuSchedulerProcessOperation";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_H2D:
+      return "aiuScheduleDMAH2D";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_D2H:
+      return "aiuScheduleDMAD2H";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_COMPUTE:
+      return "aiuScheduleCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_FILL:
+      return "aiuScheduleFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_SIGNAL:
+      return "aiuScheduleP2PFirmwareSignal";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_WAIT:
+      return "aiuScheduleP2PFirmwareWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_NULL_OP:
+      return "aiuScheduleNullOp";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_SIGNAL:
+      return "aiuSchedulerEventSignal";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_WAIT:
+      return "aiuSchedulerEventWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PLAN_HAZARDS:
+      return "aiuSchedulerPlanHazards";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_ENQUEUE_OPERATION:
+      return "aiuSchedulerEnqueueOperation";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_RELEASE_STREAM:
+      return "aiuSchedulerReleaseStream";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_SYNCHRONIZE:
+      return "aiuSchedulerSynchronize";
+
     default:
       break;
   }
@@ -474,15 +532,72 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     case AIUPTI_RUNTIME_TRACE_CBID_FILE_TRANSFER_FTOM:
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_DTOH:
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_HTOD:
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_H2D:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_D2H:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COPY_RAW:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNC_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_ASYNC_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_COMPUTE:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_H2D:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_D2H:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_SIGNAL:
       runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COMPUTE:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_COMPUTE:
+      runtime_activity->addMetadata("num_tensors", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_ENQUEUE_OPERATION:
+      runtime_activity->addMetadata("queue_depth", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PLAN_HAZARDS:
+      runtime_activity->addMetadata("num_edges", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNCHRONIZE:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_IDLE_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_SYNCHRONIZE:
+      runtime_activity->addMetadata("pending_at_entry", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_RELEASE_STREAM:
+      runtime_activity->addMetadata("dropped_ops", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PROCESS_OPERATION:
+      runtime_activity->addMetadata("op_type", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_SIGNAL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_SIGNAL:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_WAIT:
+      runtime_activity->addMetadata("event_key", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_WAIT:
+      runtime_activity->addMetadata("expected_count", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_NULL_OP:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_NULL_OP:
+      runtime_activity->addMetadata("pipeline_barrier",
+                                    (activity->data & 1) != 0 ? 1 : 0);
+      runtime_activity->addMetadata("skip_hazard",
+                                    (activity->data & 2) != 0 ? 1 : 0);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_CALLBACK:
+      runtime_activity->addMetadata("pipeline_barrier", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
       runtime_activity->addMetadata("fence_size", activity->data);
-      break;
-
-    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
-      runtime_activity->addMetadata("bytes", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
