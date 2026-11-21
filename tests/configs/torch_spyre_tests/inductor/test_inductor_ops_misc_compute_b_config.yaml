@@ -48,6 +48,7 @@ test_suite_config:
             - TestOps::test_div_rounding_mode.*
             - TestOps::test_div_mixed_dtype.*
             - TestOps::test_div_scalar_dtypes.*
+            - TestOps::test_div_mod.*
             - TestOps::test_floor_divide_eager.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log
