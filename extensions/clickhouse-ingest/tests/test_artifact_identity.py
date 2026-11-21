@@ -168,6 +168,39 @@ def test_insert_writes_artifact_ref_and_tag_once():
     assert not _rows(again, ARTIFACTS) and not _rows(again, ARTIFACT_TAGS)
 
 
+def test_a_wheel_url_keeps_its_address_and_shares_the_pip_specs_id():
+    url = (
+        "https://index.example.com/team/torchvision-0.29.1+cpu.7f46a88f1e81-"
+        "cp312-cp312-linux_s390x.whl"
+    )
+    by_url = ArtifactIdentity.from_wheel(url, "s390x")
+    by_spec = ArtifactIdentity.from_wheel(
+        "torchvision==0.29.1+cpu.7f46a88f1e81", "s390x"
+    )
+    assert by_url.artifact_id == by_spec.artifact_id
+    assert (by_url.ref, by_url.download_uri) == (
+        "torchvision==0.29.1+cpu.7f46a88f1e81",
+        url,
+    )
+    assert by_spec.download_uri == ""
+
+
+def test_insert_writes_a_wheels_download_uri_as_its_index_uri():
+    ident = ArtifactIdentity.from_wheel(
+        "torchvision==0.29.1+cpu.7f46a88f1e81",
+        "s390x",
+        download_uri="https://index.example.com/team/torchvision-0.29.1.whl",
+    )
+    c = FakeClient()
+    insert_artifact(c, "db", ident)
+    (ref,) = _rows(c, ARTIFACT_REFS)
+    assert (ref["method"], ref["ref"], ref["index_uri"]) == (
+        "pip",
+        "torchvision==0.29.1+cpu.7f46a88f1e81",
+        "https://index.example.com/team/torchvision-0.29.1.whl",
+    )
+
+
 def test_a_release_names_itself_in_its_own_family():
     from spyre_clickhouse_ingest.artifacts import register_release
 
