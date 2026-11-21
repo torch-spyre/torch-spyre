@@ -16,7 +16,7 @@ import torch
 import math
 import pytest
 
-from utils_inductor import cached_randn, compare_with_cpu, strict_xfail
+from utils_inductor import cached_randn, compare_with_cpu, expects_raise, strict_xfail
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -333,15 +333,21 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_local_window_mask_scalar(self, request, execution_mode):
+    @expects_raise
+    def test_sdpa_local_window_mask_scalar(self, execution_mode):
         """SDPA: local window via ``masked_fill(..., -inf)``; ``window_size=32`` sets mask support."""
         # The mask is built with ``mask[i, start:end] = False`` on a device bool
-        # tensor. Eager has no lowering for the resulting spyre.copy_from_dNd;
-        # compiled fails with "Cannot resolve target for 'index_expr'" (#4502).
-        strict_xfail(
-            request,
-            torch._inductor.exc.InductorError,
-            "slice assignment into a device bool tensor (#4502)",
+        # tensor. Eager rejects filling a partial view; compiled cannot lower
+        # index_expr. TODO(#4502): compare numerics once slice fills are supported.
+        error = (
+            RuntimeError
+            if execution_mode == "eager"
+            else torch._inductor.exc.InductorError
+        )
+        message = (
+            "fill_/zero_ of a partial view of a Spyre tensor is not supported"
+            if execution_mode == "eager"
+            else "Cannot resolve target for 'index_expr'"
         )
 
         def local_attention(q, k, v):
@@ -362,16 +368,17 @@ class TestSdpaScalarHyperparameters:
         q = cached_randn((2, 8, 128, 64), dtype=torch.float16)
         k = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
         v = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
-        compare_with_cpu(
-            local_attention,
-            q,
-            k,
-            v,
-            atol=0.1,
-            rtol=0.1,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        with pytest.raises(error, match=message):
+            compare_with_cpu(
+                local_attention,
+                q,
+                k,
+                v,
+                atol=0.1,
+                rtol=0.1,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_sdpa_cross_sequence_length(self, execution_mode):
         """SDPA with Q seq len ≠ KV seq len (scalar ``1/sqrt(d_k)`` scaling only)."""
