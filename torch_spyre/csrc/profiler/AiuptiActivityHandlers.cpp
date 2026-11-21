@@ -18,6 +18,7 @@
 #include <libaiupti/aiupti_runtime_cbid.h>
 
 #include <cstring>
+#include <format>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -328,23 +329,31 @@ inline std::string fixedCharField(const char (&field)[N]) {
   return std::string(field, strnlen(field, N));
 }
 
+// Name of a collective algorithm ID. The producer registers its names with
+// flex and libaiupti resolves them, so the name is whole however long it is.
+// An ID nobody registered is written as algo_0x<id> so the gap is visible in
+// the trace instead of the arg silently going missing.
+inline std::string collAlgoName(uint32_t id) {
+  const std::string_view name = AIUpti_GetCollAlgoName(id);
+  return name.empty() ? std::format("algo_0x{:08x}", id) : std::string(name);
+}
+
 // Collective-communication metadata, when the producer set any. Emitted as
 // trace args only, so activity names and grouping are unaffected. The first
 // byte is checked before building a string because most records carry none.
 //
-// Producer contract (libaiupti AIUpti_ActivityCompute/_ActivityMemcpy): the
-// names are fixed char[AIUPTI_COLL_NAME_SIZE] arrays, empty when not set, and
-// coll_bytes is 0 both for a zero-byte transfer and when unknown. flex fills
-// coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
-// all required, so a non-empty coll_algo means coll_bytes was really parsed.
-// On collective records coll_bytes is therefore the number when known
-// (including a real 0) and "" when the label carried no size.
+// Producer contract (libaiupti AIUpti_ActivityCompute/_ActivityMemcpy):
+// coll_group is a fixed char[AIUPTI_COLL_NAME_SIZE] array, empty when not set.
+// coll_algo_id is the algorithm ID, 0 when not set. coll_bytes is 0 both for a
+// zero-byte transfer and when unknown, so on a collective record that names
+// no algorithm a zero is reported as "" (size unknown), and on one that does
+// it is reported as the number.
 
 template <class T, class = void>
 struct HasCollFields : std::false_type {};
 template <class T>
 struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
-                                    decltype(std::declval<T&>().coll_algo),
+                                    decltype(std::declval<T&>().coll_algo_id),
                                     decltype(std::declval<T&>().coll_bytes)>>
     : std::true_type {};
 
@@ -356,11 +365,11 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
       trace_activity->addMetadataQuoted("coll_group",
                                         fixedCharField(activity->coll_group));
     }
-    if (activity->coll_algo[0] != '\0') {
+    if (activity->coll_algo_id != 0) {
       trace_activity->addMetadataQuoted("coll_algo",
-                                        fixedCharField(activity->coll_algo));
+                                        collAlgoName(activity->coll_algo_id));
     }
-    if (activity->coll_bytes != 0 || activity->coll_algo[0] != '\0') {
+    if (activity->coll_bytes != 0 || activity->coll_algo_id != 0) {
       trace_activity->addMetadata("coll_bytes", activity->coll_bytes);
     } else if (activity->coll_group[0] != '\0') {
       trace_activity->addMetadataQuoted("coll_bytes", "");

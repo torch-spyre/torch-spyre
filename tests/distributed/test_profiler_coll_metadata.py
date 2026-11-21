@@ -86,8 +86,8 @@ class TestProfilerCollMetadata(TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _profile_allreduce_trace(self):
-        input_device = torch.arange(128, dtype=torch.float16).to(DEVICE)
+    def _profile_allreduce_trace(self, numel=128):
+        input_device = torch.arange(numel, dtype=torch.float16).to(DEVICE)
         # Warm up outside profile() so one-time setup does not dominate the trace.
         dist.all_reduce(input_device, op=dist.ReduceOp.SUM)
         torch.spyre.synchronize()
@@ -140,6 +140,54 @@ class TestProfilerCollMetadata(TestCase):
                 else:
                     self.assertIsInstance(value, int, f"coll_bytes on {name!r}")
                     self.assertGreaterEqual(value, 0, f"coll_bytes on {name!r}")
+
+    def test_coll_algo_names_are_registered(self):
+        """Every coll_algo resolves to a name; none falls back to algo_0x<id>.
+
+        The record carries an algorithm ID that spyre-comms registers with flex at
+        init. The fallback is written only for an ID nobody registered, so seeing
+        it means the registration or a new algorithm's table entry is missing.
+        """
+        trace = self._profile_allreduce_trace()
+        for e in self._coll_events(trace):
+            algo = e["args"].get("coll_algo")
+            if algo is not None:
+                self.assertFalse(
+                    algo.startswith("algo_0x"),
+                    f"unregistered collective algorithm ID {algo} on {e.get('name')!r}",
+                )
+
+    def test_forced_long_algorithm_name_is_not_truncated(self):
+        """AllReduce_Offload_GatherSumBcast (32 characters) keeps its last letter.
+
+        Names used to be cut to 31 characters, which dropped the final "t". This
+        forces that algorithm. If the library picks another one, there is nothing
+        to check and the test skips; if the name appears at all it must be whole.
+        """
+        full = "AllReduce_Offload_GatherSumBcast"
+        previous = os.environ.get("COLL_ALLREDUCE_ALGO")
+        os.environ["COLL_ALLREDUCE_ALGO"] = "Offload_GatherSumBcast"
+        try:
+            # A size no other test uses, so a cached algorithm choice is not reused.
+            trace = self._profile_allreduce_trace(numel=384)
+        finally:
+            if previous is None:
+                os.environ.pop("COLL_ALLREDUCE_ALGO", None)
+            else:
+                os.environ["COLL_ALLREDUCE_ALGO"] = previous
+
+        algos = {
+            e["args"]["coll_algo"]
+            for e in self._coll_events(trace)
+            if "coll_algo" in e["args"]
+        }
+        cut = full[:31]
+        seen = {a for a in algos if a.startswith(cut)}
+        if not seen:
+            self.skipTest(
+                f"Rank {self.comm_rank}: {full} was not selected (saw {sorted(algos)})"
+            )
+        self.assertEqual(seen, {full})
 
     def test_coll_args_only_on_device_activities(self):
         """coll_* args appear only on kernel/memcpy events, never on CPU ops."""
