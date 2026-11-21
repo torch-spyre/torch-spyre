@@ -47,11 +47,26 @@ spec:
     - {key: case.input_len, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
     - {key: case.output_len, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
     - {key: case.card, class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: run.quality.harness, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+    - {key: run.quality.harness_version, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+    - {key: run.quality.protocol, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "digest over harness, task version, prompt and filter pipeline as the harness computed it; recorded, never authored"}
+    - {key: run.quality.model_revision, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+    - {key: run.quality.dataset_digest, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "digest of the scored question list"}
+    - {key: run.quality.temperature, class: run, role: root, type: float, order: numeric, stored_in: benchmark_runs.props}
+    - {key: run.quality.seed, class: run, role: root, type: int, order: numeric, stored_in: benchmark_runs.props, description: "a run attribute, never identity"}
+    - {key: run.quality.samples_digest, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "digest of the per-sample attachment kept beside the Result"}
   runners:
     - {name: vllm-bench, protocol: process/v1, command: [python3, -m, spyre_bench.llm.vllm_runner]}
     - {name: lm-eval, protocol: process/v1, command: [python3, -m, spyre_bench.llm.lm_eval_runner]}
   gates:
     - {id: llm.server_ready, phase: in, reason: SERVER_START_FAILED}
+    - {id: llm.dataset_digest, phase: post, reason: DATASET_MISMATCH, check: "run.quality.dataset_digest equals the digest the Benchmark's input declares"}
+    - {id: llm.records_complete, phase: post, reason: RECORDS_INCOMPLETE, check: "llm.eval.n_samples equals the input's expect.records"}
+    - {id: llm.no_errors, phase: post, reason: INFRASTRUCTURE, check: "llm.eval.error_frac is 0"}
+    - {id: llm.no_truncation, phase: post, reason: TRUNCATION, check: "llm.eval.truncated_frac <= 0.01"}
+    - {id: llm.harness_pinned, phase: post, reason: PROTOCOL_UNPINNED, check: "run.quality.harness_version and run.quality.protocol are recorded"}
+    - {id: llm.model_pinned, phase: post, reason: MODEL_UNPINNED, check: "run.quality.model_revision is recorded"}
+    - {id: llm.determinism, phase: post, reason: SEED_UNPINNED, check: "a greedy case ran at temperature 0; a sampled case recorded run.quality.seed"}
   metrics:
     - {name: llm.ttft.mean, class: latency_ttft, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
@@ -72,3 +87,23 @@ spec:
     - {name: llm.startup.warm, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
     - {name: llm.eval.exact_match, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
     - {name: llm.parity.greedy_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}
+    - {name: llm.eval.acc, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.acc_norm, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.f1, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.eval.exact_match_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+       description: "standard error of llm.eval.exact_match as the harness reports it"}
+    - {name: llm.eval.acc_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.acc_norm_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.f1_stderr, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute}
+    - {name: llm.eval.n_samples, unit: "{record}", direction: none, category: diagnostic, statistic: value, compare: exact,
+       description: "records the harness scored; compared with the input's expect.records by llm.records_complete"}
+    - {name: llm.eval.error_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+       description: "share of requests that errored or came back empty"}
+    - {name: llm.eval.truncated_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+       description: "share of generations that hit max_tokens or a prompt cut by max_model_len"}
+    - {name: llm.parity.mean_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.max_abs_prob_err, unit: "1", direction: lower_is_better, category: quality, statistic: max, compare: absolute}
+    - {name: llm.parity.tie_adjusted_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.parity.ref_coverage, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: absolute}
+    - {name: llm.eval.invalid_frac, unit: "1", direction: lower_is_better, category: diagnostic, statistic: value, compare: absolute,
+       description: "share of answers the scorer could not parse; a failed request counts here when the harness has no error counter"}

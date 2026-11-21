@@ -704,10 +704,34 @@ SPECS = {
                     "resources": obj({"cpu": integer(minimum=1), "memory": s(pattern=r"^[0-9]+(Mi|Gi|Ti)$")}),
                     "cpu_pinning": obj(
                         {
-                            "policy": {"enum": ["none", "device_local", "per_device", "explicit"]},
+                            "policy": {"enum": ["none", "device_local", "per_device", "explicit", "platform"]},
                             "cpus": s(
                                 pattern=CPU_LIST, description="CPU list such as 0-7,16; only for policy explicit"
                             ),
+                            "cpus_by_device": arr(
+                                s(pattern=CPU_LIST),
+                                minItems=1,
+                                description="one CPU list per device, in device order; per_device only",
+                            ),
+                            "assign": obj(
+                                {
+                                    "cores_per_device": integer(minimum=1),
+                                    "spread": {"enum": ["pack", "spread", "round_robin"]},
+                                    "smt": {"enum": ["primary_only", "siblings", "both"]},
+                                    "reserve": integer(minimum=0),
+                                    "reserve_cpus": s(pattern=CPU_LIST),
+                                    "spread_scope": {"enum": ["all", "socket"]},
+                                    "llc_align": BOOL,
+                                },
+                                required=("cores_per_device",),
+                                desc="per_device only: generate the lists at run time from the host topology",
+                            ),
+                            "layout": {
+                                "enum": ["tree", "ranks"],
+                                "description": "tree: pin the command's process tree; ranks: also pin each rank by "
+                                "LOCAL_RANK behind {pin_wrapper} (per_device only)",
+                            },
+                            "launcher": {"enum": ["taskset", "numactl"], "description": "tool that applies the CPUs"},
                             "require_verified": {
                                 "type": "boolean",
                                 "description": "a violated or unobservable placement caps the result at suspect",
@@ -747,6 +771,12 @@ SPECS = {
     ),
     "ValidityPolicy": obj(
         {
+            "applies_to": arr(
+                {"enum": ["perf", "quality"]},
+                minItems=1,
+                description="test types the policy judges; default [perf]. A quality policy replaces the clean, qualification, "
+                "cv and warm-up requirements with the gates listed per row; mixed lists are rejected",
+            ),
             "purposes": {
                 "type": "object",
                 "additionalProperties": obj(
@@ -766,6 +796,10 @@ SPECS = {
                                 "max_cv_pct": num(minimum=0),
                                 "discard_warmup": integer(minimum=0),
                                 "placement": {"enum": ["required", "optional"]},
+                                "gates": arr(
+                                    ref("metric"),
+                                    description="quality policies: pack gate ids evaluated for the row, e.g. llm.records_complete",
+                                ),
                             },
                             desc="gates a result must pass to earn `valid`; failing one caps the validity (qualification: unqualified_env, "
                             "clean: shared_env, the rest: suspect)",
@@ -901,6 +935,31 @@ SPECS = {
                 },
                 required=("by", "metric"),
                 desc="a table of per-cell statistics over `by` within each `across` combination; metric may be derive.name",
+            ),
+            "reference": obj(
+                {
+                    "case": ref("case_name"),
+                    "value": num(),
+                    "stderr": num(minimum=0),
+                    "n": integer(minimum=1),
+                    "label": s(description="abstract name of an inline reference, e.g. cpu-fp32-ref"),
+                    "stderr_metric": ref("metric"),
+                    "tolerance": obj(
+                        {
+                            "stderr": num(
+                                minimum=0,
+                                description="allowed shortfall in combined standard errors; a single run is `regressed` only "
+                                "from 4 combined standard errors, a smaller shortfall past the allowance is `suspected`",
+                            ),
+                            "abs": num(minimum=0, description="practical floor: a shortfall below it is never worse"),
+                        },
+                        desc="at least one of stderr, abs; both set = the larger allowance",
+                    ),
+                },
+                required=("tolerance",),
+                desc="quality: compare the score of each selected Result with a reference (the Result of `case`, or an inline "
+                "value with its stderr or n); `metric` is the score. Advisory: never gates, and a Result whose validity is "
+                "suspect or invalid is reported as such, never as regressed",
             ),
         },
         required=("select", "metric", "vary"),

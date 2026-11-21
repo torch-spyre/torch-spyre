@@ -20,14 +20,20 @@ re-parented worker is still judged. When the root sits in the root cgroup (a pri
 tie a worker to the root, so any process outside the tree that was re-parented to pid 1 makes the result `unknown`.
 Verification covers affinity masks only: a cgroup cpuset narrower than the requested set is not distinguished. The
 output keys are the run.exec.* run properties (strings, as stored).
+
+A request with per-device lists (`cpus_by_device`) is judged per device: every thread must be inside one list, or, with
+`layout: ranks`, inside the list of its own rank (the LOCAL_RANK of its process environment) and a process without a
+rank (the launcher agent) inside their union. Processes still in the launcher stage (the pinning tool or the rank
+wrapper before it execs the command) are not judged; a sample that sees only those is skipped by the caller.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import regex as re
 
-POLICIES = ("none", "device_local", "per_device", "explicit")
+POLICIES = ("none", "device_local", "per_device", "explicit", "platform")
 MAX_CPU = 16383
 LIST = re.compile(r"[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*")
 ROOT_CGROUPS = ("", "0::/")
@@ -86,7 +92,12 @@ def _tree(proc, root_pid, snap, cgroup):
             todo += kids.get(pid, [])
     members |= {pid for pid, s in snap.items() if s[1] == root[1] or s[2] == root[2]}
     if cgroup in ROOT_CGROUPS:
-        if any(s[0] == 1 and pid not in members and pid != 1 for pid, s in snap.items()):
+        # The observer and its ancestors are no orphans, though in a container they are direct children of pid 1.
+        own, pid = set(), os.getpid()
+        while pid in snap and pid not in own:
+            own.add(pid)
+            pid = snap[pid][0]
+        if any(s[0] == 1 and p not in members and p != 1 and p not in own for p, s in snap.items()):
             return None
         return members
     for pid in snap.keys() - members:
@@ -99,12 +110,36 @@ def _tree(proc, root_pid, snap, cgroup):
     return members
 
 
-def read_affinities(root_pid, proc="/proc", expected_starttime=None):
+def starttime(pid, proc="/proc"):
+    """The /proc start time of a process (to detect pid reuse), or None when unreadable."""
+    try:
+        return _stat(Path(proc), pid)[3]
+    except (OSError, ValueError):
+        return None
+
+
+def launcher_stage(proc, pid, markers=()):
+    """True while a process is still the engine's own pinning tool or rank wrapper.
+
+    markers: wrapper paths, and launcher prefixes joined with NUL; a benchmark that runs taskset/numactl itself is not
+    the launcher stage and is judged by its masks like any other process.
+    """
+    try:
+        argv = [a for a in (proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if a]
+    except OSError:
+        return False
+    joined = "\0".join(argv) + "\0"
+    return bool(argv) and any(joined.startswith(m) if "\0" in m else m in argv[:3] for m in markers)
+
+
+def read_affinities(root_pid, proc="/proc", expected_starttime=None, markers=None):
     """[(pid, tid, frozenset(cpus))] for the process tree of root_pid, or None unless every member was read.
 
     A process that exits mid-scan is skipped; any other unreadable or malformed entry, an empty mask, a root whose
     start time changed during the scan or differs from expected_starttime (the value recorded at spawn: pid reuse),
-    or, in the root cgroup, a re-parented process outside the tree, makes the whole observation None.
+    or, in the root cgroup, a re-parented process outside the tree, makes the whole observation None. With `markers`
+    (a collection of wrapper paths; may be empty) processes in the launcher stage are left out, and a tree made only of
+    them gives [] (nothing to judge yet) rather than None.
     """
     proc = Path(proc)
     root_pid = int(root_pid)
@@ -128,11 +163,14 @@ def read_affinities(root_pid, proc="/proc", expected_starttime=None):
                     continue
         if root_pid not in snap:
             return None
-        out = []
+        out, staged = [], 0
         members = _tree(proc, root_pid, snap, cgroup)
         if members is None:
             return None
         for pid in sorted(members):
+            if markers is not None and launcher_stage(proc, pid, markers):
+                staged += 1
+                continue
             try:
                 tasks = sorted((proc / str(pid) / "task").iterdir())
             except FileNotFoundError:
@@ -146,6 +184,8 @@ def read_affinities(root_pid, proc="/proc", expected_starttime=None):
                 if len(masks) != 1:
                     return None
                 out.append((pid, int(t.name), parse_cpu_list(masks[0].strip())))
+        if not out and staged:
+            return []
         return out if out and _stat(proc, root_pid)[3] == started else None
     except (OSError, ValueError):
         return None
@@ -165,12 +205,15 @@ def numa_nodes(value):
 
 
 def node_cpus(numa_node, sys_root="/sys"):
-    """CPUs of one NUMA node from sysfs, or None."""
+    """CPUs of one NUMA node from sysfs, or None. A kernel without NUMA (no node directory) has node 0 = all online."""
     try:
         n = int(numa_node)
         if n < 0:
             return None
-        return parse_cpu_list((Path(sys_root) / f"devices/system/node/node{n}/cpulist").read_text().strip())
+        root = Path(sys_root) / "devices/system"
+        if n == 0 and not (root / "node").is_dir():
+            return parse_cpu_list((root / "cpu/online").read_text().strip())
+        return parse_cpu_list((root / f"node/node{n}/cpulist").read_text().strip())
     except (OSError, ValueError, TypeError):
         return None
 
@@ -183,10 +226,19 @@ def resolve_requested(request, device_numa=(), sys_root="/sys"):
     policy = (request or {}).get("policy", "none")
     if policy == "none":
         return None, "none"
+    if policy == "platform":
+        return None, "platform"  # pinned by the platform in-process: recorded, never judged
+    if (request or {}).get("unresolved"):
+        return None, "unresolved"
     if policy == "explicit":
         try:
             return [parse_cpu_list(request["cpus"])], "explicit"
         except (KeyError, ValueError):
+            return None, "unresolved"
+    if policy == "per_device" and request.get("cpus_by_device"):
+        try:
+            return [parse_cpu_list(x) for x in request["cpus_by_device"]], "explicit"
+        except ValueError:
             return None, "unresolved"
     nodes = numa_nodes(device_numa) if device_numa not in ((), [], "", None) else None
     sets = [node_cpus(n, sys_root) for n in nodes or ()]
@@ -195,20 +247,62 @@ def resolve_requested(request, device_numa=(), sys_root="/sys"):
     return ([frozenset().union(*sets)] if policy == "device_local" else sets), "device_numa"
 
 
-def verify_pinning(request, pid, device_numa=(), proc="/proc", sys_root="/sys", expected_starttime=None):
-    """run.exec.* properties for the process tree at pid under the requested cpu_pinning block.
+def rank_of(proc, pid):
+    """LOCAL_RANK from a process's start-time environment: an int, None when absent, or "gone" when it exited.
+
+    Raises OSError for an unreadable environment (another user's process), which makes the observation unknown.
+    """
+    try:
+        env = (Path(proc) / str(pid) / "environ").read_bytes().split(b"\0")
+    except FileNotFoundError:
+        return "gone"
+    for item in env:
+        if item.startswith(b"LOCAL_RANK="):
+            value = item[len(b"LOCAL_RANK=") :]
+            return int(value) if value.isdigit() else None
+    return None
+
+
+def rank_violations(seen, lists, proc):
+    """Threads outside their rank's list (ranks layout), or None when a rank could not be read."""
+    union = frozenset().union(*lists)
+    bad, ranks = 0, {}
+    for pid, _, cpus in seen:
+        try:
+            if pid not in ranks:
+                ranks[pid] = rank_of(proc, pid)
+        except OSError:
+            return None
+        rank = ranks[pid]
+        if rank == "gone":
+            continue
+        allowed = union if rank is None else lists[rank] if rank < len(lists) else frozenset()
+        bad += not cpus <= allowed
+    return bad
+
+
+def verify_pinning(request, pid, device_numa=(), proc="/proc", sys_root="/sys", expected_starttime=None, markers=None):
+    """run.exec.* properties for the process tree at pid under the requested cpu_pinning block, or None while every
+    process of the tree is still in the launcher stage (see read_affinities; only with `markers`).
 
     expected_starttime: the root's /proc starttime recorded at spawn; a different value (pid reuse) gives unknown.
     """
     policy = (request or {}).get("policy", "none")
     allowed, source = resolve_requested(request, device_numa, sys_root)
-    seen = read_affinities(pid, proc, expected_starttime)
+    seen = read_affinities(pid, proc, expected_starttime, markers)
+    if seen == []:
+        return None
     props = {"run.exec.cpu_pinning": policy, "run.exec.cpu_set_source": source}
     if seen:
         props["run.exec.cpu_set"] = format_cpu_list(frozenset().union(*(c for _, _, c in seen)))
     if allowed is None or not seen:
         return {**props, "run.exec.pinning_verified": "unknown"}
-    bad = sum(1 for _, _, c in seen if not any(c <= a for a in allowed))
+    if (request or {}).get("layout") == "ranks" and policy == "per_device":
+        bad = rank_violations(seen, allowed, Path(proc))
+        if bad is None:
+            return {**props, "run.exec.pinning_verified": "unknown"}
+    else:
+        bad = sum(1 for _, _, c in seen if not any(c <= a for a in allowed))
     return {
         **props,
         "run.exec.pinning_verified": "false" if bad else "true",
