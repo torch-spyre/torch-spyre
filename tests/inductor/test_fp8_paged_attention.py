@@ -1074,14 +1074,11 @@ class TestFp8HeadMajorReshapeAndCache:
 
         k_exp = _cpu_quantize_dequantize(key, _cpu_per_token_scale(key))
 
-        # atol=2.0 is deliberately loose: with two index_copy_ calls into one
-        # destination the first write is lost (head 0 reads back as zeros), so
-        # this only bounds the output by the value range.  Tracked separately.
         torch.testing.assert_close(
-            k_p0.cpu()[0, :num_tokens], k_exp[:, 0], atol=2.0, rtol=0.0
+            k_p0.cpu()[0, :num_tokens], k_exp[:, 0], atol=0.2, rtol=0.0
         )
         torch.testing.assert_close(
-            k_p1.cpu()[0, :num_tokens], k_exp[:, 1], atol=2.0, rtol=0.0
+            k_p1.cpu()[0, :num_tokens], k_exp[:, 1], atol=0.2, rtol=0.0
         )
 
 

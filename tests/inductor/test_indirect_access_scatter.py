@@ -684,6 +684,22 @@ class _ScatterScenarios:
 
         self._assert_compiled_matches_cpu(kernel, y, src_y, idx_y, z, src_z, idx_z)
 
+    def test_index_copy_twice_into_one_destination_e2e(self):
+        """Two in-place index_copy_ calls into one graph input: the second
+        scatter must start from the destination the first one wrote."""
+        dst = torch.zeros(128, 128, dtype=torch.float16).to("spyre")
+        src0 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        src1 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        idx0 = torch.arange(0, 4, dtype=torch.int64).to("spyre")
+        idx1 = torch.arange(64, 68, dtype=torch.int64).to("spyre")
+
+        def kernel(dst, src0, src1, idx0, idx1):
+            dst.index_copy_(0, idx0, src0)
+            dst.index_copy_(0, idx1, src1)
+            return dst
+
+        self._assert_compiled_matches_cpu(kernel, dst, src0, src1, idx0, idx1)
+
     def test_index_put_3d_scatter_dim1_e2e(self):
         """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
         Tests indirect access on a non-leading dimension, validating stride
