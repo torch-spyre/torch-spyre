@@ -151,3 +151,17 @@ def test_a_failed_file_withholds_the_verdict_and_fails_a_strict_run(
 def test_without_a_problem_the_verdict_is_written(monkeypatch, tmp_path):
     live = ingest(monkeypatch, tmp_path, "both", "MergeTree", "--strict", files=2)
     assert any(e[0] == "insert" and e[2] == "artifact_results" for e in live.log)
+
+
+def test_a_file_with_rows_already_stored_still_takes_the_replace_path(
+    monkeypatch, tmp_path
+):
+    import spyre_clickhouse_ingest as pkg
+
+    calls = []
+    monkeypatch.setattr(pkg, "cases_already_ingested", lambda *a, **k: True)
+    monkeypatch.setattr(
+        results, "replace_case_attempt", lambda *a, **k: calls.append(a) or 0
+    )
+    ingest(monkeypatch, tmp_path, "v2", files=2)
+    assert len(calls) == 2  # a part-stored file is finished, not skipped
