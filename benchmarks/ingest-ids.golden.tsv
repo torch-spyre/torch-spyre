@@ -1,0 +1,9 @@
+component	name	row	config_name	input_shapes	run_mode	kernel_name	benchmark_id
+torch-spyre	pointwise_add	report		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark		9b763db9-f0f2-55e5-8701-6e7ec800bd38
+torch-spyre	pointwise_add	kernel		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	a7575aca-a99a-5eb8-a679-c9986aba1f31
+torch-spyre	pointwise_add	kernel		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	74ef8612-4601-5272-ba2a-b8cc4e51d951
+torch-spyre	pointwise_add	total		[[1, 512, 4096], [1, 512, 4096]]	op_benchmark	Total	d8411110-dce1-55d2-ae42-c61a6eb838bb
+torch-spyre	pointwise_add	report		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark		d3f28b8a-33d8-50b8-be4c-0684594a3537
+torch-spyre	pointwise_add	kernel		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@2	9903b024-f9e8-5236-9b70-c2e8946ffc68
+torch-spyre	pointwise_add	kernel		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	spyre_kernel_v1_fused_add#2@1	97c2b96e-25fe-573b-88e3-dc7938d802cd
+torch-spyre	pointwise_add	total		[[4, 1, 4096], [4, 1, 4096]]	op_benchmark	Total	e2fc9ad4-53af-56c1-a3df-3c450ccb1a1a
