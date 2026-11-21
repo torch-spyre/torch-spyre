@@ -263,9 +263,7 @@ embedding test, 47 kernels under vLLM, the same way.
 Keep in mind:
 
 - Values are compared as host tensors, so the runs may lay a tensor out differently
-  on the device, as long as the copy to the host reads both faithfully. It does not
-  for every element arrangement (#4393), so a kernel whose args differ in
-  arrangement between the runs is reported as not comparable.
+  on the device, as long as the copy to the host reads both faithfully.
 - The difference is relative to the largest value, so one wrong small element among
   large ones can stay under `--tol` (default `1e-2`).
 - A capture copies every arg to the host before and after each kernel's first

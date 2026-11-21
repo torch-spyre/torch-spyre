@@ -43,8 +43,9 @@ _TOL_F32 = 1e-5
 
 _MASKED_FILL_FP32 = rejection(
     4714,
-    "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA that is refused as Multi-arg pointwise with mixed EA.",
-    r"Multi-arg pointwise with mixed EA",
+    "masked_fill fp32: the bool mask cast to fp32 gives a staggered EA whose shuffle "
+    "needs whole stick pairs; the stick dim of 32 is not a whole pair.",
+    r"requires whole stick pairs",
 )
 _IR_DUP_EAGER = (
     4634,
