@@ -1922,7 +1922,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
@@ -2307,7 +2307,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
 
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.loop_info import LoopInfo
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _identity_chain_has_valid_loop_advances,
         )
@@ -2325,7 +2325,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         )
         reader = mock.Mock()
         reader.get_name.return_value = "reader"
-        reader.loop_info = CoarseTileInfo(
+        reader.loop_info = LoopInfo(
             loop_group_id=(0, 1),
             loop_count=[2, 4],
             loop_tiled_dims=[[], [0]],
@@ -2602,7 +2602,7 @@ class TestDrainMaterialization(unittest.TestCase):
         records are captured); only the returned one is a graph-output carry
         and therefore the only one the drain plan can apply to.
         """
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
 
         output_names = set(graph.get_output_names())
         storages = []
@@ -2626,7 +2626,7 @@ class TestDrainMaterialization(unittest.TestCase):
 
     @staticmethod
     def _all_carry_records(graph):
-        from torch_spyre._inductor.loop_info import LoopCarryRecord
+        from torch_spyre._inductor.loop_node import LoopCarryRecord
 
         records = []
         for op in graph.operations:
@@ -2787,9 +2787,9 @@ class TestDrainMaterialization(unittest.TestCase):
             with mock.patch.object(storage, "_loop_carry_record", broken):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("nested loop level"):
-            from torch_spyre._inductor.loop_info import CoarseTileInfo
+            from torch_spyre._inductor.loop_info import LoopInfo
 
-            nested = CoarseTileInfo(
+            nested = LoopInfo(
                 loop_group_id=(0, 0),
                 loop_count=[sympy.Integer(4), sympy.Integer(4)],
                 loop_tiled_dims=[[], []],
@@ -2797,9 +2797,9 @@ class TestDrainMaterialization(unittest.TestCase):
             with mock.patch.object(update, "loop_info", nested):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("storage is itself a loop member"):
-            from torch_spyre._inductor.loop_info import CoarseTileInfo
+            from torch_spyre._inductor.loop_info import LoopInfo
 
-            tagged = CoarseTileInfo(
+            tagged = LoopInfo(
                 loop_group_id=(0,),
                 loop_count=[sympy.Integer(4)],
                 loop_tiled_dims=[[]],

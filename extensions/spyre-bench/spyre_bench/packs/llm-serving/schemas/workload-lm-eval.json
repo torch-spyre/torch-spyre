@@ -1,0 +1,46 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/workload-lm-eval.json",
+ "title": "llm/lm-eval",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "eval": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "task": {
+     "type": "string"
+    },
+    "num_fewshot": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "seed": {
+     "type": "integer"
+    },
+    "filter": {
+     "type": "string"
+    },
+    "batch_size": {
+     "type": "integer",
+     "minimum": 1
+    }
+   },
+   "required": [
+    "task"
+   ]
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "eval"
+ ]
+}
