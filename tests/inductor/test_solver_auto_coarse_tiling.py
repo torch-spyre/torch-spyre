@@ -960,7 +960,11 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
 
         Bypasses the solve's own pairing, so what is left to split an
-        out-of-step group is ``apply_tilings`` itself.
+        out-of-step group is ``apply_tilings`` itself. The solve is offered
+        nothing finer than ``d0:4``, so it places no buffer tighter than the
+        forced tiling makes it: left the discovered menus, a solve that prices
+        tilings takes a finer one, and ``check_priced_footprints`` refuses the
+        applied graph for not fitting where that put it.
         """
 
         def chosen(graph, allocation):
@@ -971,7 +975,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             }
 
         with patch(_CHOSEN_TILINGS, chosen):
-            return self._compile(fn, args)
+            return self._compile(fn, args, consumer_menu=[_D0_BY_4, TileSpec()])
 
     def _assert_group_split(self, fn):
         """The consumer does not read its producer tile by tile, so the apply

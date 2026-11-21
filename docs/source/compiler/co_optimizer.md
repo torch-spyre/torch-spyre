@@ -292,10 +292,12 @@ term drops out entirely. This fallback is weaker — on a graph where everything
 every division scores identically and the search has nothing left to optimize on. On the CP-SAT
 side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
-remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
-that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
-in tile size and cut count).
+remaining ties by cut count, parallelism, division balance and tile count; with the printer,
+CP-SAT also takes that ladder when `cost_expr_to_cpsat` cannot lower the expression, and
+whenever `auto_coarse_tiling` is on, since the allocator then withholds the expression (the
+model is flat in tile size and cut count). With `cpsat_table_lowering` on it does neither: the
+tables lower the expression under `auto_coarse_tiling` too, and an expression they cannot lower
+raises `TableLoweringError`.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*
@@ -427,8 +429,10 @@ solvers differ in what "substitute and evaluate" compiles down to:
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
   as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
-  searches the symbolic constraint space directly.
+  (`scratchpad/cpsat_expr_printer.py`), or, with `cpsat_table_lowering` on, via
+  `lower_cost_with_tables(...)` (`scratchpad/cpsat_table_lowering.py`), which computes every
+  cost value before the solve and hands CP-SAT tables of them. Either way CP-SAT never
+  evaluates `cost_expr` in Python during the search.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every
