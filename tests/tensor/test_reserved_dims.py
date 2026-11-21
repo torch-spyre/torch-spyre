@@ -164,13 +164,17 @@ class TestGetReservedDims(TestCase):
                     v.resize_(new_size)
 
     def test_same_geometry_views_share_the_base_data(self) -> None:
-        x, x_dev = declared_tensor()
+        # The host-to-device copy rounds fp16, so compare with what the device
+        # reads back, not with the host tensor. The same bytes must read back
+        # identically through the view.
+        _, x_dev = declared_tensor()
+        on_device = x_dev.cpu()
         for v in (
             x_dev.view(x_dev.shape),
             torch.ops.aten.alias(x_dev),
             x_dev.as_strided(x_dev.shape, x_dev.stride()),
         ):
-            self.assertEqual(v.cpu(), x, atol=1e-3, rtol=0)
+            self.assertEqual(v.cpu(), on_device, atol=0, rtol=0)
         x_dev.view(x_dev.shape).zero_()
         self.assertTrue(x_dev.cpu().eq(0).all())
 
@@ -178,14 +182,17 @@ class TestGetReservedDims(TestCase):
         # With the map, a view takes the reserved resize_ path. Without it, the
         # unreserved path recomputes the layout from the concrete size and the
         # view reads back wrong data.
-        x, x_dev = declared_tensor()
+        # Compared with what the device reads back, since the host-to-device
+        # copy rounds fp16.
+        _, x_dev = declared_tensor()
+        on_device = x_dev.cpu()
         v = x_dev.view(x_dev.shape)
         v.resize_((140, 1024))
         self.assertEqual(tuple(v.shape), (140, 1024))
-        self.assertEqual(v.cpu(), x[:140], atol=1e-3, rtol=0)
+        self.assertEqual(v.cpu(), on_device[:140], atol=0, rtol=0)
         # The base is untouched.
         self.assertEqual(tuple(x_dev.shape), (560, 1024))
-        self.assertEqual(x_dev.cpu(), x, atol=1e-3, rtol=0)
+        self.assertEqual(x_dev.cpu(), on_device, atol=0, rtol=0)
 
     def test_grow_on_view_matches_cpu(self) -> None:
         # Growing is what the reserved path exists for: the buffer is already
@@ -193,10 +200,11 @@ class TestGetReservedDims(TestCase):
         # that existed before the grow have defined values.
         x = torch.rand(140, 1024, dtype=torch.float16)
         x_dev = x.to(DEVICE, dynamic=DECLARATION)
+        on_device = x_dev.cpu()
         v = x_dev.view(x_dev.shape)
         v.resize_((630, 1024))
         self.assertEqual(tuple(v.shape), (630, 1024))
-        self.assertEqual(v.cpu()[:140], x, atol=1e-3, rtol=0)
+        self.assertEqual(v.cpu()[:140], on_device, atol=0, rtol=0)
         self.assertEqual(tuple(x_dev.shape), (140, 1024))
         # The data check alone also passes through the unreserved path, so
         # check the view kept its reservation through the grow.

@@ -674,10 +674,10 @@ the wrong axis.
 
 A view or `detach()` result is a new tensor object, so it does not carry the
 `torch._dynamo.mark_dynamic` that `to(dynamic=...)` placed on the original.
-It keeps its reservation, so the first compile treats it as static; the next
-distinct size recompiles with the dimension dynamic and picks up the declared
-range. Call `torch._dynamo.mark_dynamic` on it yourself to skip that first
-compile.
+Without that mark, the first compile treats the tensor as static, even though
+it keeps its reservation; the next distinct size recompiles with the dimension
+dynamic and picks up the declared range. Call `torch._dynamo.mark_dynamic` on
+it yourself to skip that first compile.
 
 To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
 when there is no valid reservation):
