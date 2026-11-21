@@ -178,15 +178,25 @@ def _shard_symbol(write: MemoryDep, size: list[int], shard_dim: int) -> sympy.Sy
 def _check_local_strides(
     name: str, size: list[int], dtype: torch.dtype, placement: ShardedPlacement
 ) -> None:
-    """Reject shardings whose shard-local strides differ from the global ones.
+    """Reject shardings whose shards are not whole device dims of whole sticks.
 
-    DeepTools gives each core its own start address, but derives HBM strides
-    inside the core's tile from the global shape (N_). The kernel is correct
-    only if every device dim has the same stride in the shard's own layout as
-    in the global layout, and the shard dim is the outermost device dim (so a
-    shard is one contiguous block). Measured counterexamples: 32x128 fp16
-    Shard(0) leaves the second stick of every row unwritten; 4x8x512
-    Shard(2) would write past the end of its chunk. Fail closed.
+    Shard-local device strides may differ from the global ones: DeepTools
+    gives each core its own start address and walks the core's tile with the
+    shard-local layout (verified end-to-end for pointwise ops and for
+    shard-local and cross-shard reductions, bit-exact on integer data). An
+    earlier version of this check also required equal strides -- the backend
+    was believed to derive in-tile HBM strides from the global shape (N_) --
+    but the then-measured counterexamples do not reproduce on the current
+    backend, and the real blocker was the codegen guard's unified-model
+    stride arithmetic, replaced by the shard-dim identity check in
+    ``verify_non_unified_split``. What must still hold:
+
+    - the shard keeps the global device layout's dim structure (a restickified
+      or otherwise relaid shard is not chunk-addressable);
+    - the shard boundary falls on whole sticks of the stick dim (a stick
+      cannot be split between chunks -- a permanent limit);
+    - exactly one device dim is divided, exactly num_shards ways (each core's
+      chunk is the tensor cut on one dim).
     """
     from torch_spyre._C import SpyreTensorLayout
 
@@ -195,9 +205,6 @@ def _check_local_strides(
     global_dev = list(SpyreTensorLayout(size, dtype).device_size)
     local_dev = list(SpyreTensorLayout(local_size, dtype).device_size)
     elems_per_stick = global_dev[-1]
-
-    def strides(dev: list[int]) -> list[int]:
-        return [math.prod(dev[i + 1 :]) for i in range(len(dev))]
 
     split = [i for i, (g, lo) in enumerate(zip(global_dev, local_dev)) if g != lo]
     ok = (
@@ -210,20 +217,13 @@ def _check_local_strides(
         # Exactly one device dim is divided, exactly num_shards ways ...
         and len(split) == 1
         and global_dev[split[0]] == placement.num_shards * local_dev[split[0]]
-        # ... and every dim a core walks has the same stride in the shard's own
-        # layout as in the global one (DeepTools uses the global strides).
-        and all(
-            gs == ls
-            for gs, ls, lo in zip(strides(global_dev), strides(local_dev), local_dev)
-            if lo > 1
-        )
     )
     if not ok:
         raise Unsupported(
-            f"{name}: non-unified kernels need shard-local strides equal to the "
-            f"global ones; got shape {size}, shard dim {placement.shard_dim}, "
-            f"{placement.num_shards} shards (device sizes {global_dev} vs shard "
-            f"{local_dev})"
+            f"{name}: non-unified kernels need shards that are whole device "
+            f"dims of whole sticks; got shape {size}, shard dim "
+            f"{placement.shard_dim}, {placement.num_shards} shards (device "
+            f"sizes {global_dev} vs shard {local_dev})"
         )
 
 

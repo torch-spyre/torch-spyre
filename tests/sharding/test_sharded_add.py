@@ -51,7 +51,7 @@ from torch_spyre._inductor import config as spyre_config
 
 from torch_spyre.execution import kernel_runner
 
-_STRIDE_REJECTION = "shard-local strides equal to the global ones"
+_STRIDE_REJECTION = "whole device dims of whole sticks"
 
 
 def expects_raise(test):
@@ -152,6 +152,12 @@ def _sharded(cpu: torch.Tensor, dim: int, n: int) -> torch.Tensor:
         ((32, 128), 1, torch.float16),
         ((16, 32), 1, torch.float32),
         ((64,), 0, torch.float16),
+        # Shard-local strides differ from the global ones (the shard dim is
+        # not the innermost non-stick device dim): admitted since the codegen
+        # guard checks the split against the shard dim instead of unified-
+        # model stride distances (issue #5827).
+        ((4, 128), 0, torch.float16),
+        ((4, 8, 64), 2, torch.float16),
     ],
 )
 def test_compiled_add_runs_one_shard_per_core(launched, shape_per_shard, dim, dtype):
@@ -324,17 +330,9 @@ def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
 @pytest.mark.parametrize(
     "shape_per_shard, dim",
     [
-        # Rows wider than one stick: in-tile strides would follow the global
-        # shape and leave the second stick of every row unwritten.
-        # TODO: positive once DeepTools uses per-core layout sizes.
-        ((4, 128), 0),
         # Last-dim shards that are not whole sticks (32 of 64 fp16 elements).
         # A real limit: a stick cannot be split between chunks.
         ((32, 32), 1),
-        # 3-D Shard(last): a non-shard dim sits outside the stick dim, so its
-        # global stride would address past the end of the chunk.
-        # TODO: positive once DeepTools uses per-core layout sizes.
-        ((4, 8, 64), 2),
     ],
 )
 @expects_raise
