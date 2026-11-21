@@ -136,6 +136,7 @@ def collect_work_division_constraints(
     for constraint in (
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
+        padded_pool_spatial_blocked_vars,
         reduction_window_blocked_vars,
         coarse_tile_local_dim_split_domains,
         direct_read_source_stick_split_domains,
@@ -405,6 +406,63 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
         and concretize_expr(ctx.it_space[sym]) > 1
     }
     return ConstraintResult(blocked=blocked)
+
+
+def padded_pool_spatial_blocked_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep a padded pool's padded output spatial dims unsplit.
+
+    The pad lanes are filled on chip by the backend, and a core slice that
+    starts after the front pad gets its HBM start address shifted back by the
+    pad.  On the bundle path that address is symbolic, and without backend
+    support for shifting it the backend compiler rejects an undeclared symbol.
+    A pad axis split down to fewer outputs per core than the pad, which the
+    backend's own work division forbids, gives silently wrong results.  Batch
+    and channel splits are unaffected.
+    """
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    if ctx.op.data.reduction_type not in POOL_OPS:
+        return ConstraintResult()
+    op_info = getattr(ctx.op.data, "op_info", None)
+    pool_params = op_info.get("pool_params") if isinstance(op_info, dict) else None
+    if not isinstance(pool_params, dict):
+        return ConstraintResult()
+    padded = (
+        int(pool_params.get("pad_h", 0)) > 0,
+        int(pool_params.get("pad_w", 0)) > 0,
+    )
+    if not any(padded):
+        return ConstraintResult()
+
+    # The write's index vars follow the output dims [N, C, H_out, W_out] with
+    # size-1 dims squeezed out, so pair the surviving dims with the vars in
+    # order to find H_out/W_out without guessing from sizes.
+    write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
+    out_sizes = [concretize_expr(s) for s in ctx.op.data.get_size()]
+    surviving = [pos for pos, size in enumerate(out_sizes) if size > 1]
+    write_vars = list(write.ranges)
+    if len(surviving) != len(write_vars):
+        return ConstraintResult()
+    pos_to_var = dict(zip(surviving, write_vars))
+    pads = (int(pool_params.get("pad_h", 0)), int(pool_params.get("pad_w", 0)))
+    padded_vars = {
+        pos_to_var[pos]: (out_sizes[pos], pad)
+        for pos, pad in zip((2, 3), pads)
+        if pad > 0 and pos in pos_to_var and isinstance(pos_to_var[pos], Symbol)
+    }
+    if not config.pool_padded_spatial_split:
+        return ConstraintResult(blocked=set(padded_vars))
+    # With backend support, a split is legal while every core keeps more
+    # outputs than the pad (1 output per core under pad 1 gave wrong results).
+    return ConstraintResult(
+        allowed_splits={
+            var: frozenset(int(d) for d in divisors(size) if size // d > pad)
+            or frozenset({1})
+            for var, (size, pad) in padded_vars.items()
+        }
+    )
 
 
 def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
