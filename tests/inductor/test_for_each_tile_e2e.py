@@ -1683,7 +1683,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         hardware limit if the work-division planner is free to split its row
         dim across cores. Before the fix, _transfer_loop_info left the
         embedding consumer's own loop_tiled_dims on that copy's deep-copied
-        CoarseTileInfo, which coarse_tile_local_dim_split_domains misread as
+        LoopInfo, which coarse_tile_local_dim_split_domains misread as
         "the copy's row dim is loop-tiled" and pinned its core split to 1,
         making every split attempt fail with "per-core tensor span 384.500
         MB ... exceeds hardware limit of 256.00 MB" -- reproduced by

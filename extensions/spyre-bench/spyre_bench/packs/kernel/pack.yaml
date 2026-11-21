@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: kernel, description: "kernel and layer microbenchmarks on any device"}
+spec:
+  prefix: kernel
+  version: 0.2.0
+  requires: {core: "0.2"}
+  types:
+    - {name: op-library, for: System, schema: schemas/system-op-library.json}
+    - {name: op, for: Workload, schema: schemas/workload-op.json, levels: [kernel], runner: harness-a,
+       load: [iterations], default_metrics: [kernel.time.mean]}
+    - {name: layer, for: Workload, schema: schemas/workload-layer.json, levels: [layer], runner: harness-a,
+       load: [iterations], default_metrics: [kernel.total_duration]}
+  vocabularies:
+    levels: [kernel, layer, graph]
+  runners:
+    - {name: harness-a, protocol: process/v1, command: [python3, -m, spyre_bench.kernel.bench_runner]}
+  metrics:
+    - {name: kernel.time.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.total_duration, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}
