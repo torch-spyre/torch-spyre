@@ -538,6 +538,34 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Logins and hosts
+
+`ClickHouse.connect()` returns a **writer** client by default. It refuses `CREATE`, `ALTER`,
+`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `GRANT` and `REVOKE` before
+they reach the server (`SchemaStatementOnWriter`); reads, inserts, `DELETE FROM` and
+`INSERT ... SELECT` pass. This catches mistakes; the writer login's grants are the real boundary.
+DDL (the applier, the sandbox tools, the ensure-table steps of the dispatch, model-ops and
+hw-diagnostics ingests) uses `ClickHouse.connect(role="schema")`. `tests/test_logins.py` scans the
+ingest code and `.github/scripts` for DDL sent on a writer.
+
+| Variable | Used for |
+|---|---|
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASS` | the writer login (legacy host) |
+| `CLICKHOUSE_SCHEMA_USER` / `CLICKHOUSE_SCHEMA_PASSWORD` | the schema login; unset falls back to the writer login with one warning |
+| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones |
+| `CLICKHOUSE_V2_USER` / `CLICKHOUSE_V2_PASSWORD` | the writer login on the v2 host; unset uses the legacy writer pair |
+| `CLICKHOUSE_V2_SCHEMA_USER` / `CLICKHOUSE_V2_SCHEMA_PASSWORD` | the schema login on the v2 host; unset tries the schema pair, then the v2 writer pair |
+| `CH_V2_DATABASES` | comma list of the databases the v2 host serves (default `spyre_v2`); `CLICKHOUSE_DB_V2` is always included |
+| `CH_REQUIRE_V2_HOST` | `1`: connecting with a v2 database configured but no `CLICKHOUSE_V2_HOST` is an error |
+
+Half a user/password pair is an error. Without `CLICKHOUSE_V2_HOST` there is one host, as before.
+With it, a connection whose database is a v2 database goes to the v2 host, and any other is a
+`RoutedClient`: statements stay on the legacy host unless they name a v2 database (`db.table`,
+`FROM db`, `USE db`, `database = 'db'`, or an insert's `database=`), ignoring comments and string
+literals. A statement naming qualified tables on both hosts raises `CrossHostStatement`. The v2
+client opens on first use. An unqualified statement always goes to the legacy host, so v2 code
+must keep qualifying its tables.
+
 ## Write resilience
 
 `resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,

@@ -196,7 +196,7 @@ def main() -> None:
 
     # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
     if args.write_v1:
-        ensure_extra_columns(client, table=args.table)
+        ensure_extra_columns(get_client(role="schema"), table=args.table)
         if already_ingested(client, run_id, component, table=args.table):
             print(
                 f"[info] v1: run_id={run_id} component={component!r} already ingested "
