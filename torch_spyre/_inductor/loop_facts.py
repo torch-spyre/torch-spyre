@@ -100,16 +100,18 @@ def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
 
 
 def _in_built_node(op: Operation) -> bool:
-    # An op with no loop_info answers "not looped" as it always did, even when a
-    # helper put it in a body (a once-op extern the scheduler hoists, say): node
-    # membership becomes the truth only when the stamp is gone (stage 9.4).
+    """True if ``op`` is a MEMBER of the loops around it: it sits in built nodes AND
+    each of them holds its tiling entry. Being placed in a body is not enough: an LX
+    clone the allocator puts beside a body consumer runs every trip but is not part
+    of the loop's computation, and treating it as looped made the same-tile-group
+    relayout offer a candidate for it (a wrong plan on the eager SDPA graphs,
+    ``test_gather_attention``). An entry exists exactly for the ops that had a
+    ``loop_info`` stamp."""
     chain = getattr(op, "_loop_chain", ())
-    return (
-        isinstance(chain, tuple)
-        and bool(chain)
-        and getattr(op, "loop_info", None) is not None
-        and all(node.facts_recorded for node in chain)
-    )
+    if not (isinstance(chain, tuple) and chain):
+        return False
+    name = op.get_name()
+    return all(node.facts_recorded and name in node.tiling for node in chain)
 
 
 def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:

@@ -880,6 +880,23 @@ class TestNodeFacts(unittest.TestCase):
         self.assertFalse(is_looped(once))
         self.assertTrue(is_looped(a))
 
+    def test_an_op_is_a_member_only_where_the_node_holds_its_tiling(self):
+        """A stamp written after placement, with no ``record_loop_info``, is not yet a
+        member: the nodes hold no entry, so the op answers from its stamp."""
+        graph, node, a, b = self._tiled_pair()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        late.loop_info = LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[4],
+            loop_tiled_dims=[[2]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        self.assertNotIn("late", node.tiling)
+        self.assertEqual(enclosing_loops(late), stamped_levels(late))
+        record_loop_info(late)
+        self.assertEqual(enclosing_loops(late), node_levels(late))
+
     def test_replace_op_takes_the_new_ops_tiling(self):
         graph, node, a, b = self._tiled_pair()
         new = _Op("a", (0,), [4])

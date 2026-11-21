@@ -296,6 +296,13 @@ def _node_fact_problems(
         or not all(n.facts_recorded for n in enclosing)
     ):
         return
+    if any(op.get_name() not in n.tiling for n in enclosing):
+        problems.append(
+            f"{op.get_name()}: stamped with a loop_info inside "
+            f"{[n.get_name() for n in enclosing]} but those nodes hold no tiling for "
+            "it (a stamp written after the op was placed needs record_loop_info)"
+        )
+        return
     if tuple(getattr(op, "_loop_chain", ())) != enclosing:
         problems.append(
             f"{op.get_name()}: its recorded node chain "

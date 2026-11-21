@@ -477,8 +477,10 @@ def _fill_tiling(entry: ir.Operation, overwrite: bool = False) -> None:
         for level, node in enumerate(getattr(leaf, "_loop_chain", ())):
             if overwrite or name not in node.tiling:
                 node.tiling[name] = (
-                    _level_dims(info.loop_tiled_dims, level),
-                    _level_dims(info.loop_tiled_reduction_dims, level),
+                    _level_dims(getattr(info, "loop_tiled_dims", None) or (), level),
+                    _level_dims(
+                        getattr(info, "loop_tiled_reduction_dims", None) or (), level
+                    ),
                 )
 
 

@@ -297,6 +297,26 @@ class TestNodeFactsRule(unittest.TestCase):
         self.assertIn("a: loop_info says", problem)
         self.assertIn("but its nodes say", problem)
 
+    def test_a_stamp_written_after_placement_without_record_loop_info_is_reported(self):
+        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import insert_before
+
+        graph, a, b = self._built()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        # Unstamped, it is a non-member in the body (rule 5), not a rule-6 case.
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("late is in the body", problem)
+        late.loop_info = LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[4],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("late: stamped with a loop_info", problem)
+        self.assertIn("record_loop_info", problem)
+
     def test_an_op_with_no_recorded_chain_is_reported(self):
         graph, a, b = self._built()
         del a._loop_chain
