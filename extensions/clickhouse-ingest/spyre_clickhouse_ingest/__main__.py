@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|relay} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|spool|relay} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
@@ -27,6 +27,7 @@ def main(argv=None):
         "results",
         "ci-run-timings",
         "dispatch",
+        "spool",
         "relay",
         "bench-verdicts",
     )
@@ -41,6 +42,8 @@ def main(argv=None):
         from .ci_run_timings import main as run
     elif command == "dispatch":
         from .dispatch import main as run
+    elif command == "spool":
+        from .spool_cli import main as run
     elif command == "relay":
         from .relay import main as run
     elif command == "bench-verdicts":
