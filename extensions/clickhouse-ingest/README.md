@@ -699,10 +699,11 @@ rows written by two calls are never merged; the quorum never degrades. The CI wo
 `vars.CH_WRITE_RESILIENCE`, `vars.CH_WRITE_STRICT` and `vars.CH_WRITE_DEADLINE_S` (default 120 s
 there; 300 s in the library).
 
-Each call retries up to `CH_WRITE_DEADLINE_S`. Once one call in a process has spent its deadline
-(parked, or failed with no spool), later calls get one attempt each, so an outage costs one
-deadline per process, not one per table and file. The next call that stores its rows ends that,
-and so does one more deadline passing; the state is shared by a process's threads under a lock. A
+Each call retries up to `CH_WRITE_DEADLINE_S`. Once a call to a table has spent its deadline
+(parked, or failed with no spool), later calls to that table in the process get one attempt each,
+so an outage costs one deadline per table, not one per file; a table that keeps storing is not
+slowed by one that fails. The next call to that table that stores its rows ends it, and so does
+one more deadline passing; the state is shared by a process's threads under a lock. A
 long-lived caller that writes in-process (a web server calling `dispatch.request`) holds the
 request for up to one deadline: set `CH_WRITE_DEADLINE_S` low there (a few seconds) and
 `CH_WRITE_RESILIENCE=off` in its environment to opt out; with no `CH_WRITE_SPOOL` it fails the

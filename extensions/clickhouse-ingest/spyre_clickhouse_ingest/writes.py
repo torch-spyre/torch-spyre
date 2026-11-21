@@ -17,8 +17,8 @@
 `CH_WRITE_RESILIENCE=auto` (default; `off` disables) applies it when the target's engine is
 Replicated*. A plain table, or one whose engine cannot be read, returns None and the caller keeps
 its own path. Rows that cannot land are parked in the spool and the call raises BatchParked. Once
-one call has parked, later calls in the process get one attempt each, so an outage costs one
-CH_WRITE_DEADLINE_S, not one per call. `finish` turns a clean run that parked rows into
+a call to a table has parked, later calls to that table get one attempt each, so an outage costs
+one CH_WRITE_DEADLINE_S per table, not one per call. `finish` turns a clean run that parked rows into
 EXIT_PARKED, unless the run also wrote the authoritative v1 rows (see `finish`).
 """
 
@@ -63,8 +63,9 @@ _parked: dict[str, int] = {}  # table -> rows; bounded by the tables a process w
 _spools: dict[str, Spool | None] = {}
 _calls: dict[tuple[str, str], int] = {}
 _process = uuid.uuid4().hex
-# "spent": when a call last used up its deadline; cleared by the next call that stores its rows.
-_state: dict = {"spent": None, "v1": False}
+# "spent": (database, table) -> when a call to it last used up its deadline; cleared by the next
+# call to that table that stores its rows, so one failing table never slows a healthy one.
+_state: dict = {"spent": {}, "v1": False}
 _lock = threading.Lock()
 
 
@@ -74,21 +75,25 @@ def reset() -> None:
         _parked.clear()
         _spools.clear()
         _calls.clear()
-        _state.update(spent=None, v1=False)
+        _state.update(spent={}, v1=False)
 
 
-def _spent_recently(deadline_s: float) -> bool:
-    """An outage is still being paid for: a call spent its deadline less than one deadline ago."""
+def _spent_recently(key, deadline_s: float) -> bool:
+    """A call to this table spent its deadline less than one deadline ago."""
     with _lock:
-        spent = _state["spent"]
+        spent = _state["spent"].get(key)
         if spent is not None and time.monotonic() - spent >= deadline_s:
-            _state["spent"] = spent = None
+            del _state["spent"][key]
+            spent = None
         return spent is not None
 
 
-def _mark_spent(spent: bool) -> None:
+def _mark_spent(key, spent: bool) -> None:
     with _lock:
-        _state["spent"] = time.monotonic() if spent else None
+        if spent:
+            _state["spent"][key] = time.monotonic()
+        else:
+            _state["spent"].pop(key, None)
 
 
 def note_v1_written() -> None:
@@ -231,7 +236,8 @@ def insert(
         return None
     policy = Policy.from_env()
     policy.batch_rows, policy.degrade_to = batch_rows, None
-    if _spent_recently(policy.deadline_s):
+    key = (database or "", table)
+    if _spent_recently(key, policy.deadline_s):
         policy.deadline_s = 0.0
     try:
         out = resilient_insert(
@@ -248,10 +254,10 @@ def insert(
             feeds_views=found.feeds_views,
         )
     except WriteFailed as err:
-        _mark_spent(True)
+        _mark_spent(key, True)
         stored = err.outcome.stored if err.outcome else 0
         raise BatchFailed(f"{table}: {err}", stored) from err
-    _mark_spent(bool(out.spooled))
+    _mark_spent(key, bool(out.spooled))
     if out.spooled:
         name = f"{database}.{table}" if database else table
         with _lock:

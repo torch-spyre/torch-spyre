@@ -72,8 +72,7 @@ def server(tmp_path_factory):
     cfg.write_text(KEEPER)
     # Rootless podman maps the server's own uid: it must be able to read the mounted file.
     cfg.chmod(0o644)
-    for d in (cfg.parent, cfg.parent.parent):
-        d.chmod(0o755)
+    cfg.parent.chmod(0o755)
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]

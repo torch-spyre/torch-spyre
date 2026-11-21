@@ -26,6 +26,7 @@ class Logged(LiveClient):
     """Every statement in order, inserts with their settings; tables answer with ENGINE."""
 
     ENGINE = "MergeTree"
+    database = "spyre"
 
     def __init__(self):
         super().__init__()
@@ -179,8 +180,10 @@ PERF_XML = (
 )
 
 
-def perf_ingest(monkeypatch, tmp_path, insert_benchmarks):
-    (tmp_path / "report.xml").write_text(PERF_XML)
+def perf_ingest(
+    monkeypatch, tmp_path, insert_benchmarks, xml=PERF_XML, name="report.xml"
+):
+    (tmp_path / name).write_text(xml)
     live = Logged()
     monkeypatch.setenv("CLICKHOUSE_HOST", "ch.invalid")
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
@@ -252,3 +255,46 @@ def test_without_an_attempt_a_complete_file_is_skipped_and_a_partial_one_finishe
         results.main(["--xml-dir", str(tmp_path), "--schema", "v2", "--run-id", RUN,
                       "--trigger-type", "regression", "--arch", "x86_64"])  # fmt: skip
         assert len(calls) == replaced, stored
+
+
+KERNEL_XML = (
+    '<?xml version="1.0"?><testsuites><testsuite name="s" timestamp="2026-01-01T00:00:00Z">'
+    '<testcase classname="kernel_benchmark" name="k" time="1.0"><properties>'
+    '<property name="tag" value="kernel__sdpa"/><property name="tag" value="op__op-alpha"/>'
+    "</properties></testcase></testsuite></testsuites>"
+)
+
+
+def test_a_parked_kernel_report_withholds_the_perf_verdict(
+    monkeypatch, tmp_path, capsys
+):
+    def parks(*a, **k):
+        raise BatchParked("benchmark_runs: 1 parked, 0 stored", 0, 1)
+
+    monkeypatch.setattr(results, "_exit_if_perf_zero", lambda *a: None)
+    monkeypatch.setattr(results, "_table_exists", lambda *a, **k: True)
+    monkeypatch.setattr(results, "_absent_columns", lambda *a, **k: set())
+    live = perf_ingest(monkeypatch, tmp_path, parks, xml=KERNEL_XML, name="kernels.xml")
+    out = capsys.readouterr()
+    assert "per-kernel" in out.out and "verdict withheld" in out.err
+    assert not any(e[0] == "insert" and e[2] == "artifact_results" for e in live.log)
+
+
+def test_rows_of_file_counts_every_attempt_of_one_file():
+    from spyre_clickhouse_ingest.writer import TestResultWriter
+
+    seen = []
+
+    class Count:
+        def query(self, sql, parameters=None):
+            seen.append((sql, parameters))
+
+            class R:
+                result_rows = [(3,)]
+
+            return R()
+
+    assert TestResultWriter.rows_of_file(Count(), "db", RUN, "c", "f.xml") == 3
+    ((sql, params),) = seen
+    assert "props['source_file'] = {sf:String}" in sql and "run_attempt" not in sql
+    assert params == {"component": "c", "run_id": RUN, "sf": "f.xml"}

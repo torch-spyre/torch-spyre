@@ -461,8 +461,12 @@ runs:
         # One manifest line per batch for the whole job: batches another action already listed are skipped.
         seen="${RUNNER_TEMP}/ch-spool-listed.jsonl"
         touch "${seen}"
-        CH_WRITE_SPOOL="${spool}" "${py}" -m spyre_clickhouse_ingest spool list 2> /dev/null \
+        errs="${RUNNER_TEMP}/ch-spool-list.err"
+        CH_WRITE_SPOOL="${spool}" "${py}" -m spyre_clickhouse_ingest spool list 2> "${errs}" \
           | grep -vxF -f "${seen}" > "${RUNNER_TEMP}/ch-spool-manifest.jsonl" || true
+        if [ -s "${errs}" ]; then
+          echo "::warning title=ClickHouse spool::$(head -c 500 "${errs}" | tr '\n' ' ')"
+        fi
         [ -s "${RUNNER_TEMP}/ch-spool-manifest.jsonl" ] || exit 0
         cat "${RUNNER_TEMP}/ch-spool-manifest.jsonl" >> "${seen}"
         { echo "parked=true"; echo "id=$(date +%s)-${RANDOM}${RANDOM}"; } >> "$GITHUB_OUTPUT"

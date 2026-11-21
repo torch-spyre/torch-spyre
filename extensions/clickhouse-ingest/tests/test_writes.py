@@ -370,7 +370,7 @@ def test_after_one_call_spends_its_deadline_later_calls_get_one_attempt(
     assert len(first.inserts) > 1
     second = Fake(script=[err(285)] * 1000)
     with pytest.raises(BatchParked):
-        writes.insert(second, "u", ROWS, ["a", "b"], "db")
+        writes.insert(second, "t", ROWS, ["a", "b"], "db")
     assert len(second.inserts) == 1
     healthy = Fake()
     assert (
@@ -379,7 +379,7 @@ def test_after_one_call_spends_its_deadline_later_calls_get_one_attempt(
     writes.reset()
     third = Fake(script=[err(285)] * 1000)
     with pytest.raises(BatchParked):
-        writes.insert(third, "w", ROWS, ["a", "b"], "db")
+        writes.insert(third, "t", ROWS, ["a", "b"], "db")
     assert len(third.inserts) > 1
 
 
@@ -389,7 +389,7 @@ def test_a_failure_without_a_spool_also_spends_the_deadline(monkeypatch):
         writes.insert(Fake(script=[err(285)] * 1000), "t", ROWS, ["a", "b"], "db")
     second = Fake(script=[err(285)] * 1000)
     with pytest.raises(BatchFailed):
-        writes.insert(second, "u", ROWS, ["a", "b"], "db")
+        writes.insert(second, "t", ROWS, ["a", "b"], "db")
     assert len(second.inserts) == 1
 
 
@@ -605,7 +605,7 @@ def test_a_long_lived_threaded_process_recovers_after_an_outage(monkeypatch):
     threads = [threading.Thread(target=request, args=(after,)) for _ in range(8)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    assert after == [1] * 8 and writes._state["spent"] is None
+    assert after == [1] * 8 and writes._state["spent"] == {}
     tokens = writes._calls[("db", "dispatch_requests")]
     assert tokens == 16  # scope numbers are unique across threads
 
@@ -646,3 +646,43 @@ def test_an_artifact_row_that_parks_fails_the_artifacts_command(monkeypatch):
         cli.main(
             ["artifacts", "ensure", "--artifact", "wheel:pkg==1.0", "--arch", "x86_64"]
         )
+
+
+def test_a_failing_table_does_not_slow_a_healthy_one_and_stays_cheap(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.05")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    sick = Fake(script=[err(252)] * 10000)
+    with pytest.raises(BatchParked):
+        writes.insert(sick, "sick", ROWS, ["a", "b"], "db")
+    for _ in range(5):  # interleaved: healthy stores never reset the sick table's state
+        assert writes.insert(Fake(), "healthy", ROWS, ["a", "b"], "db") == 7
+        before = len(sick.inserts)
+        with pytest.raises(BatchParked):
+            writes.insert(sick, "sick", ROWS, ["a", "b"], "db")
+        assert len(sick.inserts) - before == 1
+    flaky = Fake(script=[err(285)] * 2)
+    assert writes.insert(flaky, "healthy", ROWS, ["a", "b"], "db") == 7
+    assert len(flaky.inserts) == 3  # the healthy table still gets full retries
+
+
+def test_bytes_inside_a_map_value_are_refused(tmp_path):
+    spool = park(tmp_path, rows=[[1, {"k": str(b"\x00raw")}]])
+    fake = Fake()
+    fake.columns = [("a", "UInt32"), ("b", "Map(String, String)")]
+    assert "bytes" in writes.replay(fake, next(spool.pending()))
+    assert fake.inserts == []
+
+
+def test_the_get_merge_tree_setting_answer_is_cached(capsys):
+    class Setting(NoWindow):
+        calls = 0
+
+        def command(self, sql, *a, **k):
+            Setting.calls += 1
+            return "1000"
+
+    c = Setting()
+    assert writes.window(c, "t", "db") == writes.window(c, "t", "db") == 1000
+    assert Setting.calls == 1
