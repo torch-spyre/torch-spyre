@@ -43,7 +43,6 @@ export BENCH_PURPOSE BENCH_ENVIRONMENT BENCH_SELECTION BENCH_CASES BENCH_TIER BE
 	BENCH_SUBJECT_ID BENCH_REUSE BENCH_PLAN BENCH_SET BENCH_INGEST BENCH_INVOKER BENCH_ARCH BENCH_CARDS \
 	BENCH_QUEUE BENCH_CLEAN BENCH_MAX_WAIT BENCH_MAX_HOLD BENCH_LEASE_FILE BENCH_RUN_ID BENCH_QUIET
 
-# Install hint: the package lives in torch-spyre#6298 until that PR is merged, then on main.
 _bench_install = uv pip install 'spyre-bench @ git+https://github.com/torch-spyre/torch-spyre@$(BENCH_ENGINE_REF)\#subdirectory=extensions/spyre-bench'
 _bench_central = $(if $(BENCH_CENTRAL),--central '$(BENCH_CENTRAL)')
 # Soft mode (BENCH_OPTIONAL non-empty, BENCH_REQUIRED empty) is for callers that must not fail without the engine.
