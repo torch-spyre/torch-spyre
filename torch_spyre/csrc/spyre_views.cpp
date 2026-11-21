@@ -187,7 +187,7 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   at::native::setStrided(result, size, stride, storage_offset);
   auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
   spyre_impl->spyre_layout = device_layout;
-  if (device_layout == orig_impl->spyre_layout) {
+  if (device_layout.equals_ignoring_valid_elements(orig_impl->spyre_layout)) {
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
   } else {
@@ -239,7 +239,7 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                          offset_increment);
   spyre_tensor_impl_->set_sizes_and_strides(size, stride);
   spyre_tensor_impl_->spyre_layout = stl;
-  if (stl == orig_stl) {
+  if (stl.equals_ignoring_valid_elements(orig_stl)) {
     spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   } else {
