@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# profile perf-kernel, op-level record: the producer leaves kernel_name and is_total absent (they hash as empty) and
+# writes no tags. `from` takes an identity value of the case, `join` flattens a list.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: ingest-demo-fp16}
+spec: {type: kernel/op-library, backend: spyre, library: torch-spyre, precision: fp16, harness: harness-a, extensions: {spyre: {mode: a}}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-matmul}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: ingest-demo-fp16
+  workload: {type: kernel/op, op: matmul, load: {executor: iterations, iterations: 100, warmup_iterations: 3}}
+  est_hours: 0.1
+  run: {repeats: 1, timeout: 30m, est: 2m, isolation: process}
+  identity:
+    mode: ingest
+    discriminators:
+      - {key: record_type, value: op}
+      - {key: config_name, value: ""}
+      - {key: input_shapes, from: case.shape, join: "_"}
+      - {key: run_mode, value: op_benchmark}
+      - {key: kernel_name, value: ""}
+      - {key: is_total, value: ""}
+  matrix:
+    name_template: op_matmul_{shape}
+    axes:
+      shape:
+        - {token: m4096-n4096-k4096, patch: {workload: {shape: [4096, 4096, 4096]}}}
+        - {token: m1-n4096-k4096, patch: {workload: {shape: [1, 4096, 4096]}}}

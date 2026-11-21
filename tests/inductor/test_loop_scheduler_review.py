@@ -53,7 +53,13 @@ from torch_spyre._inductor import config, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import work_division
 from torch_spyre._inductor.ir import SpyreConstantFallback
-from torch_spyre._inductor.loop_node import LoopNode, all_ops
+from torch_spyre._inductor.loop_node import (
+    LoopNode,
+    all_ops,
+    insert_after,
+    insert_at_start,
+    remove_op,
+)
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import lx_relayout
@@ -286,9 +292,8 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     position of the loop's first member, which through ``OpsView`` is inside
     the LoopNode's body with no ``loop_info``; the flat path rebuilt loops from
     ``loop_info`` and ran it once, before the loop, while the flow-through ran it
-    every trip, until ``peel_non_members`` at the hand-off moved it out. Stage
-    8.2 places it before the loop's node, so no hoisted clone is ever at the edge
-    of a body, and the two paths agree. The graph
+    every trip. Stage 8.2 places it before the loop's node, so no hoisted clone is
+    ever at the edge of a body, and the two paths agree. The graph
     of ``test_for_each_tile_lowering.test_one_unhinted_scan_does_not_block_the_other``
     (two sibling paged-gather scans)."""
     from for_each_tile_fixtures import (
@@ -400,7 +405,7 @@ def _inject_dead_body_copy(record: dict):
         buf.loop_info = copy.deepcopy(src.loop_info)
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
-        loop.body.insert(loop.body.index(src) + 1, buf)
+        insert_after(real, src, buf)
         record["name"] = name
 
     return dce
@@ -549,8 +554,8 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
             if isinstance(op, SpyreConstantFallback)
             and getattr(op, "loop_info", None) is not None
         )
-        graph.operations.remove(constant)
-        node.body.insert(0, constant)
+        remove_op(graph.operations, constant)
+        insert_at_start(node, constant)
         seen["body_externs"] = [constant.get_name()]
         real(graph)
 
@@ -606,6 +611,12 @@ def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     # members only: nothing to refuse, in one loop or in a nest
     _check_members(node, [member_a, member_b])
     _check_members(node, [])
+
+    # a non-member at the head or the tail is refused too (the hand-off no longer
+    # moves it out of the node)
+    for edge in ([outsider, member_a, member_b], [member_a, member_b, outsider]):
+        with pytest.raises(Exception, match="not all members of it"):
+            _check_members(node, edge)
 
     # a non-member between two members is refused, and named
     with pytest.raises(Exception, match="not all members of it") as info:
