@@ -30,6 +30,7 @@ import contextlib
 import dataclasses
 import importlib
 import inspect
+import math
 import sys
 import unittest
 from unittest import mock
@@ -40,6 +41,7 @@ import sympy
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
+from torch_spyre._inductor.core_mapping import derive_core_mapping
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 # ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ def make_op_spec(
     replicated_scalars: list | None = None,
     is_reduction: bool = False,
     divisions: dict | None = None,
+    core_map: dict | None = None,
     space: dict | None = None,
     tiled: list | None = None,
     trips: dict | None = None,
@@ -116,6 +119,8 @@ def make_op_spec(
       Defaults to False, as it does in the contract.
     * ``divisions`` maps a coordinate symbol's name to its work division;
       ``space`` replaces the iteration space outright (``{}`` for a tiled op).
+    * ``core_map`` is ``core_id_to_work_slice``, by symbol name; left out, it is
+      the frontend's default for the divisions, first divided symbol fastest.
     * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
       ``first_arg_index`` continues the numbering for a second op in one kernel.
     * ``op_info`` is the op's auxiliary dict, which the recipes that take scalar
@@ -172,10 +177,21 @@ def make_op_spec(
             symbol: (extent, (divisions or {}).get(str(symbol), 1))
             for symbol, extent in zip(sympy.symbols(f"d0:{len(out_size)}"), out_size)
         }
+    if core_map is None:
+        # What the frontend's ``_finalize_core_mapping`` gives an op that is not
+        # a matmul: the divided symbols in iteration-space order, first fastest.
+        core_map = derive_core_mapping(
+            list(space),
+            [int(div) for _extent, div in space.values()],
+            math.prod(int(div) for _extent, div in space.values()),
+        )
+    else:
+        core_map = {sympy.Symbol(str(k)): sympy.sympify(v) for k, v in core_map.items()}
     return OpSpec(
         op=op,
         is_reduction=is_reduction,
         iteration_space=space,
+        core_id_to_work_slice=core_map,
         args=args,
         op_info=op_info or {},
         tiled_symbols=tiled or [],
@@ -791,19 +807,110 @@ class TestWorkDivision(unittest.TestCase):
     def test_the_grid_is_the_product_of_the_divisions(self):
         plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
         self.assertEqual(plan.grid, (32,))
-        self.assertEqual(plan.divisions, (ktir.Division(symbol="d1", div=32, inner=1),))
+        self.assertEqual(
+            plan.divisions, (ktir.Division(symbol="d1", div=32, steps=()),)
+        )
 
     def test_two_divided_symbols_are_mixed_radix(self):
-        """Outermost-first, and ``inner`` is that symbol's stride in the grid."""
+        """Outermost-first, each read from ``core_id_to_work_slice``.
+
+        The frontend's default takes the first divided symbol fastest:
+        ``d0 = Mod(core_id, 2)`` and ``d1 = Mod(floor(core_id/2), 4)``, whose
+        remainder an 8-core grid makes the identity.
+        """
         plan = ktir.build_kernel_plan([make_op_spec(divisions={"d0": 2, "d1": 4})])
         self.assertEqual(plan.grid, (8,))
         self.assertEqual(
             plan.divisions,
             (
-                ktir.Division(symbol="d0", div=2, inner=4),
-                ktir.Division(symbol="d1", div=4, inner=1),
+                ktir.Division(symbol="d0", div=2, steps=(("rem", 2),)),
+                ktir.Division(symbol="d1", div=4, steps=(("div", 2),)),
             ),
         )
+
+    def test_the_core_order_is_the_specs_not_the_emitters(self):
+        """A mapping that takes ``d1`` fastest is followed, not re-derived.
+
+        It is what ``core_id_k_fast_emission`` gives a matmul's K, and what the
+        emitter itself derived before it read the mapping.
+        """
+        plan = ktir.build_kernel_plan(
+            [
+                make_op_spec(
+                    divisions={"d0": 2, "d1": 4},
+                    core_map={
+                        "d0": "Mod(floor(core_id/4), 2)",
+                        "d1": "Mod(core_id, 4)",
+                    },
+                )
+            ]
+        )
+        self.assertEqual(
+            plan.divisions,
+            (
+                ktir.Division(symbol="d0", div=2, steps=(("div", 4),)),
+                ktir.Division(symbol="d1", div=4, steps=(("rem", 4),)),
+            ),
+        )
+
+    def test_a_grouped_mapping_nests_its_steps(self):
+        """The grouped form ``derive_core_mapping`` writes for LX tensor owners.
+
+        ``d2``'s slice is ``Mod(floor(Mod(core_id, 4)/2), 2)``: a remainder, then
+        a division, and an outer remainder its range makes the identity.
+        """
+        d0, d1, d2, d3 = sympy.symbols("d0:4")
+        core_map = derive_core_mapping(
+            [d0, d1, d2, d3], [2, 2, 2, 1], 8, grouped_splits={d1: 2}
+        )
+        plan = ktir.build_kernel_plan(
+            [
+                make_op_spec(
+                    size=[16, 8, 512, 64],
+                    divisions={"d0": 2, "d1": 2, "d2": 2},
+                    core_map=core_map,
+                )
+            ]
+        )
+        self.assertEqual(
+            plan.divisions,
+            (
+                ktir.Division(symbol="d0", div=2, steps=(("rem", 2),)),
+                ktir.Division(symbol="d1", div=2, steps=(("div", 4),)),
+                ktir.Division(symbol="d2", div=2, steps=(("rem", 4), ("div", 2))),
+            ),
+        )
+
+    def test_a_divided_op_without_a_mapping_is_refused(self):
+        spec = make_op_spec(divisions={"d1": 4})
+        spec.core_id_to_work_slice = None
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([spec])
+        self.assertIn("carries no core_id_to_work_slice", str(ctx.exception))
+
+    def test_an_undivided_op_needs_no_mapping(self):
+        spec = make_op_spec()
+        spec.core_id_to_work_slice = None
+        self.assertEqual(ktir.build_kernel_plan([spec]).grid, (1,))
+
+    def test_a_form_other_than_mod_and_floor_is_refused(self):
+        """``Mod(3*core_id, 4)`` is one-to-one on 4 cores, but not a chain of steps."""
+        spec = make_op_spec(divisions={"d1": 4}, core_map={"d1": "Mod(3*core_id, 4)"})
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([spec])
+        self.assertIn("not Mod or floor division", str(ctx.exception))
+
+    def test_ops_that_give_a_core_different_slices_are_refused(self):
+        """The same divisions, assigned in opposite orders by the two ops."""
+        first, second = make_chained_op_specs(divisions={"d0": 2, "d1": 4})
+        second.core_id_to_work_slice = {
+            sympy.Symbol("d0"): sympy.sympify("Mod(floor(core_id/4), 2)"),
+            sympy.Symbol("d1"): sympy.sympify("Mod(core_id, 4)"),
+            sympy.Symbol("d2"): sympy.Integer(0),
+        }
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([first, second])
+        self.assertIn("different slices", str(ctx.exception))
 
     def test_the_tile_shrinks_and_the_view_does_not(self):
         """One core's tile is its share; every core addresses the whole buffer."""
@@ -2202,7 +2309,9 @@ class TestPlanFusionStructure(FusionCase):
 
         plan = ktir.build_kernel_plan(pair)
         self.assertEqual(plan.grid, (32,))
-        self.assertEqual(plan.divisions, (ktir.Division(symbol="e1", div=32, inner=1),))
+        self.assertEqual(
+            plan.divisions, (ktir.Division(symbol="e1", div=32, steps=()),)
+        )
         self.assertEqual([step.op for step in plan.steps], ["absmax"])
 
 
