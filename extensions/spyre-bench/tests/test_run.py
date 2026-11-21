@@ -1446,7 +1446,7 @@ class PinningTests(unittest.TestCase):
         out.mkdir(exist_ok=True)
         seen = []
 
-        def fake_verify(request, pid, device_numa):
+        def fake_verify(request, pid, device_numa, **_):
             seen.append((request["policy"], device_numa))
             return {"run.exec.pinning_verified": "true", "run.exec.cpu_pinning": request["policy"]}
 
@@ -1645,7 +1645,7 @@ class VerdictTests(unittest.TestCase):
             [v["status"] for v in doc["verdicts"]], ["pass", "regressed", "improved", "suspected", "no_baseline"]
         )
         self.assertEqual({b["name"]: b["status"] for b in doc["benchmarks"]}["op_b"], "regressed")
-        self.assertEqual(set(doc["verdicts"][0]), set(verdict_cmd.FIELDS))
+        self.assertEqual(set(doc["verdicts"][0]), set(verdict_cmd.FIELDS) | {"anchored"})
 
     def test_per_benchmark_status_is_the_worst_metric(self):
         rows = [verdict_row(metric="m1"), verdict_row(metric="m2", status="suspected")]

@@ -15,7 +15,7 @@
 """Apply each declared loop carry: make its update an in-place write.
 
 ``splice_while_loops`` declares each accumulator carry of a ``for_each_tile``
-loop with a :class:`~torch_spyre._inductor.loop_info.LoopCarryRecord` on the
+loop with a :class:`~torch_spyre._inductor.loop_node.LoopCarryRecord` on the
 carry's storage (its pre-loop initial buffer) and on its update (the body op
 that computes the next trip's value). It leaves the body pure: the update
 writes its own buffer, and the loop's result is that buffer.
@@ -37,7 +37,7 @@ from torch._inductor import ir
 from torch._inductor.graph import GraphLowering
 
 from .logging_utils import get_inductor_logger
-from .loop_info import LoopCarryRecord
+from .loop_node import LoopCarryRecord
 from .loop_node import OpsView, all_ops, has_loop_nodes
 from .pass_utils import invalidate_op_read_writes, redirect_computed_buffer_reads
 from .wsr.while_loop_bridge import (

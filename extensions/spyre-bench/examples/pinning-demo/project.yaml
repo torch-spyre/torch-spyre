@@ -6,7 +6,7 @@ kind: Project
 metadata: {name: pinning-demo}
 spec:
   packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
-  default_suites: [decode]
+  default_suites: [decode]  # tp2 holds the one-process-per-rank variant: --suite tp2
   default_environment: node-a-unpinned
   visibility: public
   groupings:
@@ -82,3 +82,8 @@ apiVersion: bench/v1alpha1
 kind: Model
 metadata: {name: demo-llm-a}
 spec: {assets: [{role: weights, asset: demo-llm-a-weights}], family: demo, architecture: decoder-only}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: tp2}
+spec: {type: perf}

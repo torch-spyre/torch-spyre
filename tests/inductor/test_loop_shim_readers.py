@@ -14,7 +14,7 @@
 
 """A reader that takes its facts from a shim op's index: the cost features.
 
-``LoopShim`` carries no per-read lists, so ``cost_features.extract_op_features`` reads
+A strict ``LoopInfo`` carries no per-read lists, so ``cost_features.extract_op_features`` reads
 whether an operand advances at a level from the access's index. The device-free
 accessor tests are in ``test_loop_shim.py``; this file runs the reader on the shim ops
 of real compiled graphs and checks the loop facts it reports against what the plan
@@ -27,7 +27,6 @@ from torch._inductor.ir import ComputedBuffer
 
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.cost_features import extract_op_features
-from torch_spyre._inductor.loop_info import LoopShim
 from torch_spyre._inductor.loop_node import all_ops
 
 from test_span_overflow_gate import CASES, _shaped, compile_span_overflow
@@ -45,7 +44,9 @@ def _features_of_the_looped_ops(case):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         for op in all_ops(graph.operations):
             info = getattr(op, "loop_info", None)
-            if isinstance(op, ComputedBuffer) and isinstance(info, LoopShim):
+            if isinstance(op, ComputedBuffer) and getattr(
+                info, "strict_loop_vars", False
+            ):
                 features = extract_op_features(op)
                 rows.append(
                     (

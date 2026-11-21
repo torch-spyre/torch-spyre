@@ -16,7 +16,7 @@
 
 The lowering itself is ``wsr/loop_tiling_lowering.py`` (entry point
 ``tile_groups(graph, groups)``): it divides each tiled op's ranges by the loop's
-trip count and gives every member a ``LoopShim``. This module keeps what that
+trip count and gives every member a ``LoopInfo``. This module keeps what that
 lowering shares with the ``for_each_tile`` lowering:
 
   - the range and layout division (``_divide_ranges``, ``_divide_reduction_ranges``),
@@ -66,6 +66,7 @@ from torch_spyre._C import SpyreTensorLayout
 
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..loop_facts import counted_loop_path
 from ..loop_node import move_before
 from ..pass_utils import (
     op_out_coords,
@@ -237,7 +238,7 @@ def _find_outside_consumers_planned(
     of objects (planning is zero-mutation, so there's no reason to carry
     object references past this stage), and looks up each candidate's outer loop-group key from
     name_to_group_outer_key (built once by the caller from the planned
-    CoarseTileInfo dict) instead of a not-yet-stamped op.loop_info attribute.
+    LoopInfo dict) instead of a not-yet-stamped op.loop_info attribute.
     """
     outer_key = group_loop_id[0]
     consumer_names: list[str] = []
@@ -878,8 +879,8 @@ def _find_outside_consumers(
             continue
         if not _reads_buffer(op, buf_name):
             continue
-        li = getattr(op, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
+        path = counted_loop_path(op, include_extern=True)
+        if not path or path[0] != outer_key:
             consumers.append(op)
 
     is_graph_output = buf_name in _graph_output_names()

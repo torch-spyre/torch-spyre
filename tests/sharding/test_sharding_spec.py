@@ -17,6 +17,10 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+from pathlib import Path
+
+import torch
 
 import pytest
 from torch.distributed.tensor import Replicate, Shard
@@ -206,3 +210,204 @@ def test_receipt_rejects_nonpositive_shard_bytes():
 
     with pytest.raises(ValueError, match="positive"):
         validate_sharded_receipt(receipt, 8, -128)
+
+
+def test_coverage_guard_passes_when_device_tests_executed():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=2,
+        vf_capable=True,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "pass"
+    assert message is None
+
+
+def test_coverage_guard_fails_when_vf_host_ran_nothing():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=0,
+        vf_capable=True,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "fail"
+    assert "bound VFs" in message
+
+
+def test_coverage_guard_warns_when_no_device():
+    from device_suite import device_coverage_verdict
+
+    verdict, message = device_coverage_verdict(
+        device_collected=36,
+        device_executed=0,
+        suite_collected=2,
+        suite_executed=0,
+        vf_capable=False,
+        runtime_open=False,
+        collect_only=False,
+    )
+    assert verdict == "warn"
+    assert "0 of 36" in message
+
+
+def test_coverage_guard_passes_on_collect_only_and_subsets():
+    from device_suite import device_coverage_verdict
+
+    # --collect-only: nothing was supposed to run.
+    assert device_coverage_verdict(36, 0, 2, 0, True, False, True)[0] == "pass"
+    # A -k selection that deselected the wrapper: the in-process skip of a
+    # hand-picked device test is by design, not silent rot.
+    assert device_coverage_verdict(1, 0, 0, 0, True, False, False)[0] == "pass"
+    # Runtime already open: the wrapper skips by design (run files alone).
+    verdict, _ = device_coverage_verdict(36, 0, 2, 0, True, True, False)
+    assert verdict == "warn"
+
+
+def test_vf_mode_is_promoted_to_emulation_before_the_runtime_loads(monkeypatch):
+    from device_env import promote_vf_mode_to_emulation
+    from torch_spyre._inductor import config as spyre_config
+
+    if not hasattr(torch, "spyre"):
+        pytest.skip(
+            "TORCH_DEVICE_BACKEND_AUTOLOAD=0: torch.spyre is not registered, "
+            "so the runtime-open interplay this test pins cannot exist"
+        )
+
+    # The promotion must be a no-op once the runtime is open (the mode is
+    # fixed then). Earlier tests in a combined run may have opened it, so
+    # pin the state this test reasons about instead of inheriting it.
+    monkeypatch.setattr(torch.spyre, "is_initialized", lambda: False)
+
+    # promote() rewrites torch_spyre._inductor.config.sencores directly
+    # when that module is already imported, and monkeypatch.setenv does
+    # not undo that — the core count would leak to later tests in this
+    # process (on a device-less runner the conftest never rewrote it).
+    # patch() restores the attribute on exit, whatever the calls inside
+    # did to it. (Not monkeypatch.setattr: pytest 9.2 regression.)
+    with spyre_config.patch(sencores=spyre_config.sencores):
+        # The whole suite runs in the emulation shape: a full-core VF
+        # environment (SENCORES=32) is rewritten to EMUL1p5 with SENCORES
+        # forced into the sharded-admitting shapes.
+        monkeypatch.setenv("FLEX_DEVICE", "VF")
+        monkeypatch.setenv("SENCORES", "8")
+        assert promote_vf_mode_to_emulation() is True
+        assert os.environ["FLEX_DEVICE"] == "EMUL1p5"
+        assert os.environ["SENCORES"] == "8"
+
+        monkeypatch.setenv("FLEX_DEVICE", "VF")
+        monkeypatch.setenv("SENCORES", "32")
+        assert promote_vf_mode_to_emulation() is True
+        assert os.environ["FLEX_DEVICE"] == "EMUL1p5"
+        assert os.environ["SENCORES"] == "8"
+
+        monkeypatch.setenv("FLEX_DEVICE", "VF")
+        monkeypatch.setenv("SENCORES", "16")
+        assert promote_vf_mode_to_emulation() is True
+        assert os.environ["SENCORES"] == "16"
+        monkeypatch.delenv("SENCORES")
+
+        # Other modes are left alone (PF stays PF; unset stays unset).
+        monkeypatch.setenv("FLEX_DEVICE", "PF")
+        assert promote_vf_mode_to_emulation() is False
+        assert os.environ["FLEX_DEVICE"] == "PF"
+        monkeypatch.delenv("FLEX_DEVICE")
+        assert promote_vf_mode_to_emulation() is False
+        assert "FLEX_DEVICE" not in os.environ
+
+        # With the runtime already open, even VF is left alone.
+        monkeypatch.setattr(torch.spyre, "is_initialized", lambda: True)
+        monkeypatch.setenv("FLEX_DEVICE", "VF")
+        monkeypatch.setenv("SENCORES", "8")
+        assert promote_vf_mode_to_emulation() is False
+        assert os.environ["FLEX_DEVICE"] == "VF"
+
+
+def test_session_is_sharding_only():
+    """The scoping gate for the VF -> emulation promotion (see conftest).
+
+    Pure function of the session's path arguments and the invocation
+    directory: the rewrite must apply only when nothing outside
+    tests/sharding is collected. The repo layout is fixed, so real paths
+    are used, resolved against a fake invocation directory.
+    """
+    from device_suite import session_is_sharding_only
+
+    repo = Path(__file__).resolve().parents[2]
+    sharding = repo / "tests" / "sharding"
+
+    # A bare pytest (no args) collects from the invocation directory: inside
+    # promotes, the repo root does not.
+    assert session_is_sharding_only([], sharding) is True
+    assert session_is_sharding_only([], repo) is False
+
+    # Paths and node ids inside the directory.
+    assert session_is_sharding_only(["tests/sharding"], repo) is True
+    assert (
+        session_is_sharding_only(["tests/sharding/test_sharded_add.py"], repo) is True
+    )
+    assert (
+        session_is_sharding_only(
+            ["tests/sharding/test_sharded_add.py::test_eager_add_on_sharded_inputs"],
+            repo,
+        )
+        is True
+    )
+    assert (
+        session_is_sharding_only([str(sharding / "test_sharding_spec.py")], repo)
+        is True
+    )
+
+    # Relative to a different invocation directory (cd tests && pytest sharding).
+    assert session_is_sharding_only(["sharding"], repo / "tests") is True
+
+    # Anything outside, alone or mixed with an inside path.
+    assert session_is_sharding_only(["tests"], repo) is False
+    assert session_is_sharding_only(["tests/test_allocator_e2e.py"], repo) is False
+    assert (
+        session_is_sharding_only(
+            ["tests/sharding/test_sharded_add.py", "tests/test_allocator_e2e.py"], repo
+        )
+        is False
+    )
+    assert session_is_sharding_only([".."], sharding) is False
+
+
+def test_coverage_guard_never_probes_when_the_verdict_cannot_use_it():
+    """The vf-capability probe opens the card in a subprocess; it must not
+    run on a session whose verdict ignores it (review finding on #6206:
+    --collect-only paid ~12 s for a probe whose answer was discarded, and
+    a completed run probed while the parent still held the card)."""
+    from device_suite import device_coverage_verdict
+
+    def boom() -> bool:
+        raise AssertionError("the probe must not run on this verdict path")
+
+    # --collect-only.
+    assert device_coverage_verdict(36, 0, 2, 0, boom, False, True)[0] == "pass"
+    # The session executed its device tests (or wrappers).
+    assert device_coverage_verdict(36, 5, 2, 1, boom, False, False)[0] == "pass"
+    assert device_coverage_verdict(0, 0, 2, 2, boom, False, False)[0] == "pass"
+    # Nothing guard-marked was selected at all.
+    assert device_coverage_verdict(0, 0, 0, 0, boom, False, False)[0] == "pass"
+    # The runtime is open: the wrapper skipped by design, no probe needed.
+    assert device_coverage_verdict(36, 0, 2, 0, boom, True, False)[0] == "warn"
+
+    # On the one path that needs it, the callable is consulted.
+    calls = []
+
+    def counting() -> bool:
+        calls.append(1)
+        return True
+
+    assert device_coverage_verdict(36, 0, 2, 0, counting, False, False)[0] == "fail"
+    assert calls == [1]

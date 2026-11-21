@@ -91,7 +91,13 @@ class _Probe:
     def hand_off(self, original):
         def wrapper(graph):
             operations = getattr(graph.operations, "real", graph.operations)
-            self.inductions.update(loop_node._inductions_of(operations))
+            self.inductions.update(
+                {
+                    node.group_id: node.induction
+                    for node in loop_node._nodes_in(operations)
+                    if node.induction is not None
+                }
+            )
             return original(graph)
 
         return wrapper

@@ -22,7 +22,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import ReadWrites
 from torch._inductor.graph import GraphLowering
 
-from .loop_info import LoopCarryRecord
+from .loop_node import LoopCarryRecord
 from .loop_node import LoopNode, all_ops, remove_op
 
 
