@@ -40,7 +40,7 @@ every step of turning one into tiled, schedulable ops:
    op is the tile and which of its own index variables is the tiled one.
 
 4. Stamp: _stamp_direct_loop_info directly constructs and stamps a
-   CoarseTileInfo on every op in a spliced group, one nesting level at a
+   LoopInfo on every op in a spliced group, one nesting level at a
    time, from ground truth already available at this point -- trip count
    (from the prover), loop var (from the spliced body), and tiled-dim
    position (from lookup_marker_dim, or a structural fallback anchored on
@@ -1251,7 +1251,7 @@ def _consume_tile_dim_markers(
     ``ComputedBuffer`` are ``(unsafe_hash=False, eq=True)`` dataclasses, so
     Python sets their ``__hash__`` to ``None`` and they cannot be dict/set
     keys directly (see ``coarse_tile.py``'s ``plan: dict[int,
-    CoarseTileInfo]`` docstring for the same, already-established
+    LoopInfo]`` docstring for the same, already-established
     convention in this codebase for using ``id()`` instead of the object).
     But ``id(op)`` itself is NOT safe here the way it is for that other
     convention's own single-pass, single-object lifetime: a *later*
@@ -1537,6 +1537,8 @@ def _consume_tile_dim_markers(
             # `_marker_dim(op) is not None` individually -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
             # matters, on `_marker_resolution(op)`.
             marker_op.tile_marker_resolution = MarkerResolution.INLINE_ERASED
+            # A plain list edit is right here: this runs inside splice_while_loops,
+            # before ``collapse`` builds any LoopNode, so there is no node to tell.
             operations.remove(marker_op)
             if marker_op in group_ops:
                 group_ops.remove(marker_op)
@@ -1714,7 +1716,7 @@ def _stamp_direct_loop_info(
     trip_count: sympy.Expr,
     group_idx: int,
 ) -> None:
-    """Directly construct and stamp one CoarseTileInfo level per op.
+    """Directly construct and stamp one LoopInfo level per op.
 
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
@@ -1726,9 +1728,9 @@ def _stamp_direct_loop_info(
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
     why stamping is deferred to a single final phase in this order. Each
-    call extends whatever single CoarseTileInfo a strictly-outer level's
+    call extends whatever single LoopInfo a strictly-outer level's
     own call already stamped, never overwriting it. ``op.loop_info`` is
-    ALWAYS a single ``CoarseTileInfo`` (never a list of them): its per-level
+    ALWAYS a single ``LoopInfo`` (never a list of them): its per-level
     list fields (loop_group_id/loop_count/loop_tiled_dims/
     loop_tiled_reduction_dims) encode every nesting level inside ONE object,
     outermost first. An access's per-trip advance is not recorded: it is the
@@ -1755,7 +1757,7 @@ def _stamp_direct_loop_info(
     from torch._inductor.ir import Reduction
 
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_info import LoopInfo
     from torch_spyre._inductor.propagate_hints import DimHint
     from torch_spyre._inductor.pass_utils import op_out_coords
     from torch_spyre._inductor.wsr.loop_tiling_common import (
@@ -1919,7 +1921,7 @@ def _stamp_direct_loop_info(
         return None
 
     for op in group_ops:
-        existing: CoarseTileInfo | None = getattr(op, "loop_info", None)
+        existing: LoopInfo | None = getattr(op, "loop_info", None)
 
         prior_hints = list(getattr(op, "dim_hints", None) or [])
         op.dim_hints = [
@@ -2023,7 +2025,7 @@ def _stamp_direct_loop_info(
         # ``loop_group_id[0]`` agrees across an outer loop's members and
         # ``scheduler.py`` groups siblings, not nests.
         if existing is None:
-            op.loop_info = CoarseTileInfo(
+            op.loop_info = LoopInfo(
                 loop_group_id=(group_idx,),
                 loop_count=[trip_count],
                 loop_tiled_dims=[loop_tiled_dims],
@@ -2272,10 +2274,12 @@ def _identity_chain_has_valid_loop_advances(
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
 
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_info import LoopInfo
 
     final_info = getattr(final_consumer, "loop_info", None)
-    if not isinstance(final_info, CoarseTileInfo):
+    # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+    # lowering, so no strict_loop_vars op exists yet.
+    if not isinstance(final_info, LoopInfo):
         return False
 
     def memory_reads(op):
@@ -2289,7 +2293,9 @@ def _identity_chain_has_valid_loop_advances(
     ]
     for reader in readers:
         reader_info = getattr(reader, "loop_info", None)
-        if not isinstance(reader_info, CoarseTileInfo):
+        # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+        # lowering, so no strict_loop_vars op exists yet.
+        if not isinstance(reader_info, LoopInfo):
             return False
         reader_group = reader_info.loop_group_id
         if (
@@ -2384,7 +2390,7 @@ def _is_declared_carry_update(op: Any) -> bool:
     No known graph reaches this check: it restores the earlier behaviour (a
     carry update was never a candidate) and has no test that depends on it.
     """
-    from torch_spyre._inductor.loop_info import LoopCarryRecord
+    from torch_spyre._inductor.loop_node import LoopCarryRecord
 
     record = getattr(op, "_loop_carry_record", None)
     return isinstance(record, LoopCarryRecord) and record.update_name == op.get_name()
@@ -2399,7 +2405,7 @@ def _contract_cross_scope_input_materializations(
     A full graph can normalize a non-contiguous graph input before an outer
     ``for_each_tile`` and then select successively smaller tiles in nested
     loops.  The loop-external normalization intentionally has no
-    :class:`CoarseTileInfo`; it is not a loop operation.  Instead of assigning
+    :class:`LoopInfo`; it is not a loop operation.  Instead of assigning
     it fictitious loop membership, bypass the intervening pure identities,
     make the final consumer read that normalization with the composed loop
     address, and save the equivalent graph-input read for the post-layout
@@ -2410,10 +2416,8 @@ def _contract_cross_scope_input_materializations(
     from torch._inductor.ir import FixedLayout
 
     from torch_spyre._inductor.constants import MATMUL_REDUCTION_OPS
-    from torch_spyre._inductor.loop_info import (
-        CoarseTileInfo,
-        ReadCopyElisionRecord,
-    )
+    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
     from torch_spyre._inductor.wsr.loop_tiling_common import (
         _rescale_index,
@@ -2534,7 +2538,9 @@ def _contract_cross_scope_input_materializations(
             if not valid_chain or terminal_consumer is None or terminal_dep is None:
                 continue
             terminal_info = getattr(terminal_consumer, "loop_info", None)
-            if not isinstance(terminal_info, CoarseTileInfo):
+            # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+            # lowering, so no strict_loop_vars op exists yet.
+            if not isinstance(terminal_info, LoopInfo):
                 continue
 
             # Keep the deepest identity that already belongs to the terminal
@@ -2573,7 +2579,9 @@ def _contract_cross_scope_input_materializations(
                     continue
 
             final_info = getattr(final_consumer, "loop_info", None)
-            if not isinstance(final_info, CoarseTileInfo):
+            # for_each_tile ops only: splice_while_loops runs before the loop-tiling
+            # lowering, so no strict_loop_vars op exists yet.
+            if not isinstance(final_info, LoopInfo):
                 continue
             if isinstance(
                 getattr(final_consumer, "_read_copy_elision_record", None),
@@ -2749,6 +2757,7 @@ def _contract_cross_scope_input_materializations(
                     None,
                 )
                 if dead_identity is not None:
+                    # Plain list edit: before ``collapse`` (see _consume_tile_dim_markers).
                     operations.remove(dead_identity)
                     graph.removed_buffers.add(name)
             transformed = True
@@ -2831,7 +2840,7 @@ def _contract_exact_stride_input_materializations(
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
 
-    from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.wsr.loop_tiling_common import (
         _AddLoopTermHandler,
         _NameSwapHandler,
@@ -3227,7 +3236,7 @@ def splice_while_loops(graph) -> None:
 
     Runs to a fixed point (handles nested for_each_tile, whose inner
     WhileLoop only appears after the outer one's body has been spliced in).
-    Directly constructs and stamps CoarseTileInfo per accepted group from
+    Directly constructs and stamps LoopInfo per accepted group from
     ground truth (trip count, loop var, tile_dim_marker resolution, carry
     roles) via _stamp_direct_loop_info -- never hands the group to
     coarse_tile.py's planner for re-inference, since its

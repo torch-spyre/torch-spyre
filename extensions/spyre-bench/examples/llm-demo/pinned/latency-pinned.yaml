@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Pinned set: selected only through pinned@* Selections, run on a fixed subject.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-c-tp1-fp16}
+spec: {type: llm/vllm, backend: spyre, token: demo-llm-c, model: demo-llm-c, precision: fp16, flags: {max-model-len: 128}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: latency-pinned}
+spec:
+  type: perf
+  level: model
+  tier: sanity
+  system: demo-llm-c-tp1-fp16
+  workload:
+    type: llm/latency
+    shape: {batch_size: 1, input_len: 64, output_len: 64}
+    load: {executor: iterations, iterations: 2, warmup_iterations: 1}
+  environment: ref-1card
+  run: {cache: warm, repeats: 1, timeout: 5m, est: 2m}
+  variants:
+    - name: latency_pinned_demo-llm-c_tp1_in64_out64

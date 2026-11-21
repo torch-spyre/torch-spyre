@@ -1,0 +1,13 @@
+# Invalidation rows as the writer appends them (shape: core/schemas/tool-output/invalidation.shape.json).
+# Never authored in a catalog. Effect of an active row: excluded from reuse, baselines and verdicts.
+events:
+  - {id: inv-1, scope_kind: device, state: invalid, device: serial-b, from: "2026-11-02T00:00:00Z", to: "2026-11-10T00:00:00Z",
+     code: faulty_hardware, reason: "example fault on serial-b"}
+  - {id: inv-2, scope_kind: run_benchmark, state: invalid, run_id: 7c1e0000-0000-5000-8000-000000000001,
+     benchmark_id: 4f2c91ab-03d7-5a11-9c20-7d3e8b1a64f0, repeat: 2, code: measurement_bug, reason: "example measurement bug"}
+  - {id: inv-3, scope_kind: node, state: suspect, node: host-a, from: "2026-11-08T00:00:00Z", code: under_investigation,
+     reason: "under investigation"}
+  - {id: inv-4, scope_kind: node, state: restored, restores: inv-3, node: host-a, from: "2026-11-08T00:00:00Z", reason: "node cleared"}
+  - {id: inv-5, scope_kind: placement, state: invalid, placement_id: pl-a2, code: bad_config, reason: "example config error"}
+# scope_kind query is reserved; the writer rejects it until enabled:
+#   match: env.fp.device.driver=x.y.z, from 2026-11-05, state suspect

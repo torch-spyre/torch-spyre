@@ -12,17 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|spool|relay} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
 # `results` modes that never reach ClickHouse; they run on the standard library alone.
-OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload")
+OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload", "--check")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = ("artifacts", "results", "ci-run-timings", "dispatch")
+    commands = (
+        "artifacts",
+        "results",
+        "ci-run-timings",
+        "dispatch",
+        "spool",
+        "relay",
+        "bench-verdicts",
+    )
     if not argv or argv[0] not in commands:
         sys.exit(
             f"usage: python -m spyre_clickhouse_ingest {{{'|'.join(commands)}}} ..."
@@ -34,6 +42,12 @@ def main(argv=None):
         from .ci_run_timings import main as run
     elif command == "dispatch":
         from .dispatch import main as run
+    elif command == "spool":
+        from .spool_cli import main as run
+    elif command == "relay":
+        from .relay import main as run
+    elif command == "bench-verdicts":
+        from .bench_verdicts import main as run
     elif any(a.split("=")[0] in OFFLINE_FLAGS for a in rest):
         from .offline import main as run
     else:

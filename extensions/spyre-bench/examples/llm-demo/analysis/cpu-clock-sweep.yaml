@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Everything constant except the host CPU clock. env.id hashes the fingerprint, which includes the clock, so it is
+# relaxed; the other fingerprint attributes stay held because unlisted keys are held.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: cpu-clock-sweep, owner: example-team}
+spec:
+  select: {benchmarks: [serve-demo-llm-a]}
+  metric: llm.ttft.p99
+  hold: ["case.*", "system.*", "input.*", "subject.id", "env.label.*"]
+  relax: ["env.id", "env.placement_id", "env.node", "run.profile_level"]
+  vary: ["env.fp.cpu.base_ghz"]
+  output: {controlled_sets: true, rank_variables: true, noise: series_floor, chart: dots-per-vary-key}

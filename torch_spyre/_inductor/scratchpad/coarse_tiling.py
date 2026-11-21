@@ -44,7 +44,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
-from ..loop_facts import counted_loop_path
+from ..loop_facts import counted_loop_path, is_looped
 from ..loop_node import request_loop_nodes
 from ..pass_utils import (
     _prepare_per_core_view,
@@ -432,7 +432,7 @@ def _is_spliced(op: Operation) -> bool:
     set to every op of each level; no other tiling source sets that field
     (see ``loop_var_ranges_from_dim_hints`` in pass_utils.py).
     """
-    return getattr(op, "loop_info", None) is not None and any(
+    return is_looped(op) and any(
         h.loop_var is not None and h.loop_var_range is not None
         for h in getattr(op, "dim_hints", None) or []
     )
@@ -808,7 +808,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
     tiled = {name for name, spec in choices.items() if not spec.is_untiled}
     for op in graph.operations:
         name = op.get_operation_name()
-        added = name not in before and getattr(op, "loop_info", None) is not None
+        added = name not in before and is_looped(op)
         if name in tiled or added:
             setattr(op, JOINT_TILING_AND_DIVISION_ATTR, True)
 

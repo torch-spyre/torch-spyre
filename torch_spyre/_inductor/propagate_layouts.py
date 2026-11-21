@@ -89,6 +89,7 @@ from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
     concretize_expr,
+    dense_relocation_serves_read,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
@@ -104,6 +105,8 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    non_stick_reduction_vars,
+    output_is_indirectly_mutated,
     op_read_writes,
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
@@ -794,6 +797,24 @@ def _qfp8wt_stl(
     )
 
 
+def _with_input_ea(
+    out_stl: SpyreTensorLayout, output_dep: MemoryDep, ea: ElementArrangement
+) -> SpyreTensorLayout:
+    """``out_stl`` tagged with the staggered ``ea`` when its stick has an order.
+
+    An output stick with no host dim (a broadcast stick), or only size-1 ones,
+    holds a lone element that no arrangement moves, and the D2H restore has no
+    stick dim to identify ("Unable to determine the stick dimension"), so it stays
+    STANDARD. Decided from the access coordinates, not ``stride_map[-1]``, as
+    ``_typecast_layouts`` does.
+    """
+    coords = try_device_coordinates(out_stl, output_dep, None)
+    stick_vars = coords[-1].free_symbols if coords else ()
+    if any(concretize_expr(output_dep.ranges[v]) > 1 for v in stick_vars):
+        return out_stl.with_element_arrangement(ea)
+    return out_stl
+
+
 def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
@@ -822,9 +843,31 @@ def _reduction_layout_from_stl(
 
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
-        # TODO(#5966): as in _default_pointwise_layout, try a dense relocation of
-        # the stick before returning the sparse output, and derive the output
-        # candidates below from the relocated layout.
+        # The stick moved to another real dim serves the read densely; derive the
+        # output from the read on that layout, as for any other input layout.
+        # Probed without indirect_sizes or op, as above; see the note on the same
+        # call in _default_pointwise_layout.  The reduced variables must stay off
+        # the stick for a prod (#4409): the widest dim the reshape leaves alone is
+        # often the reduced one, and the check below would then decline to
+        # preserve the layout while the input was still restickified onto it.
+        # This site probes without op (above), so the relocation cannot apply
+        # output_is_indirectly_mutated itself; it is applied here instead.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(
+                stl,
+                in_layout,
+                dep,
+                forbidden_stick_syms=non_stick_reduction_vars(
+                    data.reduction_type, dep, output_dep
+                ),
+            )
+        )
+        if relocated is not None:
+            stl = relocated
+            x_dev_coords = try_device_coordinates(stl, dep, None)
+    if x_dev_coords is None:
         if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
             # As for a pointwise op below.
             # TODO(#5872): return the sparse output as one candidate next to the
@@ -866,6 +909,19 @@ def _reduction_layout_from_stl(
             ]
             if out_stl is not None
         ]
+        # Reducing a non-stick dim keeps each stick's element order, so a
+        # staggered EA on the input still describes the output. When the
+        # reduction consumes the stick dim the stagger is gone and the output
+        # stays STANDARD. See #5553.
+        if (
+            stl.element_arrangement in STAGGERED_EAS
+            and reduction_var is not None
+            and reduction_var not in x_stick_expr.free_symbols
+        ):
+            output_stls = [
+                _with_input_ea(out_stl, output_dep, stl.element_arrangement)
+                for out_stl in output_stls
+            ]
         if output_stls:
             return output_stls
 
@@ -915,6 +971,7 @@ def _default_pointwise_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     aten_op,
+    op: "Operation | None" = None,
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for the default single-arg pointwise case.
 
@@ -971,11 +1028,24 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
-        # TODO(#5966): before returning the sparse output, try a dense
-        # relocation of the stick (see compute_restickify_needed) and derive the
-        # output candidates below from the relocated layout, as for any other
-        # input layout. The sparse output stays as the fallback for a read with
-        # no dim to move the stick to.
+        # As in _reduction_layout: a dense relocation of the stick serves the
+        # read, so the normal candidates below are derived from it.
+        # No indirect_sizes or op here, matching the try_device_coordinates calls
+        # around it; compute_restickify_needed probes with both, so the two can
+        # pick different targets for a read with indirect symbols. It checks the
+        # target it picks against this output (stick_compatible) and reports the
+        # restickify infeasible when they disagree, so a mismatch costs a
+        # discarded candidate rather than a wrong layout.
+        # As at the reduction site: probed without op, so the gate is applied here.
+        relocated = (
+            None
+            if output_is_indirectly_mutated(op)
+            else dense_relocation_serves_read(stl, in_layout, dep)
+        )
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
         if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
             # A read the input's layout cannot serve (flattening [8, 65] into
             # [520] splits a stick): compute_restickify_needed moves the input to
@@ -1073,7 +1143,9 @@ def _single_arg_op_layout(
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
             return [_qfp8wt_stl(output, in_layout)]
 
-    return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
+    return _default_pointwise_layout(
+        stl, dep, in_layout, output, output_dep, aten_op, op
+    )
 
 
 def _clone_layout(

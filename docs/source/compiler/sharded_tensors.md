@@ -105,7 +105,11 @@ Copies a CPU tensor into a sharded Spyre tensor. Arguments:
   dimension to split, or the single-element list `[Shard(dim)]`. Exactly one
   placement is admitted (there is no multi-dimensional mesh); `dim` may be
   negative. The named dimension must divide into `num_shards` equal,
-  non-empty shards.
+  non-empty shards: its size must be a multiple of `num_shards`. The shard
+  count is never reduced to fit; an unshardable dimension is rejected before
+  any allocation, and the error lists the dimensions that would divide.
+  For example, `Shard(0)` on a `[3, 32, 64]` tensor with 8 shards is rejected
+  (3 elements cannot split into 8 shards) and suggests dims 1 and 2.
 * **`num_shards`** — keyword-only. Must be 8 or 16 and must equal the active
   core count (`SENCORES`), so storage and the kernels that consume it agree
   on how many cores participate. Omitted, it defaults to the active core
