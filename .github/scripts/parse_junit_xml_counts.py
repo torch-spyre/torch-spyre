@@ -57,8 +57,7 @@ def suite_duration_seconds(xml_path: Path) -> float:
     """Sum of every <testcase time="..."> in the report.
 
     Summing testcase times (rather than trusting the <testsuite time="...">
-    header) is the same defensive read _test_matrix.yaml's empty-suite check
-    uses for testcase counts -- pytest-xdist writes unreliable suite-level
+    header) is a defensive read: pytest-xdist writes unreliable suite-level
     attributes in some configurations.
     """
     if not xml_path.is_file():

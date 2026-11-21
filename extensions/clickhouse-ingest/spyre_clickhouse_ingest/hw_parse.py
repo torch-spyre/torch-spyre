@@ -232,7 +232,9 @@ _RAS_NAME_TO_REASON = {
 _RE_ANSI = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _RE_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 
-# Jobs that are CI infrastructure, not test suites — skip them entirely
+# Jobs that are CI infrastructure, not test suites — skip them entirely.
+# "test matrix result" and "report empty test suites" were removed from _test_matrix.yaml on
+# 2026-11-17 (#6387). They stay listed so that runs from before then still parse when re-ingested.
 _SKIP_JOB_NAMES = re.compile(
     r"^(detect changed files|run spyre unit tests|ingest|push.*(clickhouse|diagnostics)"
     r"|collect suites for|build torch-spyre wheel|generate test matrix"
