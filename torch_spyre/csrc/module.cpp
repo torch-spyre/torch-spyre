@@ -299,6 +299,21 @@ PYBIND11_MODULE(_C, m) {
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);
+  m.def(
+      "_correction_upload_stats",
+      []() {
+        const spyre::CorrectionUploadStats stats =
+            spyre::correction_upload_stats();
+        py::dict result;
+        result["launches"] = stats.launches;
+        result["prefixed"] = stats.prefixed;
+        result["bytes_full"] = stats.bytes_full;
+        result["bytes_sent"] = stats.bytes_sent;
+        return result;
+      },
+      "Process-lifetime counters of program-correction uploads: host-compute "
+      "launches, uploads cut to the current trip count, bytes held by the "
+      "correction regions and bytes uploaded");
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);

@@ -422,6 +422,61 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
  * @param hc_props  Properties from the ComputeOnHost command.
  * @param h2d_props Properties from the adjacent DataTransfer H2D command.
  */
+namespace {
+
+// Which host-compute input slots a correction's symbol definitions read, from
+// the Hcm's variable data conversion info: inputSym_ holds one symbol id per
+// input slot and every definition is an array whose terms name a symbol as
+// "V-<id>". An empty result means the metadata did not have this shape, and
+// the launch then uploads the whole correction.
+std::vector<bool> correctionReadsInputs(const nlohmann::json& hcm) {
+  std::vector<bool> reads;
+  try {
+    if (!hcm.contains("vdci")) {
+      return reads;
+    }
+    const nlohmann::json& vdci = hcm["vdci"];
+    if (!vdci.contains("inputSym_") || !vdci["inputSym_"].is_array() ||
+        !vdci.contains("variableDefs_") || !vdci["variableDefs_"].is_array()) {
+      return reads;
+    }
+    std::vector<std::string> tokens;
+    for (const auto& symbol : vdci["inputSym_"]) {
+      if (symbol.is_number_integer()) {
+        tokens.push_back("V-" +
+                         std::to_string(std::llabs(symbol.get<int64_t>())));
+      } else if (symbol.is_string()) {
+        tokens.push_back(symbol.get<std::string>());
+      } else {
+        return reads;
+      }
+    }
+    reads.assign(tokens.size(), false);
+    for (const auto& definition : vdci["variableDefs_"]) {
+      if (!definition.is_array()) {
+        continue;
+      }
+      for (const auto& term : definition) {
+        if (!term.is_string()) {
+          continue;
+        }
+        const std::string value = term.get<std::string>();
+        for (size_t slot = 0; slot < tokens.size(); ++slot) {
+          if (value == tokens[slot]) {
+            reads[slot] = true;
+          }
+        }
+      }
+    }
+  }
+  catch (const std::exception&) {
+    reads.clear();
+  }
+  return reads;
+}
+
+}  // namespace
+
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
     const nlohmann::json& hc_props, const nlohmann::json& h2d_props) {
   // ---- Parse ComputeOnHost properties ----
@@ -513,9 +568,19 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
   flex::CompositeAddress device_address =
       compute_offset_address(job_allocation_.at(0), device_ptr, transfer_size);
 
+  // What the launch needs to cut a symbolic loop's upload to the iterations
+  // that run: the size of the address table leading the blob (the Hcm's
+  // second senconst, written first by the host executor) and the input slots
+  // this step's definitions read.
+  size_t address_table_bytes = 0;
+  if (hcm_data->senConstants.size() == 2) {
+    address_table_bytes = hcm_data->senConstants[1].sizeInBytes();
+  }
+  std::vector<bool> reads_input = correctionReadsInputs(hc_props["hcm"]);
+
   return std::make_unique<JobPlanStepHostCompute>(
       std::move(hcm_data), correction_size, std::move(device_address), inp_ptr,
-      std::move(ishape));
+      std::move(ishape), address_table_bytes, std::move(reads_input));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
