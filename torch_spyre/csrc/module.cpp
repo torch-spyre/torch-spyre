@@ -297,6 +297,13 @@ PYBIND11_MODULE(_C, m) {
         "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
+  m.def(
+      "flush_cb_dump", []() { return flex::RuntimeContext::flushCbDump(); },
+      py::call_guard<py::gil_scoped_release>(),
+      "Write flex's control-block dump (FLEX_CB_TIMELINE_FILE) now and return "
+      "the number of rows "
+      "written. Call at the end of a run, before teardown; no-op when the dump "
+      "is disabled.");
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);
 
