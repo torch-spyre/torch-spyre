@@ -38,11 +38,6 @@ _INDEX_2D_EAGER = rejection(
     "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
     r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
 )
-_COPY_D2D_UNALIGNED = rejection(
-    5383,
-    "compile copy_from_d2d of a sliced view requires a stick-aligned storage_offset.",
-    r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
-)
 _POINTWISE_NO_LAYOUT = rejection(
     6388,
     "compile RoPE: cos/sin gathered from a cache and sliced feed pointwise ops: Multi-arg pointwise has no supported output layout.",
@@ -350,11 +345,7 @@ class TestGatherPagedAttentionAndSDPA:
         """Gather RoPE position embeddings → apply rotate-half → SDPA."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6388
-        _xfail_existing(
-            execution_mode,
-            eager=_COPY_D2D_UNALIGNED,
-            compiled=_POINTWISE_NO_LAYOUT,
-        )
+        _xfail_existing(execution_mode, compiled=_POINTWISE_NO_LAYOUT)
         pool, H, D, Lk = 512, 8, 64, 32
         half = D // 2
         cos_sin = cached_randn(
