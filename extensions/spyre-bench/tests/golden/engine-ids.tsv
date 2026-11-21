@@ -38,3 +38,5 @@ postgres-demo	pgbench-tpcb/system=tuned/clients=c32	06d6ea5c-5e1b-5daf-b5f3-fde0
 postgres-demo	pgbench-tpcb/system=tuned/clients=c64	dbc12f4a-5273-5f17-9d50-d9834fe8f8fa	02c7d55f-c7ad-5225-9891-e21956d7a303	f70667bf-8885-53be-8d21-b34497b26699
 pinning-demo	decode-probe/out=out1	b0bde9a7-7881-5b78-afee-577fb941b226	fa8113f6-32e5-5a6c-b6f3-a826fc6f3188	f2b2d8a4-9159-55b4-983b-6914a5df521b
 pinning-demo	decode-probe/out=out129	1614c1e7-b2b8-5836-8afe-a1cf7e9061d3	390804bc-a82a-53b5-b323-966c7fc19712	f2b2d8a4-9159-55b4-983b-6914a5df521b
+pinning-demo	decode-probe-tp2/out=out1	3419cc6c-b107-5765-bede-ab6d01d5dc9d	de112c00-cf3a-5ecb-9fac-356011429bf7	f2b2d8a4-9159-55b4-983b-6914a5df521b
+pinning-demo	decode-probe-tp2/out=out129	0b6ba859-6d6b-54f3-aabf-01dd1deaa1ad	1f59011b-7ff5-5a33-8a40-1f244d8a2407	f2b2d8a4-9159-55b4-983b-6914a5df521b
