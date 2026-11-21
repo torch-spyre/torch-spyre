@@ -139,6 +139,9 @@ def test_connect_hands_out_a_guarded_client_by_default(captured):
         "# note\nDROP TABLE t",
         "/* c */ CREATE OR REPLACE VIEW v AS SELECT 1",
         "GRANT SELECT ON db.* TO u",
+        "REPLACE TABLE t AS SELECT 1",
+        "\ufeffCREATE TABLE t (a Int8)",
+        "#! note\nCREATE TABLE t (a Int8)",
     ],
 )
 def test_a_writer_connection_never_sends_schema_statements(sql):

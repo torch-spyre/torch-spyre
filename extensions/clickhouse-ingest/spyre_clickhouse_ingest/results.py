@@ -2040,7 +2040,14 @@ def main(argv=None, assigned_trust=""):
     run_started = None
 
     # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
-    bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
+    try:
+        bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
+    except Exception as err:  # a v2 host that is down must not cost the v1 rows
+        print(
+            f"  [warn] v2 benchmark gate failed, v1 unaffected: {err!r}",
+            file=sys.stderr,
+        )
+        bench_ready = False
     if args.purpose and not bench_ready:
         _refuse_purpose("the v2 benchmark tables are absent or incomplete")
 

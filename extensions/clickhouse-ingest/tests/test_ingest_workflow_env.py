@@ -173,3 +173,23 @@ def test_an_unset_prod_v2_secret_never_falls_through_to_the_dev_one(wf):
             ln for ln in text.splitlines() if ln.strip().startswith(f"{name}: ${{{{")
         ]
         assert lines and all("toJSON(secrets." in ln for ln in lines), lines
+
+
+def test_the_covered_tier_lookup_refuses_half_a_v2_login(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith(("CLICKHOUSE_", "CH_"))
+    }
+    env.update(
+        CLICKHOUSE_HOST="legacy.example.com", CLICKHOUSE_DB_V2="spyre_v2",
+        CLICKHOUSE_V2_HOST="v2.example.com", CLICKHOUSE_V2_USER="w",
+    )  # fmt: skip
+    p = subprocess.run(
+        [sys.executable, str(REPO / ".github/scripts/resolve_covered_tiers.py"),
+         "--commit-sha", "ab12", "--arch", "x86_64"],
+        capture_output=True, text=True, env=env, cwd=tmp_path,
+    )  # fmt: skip
+    assert p.returncode == 0 and "set both CLICKHOUSE_V2_USER" in p.stderr

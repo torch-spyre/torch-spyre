@@ -86,8 +86,8 @@ class ClickHouseEnv:
 
     @classmethod
     def v2_secure(cls) -> bool:
-        raw = cls.get("CLICKHOUSE_V2_SECURE")
-        return cls.secure() if not raw else raw not in ("0", "false", "no")
+        raw = cls.get("CLICKHOUSE_V2_SECURE").lower()
+        return cls.secure() if not raw else raw not in ("0", "false", "no", "off")
 
     @classmethod
     def v2_databases(cls) -> tuple:
@@ -118,11 +118,11 @@ class WriterClient:
     """A data-write client that refuses schema statements before they reach the server.
 
     A guard against mistakes, not a boundary: the writer login's grants are. Reads, inserts,
-    lightweight `DELETE FROM` and `INSERT ... SELECT` pass; every ALTER is refused.
+    lightweight `DELETE FROM` and `INSERT ... SELECT` pass; every ALTER and REPLACE is refused.
     """
 
     SCHEMA_VERBS = frozenset(
-        "CREATE ALTER DROP TRUNCATE RENAME EXCHANGE ATTACH DETACH UNDROP GRANT REVOKE".split()
+        "CREATE ALTER DROP TRUNCATE RENAME EXCHANGE ATTACH DETACH UNDROP REPLACE GRANT REVOKE".split()
     )
     _LEAD = re.compile(
         r"\s*(?:(?:--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*([A-Za-z]+)",
@@ -144,7 +144,7 @@ class WriterClient:
             return
         if not isinstance(sql, str):
             raise SchemaStatementOnWriter("statement is not text; refused on a writer")
-        m = cls._LEAD.match(sql)
+        m = cls._LEAD.match(sql.lstrip("\ufeff"))
         if m and m.group(1).upper() in cls.SCHEMA_VERBS:
             raise SchemaStatementOnWriter(
                 f"{m.group(1).upper()} on a writer connection; use "
@@ -161,6 +161,10 @@ class WriterClient:
             return attr(*args, **kwargs)
 
         return guarded
+
+
+class V2Unavailable(RuntimeError):
+    """The v2 client could not be opened when a statement first needed it."""
 
 
 class CrossHostStatement(RuntimeError):
@@ -197,10 +201,12 @@ class RoutedClient:
     """The legacy-host client plus a lazily opened v2-host client, chosen per statement.
 
     A statement goes to the v2 host when, ignoring comments and string literals, it names a v2
-    database: `db.table` (any quoting or case), a bare `FROM/USE/DATABASE db`, or a string that is
-    exactly a database name compared with a database column (`WHERE database = 'db'`). One that
-    also names a table on the legacy host raises CrossHostStatement. Everything else, unqualified
-    and system statements included, stays on the legacy host.
+    database: `db.table` (any quoting; names are case-sensitive, as in ClickHouse), a bare
+    `FROM/USE/DATABASE db`, a table-function argument (`merge(db, ...)`), a string that is exactly
+    a database name compared with a database column (`database = 'db'`, either side, `IN`,
+    `LIKE`), or a database-like parameter (`{db:String}`, `{x:Identifier}`). One that also names a
+    table on the legacy host raises CrossHostStatement. Everything else, unqualified and system
+    statements included, stays on the legacy host.
     """
 
     _ROUTED_BY_SQL = WriterClient._GUARDED - {"command", "query"}
@@ -209,11 +215,15 @@ class RoutedClient:
         "WHERE GROUP ORDER LIMIT HAVING SETTINGS UNION FORMAT PREWHERE WINDOW QUALIFY".split()
     )
     _DB_COLUMNS = frozenset({"database", "table_schema", "db", "db_name"})
+    _COMPARE = frozenset({"IN", "LIKE", "ILIKE"})
+    _TABLE_FUNCTIONS = frozenset(
+        "MERGE REMOTE REMOTESECURE CLUSTER CLUSTERALLREPLICAS".split()
+    )
 
     def __init__(self, legacy, v2_factory, v2_databases):
         self.legacy, self._factory, self._v2 = legacy, v2_factory, None
         self.v2_databases = tuple(v2_databases)
-        self._names = {d.lower() for d in self.v2_databases}
+        self._names = set(self.v2_databases)
         self._settings: dict = {}
         self._lock = threading.Lock()
 
@@ -233,21 +243,27 @@ class RoutedClient:
         if self._v2 is not None:
             self._v2.set_client_setting(key, value)
 
+    def _is_compare(self, tok) -> bool:
+        return tok == ("sym", "=") or (
+            tok[0] == "word" and tok[1].upper() in self._COMPARE
+        )
+
+    def _is_db_column(self, tok) -> bool:
+        return tok[0] == "word" and tok[1].lower() in self._DB_COLUMNS
+
     def _is_db_literal(self, toks, i) -> bool:
+        """A string compared with a database column, on either side."""
         j = i - 1
         while j >= 0 and toks[j] == ("sym", "("):
             j -= 1
-        if j >= 0 and (
-            toks[j] == ("sym", "=")
-            or (toks[j][0] == "word" and toks[j][1].upper() == "IN")
-        ):
-            j -= 1
-            return (
-                j >= 0
-                and toks[j][0] == "word"
-                and toks[j][1].lower() in self._DB_COLUMNS
-            )
-        return False
+        if j >= 1 and self._is_compare(toks[j]) and self._is_db_column(toks[j - 1]):
+            return True
+        after = toks[i + 1 : i + 3]
+        return (
+            len(after) == 2
+            and self._is_compare(after[0])
+            and self._is_db_column(after[1])
+        )
 
     def _hits(self, sql: str) -> tuple[bool, bool]:
         """(names a v2 database, names a qualified table elsewhere) for one statement."""
@@ -255,6 +271,7 @@ class RoutedClient:
         first = toks[0][1].upper() if toks and toks[0][0] == "word" else ""
         v2 = other = False
         in_from: dict[int, bool] = {}  # paren depth -> inside that depth's FROM list
+        func: dict[int, str] = {}  # paren depth -> the function that opened it
         depth = 0
 
         def word(k):
@@ -267,10 +284,16 @@ class RoutedClient:
             prev, prev2 = word(i - 1), word(i - 2)
             if kind == "sym" and text == "(":
                 depth += 1
-                in_from[depth] = False
+                in_from[depth], func[depth] = False, prev
             elif kind == "sym" and text == ")":
                 in_from.pop(depth, None)
+                func.pop(depth, None)
                 depth = max(0, depth - 1)
+            table_arg = (
+                func.get(depth, "") in self._TABLE_FUNCTIONS
+                and i > 0
+                and toks[i - 1] in (("sym", "("), ("sym", ","))
+            )
             if kind == "word":
                 up = text.upper()
                 if up == "FROM":
@@ -278,27 +301,30 @@ class RoutedClient:
                 elif up == "SELECT" or up in self._ENDS_FROM:
                     in_from[depth] = False
             if kind == "str":
-                if text.lower() in self._names and self._is_db_literal(toks, i):
+                if text in self._names and (table_arg or self._is_db_literal(toks, i)):
                     v2 = True
-            elif kind == "word" and text.lower() in self._names:
-                if qualified or prev in _DB_KEYWORDS:
+            elif kind == "word" and text in self._names:
+                if qualified or table_arg or prev in _DB_KEYWORDS:
                     v2 = True
             elif kind == "word" and qualified and text.lower() != "system":
                 after_join = prev == "JOIN" and prev2 != "ARRAY"
                 listed = in_from.get(depth, False) and toks[i - 1] == ("sym", ",")
                 create_as = first == "CREATE" and prev == "AS"
+                renamed = first in ("RENAME", "EXCHANGE") and prev in ("TO", "AND")
                 if (
-                    prev in ("INTO", "TABLE", "FROM")
+                    prev in ("INTO", "TABLE", "FROM", "IN")
                     or after_join
                     or listed
                     or create_as
+                    or renamed
+                    or table_arg
                 ):
                     other = True
         return v2, other
 
     def route(self, table=None, database=None, sql=None, parameters=None):
         """The backend client for one statement."""
-        if isinstance(database, str) and database.lower() in self._names:
+        if isinstance(database, str) and database in self._names:
             return self.v2
         if isinstance(table, str) and self._hits(f"INTO {table}")[0]:
             return self.v2
@@ -310,10 +336,17 @@ class RoutedClient:
                 )
             if v2:
                 return self.v2
+        idents = (
+            set(re.findall(r"\{(\w+):Identifier\}", sql))
+            if isinstance(sql, str)
+            else set()
+        )
         if isinstance(parameters, dict) and any(
             isinstance(v, str)
-            and v.lower() in self._names
-            and (k in self._DB_COLUMNS or k.endswith("_database"))
+            and v in self._names
+            and (
+                k in self._DB_COLUMNS or k.endswith(("_database", "db")) or k in idents
+            )
             for k, v in parameters.items()
         ):
             return self.v2
@@ -416,7 +449,8 @@ class ClickHouse:
             )
 
     @classmethod
-    def _open(cls, role: str, v2: bool, database: str, verify: bool):
+    def _params(cls, role: str, v2: bool, database: str) -> dict:
+        """The connection arguments for one host; SystemExit names a bad setting."""
         host = cls.ENV.v2_host() if v2 else cls.ENV.host()
         if not host:
             raise SystemExit(
@@ -429,18 +463,29 @@ class ClickHouse:
                 ("CLICKHOUSE_V2_PASSWORD" if v2 else "CLICKHOUSE_PASS")
                 + " is unset or empty -- check the secrets mapping"
             )
+        port_var = (
+            "CLICKHOUSE_V2_PORT"
+            if v2 and cls.ENV.get("CLICKHOUSE_V2_PORT")
+            else "CLICKHOUSE_PORT"
+        )
         port_raw = cls.ENV.v2_port() if v2 else cls.ENV.port()
         try:
             port = int(port_raw)
         except ValueError:
-            raise SystemExit(f"CLICKHOUSE_PORT is not a number: {port_raw!r}") from None
-        client = clickhouse_connect.get_client(
+            raise SystemExit(f"{port_var} is not a number: {port_raw!r}") from None
+        return dict(
             host=host,
             port=port,
             user=user,
             password=password,
             database=database,
             secure=secure,
+        )
+
+    @classmethod
+    def _open(cls, role: str, params: dict, verify: bool):
+        client = clickhouse_connect.get_client(
+            **params,
             verify=verify,
             # No session: a timed-out request keeps its session locked server-side, so every
             # retry or probe on the same client would fail with SESSION_IS_LOCKED.
@@ -458,25 +503,41 @@ class ClickHouse:
 
         `role='writer'` (default) refuses schema statements; `role='schema'` is for the applier,
         ensure-table steps and sandbox administration. With CLICKHOUSE_V2_HOST set, a connection
-        to a v2 database goes to that host and any other one is a RoutedClient.
+        to a v2 database goes to that host and any other one is a RoutedClient. Every v2 setting
+        is checked here, before anything is written; the v2 client itself opens on first use.
         """
         if role not in (cls.WRITER, cls.SCHEMA):
             raise ValueError(f"unknown role {role!r}")
         database = database or cls.ENV.database()
+        v2_dbs = cls.ENV.v2_databases()
         if not cls.ENV.v2_host():
-            wants_v2 = cls.ENV.target_database() or database in cls.ENV.v2_databases()
+            wants_v2 = cls.ENV.target_database() or database in v2_dbs
             if wants_v2 and cls.ENV.flag("CH_REQUIRE_V2_HOST"):
                 raise SystemExit(
                     "CH_REQUIRE_V2_HOST is set and a v2 database is configured, but "
                     "CLICKHOUSE_V2_HOST is unset or empty -- the write would go to the legacy host"
                 )
-            return cls._open(role, False, database, verify)
-        if database in cls.ENV.v2_databases():
-            return cls._open(role, True, database, verify)
+            return cls._open(role, cls._params(role, False, database), verify)
+        v1 = cls.ENV.database()
+        if v1 in v2_dbs and v1 != cls.ENV.target_database():
+            raise SystemExit(
+                f"CH_V2_DATABASES names CLICKHOUSE_DB ({v1}): every v1 statement would go to "
+                "the v2 host"
+            )
+        if database in v2_dbs:
+            return cls._open(role, cls._params(role, True, database), verify)
+        v2_params = cls._params(role, True, cls.ENV.v2_default_database())
+
+        def open_v2():
+            try:
+                return cls._open(role, v2_params, verify)
+            except (
+                SystemExit
+            ) as stop:  # a SystemExit here would skip the caller's handlers
+                raise V2Unavailable(str(stop)) from None
+
         return RoutedClient(
-            cls._open(role, False, database, verify),
-            lambda: cls._open(role, True, cls.ENV.v2_default_database(), verify),
-            cls.ENV.v2_databases(),
+            cls._open(role, cls._params(role, False, database), verify), open_v2, v2_dbs
         )
 
     @staticmethod
