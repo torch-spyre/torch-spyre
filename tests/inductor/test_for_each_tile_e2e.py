@@ -1237,7 +1237,7 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
 
 def _record_loop_membership(result: dict):
     """A pre-scheduling pipeline that records, once it is done, where the ops that
-    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+    claim a loop (``enclosing_loops``) sit in the node tree.
 
     An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
     constant to the head of the graph and it keeps its ``loop_info`` (see
@@ -1245,6 +1245,7 @@ def _record_loop_membership(result: dict):
     ``result`` is filled in rather than kept on the class, so tests share no state.
     """
     from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_facts import enclosing_loops
     from torch_spyre._inductor.loop_node import LoopNode
 
     class _Record(CustomPreSchedulingPasses):
@@ -1252,10 +1253,8 @@ def _record_loop_membership(result: dict):
             super().__call__(graph)
 
             def claims_a_loop(op):
-                return (
-                    not isinstance(op, SpyreConstantFallback)
-                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-                    is not None
+                return not isinstance(op, SpyreConstantFallback) and bool(
+                    enclosing_loops(op)
                 )
 
             result["top_level"] = [

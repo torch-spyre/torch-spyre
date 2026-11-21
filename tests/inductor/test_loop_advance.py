@@ -37,6 +37,7 @@ from torch._inductor.virtualized import V
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor.loop_facts import (
+    is_looped,
     output_advance,
     output_advances_anywhere,
     read_advance,
@@ -257,7 +258,7 @@ class _Recorder:
     def check(self, kernel, tensor, is_input, name, result):
         ir_node = kernel.current_node.node
         op_name = ir_node.get_operation_name()
-        if getattr(ir_node, "loop_info", None) is None:
+        if not is_looped(ir_node):
             assert result is None
             dep = _kernel_read_dep(kernel, ir_node, name) if is_input else None
             assert (

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import dataclasses
 import logging
 from collections import defaultdict
@@ -28,7 +27,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_facts import counted_loop_path, enclosing_loops, is_looped
 from .read_copy_elision import ReadCopyElisionRecord
-from .loop_node import move_after, move_before, record_loop_info
+from .loop_node import move_after, move_before, record_member
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -495,48 +494,43 @@ def _transfer_loop_info(
     restick_arg_info: RestickifyArgInfo,
     shared_loop_depth: int,
 ) -> None:
-    """Assign loop_info to a newly-created restickify buffer.
+    """Make a newly placed restickify buffer a member of its consumer's loops.
 
-    When coarse-tiling has already annotated the consumer op with loop_info,
-    the restickify node must also carry loop_info to remain contiguous in
-    build_loop_scheduler_nodes: it gets a copy of the consumer's. Which accesses
-    advance is the index's business (``_moved_loop_term`` moves the loop term to
-    the copy when the copy takes over the swapped read's advance).
+    When the consumer is in a loop, the copy was just placed beside it (so it is in
+    the same nodes) and must be told what it tiles: it tiles what the consumer
+    tiles. That is how it stays contiguous in the loop's node. Which accesses
+    advance is the index's business (``_moved_loop_term`` moves the loop term to the
+    copy when the copy takes over the swapped read's advance).
 
     No shared loop scope (``old_name_buf`` is not itself a tiled stage): the copy
     reads a fixed full copy of ``old_name_buf``, made once, and its output is
-    consumed at a fixed address by every trip, so its extent is pinned.
+    consumed at a fixed address by every trip, so its extent is pinned, and it tiles
+    nothing: the consumer's tiled dims (e.g. a per-tile token dim) would be misread
+    against this copy's own unrelated dim at the same index.
+    work_division_constraints.py reads them to pin a dim's split to 1, so a stale
+    entry would block the split this full, untiled copy needs to fit the per-core
+    span limit (issue #6277).
+
+    TODO(#5863 8.3): that fixed full copy sits inside the loop body and runs on
+    every trip. Placing it before the node (insert_before) would run it once;
+    test_embedding_restickify_table_no_span_overflow is the acceptance case.
     """
-    source_li = getattr(old_name_buf, "loop_info", None)
-    consumer_li = getattr(op, "loop_info", None)
-    if consumer_li is None:
+    consumer_levels = enclosing_loops(op)
+    if not consumer_levels:
         return
-    restick_buff.loop_info = copy.deepcopy(consumer_li)
-    has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+    has_shared_loop_scope = is_looped(old_name_buf) and shared_loop_depth > 0
+    if has_shared_loop_scope:
+        tiling = [
+            (level.tiled_dims, level.tiled_reduction_dims) for level in consumer_levels
+        ]
+    else:
+        tiling = [((), ()) for _ in consumer_levels]
+    record_member(restick_buff, tiling, like=op)
     if not has_shared_loop_scope:
-        # Also clear loop_tiled_dims/loop_tiled_reduction_dims: left as the
-        # consumer's (e.g. a per-tile token dim), they get misread against this
-        # copy's own unrelated dim at the same index. work_division_constraints.py
-        # reads them to pin a dim's split to 1, so a stale entry here blocks the
-        # split this full, untiled copy needs to fit the per-core span limit
-        # (issue #6277).
-        # TODO(#5863 8.3): this fixed full copy sits inside the loop body and runs on
-        # every trip. Once insert_restickify is node-aware, place it before the node
-        # (insert_before) so it runs once; an op outside every loop cannot carry a
-        # stale loop_tiled_dims. Stage 9 needs another source for the dims
-        # coarse_tile_local_dim_split_domains pins once loop_tiled_dims is deleted;
-        # test_embedding_restickify_table_no_span_overflow is the acceptance case.
-        levels = len(getattr(consumer_li, "loop_count", []) or [])
-        restick_buff.loop_info = dataclasses.replace(
-            restick_buff.loop_info,
-            loop_tiled_dims=[[] for _ in range(levels)],
-            loop_tiled_reduction_dims=[[] for _ in range(levels)],
-        )
         # Only this case needs the pin: a tiled-stage copy advances per trip and
         # takes its extent from the tile, while this fixed copy takes the whole
         # operand's, which may be symbolic (a reserved pool).
         _pin_fixed_copy_extent_to_declared_max(restick_buff)
-    record_loop_info(restick_buff)
 
 
 def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:

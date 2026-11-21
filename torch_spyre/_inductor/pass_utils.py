@@ -5473,7 +5473,12 @@ def format_operations(operations: list[Operation]) -> str:
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
             if levels := enclosing_loops(op):
-                buf.write(f"\n  loop_levels={list(levels)}")
+                # No induction: a node knows it, the flat path's stamp does not,
+                # and the two paths' dumps are compared.
+                buf.write(
+                    "\n  loop_levels="
+                    f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"
+                )
             buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

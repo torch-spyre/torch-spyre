@@ -34,6 +34,7 @@ the equivalence tests that compare against the flat path.
 from __future__ import annotations
 
 import contextlib
+import copy
 import contextvars
 from collections.abc import Iterable, Iterator, Mapping, MutableSequence
 from dataclasses import dataclass, field
@@ -461,6 +462,39 @@ def _set_chain(entry: ir.Operation, chain: tuple["LoopNode", ...]) -> None:
         entry._loop_chain = chain  # type: ignore[attr-defined]
 
 
+def record_member(
+    op: ir.Operation,
+    tiling: Iterable[tuple[Iterable[int], Iterable[int]]],
+    *,
+    like: ir.Operation | None = None,
+) -> None:
+    """``op``, already placed in built nodes, is a member of their loops, and tiles
+    ``tiling[level] = (tiled_dims, tiled_reduction_dims)`` at each level, outermost
+    first. This is how a pass that puts a new op into a loop says what the op is
+    to the loop; nothing is stamped on the op. Raises ``ValueError`` if the op is in
+    no node or ``tiling`` does not have one entry per node around it.
+
+    A graph with no built nodes (``BUILD_LOOP_NODES`` off: the flat path the
+    equivalence tests compare against, deleted in stage 9.5) has nowhere to record
+    it. If ``like`` (the neighbour the op was placed beside) is given, the op gets
+    a copy of the neighbour's ``loop_info`` with this tiling instead.
+    """
+    chain = getattr(op, "_loop_chain", ())
+    tiling = [(tuple(dims), tuple(reduction)) for dims, reduction in tiling]
+    if not chain and like is not None and not BUILD_LOOP_NODES:
+        info = copy.deepcopy(like.loop_info)  # type: ignore[attr-defined]
+        info.loop_tiled_dims = [list(dims) for dims, _ in tiling]
+        info.loop_tiled_reduction_dims = [list(red) for _, red in tiling]
+        op.loop_info = info  # type: ignore[attr-defined]
+        return
+    if not chain or len(chain) != len(tiling):
+        raise ValueError(
+            f"{op.get_name()} is in {len(chain)} loop node(s), not {len(tiling)}"
+        )
+    for node, entry in zip(chain, tiling):
+        node.tiling[op.get_name()] = entry
+
+
 def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
     """``target`` stands in for ``source`` (a rebuilt or a probe copy of it, same
     name): it is a member of the same loops. The nodes' tiling is keyed by name, so
@@ -842,5 +876,6 @@ def expand(graph: Any) -> None:
         return
     with building_loop():
         operations[:] = list(all_ops(operations))
-        for op in operations:
-            op._loop_chain = ()  # type: ignore[attr-defined]
+        # The ops keep their ``_loop_chain``: the nodes still exist (the scheduler
+        # patch calls this after it built its nodes, and each LoopNode keeps its
+        # body), so the chain and the node's tiling stay true for kernel codegen.

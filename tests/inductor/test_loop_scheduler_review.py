@@ -53,6 +53,7 @@ from torch_spyre._inductor import config, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import work_division
 from torch_spyre._inductor.ir import SpyreConstantFallback
+from torch_spyre._inductor.loop_facts import is_looped
 from torch_spyre._inductor.loop_node import (
     LoopNode,
     all_ops,
@@ -314,7 +315,7 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
             for node in graph.operations
             if isinstance(node, LoopNode) and node.body
             for op in (node.body[0], node.body[-1])
-            if isinstance(op, ComputedBuffer) and getattr(op, "loop_info", None) is None
+            if isinstance(op, ComputedBuffer) and not is_looped(op)
         ]
         # The clones hoisted in this compile, each in the unbroken run of hoisted
         # clones that ends right before a node (several are hoisted to one loop).
