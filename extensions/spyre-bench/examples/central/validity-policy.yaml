@@ -43,3 +43,43 @@ spec:
       requires: {qualification: any, clean: clean, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
       baseline: false
       reference: false
+---
+# Quality: a score is trusted for its data checks, not for node cleanliness or timing. Nothing here gates a check.
+apiVersion: bench/v1alpha1
+kind: ValidityPolicy
+metadata: {name: demo-quality, owner: example-team, description: "quality purposes as data gates, central"}
+spec:
+  applies_to: [quality]
+  purposes:
+    pr:
+      description: "sanity subset on a PR: usable for an advisory check, never a baseline"
+      floor: suspect
+      requires: {min_repeats: 1, gates: [llm.records_complete, llm.no_errors]}
+      baseline: false
+      reference: false
+    nightly:
+      floor: shared_env
+      requires: {min_repeats: 1, gates: [llm.dataset_digest, llm.records_complete, llm.no_errors, llm.no_truncation, llm.harness_pinned, llm.model_pinned, llm.determinism]}
+      baseline: true
+      reference: false
+    weekly:
+      floor: shared_env
+      requires: {min_repeats: 1, gates: [llm.dataset_digest, llm.records_complete, llm.no_errors, llm.no_truncation, llm.harness_pinned, llm.model_pinned, llm.determinism]}
+      baseline: true
+      reference: false
+    release:
+      floor: valid
+      requires: {min_repeats: 1, gates: [llm.dataset_digest, llm.records_complete, llm.no_errors, llm.no_truncation, llm.harness_pinned, llm.model_pinned, llm.determinism]}
+      baseline: true
+      reference: true
+    reference:
+      description: "a score generated to compare others with: strict data checks, no clean-node requirement"
+      floor: valid
+      requires: {min_repeats: 1, gates: [llm.dataset_digest, llm.records_complete, llm.no_errors, llm.no_truncation, llm.harness_pinned, llm.model_pinned, llm.determinism]}
+      baseline: true
+      reference: true
+    investigate:
+      floor: suspect
+      requires: {min_repeats: 1, gates: [llm.records_complete]}
+      baseline: false
+      reference: false

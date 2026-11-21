@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata:
+  name: granite
+spec:
+  type: perf
+  level: layer
+  tier: core
+  system: op-library
+  est_hours: 0.3
+  workload:
+    type: kernel/layer
+    model: granite
+    layer: decoder
+    load:
+      executor: iterations
+      iterations: 20
+      warmup_iterations: 3
+  run:
+    command:
+      - python3
+      - benchmarks/tools/run_kernel_case.py
+      - --model
+      - '{benchmark}'
+      - --config
+      - '{case.flags.config}'
+      - --mode
+      - '{case.flags.mode}'
+      - --suite-dir
+      - '{out_dir}/suite'
+      - --raw-dir
+      - '{raw_dir}'
+      - --repeat-dir
+      - '{repeat_dir}'
+  identity:
+    mode: ingest
+    profile: perf-kernel
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: config_name, from: case.flags.config}
+      - {key: input_shapes, value: ''}
+      - {key: run_mode, from: case.flags.mode}
+      - {key: kernel_name, value: ''}
+      - {key: is_total, value: ''}
+  matrix:
+    name_template: granite_{config}_{mode}
+    axes:
+      config:
+        - token: full-model
+          patch: {workload: {flags: {config: full_model}}}
+        - token: one-block
+          patch: {workload: {flags: {config: one_block}}}
+      mode:
+        - token: prefill
+          patch: {workload: {bucket: [1, 512], flags: {mode: prefill_only}}}
+        - token: decode
+          patch: {workload: {bucket: [4, 128], flags: {mode: decode_only}}}
+        - token: generate
+          patch: {workload: {bucket: [4, 128], flags: {mode: generate}}}

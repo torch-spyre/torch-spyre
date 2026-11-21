@@ -81,9 +81,9 @@ spec:
     - {key: run.clean.devices_exclusive, class: run, role: root, type: enum, values: [enforced, none, unknown], stored_in: benchmark_runs.props, description: "enforced whenever a claim shows the card reserved to the one workload"}
     - {key: run.clean.load_clean, class: run, role: root, type: bool, stored_in: benchmark_runs.props, description: "probe before/during/after load check came back clean"}
     - {key: run.clean.throttled, class: run, role: root, type: bool}
-    - {key: run.exec.cpu_pinning, class: run, role: root, type: enum, values: [none, device_local, per_device, explicit], stored_in: benchmark_runs.props, description: "requested policy; join key for pinned vs unpinned comparisons"}
+    - {key: run.exec.cpu_pinning, class: run, role: root, type: enum, values: [none, device_local, per_device, explicit, platform], stored_in: benchmark_runs.props, description: "requested policy (platform: the stack pins itself, not verified); join key for pinned vs unpinned comparisons"}
     - {key: run.exec.cpu_set, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "union of the CPUs the process tree is allowed on, canonical range string; absent when not observed"}
-    - {key: run.exec.cpu_set_source, class: run, role: root, type: enum, values: [explicit, device_numa, unresolved, none], stored_in: benchmark_runs.props, description: "where the requested set came from"}
+    - {key: run.exec.cpu_set_source, class: run, role: root, type: enum, values: [explicit, device_numa, unresolved, platform, none], stored_in: benchmark_runs.props, description: "where the requested set came from"}
     - {key: run.exec.pinning_verified, class: run, role: root, type: enum, values: ["true", "false", "unknown"], stored_in: benchmark_runs.props, description: "every observed thread inside the requested set; unknown when not observable, never true by default"}
     - {key: run.exec.pinning_violations, class: run, role: root, type: int, order: numeric, stored_in: benchmark_runs.props, description: "threads outside the requested set; absent when unknown"}
   metrics:
