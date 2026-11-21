@@ -569,8 +569,8 @@ must keep qualifying its tables.
 ## Write resilience
 
 `resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
-a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet except the `spool` command and there is no
-probe.** It is a building block with deliberately small promises.
+a Keeper blip, an `insert_quorum` that is briefly unmet). It is a building block with deliberately
+small promises; `writes.py` wires it into the ingests (see "In the ingests" below).
 
 What it promises:
 
@@ -622,9 +622,8 @@ What it promises:
 
 What it does not promise:
 
-- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
-  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
-  window has not passed; neither is small enough to ship without a probe.
+- No automatic replay. Parked batches stay until a person acts (`spool replay`, below, is run by
+  hand and refuses a plain table).
 - No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
   on a plain table.
 - `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
@@ -651,8 +650,18 @@ Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 
 ```text
 python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
 python -m spyre_clickhouse_ingest spool list --fail-if-pending   # same; exit 75 if anything is parked
+python -m spyre_clickhouse_ingest spool replay [TOKEN]   # resend under the original token
 python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
 ```
+
+`replay` resends a batch only to a Replicated table with a nonzero dedup window, under the token it
+was first sent with, so a batch that did land is a no-op; it drops the file once the batch is
+stored and keeps it otherwise (one attempt per run). A `held` batch is also refused when the
+window cannot be read or the batch is older than `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600 s),
+since the server may have evicted its token. The JSON file flattens cells to text; replay turns
+top-level DateTime, Date, UUID and Decimal columns back into those types from `system.columns`
+and sends through the normal client, so run it on a host in the same time zone as the original
+writer (a naive datetime is read as local time).
 
 A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
 rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
@@ -664,7 +673,32 @@ leftover `.tmp` files; all of them count toward the size cap, and the quarantine
 data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
 opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
 a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
-The spool refuses a directory that is a symlink or owned by another user. The spool directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+The spool refuses a directory that is a symlink or owned by another user. The spool directory is `CH_WRITE_SPOOL`, else `$RUNNER_TEMP/ch-spool`; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+
+### In the ingests
+
+`CH_WRITE_RESILIENCE=auto` (the default; `off` disables it) sends `Table.insert`, the v2 copy of
+`hw_failure_diagnostics` and `result_invalidations` through `resilient_insert` when the target's
+engine is Replicated (one `system.tables` read per client and table, which also says whether a
+materialized view reads the table). A plain table, a table the login cannot see and a failed
+lookup keep the existing `insert_chunks` path, and the legacy v1 inserts never look: their
+statements are the same as without this module. Every call gets its own token scope, so identical
+rows written by two calls are never merged; the quorum never degrades.
+
+Rows that cannot land are parked in the spool and the insert raises `BatchParked`. The results
+ingest then marks the file and withholds the artifact verdict of its run (the first terminal
+verdict wins, and one built from the files that did land could be green); `--strict` fails on a
+withheld verdict. The CLI and the hw-diagnostics script exit 75 (EX_TEMPFAIL) after a clean run
+that parked rows and append a rows-free list of the parked tables to `$GITHUB_STEP_SUMMARY`. The
+ingest composite actions upload `spool list` output as a `ch-spool-manifest-*` artifact, never the
+spool itself, which holds full rows and dies with an ephemeral runner: re-run the job, or set
+`CH_WRITE_SPOOL` to a persistent directory on a self-hosted runner and `spool replay` there.
+
+A re-run of a v2 test-results file converges: with `--run-attempt`, a file counts as ingested
+only while no rows of an earlier attempt remain, and the new attempt is inserted before the old
+one is deleted, so an insert that parks or fails leaves the previous attempt whole. Artifact
+verdicts follow the same order. A run that stops between deleting old rows and rebuilding
+`run_case_counters` still leaves the counters stale, as before.
 
 ## What is deliberately NOT here
 
