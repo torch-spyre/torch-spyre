@@ -144,10 +144,37 @@ def test_a_rerun_verdict_replaces_the_earlier_attempts():
     assert dict(zip(cols, rows[0]))["props"]["run_attempt"] == "2"
 
 
+def test_a_rerun_verdict_is_inserted_before_the_earlier_attempts_are_dropped():
+    c = FakeClient(run_count=0)
+    log = []
+    c.insert = lambda table, *a, **k: log.append(("insert", table))
+    c.command = lambda sql, parameters=None: log.append(("command", sql.split()[0]))
+    assert _verdict(c, 2)
+    assert log.index(("insert", "artifact_results")) < log.index(("command", "DELETE"))
+
+
+class OnlyThisAttempt(FakeClient):
+    def query(self, sql, parameters=None):
+        self.queries.append((sql, parameters or {}))
+
+        class R:
+            result_rows = [(0 if "< {attempt" in sql else 1,)]
+
+        return R()
+
+
 def test_a_verdict_from_this_attempt_is_not_rewritten():
-    c = FakeClient(run_count=1)
+    c = OnlyThisAttempt()
     assert _verdict(c, 2)
     assert c.commands == [] and not [i for i in c.inserts if i[0] == "artifact_results"]
+
+
+def test_a_rerun_after_a_stop_between_insert_and_delete_drops_the_older_verdict():
+    c = FakeClient(run_count=1)  # this attempt's verdict and an older one both count
+    assert _verdict(c, 2)
+    assert not [i for i in c.inserts if i[0] == "artifact_results"]
+    (sql, params) = c.commands[0]
+    assert sql.startswith("DELETE FROM db.artifact_results") and params["attempt"] == 2
 
 
 def test_no_attempt_keeps_first_write_wins_for_verdicts():

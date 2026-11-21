@@ -52,11 +52,10 @@ from spyre_clickhouse_ingest import (
     get_client,
     insert_artifact_result,
     insert_benchmarks,
-    insert_test_results,
     promote_xpass,
     capability_declaration,
     cases_already_ingested,
-    drop_older_case_attempts,
+    replace_case_attempt,
     benchmarks_already_ingested,
     component_of,
     target_database,
@@ -64,7 +63,7 @@ from spyre_clickhouse_ingest import (
     source_and_external_run_id,
     tables_present,
 )
-from spyre_clickhouse_ingest.batching import insert_chunks
+from spyre_clickhouse_ingest.batching import BatchParked, insert_chunks
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
 from spyre_clickhouse_ingest.offline import main as offline_main
@@ -1600,13 +1599,28 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
         acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
-def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
+def _write_artifact_verdicts(
+    client, v2db: str, args, legs: dict, incomplete=frozenset()
+) -> bool:
     """Write the artifact and one artifact_results row per (run_id, tier) of this leg; False
-    when a named artifact's verdicts were not all recorded."""
+    when a named artifact's verdicts were not all recorded.
+
+    A run in `incomplete` (a file of it parked or failed in v2; "" stands for any run) gets no
+    verdict: the first terminal verdict wins, and one built from the files that landed could be
+    green for a run that is not.
+    """
     if not legs or not v2db or not (artifact_spec(args)):
         return True
+    withheld = {k for k in legs if "" in incomplete or str(k[0]) in incomplete}
+    if withheld:
+        print(
+            f"  [warn] v2: verdict withheld for {len(withheld)} leg(s): a file of the run was "
+            "parked or failed. Re-run this ingest over the whole leg to record it",
+            file=sys.stderr,
+        )
+        legs = {k: v for k, v in legs.items() if k not in withheld}
     try:
-        return _write_named_artifact_verdicts(client, v2db, args, legs)
+        return _write_named_artifact_verdicts(client, v2db, args, legs) and not withheld
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
@@ -2028,6 +2042,9 @@ def main(argv=None, assigned_trust=""):
     parsed_benchmarks = 0
     total_kernels = 0
     v2_failed_files = []
+    v2_parked_files: list = []
+    # v2 run_ids with a parked or failed file; "" = unknown.
+    incomplete_runs: set = set()
 
     # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
     # files under one run_id, so a per-file write would report only the first shard's verdict.
@@ -2123,17 +2140,26 @@ def main(argv=None, assigned_trust=""):
                     )
                     _purpose_skipped(args, "the report was already ingested")
                 else:
-                    _n = insert_benchmarks(
-                        client,
-                        v2db,
-                        component_of(args, COMPONENT_DEFAULT),
-                        _v2_run_id,
-                        _bench_entries(kernels, _purpose_props(args)),
-                        report_kind="kernel",
-                        source_file=run_meta["source_file"],
-                    )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
-                    _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    try:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(kernels, _purpose_props(args)),
+                            report_kind="kernel",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    except BatchParked as _v2_parked:
+                        v2_parked_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 rows were parked")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
@@ -2211,17 +2237,26 @@ def main(argv=None, assigned_trust=""):
                     )
                     _purpose_skipped(args, "the report was already ingested")
                 else:
-                    _n = insert_benchmarks(
-                        client,
-                        v2db,
-                        component_of(args, COMPONENT_DEFAULT),
-                        _v2_run_id,
-                        _bench_entries(benchmarks, _purpose_props(args)),
-                        report_kind="benchmark",
-                        source_file=run_meta["source_file"],
-                    )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
-                    _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    try:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(benchmarks, _purpose_props(args)),
+                            report_kind="benchmark",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    except BatchParked as _v2_parked:
+                        v2_parked_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 rows were parked")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
@@ -2302,6 +2337,7 @@ def main(argv=None, assigned_trust=""):
             # v2 tables, alongside v1. Failure here must never cost a v1 row: v1 is still
             # authoritative, so the experimental write is contained rather than allowed to
             # abort the loop and drop every remaining file's v1 insert.
+            _v2_run_id = ""
             try:
                 if v2db and tables_present(client, v2db):
                     _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
@@ -2329,17 +2365,9 @@ def main(argv=None, assigned_trust=""):
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        # Before the insert, so a failed delete aborts this file (caught
-                        # below) rather than leaving two attempts' rows under one run_id.
-                        drop_older_case_attempts(
-                            client,
-                            v2db,
-                            _v2_run_id,
-                            component_of(args, COMPONENT_DEFAULT),
-                            xml_path.name,
-                            args.run_attempt,
-                        )
-                        _n = insert_test_results(
+                        # Insert, then drop the earlier attempts: one that parks or fails
+                        # keeps the previous attempt (see replace_attempt).
+                        _n = replace_case_attempt(
                             client,
                             v2db,
                             component_of(args, COMPONENT_DEFAULT),
@@ -2364,8 +2392,16 @@ def main(argv=None, assigned_trust=""):
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
                         _first_failure(_acc, cases)
                         _capability_legs(artifact_legs, _v2_run_id, cases)
+            except BatchParked as _v2_parked:
+                v2_parked_files.append(xml_path.name)
+                incomplete_runs.add(str(_v2_run_id))
+                print(
+                    f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                    file=sys.stderr,
+                )
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
+                incomplete_runs.add(str(_v2_run_id))
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
                     file=sys.stderr,
@@ -2381,7 +2417,9 @@ def main(argv=None, assigned_trust=""):
     if not _opt(args, "tag_date"):
         # The run's own day, not the ingest's: a run past midnight keeps its start date.
         args.tag_date = (run_started or datetime.now(UTC)).date()
-    verdicts_recorded = _write_artifact_verdicts(client, v2db, args, artifact_legs)
+    verdicts_recorded = _write_artifact_verdicts(
+        client, v2db, args, artifact_legs, incomplete_runs
+    )
 
     state = _purpose_state(args)
     if args.purpose and not state["rows"] and not state["skips"]:
@@ -2397,6 +2435,11 @@ def main(argv=None, assigned_trust=""):
         print(
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
+        )
+    if v2_parked_files:
+        print(
+            f"  [warn] v2 rows PARKED for {len(v2_parked_files)} file(s): "
+            + ", ".join(v2_parked_files)
         )
     if args.dry_run:
         print("  dry run -- nothing written; would write:\n" + client.report())
