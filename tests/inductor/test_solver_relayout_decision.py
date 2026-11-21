@@ -50,7 +50,7 @@ pytest.importorskip("ortools")
 
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor import config
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import ilp_solver_ortools, sa_cooptimizer, utils
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -196,7 +196,7 @@ def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(tiled):
     this parent is coarse-tiled, the same-tile-group case #5057 needs. Group 1
     is the costlier one, so the cap keeps it only if it is pinned."""
     loop_info = (
-        CoarseTileInfo(
+        LoopInfo(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[]],

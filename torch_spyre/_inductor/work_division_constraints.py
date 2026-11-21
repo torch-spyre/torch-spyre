@@ -61,7 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .loop_facts import enclosing_loops
+from .loop_facts import enclosing_loops, is_looped
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -505,7 +505,7 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
+    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``LoopInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
     ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
@@ -557,7 +557,7 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    if getattr(ctx.op, "loop_info", None) is None:
+    if not is_looped(ctx.op):
         return ConstraintResult()
     levels = enclosing_loops(ctx.op)
 
@@ -775,13 +775,11 @@ def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
 
 
 def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict TopK search-space and result dims to supported factors.
+    """Restrict TopK K-splits to factors within the per-core result limit.
 
-    TopK hardware requires at most ``TOPK_MAX_K_PER_CORE`` result rows per
-    core. Although larger divisors also meet that limit, the 4D ``k=32``
-    result-axis regression showed they produce incorrect output mapping. Keep
-    only the smallest sufficient K split until larger factors have codegen
-    support and regression coverage.
+    The reduction/search axes stay unsplit. Expose every divisor of the output
+    K axis that fits within ``SENCORES`` and leaves at most
+    ``TOPK_MAX_K_PER_CORE`` results per core.
     """
     if (
         not isinstance(ctx.op.data, Reduction)
@@ -805,7 +803,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
+    allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
@@ -1000,6 +998,17 @@ def plain_reduction_k_split_domains(
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
+    # A cross-shard reduction over the ring (sharded_hbm) splits exactly its
+    # pinned shard dim, which is a reduction var, and nothing else. That is
+    # the single split reduction dim the backend supports; keep every other
+    # reduction var unsplit.
+    if getattr(ctx.op, "shard_ring_reduction", False):
+        pinned = set(getattr(ctx.op, "shard_pinned_splits", {}) or {})
+        return ConstraintResult(
+            allowed_splits={
+                v: frozenset({1}) for v in ctx.reduction_vars if v not in pinned
+            }
+        )
     # Multi-axis: backend supports at most one split reduction dim.
     if len(ctx.reduction_vars) > 1:
         return ConstraintResult(
@@ -1013,8 +1022,8 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 
     A gather value table and scatter destination have one shared base on every
     core. Their data dims must therefore stay at split=1. A partial index stick
-    also stays unsplit unless gather-output padding made its entry slices
-    stick-aligned. Other index-entry dims remain available for multicore work.
+    also stays unsplit. Other index-entry dims remain available for multicore
+    work.
     """
     return ConstraintResult(
         allowed_splits={

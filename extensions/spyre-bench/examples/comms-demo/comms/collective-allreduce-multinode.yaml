@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A two-node CPU case: the Environment requests the interconnect as well.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: comms-demo-ws8}
+spec: {base: comms-demo-ws2, token: ws8, patch: {world_size: 8}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: collective-allreduce-multinode, owner: example-team}
+spec:
+  type: perf
+  level: collective
+  tier: extended
+  system: comms-demo-ws8
+  environment: cpu-2node
+  workload:
+    type: comms/collective
+    op: allreduce
+    algorithm: ring
+    protocol: proto-b
+    msg_bytes: 67108864
+    load: {executor: iterations, iterations: 100, warmup_iterations: 10}
+  run: {repeats: 3, timeout: 40m, est: 12m}
+  variants:
+    - name: collective_allreduce_proto-b_ring_ws8_sz64m_2node

@@ -75,11 +75,9 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
-    LoopCarryRecord,
-    copy_op_metadata,
-)
+from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
@@ -1005,7 +1003,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_only_whole_stick_partitions_are_legal(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(3)],
             loop_tiled_dims=[[]],
@@ -1042,7 +1040,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_short_loop_does_not_force_source_compatible_division(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="short_direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_info = LoopInfo(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(2)],
             loop_tiled_dims=[[]],
@@ -3226,7 +3224,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         # One counted loop holds the update and the reader. The update writes
         # through the storage.
-        loop = CoarseTileInfo(
+        loop = LoopInfo(
             loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
         )
         update_op.loop_info = loop
@@ -4877,7 +4875,7 @@ class TestFp8MatmulConsumerAlignmentOnDevice(unittest.TestCase):
 
 
 class TestTopKConstraints(unittest.TestCase):
-    def test_topk_uses_minimum_supported_split_domains(self):
+    def test_topk_exposes_all_per_core_legal_k_splits(self):
         k, search = _isym("k"), _isym("search")
         op = _computed_buffer(
             (8, 16),
@@ -4896,18 +4894,18 @@ class TestTopKConstraints(unittest.TestCase):
             )
         )
         self.assertEqual(result.allowed_splits[search], frozenset({1}))
-        self.assertEqual(result.allowed_splits[k], frozenset({2}))
+        self.assertEqual(result.allowed_splits[k], frozenset({2, 4, 8}))
 
-    def test_default_planner_uses_minimum_supported_k_split(self):
+    def test_default_planner_uses_largest_allowed_k_split(self):
         k, search = _isym("k"), _isym("search")
         splits = multi_dim_iteration_space_split(
             {k: 8, search: 16},
             32,
             [k],
             [search],
-            allowed_splits={search: frozenset({1}), k: frozenset({2})},
+            allowed_splits={search: frozenset({1}), k: frozenset({2, 4, 8})},
         )
-        self.assertEqual(splits[k], 2)
+        self.assertEqual(splits[k], 8)
         self.assertEqual(splits[search], 1)
 
 
@@ -5786,7 +5784,7 @@ class TestJointTilingAndDivisionExemption(unittest.TestCase):
     def _tiled_op(self, marked):
         op = MagicMock()
         op.get_name.return_value = "buf0"
-        # One level, as CoarseTileInfo always has: group id, count and the
+        # One level, as LoopInfo always has: group id, count and the
         # tiled-dim lists are the same length.
         op.loop_info = SimpleNamespace(
             loop_group_id=(0,),

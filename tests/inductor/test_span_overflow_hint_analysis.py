@@ -19,7 +19,7 @@ These tests intentionally mirror the compiler layers used by user
 
 1. Planner: span_overflow_hint_analysis returns a selected dim and split count.
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
-3. Coarse-tile IR: the lowering consumes the group and stamps a LoopShim.
+3. Coarse-tile IR: the lowering consumes the group and stamps a strict LoopInfo.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
 
 Coverage in this file:
@@ -30,7 +30,7 @@ Coverage in this file:
 - planner boundary errors when no legal divisor validates post-tile span;
 - hard failure when output MemoryDep address math is unavailable;
 - adapter mapping with both constant and symbolic batch output coordinates;
-- the lowering's stamping of ranges/layout/LoopShim;
+- the lowering's stamping of ranges/layout/LoopInfo;
 - equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 

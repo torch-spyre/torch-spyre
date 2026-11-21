@@ -1,0 +1,33 @@
+# End-to-end MoE serving; an optimization is a System flag, so A and B differ in one field.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: moe-demo-serve-tp4-fp16}
+spec:
+  type: llm/vllm
+  backend: spyre
+  token: moedemo
+  model: demo-moe-a
+  precision: fp16
+  tp: 4
+  flags: {max-model-len: 8192, max-num-seqs: 32, enable-chunked-prefill: true}
+  extensions:
+    spyre: {mode: a}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: moe-serve-e2e, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: extended
+  system: moe-demo-serve-tp4-fp16
+  workload: {base: trace-replay}
+  environment: ref-8card-one-node
+  metrics: {required: [llm.ttft.p99, llm.itl.median, llm.output_throughput], headline: [llm.itl.median]}
+  env: {MOE_DISPATCH: routed}
+  context: {length_mode: dataset, ttft_def: arrival_to_first_token, itl_def: token_gap, token_basis: tokenizer}
+  run: {repeats: 3, cache: warm, isolation: session, timeout: 40m}
+  matrix:
+    name_template: moe_serve_{conc}
+    axes:
+      conc: {path: workload.load.concurrency, values: [1, 8, 32], token: "c{}"}
