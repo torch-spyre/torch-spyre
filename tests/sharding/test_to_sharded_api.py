@@ -376,8 +376,11 @@ def test_device_fill_writes_every_shard(active_cores, num_shards, dim, dtype, op
     active_cores["cores"] = num_shards
     shape = [num_shards * 4, 64]
     shape[dim] = num_shards * 64
-    result = torch.spyre.to_sharded(_source(tuple(shape), dtype), Shard(dim))
+    result = torch.spyre.to_sharded(
+        _source(tuple(shape), dtype), Shard(dim), num_shards=num_shards
+    )
     before = torch.spyre.sharding_info(result)
+    assert before.num_shards == num_shards
 
     if op == "fill":
         result.fill_(3)
@@ -397,9 +400,11 @@ def test_device_fill_writes_every_shard(active_cores, num_shards, dim, dtype, op
 
 
 @_requires_spyre
-def test_device_fill_then_partial_copy_keeps_other_shards(active_cores):
-    # A fill followed by a copy into one shard: only that shard's rows move,
-    # so each shard was filled in its own chunk.
+def test_device_fill_then_copy_runs_in_order(active_cores):
+    # A fill, then a copy whose source differs from the fill only in rows
+    # 12:16: the copy must land after the fill. The copy rewrites every
+    # shard, so this checks fill/copy ordering, not that each shard is filled
+    # in its own chunk (test_device_fill_writes_every_shard checks that).
     from torch_spyre import _C
 
     result = torch.spyre.to_sharded(torch.randn(32, 64), Shard(0))
