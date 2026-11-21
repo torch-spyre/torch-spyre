@@ -41,7 +41,7 @@ from utils_inductor import expects_raise
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+from torch_spyre._inductor.op_spec import CountSource, LoopSpec, OpSpec
 
 SYM = "s0"
 TILE = 64
@@ -367,6 +367,160 @@ class TestOneParameterServesEveryLoopOnThatDimension(_BundleHarness):
 
         self.assertEqual(bundle.count(f"%dim_{SYM}_base:"), 1)
         self.assertEqual(len([k for k in kinds if k.is_loop_dimension]), 1)
+
+
+class _DeviceReadHarness(_BundleHarness):
+    """A loop whose trip count an earlier op in the bundle writes to the pool."""
+
+    COUNT_OFFSET = 4096
+    MAX_TILES = 16
+    POOL_SIZE = 65536
+
+    @staticmethod
+    def _pool_entry(sdsc_idx):
+        """One compiled OpSpec that uses the pool, so ``%pool`` is defined."""
+        return (
+            _sdsc_json(sdsc_idx),
+            [0, 0],
+            [],
+            [SymbolKind.kernel(0), SymbolKind.pool()],
+        )
+
+    def _source(self, **overrides):
+        fields = {"pool_offset": self.COUNT_OFFSET, "max_value": self.MAX_TILES}
+        fields.update(overrides)
+        return CountSource(**fields)
+
+    def _device_read_loop(self, count=None, source=None):
+        return LoopSpec(
+            count=sympy.Integer(self.MAX_TILES if count is None else count),
+            body=[_op_spec()],
+            count_from_buffer=self._source() if source is None else source,
+        )
+
+    def _run_with_producer(self, loop):
+        """The count's producer op, then ``loop`` holding one op."""
+        entries = [self._pool_entry(i) for i in range(2)]
+        bundle, _kinds = self._run([_op_spec(), loop], entries, self.POOL_SIZE)
+        return bundle
+
+
+class TestADeviceReadCountIsReadRightBeforeItsLoop(_DeviceReadHarness):
+    """The read has to come after the op that writes the count and before the
+    loop that uses it, so it cannot sit with the other loop constants at the
+    top of the bundle.
+    """
+
+    def test_producer_then_read_then_loop(self):
+        bundle = self._run_with_producer(self._device_read_loop())
+
+        producer = bundle.index('sdsc_filename="sdsc_0.json"')
+        read = bundle.index("sdscbundle.load_value_at_address")
+        loop = bundle.index("scf.for %i_0")
+        self.assertLess(producer, read, bundle)
+        self.assertLess(read, loop, bundle)
+
+    def test_the_read_and_the_loop_form(self):
+        bundle = self._run_with_producer(self._device_read_loop())
+
+        self.assertIn(
+            "%n_0 = sdscbundle.load_value_at_address %cnt_addr_0 "
+            f"{{granularity = 1, max_value = {self.MAX_TILES}}} : index",
+            bundle,
+        )
+        self.assertIn("scf.for %i_0 = %c0 to %n_0 step %c1", bundle)
+        self.assertNotIn("%loop_bound_0", bundle)
+
+    def test_the_address_is_set_up_at_the_top(self):
+        """The address is a fixed offset into the pool, so it is a constant."""
+        bundle = self._run_with_producer(self._device_read_loop())
+
+        self.assertIn(
+            f"%cnt_off_0 = arith.constant {self.COUNT_OFFSET} : index", bundle
+        )
+        self.assertIn("%cnt_addr_0 = arith.addi %pool, %cnt_off_0 : index", bundle)
+        self.assertLess(
+            bundle.index("%pool = sdscbundle.device_mem_allocate"),
+            bundle.index("%cnt_addr_0 ="),
+        )
+        self.assertLess(
+            bundle.index("%cnt_addr_0 ="), bundle.index("sdscbundle.sdsc_execute")
+        )
+
+    def test_no_division_is_authored(self):
+        bundle = self._run_with_producer(self._device_read_loop())
+
+        for forbidden in ("divsi", "divui", "ceildiv", "floordiv"):
+            self.assertNotIn(forbidden, bundle, f"authored a {forbidden}")
+
+    def test_inside_a_constant_loop_the_read_is_inside_too(self):
+        outer = LoopSpec(count=sympy.Integer(4), body=[self._device_read_loop()])
+
+        bundle = self._run_with_producer(outer)
+
+        outer_loop = bundle.index("scf.for %i_0 = %c0 to %loop_bound_0 step %c1")
+        read = bundle.index("%n_1 = sdscbundle.load_value_at_address %cnt_addr_1")
+        inner_loop = bundle.index("scf.for %i_1 = %c0 to %n_1 step %c1")
+        self.assertLess(outer_loop, read, bundle)
+        self.assertLess(read, inner_loop, bundle)
+        # Same depth as the inner loop it bounds, one deeper than the outer one.
+        self.assertIn("\n\t\t\t%n_1 = sdscbundle.load_value_at_address", bundle)
+        self.assertIn("\n\t\t\tscf.for %i_1", bundle)
+
+
+class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
+    """The backend plans every such loop for ``max_value`` trips, so a loop and
+    a source that disagree are refused rather than emitted."""
+
+    def _refuses(self, loop, fragment):
+        with self.assertRaises(Unsupported) as caught:
+            self._run_with_producer(loop)
+        self.assertIn(fragment, str(caught.exception))
+
+    @expects_raise
+    def test_a_non_positive_max_value(self):
+        self._refuses(
+            self._device_read_loop(source=self._source(max_value=0)),
+            "positive max_value and granularity",
+        )
+
+    @expects_raise
+    def test_a_non_positive_granularity(self):
+        self._refuses(
+            self._device_read_loop(source=self._source(granularity=0)),
+            "positive max_value and granularity",
+        )
+
+    @expects_raise
+    def test_a_max_value_other_than_the_static_count(self):
+        self._refuses(
+            self._device_read_loop(count=8, source=self._source(max_value=16)),
+            "planned for 8 trips",
+        )
+
+    @expects_raise
+    def test_a_max_value_not_a_multiple_of_the_granularity(self):
+        self._refuses(
+            self._device_read_loop(source=self._source(granularity=3)),
+            "not a multiple of granularity=3",
+        )
+
+    @expects_raise
+    def test_a_symbolic_count_too(self):
+        loop = dataclasses.replace(
+            self._symbolic_loop(), count_from_buffer=self._source()
+        )
+        self._refuses(loop, "one kind of bound")
+
+    @expects_raise
+    def test_no_pool_to_read_from(self):
+        """No op uses the pool, so ``%pool`` is never defined."""
+        loop = self._device_read_loop()
+
+        with self.assertRaises(Unsupported) as caught:
+            self._run([_op_spec(), loop], [self._entry(), self._entry()])
+
+        self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
 
 if __name__ == "__main__":
