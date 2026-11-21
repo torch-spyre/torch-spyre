@@ -61,6 +61,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+from torch_spyre._inductor.constants import IDENTITY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import (
     IndirectAccess,
     LoopSpec,
@@ -710,6 +711,39 @@ class IndirectAccessTestCase(InductorTestCase):
                 checked += 1
         self.assertTrue(checked, "no indirect-access input arg found to check")
 
+    def indirect_ops(self, kernel, *dev_args):
+        """Compile ``kernel`` and return the ops of the specs with an indirect input."""
+        torch._dynamo.reset()
+        with capture_op_specs() as captured:
+            torch.compile(kernel)(*dev_args)
+        return [
+            s.op for s in flatten_op_specs(captured) if op_spec_has_indirect_input(s)
+        ]
+
+    def assert_gather_fused_into(self, op_specs, op):
+        """The indirect read belongs to the ``op`` spec, not to an ``identity`` copy."""
+        indirect_ops = [s.op for s in op_specs if op_spec_has_indirect_input(s)]
+        self.assertIn(
+            op,
+            indirect_ops,
+            f"gather not fused into {op!r}; indirect specs are {indirect_ops}",
+        )
+        self.assertNotIn(
+            IDENTITY_OP,
+            indirect_ops,
+            f"separate indirect {IDENTITY_OP} emitted next to {op!r}",
+        )
+
+    def assert_one_indirect_access_per_op(self, op_specs):
+        """At most one indirect access (one index tensor) per op spec."""
+        for s in op_specs:
+            names = indirect_access_target_names([s])
+            self.assertLessEqual(
+                len(names),
+                1,
+                f"{s.op}: {len(names)} indirect accesses fused into one op ({names})",
+            )
+
     # -- One-compile, all-stage scenario check (used by per-op test files) --
     def check(
         self,
@@ -746,6 +780,11 @@ class IndirectAccessTestCase(InductorTestCase):
             self.assertIn(
                 op, [s.op for s in r.op_specs], f"op {op!r} not in produced specs"
             )
+        if op is not None and r.label == GATHER_OP_SPEC:
+            # A gather and its consuming op are one op spec: no separate
+            # ``identity`` copy of the gathered rows is emitted for it.
+            self.assert_gather_fused_into(r.op_specs, op)
+        self.assert_one_indirect_access_per_op(r.op_specs)
         if detected is True:
             self.assertTrue(r.detected_index_names, "index buffer was not detected")
         elif detected is False:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 from typing import Callable
 
 from sympy import Symbol
@@ -208,6 +209,15 @@ def compute_indirect_max_dim_sizes(
     return -1
 
 
+def _same_layout(entry: dict, dim_order, stick_dim_order, stick_size) -> bool:
+    """Whether a recorded layout entry matches the given layout."""
+    return (
+        entry["stick_dim_order"] == stick_dim_order
+        and Counter(entry["dim_order"]) == Counter(dim_order)
+        and entry["stick_size"] == stick_size
+    )
+
+
 def get_indirect_layout_label(
     tensor_idx: int,
     index_tensor_indices: set[int],
@@ -243,5 +253,11 @@ def get_indirect_layout_label(
             "stick_dim_order": effective_stick,
             "stick_size": stick_size,
         }
+    elif not _same_layout(layouts[label], dim_order, effective_stick, stick_size):
+        # A tensor with a different layout than the value tensor, e.g. the
+        # output of a reduction fused with the gather, cannot share its label.
+        return get_layout_label_func(
+            layouts, dim_order, effective_stick, stick_size, layout_labels
+        )
     logger.debug(f"Tensor {tensor_idx}: OUTPUT layout (indirect access)")
     return label

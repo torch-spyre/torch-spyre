@@ -2008,6 +2008,16 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
+def _ref_arg(op_spec):
+    if op_spec.is_reduction:
+        # The reduced tensor, not the index tensor of a gather fused into it
+        # (index tensors lead the args).
+        return next(
+            (a for a in op_spec.args if not is_index_tensor(a, op_spec)),
+            op_spec.args[0],
+        )
+
+
 def _merged_reduction_dim_order(op_spec, symbol_mapping):
     """Union op_dim_order/op_stick_dim across every reduction operand.
 

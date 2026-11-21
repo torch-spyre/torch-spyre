@@ -303,16 +303,16 @@ pre-scheduling sequence.
 
 ## Op spec layout
 
-For an unfused gather the scheduler produces **two** op specs:
+A gather whose consumer is a Spyre pointwise op fuses with it into a **single**
+op spec: the index tensor is a named input and the value tensor's coordinates
+carry the `IndirectAccess` expression. `x[i].exp()` is one `exp` op spec.
+
+A gather that cannot fuse produces **two** op specs:
 
 1. **identity** — copies gathered rows from the value tensor into a
    temporary buffer using `IndirectAccess` coordinates.
-2. **exp** (or whichever unary follows) — applies the unary to the temporary
-   buffer using direct coordinates.
-
-When fusion is enabled (currently disabled pending backend support — see the
-flag in `patches.py`), the two ops collapse into a single fused op spec with
-the index tensor as a named input.
+2. **exp** (or whichever op follows) — reads that buffer with direct
+   coordinates.
 
 The argument ordering rule for op specs that contain an index tensor is:
 
@@ -327,11 +327,38 @@ scanning other args' coordinates for `IndirectAccess` atoms whose name matches.
 
 ## Fusion
 
-Pointwise fusion with the gather is currently **disabled** in `patches.py`
-because `IndirectAccess` coordinate expressions are not yet handled in SuperDSC
-generation. When enabled, the identity op and the downstream pointwise op
-merge into one op spec with a single `IndirectAccess` coordinate expression in
-the input arg.
+A gather stays inlineable, so Inductor splices its `inner_fn` into the consumer.
+So does a pointwise producer whose only use is as the value tensor of a gather.
+Both are set up by `_gather_fusion_patches` in `patches.py`. Every other op is
+still realized when it is lowered. Nothing names a gather or scatter op:
+
+- A node is a gather when the `Pointwise` just built for it has more indirect
+  symbols (`is_indirect`, from `torch._inductor.dependencies`) in its reads than
+  the producers inlined into it.
+- A producer fuses into a gather (`_feeds_a_gather`) when its only use is a
+  non-mutating op that is neither pointwise nor a reduction, takes the producer
+  as its first argument once, and takes only integer tensors besides. `_run_node`
+  checks that guess against the lowered IR and raises `Unsupported` if the
+  consumer turns out not to be a gather.
+
+**Rule: at most one indirect access per op spec.** `_run_node` enforces it
+before each node is lowered. An op tagged `pointwise` or `reduction` may inline
+one indirect access; any other op (a gather, a scatter, a matmul) may inline none.
+Of the inlineable gathers feeding the node, the first that fits stays inlined and
+the rest are realized into buffers. So:
+
+- `x[i].exp()`, `x[i] + 1.0`: one op spec.
+- `x[i] + x[j]`, `x[i] + y[j]`: one gather is fused into the `add`; the other is
+  an `identity` op spec before it.
+- `x.exp()[i]`: one `exp` op spec whose input carries the `IndirectAccess`. Only
+  the last producer in a chain fuses: in `x.abs().neg().exp()[i]`, `abs` and
+  `neg` stay separate op specs.
+- `x[j].exp()[i]`: the second gather is an `identity` copy, because fusing both
+  would put two indirect accesses in one op.
+- `x[y[i]]`, `x[i]` feeding a matmul or a scatter: the inner gather is an
+  `identity` copy.
+
+Scatters and matmuls are not fused into a gather here.
 
 ---
 
@@ -343,5 +370,5 @@ the input arg.
   A runtime-indexed scatter carried through a counted loop is supported; see the
   partial-scatter-carry section of
   [Working Set Reduction](working_set_reduction.md).
-- The fused (single op spec) gather path is disabled because `IndirectAccess`
-  coordinates are not yet handled in SuperDSC generation.
+- At most one indirect access is fused into an op. Scatter (`index_put`)
+  fusion is not done.
