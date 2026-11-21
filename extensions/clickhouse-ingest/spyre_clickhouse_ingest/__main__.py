@@ -52,7 +52,20 @@ def main(argv=None):
         from .offline import main as run
     else:
         from .results import main as run
-    return run(rest)
+    try:
+        rc = run(rest)
+    except SystemExit as stop:
+        code = _with_parked(stop.code)
+        if code is stop.code:
+            raise
+        raise SystemExit(code) from None
+    return _with_parked(rc)
+
+
+def _with_parked(rc):
+    """EXIT_PARKED for a clean run that parked rows (possible only once `writes` is imported)."""
+    writes = sys.modules.get(f"{__package__}.writes")
+    return writes.finish(rc) if writes else rc
 
 
 if __name__ == "__main__":

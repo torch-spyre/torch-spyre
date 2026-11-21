@@ -173,3 +173,23 @@ def test_an_unset_prod_v2_secret_never_falls_through_to_the_dev_one(wf):
             ln for ln in text.splitlines() if ln.strip().startswith(f"{name}: ${{{{")
         ]
         assert lines and all("toJSON(secrets." in ln for ln in lines), lines
+
+
+def test_v2_ingest_actions_publish_a_rows_free_manifest_and_never_upload_the_spool():
+    checked = 0
+    for name, doc in actions():
+        steps = (doc.get("runs") or {}).get("steps") or []
+        uploads = [
+            str((s.get("with") or {}).get("path", ""))
+            for s in steps
+            if "upload-artifact" in s.get("uses", "")
+        ]
+        assert not [p for p in uploads if "spool" in p and "manifest" not in p], name
+        if "clickhouse-db-v2" not in (doc.get("inputs") or {}):
+            continue
+        checked += 1
+        runs = " ".join(str(s.get("run", "")) for s in steps)
+        assert "spool list" in runs and any(
+            "ch-spool-manifest" in p for p in uploads
+        ), name
+    assert checked >= 3

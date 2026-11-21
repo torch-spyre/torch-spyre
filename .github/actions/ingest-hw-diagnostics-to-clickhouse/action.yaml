@@ -270,3 +270,26 @@ runs:
           --run-url        "${RUN_URL}" \
           --artifact-id    "${{ inputs.artifact-id }}" \
           "${TABLE_ARGS[@]}"
+
+    # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.
+    - name: Publish a rows-free manifest of parked ClickHouse rows
+      id: ch-spool
+      if: always() && steps.gate.outputs.configured == 'true'
+      shell: bash
+      run: |
+        spool="${CH_WRITE_SPOOL:-${RUNNER_TEMP}/ch-spool}"
+        compgen -G "${spool}/[0-9]*.json" > /dev/null || exit 0
+        source .venv/bin/activate
+        CH_WRITE_SPOOL="${spool}" python3 -m spyre_clickhouse_ingest spool list \
+          > "${RUNNER_TEMP}/ch-spool-manifest.jsonl" || true
+        echo "parked=true" >> "$GITHUB_OUTPUT"
+        echo "::warning title=ClickHouse::rows were parked, not stored; see the step summary"
+
+    - name: Upload the parked-rows manifest
+      if: always() && steps.ch-spool.outputs.parked == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ch-spool-manifest-hw-${{ github.job }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/ch-spool-manifest.jsonl
+        retention-days: 7
+        overwrite: true

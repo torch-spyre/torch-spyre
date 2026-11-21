@@ -23,6 +23,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.batching import BatchParked
 from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
 from spyre_clickhouse_ingest.hw_diagnostics import (
     NIL_UUID,
@@ -239,8 +241,10 @@ def main() -> None:
                     print(
                         f"[info] v2: inserting {len(rows)} row(s) into {v2_table} ..."
                     )
-                    insert_rows(client, rows, table=v2_table)
+                    insert_rows(client, rows, table=v2_table, resilient=True)
                     print(f"[info] v2: inserted {len(rows)} row(s) into {v2_table}")
+            except BatchParked as exc:
+                print(f"[warn] v2 rows parked, not stored: {exc}", file=sys.stderr)
             except Exception as exc:
                 print(
                     f"[warn] v2 write failed (v1 rows unaffected): {exc}",
@@ -265,4 +269,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as stop:
+        sys.exit(writes.finish(stop.code))
+    sys.exit(writes.finish(0))

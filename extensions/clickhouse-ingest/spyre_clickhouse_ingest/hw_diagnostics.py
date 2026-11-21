@@ -172,8 +172,10 @@ class RecordLoader:
         ]
 
     @staticmethod
-    def insert(client, rows: list, table: str = "") -> None:
-        """Insert with explicit column names, so row order is checked, not assumed."""
+    def insert(client, rows: list, table: str = "", resilient: bool = False) -> None:
+        """Insert with explicit column names, so row order is checked, not assumed.
+
+        `resilient` (the v2 copy) sends a Replicated target through `writes.insert`."""
         table = table or HwFailureDiagnostics.DEFAULT_TABLE
         cols = HwFailureDiagnostics.COLUMN_NAMES
         if rows and len(rows[0]) != len(cols):
@@ -181,6 +183,11 @@ class RecordLoader:
                 f"row has {len(rows[0])} values but {table} expects "
                 f"{len(cols)}: build_row and HW_COLUMN_NAMES disagree"
             )
+        if resilient:
+            from . import writes
+
+            if writes.insert(client, table, rows, list(cols)) is not None:
+                return
         client.insert(table=table, data=rows, column_names=list(cols))
 
 
