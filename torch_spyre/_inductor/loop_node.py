@@ -131,6 +131,10 @@ class LoopNode(ir.Operation):
         # the edit helpers below and ``expand`` call. A new edit site calls one of
         # those helpers; it never assigns either directly.
         self.group_id = group_id
+        # True on a loop the loop-tiling lowering made: every member's dim_hints list
+        # the loop variable of every level, so a member that lists none is a compiler
+        # bug and not a loop-invariant op (a for_each_tile loop's fill, say).
+        self.strict_loop_vars = False
         # False on a node built by hand (unit tests), whose facts nothing recorded.
         self.facts_recorded = False
         self.tiling: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
@@ -455,6 +459,13 @@ def _set_chain(entry: ir.Operation, chain: tuple["LoopNode", ...]) -> None:
             _set_chain(child, inner)
     else:
         entry._loop_chain = chain  # type: ignore[attr-defined]
+
+
+def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
+    """``target`` stands in for ``source`` (a rebuilt or a probe copy of it, same
+    name): it is a member of the same loops. The nodes' tiling is keyed by name, so
+    only the pointer to the nodes needs copying."""
+    target._loop_chain = tuple(getattr(source, "_loop_chain", ()))  # type: ignore[attr-defined]
 
 
 def record_loop_info(op: ir.Operation) -> None:
@@ -796,6 +807,10 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
         _fill_tiling(entry)
     for node in _nodes_in(operations):
         node.facts_recorded = True
+        node.strict_loop_vars = any(
+            getattr(getattr(leaf, "loop_info", None), "strict_loop_vars", False)
+            for leaf in all_ops(node.body)
+        )
 
 
 def collapse(

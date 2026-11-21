@@ -26,7 +26,7 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .loop_facts import counted_loop_path, enclosing_loops
+from .loop_facts import counted_loop_path, enclosing_loops, is_looped
 from .read_copy_elision import ReadCopyElisionRecord
 from .loop_node import move_after, move_before, record_loop_info
 from .optimize_restickify import AnyInNode, EdgeCostMap
@@ -272,9 +272,7 @@ def _moved_loop_term(
     leave a fixed-address read advancing. With no shared level the consumer keeps
     its term.
     """
-    consumer_li = getattr(op, "loop_info", None)
-    copy_li = getattr(restick_buff, "loop_info", None)
-    if consumer_li is None or copy_li is None:
+    if not is_looped(op) or not is_looped(restick_buff):
         return None
     if not n_levels or shared_loop_depth == 0:
         return None
@@ -842,8 +840,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # Tiled-reduction scratch: propagate the reduction op's device
             # layout to accum_full so fill, combine, and copy all agree on
             # the device coordinate system.
-            loop_info = getattr(op, "loop_info", None)
-            if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
+            if is_looped(op) and isinstance(op.layout, FixedTiledLayout):
                 all_tiled_rdims_empty = not any(
                     level.tiled_reduction_dims for level in enclosing_loops(op)
                 )

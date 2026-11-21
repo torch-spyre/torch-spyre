@@ -396,11 +396,21 @@ def test_loop_induction_symbols_is_the_unbacked_non_iteration_non_indirect_set()
     assert loop_induction_symbols(0, set()) == []
 
 
+def _one_level_loop_info():
+    """A one-level loop stamp: a stand-in that lists no group is not in a loop."""
+    return SimpleNamespace(
+        loop_group_id=(0,),
+        loop_count=[2],
+        loop_tiled_dims=[[]],
+        loop_tiled_reduction_dims=[[]],
+    )
+
+
 class _ReadOp:
     """A consumer with one memory read, enough for ``_moved_loop_term``."""
 
     def __init__(self, index):
-        self.loop_info = SimpleNamespace()
+        self.loop_info = _one_level_loop_info()
         self._dep = MemoryDep("buf", index, (), ())
 
     def get_read_writes(self):
@@ -410,7 +420,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    copy = SimpleNamespace(loop_info=SimpleNamespace())
+    copy = SimpleNamespace(loop_info=_one_level_loop_info())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

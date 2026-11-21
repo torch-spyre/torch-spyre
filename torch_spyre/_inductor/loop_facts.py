@@ -154,6 +154,15 @@ def node_levels(op: Operation) -> tuple[LoopLevel, ...]:
     return tuple(levels)
 
 
+def strict_loop_vars(op: Operation) -> bool:
+    """True if the loop-tiling lowering made the loops around ``op``: every member
+    lists the loop variable of every level in its ``dim_hints``. From the nodes once
+    built, from the stamp for an op no node holds."""
+    if _in_built_node(op):
+        return any(node.strict_loop_vars for node in op._loop_chain)  # type: ignore[attr-defined]
+    return bool(getattr(getattr(op, "loop_info", None), "strict_loop_vars", False))
+
+
 def is_looped(op: Operation) -> bool:
     """True if a counted loop encloses ``op`` (it runs inside, or is stamped for, a
     loop). An ``ExternKernel`` that keeps its stamp counts."""
@@ -269,7 +278,7 @@ def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     ]
     depth = loop_depth(op)
     if not variables:
-        if getattr(op.loop_info, "strict_loop_vars", False):
+        if strict_loop_vars(op):
             raise RuntimeError(
                 f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
                 f"is made by the loop-tiling lowering but lists none of its {depth} "
@@ -301,7 +310,7 @@ def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     the caller. Read from the index: the coefficient of the level's loop variable
     (``_loop_coefficient``, which refuses a non-affine use).
     """
-    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
+    if not is_looped(op) or not isinstance(dep, MemoryDep):
         return ()
     if dep not in _memory_reads(op):
         return ()
@@ -314,7 +323,7 @@ def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
     The write is ``op``'s first ``MemoryDep`` write, as in the kernel.  ``()``
     when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.
     """
-    if getattr(op, "loop_info", None) is None:
+    if not is_looped(op):
         return ()
     dep = _first_memory_write(op)
     if dep is None:
@@ -331,7 +340,7 @@ def read_advances_anywhere(
     holds them (e.g. from ``pass_utils.op_read_writes``); without it they are
     re-derived from ``op.get_read_writes()``.
     """
-    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
+    if not is_looped(op) or not isinstance(dep, MemoryDep):
         return False
     if dep not in (_memory_reads(op) if reads is None else reads):
         return False
@@ -345,7 +354,7 @@ def output_advances_anywhere(op: Operation) -> bool:
     The loop fact of ``scratchpad.utils._is_tiled_advancing``, without its
     ``FixedTiledLayout`` gate (a layout question, not a loop fact).
     """
-    if getattr(op, "loop_info", None) is None:
+    if not is_looped(op):
         return False
     dep = _first_memory_write(op)
     return dep is not None and any(a != 0 for a in _index_advance(op, dep))
@@ -358,7 +367,7 @@ def advancing_levels(op: Operation) -> frozenset[int]:
     level advances; the answer comes from the index. Empty for an op that is in no
     loop.
     """
-    if getattr(op, "loop_info", None) is None:
+    if not is_looped(op):
         return frozenset()
     levels: set[int] = set()
     for dep in _memory_reads(op):
