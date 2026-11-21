@@ -291,9 +291,6 @@ TIED_TOPK_COMPILED = _xfail(
     "#4639: compiled tied topk selects experts outside the tied pool",
     r"compiled spyre <-> cpu\[1\] mismatch",
 )
-HISTC = _xfail(
-    NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
-)
 REPEAT_INTERLEAVE = _xfail(
     NotImplementedError,
     "#673: repeat_interleave.Tensor has no Spyre kernel",
@@ -1039,7 +1036,7 @@ def test_G4_GM_001_sort_dispatch(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=HISTC, compiled=HISTC),
+    _cases(),
 )
 def test_G4_GM_002_histc_cumsum_offsets(execution_mode, T):
     """Per-expert row counts with histc, then int32 cumulative offsets."""

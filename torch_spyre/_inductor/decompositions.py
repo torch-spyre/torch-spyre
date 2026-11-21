@@ -30,6 +30,7 @@ import math
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
+import numpy as np
 import torch
 import torch._decomp as decomp
 from torch._prims_common import (
@@ -1697,7 +1698,15 @@ class _OPWrapper:
         # dispatch reaches that rewrite through this lazy compilation path,
         # outside Dynamo's usual scalar-capture setup.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
-            return self._compiled_fn(*args, **kwargs)
+            try:
+                return self._compiled_fn(*args, **kwargs)
+            except Exception:
+                # A RuntimeError raised while the decomposition is traced makes
+                # Dynamo skip the function from then on. Later calls would run
+                # its Python body, whose custom ops have no eager kernel and
+                # return None. Clear that state so the next call compiles again.
+                torch._C._dynamo.eval_frame.reset_code(self._fn.__code__)
+                raise
 
 
 def _register_spyre_dispatchkey_kernels_permanently():
@@ -1875,6 +1884,96 @@ def spyre_topk(
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
+
+
+def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
+    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range; below ``lo``,
+    above ``hi`` or for NaN, a negative number or NaN, which matches no bin."""
+    valid = (x <= hi).to(torch.float32)
+    scaled = (x - lo) * float(bins)
+    pos = torch.floor(scaled / width_den)
+    if repair_division:
+        # Dividing by a device tensor can land a float step under a whole
+        # quotient, which floors to the bin below. Multiply back to restore it.
+        rem = scaled - pos * width_den
+        pos = pos + (rem >= width_den).to(torch.float32)
+        pos = pos - (rem < 0).to(torch.float32)
+    pos = pos - torch.relu(pos - (bins - 1.0))  # x == hi -> bins - 1
+    return pos * valid + (valid - 1.0)
+
+
+@register_spyre_decompositions([torch.ops.aten.histc.default])
+def spyre_histc(
+    input: torch.Tensor,
+    bins: int = 100,
+    min: float = 0,
+    max: float = 0,
+) -> torch.Tensor:
+    """1-D int32/int64/float32/float16 histc: bin index per element, then
+    spyre::histc_count. The index maths is fp32, so integers are exact below
+    2**24, and a value within a float step of a bin edge can land in the
+    neighbouring bin: device fp32 arithmetic rounds differently from the CPU's."""
+    if input.dtype not in (torch.int32, torch.int64, torch.float32, torch.float16):
+        raise Unsupported(
+            f"histc: {input.dtype} input is not supported "
+            "(int32, int64, float32 and float16 are)"
+        )
+    if input.dim() != 1:
+        raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
+    # torch's checks; eager dispatch skips its meta checks.
+    if bins <= 0:
+        raise RuntimeError(f"torch.histc(): bins must be > 0, but got {bins}")
+    lo, hi = float(min), float(max)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise RuntimeError(f"torch.histc: range of [{lo}, {hi}] is not finite")
+    if lo > hi:
+        raise RuntimeError("torch.histc: max must be larger than min")
+    # An fp16 input is compared and counted as fp16 (the index maths stays in
+    # fp32). Device fp16 holds whole numbers exactly only up to 1024, hence the
+    # two limits.
+    # TODO: count in fp32, with no element limit, once a reduction keeps its
+    # input's element arrangement (#5553).
+    idx_dtype = torch.float16 if input.dtype == torch.float16 else torch.float32
+    if idx_dtype == torch.float16:
+        if bins > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 bins")
+        if input.numel() > 1024:
+            raise Unsupported("histc: float16 input supports at most 1024 elements")
+    if input.numel() == 0:
+        return input.new_zeros((bins,))
+
+    # First, so this extern call does not split the kernels that follow.
+    stick = get_elem_in_stick(idx_dtype)
+    bin_ids = torch.ops.spyre.histc_bin_ids(
+        (bins + stick - 1) // stick * stick, idx_dtype
+    )
+    x = input.to(torch.float32)
+    if lo == hi:
+        # min == max: the data's range, widened by 1 if constant, as torch does.
+        # Unlike torch, NaN or inf in the data does not raise.
+        # An fp16 input's fp32 copy is padded, and a reduction over it would read
+        # the padding, so its range is taken from the input itself.
+        src = input if input.dtype == torch.float16 else x
+        lo_t = torch.amin(src).to(torch.float32)
+        hi_t = torch.amax(src).to(torch.float32)
+        same = lo_t == hi_t
+        lo_t = torch.where(same, lo_t - 1, lo_t)
+        hi_t = torch.where(same, hi_t + 1, hi_t)
+        idx = _histc_bin_index(x, lo_t, hi_t, hi_t - lo_t, bins, repair_division=True)
+    else:
+        # Edges in fp32, as torch computes them.
+        idx = _histc_bin_index(
+            x,
+            float(np.float32(lo)),
+            float(np.float32(hi)),
+            float(np.float32(hi) - np.float32(lo)),
+            bins,
+        )
+    if idx_dtype == torch.float16:
+        # The fp32 index of an fp16 input is in staggered order; the cast back to
+        # fp16 restores standard order for histc_count.
+        idx = idx.to(torch.float16)
+    return torch.ops.spyre.histc_count(idx, bin_ids, bins, input.dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])

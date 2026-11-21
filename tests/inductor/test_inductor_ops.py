@@ -2523,6 +2523,181 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # (x, bins, min, max). The MoE router case is int32 expert ids with min=0,
+        # max=bins-1 (gemma-4-26B-A4B: 24 tokens x top-8 = 192 ids, 128 experts).
+        ("test_histc", "test_histc_cpu"): {
+            "param_sets": {
+                "int32_gemma_192_sorted": (
+                    torch.randint(0, 128, (192,), dtype=torch.int32).sort().values,
+                    128,
+                    0,
+                    127,
+                ),
+                # One decode token: a partial stick.
+                "int32_decode_8": (
+                    torch.randint(0, 128, (8,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # Off the 64-element boundary, with ids >= bins (expert-parallel
+                # sentinels) that histc must drop.
+                "int32_65_with_sentinels": (
+                    torch.randint(0, 136, (65,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # One bin past 1024 (beyond exact 16-bit counting), at value == max.
+                "int32_4096_all_in_last_bin": (
+                    torch.full((4096,), 127, dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # The general rule for integers: several values per bin, and
+                # values below min and above max.
+                "int32_range_0_50": (
+                    torch.randint(-5, 60, (192,), dtype=torch.int32),
+                    10,
+                    0,
+                    50,
+                ),
+                # Every bin edge, one float step either side of it, NaN and +-inf.
+                # With min=0 and max=1 the subtraction and division are exact; in
+                # other ranges an edge value can land in the neighbouring bin
+                # (see spyre_histc).
+                "fp32_edges_nan_inf": (
+                    torch.cat(
+                        [
+                            torch.linspace(0, 1, 11),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(2.0)),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(-2.0)),
+                            torch.tensor([float("nan"), float("inf"), -float("inf")]),
+                        ]
+                    ),
+                    10,
+                    0,
+                    1,
+                ),
+                # min == max: the data's own range.
+                "fp32_auto_range": (torch.randn((256,)), 20, 0, 0),
+                # Integer data sits on the bin edges of its own range (5..20 in 10
+                # bins: every third value), where the scaled position is a whole
+                # number.
+                "int32_auto_range": (
+                    (torch.arange(192) % 16 + 5).to(torch.int32),
+                    10,
+                    0,
+                    0,
+                ),
+                # topk indices are int64 in most router code.
+                "int64_192": (
+                    torch.randint(0, 128, (192,), dtype=torch.int64),
+                    128,
+                    0,
+                    127,
+                ),
+                "int32_bins_2048": (
+                    torch.randint(0, 2048, (512,), dtype=torch.int32),
+                    2048,
+                    0,
+                    2047,
+                ),
+                # TODO: N-D input. Flattening on the device works compiled for
+                # int32/int64/float32, but not in eager mode or for unaligned
+                # float16; when histc accepts N-D this becomes a positive case.
+                "2d_input": (torch.rand((4, 64)), 10, 0, 1),
+                # No elements: every count is zero.
+                "empty_input": (torch.empty((0,)), 8, 0, 1),
+                # fp16 inputs are multiples of 1/16, exact in device fp16, with
+                # values below min and above max.
+                "fp16_192": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                "fp16_8": (
+                    (torch.randint(-4, 21, (8,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                "fp16_65": (
+                    (torch.randint(-4, 21, (65,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                # NaN, +-inf, both edges and values outside the range.
+                "fp16_nan_inf": (
+                    torch.tensor(
+                        [float("nan"), float("inf"), -float("inf")]
+                        + [0.5, 1.0, 0.0, -0.25, 1.25],
+                        dtype=torch.float16,
+                    ).repeat(16),
+                    10,
+                    0,
+                    1,
+                ),
+                "fp16_auto_range": (
+                    (torch.randint(-4, 21, (128,)) / 16).to(torch.float16),
+                    20,
+                    0,
+                    0,
+                ),
+                # All positive and off the stick boundary: a padding zero read as
+                # data would move the range's minimum.
+                "fp16_auto_range_positive_100": (
+                    ((torch.arange(100) % 13 + 8) / 16).to(torch.float16),
+                    7,
+                    0,
+                    0,
+                ),
+                "fp16_auto_range_negative_100": (
+                    (-(torch.arange(100) % 13 + 8) / 16).to(torch.float16),
+                    7,
+                    0,
+                    0,
+                ),
+                # The most elements fp16 allows, all in one bin: the largest count.
+                "fp16_1024_in_one_bin": (
+                    torch.full((1024,), 0.5, dtype=torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+                # The most bins fp16 allows.
+                "fp16_bins_1024": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    1024,
+                    0,
+                    1,
+                ),
+                "fp16_bins_1025": (
+                    (torch.randint(-4, 21, (192,)) / 16).to(torch.float16),
+                    1025,
+                    0,
+                    1,
+                ),
+                # TODO: an fp16 input is counted in fp16, exact only up to 1024.
+                # When it is counted in fp32 (#5553) this becomes a positive case.
+                "fp16_1025_elements": (
+                    (torch.randint(-4, 21, (1025,)) / 16).to(torch.float16),
+                    8,
+                    0,
+                    1,
+                ),
+            },
+            "expect_raise": {
+                "2d_input": "histc: only 1-D input is supported",
+                "fp16_bins_1025": "histc: float16 input supports at most 1024 bins",
+                "fp16_1025_elements": (
+                    "histc: float16 input supports at most 1024 elements"
+                ),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -11645,6 +11820,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return values, indices.to(torch.int64)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_histc_cpu(self, x, bins: int, min: float, max: float):
+        # CPU histc has no integer kernel, so the reference counts the fp32 copy
+        # and is cast back; counts are whole numbers, so the comparison is exact.
+        counts = torch.histc(x.float(), bins=bins, min=min, max=max)
+        if x.dtype == torch.float16:
+            # The lx wraps append an op to an fp16 result, so they need a
+            # reference they can apply the same op to.
+            ref = {"dlfloat16_reference": counts.double()}
+        else:
+            ref = {"cpu_eager_result": counts.to(x.dtype)}
+        self.compare_with_cpu(
+            lambda x: torch.histc(x, bins=bins, min=min, max=max),
+            x,
+            atol=0,
+            rtol=0,
+            cpu_compile=False,
+            **ref,
+        )
+
+    @expects_raise
+    def test_histc_argument_errors(self):
+        # torch's own argument checks. Compiled, torch's meta function raises
+        # them; eager dispatch skips it, so spyre_histc repeats them.
+        x = torch.rand((64,))
+        cases = {
+            "bins must be > 0": {"bins": 0, "min": 0, "max": 1},
+            "max must be larger than min": {"bins": 8, "min": 1, "max": 0},
+            "is not finite": {"bins": 8, "min": 0, "max": float("inf")},
+        }
+        for fragment, kwargs in cases.items():
+            for compile_mode in (True, False):
+                with pytest.raises(Exception, match=fragment):
+                    _compile_and_run(
+                        lambda x, _kw=kwargs: torch.histc(x, **_kw),
+                        [x],
+                        "spyre",
+                        compile=compile_mode,
+                    )
+        # An eager call that raised must leave the next eager call working. Called
+        # directly: _compile_and_run resets the compile caches between calls.
+        x_dev = x.to("spyre")
+        with pytest.raises(RuntimeError, match="bins must be > 0"):
+            torch.histc(x_dev, bins=0)
+        out = torch.histc(x_dev, bins=8, min=0, max=1)
+        assert out is not None
+        torch.testing.assert_close(
+            out.cpu(), torch.histc(x, bins=8, min=0, max=1), rtol=0, atol=0
+        )
 
     @expects_raise
     def test_topk_largest_false_rejected(self):
