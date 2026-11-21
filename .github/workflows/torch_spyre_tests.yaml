@@ -124,10 +124,11 @@ jobs:
     # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     # Repo variable GHA_FULL_MERGE_QUEUE_TESTS=true lifts the label and merge-queue skips so GHA runs the full suite;
     # GHA_TESTS_ON_AUTO_MERGE=true lifts the auto-merge skip on PRs.
+    # Fork PR runs cannot read repo variables, so both skips are bypassed for them; spyre_test_status.yaml posts the status only when GHA_FULL_MERGE_QUEUE_TESTS is true in the base repo.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true') &&
-      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null && vars.GHA_TESTS_ON_AUTO_MERGE != 'true') &&
+      (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.auto_merge != null && vars.GHA_TESTS_ON_AUTO_MERGE != 'true') &&
       (github.event_name != 'merge_group' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true')
     uses: ./.github/workflows/_test_matrix.yaml
     with:
@@ -182,7 +183,7 @@ jobs:
           RESULT="${{ needs.run-tests.result }}"
           echo "run-tests result: ${RESULT}"
 
-          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
+          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" && "${RESULT}" == "skipped" ]] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
             echo "integration-test label set -- the Jenkins integration run owns this"
             echo "commit's testing and reports its own check. Passing this required"
             echo "gate so the merge queue is not blocked by a missing check."

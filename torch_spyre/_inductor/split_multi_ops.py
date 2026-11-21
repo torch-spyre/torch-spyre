@@ -31,7 +31,7 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
-from .loop_info import ReadCopyElisionRecord
+from .read_copy_elision import ReadCopyElisionRecord
 from .loop_node import move_before
 from .errors import Unsupported
 from .pass_utils import (
