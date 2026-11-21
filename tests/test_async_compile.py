@@ -381,7 +381,7 @@ def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
-        spyre_config.patch({"spyre_kernel_cache": True}),  # type: ignore[attr-defined]
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(async_compile_mod, "compute_specs_hash", return_value="key"),
         patch.object(
             async_compile_mod,
@@ -612,7 +612,7 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
             compiler = async_compile_mod.SpyreAsyncCompile()
             tasks = []
             for index, compile_dir in enumerate(compile_dirs):
-                with spyre_config.patch(backend_loop_unroll=bool(index)):  # type: ignore[attr-defined]
+                with spyre_config.patch(backend_loop_unroll=bool(index)):
                     tasks.append(
                         compiler._submit_backend_compile(
                             f"sdsc_{index}",

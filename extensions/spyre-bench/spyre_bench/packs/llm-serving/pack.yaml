@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# LLM serving and quality: vLLM/HF systems, online and offline loads, startup, lm-eval, parity, data generation.
+# Metric names follow OpenTelemetry gen_ai naming intent: no units in names, base units (s), UCUM.
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: llm-serving}
+spec:
+  prefix: llm
+  version: 0.2.0
+  requires: {core: "0.2"}
+  types:
+    - {name: vllm, for: System, schema: schemas/system-vllm.json, refs: {model: Model}}
+    - {name: hf-transformers, for: System, schema: schemas/system-hf-transformers.json, refs: {model: Model}}
+    - {name: lm-eval-model, for: System, schema: schemas/system-lm-eval.json, refs: {model: Model}}
+    - name: serve
+      for: Workload
+      schema: schemas/workload-serve.json
+      levels: [service]
+      runner: vllm-bench
+      load: [closed, open, batch, ramp]
+      default_metrics: [llm.ttft.p99, llm.itl.median, llm.output_throughput]
+      scenarios:
+        single_stream: {executor: closed, concurrency: 1, requests: 1024}
+        multi_stream: {executor: closed, concurrency: 8, requests: 1024}
+        server: {executor: open, rate: 1.0, arrival: poisson, duration: 10m, warmup: 1m}
+        offline: {executor: batch, requests: 2048}
+    - {name: latency, for: Workload, schema: schemas/workload-latency.json, levels: [model], runner: vllm-bench,
+       load: [iterations], default_metrics: [llm.batch_latency.mean]}
+    - {name: throughput, for: Workload, schema: schemas/workload-throughput.json, levels: [model], runner: vllm-bench,
+       load: [batch], default_metrics: [llm.output_throughput, llm.request_throughput]}
+    - {name: startup, for: Workload, schema: schemas/workload-startup.json, levels: [service], runner: vllm-bench,
+       load: [], default_metrics: [llm.startup.cold, llm.startup.warm]}
+    - {name: lm-eval, for: Workload, schema: schemas/workload-lm-eval.json, levels: [model, service], runner: lm-eval,
+       load: [], default_metrics: [llm.eval.exact_match], non_identity: [flags.output_path, flags.log_samples]}
+    - {name: parity, for: Workload, schema: schemas/workload-parity.json, levels: [service], runner: vllm-bench,
+       load: [], default_metrics: [llm.parity.greedy_match_ratio]}
+    - {name: generate, for: Workload, schema: schemas/workload-generate.json, levels: [service], runner: vllm-bench,
+       load: [batch], default_metrics: [core.duration]}
+  vocabularies:
+    levels: [model]
+  attributes:
+    - {key: system.model, class: run, role: root, type: string, plot: true, stored_in: benchmarks.props}
+    - {key: system.model_id, class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: system.precision, class: identity, role: root, type: enum, values: [fp32, bf16, fp16, fp8, fp4, int8, int4], plot: true, stored_in: benchmarks.props}
+    - {key: system.tp, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
+    - {key: system.pp, class: identity, role: root, type: int, order: numeric, stored_in: benchmarks.props}
+    - {key: case.input_len, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
+    - {key: case.output_len, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
+    - {key: case.card, class: identity, role: root, type: string, stored_in: benchmarks.props}
+  runners:
+    - {name: vllm-bench, protocol: process/v1, command: [python3, -m, spyre_bench.llm.vllm_runner]}
+    - {name: lm-eval, protocol: process/v1, command: [python3, -m, spyre_bench.llm.lm_eval_runner]}
+  gates:
+    - {id: llm.server_ready, phase: in, reason: SERVER_START_FAILED}
+  metrics:
+    - {name: llm.ttft.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
+       noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
+    - {name: llm.ttft.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+       noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
+    - {name: llm.itl.median, unit: s, direction: lower_is_better, category: performance, statistic: median, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.itl.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.tpot.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+       noise: {min_repeats: 3}, otel: gen_ai.server.time_per_output_token}
+    - {name: llm.e2el.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.e2el.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative}
+    - {name: llm.output_throughput, unit: "{token}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.request_throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.goodput_at_slo, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value,
+       compare: relative, description: "requests/s meeting every bound of the workload's slo"}
+    - {name: llm.batch_latency.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.startup.cold, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 1}}
+    - {name: llm.startup.warm, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.eval.exact_match, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.greedy_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}

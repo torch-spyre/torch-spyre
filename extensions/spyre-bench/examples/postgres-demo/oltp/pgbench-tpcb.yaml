@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# The system axis (default vs tuned) is the SPEC base/peak idea; the load's concurrency sweeps the clients.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: pg16-default}
+spec: {type: pg/postgres, backend: postgres, token: default, major: 16, settings: {max_connections: 200}}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: pg16-tuned}
+spec:
+  base: pg16-default
+  token: tuned
+  patch: {settings: {shared_buffers: 32GB, effective_cache_size: 96GB, wal_buffers: 64MB, synchronous_commit: "off"}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: pgbench-tpcb, owner: example-team}
+spec:
+  type: perf
+  level: transaction
+  tier: core
+  system: pg16-default
+  workload:
+    type: pg/pgbench
+    script: tpcb-like
+    jobs: 4
+    protocol: prepared
+    progress_s: 10
+    inputs: [{name: data, asset: pgbench-data-sf100}]
+    load: {executor: closed, concurrency: 1, duration: 5m, warmup: 1m}
+  run: {repeats: 3, timeout: 30m, est: 6m}
+  matrix:
+    axes:
+      system:
+        - {token: default, patch: {}}
+        - {token: tuned, patch: {system: pg16-tuned}}
+      clients: {path: workload.load.concurrency, values: [1, 8, 32, 64], token: "c{}"}
+    exclude:
+      - {system: default, clients: c64}
+---
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: pg-tps-no-regression, owner: example-team}
+spec:
+  selector: {benchmarks: [pgbench-tpcb]}
+  metric: pg.tps
+  baseline: {kind: rolling, window: 30, min_n: 5, purposes: [nightly, release], match: {environment: id}}
+  tolerance: {pct: 3}
+  noise: {sigmas: 2, source: baseline_mad}
+  severity: gating

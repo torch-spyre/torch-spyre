@@ -49,7 +49,7 @@ from torch_spyre._inductor import loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import propagate_layouts
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.loop_node import LoopNode, all_ops, expand
 from torch_spyre._inductor.loop_scheduler import (
     LoopSchedulerNode,
@@ -125,7 +125,7 @@ class _Graph(unittest.TestCase):
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
         if gid is not None:
-            buf.loop_info = CoarseTileInfo(
+            buf.loop_info = LoopInfo(
                 loop_group_id=gid,
                 loop_count=[4] * len(gid),
                 loop_tiled_dims=[[] for _ in gid],
@@ -203,7 +203,7 @@ class TestFormatOperations(_Graph):
         text = format_operations(ops)
         self.assertEqual(text, "".join(format_operations([op]) for op in ops))
         self.assertTrue(text.startswith("a: ComputedBuffer\n  buffer=a\n  layout="))
-        self.assertIn("\n  loop_info=CoarseTileInfo(loop_group_id=(0,)", text)
+        self.assertIn("\n  loop_info=LoopInfo(loop_group_id=(0,)", text)
         self.assertTrue(text.endswith("\n\n"))
         self.assertNotIn("LoopNode", text)
 
