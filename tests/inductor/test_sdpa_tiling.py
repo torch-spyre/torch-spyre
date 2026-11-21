@@ -470,6 +470,25 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.num_kv_blocks, 1)
         self.assertIn("fewest DSC executes", config.reason)
 
+    def test_decode_single_block_is_judged_on_its_per_core_share(self):
+        """One decode block stays one block while its per-core share fits LX."""
+        shape = dict(
+            num_heads=16,
+            num_kvheads=1,
+            max_seqlen_q=1,
+            max_seqlen_kv=8192,
+            head_dim=512,
+        )
+        single = self._select(**shape, lx_budget_bytes=1 << 40)
+        self.assertEqual(single.num_kv_blocks, 1)
+        estimate = single.estimated_live_bytes_per_core
+
+        over_one_core = self._select(**shape, lx_budget_bytes=estimate - 1)
+        self.assertEqual(over_one_core.num_kv_blocks, 1)
+
+        over_every_core = self._select(**shape, lx_budget_bytes=estimate // 32 - 1)
+        self.assertGreater(over_every_core.num_kv_blocks, 1)
+
     def test_unknown_decode_geometry_is_not_forced_to_a_model_policy(self):
         config = self._select(
             num_heads=12,
