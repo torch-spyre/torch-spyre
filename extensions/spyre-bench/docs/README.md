@@ -214,6 +214,11 @@ A public definition names a dataset by an opaque slug (`slot-95`), never by its 
   last one wins). Keep that path write-restricted.
 - `dataset.json` is not part of any identity. The store namespace is configured per deployment, never in a public file.
 
+## Metric context
+
+Every metric belongs to a metric class that lists the facets its numbers must carry; see
+[metric-context.md](metric-context.md). `validate` warns when a Benchmark does not declare a required author-only facet.
+
 ## Cost hints, not scheduling
 
 The core Benchmark kind carries no cadence. `est_hours` (optional, all cases) and `run.est`/`run.timeout` (per case)

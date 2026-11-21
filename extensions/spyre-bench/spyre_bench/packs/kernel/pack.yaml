@@ -17,5 +17,5 @@ spec:
   runners:
     - {name: harness-a, protocol: process/v1, command: [python3, -m, spyre_bench.kernel.bench_runner]}
   metrics:
-    - {name: kernel.time.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
-    - {name: kernel.total_duration, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.time.mean, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.total_duration, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}

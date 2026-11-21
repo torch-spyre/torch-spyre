@@ -33,7 +33,7 @@ from pathlib import Path
 import regex as re
 import yaml
 
-from spyre_bench import ingest_adapter, placement
+from spyre_bench import ingest_adapter, metric_context, placement
 from spyre_bench.ingest_adapter import IngestUnavailable
 from spyre_bench.placement import parse_cpu_list
 
@@ -638,6 +638,7 @@ class Registry:
     def __init__(self):
         self.packs, self.types, self.ext, self.attrs, self.metrics = {}, {}, {}, {}, {}
         self.device_classes, self.relations, self.analyzers, self.resolvers = {}, set(), {}, {}
+        self.builtin_metrics = set()
         self.vocab = {"test_types": set(), "levels": set(), "purposes": set()}
         self.runners, self.probes, self.gates, self.errors = {}, {}, {}, []
         self.load(CORE_DIR)
@@ -684,6 +685,10 @@ class Registry:
                     f"{p.where}: metric {m['name']}: unit {m['unit']!r} is not a UCUM unit in the allowed subset"
                 )
             self.metrics[m["name"]] = m
+            if pack_dir.resolve() == CORE_DIR.resolve() or pack_dir.resolve().parent == PACKS_DIR.resolve():
+                self.builtin_metrics.add(m["name"])
+        vocab = metric_context.default_vocab()
+        self.errors += [f"{p.where}: {e}" for e in metric_context.pack_errors(sp.get("metrics", []), vocab)]
         self.relations |= {f"{prefix}/{r}" for r in sp.get("relations", [])}
         for kind, reg in (("runners", self.runners), ("probes", self.probes)):
             for r in sp.get(kind, []):

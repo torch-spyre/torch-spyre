@@ -1,0 +1,116 @@
+# Controlled vocabulary of metric context: facets, and per metric class the facets a number must carry.
+# Facet: id, group, type, values|unit, key (attribute-registry key or "-"), ident (identity|prop|label|n/a),
+#   auto (engine|probe|declared|derive|ingest), when (key=value condition), compare (note = recorded, never an equality test).
+# Class: id, match (metric-name globs), required (a|b = either), optional.
+version: 1
+groups: ["workload", "state", "build", "environment", "method", "judgement"]
+facets:
+  - {id: model, group: workload, type: str, key: system.model, ident: identity, auto: engine}
+  - {id: dtype, group: workload, type: enum, values: ["fp32", "bf16", "fp16", "fp8", "fp4", "int8", "int4"], key: system.precision, ident: prop, auto: engine}
+  - {id: quant_scheme, group: workload, type: str, key: -, ident: prop, auto: declared, none_ok: true}
+  - {id: tp, group: workload, type: int, unit: "", key: system.tp, ident: identity, auto: engine}
+  - {id: pp, group: workload, type: int, unit: "", key: system.pp, ident: prop, auto: engine}
+  - {id: batch_size, group: workload, type: int, unit: "", key: -, ident: identity, auto: engine}
+  - {id: concurrency, group: workload, type: int, unit: "", key: case.load.concurrency, ident: identity, auto: engine}
+  - {id: request_rate, group: workload, type: float, unit: request/s, key: case.load.rate, ident: prop, auto: engine}
+  - {id: arrival, group: workload, type: enum, values: ["closed", "poisson", "burst", "batch", "ramp", "trace"], key: case.load.executor, ident: prop, auto: engine}
+  - {id: num_requests, group: workload, type: int, unit: "", key: case.load.requests, ident: identity, auto: engine}
+  - {id: input_len, group: workload, type: int, unit: token, key: case.input_len, ident: identity, auto: engine}
+  - {id: output_len, group: workload, type: int, unit: token, key: case.output_len, ident: identity, auto: engine}
+  - {id: length_mode, group: workload, type: enum, values: ["fixed", "range_ratio", "dataset"], key: -, ident: prop, auto: declared}
+  - {id: kv_span, group: workload, type: str, unit: token, key: -, ident: prop, auto: derive, derive_from: ["input_len", "output_len"]}
+  - {id: kv_ladder, group: workload, type: str, key: SPYRE_ATTN_KV_LADDER, ident: prop, auto: engine, when: backend=spyre}
+  - {id: kv_bucket, group: workload, type: str, unit: token, key: -, ident: prop, auto: derive, compare: note}
+  - {id: actual_input_len, group: workload, type: float, unit: token, key: -, ident: n/a, auto: ingest, compare: note}
+  - {id: actual_output_len, group: workload, type: float, unit: token, key: -, ident: n/a, auto: ingest, compare: note}
+  - {id: block_size, group: workload, type: int, unit: token, key: -, ident: prop, auto: engine}
+  - {id: max_model_len, group: workload, type: int, unit: token, key: -, ident: identity, auto: engine}
+  - {id: max_num_seqs, group: workload, type: int, unit: "", key: -, ident: identity, auto: engine}
+  - {id: prefix_cache, group: workload, type: enum, values: ["off", "on_cold", "on_warm"], key: -, ident: prop, auto: engine}
+  - {id: prefix_hit_ratio, group: workload, type: float, unit: ratio, key: -, ident: n/a, auto: ingest, compare: note}
+  - {id: chunked_prefill, group: workload, type: enum, values: [true, false], key: -, ident: prop, auto: engine}
+  - {id: kv_cache_dtype, group: workload, type: enum, values: ["auto", "fp16", "bf16", "fp8"], key: -, ident: prop, auto: engine}
+  - {id: dataset, group: workload, type: str, key: input.<name>.asset, ident: identity, auto: engine}
+  - {id: sampling, group: workload, type: str, key: -, ident: prop, auto: declared}
+  - {id: run_mode, group: workload, type: enum, values: ["serve", "throughput", "latency", "prefill_only", "decode_only", "generate", "op_benchmark"], key: -, ident: identity, auto: engine}
+  - {id: op_shape, group: workload, type: str, key: -, ident: identity, auto: engine}
+  - {id: eval_task, group: workload, type: str, key: -, ident: identity, auto: engine}
+  - {id: cache_state, group: state, type: enum, values: ["warm", "cold", "partial"], key: run.cache, derive_from: ["compile_cache", "shape_warmup"], ident: prop, auto: derive}
+  - {id: compile_cache, group: state, type: enum, values: ["cold", "warm"], key: SPYRE_KERNEL_CACHE, ident: prop, auto: probe}
+  - {id: shape_warmup, group: state, type: enum, values: ["complete", "partial", "none"], key: -, ident: prop, auto: engine}
+  - {id: warmup_requests, group: state, type: int, unit: "", key: -, ident: prop, auto: engine}
+  - {id: window, group: state, type: enum, values: ["steady", "first_request", "whole_run"], key: -, ident: prop, auto: engine}
+  - {id: graph_mode, group: state, type: enum, values: ["eager", "compiled"], key: -, ident: prop, auto: probe}
+  - {id: weights_cache, group: state, type: enum, values: ["warm", "cold"], key: -, ident: prop, auto: probe}
+  - {id: build, group: build, type: id, key: subject.id, ident: prop, auto: engine}
+  - {id: commits, group: build, type: str, key: subject.dep.<name>, ident: prop, auto: engine}
+  - {id: model_runner, group: build, type: enum, values: ["v1", "v2"], key: -, ident: prop, auto: declared}
+  - {id: backend, group: build, type: str, key: system.backend, ident: prop, auto: engine}
+  - {id: stack_label, group: build, type: str, key: -, ident: prop, auto: ingest}
+  - {id: engine_version, group: build, type: str, key: -, ident: prop, auto: probe}
+  - {id: result_schema, group: build, type: enum, values: ["v1", "v2"], key: -, ident: n/a, auto: ingest}
+  - {id: arch, group: environment, type: enum, values: ["x86_64", "ppc64le", "s390x", "aarch64"], key: cpu.arch, ident: prop, auto: ingest}
+  - {id: host_class, group: environment, type: str, key: env.label.node.class, ident: label, auto: engine}
+  - {id: device_type, group: environment, type: str, key: -, ident: prop, auto: ingest, none_ok: true}
+  - {id: device_count, group: environment, type: int, unit: "", key: env.label.device.count, ident: label, auto: engine}
+  - {id: firmware, group: environment, type: str, key: env.fp.device.firmware, ident: prop, auto: probe}
+  - {id: driver, group: environment, type: str, key: env.fp.device.driver, ident: prop, auto: probe}
+  - {id: cpu_pinning, group: environment, type: enum, values: ["none", "device_local", "per_device", "explicit"], key: run.exec.cpu_pinning, ident: label, auto: engine}
+  - {id: numa_node, group: environment, type: str, key: env.fp.device.numa_node, ident: prop, auto: probe}
+  - {id: clean, group: environment, type: enum, values: ["enforced", "observed", "none"], key: run.clean.exclusive, ident: prop, auto: engine}
+  - {id: mem_placement, group: environment, type: str, key: mem.weight.<name>.region_id, ident: prop, auto: probe, compare: note}
+  - {id: mem_alloc_policy, group: environment, type: enum, values: ["default", "reordered", "pinned"], key: -, ident: prop, auto: declared, none_ok: true}
+  - {id: governor, group: environment, type: str, key: env.fp.governor, ident: prop, auto: probe}
+  - {id: env_id, group: environment, type: id, key: env.id, ident: prop, auto: engine}
+  - {id: tool, group: method, type: str, key: -, ident: prop, auto: engine}
+  - {id: tool_version, group: method, type: str, key: -, ident: prop, auto: probe}
+  - {id: repeats, group: method, type: int, unit: "", key: run.repeats, ident: prop, auto: engine}
+  - {id: statistic, group: method, type: enum, values: ["value", "mean", "median", "p50", "p90", "p95", "p99", "p100", "std", "sum", "min", "max", "count", "ratio"], key: -, ident: n/a, auto: derive}
+  - {id: sample_n, group: method, type: int, unit: "", key: -, ident: n/a, auto: engine}
+  - {id: spread, group: method, type: str, key: -, ident: n/a, auto: derive}
+  - {id: ttft_def, group: method, type: enum, values: ["arrival_to_first_token", "send_to_first_token"], key: -, ident: prop, auto: declared}
+  - {id: itl_def, group: method, type: enum, values: ["token_gap", "tpot_mean"], key: -, ident: prop, auto: declared}
+  - {id: token_basis, group: method, type: enum, values: ["tokenizer", "stream_chunks"], key: -, ident: prop, auto: declared}
+  - {id: timer, group: method, type: enum, values: ["wall", "device_event", "profiler"], key: -, ident: prop, auto: declared}
+  - {id: ratio_basis, group: method, type: str, key: -, ident: prop, auto: declared}
+  - {id: roofline_basis, group: method, type: str, key: -, ident: prop, auto: declared}
+  - {id: trust, group: judgement, type: enum, values: ["ci", "lab", "external"], key: run.trust, ident: n/a, auto: ingest}
+  - {id: validity, group: judgement, type: enum, values: ["valid", "shared_env", "unqualified_env", "suspect", "invalid", "external"], key: run.validity, ident: n/a, auto: ingest}
+  - {id: purpose, group: judgement, type: enum, values: ["pr", "nightly", "weekly", "release", "reference", "qualification", "investigate"], key: run.purpose, ident: n/a, auto: engine}
+  - {id: baseline, group: judgement, type: str, key: -, ident: n/a, auto: derive, none_ok: true}
+  - {id: verdict, group: judgement, type: enum, values: ["pass", "regressed", "improved", "suspected", "no_baseline"], key: -, ident: n/a, auto: derive}
+  - {id: moe_experts, group: workload, type: int, unit: "", key: -, ident: identity, auto: derive, derive_from: ["model"]}
+  - {id: moe_top_k, group: workload, type: int, unit: "", key: -, ident: identity, auto: derive, derive_from: ["model"]}
+  - {id: phase, group: workload, type: enum, values: ["prefill", "decode", "both"], key: -, ident: identity, auto: engine}
+  - {id: tokens_per_expert, group: workload, type: float, unit: token, key: -, ident: prop, auto: derive, derive_from: ["batch_size", "input_len", "moe_experts", "moe_top_k"]}
+  - {id: chunk_tokens, group: workload, type: int, unit: token, key: -, ident: identity, auto: engine}
+  - {id: tile_tokens, group: workload, type: int, unit: token, key: -, ident: identity, auto: declared}
+  - {id: expert_concurrency, group: workload, type: int, unit: "", key: -, ident: identity, auto: declared}
+  - {id: expert_parallel, group: workload, type: int, unit: "", key: system.ep, ident: identity, auto: engine}
+  - {id: moe_dispatch, group: workload, type: enum, values: ["dense_all_experts", "routed_tiles", "gathered_per_token", "gathered_batched"], key: -, ident: identity, auto: declared}
+  - {id: loop_bound_max, group: workload, type: int, unit: "", key: -, ident: prop, auto: derive, derive_from: ["chunk_tokens", "tile_tokens", "moe_experts"]}
+  - {id: loop_trip_count, group: workload, type: str, unit: "", key: -, ident: n/a, auto: ingest, compare: note}
+  - {id: routing_balance, group: workload, type: str, key: -, ident: n/a, auto: ingest, compare: note}
+  - {id: router_source, group: workload, type: enum, values: ["real", "uniform_synthetic", "trace"], key: -, ident: prop, auto: declared}
+  - {id: core_count, group: environment, type: int, unit: "", key: -, ident: prop, auto: probe}
+  - {id: candidate, group: judgement, type: str, key: -, ident: n/a, auto: declared}
+  - {id: baseline_config, group: judgement, type: str, key: -, ident: n/a, auto: declared}
+  - {id: value_kind, group: judgement, type: enum, values: ["config", "limit", "derived", "tested"], key: -, ident: n/a, auto: declared}
+  - {id: source, group: judgement, type: str, key: -, ident: n/a, auto: declared}
+classes:
+  - {id: latency_ttft, match: ["*ttft*"], required: ["cache_state", "window", "concurrency|request_rate", "input_len", "output_len", "length_mode", "kv_span", "kv_ladder", "prefix_cache", "dtype", "tp", "model", "backend", "arch", "device_type", "device_count", "build", "clean", "ttft_def", "statistic"], optional: ["batch_size", "dataset", "sampling", "compile_cache", "shape_warmup", "warmup_requests", "actual_input_len", "actual_output_len", "kv_bucket", "prefix_hit_ratio", "block_size", "firmware", "driver", "cpu_pinning", "mem_placement", "model_runner", "sample_n", "spread", "trust"]}
+  - {id: latency_itl, match: ["*itl*", "*tpot*"], required: ["cache_state", "window", "concurrency|request_rate", "input_len", "output_len", "length_mode", "kv_span", "kv_ladder", "dtype", "tp", "model", "backend", "arch", "device_type", "device_count", "build", "clean", "mem_placement", "itl_def", "statistic"], optional: ["batch_size", "prefix_cache", "dataset", "sampling", "compile_cache", "shape_warmup", "warmup_requests", "actual_input_len", "actual_output_len", "kv_bucket", "block_size", "firmware", "driver", "cpu_pinning", "mem_placement", "model_runner", "sample_n", "spread", "trust"]}
+  - {id: latency_e2e, match: ["*e2el*", "*latency*", "*ttlt*", "*total_s"], required: ["cache_state", "window", "concurrency|request_rate", "input_len", "output_len", "length_mode", "kv_span", "kv_ladder", "prefix_cache", "dtype", "tp", "model", "backend", "arch", "device_type", "device_count", "build", "clean", "statistic"], optional: ["batch_size", "dataset", "sampling", "compile_cache", "shape_warmup", "warmup_requests", "actual_input_len", "actual_output_len", "kv_bucket", "prefix_hit_ratio", "block_size", "mem_placement", "model_runner", "sample_n", "spread", "trust"]}
+  - {id: throughput, match: ["*throughput*", "*_tps", "tps", "*tokens_per_second*", "*requests_per_second*"], required: ["cache_state", "window", "concurrency|request_rate", "input_len", "output_len", "length_mode", "kv_span", "kv_ladder", "prefix_cache", "dtype", "tp", "model", "backend", "arch", "device_type", "device_count", "build", "clean", "token_basis", "statistic"], optional: ["batch_size", "dataset", "sampling", "compile_cache", "shape_warmup", "warmup_requests", "actual_input_len", "actual_output_len", "kv_bucket", "prefix_hit_ratio", "block_size", "firmware", "driver", "cpu_pinning", "mem_placement", "model_runner", "sample_n", "spread", "trust"]}
+  - {id: kernel_time, match: ["kernel.*", "*kernel*_ms", "*total_duration*", "*memory_transfer*", "duration_ms", "*torch_spyre_ms", "spyre_ms"], required: ["cache_state", "op_shape", "dtype", "batch_size", "backend", "arch", "device_type", "device_count", "build", "clean", "mem_placement", "timer", "statistic", "sample_n"], optional: ["run_mode", "compile_cache", "graph_mode", "firmware", "driver", "cpu_pinning", "numa_node", "mem_placement", "spread", "repeats", "trust"]}
+  - {id: startup_time, match: ["*startup*", "*compile*", "*load_time*", "*warmup_time*"], required: ["cache_state", "compile_cache", "weights_cache", "model", "dtype", "tp", "backend", "arch", "device_type", "device_count", "build", "clean", "statistic"], optional: ["firmware", "driver", "sample_n", "spread", "trust"]}
+  - {id: memory, match: ["*mem_size*", "*memory*"], required: ["model", "dtype", "tp", "kv_span", "kv_ladder", "kv_cache_dtype", "backend", "arch", "device_type", "build", "statistic"], optional: ["batch_size", "concurrency", "mem_placement", "trust"]}
+  - {id: quality_score, match: ["*exact_match*", "*accuracy*", "acc_norm", "*bleu*", "*rouge*", "meteor", "f1*", "*_f1", "*ndcg*", "*mrr*", "main_score", "*pearson*", "*spearman*", "*parity*", "*v_measure*", "*precision*", "*recall*"], required: ["eval_task", "dataset", "sampling", "model", "dtype", "tp", "backend", "arch", "device_type", "build", "tool", "statistic", "sample_n"], optional: ["model_runner", "stack_label", "engine_version", "trust", "baseline"]}
+  - {id: pass_rate, match: ["*pass_rate*", "*pass_pct*", "*passed*"], required: ["dataset", "backend", "arch", "device_type", "build", "purpose", "statistic", "sample_n"], optional: ["trust", "validity"]}
+  - {id: op_coverage, match: ["*coverage*"], required: ["dataset", "backend", "arch", "device_type", "build", "statistic"], optional: ["trust"]}
+  - {id: utilisation, match: ["*util*"], required: ["cache_state", "window", "op_shape", "dtype", "backend", "arch", "device_type", "device_count", "build", "clean", "timer", "statistic"], optional: ["concurrency", "mem_placement", "trust"]}
+  - {id: roofline_pct, match: ["*roofline*"], required: ["cache_state", "op_shape", "dtype", "backend", "arch", "device_type", "device_count", "build", "clean", "roofline_basis", "timer", "statistic"], optional: ["mem_placement", "trust"]}
+  - {id: ratio, match: ["ratio", "*_ratio", "*speedup*"], required: ["ratio_basis", "backend", "arch", "device_type", "build", "statistic"], optional: ["trust"]}
+  - {id: design_parameter, match: ["param.*"], required: ["model", "phase", "backend", "device_type", "value_kind", "source"], optional: ["moe_experts", "moe_top_k", "chunk_tokens", "tile_tokens", "loop_bound_max", "expert_concurrency", "device_count", "tp", "dtype", "trust"]}
+  - {id: diagnostic, match: [], required: [], optional: [backend, arch, device_type, build]}
+  - {id: collective, match: ["comms.*"], required: [backend, arch, device_type, device_count, build, clean, statistic], optional: [dtype, tp, sample_n, spread, trust]}
