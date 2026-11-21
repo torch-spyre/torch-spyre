@@ -61,11 +61,15 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
+| `benchmeta.py` | a vLLM bench's `env`/`phases`/`host_resources`/`outputs`/`compile_summary` sidecars -> `run.*`/`subject.*` run props (key list in its docstring) |
+| `vllm_trace.py` | `python -m spyre_clickhouse_ingest vllm-trace <run_dir>`: one profiled run's analyzer JSON -> `report_kind=vllm-trace` rows (`trace_phase`, `trace_step`, `trace_kernel`, `compile_pass`; all in `benchmark_excluded_record_types`), linked to the artifact by a performance verdict. Per-step arrays are the `trace_bundle.py` path (`step_trace`); `trace_step` is the analyzer's per-kind mean |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
+| `reference.py` | `bench-reference` bundles: file format and validation, identity, approval rules, lifecycle, and the writer that runs at approval (docs/references.md) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
+| `bench_verdicts.py` | read-only verdict reader for one run or artifact (`python -m spyre_clickhouse_ingest bench-verdicts`): verdict, baseline, repeats/CV, trust, validity and invalidation per benchmark metric, as JSON or markdown; the advisory check poster is `.github/scripts/bench_check.py` |
 
 ## Naming an artifact (simple -> advanced)
 
@@ -114,6 +118,13 @@ run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-
 `<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
 scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
 `ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--purpose nightly|weekly|merge|on-demand|pr-check|...` records why a perf `report.xml` run happened as the
+run prop `run.purpose` on `benchmark_runs` (lower-cased; it never enters the benchmark id). Only `nightly`,
+`weekly` and `merge` runs join the rolling verdict baselines (`benchmark_baseline_purposes`); a run with another
+purpose is judged but capped at `suspected`, and a run without the prop stays eligible. It is accepted for the
+`--xml-dir`/`--xml-file` path only; the other input kinds refuse it rather than drop it. On that path it exits 2
+when no row could carry it (`--schema` without v2, `CLICKHOUSE_DB_V2` unset, v2 benchmark tables absent) and
+warns per file when the file is a plain test report or was already ingested.
 `--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
 Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
@@ -239,8 +250,7 @@ covers an isolated lab, an air-gapped host, a person testing by hand, or a vLLM 
 disconnected system.
 - `--offline` writes a **bundle** instead of connecting.
 - `--upload` puts the bundle in the Artifactory inbox.
-- The `v2-results-relay` job (spyre-frameworks, every 15 minutes) records it with
-  `results --from-bundle`.
+- A scheduled `relay` job (every 15 minutes) records it with `results --from-bundle`.
 
 The recording goes through the path a connected run takes: `results` for JUnit, and `vllm.py`
 for vLLM bench JSON (the module spyre-inference's live perf ingest uses). So the rows link to the
@@ -253,7 +263,23 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | write + upload | `results --offline --upload [--wait] <the usual flags>` |
 | upload one | `results --upload <dir\|tgz> [--as-folder] [--wait]` |
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
+| compatibility | `results --check [<dir\|tgz>]` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
+
+### The relay
+
+`python -m spyre_clickhouse_ingest relay [--apply]` is the job that records the inbox. It needs no checkout of any
+other repository: it lists the inbox with Artifactory AQL (`ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`, a path template with `{arch}`; `ARTIFACTORY_TOKEN`, with `ARTIFACTORY_USER` for basic
+auth), ingests each bundle with `results --from-bundle --strict --channel-trust <trust of the uploading account>`, and
+moves it to `processed/` or `rejected/` (+ `REJECTED.json`). Without `--apply` it ingests with `--dry-run` and moves
+nothing. Each ingested bundle also gets one `published` row in `result_uploads` (written before the move, keyed by the
+run, so a repeat or a race adds nothing), which lets the dashboard retract a relay upload like any other. An
+Artifactory account listed with `--ci-account` is recorded as trust `ci`, every other as `external`; a bundle's run key
+never decides trust. `--trusted-job-prefix` (repeatable) limits which CI-looking run keys are accepted.
+`--backfill-processed` writes the missing rows for bundles already in `processed/`; `--no-record-uploads` skips the
+row when the login lacks INSERT on `result_uploads`. A bundle whose row cannot be written is reported
+`unrecordable`, stays in the inbox and is retried.
 
 A **connected** run records every kind directly with the same flags, no `--offline`:
 
@@ -263,6 +289,7 @@ A **connected** run records every kind directly with the same flags, no `--offli
 | vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
 | sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
 | benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+| bench | `results --bench-dir <dir> --trigger-type perf\|quality --channel-trust ci --workflow <series> <the usual flags>` ([bench bundles](docs/bench-bundles.md)) |
 
 vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
 temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
@@ -287,13 +314,62 @@ On a host without network access, use either:
 - or just `spyre_clickhouse_ingest/offline.py` with `bundle.schema.json` beside it:
   `python offline.py --offline ...` (same flags).
 
+### Sealing for a site without a route to the database
+
+- **Repeatable.** Sealing the same results twice gives the same bundle sha256 (and the same
+  `.tgz` bytes) on the same host with the same kit version (the host and user in `runner`, and
+  `producer.version`, are part of the digest unless redacted or the same), so a retried seal is a duplicate upload, not a second run. The seal time is not
+  recorded; `ended_at` is the last JUnit suite's end, or `--ended-at`, or absent.
+- **Redaction.** `bundle.json` records the sealing host and user under `runner`;
+  `--redact-host` and `--redact-user` leave them out. `--redact-host` also blanks the
+  `hostname` attribute (either quote style) of JUnit `<testsuite>` elements in `results/*.xml`,
+  byte for byte otherwise, and reports how many it blanked and which files still contain the
+  host name (for example in `system-out`). `--redact-host` scans only `results/`, not `attachments/`. Redaction does not cover JUnit `<properties>`, `system-out`,
+  `run_url` or attachments, and the host-name check does not read non-ASCII-compatible XML
+  (such as UTF-16) or reliably tell a short host name from other text; the digest also depends on `producer.version` and, in a `.tgz`,
+  on the zlib build. An `--append-to-run` round carries the run's earlier trust forward when it has none of its
+  own, records the lower of the two when it has both, and writes nothing when neither exists. If the first round had no trust, a later round's own
+  trust is recorded as it is. A duplicate or dry run prints no receipt. `--check` stands alone
+  and needs a path or none.
+- **Trust label.** `--seal-trust lab|external` (default `external`) is recorded as `trust` in
+  `bundle.json`. It is a claim: the receiving channel decides the level, and the lower of the
+  two is recorded as `run.trust` on the run's verdict.
+  - `--channel-trust ci|lab|external` is the trusted-operator flag for `--from-bundle` and the
+    direct vllm/sendnn/benchmarks/tables ingests: whoever can run the ingest can assert a
+    level, as they can already write the database. It is an error with `--offline`/`--upload`,
+    `--validate-only`, `--check` and on the direct JUnit path.
+  - A labelled bundle with no channel level is recorded as `external`; a bundle with neither
+    a label nor a channel level records no `run.trust`, as before. A bundle can lower its
+    trust, never raise it; `ci` is refused in a bundle.
+  - Rejected: a `run.trust` key in the `props` or `run_props` of benchmark rows or table rows,
+    in `--bundle-prop`, and in `--result-prop`. Accepted, because it never reaches the
+    verdict: a JUnit `<property>` (it becomes a `test_case_runs` prop), a capability `sig`
+    entry (part of the capability identity) and `tags` (tag values).
+  - An `--append-to-run` round reads the run's earlier `run.trust` from
+    `v_artifact_results_published`, so retracted rounds do not count. `artifact_results` is
+    append-only, so no merge can drop an older verdict's trust.
+- **Time zones.** A JUnit timestamp without a zone is read as UTC (a warning says so whenever
+  a time is taken from such a file), whatever the sealing host's zone; the dashboard reads it
+  the same way, so the sealing host's zone does not matter.
+  For `--offline`, `--triggered-at`/`--ended-at` must carry a zone, and an end before the
+  start is clamped to the start with a warning.
+- **Compatibility.** `results --check` prints the schema versions, kinds and trust labels this
+  ingest accepts. `results --check <bundle>` also says whether it can read that bundle (exit 2
+  and a message naming the side to upgrade when not). A sealed bundle carries `producer`
+  (kit name and version) for this. An ingest older than the kit refuses `trust` and `producer`
+  as unknown keys: upgrade the connected side first.
+- **Receipt.** `results --from-bundle` adds `receipt` to its report and prints it to stderr,
+  `RCPT-XXXX-XXXX-XXXX-XXXX`, the first 16 hex digits of sha256(`<bundle sha256>` NUL
+  `<upload_id>`), grouped. `upload_id` comes from `--bundle-prop upload_id=<id>` (empty
+  otherwise), so the site can recompute it from the digest it sealed.
+
 ### The bundle
 
-A folder, or a `.tgz` of one:
+A folder, or a `.tgz` of one. A vllm bundle may also hold top-level sidecars (`env.json`, `<test>.env.json`, ...) and `results/<test>/<kind>.json`; deploy this package before uploading nested bundles, since older readers reject them in `check()`. Symlinks in the results dir are not bundled.
 
 ```
 bundle.json        # bundle.schema.json
-results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, (kind benchmarks) *.json, or (kind tables) <table>.json; flat
+results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, (kind benchmarks) *.json, or (kind tables) <table>.json; flat, except a vllm bundle's per-test sidecars results/<test>/<kind>.json (never repeats/)
 attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
 ```
 
@@ -322,7 +398,7 @@ Everything else is optional (`--offline` writes most of it):
 | `kind`, `perf` | `junit`; for vllm, `{model, tensor_parallel, input_len, output_len, cards, head_sha, head_branch, state}` |
 | `run_url`, `workflow`, `runner`, `env`, `notes`, `uploader`, `sealed_at`, `tag_family`, `tags` | unset (tags for Jenkins keys only) |
 
-The bundle sha256 covers every file's path and content, bundle.json included. Ingest refuses a
+The bundle sha256 covers every file's path and content, bundle.json included. The sha256 values are written by the sealer into the bundle, so they catch accidental corruption, not tampering: anyone who edits the files can recompute them. Ingest refuses a
 run_key that already has another run's or bundle's results. The verdict's `props` carry
 `source=bundle`, `uploader` (the Artifactory account that uploaded it), `bundle_sha256` and
 `bundle_url`; `bundle_url` is also the `run_url` when the bundle names none.

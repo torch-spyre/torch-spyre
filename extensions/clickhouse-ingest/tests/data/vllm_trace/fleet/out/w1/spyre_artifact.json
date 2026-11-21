@@ -1,0 +1,25 @@
+{
+ "arch": "x86_64",
+ "artifact_id": "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa",
+ "artifact_name": "example-artifact",
+ "build_job": "example/build",
+ "build_number": "1",
+ "build_url": "https://ci.example.invalid/job/build/1/",
+ "component": "spyre-inference",
+ "deps": [
+  {
+   "component": "dep-a",
+   "id12": "cccccccccccc",
+   "kind": "image"
+  },
+  {
+   "component": "dep-b",
+   "id12": "dddddddddddd",
+   "kind": "wheel"
+  }
+ ],
+ "id12": "aaaaaaaaaaaa",
+ "pin_channel": "default",
+ "pin_epoch": "1",
+ "sources": []
+}

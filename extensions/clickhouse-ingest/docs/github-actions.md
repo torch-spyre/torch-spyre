@@ -63,6 +63,7 @@ XML pipeline ends here.
 | `artifact-id` | From `derive-gha-artifact-id`. Set, it also writes the `artifacts` row + verdict; empty writes neither. |
 | `artifact` / `tag-family` / `tag` / `tag-date` | Name the artifact the run tested by any spec (`image:`, `id:`, `gha:`, ...), and how to tag it; the same options as [`v2-artifact`](#v2-artifact). |
 | `component` / `platform` / `trigger-type` | Hash inputs and tier label stamped on v2 rows — `component` is the value that keeps hf-adapters' and torch-spyre's `test_cases` from colliding on an identically-named test. |
+| `purpose` | `run.purpose` of the perf rows (`nightly`, `weekly`, `merge`, `on-demand`, ...); only the first three join verdict baselines. Empty records none. |
 | `schema` | `v1` (default) / `v2` / `both` — the migration-window switch. |
 | `clickhouse-*` | Connection; empty `clickhouse-host` is a clean no-op. |
 

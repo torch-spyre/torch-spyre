@@ -1,0 +1,273 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""env/phases/host_resources/outputs/compile_summary sidecars through the vLLM ingest."""
+
+import json
+
+import pytest
+import regex as re
+
+from spyre_clickhouse_ingest import benchmeta, vllm
+
+TEST = "latency_granite8B_tp1_in64_out64"
+ENV = {
+    "host": "node-1",
+    "arch": "x86_64",
+    "cpu": {"model": "EPYC", "threads": 64},
+    "cgroup": {"cpu_max": "32000 100000", "memory_max": "max"},
+    "kernel": "5.14",
+    "os": "RHEL 9",
+    "cards": [{"pci": "0000:1a:00.0"}, {"pci": "0000:1b:00.0"}],
+    "knobs": {"SPYRE_X": "1", "VLLM-Y": "2"},
+    "artifact": {"id12": "abcdef123456"},
+}
+
+
+def _bench(d):
+    (d / f"{TEST}.json").write_text(
+        json.dumps({"avg_latency": 1.5, "latencies": [1.4, 1.6]})
+    )
+
+
+def _rows(d):
+    return vllm.extract_rows(str(d), "main", "881a59d2", "", "0", "wf", 0)
+
+
+def _run_props(d):
+    (entry,) = vllm.bench_entries(_rows(d))
+    return entry["run_props"]
+
+
+def test_no_sidecars_leaves_run_props_unchanged(tmp_path):
+    _bench(tmp_path)
+    assert not any(
+        k.startswith(("run.host.", "run.phase.", "run.env."))
+        for k in _run_props(tmp_path)
+    )
+    assert benchmeta.props_for(str(tmp_path), TEST) == {}
+
+
+def test_sidecars_are_not_read_as_benchmark_files(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps(ENV))
+    (tmp_path / "phases.json").write_text('{"phases": []}')
+    assert len(_rows(tmp_path)) == 1
+
+
+def test_env_becomes_run_props(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps(ENV))
+    p = _run_props(tmp_path)
+    assert p["run.node"] == "node-1"
+    assert p["run.host.cpu_model"] == "EPYC"
+    assert p["run.host.card_ids"] == "0000:1a:00.0,0000:1b:00.0"
+    assert p["subject.artifact_id12"] == "abcdef123456"
+    assert p["run.env.SPYRE_X"] == "1"
+    assert p["run.env.VLLM_Y"] == "2"
+    assert p["head_sha"] == "881a59d2"
+
+
+def test_phases_hosts_outputs_compile(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "phases.json").write_text(
+        json.dumps(
+            {
+                "server_startup_sec": 12.5,
+                "phases": [
+                    {"name": "load", "t_start": 1.0, "t_end": 4.5},
+                    {"name": "bad", "t_start": 5, "t_end": 2},
+                ],
+                "clock": "monotonic",
+            }
+        )
+    )
+    (tmp_path / "host_resources.json").write_text(
+        json.dumps(
+            {
+                "load": {"cpu_s": 3.5, "rss_peak_b": 100, "note": "x"},
+                "series_file": "host_series.jsonl",
+            }
+        )
+    )
+    (tmp_path / "outputs.json").write_text(
+        json.dumps({"prompts": 2, "token_sha256": ["a", "b"], "greedy": True})
+    )
+    (tmp_path / "compile_summary.json").write_text(
+        json.dumps({"total_s": 9.0, "cache": {"entries": 3, "hits": 2, "misses": 1}})
+    )
+    p = _run_props(tmp_path)
+    assert p["run.phase.server_startup_s"] == "12.5"
+    assert p["run.phase.load_s"] == "3.500"
+    assert "run.phase.bad_s" not in p
+    assert p["run.res.load.cpu_s"] == "3.5"
+    assert p["run.res.load.rss_peak_b"] == "100"
+    assert "run.res.load.note" not in p
+    assert len(p["run.output_digest"]) == 64
+    assert (p["run.output_digest.0"], p["run.output_digest.1"]) == ("a", "b")
+    assert p["run.output_greedy"] == "1"
+    assert p["run.compile.total_s"] == "9.0"
+    assert p["run.compile.cache_hits"] == "2"
+
+
+def test_per_test_file_wins_and_malformed_is_skipped(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps(ENV))
+    (tmp_path / f"{TEST}.env.json").write_text(json.dumps({"host": "other"}))
+    (tmp_path / "phases.json").write_text("{not json")
+    (tmp_path / "outputs.json").write_text("[1]")
+    p = _run_props(tmp_path)
+    assert p["run.node"] == "other"
+    assert "run.host.cpu_model" not in p
+    assert not any(k.startswith(("run.phase.", "run.output_")) for k in p)
+
+
+def test_sampler_record_file_is_not_a_host_resources_summary(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / f"{TEST}.host_resources.json").write_text(
+        json.dumps({"test_name": TEST, "metric": "host_mem_mb", "value": 5}) + "\n"
+    )
+    assert not any(
+        k.startswith("run.res.") for k in benchmeta.props_for(str(tmp_path), TEST)
+    )
+
+
+def test_per_test_subdir_is_read_first_and_repeats_ignored(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps(ENV))
+    sub = tmp_path / TEST
+    sub.mkdir()
+    (sub / "env.json").write_text(json.dumps({"host": "subdir"}))
+    (sub / "host_resources.json").write_text(json.dumps({"load": {"cpu_s": 2}}))
+    (sub / "compile_summary.json").write_text(json.dumps({"total_s": 4}))
+    rep = tmp_path / "repeats" / "r1" / TEST
+    rep.mkdir(parents=True)
+    (rep / "outputs.json").write_text(json.dumps({"token_sha256": ["z"]}))
+    (rep / "env.json").write_text(json.dumps({"host": "repeat"}))
+    p = _run_props(tmp_path)
+    assert p["run.node"] == "subdir"
+    assert p["run.res.load.cpu_s"] == "2"
+    assert p["run.compile.total_s"] == "4"
+    assert "run.output_digest" not in p
+    assert len(_rows(tmp_path)) == 1
+
+
+@pytest.mark.parametrize(
+    "name, doc",
+    [
+        ("env", {"cards": 5}),
+        ("env", {"cards": [{"pci": ["x"]}], "knobs": {"A": 1}, "cpu": {"threads": 1}}),
+        ("phases", {"phases": 5}),
+        ("phases", {"phases": [{"name": "p", "t_start": 0, "t_end": 10**400}]}),
+        ("host_resources", {"load": {"cpu_s": 10**400}}),
+        ("host_resources", 5),
+    ],
+)
+def test_wrong_shaped_sidecar_is_skipped_and_never_aborts(tmp_path, name, doc):
+    _bench(tmp_path)
+    (tmp_path / f"{name}.json").write_text(json.dumps(doc))
+    (tmp_path / "compile_summary.json").write_text(json.dumps({"total_s": 9.0}))
+    p = _run_props(tmp_path)
+    assert p["run.compile.total_s"] == "9.0"
+    assert not any(k.startswith(("run.phase.", "run.res.")) for k in p)
+
+
+def test_a_failing_sidecar_leaves_none_of_its_partial_props(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps({"host": "n1", "cards": 5}))
+    assert "run.node" not in _run_props(tmp_path)
+
+
+def test_host_resources_keys_are_sanitized_and_capped(tmp_path):
+    _bench(tmp_path)
+    res = {f"p{i}": {"a b/c": 1, "d": 2} for i in range(500)}
+    (tmp_path / "host_resources.json").write_text(json.dumps(res))
+    got = {k: v for k, v in _run_props(tmp_path).items() if k.startswith("run.res.")}
+    assert len(got) == 200
+    assert "run.res.p0.a_b_c" in got
+    assert all(re.fullmatch(r"run\.res\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+", k) for k in got)
+
+
+@pytest.mark.parametrize("name", ["../x", "/etc/x", "a/../../x"])
+def test_test_name_cannot_leave_the_results_dir(tmp_path, name):
+    outside = tmp_path / "x"
+    outside.mkdir()
+    (outside / "env.json").write_text(json.dumps({"host": "leak"}))
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "x").mkdir()
+    (results / "x" / "env.json").write_text(json.dumps({"host": "leak"}))
+    assert benchmeta.props_for(str(results), name) == {}
+
+
+def test_a_deeply_nested_sidecar_is_skipped_with_a_warning(tmp_path, caplog):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text("[" * 200000)
+    (tmp_path / "compile_summary.json").write_text(json.dumps({"total_s": 9.0}))
+    assert _run_props(tmp_path)["run.compile.total_s"] == "9.0"
+    assert "skipped" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_numbers_are_never_stored(tmp_path, raw):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(
+        '{"mem_total_b": %s, "knobs": {"X": %s}, "host": "n1"}' % (raw, raw)
+    )
+    (tmp_path / "compile_summary.json").write_text('{"total_s": %s}' % raw)
+    (tmp_path / "host_resources.json").write_text('{"load": {"cpu_s": %s}}' % raw)
+    p = _run_props(tmp_path)
+    assert p["run.node"] == "n1"
+    assert not {"run.host.mem_total_b", "run.env.X", "run.compile.total_s"} & set(p)
+    assert "run.res.load.cpu_s" not in p
+
+
+def test_long_keys_and_values_are_skipped_and_empty_knob_names_ignored(tmp_path):
+    _bench(tmp_path)
+    knobs = {"": "a", "-": "b", "K" * 200: "c", "LONG": "v" * 513, "OK": "v" * 512}
+    (tmp_path / "env.json").write_text(json.dumps({"knobs": knobs}))
+    got = {k: v for k, v in _run_props(tmp_path).items() if k.startswith("run.env.")}
+    assert set(got) == {"run.env._", "run.env.OK"}
+
+
+def test_knobs_are_capped(tmp_path):
+    _bench(tmp_path)
+    knobs = {f"K{i:03d}": i for i in range(benchmeta._MAX_KNOBS + 25)}
+    (tmp_path / "env.json").write_text(json.dumps({"knobs": knobs}))
+    got = [k for k in _run_props(tmp_path) if k.startswith("run.env.")]
+    assert len(got) == benchmeta._MAX_KNOBS and "run.env.K000" in got
+
+
+def test_a_sidecar_with_a_vllm_signature_is_not_a_native_bench_file(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "outputs.json").write_text(
+        json.dumps({"avg_latency": 9.9, "token_sha256": ["a"]})
+    )
+    (tmp_path / f"{TEST}.env.json").write_text(
+        json.dumps({"avg_latency": 9.9, "host": "n"})
+    )
+    rows = _rows(tmp_path)
+    assert {r["actual"] for r in rows if r["metric"] == "avg_latency"} == {1.5}
+    assert _run_props(tmp_path)["run.output_digest.0"] == "a"
+
+
+def test_symlinked_sidecars_leaving_the_results_dir_are_not_read(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "env.json").write_text(json.dumps({"host": "leak"}))
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "env.json").symlink_to(outside / "env.json")
+    (results / TEST).symlink_to(outside, target_is_directory=True)
+    assert benchmeta.props_for(str(results), TEST) == {}

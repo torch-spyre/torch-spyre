@@ -14,13 +14,19 @@
       ]
     },
     "kind": {
-      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg. sendnn: results/*.txt, the perf suite's report_sendnn.txt, as torch-spyre benchmark rows on the sendnn backend (always uploaded; no CI leg runs sendnn). benchmarks: results/*.json of generic benchmark rows ({\"benchmarks\": [{name, props, backend, measurements, iterations, run_props, tags}]}), for evals and harnesses with no runner format of their own; test_type perf or quality. tables: results/<table>.json (test_case_runs, benchmark_runs, capability_runs, artifact_results), each {\"rows\": [...]} carrying the identity fields its table hashes; the writers derive the ids. See docs/table-formats.md.",
+      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg. sendnn: results/*.txt, the perf suite's report_sendnn.txt, as torch-spyre benchmark rows on the sendnn backend (always uploaded; no CI leg runs sendnn). benchmarks: results/*.json of generic benchmark rows ({\"benchmarks\": [{name, props, backend, measurements, iterations, run_props, tags}]}), for evals and harnesses with no runner format of their own; test_type perf or quality. tables: results/<table>.json (test_case_runs, benchmark_runs, capability_runs, artifact_results), each {\"rows\": [...]} carrying the identity fields its table hashes; the writers derive the ids. See docs/table-formats.md. bench: results/*.json, one bench Result per case (apiVersion bench/*, kind Result, with repeats, placement and environment), test_type perf or quality; the receiving channel derives trust and recomputes every id. bench-definitions, bench-qualification, bench-invalidation, bench-placement: one results/*.json of records; they name no artifact, test_type or arch, and only a CI-trusted channel ingests them (a lab one too, for bench-invalidation). bench-reference: results/reference.json (+ attachments/), a comparison target written once at approval as a synthetic `reference` artifact; names no artifact; see docs/references.md.",
       "enum": [
         "junit",
         "vllm",
         "sendnn",
         "benchmarks",
-        "tables"
+        "tables",
+        "bench",
+        "bench-definitions",
+        "bench-qualification",
+        "bench-invalidation",
+        "bench-placement",
+        "bench-reference"
       ]
     },
     "artifact_id": {
@@ -61,11 +67,13 @@
       "pattern": "^[a-z0-9][a-z0-9._-]*$"
     },
     "arch": {
-      "description": "Where the tests ran. Default: the artifact's arch. Needed with an image alone.",
+      "description": "Where the tests ran. Default: the artifact's arch. Needed with an image alone. noarch and multi only for bench-reference (derived from its values).",
       "enum": [
         "x86_64",
         "s390x",
-        "ppc64le"
+        "ppc64le",
+        "noarch",
+        "multi"
       ]
     },
     "test_type": {
@@ -152,6 +160,21 @@
       "type": "string",
       "format": "date-time"
     },
+    "trust": {
+      "description": "Where the sealed results came from: lab or external (default external for an offline seal). A label only lowers the trust the receiving channel assigns; `ci` is never read from a bundle.",
+      "type": "string",
+      "enum": [
+        "lab",
+        "external"
+      ]
+    },
+    "producer": {
+      "description": "The kit that sealed it, for the compatibility check (`results --check <bundle>`).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "files": {
       "description": "Every file of the bundle but bundle.json. results/*.xml (junit) or results/*.json (vllm) are ingested; attachments/ are kept, not ingested.",
       "type": "array",
@@ -166,7 +189,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "pattern": "^(results/[^/]+\\.(xml|json|txt)|attachments/[^\\s]+)$"
+            "pattern": "^(results/[^/]+\\.(xml|json|txt)|results/[^/]+/(env|phases|host_resources|outputs|compile_summary)\\.json|attachments/[^\\s]+)$"
           },
           "sha256": {
             "type": "string",

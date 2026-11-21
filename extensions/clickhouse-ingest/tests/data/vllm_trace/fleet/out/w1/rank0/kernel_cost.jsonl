@@ -1,0 +1,2 @@
+{"provenance_key": "kernelkey0000000", "kernel": "k", "aten_ops": ["aten.mm.default"], "cost": {"predicted_us": 300.5, "macs": 1}}
+{"provenance_key": "nocost0000000000", "kernel": "k", "aten_ops": [], "cost": null}

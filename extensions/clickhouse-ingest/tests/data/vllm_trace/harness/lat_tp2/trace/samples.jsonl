@@ -1,0 +1,4 @@
+{"t_s": 1793777270.225, "phase": "compile_warmup", "cpu_cores": 1.0, "rss_b": 500000000.0, "cgroup_b": 1000000000.0, "throttled_s": 0.0}
+{"t_s": 1793777270.725, "phase": "ready", "cpu_cores": 2.0, "rss_b": 500000000.0, "cgroup_b": 1000000000.0, "throttled_s": 0.1}
+{"t_s": 1793777271.225, "phase": "warmup", "cpu_cores": 3.0, "rss_b": 500000000.0, "cgroup_b": 1000000000.0, "throttled_s": 0.2}
+{"t_s": 1793777271.725, "phase": "profiled", "cpu_cores": 4.0, "rss_b": 500000000.0, "cgroup_b": 1000000000.0, "throttled_s": 0.30000000000000004}

@@ -1,0 +1,48 @@
+{
+ "argv": [
+  "bash",
+  "run.sh"
+ ],
+ "artifact": {
+  "arch": "x86_64",
+  "artifact_id": "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb",
+  "artifact_name": "example-artifact",
+  "component": "spyre-inference",
+  "deps": [
+   {
+    "component": "dep-a",
+    "id12": "cccccccccccc",
+    "kind": "image"
+   }
+  ],
+  "id12": "bbbbbbbbbbbb",
+  "pin_channel": "default",
+  "pin_epoch": "1",
+  "sources": []
+ },
+ "env": {
+  "arch": "x86_64",
+  "cgroup": {
+   "cpu_max": "max 100000",
+   "memory_max": "max"
+  },
+  "cpu": {
+   "model": "Example CPU",
+   "threads": 64
+  },
+  "host": "node-a",
+  "kernel": "0.0.0-example",
+  "knobs": {
+   "FLEX_COMPUTE": "EXAMPLE",
+   "VLLM_PLUGINS": "example"
+  },
+  "mem_total_b": 1000000,
+  "os": "Example Linux"
+ },
+ "image": "",
+ "knobs": {
+  "FLEX_COMPUTE": "EXAMPLE"
+ },
+ "run_id": "20261103T000544-b512",
+ "start": "2026-11-03T00:05:44Z"
+}
