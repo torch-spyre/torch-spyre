@@ -30,6 +30,8 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, Operation
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 
+from .errors import Unsupported
+
 
 @dataclass(frozen=True)
 class LoopLevel:
@@ -128,123 +130,94 @@ def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Per-read and output advance
+# Per-read and output advance (read from the index)
 # ---------------------------------------------------------------------------
-
-
-def _host_dim_to_index_symbol(ir_node, dim: int) -> sympy.Symbol:
-    """``SpyreKernel._host_dim_to_index_symbol``: the kernel's own mapping.
-
-    Imported at call time so that this module, which ``scratchpad`` readers
-    import, does not import ``spyre_kernel`` at load time.
-    """
-    from .spyre_kernel import SpyreKernel
-
-    return SpyreKernel._host_dim_to_index_symbol(ir_node, dim)
 
 
 def _memory_reads(op) -> list[MemoryDep]:
     return [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
 
 
-def _read_record(op, dep: MemoryDep, reads: Sequence[MemoryDep] | None = None):
-    """``(loop_info, dep_idx)`` for ``dep`` as a read of ``op``, else ``None``.
+def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
+    """The coefficient of the loop variable ``variable`` in ``index``.
 
-    The kernel gives the k-th read of a (mutation-resolved) buffer name the
-    record of the k-th ``MemoryDep`` read with that name, which is the
-    record at that read's own position among the ``MemoryDep`` reads; so
-    ``dep``'s record is the one at ``dep``'s position.  A ``dep`` equal to two
-    reads takes the first.  ``reads``, when given, is ``op``'s ``MemoryDep``
-    reads in order, used in place of re-deriving them.
+    (The lowering computes the step it writes into the index separately, as the delta
+    of the undivided index over one trip: ``wsr.loop_tiling_lowering._tile_step``. This
+    reads that term back from the final index.)
+
+    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
+    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
+    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
+    advance", those would be silently wrong once the stored record, which makes such
+    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
+
+    * it must be affine in the variable (the second difference is zero), and
+    * the step must be a number (a symbolic step cannot be projected to device
+      elements),
+
+    otherwise this raises ``Unsupported``. A variable that does not occur in the
+    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
+    ``8*u0`` and has coefficient 8.
+
+    Lives here (``spyre_kernel`` imports it) because the advance accessors below
+    read a shim op's advances with it.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or not isinstance(dep, MemoryDep):
-        return None
-    if reads is None:
-        reads = _memory_reads(op)
-    if dep not in reads:
-        return None
-    return loop_info, reads.index(dep)
-
-
-def _at(lists, i):
-    return lists[i] if lists is not None and i < len(lists) else []
-
-
-def _per_level_advance(
-    ir_node, dep: MemoryDep, per_level_dims, squeezed_per_level, depth: int
-) -> tuple[sympy.Expr, ...]:
-    """One host-element advance per level, built as the kernel builds it.
-
-    Mirrors ``SpyreKernel._general_tile_advance`` before its device
-    projection: substitute ``extent * s`` for each tiled dim's index symbol,
-    zero every other free symbol of ``dep.index``, add ``s * extent *
-    host_stride`` for each squeezed pair.  ``s`` is a fresh symbol, and the
-    reported value is the term at ``s = 1`` minus the term at ``s = 0``: the
-    per-trip step, without the constant offset (e.g. a slice start) that
-    ``dep.index`` may carry and the kernel's projection drops.  For a term
-    linear in ``s`` (every term the ``for_each_tile`` corpus produces) this
-    is the coefficient the kernel projects; a term non-linear in ``s`` (e.g.
-    through ``floor``) has no single per-trip step, and the kernel's
-    projection of one is not reproduced here.
-    """
-    n = max(depth, len(per_level_dims or ()), len(squeezed_per_level or ()))
-    out: list[sympy.Expr] = []
-    for level in range(n):
-        pairs = _at(per_level_dims, level)
-        squeezed = _at(squeezed_per_level, level)
-        if not pairs and not squeezed:
-            out.append(sympy.S.Zero)
-            continue
-        s = sympy.Dummy("level")
-        term = sympy.S.Zero
-        if pairs:
-            subs = {
-                _host_dim_to_index_symbol(ir_node, d): extent * s for d, extent in pairs
-            }
-            subs.update(
-                {sym: sympy.S.Zero for sym in dep.index.free_symbols if sym not in subs}
-            )
-            term += dep.index.subs(subs)
-        for host_stride, extent in squeezed:
-            term += s * extent * host_stride
-        out.append(sympy.simplify(term.subs(s, 1) - term.subs(s, 0)))
-    return tuple(out)
+    if variable not in index.free_symbols:
+        return sympy.S.Zero
+    at = [sympy.expand(index.xreplace({variable: k})) for k in (0, 1, 2)]
+    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
+        raise Unsupported(
+            f"the loop variable {variable} is used non-affinely in the index "
+            f"{index}; a per-trip advance cannot be read from it"
+        )
+    step = sympy.simplify(at[1] - at[0])
+    if not step.is_number:
+        raise Unsupported(
+            f"the loop variable {variable} has the symbolic step {step} in the "
+            f"index {index}; it cannot be projected to device elements"
+        )
+    return step
 
 
 def _depth(loop_info) -> int:
     return len(_group_path(loop_info))
 
 
-def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
-    """Host-element advance per trip of read ``dep``, one per level, outermost first.
+def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
+    """An op's advance per level: the coefficient of each loop variable in
+    ``dep.index``, in host elements. The loop variables are the ``dim_hints``
+    entries that carry a ``loop_var_range``, outermost first; an ordinary
+    iteration-symbol hint is not one.
 
-    ``sympy.S.Zero`` for a level at which the read does not advance; ``()``
-    when ``op`` has no ``loop_info`` or ``dep`` is not one of its
-    ``MemoryDep`` reads.  The value is in host elements: projecting it to the
-    device (``views.tiling_expr_to_device_expr``) needs a concrete layout and
-    stays with the caller.
-
-    For a term that is linear in the level's loop variable (every term the
-    ``for_each_tile`` lowering produces today) this is the coefficient the
-    kernel projects.  For a non-linear term the two can differ:
-    ``4096 * floor(8 * s)`` gives ``32768`` here (the term at ``s = 1`` minus
-    the term at ``s = 0``), while ``SpyreKernel._general_tile_advance`` takes the
-    coefficient of ``s``, which is ``0``, and so emits no advance.  Do not
-    substitute one for the other without deciding which is right.
+    An op of a ``for_each_tile`` loop that lists no loop variable has none in its
+    index, so nothing it reads or writes moves with the loop: zero at every level.
+    (The loop's fill and other once-only members are like that.) An op the
+    loop-tiling lowering made (``strict_loop_vars``) always lists the variable of every
+    level, so one that lists none is a compiler bug, not a zero: that raises, as it
+    did before part A. Otherwise the count must equal the loop depth, else the
+    pairing of variable to level is unknown and nothing here can guess it.
     """
-    found = _read_record(op, dep)
-    if found is None:
-        return ()
-    loop_info, idx = found
-    tiled = loop_info.tiled_dims_per_read
-    if idx >= len(tiled):
-        # The kernel emits no advance for a read past the record.
-        return (sympy.S.Zero,) * _depth(loop_info)
-    squeezed = getattr(loop_info, "squeezed_advance_per_read", None) or []
-    return _per_level_advance(
-        op, dep, tiled[idx], _at(squeezed, idx), _depth(loop_info)
-    )
+    variables = [
+        h.loop_var
+        for h in getattr(op, "dim_hints", None) or ()
+        if h.loop_var is not None and h.loop_var_range is not None
+    ]
+    depth = _depth(op.loop_info)
+    if not variables:
+        if getattr(op.loop_info, "strict_loop_vars", False):
+            raise RuntimeError(
+                f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
+                f"is made by the loop-tiling lowering but lists none of its {depth} "
+                "loop variable(s): its advances cannot be read from the index"
+            )
+        return (sympy.S.Zero,) * depth
+    if len(variables) != depth:
+        raise RuntimeError(
+            f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
+            f"has {depth} loop level(s) but {len(variables)} loop variable "
+            "hint(s): its advances cannot be read from the index"
+        )
+    return tuple(_loop_coefficient(dep.index, v) for v in variables)
 
 
 def _first_memory_write(op) -> MemoryDep | None:
@@ -253,69 +226,79 @@ def _first_memory_write(op) -> MemoryDep | None:
     )
 
 
+def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
+    """Host-element advance per trip of read ``dep``, one per level, outermost first.
+
+    ``sympy.S.Zero`` for a level at which the read does not advance; ``()`` when
+    ``op`` has no ``loop_info`` or ``dep`` is not one of its ``MemoryDep`` reads.
+    The value is in host elements: projecting it to the device
+    (``views.tiling_expr_to_device_expr``) needs a concrete layout and stays with
+    the caller. Read from the index: the coefficient of the level's loop variable
+    (``_loop_coefficient``, which refuses a non-affine use).
+    """
+    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
+        return ()
+    if dep not in _memory_reads(op):
+        return ()
+    return _index_advance(op, dep)
+
+
 def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
     """Host-element advance per trip of ``op``'s write, one per level.
 
     The write is ``op``'s first ``MemoryDep`` write, as in the kernel.  ``()``
-    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.  The same
-    caveat as :func:`read_advance` applies to a term that is not linear in the
-    level's loop variable.
+    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
+    if getattr(op, "loop_info", None) is None:
         return ()
     dep = _first_memory_write(op)
     if dep is None:
         return ()
-    return _per_level_advance(
-        op,
-        dep,
-        loop_info.output_tiled_dims,
-        getattr(loop_info, "squeezed_advance_output", None) or [],
-        _depth(loop_info),
-    )
+    return _index_advance(op, dep)
 
 
 def read_advances_anywhere(
     op: Operation, dep: MemoryDep, *, reads: Sequence[MemoryDep] | None = None
 ) -> bool:
-    """True if read ``dep`` of ``op`` has a tiled or squeezed entry at any level.
+    """True if read ``dep`` of ``op`` advances at any level.
 
-    Answers from the record, as ``scratchpad.utils._is_read_advancing_anywhere``
-    does, not from ``any(a != 0 for a in read_advance(op, dep))``: the two
-    differ for a record whose substituted term is zero (a tiled dim whose
-    symbol is absent from ``dep.index``), and the existing readers treat such
-    a read as advancing.  A read past the end of ``tiled_dims_per_read`` is
-    not advancing.
-
-    ``reads`` is ``op``'s ``MemoryDep`` reads in order, for a caller that
-    already holds them (e.g. from ``pass_utils.op_read_writes``); without it
-    they are re-derived from ``op.get_read_writes()``.
+    ``reads`` is ``op``'s ``MemoryDep`` reads in order, for a caller that already
+    holds them (e.g. from ``pass_utils.op_read_writes``); without it they are
+    re-derived from ``op.get_read_writes()``.
     """
-    found = _read_record(op, dep, reads)
-    if found is None:
+    if getattr(op, "loop_info", None) is None or not isinstance(dep, MemoryDep):
         return False
-    loop_info, idx = found
-    if idx >= len(loop_info.tiled_dims_per_read):
+    if dep not in (_memory_reads(op) if reads is None else reads):
         return False
-    if any(loop_info.tiled_dims_per_read[idx]):
-        return True
-    squeezed = getattr(loop_info, "squeezed_advance_per_read", None) or []
-    return idx < len(squeezed) and any(squeezed[idx])
+    return any(a != 0 for a in _index_advance(op, dep))
 
 
 def output_advances_anywhere(op: Operation) -> bool:
-    """True if ``op``'s write has a tiled or squeezed entry at any level.
+    """True if ``op``'s write advances at any level (``False`` for an op with no
+    ``MemoryDep`` write).
 
-    The record test of ``scratchpad.utils._is_tiled_advancing``, without its
-    ``FixedTiledLayout`` gate (a layout question, not a loop fact).  Like
-    ``read_advances_anywhere`` it reads the record, not the substituted term,
-    and, like it, does not ask whether ``op`` has a ``MemoryDep`` write.
+    The loop fact of ``scratchpad.utils._is_tiled_advancing``, without its
+    ``FixedTiledLayout`` gate (a layout question, not a loop fact).
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
+    if getattr(op, "loop_info", None) is None:
         return False
-    if any(dims for dims in loop_info.output_tiled_dims):
-        return True
-    squeezed = getattr(loop_info, "squeezed_advance_output", None) or []
-    return any(level for level in squeezed)
+    dep = _first_memory_write(op)
+    return dep is not None and any(a != 0 for a in _index_advance(op, dep))
+
+
+def advancing_levels(op: Operation) -> frozenset[int]:
+    """The loop levels at which any read or the write of ``op`` moves.
+
+    The kernel names a loop-level symbol for a level only if something at that
+    level advances; the answer comes from the index. Empty for an op that is in no
+    loop.
+    """
+    if getattr(op, "loop_info", None) is None:
+        return frozenset()
+    levels: set[int] = set()
+    for dep in _memory_reads(op):
+        levels.update(i for i, a in enumerate(_index_advance(op, dep)) if a != 0)
+    write = _first_memory_write(op)
+    if write is not None:
+        levels.update(i for i, a in enumerate(_index_advance(op, write)) if a != 0)
+    return frozenset(levels)

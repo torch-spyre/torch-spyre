@@ -1,0 +1,204 @@
+{
+ "plan_schema": "bench.plan/1",
+ "producer": {
+  "engine": {
+   "name": "spyre-bench",
+   "version": "<version>",
+   "plan_schema": "bench.plan/1",
+   "identity_version": 1
+  },
+  "ingest": "<ingest>"
+ },
+ "created_at": "2026-11-15T03:00:00Z",
+ "purpose": "nightly",
+ "request": {
+  "purpose": "nightly",
+  "subject": {
+   "artifact_id": "9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2"
+  },
+  "selection": {}
+ },
+ "leg": {
+  "arch": "x86_64",
+  "devices": null,
+  "nodes": null,
+  "reference_node": true,
+  "env_id": null
+ },
+ "catalog": {
+  "component": "run-demo",
+  "cases_total": 2
+ },
+ "store": "none",
+ "summary": {
+  "cases": 2,
+  "run": 2,
+  "reuse": 0,
+  "skip": 0,
+  "reasons": {}
+ },
+ "estimate": {
+  "wall_min": 2.0,
+  "device_hours": 0.03
+ },
+ "cases": [
+  {
+   "name": "op_add_fp16",
+   "benchmark_id": "672395a8-8622-53b7-8613-02fb0a4b222b",
+   "series_key": "7c8e8134-0b09-523a-aaed-df29e4cb57ae",
+   "run_props": {
+    "run.tier": "sanity",
+    "run.suite.ops": "true",
+    "run.purpose": "nightly",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.profile_level": "off"
+   },
+   "action": "run",
+   "reason": "",
+   "reused_from": null,
+   "type": "perf",
+   "level": "kernel",
+   "workload_type": "kernel/op",
+   "environment": "ref-1card",
+   "runner": "harness-a",
+   "repeats": 3,
+   "cache": "warm",
+   "profile_level": "off",
+   "accelerators": 1,
+   "timeout_min": 5.0,
+   "est_min": 1.0,
+   "case_props": {
+    "system.name": "run-demo-fp16",
+    "system.backend": "spyre",
+    "system.ext.spyre.mode": "a"
+   },
+   "validity": {
+    "expectations": [],
+    "policy": {
+     "name": "demo-default",
+     "spec_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+     "purpose": "nightly",
+     "floor": "valid",
+     "requires": {
+      "qualification": "current",
+      "clean": "any",
+      "min_repeats": 3,
+      "max_cv_pct": 5,
+      "discard_warmup": 1,
+      "placement": "required"
+     },
+     "baseline": true,
+     "reference": false
+    }
+   },
+   "clean": {
+    "requested": false,
+    "expected_exclusive": "observed"
+   },
+   "inputs": [],
+   "benchmark": "op-add",
+   "id_mode": "engine",
+   "id_profile": null,
+   "labels": {
+    "env.label.device.count": "1",
+    "env.label.node.class": "x86-ref-pool"
+   },
+   "pinning": null,
+   "command": [
+    "{python}",
+    "stub_bench.py",
+    "--op",
+    "add",
+    "--shape",
+    "1,512",
+    "--raw",
+    "{raw_dir}",
+    "--repeat",
+    "{repeat}",
+    "--out",
+    "{repeat_dir}"
+   ],
+   "ingest": null,
+   "allow_empty": false
+  },
+  {
+   "name": "op_mul_fp16",
+   "benchmark_id": "dadd42dd-6cd8-5a1b-9be8-42974dc022c4",
+   "series_key": "f807050f-2a9d-5f8c-80ec-525ececd758d",
+   "run_props": {
+    "run.tier": "core",
+    "run.suite.ops": "true",
+    "run.purpose": "nightly",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.profile_level": "off"
+   },
+   "action": "run",
+   "reason": "",
+   "reused_from": null,
+   "type": "perf",
+   "level": "kernel",
+   "workload_type": "kernel/op",
+   "environment": "ref-1card",
+   "runner": "harness-a",
+   "repeats": 2,
+   "cache": "warm",
+   "profile_level": "off",
+   "accelerators": 1,
+   "timeout_min": 5.0,
+   "est_min": 1.0,
+   "case_props": {
+    "system.name": "run-demo-fp16",
+    "system.backend": "spyre",
+    "system.ext.spyre.mode": "a"
+   },
+   "validity": {
+    "expectations": [],
+    "policy": {
+     "name": "demo-default",
+     "spec_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+     "purpose": "nightly",
+     "floor": "valid",
+     "requires": {
+      "qualification": "current",
+      "clean": "any",
+      "min_repeats": 3,
+      "max_cv_pct": 5,
+      "discard_warmup": 1,
+      "placement": "required"
+     },
+     "baseline": true,
+     "reference": false
+    }
+   },
+   "clean": {
+    "requested": false,
+    "expected_exclusive": "observed"
+   },
+   "inputs": [],
+   "benchmark": "op-mul",
+   "id_mode": "engine",
+   "id_profile": null,
+   "labels": {
+    "env.label.device.count": "1",
+    "env.label.node.class": "x86-ref-pool"
+   },
+   "pinning": null,
+   "command": [
+    "{python}",
+    "stub_bench.py",
+    "--op",
+    "mul",
+    "--shape",
+    "1,512",
+    "--raw",
+    "{raw_dir}",
+    "--repeat",
+    "{repeat}",
+    "--out",
+    "{repeat_dir}"
+   ],
+   "ingest": null,
+   "allow_empty": false
+  }
+ ]
+}

@@ -96,6 +96,12 @@ class CandidateDivisionTest(TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
             ),
+            # The fake op has no read/writes to classify its split axes from;
+            # this test is about the candidate menu, not the reduction axes.
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._reduction_syms",
+                return_value=frozenset(),
+            ),
         ):
             CoOptimizingAllocator._extract_op_features(
                 None, None, "out", buffers, {}, op=op
@@ -704,7 +710,7 @@ class SymbolicTileCountCostTest(TestCase):
                 expr = sympy.sympify(predict_ops([self._at(op, self.TILE)]))
                 for count in (1, 4):
                     want = float(predict_ops([self._at(op, count)]))
-                    got = float(expr.subs(self.TILE, count))
+                    got = float(expr.xreplace({self.TILE: count}))
                     self.assertAlmostEqual(
                         got,
                         want,

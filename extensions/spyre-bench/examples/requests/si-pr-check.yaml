@@ -1,0 +1,9 @@
+# A sanity request for a PR build: plan with the Selection's reuse rule.
+purpose: pr
+environment: ref-8card-pr
+subject:
+  artifact_id: 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2
+  resolver: spyre/artifact
+  attrs: {subject.dep.lib: 3a91c0de4f27, subject.lineage: main}
+selection: {cases: [sanity-with-reuse], type: perf}
+budget: {device_hours: 12}
