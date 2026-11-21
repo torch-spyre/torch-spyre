@@ -126,7 +126,7 @@ class _Probe:
 
     def _record(self, kernel, tensor, is_input, name, result):
         node = kernel.current_node.node
-        info = getattr(node, "loop_info", None)
+        info = getattr(node, "loop_member", None)
         if info is None:
             return
         dep = self._dep(kernel, node, is_input, name)
@@ -188,7 +188,7 @@ def _compile_and_probe(fn, args, ctx=None):
 def test_the_index_gives_the_kernels_advance(case):
     fn, args, ctx = CORPUS[case]()
     probe = _compile_and_probe(fn, args, ctx)
-    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_info"
+    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_member"
 
     differing = [r for r in probe.rows if not r[6]]
     assert not differing, [
@@ -410,7 +410,7 @@ class _ReadOp:
     """A consumer with one memory read, enough for ``_moved_loop_term``."""
 
     def __init__(self, index):
-        self.loop_info = _one_level_loop_info()
+        self.loop_member = _one_level_loop_info()
         self._dep = MemoryDep("buf", index, (), ())
 
     def get_read_writes(self):
@@ -420,7 +420,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    copy = SimpleNamespace(loop_info=_one_level_loop_info())
+    copy = SimpleNamespace(loop_member=_one_level_loop_info())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

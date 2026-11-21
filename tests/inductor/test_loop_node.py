@@ -50,7 +50,7 @@ from torch_spyre._inductor.loop_facts import (
     node_levels,
     stamped_levels,
 )
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
@@ -79,12 +79,12 @@ def _dep(name):
 
 
 class _Op:
-    """A stub op: a name, reads/writes, optional loop_info and layout."""
+    """A stub op: a name, reads/writes, optional loop_member and layout."""
 
     def __init__(self, name, gid=None, counts=None, reads=(), writes=None):
         self._name = name
         if gid is not None:
-            self.loop_info = LoopInfo(
+            self.loop_member = LoopMember(
                 loop_group_id=tuple(gid),
                 loop_count=list(counts),
                 loop_tiled_dims=[[] for _ in gid],
@@ -335,7 +335,7 @@ class TestCollapse(unittest.TestCase):
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
         ext = MagicMock(spec=ExternKernel)
-        ext.loop_info = LoopInfo((0,), [4], [[]], [[]])
+        ext.loop_member = LoopMember((0,), [4], [[]], [[]])
         ext.get_name.return_value = "ext"
         a = _Op("a", (0,), [4])
         out = _round_trip(self, [ext, a])
@@ -771,8 +771,8 @@ class TestNodeFacts(unittest.TestCase):
 
     def _tiled_pair(self):
         a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
-        a.loop_info.loop_tiled_dims = [[1]]
-        b.loop_info.loop_tiled_reduction_dims = [[0]]
+        a.loop_member.loop_tiled_dims = [[1]]
+        b.loop_member.loop_tiled_reduction_dims = [[0]]
         graph = _graph([_Op("pre"), a, b, _Op("post")])
         collapse(graph)
         node = next(o for o in graph.operations if isinstance(o, LoopNode))
@@ -810,7 +810,7 @@ class TestNodeFacts(unittest.TestCase):
 
     def test_an_op_no_node_holds_answers_from_its_stamp(self):
         a = _Op("a", (0,), [4])
-        a.loop_info.loop_tiled_dims = [[1]]
+        a.loop_member.loop_tiled_dims = [[1]]
         self.assertEqual(node_levels(a), ())
         (level,) = enclosing_loops(a)
         self.assertEqual((level.group_path, level.tiled_dims), ((0,), (1,)))
@@ -825,7 +825,7 @@ class TestNodeFacts(unittest.TestCase):
     def test_nested_chain_is_outermost_first(self):
         b = _Op("b", (0,), [4])
         c = _Op("c", (0, 0), [4, 2])
-        c.loop_info.loop_tiled_dims = [[], [2]]
+        c.loop_member.loop_tiled_dims = [[], [2]]
         graph = _graph([b, c])
         collapse(graph)
         (outer,) = graph.operations
@@ -839,7 +839,7 @@ class TestNodeFacts(unittest.TestCase):
     def test_an_op_placed_in_a_body_joins_its_chain_and_tiling(self):
         graph, node, a, b = self._tiled_pair()
         new = _Op("new", (0,), [4])
-        new.loop_info.loop_tiled_dims = [[0]]
+        new.loop_member.loop_tiled_dims = [[0]]
         insert_before(graph.operations, b, new)
         self.assertEqual(new._loop_chain, (node,))
         self.assertEqual(node.tiling["new"], ((0,), ()))
@@ -858,7 +858,7 @@ class TestNodeFacts(unittest.TestCase):
         late = _Op("late")
         insert_before(graph.operations, b, late)
         self.assertNotIn("late", node.tiling)
-        late.loop_info = LoopInfo(
+        late.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[2]],
@@ -868,7 +868,7 @@ class TestNodeFacts(unittest.TestCase):
         self.assertEqual(node.tiling["late"], ((2,), ()))
 
     def test_an_unstamped_op_in_a_body_still_answers_not_looped(self):
-        """Node membership is not yet the truth for an op with no loop_info (stage
+        """Node membership is not yet the truth for an op with no loop_member (stage
         9.4 makes it so): it answers as it always did, though a helper put it in the
         body and ``node_levels`` sees the node."""
         graph, node, a, b = self._tiled_pair()
@@ -886,7 +886,7 @@ class TestNodeFacts(unittest.TestCase):
         graph, node, a, b = self._tiled_pair()
         late = _Op("late")
         insert_before(graph.operations, b, late)
-        late.loop_info = LoopInfo(
+        late.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[2]],
@@ -900,7 +900,7 @@ class TestNodeFacts(unittest.TestCase):
     def test_replace_op_takes_the_new_ops_tiling(self):
         graph, node, a, b = self._tiled_pair()
         new = _Op("a", (0,), [4])
-        new.loop_info.loop_tiled_dims = [[0, 2]]
+        new.loop_member.loop_tiled_dims = [[0, 2]]
         replace_op(graph.operations, a, new)
         self.assertEqual(new._loop_chain, (node,))
         self.assertEqual(node.tiling["a"], ((0, 2), ()))

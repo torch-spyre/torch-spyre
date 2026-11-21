@@ -86,21 +86,21 @@ class _StarOp(_Op):
 
 
 class _LoopOp(_Op):
-    """An op whose ``loop_info`` names the counted loop it runs in."""
+    """An op whose ``loop_member`` names the counted loop it runs in."""
 
     def __init__(self, name, path, **kwargs):
         super().__init__(name, **kwargs)
-        self.loop_info = SimpleNamespace(loop_group_id=tuple(path))
+        self.loop_member = SimpleNamespace(loop_group_id=tuple(path))
 
 
 class _ExternLoopOp(_LoopOp, ExternKernel):
-    """Like ``_LoopOp`` but an ``ExternKernel``: it keeps its ``loop_info`` and
+    """Like ``_LoopOp`` but an ``ExternKernel``: it keeps its ``loop_member`` and
     runs once, so it has no loop path. Only the base class matters to the checker;
     ``ExternKernel.__init__`` is not run."""
 
 
 class _SpyreLoopOp(_LoopOp, _SpyreOp):
-    """A Spyre-device op with a ``loop_info``, so the pass pipeline runs on it."""
+    """A Spyre-device op with a ``loop_member``, so the pass pipeline runs on it."""
 
 
 def _node(name, body, induction=U0, carries=()):
@@ -158,7 +158,7 @@ class TestFindViolations(unittest.TestCase):
 
 
 class TestMembership(unittest.TestCase):
-    """Rules 4 and 5: each op's ``loop_info`` agrees with the node it sits in."""
+    """Rules 4 and 5: each op's ``loop_member`` agrees with the node it sits in."""
 
     def test_members_in_their_own_nodes_have_none(self):
         tree = [
@@ -212,7 +212,7 @@ class TestMembership(unittest.TestCase):
         self.assertIn("inner is a loop of group path (1, 2)", problems[0])
 
     def test_an_extern_kernel_outside_a_node_is_allowed(self):
-        # It keeps its loop_info but runs once: it has no loop path.
+        # It keeps its loop_member but runs once: it has no loop path.
         tree = [_ExternLoopOp("const", (0,)), _node("n0", [_LoopOp("a", (0,))])]
         self.assertEqual(find_violations(tree), [])
 
@@ -259,7 +259,7 @@ class TestMembership(unittest.TestCase):
         self.assertEqual(find_violations(tree), [])
 
     def test_a_node_with_no_member_is_not_checked(self):
-        # Hand-built nodes (and the tests above) have ops with no loop_info.
+        # Hand-built nodes (and the tests above) have ops with no loop_member.
         tree = [_node("n0", [_Op("a"), _Op("b")])]
         self.assertEqual(find_violations(tree), [])
 
@@ -272,11 +272,11 @@ class TestNodeFactsRule(unittest.TestCase):
 
         from torch_spyre._inductor.loop_node import collapse
 
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
 
         a, b = _LoopOp("a", (0,)), _LoopOp("b", (0,))
         for op in (a, b):
-            op.loop_info = LoopInfo(
+            op.loop_member = LoopMember(
                 loop_group_id=(0,),
                 loop_count=[4],
                 loop_tiled_dims=[[]],
@@ -292,13 +292,13 @@ class TestNodeFactsRule(unittest.TestCase):
 
     def test_a_stamp_changed_after_the_node_was_built_is_reported(self):
         graph, a, b = self._built()
-        a.loop_info.loop_tiled_dims = [[1]]
+        a.loop_member.loop_tiled_dims = [[1]]
         (problem,) = find_violations(graph.operations)
-        self.assertIn("a: loop_info says", problem)
+        self.assertIn("a: loop_member says", problem)
         self.assertIn("but its nodes say", problem)
 
     def test_a_stamp_written_after_placement_without_record_loop_info_is_reported(self):
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
         from torch_spyre._inductor.loop_node import insert_before
 
         graph, a, b = self._built()
@@ -307,14 +307,14 @@ class TestNodeFactsRule(unittest.TestCase):
         # Unstamped, it is a non-member in the body (rule 5), not a rule-6 case.
         (problem,) = find_violations(graph.operations)
         self.assertIn("late is in the body", problem)
-        late.loop_info = LoopInfo(
+        late.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[4],
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[]],
         )
         (problem,) = find_violations(graph.operations)
-        self.assertIn("late: stamped with a loop_info", problem)
+        self.assertIn("late: stamped with a loop_member", problem)
         self.assertIn("record_loop_info", problem)
 
     def test_an_op_with_no_recorded_chain_is_reported(self):
@@ -325,7 +325,7 @@ class TestNodeFactsRule(unittest.TestCase):
 
     def test_a_hand_built_node_is_not_compared(self):
         tree = [_node("n0", [_LoopOp("a", (0,))])]
-        tree[0].body[0].loop_info.loop_tiled_dims = [[1]]
+        tree[0].body[0].loop_member.loop_tiled_dims = [[1]]
         self.assertEqual(find_violations(tree), [])
 
 

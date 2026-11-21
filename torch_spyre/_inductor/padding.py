@@ -564,7 +564,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         _move_ops_before(operations, y_new_ops, op)
 
         # When coarse-tiling runs pre-stickification, the consuming matmul
-        # already carries loop_info.  The padding ops must inherit it so they
+        # already carries loop_member.  The padding ops must inherit it so they
         # remain contiguous in the loop group for build_loop_scheduler_nodes.
         if is_looped(op):
             levels = enclosing_loops(op)

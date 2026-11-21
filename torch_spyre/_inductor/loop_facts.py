@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only loop facts over the per-op ``loop_info`` metadata.
+"""Read-only loop facts over the per-op ``loop_member`` metadata.
 
-Every function derives its answer from ``getattr(op, "loop_info", None)`` on
+Every function derives its answer from ``getattr(op, "loop_member", None)`` on
 each call; nothing is cached and nothing is mutated.  This gives later stages
 of the loop refactor one stable read API: when the storage behind it changes,
 only this module changes, not its readers.
@@ -49,16 +49,16 @@ class LoopLevel:
     tiled_reduction_dims: tuple[int, ...]
 
 
-def _group_path(loop_info) -> tuple[int, ...]:
-    """The ``loop_group_id`` of ``loop_info`` as a tuple; ``()`` if absent/malformed."""
-    gid = getattr(loop_info, "loop_group_id", None)
+def _group_path(loop_member) -> tuple[int, ...]:
+    """The ``loop_group_id`` of ``loop_member`` as a tuple; ``()`` if absent/malformed."""
+    gid = getattr(loop_member, "loop_group_id", None)
     try:
         return tuple(gid) if gid else ()
     except TypeError:  # malformed id (e.g. a bare int)
         return ()
 
 
-def _levels(loop_info) -> tuple[LoopLevel, ...]:
+def _levels(loop_member) -> tuple[LoopLevel, ...]:
     """One ``LoopLevel`` per ``loop_group_id`` entry; ``()`` if none or malformed.
 
     ``loop_tiled_dims`` / ``loop_tiled_reduction_dims`` may be shorter than the
@@ -66,16 +66,16 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
     entry gets ``()``.  A ``loop_count`` shorter than the path is genuinely
     malformed (a trip count cannot be invented) and yields ``()``.
     """
-    if loop_info is None:
+    if loop_member is None:
         return ()
-    path = _group_path(loop_info)
+    path = _group_path(loop_member)
     if not path:
         return ()
-    counts = getattr(loop_info, "loop_count", None) or ()
+    counts = getattr(loop_member, "loop_count", None) or ()
     if len(counts) < len(path):
         return ()
-    tiled = getattr(loop_info, "loop_tiled_dims", None) or ()
-    tiled_red = getattr(loop_info, "loop_tiled_reduction_dims", None) or ()
+    tiled = getattr(loop_member, "loop_tiled_dims", None) or ()
+    tiled_red = getattr(loop_member, "loop_tiled_reduction_dims", None) or ()
 
     def at(lists, i):
         return tuple(lists[i]) if i < len(lists) else ()
@@ -93,10 +93,10 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
 
 
 def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
-    """The levels ``op.loop_info`` (the per-op stamp) describes; ``()`` if none or
+    """The levels ``op.loop_member`` (the per-op stamp) describes; ``()`` if none or
     malformed. Readers use :func:`enclosing_loops`; this is the stamp itself, for
     the loop checker's comparison with the nodes and for an op no node holds."""
-    return _levels(getattr(op, "loop_info", None))
+    return _levels(getattr(op, "loop_member", None))
 
 
 def _in_built_node(op: Operation) -> bool:
@@ -106,7 +106,7 @@ def _in_built_node(op: Operation) -> bool:
     of the loop's computation, and treating it as looped made the same-tile-group
     relayout offer a candidate for it (a wrong plan on the eager SDPA graphs,
     ``test_gather_attention``). An entry exists exactly for the ops that had a
-    ``loop_info`` stamp."""
+    ``loop_member`` stamp."""
     chain = getattr(op, "_loop_chain", ())
     if not (isinstance(chain, tuple) and chain):
         return False
@@ -120,7 +120,7 @@ def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
     Read from the ``LoopNode``s around ``op`` once the pipeline has built them
     (:func:`node_levels`; the loop checker, rule 6, keeps them equal to the stamp).
     An op no node holds yet (a loop being lowered, before its nodes are built) or no
-    longer holds (hoisted out of its loop) answers from its ``loop_info``.
+    longer holds (hoisted out of its loop) answers from its ``loop_member``.
     """
     if _in_built_node(op):
         return node_levels(op)
@@ -130,7 +130,7 @@ def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
 def node_levels(op: Operation) -> tuple[LoopLevel, ...]:
     """The same levels as :func:`enclosing_loops`, read from the ``LoopNode``s
     around ``op`` (``op._loop_chain``, set where the node is built and by the
-    ``loop_node`` edit helpers) instead of from ``op.loop_info``.
+    ``loop_node`` edit helpers) instead of from ``op.loop_member``.
 
     ``induction`` is the node's, where ``enclosing_loops`` reports ``None``. ``()``
     for an op no node holds.
@@ -160,7 +160,7 @@ def strict_loop_vars(op: Operation) -> bool:
     built, from the stamp for an op no node holds."""
     if _in_built_node(op):
         return any(node.strict_loop_vars for node in op._loop_chain)  # type: ignore[attr-defined]
-    return bool(getattr(getattr(op, "loop_info", None), "strict_loop_vars", False))
+    return bool(getattr(getattr(op, "loop_member", None), "strict_loop_vars", False))
 
 
 def is_looped(op: Operation) -> bool:
@@ -179,7 +179,7 @@ def counted_loop_path(
 ) -> tuple[int, ...]:
     """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
 
-    An ``ExternKernel`` keeps its ``loop_info`` (e.g. a hoisted loop-body
+    An ``ExternKernel`` keeps its ``loop_member`` (e.g. a hoisted loop-body
     constant) but runs once, outside the loop, so it yields ``()`` unless
     ``include_extern`` is set.  A malformed id yields ``()`` rather than
     raising.
@@ -188,11 +188,11 @@ def counted_loop_path(
         return ()
     if _in_built_node(op):
         return tuple(node.group_id for node in op._loop_chain)  # type: ignore[attr-defined]
-    return _group_path(getattr(op, "loop_info", None))
+    return _group_path(getattr(op, "loop_member", None))
 
 
 def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
-    """Levels of the first ``SchedulerNode`` in ``node`` that has a ``loop_info``.
+    """Levels of the first ``SchedulerNode`` in ``node`` that has a ``loop_member``.
 
     An ``ExternKernelSchedulerNode`` holds no ``SchedulerNode`` and so yields
     ``()``, which is how the scheduler already excludes extern kernels.
@@ -201,9 +201,9 @@ def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
         if isinstance(snode, SchedulerNode) and snode.node is not None:
             if _in_built_node(snode.node):
                 return node_levels(snode.node)
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                return _levels(loop_info)
+            loop_member = getattr(snode.node, "loop_member", None)
+            if loop_member is not None:
+                return _levels(loop_member)
     return ()
 
 
@@ -304,7 +304,7 @@ def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     """Host-element advance per trip of read ``dep``, one per level, outermost first.
 
     ``sympy.S.Zero`` for a level at which the read does not advance; ``()`` when
-    ``op`` has no ``loop_info`` or ``dep`` is not one of its ``MemoryDep`` reads.
+    ``op`` has no ``loop_member`` or ``dep`` is not one of its ``MemoryDep`` reads.
     The value is in host elements: projecting it to the device
     (``views.tiling_expr_to_device_expr``) needs a concrete layout and stays with
     the caller. Read from the index: the coefficient of the level's loop variable
@@ -321,7 +321,7 @@ def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
     """Host-element advance per trip of ``op``'s write, one per level.
 
     The write is ``op``'s first ``MemoryDep`` write, as in the kernel.  ``()``
-    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.
+    when ``op`` has no ``loop_member`` or no ``MemoryDep`` write.
     """
     if not is_looped(op):
         return ()

@@ -336,7 +336,7 @@ def test_corpus_matches_kernel(case):
     )
     for r in advancing:
         print(f"  {r[0]} {r[1]} {r[2]}: kernel={r[3]} accessor={r[4]}")
-    assert rec.compared, f"{case}: the kernel built no TensorArg with a loop_info"
+    assert rec.compared, f"{case}: the kernel built no TensorArg with a loop_member"
     if case in MUST_ADVANCE:
         assert advancing, f"{case}: no advancing record; comparison is vacuous"
     assert not rec.mismatches, "accessor != kernel:\n" + "\n".join(

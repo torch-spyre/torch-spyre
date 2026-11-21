@@ -15,9 +15,9 @@
 """``LoopNode``: a counted loop held as one operation in ``graph.operations``.
 
 ``splice_while_loops`` flattens each ``for_each_tile`` loop into ordinary ops
-stamped with ``loop_info``.  Its final step, :func:`collapse`, wraps each loop's
+stamped with ``loop_member``.  Its final step, :func:`collapse`, wraps each loop's
 ops into a ``LoopNode`` (nested for a nested loop), so a loop is a structural
-unit from the first pass after the splice.  ``loop_info`` stays on the leaf
+unit from the first pass after the splice.  ``loop_member`` stays on the leaf
 ops: the node adds structure and the per-loop facts (induction variable, trip
 count, carries) but replaces nothing yet.
 
@@ -82,6 +82,50 @@ class LoopCarryRecord:
     storage_view: Any = field(default=None, compare=False, repr=False)
 
 
+@dataclass
+class LoopMember:
+    """What a loop lowering says about an op it puts in a loop: ``op.loop_member``.
+
+    The lowerings (``for_each_tile`` and the loop-tiling lowering) write it as they
+    build a loop; ``collapse`` / ``build_pending_loop_nodes`` read it to build the
+    ``LoopNode``s and record the facts in them. After that the nodes own the facts and
+    this is no longer read (stage 9.4.3 deletes it from every op a node holds). It
+    holds the loop's own facts only. An access's per-trip advance is the loop
+    variable's coefficient in the access's index (``loop_facts.read_advance``).
+
+    Attributes
+    ----------
+    loop_group_id:
+        Tuple encoding the nesting path, e.g. ``(0,)`` for an outermost
+        group, ``(0, 0)`` for a nested group inside group 0.
+    loop_count:
+        List of trip counts, one per nesting level from outermost to
+        innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
+    loop_tiled_dims:
+        List of lists, one sub-list per nesting level.  Each sub-list
+        contains the ``data.ranges`` positional indices that are tiled at
+        that level.  An empty sub-list means the op is loop-invariant at
+        that level.
+    loop_tiled_reduction_dims:
+        List of lists, one sub-list per nesting level.  Each sub-list
+        contains the ``data.reduction_ranges`` positional indices that are
+        tiled at that level.  An empty sub-list means no reduction dim is
+        tiled at that level.  Parallel to ``loop_tiled_dims``.
+    strict_loop_vars:
+        True on an op the loop-tiling lowering made: its ``dim_hints`` list the
+        loop variable of EVERY level, so an op that lists none is a compiler bug
+        and not a loop-invariant op. False on a ``for_each_tile`` op, where an op
+        that lists no loop variable (the loop's fill, say) simply does not move
+        with the loop. Read by ``loop_facts`` and the kernel's advance lookup.
+    """
+
+    loop_group_id: tuple[int, ...]
+    loop_count: list[sympy.Expr]
+    loop_tiled_dims: list[list[int]]
+    loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    strict_loop_vars: bool = False
+
+
 # Set to False only by the no-behaviour-change test, to compare the pipeline
 # with and without nodes.  With it off, ``collapse`` builds nothing, so no
 # pass sees a view and ``expand`` has nothing to do.
@@ -127,7 +171,7 @@ class LoopNode(ir.Operation):
         # and an access need not move with the loop), so the lowering that divided
         # it records it here.
         # INVARIANT (stage 9.3a): ``tiling`` is written only by ``_fill_tiling`` /
-        # ``record_loop_info`` (from the op's ``loop_info``), and each leaf op's
+        # ``record_loop_info`` (from the op's ``loop_member``), and each leaf op's
         # ``_loop_chain`` only by ``_set_chain``, which the node builder (``_wrap``),
         # the edit helpers below and ``expand`` call. A new edit site calls one of
         # those helpers; it never assigns either directly.
@@ -477,15 +521,15 @@ def record_member(
     A graph with no built nodes (``BUILD_LOOP_NODES`` off: the flat path the
     equivalence tests compare against, deleted in stage 9.5) has nowhere to record
     it. If ``like`` (the neighbour the op was placed beside) is given, the op gets
-    a copy of the neighbour's ``loop_info`` with this tiling instead.
+    a copy of the neighbour's ``loop_member`` with this tiling instead.
     """
     chain = getattr(op, "_loop_chain", ())
     tiling = [(tuple(dims), tuple(reduction)) for dims, reduction in tiling]
     if not chain and like is not None and not BUILD_LOOP_NODES:
-        info = copy.deepcopy(like.loop_info)  # type: ignore[attr-defined]
+        info = copy.deepcopy(like.loop_member)  # type: ignore[attr-defined]
         info.loop_tiled_dims = [list(dims) for dims, _ in tiling]
         info.loop_tiled_reduction_dims = [list(red) for _, red in tiling]
-        op.loop_info = info  # type: ignore[attr-defined]
+        op.loop_member = info  # type: ignore[attr-defined]
         return
     if not chain or len(chain) != len(tiling):
         raise ValueError(
@@ -503,7 +547,7 @@ def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
 
 
 def record_loop_info(op: ir.Operation) -> None:
-    """``op.loop_info`` was (re)written after the op was placed: make the nodes
+    """``op.loop_member`` was (re)written after the op was placed: make the nodes
     around it hold the new tiled dims. A pass that stamps an op it has already
     put in a body calls this right after the stamp (the loop checker, rule 6,
     reports a node that disagrees with the stamp)."""
@@ -512,10 +556,10 @@ def record_loop_info(op: ir.Operation) -> None:
 
 def _fill_tiling(entry: ir.Operation, overwrite: bool = False) -> None:
     """Give each node enclosing a leaf op of ``entry`` the op's tiled dims at that
-    level, read from the op's ``loop_info``, unless the node already has them
+    level, read from the op's ``loop_member``, unless the node already has them
     (``overwrite`` replaces them)."""
     for leaf in all_ops([entry]):
-        info = getattr(leaf, "loop_info", None)
+        info = getattr(leaf, "loop_member", None)
         if info is None:
             continue
         name = leaf.get_name()
@@ -719,7 +763,7 @@ def _chain_of(node: LoopNode) -> tuple[LoopNode, ...]:
 
 
 def _group_path(op: ir.Operation) -> tuple[int, ...]:
-    # An ExternKernel keeps its loop_info (e.g. a hoisted loop-body constant)
+    # An ExternKernel keeps its loop_member (e.g. a hoisted loop-body constant)
     # but runs once, outside the loop, so it is not a member of any loop.
     return counted_loop_path(op)
 
@@ -746,7 +790,7 @@ def _wrap(
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
 
     A node's body is the span from its first member to its last member.  An
-    op that sits between two members but is not one (no ``loop_info``, an
+    op that sits between two members but is not one (no ``loop_member``, an
     ``ExternKernel``, or an op of another loop) is kept in that span, where it
     is: moving it would change the program order, and :func:`expand` must give
     back exactly the list it was given.  Inside the node it is an ordinary
@@ -775,7 +819,7 @@ def _wrap(
             (),
             group_id=group_idx,
             induction=inductions.get(group_idx),
-            trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
+            trip_count=ops[i].loop_member.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
         node.body = _wrap(run, depth + 1, key, inductions, counter, only)
@@ -835,14 +879,14 @@ def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
 
 def _record_node_facts(operations: list[ir.Operation]) -> None:
     """Fill every node's per-member tiling and every leaf's node chain, after the
-    nodes were built from the ops' ``loop_info``."""
+    nodes were built from the ops' ``loop_member``."""
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
     for node in _nodes_in(operations):
         node.facts_recorded = True
         node.strict_loop_vars = any(
-            getattr(getattr(leaf, "loop_info", None), "strict_loop_vars", False)
+            getattr(getattr(leaf, "loop_member", None), "strict_loop_vars", False)
             for leaf in all_ops(node.body)
         )
 

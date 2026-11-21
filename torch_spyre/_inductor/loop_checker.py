@@ -25,7 +25,7 @@ What it checks:
 2. Every loop variable in an op's read and write indices is the induction
    variable of a loop that encloses the op.
 3. Every carry's update is an op in its node's body.
-4. An op that runs in a counted loop that a node covers (its ``loop_info``
+4. An op that runs in a counted loop that a node covers (its ``loop_member``
    names that loop) sits inside that node: not outside it, and not in the body
    of another loop's node.
 5. A node's body holds no op that is not a member of the loop BETWEEN two of
@@ -37,10 +37,10 @@ later. So rule 4 fires only when a node already claims the op's loop, which is
 how a copy-back placed after its loop by a flat index (#6101) is told from a
 flat loop.
 
-Rules 4 and 5 compare each op's ``loop_info`` with the node it sits in, using
+Rules 4 and 5 compare each op's ``loop_member`` with the node it sits in, using
 the same group path that builds the nodes (:func:`counted_loop_path`, which
 gives an ``ExternKernel`` the empty path). They see only the leaf ops, so a node
-built by hand from ops with no ``loop_info`` (the unit tests do) is not checked
+built by hand from ops with no ``loop_member`` (the unit tests do) is not checked
 by them.
 
 What it cannot check: that a read which SHOULD advance carries the induction
@@ -48,7 +48,7 @@ variable. That was the padding bug (#5573); only a comparison against the
 kernel finds it.
 
 What it does not check, and why. A once-only op (an extern kernel that keeps
-its ``loop_info``, such as a ``SpyreConstantFallback`` created in a body)
+its ``loop_member``, such as a ``SpyreConstantFallback`` created in a body)
 stays in the body until the scheduler hoists it (``loop_scheduler``), so
 "once-ops are outside the node" is not an invariant before that. On the loop
 tests, a check for it fired on every graph that creates a constant in a body.
@@ -283,22 +283,22 @@ def _node_fact_problems(
     op: ir.Operation, enclosing: tuple[LoopNode, ...], problems: list[str]
 ) -> None:
     """Rule 6: the facts the nodes around ``op`` hold (group path, trip count,
-    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_info`` says.
+    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_member`` says.
 
-    Until the lowerings stop writing ``loop_info`` (stage 9.4) both exist; a pass
+    Until the lowerings stop writing ``loop_member`` (stage 9.4) both exist; a pass
     that changes the stamp after the node was built, without telling the node,
     leaves the node answering differently, which this reports. An op with no
-    ``loop_info`` has nothing to compare with and is skipped.
+    ``loop_member`` has nothing to compare with and is skipped.
     """
     if (
         not enclosing
-        or getattr(op, "loop_info", None) is None
+        or getattr(op, "loop_member", None) is None
         or not all(n.facts_recorded for n in enclosing)
     ):
         return
     if any(op.get_name() not in n.tiling for n in enclosing):
         problems.append(
-            f"{op.get_name()}: stamped with a loop_info inside "
+            f"{op.get_name()}: stamped with a loop_member inside "
             f"{[n.get_name() for n in enclosing]} but those nodes hold no tiling for "
             "it (a stamp written after the op was placed needs record_loop_info)"
         )
@@ -313,7 +313,7 @@ def _node_fact_problems(
     stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
     if stamped != derived:
         problems.append(
-            f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"
+            f"{op.get_name()}: loop_member says {stamped} but its nodes say {derived}"
         )
 
 

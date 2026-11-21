@@ -129,7 +129,7 @@ def _recording_deferral(record: dict):
         record["body_ops"] = {
             op.get_name()
             for op in all_ops(graph.operations)
-            if hasattr(op, "loop_info")
+            if hasattr(op, "loop_member")
         }
 
     with mock.patch.object(ts_passes, "defer_work_division", defer):
@@ -291,8 +291,8 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     """The LX allocator hoists an input clone "before its consumers' loop
     entry" (``push_allocation_with_clone``). It used to insert it at the flat
     position of the loop's first member, which through ``OpsView`` is inside
-    the LoopNode's body with no ``loop_info``; the flat path rebuilt loops from
-    ``loop_info`` and ran it once, before the loop, while the flow-through ran it
+    the LoopNode's body with no ``loop_member``; the flat path rebuilt loops from
+    ``loop_member`` and ran it once, before the loop, while the flow-through ran it
     every trip. Stage 8.2 places it before the loop's node, so no hoisted clone is
     ever at the edge of a body, and the two paths agree. The graph
     of ``test_for_each_tile_lowering.test_one_unhinted_scan_does_not_block_the_other``
@@ -403,7 +403,7 @@ def _inject_dead_body_copy(record: dict):
         )
         buf.origins = src.origins
         buf.operation_name = name
-        buf.loop_info = copy.deepcopy(src.loop_info)
+        buf.loop_member = copy.deepcopy(src.loop_member)
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
         insert_after(real, src, buf)
@@ -543,7 +543,7 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
     real = ts_passes._hand_off_loop_nodes
 
     def hand_off(graph):
-        # Put the body's constant (it keeps the body's loop_info) at the head
+        # Put the body's constant (it keeps the body's loop_member) at the head
         # of the LoopNode's body, after the pass loop and before the hand-off.
         # Production keeps it outside (see the test above; the passes'
         # re-collapse moves it out again), so this is what reaches the
@@ -553,7 +553,7 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
             op
             for op in graph.operations
             if isinstance(op, SpyreConstantFallback)
-            and getattr(op, "loop_info", None) is not None
+            and getattr(op, "loop_member", None) is not None
         )
         remove_op(graph.operations, constant)
         insert_at_start(node, constant)
@@ -582,7 +582,7 @@ class _Stub:
     def __init__(self, name, group=None):
         self._name = name
         if group is not None:
-            self.loop_info = SimpleNamespace(loop_group_id=group)
+            self.loop_member = SimpleNamespace(loop_group_id=group)
 
     def get_name(self):
         return self._name
@@ -590,7 +590,7 @@ class _Stub:
 
 def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     """``collapse`` keeps an op that sits between two members of a loop in
-    the node's span.  A kernel op there that is not a member (no loop_info)
+    the node's span.  A kernel op there that is not a member (no loop_member)
     would run every trip on the flow-through and once on the flat path: the
     accumulator's zero-fill, re-run each trip, returned only the last tile's
     product (max error 0.146 against the reference, 0.0007 on the flat path).
@@ -602,7 +602,7 @@ def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     ``dedup_and_promote_constants`` now hoists the constant out of the body before
     the nodes are built (the graph compiles and is right, error 0.00073), so no
     compiled graph reaches this check any more. The check guards a future pass
-    that places an op between two members without stamping its ``loop_info``."""
+    that places an op between two members without stamping its ``loop_member``."""
     from torch_spyre._inductor.loop_scheduler import _check_members
 
     node = _Stub("loopnode0")
@@ -686,9 +686,9 @@ def test_structured_and_span_overflow_loops_in_one_graph():
                     type(n).__name__,
                     sorted(
                         {
-                            leaf.node.loop_info.loop_group_id
+                            leaf.node.loop_member.loop_group_id
                             for leaf in n.get_nodes()
-                            if getattr(leaf.node, "loop_info", None) is not None
+                            if getattr(leaf.node, "loop_member", None) is not None
                         }
                     ),
                 )
