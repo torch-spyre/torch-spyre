@@ -1552,6 +1552,8 @@ class TestMatmulCoordinateMask(InductorTestCase):
             symbolic_dim_names={"out"},
         )
         self.assertEqual(mask, {})
+
+
 class TestStaggeredFp32Consumer(InductorTestCase):
     """An op that keeps the staggered arrangement iterates the whole stick pair.
 
