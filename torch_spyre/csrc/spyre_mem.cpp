@@ -1136,52 +1136,98 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
     // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    // For a 2D weight [K, N] this gives [N, K] after reversal, so cpu_sizes[0]
+    // = N and cpu_sizes[1] = K.  For higher-rank tensors (3D paged KV cache
+    // [BATCH, K, N] or 4D [BATCH0, BATCH1, K, N]) the two innermost dims after
+    // reversal are still [N, K]; the remaining leading dims are outer batch
+    // dimensions over which we emit one DataConversionStrideInfo each.
+    //
+    // Host element addresses come from the host tensor's own strides, so
+    // transposed or otherwise non-contiguous host views are read and written
+    // in logical order.
+    const std::vector<int64_t> host_tensor_sizes = cpu_tensor->sizes().vec();
+    const std::vector<int64_t> host_tensor_strides =
+        cpu_tensor->strides().vec();
+    TORCH_CHECK(host_tensor_sizes.size() >= 2,
+                "QFP8WT tensor must have at least 2 dimensions");
+    cpu_sizes = host_tensor_sizes;
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
 
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    // After reversal: cpu_sizes[0] = N (columns), cpu_sizes[1] = K (rows).
+    // Any cpu_sizes[2..] are outer batch dimensions.
     const int64_t N = cpu_sizes[0];
     const int64_t K = cpu_sizes[1];
 
-    // Expanded device shape: [si, so, K/si, N/so]
+    // Expanded device shape per [K, N] matrix: [si, so, K/si, N/so]
     TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
     TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
 
-    // Host strides for the expanded layout
+    // Host strides for the expanded 4D index space [si, so, dim2, dim3]:
+    //   element [k,n]: k = d2*si + a,  n = d3*so + b
+    //   host element = k*sK + n*sN = a*sK + b*sN + d2*(si*sK) + d3*(so*sN)
+    //   where sK, sN are the host strides of K and N (N, 1 when contiguous)
+    //   → stride_src = [sK, sN, si*sK, so*sN]
+    const int64_t sK = host_tensor_strides[host_tensor_strides.size() - 2];
+    const int64_t sN = host_tensor_strides[host_tensor_strides.size() - 1];
     const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
     const int64_t dst3 =
         dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
-    //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+    const std::vector<int64_t> host_strides = {sK, sN, si * sK, so * sN};
 
     // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
     //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
+    //   → stride_dst = [1, si, dst2, dst3]
     const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
 
-    DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = host2device ? host_strides : device_strides;
-    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-    dcsi.offset_src_ = host2device ? cpu_offset : 0;
-    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
-    dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    // The device stores batch elements densely, one [K, N] matrix after
+    // another.
+    const int64_t device_batch_stride = si * so * dim2 * dim3;  // = K * N
+
+    // Compute total batch count from cpu_sizes[2..] (outer dims beyond K and
+    // N).
+    int64_t batch = 1;
+    for (size_t i = 2; i < cpu_sizes.size(); ++i) batch *= cpu_sizes[i];
+
+    // Emit one DataConversionStrideInfo per batch element so each independent
+    // [K, N] QFP8WT matrix is transferred with the correct 2D-stick interleave.
+    // For the common 2D case (batch==1) this produces a single entry, matching
+    // the previous behaviour exactly.
+    dci.dcsi_.reserve(static_cast<size_t>(batch));
+    const size_t host_batch_rank = host_tensor_sizes.size() - 2;
+    for (int64_t b = 0; b < batch; ++b) {
+      // Host element offset of batch element b: unravel b over the outer dims
+      // (row-major, matching the device's dense batch order).
+      int64_t host_batch_offset = 0;
+      int64_t rem = b;
+      for (size_t d = host_batch_rank; d-- > 0;) {
+        host_batch_offset +=
+            (rem % host_tensor_sizes[d]) * host_tensor_strides[d];
+        rem /= host_tensor_sizes[d];
+      }
+      DataConversionStrideInfo dcsi;
+      dcsi.size_ = {si, so, dim2, dim3};
+      dcsi.stride_src_ = host2device ? host_strides : device_strides;
+      dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+      dcsi.offset_src_ = host2device ? cpu_offset + host_batch_offset
+                                     : b * device_batch_stride;
+      dcsi.offset_dst_ = host2device ? b * device_batch_stride
+                                     : cpu_offset + host_batch_offset;
+      dci.dcsi_.push_back(dcsi);
+    }
+
+    // For H2D, output (device) shape is the expanded form including batch dims.
+    // For D2H, output (host) shape is the original cpu_sizes (all dims
+    // reversed). The batch dims are appended after the four expanded dims in
+    // reversed (innermost-first) order.
+    std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    for (size_t i = 2; i < cpu_sizes.size(); ++i)
+      expanded_dev_shape.push_back(cpu_sizes[i]);
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
