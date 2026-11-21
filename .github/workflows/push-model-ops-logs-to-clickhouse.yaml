@@ -34,6 +34,12 @@ permissions:
   contents: read
   actions: read
 
+env:
+  # Read by the ingest library: persistent spool dir, its persistence flag, v2-host requirement.
+  CH_WRITE_SPOOL: ${{ vars.CH_WRITE_SPOOL }}
+  CH_WRITE_SPOOL_PERSISTENT: ${{ vars.CH_WRITE_SPOOL_PERSISTENT }}
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+
 jobs:
   ingest:
     name: Parse model-ops logs -> ClickHouse

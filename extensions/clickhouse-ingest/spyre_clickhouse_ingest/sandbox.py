@@ -175,9 +175,7 @@ class Sandbox:
     @classmethod
     def database(cls, name: str) -> str:
         if not cls.NAME.match(name):
-            raise SystemExit(
-                f"[error] sandbox name {name!r} must match {cls.NAME.pattern}"
-            )
+            sys.exit(f"[error] sandbox name {name!r} must match {cls.NAME.pattern}")
         return cls.PREFIX + name
 
     @classmethod
@@ -430,13 +428,11 @@ def main() -> None:
         )
         sys.exit(1 if steps or extra else 0)
 
-    client = ClickHouse.connect(database="default")
+    client = ClickHouse.connect(database="default", role="schema")
     if args.cmd == "bootstrap":
         pw = ClickHouseEnv.get("SANDBOX_SOURCE_PASS")
         if not pw:
-            raise SystemExit(
-                "[error] SANDBOX_SOURCE_PASS (prod read-only password) is unset"
-            )
+            sys.exit("[error] SANDBOX_SOURCE_PASS (prod read-only password) is unset")
         # NOT OVERRIDABLE: otherwise a sandbox login could pass host= to remote() and receive
         # the prod password. ALTER after CREATE so a rotated password replaces the stored one.
         keys = (
@@ -490,20 +486,20 @@ def main() -> None:
         print(f"[info] dropped {db}")
         return
     if args.cmd == "seed" and not exists:
-        raise SystemExit(f"[error] {db} does not exist -- run `create` first")
+        sys.exit(f"[error] {db} does not exist -- run `create` first")
 
     if args.cmd == "create":
         if exists and not args.replace:
-            raise SystemExit(f"[error] {db} exists -- pass --replace to rebuild it")
+            sys.exit(f"[error] {db} exists -- pass --replace to rebuild it")
         try:
             steps = Sandbox.build(
                 client,
-                lambda d: ClickHouse.connect(database=d),
+                lambda d: ClickHouse.connect(database=d, role="schema"),
                 args.name,
                 args.schema_dir,
             )
         except SchemaDrift as e:
-            raise SystemExit(f"[error] {e}") from None
+            sys.exit(f"[error] {e}")
         print(f"[info] {len(steps)} object(s) from {args.schema_dir} applied to {db}")
         password = secrets.token_urlsafe(24)
         Sandbox.grant(client, args.name, password)

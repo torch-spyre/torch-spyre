@@ -178,9 +178,10 @@ def main() -> None:
     port = os.getenv("CLICKHOUSE_PORT", "443").strip() or "443"
     url = f"https://{host}:{port}" if host else ""
     db = os.getenv("CLICKHOUSE_DB_V2", "").strip()
-    if not url or not db:
+    user = os.getenv("CLICKHOUSE_USER", "").strip()
+    if not url or not db or not user:
         print(
-            "resolve_covered_tiers: CLICKHOUSE_HOST/CLICKHOUSE_DB_V2 unset -- "
+            "resolve_covered_tiers: CLICKHOUSE_HOST/CLICKHOUSE_USER/CLICKHOUSE_DB_V2 unset -- "
             "running the full tier",
             file=sys.stderr,
         )
@@ -190,8 +191,8 @@ def main() -> None:
     try:
         tiers = covered_tiers(
             url,
-            os.getenv("CLICKHOUSE_USER", "default"),
-            os.getenv("CLICKHOUSE_PASS", ""),
+            user,
+            os.getenv("CLICKHOUSE_PASS") or os.getenv("CLICKHOUSE_PASSWORD", ""),
             db,
             args.commit_sha,
             args.arch,

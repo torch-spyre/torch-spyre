@@ -465,6 +465,11 @@ class FakeClient:
     def __init__(self):
         self.inserts = []
 
+    def query(self, sql, parameters=None):  # the engine lookup: a plain table
+        from types import SimpleNamespace
+
+        return SimpleNamespace(result_rows=[("MergeTree", 0)])
+
     def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names, database))
 

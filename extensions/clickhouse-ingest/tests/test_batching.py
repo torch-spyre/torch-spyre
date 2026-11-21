@@ -368,3 +368,17 @@ def test_every_replacing_merge_tree_model_is_marked_idempotent():
     }
     for name, cls in models.items():
         assert cls.idempotent == (name in replacing), name
+
+
+def test_439_is_retried_only_when_the_server_reports_a_5xx_and_a_resend_is_safe():
+    e = DatabaseError("HTTP status 500 ... Code: 439. CANNOT_SCHEDULE_TASK", code=439)
+    assert retriable(e)
+    assert not retriable(DatabaseError("Code: 439. CANNOT_SCHEDULE_TASK", code=439))
+    # Without already_landed or idempotent a failed batch is not resent at all.
+    c = Client(fail_at=[1], error=e)
+    with pytest.raises(Exception):
+        insert_chunks(c, "t", ROWS, ["a"], size=5, backoff_s=0, settle_s=0)
+    assert c.calls == [5]
+    c = Client(fail_at=[1], error=e)
+    run(c)
+    assert c.stored == len(ROWS)

@@ -15,10 +15,12 @@
 """The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
 import math
+import time
 from collections import Counter
 import sys
 
 from . import schema
+from .resilience import safe
 from .mark_retried import PRIOR_MESSAGE, PRIOR_MESSAGE_MAX, PRIOR_STATUS
 from .identity import (
     ArtifactIdentity,
@@ -98,6 +100,10 @@ class DryRunClient:
             return _Rows([])
         if self.client is not None:
             return self.client.query(sql, *args, **kwargs)
+        if (
+            "system.tables" in sql
+        ):  # the engine lookup of writes.target: nothing to protect
+            return _Rows([("MergeTree", 0)])
         return _Rows([(0,)] if "count()" in sql else [])
 
     def command(self, sql, *args, **kwargs):
@@ -208,7 +214,11 @@ class TestResultWriter(RunWriter):
         source_file: str = "",
         attempt: int = 0,
     ) -> bool:
-        """Have this source file's rows for this run, from this attempt or later, landed?"""
+        """Have this source file's rows for this run, from this attempt or later, landed?
+
+        Given an attempt, also false while rows from an earlier attempt of the file remain: a
+        run that stopped between its insert and its delete must come back and finish.
+        """
         if not attempt:
             return cls._seen(
                 client,
@@ -217,20 +227,41 @@ class TestResultWriter(RunWriter):
                 component,
                 (("props['source_file']", "sf", source_file),),
             )
-        return (
-            cls.fact_table.count_rows(
-                client,
-                db,
-                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
-                {
-                    "component": component,
-                    "run_id": run_id,
-                    "sf": source_file,
-                    "attempt": attempt,
-                },
-            )
-            > 0
+        params = {
+            "component": component,
+            "run_id": run_id,
+            "sf": source_file,
+            "attempt": attempt,
+        }
+        landed = cls.fact_table.count_rows(
+            client, db, f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}", params
         )
+        if not landed:
+            return False
+        older = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
+        verdicts = older.replace("props['source_file']", "props['shard']")
+        return not (
+            cls.fact_table.count_rows(client, db, older, params)
+            or CapabilityWriter.fact_table.count_rows(client, db, verdicts, params)
+        )
+
+    @classmethod
+    def replace_attempt(
+        cls, client, db, component, run_id, cases, source_file, *a, **kw
+    ):
+        """`insert`, then drop the file's rows from earlier attempts.
+
+        In that order: an insert that parks or fails leaves the previous attempt's cases and
+        counters in place. The new rows win without the delete going first, because a newer
+        attempt of the same file supersedes an older one in `_one_per_case`, and the capability
+        check counts only verdicts from this attempt or later.
+        """
+        written = cls.insert(
+            client, db, component, run_id, cases, source_file, *a, **kw
+        )
+        attempt = kw.get("attempt", 0)
+        cls.drop_older_attempts(client, db, run_id, component, source_file, attempt)
+        return written
 
     @classmethod
     def drop_older_attempts(
@@ -253,12 +284,18 @@ class TestResultWriter(RunWriter):
             "sf": source_file,
             "attempt": attempt,
         }
+        deleted = False
         if cls.fact_table.count_rows(client, db, where, params):
             client.command(
                 f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
                 parameters=params,
             )
-            cls._rebuild_counters(client, db, run_id, component)
+            deleted = True
+        # A run that died between the delete and the rebuild leaves no old rows to find, but
+        # the counters still hold their counts. Rebuilding only when something is stale keeps
+        # the DELETE-then-INSERT window away from a concurrent job sharing this run.
+        if deleted or cls._counters_stale(client, db, run_id, component):
+            cls._recount(client, db, run_id, component)
         # The file's capability verdicts are scoped by shard = source_file.
         verdicts = where.replace("props['source_file']", "props['shard']")
         capability_runs = CapabilityWriter.fact_table
@@ -282,14 +319,52 @@ class TestResultWriter(RunWriter):
         "('failed', 'error') OR toUInt32OrZero(props['result.reruns']) > 0))",
     }
 
+    @staticmethod
+    def _counters_table(db: str) -> str:
+        return f"{db}.run_case_counters" if db else "run_case_counters"
+
+    # Invariant: a concurrent leg of the run can have its fact part visible a moment before its
+    # counter rows, so a disagreement only counts once it outlasts this wait, and a rebuild is
+    # re-checked after it.
+    COUNTER_SETTLE_S = 3.0
+
+    @classmethod
+    def _counters_stale(cls, client, db: str, run_id: str, component: str) -> bool:
+        """Do run_case_counters still disagree with the fact rows of this run after a settle?"""
+        if not cls._counters_differ(client, db, run_id, component):
+            return False
+        time.sleep(cls.COUNTER_SETTLE_S)
+        return cls._counters_differ(client, db, run_id, component)
+
+    @classmethod
+    def _counters_differ(cls, client, db: str, run_id: str, component: str) -> bool:
+        params = {"component": component, "run_id": run_id}
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        facts = cls.fact_table.count_rows(client, db, where, params)
+        rows = client.query(
+            f"SELECT sum(total_tests) FROM {cls._counters_table(db)} WHERE {where}",
+            parameters=params,
+        ).result_rows
+        return int(rows[0][0] or 0) != facts if rows else facts != 0
+
+    @classmethod
+    def _recount(cls, client, db: str, run_id: str, component: str) -> None:
+        """Rebuild the counters, and once more if a concurrent leg's counter rows landed after the
+        recount had already seen its facts, which counts that leg twice."""
+        cls._rebuild_counters(client, db, run_id, component)
+        time.sleep(cls.COUNTER_SETTLE_S)
+        if cls._counters_differ(client, db, run_id, component):
+            cls._rebuild_counters(client, db, run_id, component)
+
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
         """Recount this run's run_case_counters from test_case_runs.
 
         The counters MV fires on INSERT only, so a DELETE leaves the old attempt's counts
-        summed in; the SELECT mirrors run_case_counters_mv.
+        summed in; the SELECT mirrors run_case_counters_mv. Between the DELETE and the INSERT
+        the counters are empty (a SummingMergeTree cannot be corrected in place).
         """
-        counters = f"{db}.run_case_counters" if db else "run_case_counters"
+        counters = cls._counters_table(db)
         params = {"component": component, "run_id": run_id}
         where = "component = {component:String} AND run_id = {run_id:UUID}"
         has_recovered = client.query(
@@ -301,13 +376,21 @@ class TestResultWriter(RunWriter):
         recovered = bool(has_recovered and has_recovered[0][0])
         cols = [c for c in cls._COUNTERS if c != "recovered" or recovered]
         client.command(f"DELETE FROM {counters} WHERE {where}", parameters=params)
-        client.command(
+        insert = (
             f"INSERT INTO {counters} (run_id, component, {', '.join(cols)}) "
             f"SELECT run_id, component, {', '.join(cls._COUNTERS[c] for c in cols)} "
             f"FROM {cls.fact_table.qualified(db)} WHERE {where} "
-            "GROUP BY run_id, component",
-            parameters=params,
+            "GROUP BY run_id, component"
         )
+        try:
+            client.command(insert, parameters=params)
+        except Exception as err:
+            # Counters stay empty until the next _counters_stale check, which finds them
+            # short of the fact rows and rebuilds again.
+            raise RuntimeError(
+                f"run_case_counters for run {run_id} were deleted and not rebuilt "
+                f"({safe(err)}); the next write for this run rebuilds them"
+            ) from err
 
     @classmethod
     def insert(
@@ -401,7 +484,7 @@ class TestResultWriter(RunWriter):
             t
             for t in {k[0] for k in verdicts}
             if CapabilityWriter.already_ingested(
-                client, db, run_id, component, t, shard=source_file
+                client, db, run_id, component, t, shard=source_file, attempt=attempt
             )
         }
         for (test_type, arch, disc_keys), results in verdicts.items():
@@ -430,7 +513,7 @@ class TestResultWriter(RunWriter):
                     "uuids": superseded,
                 },
             )
-            cls._rebuild_counters(client, db, run_id, component)
+            cls._recount(client, db, run_id, component)
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
         for problem, n in sorted(problems.items()):
             cls._warn(n, f"capability declaration(s) with {problem}")
@@ -772,15 +855,24 @@ class CapabilityWriter(RunWriter):
         component: str,
         test_type: str = "",
         shard: str = "",
+        attempt: int = 0,
     ) -> bool:
-        """Have this run's verdicts for this analysis and shard already landed?"""
-        return cls._seen(
-            client,
-            db,
-            run_id,
-            component,
-            (("test_type", "tt", test_type), ("props['shard']", "shard", shard)),
-        )
+        """Have this run's verdicts for this analysis and shard already landed?
+
+        Given an attempt, only verdicts from that attempt or later count, so a re-run is not
+        blocked by (and does not need the deletion of) the earlier attempt's rows.
+        """
+        scopes = (("test_type", "tt", test_type), ("props['shard']", "shard", shard))
+        if not attempt:
+            return cls._seen(client, db, run_id, component, scopes)
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        params: dict = {"component": component, "run_id": run_id, "attempt": attempt}
+        for column, key, value in scopes:
+            if value:
+                where += f" AND {column} = {{{key}:String}}"
+                params[key] = value
+        where += f" AND {TestResultWriter._ATTEMPT} >= {{attempt:UInt32}}"
+        return cls.fact_table.count_rows(client, db, where, params) > 0
 
     @classmethod
     def insert(
@@ -1091,6 +1183,16 @@ class ArtifactWriter:
         if not supersede and cls.result_recorded(
             client, db, aid, rid, kind, test_type, attempt
         ):
+            if attempt:
+                # A run that died between the insert and the delete leaves the older verdict.
+                where, params = cls._verdict_key(aid, rid, kind, test_type)
+                older = f"{where} AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}"
+                params = {**params, "attempt": attempt}
+                if cls.result_table.count_rows(client, db, older, params) > 0:
+                    client.command(
+                        f"DELETE FROM {cls.result_table.qualified(db)} WHERE {older}",
+                        parameters=params,
+                    )
             if props.get("failure_reason"):
                 cls.insert_reason(
                     client,
@@ -1104,13 +1206,6 @@ class ArtifactWriter:
                     source=props.get("source") or "writer",
                 )
             return True
-        if attempt:
-            where, params = cls._verdict_key(aid, rid, kind, test_type)
-            client.command(
-                f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where} "
-                f"AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}",
-                parameters={**params, "attempt": attempt},
-            )
         result_row: schema.ArtifactResultRow = {
             "artifact_id": aid,
             "run_id": rid,
@@ -1125,6 +1220,14 @@ class ArtifactWriter:
             ),
         }
         cls.result_table.insert(client, [result_row], db=db)
+        if attempt:
+            # After the insert: a parked or failed insert must not cost the earlier verdict.
+            where, params = cls._verdict_key(aid, rid, kind, test_type)
+            client.command(
+                f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where} "
+                f"AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}",
+                parameters={**params, "attempt": attempt},
+            )
         return True
 
     @classmethod
@@ -1332,6 +1435,7 @@ class ArtifactWriter:
 cases_already_ingested = TestResultWriter.already_ingested
 drop_older_case_attempts = TestResultWriter.drop_older_attempts
 insert_test_results = TestResultWriter.insert
+replace_case_attempt = TestResultWriter.replace_attempt
 benchmarks_already_ingested = BenchmarkWriter.already_ingested
 insert_benchmarks = BenchmarkWriter.insert
 capabilities_already_ingested = CapabilityWriter.already_ingested

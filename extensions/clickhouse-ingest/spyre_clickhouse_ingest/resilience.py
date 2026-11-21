@@ -453,6 +453,58 @@ class SpoolItem:
     # (quorum, read-only) is not ambiguous.
     ambiguous: bool = False
     scope: str | None = None
+    meta: dict = field(default_factory=dict)
+
+
+def _enc(v: Any) -> Any:
+    """JSON form of a cell that keeps its type, so a parked batch can be sent again as it was."""
+    if isinstance(v, datetime.datetime):
+        return {"$dt": v.isoformat()}
+    if isinstance(v, datetime.date):
+        return {"$d": v.isoformat()}
+    if isinstance(v, decimal.Decimal):
+        return {"$dec": str(v)}
+    if isinstance(v, datetime.time):
+        return {"$t": v.isoformat()}
+    if isinstance(v, uuid.UUID):
+        return {"$uuid": str(v)}
+    if isinstance(v, (bytes, bytearray)):
+        return {"$b": bytes(v).hex()}
+    if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return {"$ip": str(v)}
+    if isinstance(v, enum.Enum):
+        return _enc(v.value)
+    if isinstance(v, dict):
+        return {"$map": [[_enc(k), _enc(x)] for k, x in v.items()]}
+    if isinstance(v, (list, tuple)):
+        return [_enc(x) for x in v]
+    item = getattr(v, "item", None)  # numpy scalars
+    if callable(item) and type(v).__module__ == "numpy":
+        return _enc(item())
+    return v
+
+
+def _dec(v: Any) -> Any:
+    if isinstance(v, list):
+        return [_dec(x) for x in v]
+    if isinstance(v, dict):
+        if "$dt" in v:
+            return datetime.datetime.fromisoformat(v["$dt"])
+        if "$d" in v:
+            return datetime.date.fromisoformat(v["$d"])
+        if "$t" in v:
+            return datetime.time.fromisoformat(v["$t"])
+        if "$ip" in v:
+            return ipaddress.ip_address(v["$ip"])
+        if "$dec" in v:
+            return decimal.Decimal(v["$dec"])
+        if "$uuid" in v:
+            return uuid.UUID(v["$uuid"])
+        if "$b" in v:
+            return bytes.fromhex(v["$b"])
+        if "$map" in v:
+            return {_dec(k): _dec(x) for k, x in v["$map"]}
+    return v
 
 
 def _write_private(path: Path, doc: dict) -> None:
@@ -555,7 +607,7 @@ class Spool:
             for p in self.dir.iterdir()
             if p.name[:1].isdigit()
             and p.name.endswith(".json")
-            and (token is None or p.name.endswith(f"-{token}.json"))
+            and (token is None or p.name.partition("-")[2] == f"{token}.json")
         )
 
     def _used(self) -> int:
@@ -579,17 +631,20 @@ class Spool:
         created: float | None = None,
         ambiguous: bool = False,
         scope: str | None = None,
+        meta: dict | None = None,
     ) -> Path:
+        check_token(token)
         created = self.clock() if created is None else float(created)
         doc = {
             "table": table,
             "columns": list(columns),
-            "rows": [list(r) for r in rows],
+            "rows": _enc([list(r) for r in rows]),
             "token": token,
             "database": database,
             "created": created,
             "ambiguous": bool(ambiguous),
             "scope": scope,
+            "meta": dict(meta or {}),
         }
         with self._locked():
             for existing in self.files(token):
@@ -629,18 +684,21 @@ class Spool:
                 continue
             try:
                 d = json.loads(text)
+                if p.name.partition("-")[2] != f"{d['token']}.json":
+                    raise ValueError("file name and token disagree")
                 item = SpoolItem(
                     p,
                     d["table"],
                     d["columns"],
-                    d["rows"],
+                    _dec(d["rows"]),
                     d["token"],
                     d.get("database"),
                     None if d.get("created") is None else float(d["created"]),
                     bool(d.get("ambiguous")),
                     d.get("scope"),
+                    d["meta"] if isinstance(d.get("meta"), dict) else {},
                 )
-            except (ValueError, KeyError, TypeError, AttributeError):
+            except (ValueError, KeyError, TypeError, AttributeError, ArithmeticError):
                 try:
                     p.rename(p.with_name(p.name + ".corrupt"))
                 except OSError:
@@ -656,6 +714,7 @@ class Spool:
                 "table": i.table,
                 "rows": len(i.rows),
                 "held": i.ambiguous,
+                "host": i.meta.get("host"),
                 "created": i.created,
                 "file": i.path.name,
             }  # fmt: skip

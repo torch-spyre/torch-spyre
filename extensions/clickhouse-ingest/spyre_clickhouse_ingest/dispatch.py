@@ -443,7 +443,7 @@ def _pairs(values: list[str]) -> dict:
     for v in values:
         k, sep, val = v.partition("=")
         if not sep or not k:
-            raise SystemExit(f"[error] --param {v!r} is not K=V")
+            sys.exit(f"[error] --param {v!r} is not K=V")
         out[k] = val
     return out
 
@@ -594,4 +594,7 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+    from .writes import install_exit_hook
+
+    install_exit_hook()
     main()

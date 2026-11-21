@@ -43,6 +43,8 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Unit tests
         working-directory: extensions/clickhouse-ingest
+        env:
+          CH_TEST_PULL: '1'  # test_replicated_engine.py starts its own one-node Keeper container
         run: uv run --with pytest --with chdb python -m pytest -q tests
       - name: Apply to an empty database, then prove it converged
         working-directory: extensions/clickhouse-ingest

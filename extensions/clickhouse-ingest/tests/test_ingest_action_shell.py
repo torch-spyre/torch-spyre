@@ -50,6 +50,7 @@ def run_ingest_step(tmp_path, hostile):
         for k, v in step["env"].items()
     }
     env["VENV"] = str(tmp_path / "venv")
+    env["CLICKHOUSE_USER"] = "writer"  # the step refuses to run without a writer login
     (tmp_path / "venv/bin").mkdir(parents=True)
     (tmp_path / "venv/bin/activate").write_text("")
     bin_ = tmp_path / "bin"

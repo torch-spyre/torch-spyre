@@ -46,12 +46,15 @@ class Fake:
     ):
         self.target, self.shas, self.taken, self.listed = target, shas, taken, listed
         self.counts, self.inserted, self.trust = counts, [], ()
+        self.engine = "MergeTree"
 
     def set_client_setting(self, k, v):
         pass
 
     def query(self, sql, parameters=None):
-        if "bundle_kind" in sql:
+        if "system.tables" in sql:
+            rows = [[self.engine, 0]]
+        elif "bundle_kind" in sql:
             rows = [list(self.target)] if self.target else []
         elif "run.trust" in sql:
             assert "v_artifact_results_published" in sql
@@ -256,6 +259,22 @@ def test_a_generic_benchmarks_round_tags_rows_and_supersedes_the_verdict(
     assert run["props"]["upload_id"] == UPLOAD and run["props"]["round"] == "1"
     (verdict,) = c.rows[schema.ARTIFACT_RESULTS.name]
     assert verdict["props"]["upload_id"] == UPLOAD and verdict["duration_s"] == 3.0
+
+
+def test_a_first_upload_on_replicated_tables_lands_through_the_resilient_path(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(client, "tables_present", lambda *a, **k: True)
+    root = tmp_path / "g"
+    (root / "results").mkdir(parents=True)
+    (root / "results" / "evals.json").write_text(json.dumps(EVAL))
+    meta = {"kind": "benchmarks", "test_type": "quality", "component": "spyre-inference",
+            "arch": "s390x", "run_key": KEY, "artifact_id": AID}  # fmt: skip
+    inner = Fake()
+    inner.engine = "ReplicatedMergeTree"
+    c = DryRunClient(inner)
+    bundle.write_generic(c, "spyre_v2", root, meta, AID, "r", {"upload_id": UPLOAD})
+    assert c.rows[schema.BENCHMARK_RUNS.name]
 
 
 def test_a_first_upload_tags_upload_id_alone(tmp_path, monkeypatch):

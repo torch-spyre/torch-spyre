@@ -39,9 +39,10 @@ class LiveClient:
     """Answers reads as a v2 database holding an older attempt would; records every write."""
 
     COLUMNS = [(c,) for t in _tables() for c in t.columns]
+    ENGINE = "MergeTree"
 
     def __init__(self):
-        self.inserts, self.writes = [], []
+        self.inserts, self.writes, self.settings = [], [], []
 
     def command(self, sql, parameters=None):
         if sql.split()[0] in ("SELECT", "EXISTS"):
@@ -52,6 +53,8 @@ class LiveClient:
         rows = []
         if "system.columns" in sql:
             rows = self.COLUMNS
+        elif "system.tables" in sql:
+            rows = [(self.ENGINE, 0)]
         elif "count()" in sql:
             rows = [(int("< {attempt" in sql),)]
         elif not sql.lstrip().startswith(("SELECT", "WITH")):
@@ -62,8 +65,9 @@ class LiveClient:
 
         return R()
 
-    def insert(self, table, rows, column_names=None, database=None):
+    def insert(self, table, rows, column_names=None, database=None, settings=None):
         self.inserts.append((database, table, len(rows)))
+        self.settings.append((table, dict(settings or {})))
 
 
 def _run(monkeypatch, tmp_path, schema_gen, *extra):
@@ -104,6 +108,17 @@ def test_without_dry_run_the_same_ingest_writes(monkeypatch, tmp_path):
     assert {(None, "test_runs"), ("spyre_v2", "test_case_runs")} <= tables
     assert ("spyre_v2", "artifact_results") in tables
     assert any(w.startswith("DELETE FROM spyre_v2.test_case_runs") for w in live.writes)
+
+
+def test_the_same_ingest_on_replicated_tables_sends_dedup_tokens(monkeypatch, tmp_path):
+    class Replicated(LiveClient):
+        ENGINE = "ReplicatedMergeTree"
+
+    monkeypatch.setattr(LiveClient, "ENGINE", Replicated.ENGINE)
+    live = _run(monkeypatch, tmp_path, "both")
+    sent = {t: s for t, s in live.settings}
+    assert "insert_deduplication_token" in sent["test_case_runs"]
+    assert "insert_deduplication_token" in sent["artifact_results"]
 
 
 def test_the_dry_run_client_passes_reads_and_keeps_writes():

@@ -52,10 +52,10 @@ from spyre_clickhouse_ingest import (
     get_client,
     insert_artifact_result,
     insert_benchmarks,
-    insert_test_results,
     promote_xpass,
     capability_declaration,
     cases_already_ingested,
+    replace_case_attempt,
     drop_older_case_attempts,
     benchmarks_already_ingested,
     component_of,
@@ -64,6 +64,8 @@ from spyre_clickhouse_ingest import (
     source_and_external_run_id,
     tables_present,
 )
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.client import ClickHouseEnv
 from spyre_clickhouse_ingest.batching import insert_chunks
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
@@ -1355,6 +1357,7 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
             "SELECT count() FROM test_cases WHERE run_id = {r:String} AND workflow = {w:String}",
             {"r": run_id, "w": workflow},
         ),
+        resilient=False,
     )
 
 
@@ -1396,6 +1399,7 @@ def insert_properties(client, run_id: str, cases: list[dict]):
                 "SELECT count() FROM run_properties WHERE run_id = {r:String}",
                 {"r": run_id},
             ),
+            resilient=False,
         )
 
 
@@ -1574,6 +1578,19 @@ def _opt(args, name: str):
     return getattr(args, name, "") or ""
 
 
+def _note_v2_parked(
+    parked_files: list, incomplete: set, name: str, run_id, err
+) -> None:
+    parked_files.append(name)
+    _taint(incomplete, run_id)
+    print(
+        f"  [warn] v2 rows SPOOLED, not stored ({err}); `spool replay` sends only the parked "
+        "batches, and the file's later writes were not attempted: check them before "
+        "re-running (a re-run sends the parked rows again under new tokens)",
+        file=sys.stderr,
+    )
+
+
 def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
     """A perf leg's verdict: it measured something. There is no pass/fail to read."""
     if artifact_spec(args):
@@ -1600,13 +1617,37 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
         acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
-def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
+def _taint(incomplete: set, run_id) -> None:
+    """Remember that a file of `run_id` (unknown: of any run) parked or failed in v2."""
+    incomplete.add(str(run_id or ""))
+
+
+def _write_artifact_verdicts(
+    client, v2db: str, args, legs: dict, incomplete: frozenset | set = frozenset()
+) -> bool:
     """Write the artifact and one artifact_results row per (run_id, tier) of this leg; False
-    when a named artifact's verdicts were not all recorded."""
+    when a named artifact's verdicts were not all recorded.
+
+    A run with a parked or failed file gets no verdict: the first terminal verdict wins, and
+    one computed from the files that did land could be green for a run that is not.
+    """
     if not legs or not v2db or not (artifact_spec(args)):
         return True
+    withheld = {
+        k for k in legs if "" in incomplete or str(k[0]) in incomplete
+    }  # fmt: skip
+    if withheld:
+        print(
+            f"  [warn] v2: verdict withheld for {len(withheld)} leg(s) of "
+            f"run_id {', '.join(sorted({str(k[0]) for k in withheld}))}: a file of the run "
+            "was parked or failed. Replaying the spool writes no verdict: re-run this ingest over "
+            "the whole leg (the same --xml-dir) to record it; a single-file re-run would build "
+            "the verdict from that file alone",
+            file=sys.stderr,
+        )
+        legs = {k: v for k, v in legs.items() if k not in withheld}
     try:
-        return _write_named_artifact_verdicts(client, v2db, args, legs)
+        return _write_named_artifact_verdicts(client, v2db, args, legs) and not withheld
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
@@ -2028,6 +2069,8 @@ def main(argv=None, assigned_trust=""):
     parsed_benchmarks = 0
     total_kernels = 0
     v2_failed_files = []
+    v2_parked_files = []  # spooled, not failed: the exit-75 path reports them
+    incomplete_runs: set = set()  # run_ids (or "" = any) that lost a file in v2
 
     # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
     # files under one run_id, so a per-file write would report only the first shard's verdict.
@@ -2099,43 +2142,56 @@ def main(argv=None, assigned_trust=""):
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
+            _v2_run_id = ""
             if bench_ready:
-                _src, _ext = source_and_external_run_id(args, str(run_id))
-                _v2_run_id = run_id_for(args, str(run_id), args.platform or "", "perf")
-                if not _v2_run_id:
-                    print(
-                        "  [warn] v2 skipped: run_id not derivable "
-                        f"(source={_src!r} external_run_id={_ext!r})",
-                        file=sys.stderr,
+                try:
+                    _src, _ext = source_and_external_run_id(args, str(run_id))
+                    _v2_run_id = run_id_for(
+                        args, str(run_id), args.platform or "", "perf"
                     )
-                    _purpose_skipped(args, "no v2 run id could be derived")
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "kernel",
-                    run_meta["source_file"],
-                ):
-                    print(
-                        f"  v2: already ingested kernel report for "
-                        f"run_id={_v2_run_id} — skipping"
-                    )
-                    _purpose_skipped(args, "the report was already ingested")
-                else:
-                    _n = insert_benchmarks(
+                    if not _v2_run_id:
+                        print(
+                            "  [warn] v2 skipped: run_id not derivable "
+                            f"(source={_src!r} external_run_id={_ext!r})",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "no v2 run id could be derived")
+                    elif benchmarks_already_ingested(
                         client,
                         v2db,
-                        component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
-                        _bench_entries(kernels, _purpose_props(args)),
-                        report_kind="kernel",
-                        source_file=run_meta["source_file"],
+                        component_of(args, COMPONENT_DEFAULT),
+                        "kernel",
+                        run_meta["source_file"],
+                    ):
+                        print(
+                            f"  v2: already ingested kernel report for "
+                            f"run_id={_v2_run_id} — skipping"
+                        )
+                        _purpose_skipped(args, "the report was already ingested")
+                    else:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(kernels, _purpose_props(args)),
+                            report_kind="kernel",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    if _v2_run_id:
+                        _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
+
+                except writes.ParkedRows as _v2_parked:
+                    _note_v2_parked(
+                        v2_parked_files,
+                        incomplete_runs,
+                        xml_path.name,
+                        _v2_run_id,
+                        _v2_parked,
                     )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
-                    _purpose_state(args)["rows"] += _n if args.purpose else 0
-                if _v2_run_id:
-                    _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
@@ -2187,43 +2243,56 @@ def main(argv=None, assigned_trust=""):
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
+            _v2_run_id = ""
             if bench_ready:
-                _src, _ext = source_and_external_run_id(args, str(run_id))
-                _v2_run_id = run_id_for(args, str(run_id), args.platform or "", "perf")
-                if not _v2_run_id:
-                    print(
-                        "  [warn] v2 skipped: run_id not derivable "
-                        f"(source={_src!r} external_run_id={_ext!r})",
-                        file=sys.stderr,
+                try:
+                    _src, _ext = source_and_external_run_id(args, str(run_id))
+                    _v2_run_id = run_id_for(
+                        args, str(run_id), args.platform or "", "perf"
                     )
-                    _purpose_skipped(args, "no v2 run id could be derived")
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "benchmark",
-                    run_meta["source_file"],
-                ):
-                    print(
-                        f"  v2: already ingested benchmark report for "
-                        f"run_id={_v2_run_id} — skipping"
-                    )
-                    _purpose_skipped(args, "the report was already ingested")
-                else:
-                    _n = insert_benchmarks(
+                    if not _v2_run_id:
+                        print(
+                            "  [warn] v2 skipped: run_id not derivable "
+                            f"(source={_src!r} external_run_id={_ext!r})",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "no v2 run id could be derived")
+                    elif benchmarks_already_ingested(
                         client,
                         v2db,
-                        component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
-                        _bench_entries(benchmarks, _purpose_props(args)),
-                        report_kind="benchmark",
-                        source_file=run_meta["source_file"],
+                        component_of(args, COMPONENT_DEFAULT),
+                        "benchmark",
+                        run_meta["source_file"],
+                    ):
+                        print(
+                            f"  v2: already ingested benchmark report for "
+                            f"run_id={_v2_run_id} — skipping"
+                        )
+                        _purpose_skipped(args, "the report was already ingested")
+                    else:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(benchmarks, _purpose_props(args)),
+                            report_kind="benchmark",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                    if _v2_run_id:
+                        _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
+
+                except writes.ParkedRows as _v2_parked:
+                    _note_v2_parked(
+                        v2_parked_files,
+                        incomplete_runs,
+                        xml_path.name,
+                        _v2_run_id,
+                        _v2_parked,
                     )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
-                    _purpose_state(args)["rows"] += _n if args.purpose else 0
-                if _v2_run_id:
-                    _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
@@ -2302,6 +2371,7 @@ def main(argv=None, assigned_trust=""):
             # v2 tables, alongside v1. Failure here must never cost a v1 row: v1 is still
             # authoritative, so the experimental write is contained rather than allowed to
             # abort the loop and drop every remaining file's v1 insert.
+            _v2_run_id = ""
             try:
                 if v2db and tables_present(client, v2db):
                     _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
@@ -2328,10 +2398,7 @@ def main(argv=None, assigned_trust=""):
                         attempt=args.run_attempt,
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
-                    else:
-                        # Before the insert, so a failed delete aborts this file (caught
-                        # below) rather than leaving two attempts' rows under one run_id.
-                        drop_older_case_attempts(
+                        drop_older_case_attempts(  # idempotent: counts first
                             client,
                             v2db,
                             _v2_run_id,
@@ -2339,7 +2406,10 @@ def main(argv=None, assigned_trust=""):
                             xml_path.name,
                             args.run_attempt,
                         )
-                        _n = insert_test_results(
+                    else:
+                        # Insert first, then drop the earlier attempts' rows: a parked or
+                        # failed insert keeps the previous attempt (see replace_attempt).
+                        _n = replace_case_attempt(
                             client,
                             v2db,
                             component_of(args, COMPONENT_DEFAULT),
@@ -2364,8 +2434,17 @@ def main(argv=None, assigned_trust=""):
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
                         _first_failure(_acc, cases)
                         _capability_legs(artifact_legs, _v2_run_id, cases)
+            except writes.ParkedRows as _v2_parked:
+                _note_v2_parked(
+                    v2_parked_files,
+                    incomplete_runs,
+                    xml_path.name,
+                    _v2_run_id,
+                    _v2_parked,
+                )
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
+                _taint(incomplete_runs, _v2_run_id)
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
                     file=sys.stderr,
@@ -2381,7 +2460,9 @@ def main(argv=None, assigned_trust=""):
     if not _opt(args, "tag_date"):
         # The run's own day, not the ingest's: a run past midnight keeps its start date.
         args.tag_date = (run_started or datetime.now(UTC)).date()
-    verdicts_recorded = _write_artifact_verdicts(client, v2db, args, artifact_legs)
+    verdicts_recorded = _write_artifact_verdicts(
+        client, v2db, args, artifact_legs, incomplete_runs
+    )
 
     state = _purpose_state(args)
     if args.purpose and not state["rows"] and not state["skips"]:
@@ -2409,7 +2490,23 @@ def main(argv=None, assigned_trust=""):
         print(f"  [error] v2: --strict, and tag(s) {args.misc_tags} fell back to misc")
         sys.exit(1)
     _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
+    if v2_parked_files:
+        print(
+            f"  [warn] v2 rows SPOOLED for {len(v2_parked_files)} file(s): "
+            + ", ".join(v2_parked_files)
+        )
+    if v2_failed_files and ClickHouseEnv.v2_host():
+        # With a separate v2 host the v2 data is the primary copy: a failed v2 leg must fail the
+        # run, while the v1 rows already written stay (v1 dedups by run_id, so a re-run is safe).
+        print(
+            "  [error] v2 leg failed on the v2 host; v1 rows were written",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
+    from .writes import install_exit_hook
+
+    install_exit_hook()
     main()

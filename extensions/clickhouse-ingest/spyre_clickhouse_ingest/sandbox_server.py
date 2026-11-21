@@ -31,6 +31,7 @@ import io
 import json
 import os
 import ssl
+import sys
 import tarfile
 import tempfile
 import threading
@@ -93,7 +94,7 @@ class Identity:
         self, secret: bytes, tokens_file: Path, revoked_file: Path | None = None
     ):
         if len(secret) < 32:
-            raise SystemExit("[error] SANDBOX_SECRET must be at least 32 bytes")
+            sys.exit("[error] SANDBOX_SECRET must be at least 32 bytes")
         self.secret = secret
         self.tokens_file = tokens_file
         self.revoked_file = revoked_file
@@ -774,7 +775,12 @@ def main() -> None:
             secure=ClickHouseEnv.secure(),
         )
 
-    ops = Sandboxes(cfg, identity, lambda db: ClickHouse.connect(database=db), connect)
+    ops = Sandboxes(
+        cfg,
+        identity,
+        lambda db: ClickHouse.connect(database=db, role="schema"),
+        connect,
+    )
     host = cfg.public_url.split("://", 1)[-1]
     app = build_server(cfg, ops).streamable_http_app(
         stateless_http=True,

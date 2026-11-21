@@ -541,8 +541,93 @@ a view cannot serve, so they cannot be filtered by a view. The follow-up is torc
 ## Write resilience
 
 `resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
-a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet except the `spool` command and there is no
-probe.** It is a building block with deliberately small promises.
+a Keeper blip, an `insert_quorum` that is briefly unmet). Every ingest write goes through it when
+its target table is Replicated, behind a per-host breaker (`breaker.guarded_insert`): `Table.insert` and `insert_chunks` (all v2 fact and dimension
+tables, `pipeline_runs`, `ci_run_timings`, dispatch) and the v2 leg of the hw diagnostics. The
+target is read once per table from `system.tables`; a plain table, or an engine the login cannot
+read, keeps the previous code path unchanged. **The legacy v1 `spyre` database is not touched by
+any of this**: its inserts (`results` v1 tables, `perf_*`, the model-ops and dispatch scripts, the v1
+leg of the hw diagnostics) are plain `client.insert` calls with no engine lookup, no token and no
+spool, and keep their old fail-loud and re-run behaviour.
+
+### The switch and its settings
+
+| variable | default | meaning |
+|---|---|---|
+| `CH_WRITE_RESILIENCE` | `auto` | `auto`: resilient path for Replicated tables only. `off`: never (no engine lookup either). |
+| `CH_WRITE_SPOOL` | unset | Spool directory. Unset falls back to `$RUNNER_TEMP/ch-spool` (GitHub Actions), then `$WORKSPACE/.ch-spool` (other CI systems); none of those means no spool and the call raises `BatchFailed` at the deadline. |
+| `CH_WRITE_SCOPE` | `$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$GITHUB_JOB[.$CH_WRITE_LEG]`, else `$BUILD_TAG`, else one random id per process | Part of every batch token. Set `CH_WRITE_LEG` to a matrix leg's identity when legs of one job write identical rows (`ingest-xml-to-clickhouse` derives it from its inputs; the other ingest actions write one record set per job, where an identical resend is the same batch by design). |
+| `CH_WRITE_ASSUME_REPLICATED` | unset | `*` or a comma list of `table` / `db.table`. Used only when the engine lookup keeps failing after retries; without it a failed lookup takes the plain, tokenless path (with a warning), except in a Replicated database (`CH_V2_DATABASES`), where a failed lookup is assumed Replicated and parked, and a table `system.tables` does not list for the login, or a lookup the login may not run, raises instead of writing untokened. |
+| `CH_WRITE_DEADLINE_S` / `BACKOFF_S` / `BACKOFF_MAX_S` | 300 / 2 / 30 | Retry budget per call (one deadline for all its batches), with full jitter. |
+| `CH_WRITE_BREAKER_S` / `CH_WRITE_BREAKER_PROBE_S` / `CH_WRITE_BUDGET_S` / `CH_WRITE_BUDGET_WINDOW_S` | 60 / 10 / 900 / 1800 | Per host (the v1 and v2 endpoints are separate). After one write exhausts its deadline, later writes to that host go straight to the spool (raise without one) for `BREAKER_S`; then one write probes with a deadline of `PROBE_S` while the rest stay parked. Only a successful INSERT closes the breaker (a successful engine lookup does not). While it is open an unread table of a Replicated database is assumed Replicated and parked, and any other unread table raises instead of being sent tokenless. Code 242 (read-only table, what a Keeper outage gives every Replicated table) is the host's trouble like a timeout. Code 252 (too many parts) is one table's own: it neither trips the breaker nor counts toward the budget until a second table refuses the same way within `BUDGET_WINDOW_S`, which makes it the host's. Each attempt is judged on its own, so timeouts before a final refusal still count. `spool replay` shares the breaker: against a dead host the first item pays one deadline and the rest fail at once. Budget: the seconds of connectivity trouble a host costs (failed attempts, waits and engine-lookup retries, timeouts included; a slow success costs nothing) drain at `BUDGET_S / BUDGET_WINDOW_S` per second; reaching `BUDGET_S` parks every write to that host for `BUDGET_WINDOW_S`, even after another table succeeds, and retries stop at the remaining budget. The bound is per process (a job with several sequential ingest steps pays it in each), and one attempt can run as long as the client timeout, a hanging probe included, because the driver takes no per-call timeout. Unusable values (nan, negative, zero, not a number) fall back to the defaults with a warning (once per setting); `CH_WRITE_BACKOFF_S` must be positive too. Known limits: (a) 242 on a single table is read as a host outage, so one permanently read-only table written early in a run parks the healthy tables written after it (each round: that table probes, about `PROBE_S` plus its attempt time, and the rest are parked) until it is fixed; the run exits 75 and the rows are in the spool. (b) A host-wide 252 seen through one table only is not bounded across calls: each call waits one deadline. (c) The denied-lookup rule covers every lookup failure a retry cannot cure (a refusal, a proxy 4xx, an unexpected answer, a non-ClickHouse exception), not only code 497; the error says the lookup failed, the warning before it names the cause, and `CH_WRITE_ASSUME_REPLICATED` sends the table with a token anyway. (d) The cost drains continuously, so a host that is down about half of the time (cost arriving no faster than `BUDGET_S / BUDGET_WINDOW_S` per second) is never parked by the budget. |
+| `CH_WRITE_QUORUM` | unset | Send `insert_quorum` per request. Leave unset when the writer login's profile owns it; then no quorum is lowered either. |
+| `CH_WRITE_DEGRADE_TO`, `CH_WRITE_DEGRADE_AFTER_S` | unset / 60 | Lower the quorum after this long. Needs `CH_WRITE_QUORUM` (nothing to lower otherwise). Honoured only for `pipeline_runs`, `pipeline_run_links`, `ci_run_timings`; every other table is strict and never lowers it. |
+
+What the token covers: a **resend of the same batch inside one attempt of one job** (an ambiguous
+error, a retry, a second sender) lands once while the server still holds the token (at least one
+hour synchronous, 7 days asynchronous, 10000 blocks). Another attempt, another matrix leg or
+another process has another scope, so its rows are a new batch. The token is derived from the
+table, the scope and the batch's rows, so changing `CH_INGEST_BATCH_ROWS` between a failed run and
+its resend cuts other batches and defeats it.
+`already_landed` and `idempotent` are ignored on a Replicated table (the token replaces them).
+A re-run that first DELETEs and then re-inserts rows (the `run_attempt` supersede paths) is not
+affected: `INSERT ... SELECT` is never hash-deduplicated, and a new attempt is a new scope.
+
+Rows that could not land inside the deadline are **parked, not stored**, and the call raises
+`BatchParked` (a `BatchFailed` carrying `landed` and `parked`), so a caller cannot go on to
+DELETE, rebuild counters or record the work as done. Every writer path in this package inserts
+first and deletes the rows it replaces afterwards, including a re-run of a file (`replace_case_attempt`:
+the newer attempt supersedes the older in the one-outcome-per-case rule, and the capability check
+counts only verdicts from this attempt or later, so neither needs the old rows gone first).
+Anything that fails after the new rows landed (a later batch, the capability insert, the delete, the
+counter rebuild, a kill) leaves both attempts visible until the next run, which converges: a file
+counts as already ingested only while no earlier attempt's rows (cases or capability verdicts)
+remain, so the re-run finishes the insert (rows already there are skipped as restatements), deletes
+the old attempt and rebuilds `run_case_counters` (which is rebuilt every time, because its
+materialized view counts both attempts while they coexist). Readers do not rank by attempt, so until
+that run views and counters show both (ranking by attempt in the views is not done here). Attempts N and N+1 of
+one file running at once: N+1 deletes `attempt < N+1` while N may still be inserting, so N's later
+batches can land after the delete; N+1's next run (or N+2) removes them. If N+1 lands first, N's
+"already ingested" check counts N+1's rows and skips.
+The process prints a `[PARKED]` summary, appends it to `$GITHUB_STEP_SUMMARY` when set, and exits
+**75** instead of 0 on every command-line entry point (an exit hook installed by `writes.install_exit_hook()`,
+called from each `__main__` and ingest script, never by importing the package; a library consumer
+calls `writes.report_parked()` itself at the end of its run to get the loud `[PARKED]` summary
+and `writes.exit_code(rc)` for the status; a failure with
+its own status, or an uncaught error, keeps it; a bare `raise SystemExit(n)` is not seen by the
+hook and ends as 75). In a composite action the parked rows are never uploaded: the spool holds full
+rows. The step summary and a 3-day manifest artifact list token, table, row count and time only.
+
+Per-request settings (`insert_deduplication_token`, `deduplicate_blocks_in_dependent_materialized_views`,
+`async_insert_deduplicate`, `wait_for_async_insert`, `insert_quorum`) can be refused by a constrained
+writer profile (codes 164/452, or the driver's "readonly" error). `async_insert_deduplicate` and the
+view setting are dropped once and the batch is sent again (for a batch that may already be stored and
+feeds a view, the view setting is never dropped: the batch is retried until the deadline and then
+parked as held). A refused dedup token, quorum or `wait_for_async_insert` is not worked around: it
+raises `SettingRefused`, which is fatal. `spool replay` handles refusals the same way. The engine lookup is cached per client
+for its lifetime and is never invalidated: a table converted mid-process is not noticed.
+
+### Probe
+
+`python -m spyre_clickhouse_ingest probe [--table db.zz_write_probe] [--ensure] [--rows N]` writes
+N rows through the resilient path, sends the same batch again under the same token, reads the table
+back and prints one JSON line (`ok`, `replicated`, `dedup` = `held`/`doubled`/`skipped`, `count`,
+`write_ms`, `read_ms`); exit 0 healthy, 1 not. The table is created once with `--ensure`, which uses
+the schema login; the writer login only needs INSERT and SELECT on it, and its rows expire after a
+day. From Python: `from spyre_clickhouse_ingest.probe import probe; probe(client, table)`.
+
+### Credentials: writer, schema, internal
+
+| role | variables | used for |
+|---|---|---|
+| writer | `CLICKHOUSE_USER`, `CLICKHOUSE_PASS` (`CLICKHOUSE_PASSWORD` accepted) | every ingest, `probe`, `spool`; `ClickHouse.connect()` returns a client that refuses `CREATE`, `ALTER` (so also `ALTER ... DELETE/UPDATE`), `DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `GRANT`, `REVOKE`, `OPTIMIZE`, `SYSTEM`, `KILL`, `UNDROP`, `SET` and non-text statements on every statement-taking call. Lightweight `DELETE FROM` and `INSERT ... SELECT` pass. **It is a guard against mistakes, not a boundary: the writer login's server-side grants are the boundary.** |
+| schema | `CLICKHOUSE_SCHEMA_USER`, `CLICKHOUSE_SCHEMA_PASSWORD` | `apply_schema`, `probe --ensure`, sandbox administration, and the table-ensure steps of `.github/scripts/ingest_pytorch_dispatch.py` and `ingest_model_ops.py`: `ClickHouse.connect(role="schema")`. If both are unset the writer pair is used with a one-line warning; setting only one is an error. |
+| internal | server-side users (replication, `interserver_http_credentials`) | never in this tool |
+
+No user name is assumed: on a TLS connection `CLICKHOUSE_USER` must be set, and the `default`
+login is not used anywhere in the code path. (An insecure local box, `CLICKHOUSE_SECURE=0`, may omit
+it and gets the server's own default.) `hw_schema.ensure_extra_columns` issues an `ALTER`, so it
+must be given a schema-role client.
 
 What it promises:
 
@@ -594,9 +679,10 @@ What it promises:
 
 What it does not promise:
 
-- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
-  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
-  window has not passed; neither is small enough to ship without a probe.
+- No automatic replay. Parked batches stay until a person acts, and `spool replay` (below) only
+  sends a Replicated table's batch under its original token, inside the dedup window. A plain
+  table, or one whose dedup window is 0, is never replayed: replaying it would need a claim and a
+  lease.
 - No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
   on a plain table.
 - `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
@@ -613,30 +699,140 @@ What it does not promise:
   tests check that these settings are sent, not that a real cluster honours them for an
   asynchronous, quorum insert. Whether a retried async batch is deduplicated by token on a
   Keeper-backed cluster is not verified here.
-- A probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
+- A batch-level probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
   sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per batch,
   so counting rows by key would call a lost batch stored.
 
-Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 and its files are
-0600 plain JSON: they hold row data.
+### Attempts and matrix legs
 
-```text
-python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
-python -m spyre_clickhouse_ingest spool list --fail-if-pending   # same; exit 75 if anything is parked
-python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
-```
+GitHub run attempts are sequential (attempt 2 starts after attempt 1 ends), so the concurrent N and
+N+1 race above needs a re-run started by hand while the first is still going. Matrix legs that write
+the same `source_file` name under the same `run_id` and component share one key: a partial re-run of
+one leg deletes the other leg's earlier-attempt rows for that file. That was already true; give each
+leg's results a distinct file name (or run id) to avoid it.
 
-A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
-rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
-to send. `put` and `drop` take a lock file in the directory, so processes sharing it leave one
-file per token and a `held` flag is never cleared (flock on a local filesystem; not guaranteed on
-NFS). `drop` matches by token suffix. `list` prints to stderr any quarantined `.corrupt` file (one
-that would not parse as a batch), any file it could not read (left in place, not renamed), and
-leftover `.tmp` files; all of them count toward the size cap, and the quarantined ones hold row
-data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
-opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
-a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
-The spool refuses a directory that is a symlink or owned by another user. The spool directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+### What dedup does not cover
+
+Tokens protect a resend inside one process and one attempt. A job that times out after the server
+committed a batch is re-run (a new attempt, a new token) and sends those rows again unless the
+writer's own "already ingested" check catches it. Checks exist for: test cases (run, file and
+attempt), benchmarks, capability verdicts, artifact results, refs and tags, and the hw diagnostics
+table. Tables with no such check rely on a ReplacingMergeTree key (`idempotent`: artifacts, results,
+reasons, pipeline_runs, ci_run_timings, subscriptions, RBAC, dispatch) or append: `benchmark_runs` rows
+without a run key, `perf_*` and the model-ops tables on the v1 side.
+
+On the v1 side nothing is spooled or tokenised (plain tables). A v1 leg that failed midway is
+detected on a re-run only by the existing `test_runs` check (`Already ingested -- skipping`): if
+`test_runs` was written and `test_cases` was not, the re-run skips the cases (pre-existing; v1 is
+being retired).
+
+In a Replicated database a table whose engine lookup keeps failing (a connection error, not a denied
+query) is treated as Replicated and parked for replay (it raises without a spool), exactly as when the
+host breaker is open; a table the server does not list, or whose engine lookup the login is not allowed to run (code
+497), raises (`BatchFailed`) instead of going out untokened. A parked "assumed Replicated" table that
+is really plain is only found out at replay, which refuses it; until then a token-bearing probe insert
+may reach it. `CH_WRITE_ASSUME_REPLICATED` names further tables to treat as Replicated. Unqualified table names in a statement that routes to the
+v2 host resolve in the v2 client's default database (`CLICKHOUSE_DB_V2`).
+
+### Two hosts: legacy for v1, the HA endpoint for the Replicated databases
+
+The v1 `spyre` database is not replicated and stays on the legacy host (`CLICKHOUSE_HOST`). The
+Replicated databases (`spyre_v2`, `vigil_ops`, `spyre_kb`, `optimize_ops`) can be written through
+the HA endpoint so a pod restart does not fail the write. It is opt-in:
+
+| variable | default | meaning |
+|---|---|---|
+| `CLICKHOUSE_V2_HOST` | unset | HA endpoint. Unset: one host for everything, behaviour unchanged. |
+| `CLICKHOUSE_V2_PORT`, `CLICKHOUSE_V2_SECURE` | the legacy `CLICKHOUSE_PORT` / `CLICKHOUSE_SECURE` | |
+| `CLICKHOUSE_V2_USER`, `CLICKHOUSE_V2_PASSWORD` | the writer pair | A distinct writer login on the HA cluster; setting only one is an error. |
+| `CLICKHOUSE_V2_SCHEMA_USER`, `CLICKHOUSE_V2_SCHEMA_PASSWORD` | the schema pair | Same, for the schema role. |
+| `CH_V2_DATABASES` | `spyre_v2,vigil_ops,spyre_kb,optimize_ops` | Databases served by the HA endpoint. |
+
+`ClickHouse.connect(database=<a listed database>)` returns a client for the HA host directly
+(`apply_schema --database`, `artifacts ensure`, `probe`). Any other connection (the default
+`spyre`) returns a `RoutedClient`: the legacy host, plus a second client opened lazily at the HA
+host with a default database from `CLICKHOUSE_DB_V2` (never `spyre`). A statement goes to the HA host
+when it names a listed database: the `database=` argument, a `db.table` name, a `db.` qualifier in the
+SQL, or a `db`/`database` parameter value. Everything else, including `SELECT 1` and unqualified v1
+statements, stays on the legacy host. Engine detection, tokens and the spool are per backend: a
+parked batch records the `host` it was for (`spool list`), and a v1 table is never sent a token.
+
+Composite actions take `clickhouse-v2-host`, `-port`, `-user`, `-pass` inputs (`ingest-xml`,
+`ingest-hw-diagnostics`, `v2-artifact`); `_test_matrix.yaml`, `push-to-clickhouse.yaml` and
+`push-hw-diagnostics-to-clickhouse.yaml` pass the optional secrets `CLICKHOUSE_V2_HOST`, `_PORT`,
+`_USER`, `_PASSWORD`; `push-to-clickhouse.yaml` and `integration-tests.yaml` pick the `_DEV` set with
+`clickhouse_env`, selecting the whole group at once (a missing prod secret never falls through to the
+dev one). Every `_test_matrix.yaml` caller forwards them. Workflows that export `CLICKHOUSE_*` as job
+env (`refresh-test-timings`, the covered-tier lookup) read only, and keep the legacy host.
+
+`CLICKHOUSE_DB_V2` is always treated as a Replicated database, even if it is not in
+`CH_V2_DATABASES` (a dev or renamed database). To make a missing v2 host an error instead of a silent
+write to the legacy host, set the repository variable `CH_REQUIRE_V2_HOST=1`: a connection that
+would reach a Replicated database without `CLICKHOUSE_V2_HOST` then exits with a clear message.
+Single-host setups leave it unset. A statement naming tables on both hosts (`INSERT INTO spyre.t
+SELECT ... FROM spyre_v2.u`) raises `CrossHostStatement`.
+
+**Dual writes (`--schema both`).** `results` (per XML file) and `ingest_hw_diagnostics.py` write
+v1 first, then v2:
+- A v2 failure never costs the v1 rows already written. With `CLICKHOUSE_V2_HOST` set the run then
+  exits 1 (the HA copy is the primary one); with one host it only warns, as before. A re-run is safe:
+  v1 deduplicates by run, and the v2 leg is idempotent per run and attempt.
+- A v1 failure raises before the v2 leg of that file, so nothing after it is attempted and the run
+  fails loudly; the rows of earlier files and legs stay. Neither side is silently dropped, but the
+  two are not transactional: a failed run can leave one side ahead until it is re-run.
+- A parked v2 batch (`BatchParked`) fails that file's v2 leg like any other v2 error.
+- A run with a parked or failed v2 file gets no artifact verdict: the first terminal verdict wins,
+  and one computed from the files that did land could be green for a run that is not. `--strict`
+  fails on the withheld verdict. Replaying the spool writes no verdict: re-run the ingest over the
+  whole leg (the same `--xml-dir`) to record it.
+- With `--strict`, a withheld verdict exits 1, which wins over 75 (the worse failure). A
+  single-file re-run builds the verdict from that file alone, as separate per-shard invocations
+  already do.
+
+### Parked batches: what a runner does
+
+Runner pods and CI workspaces are ephemeral, so a spool left in them is lost with the pod.
+When a step exits 75 or prints `[PARKED]`:
+
+1. The rows stay on the runner. Unless `CH_WRITE_SPOOL_PERSISTENT=1`, the spool is treated as
+   ephemeral (GitHub-hosted runners, ARC pods): the report step then fails the job and says the
+   rows are LOST when the job ends. Re-running the job ingests again from the test artifacts under
+   new attempt-scoped tokens, so an *ambiguous* batch (the send may have landed) is safe only where the
+   writer has an "already ingested" guard (see "What dedup does not cover"). To keep rows, run on a
+   self-hosted runner with a persistent 0700 directory outside the workspace, owned by the runner user,
+   and set the repository variables `CH_WRITE_SPOOL=<dir>` and `CH_WRITE_SPOOL_PERSISTENT=1` (the
+   workflows export them to the ingest steps as process env; actions cannot read `vars` themselves).
+   Never upload the spool: it holds full rows.
+2. `python -m spyre_clickhouse_ingest spool list` shows token, table, row count and `held`.
+3. `python -m spyre_clickhouse_ingest spool replay [TOKEN]` resends a batch to a Replicated table
+   under its ORIGINAL token and deletes the file once it is stored, so replaying a batch that did
+   land is a no-op inside the dedup window (at least one hour synchronous, 7 days asynchronous, and
+   10000 blocks). Refused, and left in the spool: a plain table; a table whose dedup window is 0;
+   an ambiguous batch that was sent
+   without a token (parked from a table that was plain then); an ambiguous batch older than
+   `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600); a batch parked for another host than the one the
+   connection reaches. A batch refused before any write replays at any age. Values keep their types
+   through the spool (datetime, date, Decimal, UUID, bytes, Map). After replaying a `test_case_runs`
+   batch, re-run the file's ingest: it deletes the earlier attempt's rows (below). Replay restores
+   only what was parked: when one table of a file parks, the file's later writes (its other
+   tables, the capability verdicts, the counters) are not attempted, so check them before
+   re-running the file.
+4. A `held` batch may already be stored: check the table, send only the missing rows, then
+   `spool drop TOKEN` (the full token as `spool list` prints it). `put` and `drop` take a lock file in
+   the directory, so processes sharing it leave one file per token and a `held` flag is never
+   cleared (flock on a local filesystem; not guaranteed on NFS). `spool list --fail-if-pending` exits
+   75 when a batch is parked or a quarantined, unreadable or leftover temp file exists; the other
+   `list` forms exit 0. `list` prints no rows and the batch's `host`.
+5. A full spool (`CH_WRITE_SPOOL` cap 256 MiB) raises instead of dropping anything.
+
+The directory is created 0700 and must be owned by the current user, opened without following a
+symlink, and not sit in a world-writable parent without the sticky bit; otherwise parking is
+disabled with a warning. A spool that already holds batches older than a day prints a warning with
+their count and age on open.
+
+The container tests (`tests/test_replicated_engine.py`) start a one-node ClickHouse with an
+embedded Keeper under podman or docker. They run when the image is local or `CH_TEST_PULL=1`
+(set in the `clickhouse-schema` workflow's unit-test step); `CH_TEST_IMAGE` overrides the image.
 
 ## What is deliberately NOT here
 

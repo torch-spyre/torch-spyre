@@ -8,6 +8,7 @@ the remaining callers is in extensions/clickhouse-ingest/README.md ("Moving off 
 import sys
 
 from spyre_clickhouse_ingest.results import main
+from spyre_clickhouse_ingest.writes import install_exit_hook
 
 if __name__ == "__main__":
     print(
@@ -15,4 +16,5 @@ if __name__ == "__main__":
         "`python -m spyre_clickhouse_ingest results` (same arguments)",
         file=sys.stderr,
     )
+    install_exit_hook()
     sys.exit(main(sys.argv[1:]))

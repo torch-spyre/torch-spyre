@@ -14,6 +14,7 @@
 
 """The GHA leg's artifact row and verdict: what must land, and what must be refused."""
 
+from types import SimpleNamespace
 import uuid
 
 from spyre_clickhouse_ingest import (
@@ -49,6 +50,8 @@ class FakeClient:
 
     def query(self, sql, parameters=None):
         self.queries.append((sql, parameters or {}))
+        if "system.tables" in sql:  # the engine lookup: a plain table
+            return SimpleNamespace(result_rows=[("MergeTree", 0)])
         if "count()" not in sql:
             # A record lookup (resolver.Lookup) finds nothing.
             class Empty:

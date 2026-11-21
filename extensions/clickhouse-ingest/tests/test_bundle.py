@@ -288,7 +288,9 @@ class FakeClient:
         self.settings[k] = v
 
     def query(self, sql, parameters=None):
-        if "count()" in sql:
+        if "system.tables" in sql:
+            rows = [["MergeTree", 0]]
+        elif "count()" in sql:
             rows = [[int(self.landed)]]
         elif "test_case_runs" in sql:
             rows = [[f] for f in self.files]
@@ -556,6 +558,8 @@ class CapturingClient:
         pass
 
     def query(self, sql, parameters=None):
+        if "system.tables" in sql:
+            return SimpleNamespace(result_rows=[["MergeTree", 0]])
         if "count()" in sql:
             table = (
                 "artifact_results" if "artifact_results" in sql else "benchmark_runs"
