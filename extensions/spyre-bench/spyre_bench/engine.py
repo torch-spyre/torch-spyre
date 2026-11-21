@@ -146,7 +146,7 @@ PY = {
 }
 ATTR_ROOTS = {
     "identity": ("case.", "system.", "input."),
-    "run": ("run.", "case.", "system.", "input."),
+    "run": ("run.", "case.", "system.", "input.", "role."),
     "subject": ("subject.",),
     "label": ("env.label.",),
     "environment": ("env.",),
