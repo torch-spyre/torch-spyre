@@ -430,6 +430,93 @@ one occurs (exit 1); exit 2 for bad flags or a store failure, never a silent pas
 the measured values. Output: `verdict_schema: bench.verdict/1` with `summary`, `benchmarks[]` (worst status per
 benchmark: regressed, suspected, improved, no_baseline, pass) and `verdicts[]`.
 
+Each verdict also carries `anchored`, the metric's verdict against the accepted baseline of its series
+(`v_benchmark_anchored_verdicts`): `status` (`regressed`, `suspected`, `improved`, `unchanged`, `no_anchor`), `reason`
+(`anchor_regressed`, `anchor_improved`, `anchor_unchanged`, `no_anchor`, or a cap such as `single_run`), the anchor `version`,
+the values, and for a metric over the anchor's floor `since_ts`, `n_exceeding_runs` and `days_exceeding`. `summary.anchored`
+counts the statuses. It is null for a metric with no anchored row, and absent altogether when the store has no anchored view.
+The rolling verdict answers "got worse recently"; the anchored one "worse than the accepted normal, and since when", so a
+persistent regression stays visible after the rolling baseline has absorbed it. `--no-anchor` leaves it out and
+`--fail-on-anchored regressed` gates on it (exit 1; exit 2 when the store has no anchored view, never a silent pass); like `--fail-on` nothing gates by default.
+
+## Accepting a new normal
+
+```bash
+spyre-bench accept --run-dir results/bench --reason "driver 2.4 is the new normal" [--window N] [--benchmark UUID] [--metric M] [--dry-run]
+```
+
+Proposes a stored run as the new anchor of its series. It reads the run's samples from `v_benchmark_series_runs`, refuses a
+run that is not baseline-eligible (suspect, invalidated or off-purpose) or has a non-finite sample (exit 1, nothing proposed), and writes one
+`reference-request-<key>-<run>.json` (never replacing an existing file) (`bench.reference-request/1`, role `anchor`) per scope (component, arch, backend, source job)
+under `--out` (default `BENCH_OUT/accept`). Series of the scope that the run does not replace are carried over from the
+current anchor with their own time, so a partial accept does not reset them. An anchor needs at least 3 samples; a series
+that stores one sample per run needs `--window N`, which pools the series' newest N eligible runs up to the accepted one
+(`accept` refuses and says so otherwise). The request is the input of the reference
+machinery (reference bundle, approval, tag move): the engine writes no rows and moves no tag, so the anchor changes when the
+reference is approved, and until then `verdict` keeps comparing with the old one. `--reason` is required and recorded.
+Each value carries a `case` block (`component`, `name`, `tags`, `disc`, `disc_keys`, and `id_profile` when the Result
+has one) that rebuilds its `benchmark_id`: taken from the Results of `--run-dir` when given, else from the registered
+case; `accept` refuses, naming the ids, when a block cannot rebuild its id. `anchor` is `{role, run_id, as_of}`
+(`from_run_id` repeats `run_id` for the reference side that reads it). `reference create --from-request` consumes the file.
+Exit 1 not eligible or no case data, 2 bad flags, 5 store failure.
+
+## Uploading results
+
+```bash
+spyre-bench upload results/bench                       # seal and check; prints what would be sent (dry run)
+spyre-bench upload results/bench --apply --wait        # put it in the results inbox and wait for the relay
+spyre-bench upload bundle.tgz --apply                  # send a bundle sealed elsewhere, unchanged
+```
+
+`upload` is for results measured outside CI: a lab host, a developer machine, a partner's machine. The engine writes
+no rows. The command seals the run directory (every `result.json` under it) into a `bench` bundle through the
+ingest's offline module, checks it, and prints the run key, case and repeat counts, both digests and a receipt id
+(`RCPT-...`). Without `--apply` nothing leaves the machine (the sealed bundle is written to `RESULTS_DIR/upload/bundle.tgz`, or `--out`). With it, the bundle is put in the Artifactory inbox
+(`--base-url`, `--repo`, `--root` or `ARTIFACTORY_BASE_URL`, `ARTIFACTORY_V2_RESULTS_REPO`,
+`ARTIFACTORY_V2_RESULTS_ROOT`; `ARTIFACTORY_TOKEN` or `~/.netrc`) and the relay records it; `--wait [MIN]` polls for
+its outcome. The dashboard's upload page takes the same bundle if you have a login. `--via api` is refused: the
+dashboard accepts a browser login only.
+
+| Flag | Effect |
+|---|---|
+| `--seal-trust lab\|external` | where the results came from (default `external`); the receiving channel records the trust and a label can only lower it |
+| `--redact-host`, `--redact-user` | leave the sealing host and user out of the bundle |
+| `--ended-at`, `--arch`, `--test-type perf\|quality` | end time (ISO-8601 with a zone), where it ran (default `run.json`; required when it records none: it is never guessed from the host), the tier |
+| `--out` | where to write the sealed bundle (default `RESULTS_DIR/upload/bundle.tgz`) |
+
+Rules that follow from the receiving side:
+
+- **Upgrade the connected ingest first.** The sealing host's ingest must not be newer than the receiving one, and
+  `upload` needs one that knows `bench` bundles; an older one is reported with that advice.
+- **Times carry a zone.** A time without one is read as UTC, whatever the sealing machine's zone; pass `--ended-at`
+  with an explicit zone when the tests ran elsewhere.
+- **The whole ingest package must be installed** (`spyre-bench[ingest]`, or its wheel in an air-gapped kit). The
+  vendored identity module that derives benchmark ids (see the adapter contract) is not enough, because sealing reads
+  `bundle.schema.json` beside the offline module.
+- **Re-sending is safe.** The run key is the engine run id and the results digest (`content_sha256`) ignores the
+  sealing host and time, so sealing the same results again is the same run even though the bundle digest differs; the
+  receiving side skips repeats it has and rejects a repeat whose content changed.
+- **Seal flags apply to a results directory.** Given an already sealed bundle, `--redact-*`, `--seal-trust`, `--arch`,
+  `--test-type`, `--ended-at` and `--out` are refused instead of ignored; `--wait` needs `--apply`.
+- **Keys the receiving channel owns** (`run.trust` and others) are dropped from the sealed copy, with a warning.
+
+Exit codes: 0 sent or dry run, 2 invalid input, missing configuration or a rejected bundle, 5 the transfer failed or
+the relay did not answer within `--wait` (status `waiting`: the bundle is in the inbox but not yet confirmed).
+Bundle format and trust rules: `extensions/clickhouse-ingest/docs/bench-bundles.md`.
+
+## Invalidations
+
+```bash
+spyre-bench invalidate (--run ID [--benchmark ID [--repeat N]] | --node N | --device SERIAL | --placement ID) [--from T --to T] \
+    --reason-code C --reason TEXT [--state suspect|invalidated] [--apply [--confirm [TOKEN]]]
+spyre-bench invalidate restore ID --reason-code C --reason TEXT [--apply]    # also: set ID --state ..., list, show ID
+```
+
+The default is a preview: the store is read and the runs, series, benchmarks, repeats and verdict changes are printed;
+nothing is written. `--apply` records one event through a `bench-invalidation` bundle and the ingest (which owns the
+matching view, the state machine and the 50-run confirmation threshold). Needs `spyre-bench[ingest,clickhouse]`. Exit 0
+ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incident-runbook.md](incident-runbook.md).
+
 ## Running the tests
 
 See the README. The suite covers the schemas, every pack, the examples, identity, planning and reuse, invalidation,
