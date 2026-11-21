@@ -90,6 +90,33 @@ inputs:
     description: ClickHouse password.
     required: false
     default: ''
+  clickhouse-v2-host:
+    description: >-
+      Optional endpoint for the v2 databases (CLICKHOUSE_DB_V2, CH_V2_DATABASES); v1 tables stay
+      on clickhouse-host. Empty = one host for everything.
+    required: false
+    default: ''
+  clickhouse-v2-port:
+    description: Port of clickhouse-v2-host (defaults to clickhouse-port).
+    required: false
+    default: ''
+  clickhouse-v2-user:
+    description: Writer login on the v2 host (defaults to clickhouse-user).
+    required: false
+    default: ''
+  clickhouse-v2-pass:
+    description: Password for clickhouse-v2-user.
+    required: false
+    default: ''
+  clickhouse-schema-user:
+    description: >-
+      Login for the ensure-table DDL this ingest runs. Empty = the writer login, with a warning.
+    required: false
+    default: ''
+  clickhouse-schema-pass:
+    description: Password for clickhouse-schema-user.
+    required: false
+    default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
     required: false
@@ -205,6 +232,12 @@ runs:
         ROOT: ${{ steps.setup.outputs.root }}
         CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
         CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CLICKHOUSE_V2_HOST: ${{ inputs.clickhouse-v2-host }}
+        CLICKHOUSE_V2_PORT: ${{ inputs.clickhouse-v2-port }}
+        CLICKHOUSE_V2_USER: ${{ inputs.clickhouse-v2-user }}
+        CLICKHOUSE_V2_PASSWORD: ${{ inputs.clickhouse-v2-pass }}
+        CLICKHOUSE_SCHEMA_USER: ${{ inputs.clickhouse-schema-user }}
+        CLICKHOUSE_SCHEMA_PASSWORD: ${{ inputs.clickhouse-schema-pass }}
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}

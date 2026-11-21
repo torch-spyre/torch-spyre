@@ -76,6 +76,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD }}
 
       - name: Upload Logs artifact
         if: always() && steps.ingest.outputs.log-file != ''
