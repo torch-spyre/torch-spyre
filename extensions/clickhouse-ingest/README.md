@@ -554,7 +554,7 @@ ingest code and `.github/scripts` for DDL sent on a writer.
 |---|---|
 | `CLICKHOUSE_USER` / `CLICKHOUSE_PASS` | the writer login (legacy host) |
 | `CLICKHOUSE_SCHEMA_USER` / `CLICKHOUSE_SCHEMA_PASSWORD` | the schema login; unset falls back to the writer login with one warning |
-| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones (`_SECURE` and `CLICKHOUSE_SECURE` read `0/false/no/off` in any case as off) |
+| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones (the legacy `CLICKHOUSE_SECURE` is kept as is: only `0`, `false`, `no`; `CLICKHOUSE_V2_SECURE` accepts `0/false/no/off` in any case) |
 | `CLICKHOUSE_V2_USER` / `CLICKHOUSE_V2_PASSWORD` | the writer login on the v2 host; unset uses the legacy writer pair |
 | `CLICKHOUSE_V2_SCHEMA_USER` / `CLICKHOUSE_V2_SCHEMA_PASSWORD` | the schema login on the v2 host; unset tries the schema pair, then the v2 writer pair |
 | `CH_V2_DATABASES` | comma list of the databases the v2 host serves (default `spyre_v2`); `CLICKHOUSE_DB_V2` is always included |

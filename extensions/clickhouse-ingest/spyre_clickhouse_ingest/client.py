@@ -65,12 +65,10 @@ class ClickHouseEnv:
         """CLICKHOUSE_DB, the connection's own database."""
         return cls.get("CLICKHOUSE_DB", cls.DEFAULT_DB)
 
-    OFF = ("0", "false", "no", "off")
-
     @classmethod
     def secure(cls) -> bool:
-        """CLICKHOUSE_SECURE=0 (or false/no/off, any case) drops to plain HTTP, for a local box."""
-        return cls.get("CLICKHOUSE_SECURE", "1").lower() not in cls.OFF
+        """CLICKHOUSE_SECURE=0 drops to plain HTTP, to reach a local box with no TLS."""
+        return cls.get("CLICKHOUSE_SECURE", "1") not in ("0", "false", "no")
 
     @classmethod
     def target_database(cls) -> str:
@@ -88,8 +86,9 @@ class ClickHouseEnv:
 
     @classmethod
     def v2_secure(cls) -> bool:
+        """CLICKHOUSE_V2_SECURE (0/false/no/off in any case is off), else the legacy setting."""
         raw = cls.get("CLICKHOUSE_V2_SECURE").lower()
-        return cls.secure() if not raw else raw not in cls.OFF
+        return cls.secure() if not raw else raw not in ("0", "false", "no", "off")
 
     @classmethod
     def v2_databases(cls) -> tuple:

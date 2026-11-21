@@ -523,9 +523,12 @@ def test_a_v2_parameter_in_a_statement_on_legacy_tables_is_refused(routed):
         )
 
 
-@pytest.mark.parametrize("raw", ["False", "OFF", " no ", "0"])
-def test_the_legacy_and_v2_secure_parsers_agree(monkeypatch, raw):
+@pytest.mark.parametrize(
+    "raw,secure", [("0", False), ("false", False), ("no", False), ("False", True), ("OFF", True),
+                   ("off", True), ("No", True), ("1", True)],
+)  # fmt: skip
+def test_the_legacy_secure_setting_keeps_its_exact_values(monkeypatch, raw, secure):
     monkeypatch.setenv("CLICKHOUSE_SECURE", raw)
     monkeypatch.delenv("CLICKHOUSE_V2_SECURE", raising=False)
-    assert client.ClickHouseEnv.secure() is False
-    assert client.ClickHouseEnv.v2_secure() is False
+    assert client.ClickHouseEnv.secure() is secure
+    assert client.ClickHouseEnv.v2_secure() is secure  # unset: the legacy value
