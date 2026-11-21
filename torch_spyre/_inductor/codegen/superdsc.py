@@ -49,7 +49,7 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     SPYRE_INT32_OPS,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -575,8 +575,9 @@ def _is_depthwise_conv(op: str) -> bool:
     return op == DEPTHWISE_CONV2D_OP
 
 
-def _is_keep_by_index(op: str) -> bool:
-    return op == KEEP_BY_INDEX_OP
+def _is_index_masking_op(op: str) -> bool:
+    """True for keepbyindex and maskbyindex."""
+    return op in INDEX_MASKING_OPS
 
 
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
@@ -1513,7 +1514,7 @@ def _create_sdsc_tensors(
             use_op_dims
             and dim_order != dims
             and not _is_topk(op_spec.op)
-            and not _is_keep_by_index(op_spec.op)
+            and not _is_index_masking_op(op_spec.op)
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
@@ -1950,7 +1951,7 @@ def _get_op_func(
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
-        and not _is_keep_by_index(op)
+        and not _is_index_masking_op(op)
     ):
         return op + "nonstick"
     return op
@@ -2461,7 +2462,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             not (is_matmul or is_pool or has_indirect_access)
             and not is_conv
             and not _is_topk(op_spec.op)
-            and not _is_keep_by_index(op_spec.op)
+            and not _is_index_masking_op(op_spec.op)
         ):
             op_dim_order, op_stick_dim = _merged_reduction_dim_order(
                 op_spec, symbol_mapping
@@ -2763,8 +2764,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    if _is_keep_by_index(op_spec.op):
-        num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
+    if _is_index_masking_op(op_spec.op):
+        # keep/mask_by_index have exactly 2 input tensors (values, indices)
+        num_inputs = 2
 
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
