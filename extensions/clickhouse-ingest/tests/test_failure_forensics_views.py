@@ -15,7 +15,7 @@
 """Static checks on schema/57; the views' behaviour is proven on a sandbox (verify_schema)."""
 
 import json
-import re
+import regex as re
 from pathlib import Path
 
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
