@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: moe-expert-loop-sweep, owner: example-team}
+spec:
+  type: perf
+  level: kernel
+  tier: extended
+  system: moe-demo-fp16
+  workload:
+    type: kernel/op
+    op: moe_expert_loop
+    dtype: fp16
+    shape: [512, 1024, 256]
+    flags: {experts: 128, top_k: 8, phase: prefill, tile_tokens: 512, chunk_tokens: 8192, expert_concurrency: 1, expert_parallel: 1, router_source: uniform_synthetic}
+    load: {executor: iterations, iterations: 50, warmup_iterations: 5}
+  metrics: {required: [kernel.time.mean, kernel.moe.fetch_bytes, kernel.moe.loop_trips], headline: [kernel.time.mean]}
+  context: {timer: wall}
+  run: {repeats: 3, timeout: 60m, est: 20m, isolation: process}
+  matrix:
+    name_template: moe_loop_{conc}_{tile}
+    axes:
+      conc: {path: workload.flags.expert_concurrency, values: [1, 2, 4], token: "c{}"}
+      tile: {path: workload.flags.tile_tokens, values: [256, 512], token: "g{}"}

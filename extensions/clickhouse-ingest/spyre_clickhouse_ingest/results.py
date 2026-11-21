@@ -1923,7 +1923,6 @@ def main(argv=None, assigned_trust=""):
         or args.benchmarks_dir
         or args.tables_dir
         or getattr(args, "bench_dir", "")
-        or getattr(args, "reference_dir", "")
     ):
         sys.exit(
             "--purpose is recorded for the perf report.xml ingest only (--xml-dir/--xml-file); "
@@ -1935,10 +1934,6 @@ def main(argv=None, assigned_trust=""):
         from spyre_clickhouse_ingest.bundle import ingest
 
         return ingest(args)
-    if getattr(args, "reference_dir", ""):
-        sys.exit(
-            "--reference-dir seals a reference bundle (--offline); a reference is recorded at approval, not by a direct ingest"
-        )
     if (
         args.kind != "junit"
         or args.vllm_results_dir

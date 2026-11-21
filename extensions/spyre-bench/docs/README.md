@@ -220,6 +220,13 @@ A public definition names a dataset by an opaque slug (`slot-95`), never by its 
 Every metric belongs to a metric class that lists the facets its numbers must carry; see
 [metric-context.md](metric-context.md). `validate` warns when a Benchmark does not declare a required author-only facet.
 
+## Kernel pack: dtypes, MoE metrics, trace roles
+
+A kernel `op` workload accepts `dtype` `fp32`, `bf16`, `fp16`, `fp8`, `int32` and `int8`; `df16` is the device-side name
+of `fp16` and is written `fp16`. The pack registers `kernel.moe.fetch_bytes` and `kernel.moe.loop_trips` (class
+`kernel_time`) and the `role.moe.*` run properties that name which stored trace signal plays which role. A role with no
+stored signal reads as not captured, never as zero (`spyre_bench.trace_signals`). A sample is in `examples/moe-demo`.
+
 ## Cost hints, not scheduling
 
 The core Benchmark kind carries no cadence. `est_hours` (optional, all cases) and `run.est`/`run.timeout` (per case)
