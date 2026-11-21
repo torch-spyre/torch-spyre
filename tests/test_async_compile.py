@@ -204,7 +204,7 @@ def test_single_worker_compiles_inline_without_starting_pool(unroll):
     compile_backend.assert_called_once_with(
         "sdsc_0",
         "/tmp/kernel",
-        dict(os.environ),
+        {**os.environ, "SENCORES": str(spyre_config.sencores_physical)},
         unroll,
         "/parent/device.mlir",
         123.0,
@@ -239,6 +239,7 @@ def test_backend_settings_are_forwarded_to_pool_workers():
 
         fn, args = pool.calls[-1]
         assert fn is async_compile_mod._run_backend_compiler
+        assert args[2]["SENCORES"] == str(spyre_config.sencores_physical)
         assert args[3] is False
         assert args[4] == "/parent/device.mlir"
         assert args[5] == expected

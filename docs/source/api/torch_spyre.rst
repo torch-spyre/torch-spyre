@@ -712,7 +712,21 @@ Environment Variables
    * - Variable
      - Purpose
    * - ``SENCORES``
-     - Number of Spyre cores (1--32, default 32)
+     - Logical core budget for work division and LX planning (1--32,
+       default 32). It must not exceed ``SENCORES_PHYSICAL``. The SDSC
+       backend receives ``SENCORES_PHYSICAL`` instead.
+   * - ``SENCORES_PHYSICAL``
+     - Physical core count for placement and SDSC backend compilation
+       (1--32, default ``32``). Set it to the card's physical core count.
+   * - ``SPYRE_CORE_PLACEMENT``
+     - Physical placement mode: ``dense`` (default) or ``clamshell``.
+       Each operation maps ``n`` logical cores with a shift and step.
+       Dense uses shift ``0`` and step ``1``. Clamshell uses shift
+       ``-(n // 2)`` and step ``1``, modulo ``SENCORES_PHYSICAL``.
+       An operation that uses all physical cores uses dense placement.
+       Split reductions use the selected physical core placement.
+       The KTIR emitter does not support clamshell placement.
+       Wrapped placements require a recent backend build.
    * - ``DXP_LX_FRAC_AVAIL``
      - Fraction of LX scratchpad available to the planner (default ``0.2``)
    * - ``LX_PLANNING``

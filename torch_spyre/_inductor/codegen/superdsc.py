@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from sympy import Expr, Integer, Mod, Symbol
+from sympy import Eq, Expr, Integer, Mod, Or, Piecewise, Symbol
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -51,7 +51,11 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
-from torch_spyre._inductor.core_mapping import matmul_reduction_dim
+from torch_spyre._inductor.core_mapping import (
+    CorePlacement,
+    matmul_reduction_dim,
+    place_core_map,
+)
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
@@ -92,6 +96,8 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     work_division: TensorWorkDivision | None = None
+    # Physical holders of this tensor; empty means all positions in its fold.
+    active_core_ids: tuple[int, ...] = ()
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
@@ -166,6 +172,8 @@ class SDSCSpec:
     input_coord_sizes: dict = dataclasses.field(default_factory=dict)
     emit_memorg_padding: bool = False
     completed_producer_cores: tuple[int, ...] = ()
+    # Exact physical dispatch, distinct from completed-reduction source routes.
+    active_core_ids: tuple[int, ...] = ()
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -2197,6 +2205,27 @@ def _inject_implicit_conv_kernel_dims(
         work_slices[kj_sym] = 1
 
 
+def _core_placement(logical_cores: int) -> CorePlacement:
+    """Resolve a mode to the signed shift and step for one core domain."""
+    physical_cores = _spyre_config.sencores_physical
+    if not 1 <= physical_cores <= 32:
+        raise ValueError("SENCORES_PHYSICAL must be between 1 and 32")
+
+    mode = _spyre_config.core_placement_mode
+    if mode == "dense":
+        shift, step = 0, 1
+    elif mode == "clamshell":
+        # For full-card operations, use dense placement to avoid unnecessary rotation as it
+        # changes SDSC output and cache keys for no gain.
+        if logical_cores >= physical_cores:
+            shift, step = 0, 1
+        else:
+            shift, step = -(logical_cores // 2), 1
+    else:
+        raise ValueError(f"Unknown core placement mode: {mode!r}")
+    return CorePlacement(logical_cores, physical_cores, shift, step)
+
+
 def _finalize_tensor_work_divisions(
     args: list[SDSCArgs],
     mapping_dims: tuple[Symbol, ...],
@@ -2232,7 +2261,7 @@ def _finalize_tensor_work_divisions(
                 num_cores=override.num_cores or num_cores,
             )
         )
-        active_core_ids = (
+        source_ids = (
             completed_producer_cores
             if completed_producer_cores and index == 0
             else None
@@ -2244,7 +2273,7 @@ def _finalize_tensor_work_divisions(
             if not is_lx_relayout
             else num_cores % tensor_cores == 0
             and tensor_cores % tensor_owners == 0
-            and (active_core_ids is None or tensor_owners == len(active_core_ids))
+            and (source_ids is None or tensor_owners == len(source_ids))
         )
         if not valid:
             raise ValueError(
@@ -2875,6 +2904,62 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         is_relayout,
         op_spec.completed_producer_cores,
     )
+    completed_producer_cores = op_spec.completed_producer_cores
+    active_core_ids: tuple[int, ...] = ()
+    if is_relayout:
+        active: set[int] = set()
+        for index, arg in enumerate(args):
+            division = arg.work_division
+            assert division is not None
+            logical_cores = division.num_cores or num_cores
+            placement = _core_placement(logical_cores)
+            owners = placement.active_ids
+            if index == 0 and completed_producer_cores:
+                completed_producer_cores = placement.remap_ids(completed_producer_cores)
+                owners = completed_producer_cores
+            arg.active_core_ids = owners
+            active.update(owners)
+            arg.work_division = TensorWorkDivision(
+                division.work_slices,
+                place_core_map(division.core_id_to_work_slice, placement),
+                num_cores=placement.physical_span,
+            )
+        # Tensor holders, not the distinct destination work-slice count,
+        # determine which physical cores execute the shuffle. The output
+        # ownership sets its operation map. Source-only cores participate in
+        # transfers but have no output piece; map them to slice zero so the
+        # backend does not invent destination tiles on those cores.
+        destination = args[-1].work_division
+        assert destination is not None
+        destination_map = destination.core_id_to_work_slice
+        source_only_ids = active - set(args[-1].active_core_ids)
+        if source_only_ids:
+            # Test the physical source-only set, not a modulus of its size.
+            # At most one equality per physical core is needed.
+            core_id = Symbol("core_id")
+            source_only = Or(*(Eq(core_id, core) for core in sorted(source_only_ids)))
+            core_id_to_work_slice = {
+                dim: Piecewise((Integer(0), source_only), (owner, True))
+                for dim, owner in destination_map.items()
+            }
+        else:
+            core_id_to_work_slice = dict(destination_map)
+        num_cores = max(
+            division.num_cores or 1
+            for arg in args
+            if (division := arg.work_division) is not None
+        )
+        active_core_ids = tuple(sorted(active))
+    elif not any(arg.non_unified for arg in args):
+        operation_placement = _core_placement(num_cores)
+        core_id_to_work_slice = place_core_map(
+            core_id_to_work_slice, operation_placement
+        )
+        num_cores = operation_placement.physical_span
+        active_core_ids = operation_placement.active_ids
+        # The first finalization already bound each tensor to the logical
+        # operation division. Its physical map and dispatch are now on the
+        # SDSC spec, not on a second per-tensor override.
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
         i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
@@ -2929,7 +3014,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
-            completed_producer_cores=op_spec.completed_producer_cores,
+            completed_producer_cores=completed_producer_cores,
+            active_core_ids=active_core_ids,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.

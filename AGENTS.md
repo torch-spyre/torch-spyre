@@ -122,7 +122,9 @@ them with `PARAMS`, and `pr-review` checks them.
 | Variable | Purpose |
 |---|---|
 | `TORCH_SPYRE_DEBUG=1` | Enable C++ debug logging and `-O0` builds |
-| `SENCORES` | Number of Spyre cores (1–32, default 32) |
+| `SENCORES` | Logical work-division budget (1–32, default 32) |
+| `SENCORES_PHYSICAL` | Card's physical core count used for placement (1–32, default 32) |
+| `SPYRE_CORE_PLACEMENT` | Physical core placement mode: `dense` (default) or `clamshell`; the compiler resolves shift and step per operation |
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
 | `LAYOUT_SOLVER` | LX layout solver: `greedy`, `firstfit`, `bestfit`, `cpsat` (default), `simulated_annealing` |
@@ -138,6 +140,23 @@ them with `PARAMS`, and `pr-review` checks them.
 | `TORCH_SPYRE_FFT_W_CACHE_BYTES` | Byte budget for the cached fp16 DFT matrices (`torch_spyre.ops.fft`); LRU-evicted when exceeded (default: forward+inverse at the direct ceiling) |
 | `TORCH_SPYRE_NARROWING_CHECK` | Guards that split a `dynamic=` range: `warn` (default), `error`, `off` |
 | `TORCH_SPYRE_RECOMPILE_CHECK` | Recompiles that break a `dynamic=` range: `warn` (default), `error`, `all`, `off` |
+
+Unified work-division ops map logical core `i` to
+`(shift + i * step) % SENCORES_PHYSICAL`. Dense resolves to `(0, 1)`;
+clamshell resolves to `(-(n // 2), 1)` for the op's `n` logical cores.
+An operation that uses all physical cores uses dense placement.
+The logical budget must not exceed `SENCORES_PHYSICAL`.
+
+The SDSC backend process receives `SENCORES_PHYSICAL` as its `SENCORES`
+topology. Python keeps `SENCORES` as the logical planner budget.
+
+Cross-core reductions use the selected physical placement. Keep the
+backend topology equal to `SENCORES_PHYSICAL`. Wrapped placements
+(indirect routes and cross-core reductions) require a recent backend
+build.
+
+In an LX shuffle, source holders determine dispatch cores; destination
+work slices do not add cores.
 
 ## Spyre Hardware Basics
 

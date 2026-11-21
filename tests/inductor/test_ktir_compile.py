@@ -14,21 +14,29 @@
 
 """Unit tests for the OpSpec->KTIR backend-compiler hook.
 
-Covers ``_check_ktir_device_prerequisites`` and
-``SpyreAsyncCompile._compile_ktir_with_dbo`` -- the step between the emitter
-(covered by ``test_ktir_emitter.py``) and the loaded kernel.
+Covers early core-placement validation, ``_check_ktir_device_prerequisites``,
+and ``SpyreAsyncCompile._compile_ktir_with_dbo``. The latter is the step
+between the emitter (covered by ``test_ktir_emitter.py``) and the loaded kernel.
 
 No device and no real ``dbo-opt``: ``subprocess.run`` and ``shutil.which`` are
 mocked throughout, so unlike the emitter's golden test this file needs neither
 ``mlir_ktdp`` nor deeptools and runs anywhere.
 """
 
+import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
+import torch
+import torch._inductor.compile_fx as cfx
+
+from torch_spyre import _inductor as spyre_inductor
+from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre.execution import async_compile as ac
 
 _MODULE = "torch_spyre.execution.async_compile"
@@ -90,6 +98,127 @@ class _PrereqCase(unittest.TestCase):
         os.makedirs(code_dir, exist_ok=True)
         with open(os.path.join(code_dir, "spyrecode.json"), "w") as fh:
             fh.write("{}")
+
+
+class TestCorePlacementConfiguration(unittest.TestCase):
+    """Refuse invalid placement before device initialization or graph lowering."""
+
+    def setUp(self):
+        self.enterContext(
+            spyre_config.patch(
+                sencores=32,
+                sencores_physical=32,
+                core_placement_mode="dense",
+                ktir_emitter=False,
+                ktir_device_mlir="",
+            )
+        )
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SENCORES": "32",
+                    "SENCORES_PHYSICAL": "32",
+                    "SPYRE_CORE_PLACEMENT": "dense",
+                    "TORCH_SPYRE_KTIR": "0",
+                    "KTIR_DEVICE_MLIR": "",
+                },
+            )
+        )
+        self.downstream = self.enterContext(mock.patch.object(cfx, "compile_fx"))
+        self.enterContext(mock.patch.object(cfx, "_spyre_wrapped", False, create=True))
+        self.enterContext(mock.patch.object(spyre_inductor, "patch_inductor_fusions"))
+        self.enterContext(mock.patch.object(spyre_inductor, "try_collect"))
+        self.lazy_init = self.enterContext(mock.patch("torch.spyre._impl._lazy_init"))
+        spyre_inductor.enable_spyre_compile_fx_wrapper()
+        graph = torch.fx.Graph()
+        result = graph.call_function(torch.empty, ([1],), {"device": "spyre"})
+        graph.output(result)
+        self.gm = torch.fx.GraphModule({}, graph)
+
+    def _load_config(self):
+        # Match test_async_compile.py's isolated loader. Do not reload the module
+        # used by the other tests or start a subprocess for each environment.
+        name = "_test_core_placement_config"
+        spec = importlib.util.spec_from_file_location(name, spyre_config.__file__)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {name: module}):
+            spec.loader.exec_module(module)
+            return sys.modules[name]
+
+    def test_environment_rejects_logical_budget_above_physical(self):
+        with (
+            mock.patch.dict(os.environ, {"SENCORES_PHYSICAL": "16"}),
+            self.assertRaisesRegex(
+                ValueError,
+                "SENCORES must be between 1 and SENCORES_PHYSICAL, "
+                "got SENCORES=32, SENCORES_PHYSICAL=16",
+            ),
+        ):
+            self._load_config()
+
+    def test_compile_rejects_patched_logical_budget_above_physical(self):
+        with (
+            spyre_config.patch(sencores_physical=16),
+            self.assertRaisesRegex(
+                Unsupported,
+                "Spyre backend does not support: SENCORES must be between "
+                "1 and SENCORES_PHYSICAL",
+            ),
+        ):
+            cfx.compile_fx(self.gm, [])
+        self.lazy_init.assert_not_called()
+        self.downstream.assert_not_called()
+
+    def test_environment_rejects_ktir_clamshell(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TORCH_SPYRE_KTIR": "1", "SPYRE_CORE_PLACEMENT": "clamshell"},
+            ),
+            self.assertRaisesRegex(
+                ValueError, "KTIR emission with SPYRE_CORE_PLACEMENT=clamshell"
+            ),
+        ):
+            self._load_config()
+
+    def test_compile_rejects_patched_ktir_clamshell_for_any_core_count(self):
+        for cores in (1, 16, 32):
+            with (
+                self.subTest(cores=cores),
+                spyre_config.patch(
+                    sencores=cores, core_placement_mode="clamshell", ktir_emitter=True
+                ),
+                self.assertRaisesRegex(
+                    Unsupported,
+                    "Spyre backend does not support: KTIR emission with "
+                    "SPYRE_CORE_PLACEMENT=clamshell",
+                ),
+            ):
+                cfx.compile_fx(self.gm, [])
+        self.lazy_init.assert_not_called()
+        self.downstream.assert_not_called()
+
+    def test_device_override_without_ktir_allows_clamshell(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SPYRE_CORE_PLACEMENT": "clamshell",
+                "KTIR_DEVICE_MLIR": "/some/device.mlir",
+            },
+        ):
+            self.assertFalse(self._load_config().ktir_emitter)
+        with (
+            spyre_config.patch(
+                core_placement_mode="clamshell", ktir_device_mlir="/some/device.mlir"
+            ),
+            mock.patch.object(spyre_inductor, "_declared_dims_of", return_value={}),
+            mock.patch.object(spyre_inductor, "enable_spyre_context"),
+        ):
+            self.assertIs(cfx.compile_fx(self.gm, []), self.downstream.return_value)
+        self.lazy_init.assert_called_once()
+        self.downstream.assert_called_once()
 
 
 class TestKtirPrerequisites(_PrereqCase):

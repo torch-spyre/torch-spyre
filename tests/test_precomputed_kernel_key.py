@@ -282,6 +282,70 @@ class TestFingerprint(unittest.TestCase):
         for field, value in changed.items():
             self.assertNotEqual(value, base, field)
 
+    def test_physical_placement_change_rejects_precomputed_key(self):
+        with _env(sencores=8, sencores_physical=32, core_placement_mode="dense"):
+            saved = f"k|{kernel_key_fingerprint(0)}"
+            self.assertEqual(resolve_precomputed_key(saved, 0), "k")
+            for settings in (
+                {"core_placement_mode": "clamshell"},
+                {"sencores_physical": 24},
+            ):
+                with self.subTest(settings=settings), spyre_config.patch(settings):
+                    self.assertIsNone(resolve_precomputed_key(saved, 0))
+
+    def test_compiled_placement_changes_cache_key_and_blocks_old_fingerprint(self):
+        from torch_spyre._C import DataFormats
+        from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+
+        row, lane = Symbol("row"), Symbol("lane")
+        space = {row: (Integer(8), 8), lane: (Integer(64), 1)}
+        coordinates = [Integer(0), row, lane]
+        spec = OpSpec(
+            "add",
+            False,
+            space,
+            [
+                TensorArg(
+                    True,
+                    0,
+                    DataFormats.SEN169_FP16,
+                    [1, 8, 64],
+                    coordinates,
+                    {"hbm": 0},
+                ),
+                TensorArg(
+                    True,
+                    1,
+                    DataFormats.SEN169_FP16,
+                    [1, 8, 64],
+                    coordinates,
+                    {"hbm": 4096},
+                ),
+                TensorArg(
+                    False,
+                    2,
+                    DataFormats.SEN169_FP16,
+                    [1, 8, 64],
+                    coordinates,
+                    {"hbm": 8192},
+                ),
+            ],
+            {},
+            core_id_to_work_slice={row: Symbol("core_id"), lane: Integer(0)},
+        )
+        with _env(sencores=8, sencores_physical=32, core_placement_mode="clamshell"):
+            key = compute_specs_hash([spec], kernel_name="k")
+            saved = f"k|{kernel_key_fingerprint(0)}"
+            for settings in (
+                {"core_placement_mode": "dense"},
+                {"sencores_physical": 24},
+            ):
+                with self.subTest(settings=settings), spyre_config.patch(settings):
+                    self.assertNotEqual(
+                        compute_specs_hash([spec], kernel_name="k"), key
+                    )
+                    self.assertIsNone(resolve_precomputed_key(saved, 0))
+
     def test_key_and_fingerprint_share_inputs(self):
         # A non-spec input added to the key must reach the fingerprint too.
         specs = _spec_sets()["single"]
