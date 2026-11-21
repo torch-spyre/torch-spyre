@@ -53,22 +53,22 @@ spec:
   gates:
     - {id: llm.server_ready, phase: in, reason: SERVER_START_FAILED}
   metrics:
-    - {name: llm.ttft.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
+    - {name: llm.ttft.mean, class: latency_ttft, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
-    - {name: llm.ttft.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+    - {name: llm.ttft.p99, class: latency_ttft, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_to_first_token}
-    - {name: llm.itl.median, unit: s, direction: lower_is_better, category: performance, statistic: median, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.itl.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.tpot.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+    - {name: llm.itl.median, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: median, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.itl.p99, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.tpot.p99, class: latency_itl, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
        noise: {min_repeats: 3}, otel: gen_ai.server.time_per_output_token}
-    - {name: llm.e2el.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
-    - {name: llm.e2el.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative}
-    - {name: llm.output_throughput, unit: "{token}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
-    - {name: llm.request_throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
-    - {name: llm.goodput_at_slo, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value,
+    - {name: llm.e2el.mean, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.e2el.p99, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative}
+    - {name: llm.output_throughput, class: throughput, unit: "{token}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.request_throughput, class: throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative}
+    - {name: llm.goodput_at_slo, class: throughput, unit: "{request}/s", direction: higher_is_better, category: performance, statistic: value,
        compare: relative, description: "requests/s meeting every bound of the workload's slo"}
-    - {name: llm.batch_latency.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
-    - {name: llm.startup.cold, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 1}}
-    - {name: llm.startup.warm, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
-    - {name: llm.eval.exact_match, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
-    - {name: llm.parity.greedy_match_ratio, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}
+    - {name: llm.batch_latency.mean, class: latency_e2e, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative}
+    - {name: llm.startup.cold, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 1}}
+    - {name: llm.startup.warm, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative, noise: {min_repeats: 3}}
+    - {name: llm.eval.exact_match, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: mean, compare: absolute}
+    - {name: llm.parity.greedy_match_ratio, class: quality_score, unit: "1", direction: higher_is_better, category: quality, statistic: ratio, compare: exact}

@@ -522,6 +522,11 @@ SPECS = {
             "profile": ref("profile"),
             "analyze": arr(obj({"analyzer": s(), "args": {"type": "object"}}, required=("analyzer",))),
             "derived_metrics": arr(ref("metric")),
+            "context": {
+                "type": "object",
+                "additionalProperties": SCALAR,
+                "description": "metric-context facets only the author knows (token_basis, timer, ...); never identity",
+            },
             "env": ref("env"),
             "run": ref("run"),
             "previous_names": arr(ref("name"), description="names this Benchmark had; links history, ids still change"),
@@ -993,6 +998,17 @@ SPECS = {
                         },
                         "compare": {"enum": ["relative", "absolute", "exact"]},
                         "noise": obj({"min_repeats": integer(minimum=1), "cv_max": num(minimum=0)}),
+                        "class": s(
+                            pattern=r"^(x-)?[a-z][a-z0-9_-]*$",
+                            description="metric class of the metric-context vocabulary; default: matched by name",
+                        ),
+                        "context": obj(
+                            {
+                                "required": arr(s(pattern=r"^[a-z0-9_|-]+$")),
+                                "optional": arr(s(pattern=r"^[a-z0-9_-]+$")),
+                            },
+                            desc="facets numbers of this metric must carry; `required` replaces the class default",
+                        ),
                         "otel": s(),
                         "description": s(),
                     },

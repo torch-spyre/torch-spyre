@@ -1645,7 +1645,7 @@ class VerdictTests(unittest.TestCase):
             [v["status"] for v in doc["verdicts"]], ["pass", "regressed", "improved", "suspected", "no_baseline"]
         )
         self.assertEqual({b["name"]: b["status"] for b in doc["benchmarks"]}["op_b"], "regressed")
-        self.assertEqual(set(doc["verdicts"][0]), set(verdict_cmd.FIELDS))
+        self.assertEqual(set(doc["verdicts"][0]), set(verdict_cmd.FIELDS) | {"anchored"})
 
     def test_per_benchmark_status_is_the_worst_metric(self):
         rows = [verdict_row(metric="m1"), verdict_row(metric="m2", status="suspected")]
