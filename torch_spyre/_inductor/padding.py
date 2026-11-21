@@ -1207,6 +1207,29 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
+def _refresh_input_layout_override(
+    op: Operation, name: str, unpadded_layout, padded_layout
+) -> None:
+    """Keep ``op``'s input-layout override for ``name`` in step with padding.
+
+    A relayout copy-in (``_insert_mutation_relayout_copy``) records the layout
+    it reads its input with in ``op._input_layout_overrides``, and work division
+    and codegen read that instead of the buffer's own layout.  Padding replaces
+    the buffer's layout, so an override still naming the unpadded layout would
+    hide the padding from codegen (#4404).  Only an override that describes the
+    unpadded layout is refreshed; one describing a different layout is kept.
+    """
+    overrides = getattr(op, "_input_layout_overrides", None)
+    if not overrides or name not in overrides:
+        return
+    override = overrides[name]
+    if (
+        override is unpadded_layout
+        or override.device_layout == unpadded_layout.device_layout
+    ):
+        overrides[name] = padded_layout
+
+
 def _clone_input_for_padding(
     op: ComputedBuffer, in_dep, in_buf, graph: GraphLowering, pass_name: str
 ) -> ComputedBuffer | None:
@@ -1315,6 +1338,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         in_buf = clone_buf
 
     # --- Pad the input. ---
+    unpadded_layout = in_buf.get_layout()
     if size1:
         # Prepend an outermost size-64 gap dim so the elided size-1 dim's
         # allocation covers the full stick the restickify sweeps.
@@ -1337,6 +1361,9 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
             f"dim for new stick dim {new_stick_dim}"
         )
         in_buf.layout = _pad_device_dim(layout, device_dim, padded_dim_size)
+    _refresh_input_layout_override(
+        op, in_buf.get_name(), unpadded_layout, in_buf.get_layout()
+    )
 
     logger.debug(
         "insert_restickify_padding: padded input %s to device_size %s%s",
