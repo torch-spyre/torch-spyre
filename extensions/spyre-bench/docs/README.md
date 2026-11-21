@@ -213,6 +213,7 @@ A public definition names a dataset by an opaque slug (`slot-95`), never by its 
 - The file is a trusted input: whoever can write the store path decides what is public (a duplicate key is not an error: the
   last one wins). Keep that path write-restricted.
 - `dataset.json` is not part of any identity. The store namespace is configured per deployment, never in a public file.
+- `spyre-bench dataset add|list|check` creates, lists and verifies all of this in one command: [dataset-add.md](dataset-add.md).
 
 ## Metric context
 
@@ -523,6 +524,11 @@ The default is a preview: the store is read and the runs, series, benchmarks, re
 nothing is written. `--apply` records one event through a `bench-invalidation` bundle and the ingest (which owns the
 matching view, the state machine and the 50-run confirmation threshold). Needs `spyre-bench[ingest,clickhouse]`. Exit 0
 ok or preview, 2 refused or bad flags, 5 the ingest or store failed. See [incident-runbook.md](incident-runbook.md).
+
+## References
+
+`spyre-bench reference` turns a run into a comparison target, seals it as a `bench-reference` bundle, submits it for
+approval and compares later runs with it, informationally and never as a baseline: [`references.md`](references.md).
 
 ## Running the tests
 
