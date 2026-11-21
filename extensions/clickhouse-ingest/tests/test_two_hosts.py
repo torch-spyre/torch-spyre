@@ -237,8 +237,6 @@ def test_require_flag_off_values(env, monkeypatch, flag):
     [
         'INSERT INTO "spyre_v2"."t" VALUES (1)',
         "INSERT INTO spyre_v2 . t VALUES (1)",
-        "INSERT INTO SPYRE_V2.t VALUES (1)",
-        "INSERT INTO `Spyre_V2`.`t` VALUES (1)",
         "SHOW TABLES FROM spyre_v2",
         "USE spyre_v2",
         "SELECT name FROM system.tables WHERE database = 'spyre_v2'",
@@ -252,6 +250,11 @@ def test_require_flag_off_values(env, monkeypatch, flag):
         "SELECT f(a, spyre.b) FROM spyre_v2.t",
         "SELECT * FROM system.tables WHERE database = 'kb_db'",
         "SELECT 1 FROM system.columns WHERE table_schema IN ('ops_db')",
+        "SELECT * FROM system.tables WHERE 'spyre_v2' = database",
+        "SELECT * FROM system.tables WHERE database LIKE 'spyre_v2'",
+        "SELECT * FROM merge(spyre_v2, '^t')",
+        "SELECT * FROM merge('spyre_v2', '^t')",
+        "SELECT * FROM cluster('c', spyre_v2.t)",
     ],
 )
 def test_statements_naming_a_v2_database_go_to_v2(routed, sql):
@@ -269,6 +272,8 @@ def test_statements_naming_a_v2_database_go_to_v2(routed, sql):
         "SELECT * FROM test_runs WHERE note = 'my spyre_v2 note'",
         "SELECT * FROM spyre.test_runs",
         "SELECT spyre_v2_like FROM t",
+        "INSERT INTO SPYRE_V2.t VALUES (1)",  # names are case-sensitive in ClickHouse
+        "INSERT INTO `Spyre_V2`.`t` VALUES (1)",
         "SELECT * FROM spyre.test_runs WHERE name = 'kb_db'",
     ],
 )
@@ -289,6 +294,11 @@ def test_mentions_in_comments_literals_and_lookalikes_stay_on_legacy(routed, sql
         "SELECT * FROM (SELECT a FROM spyre_v2.t) q, spyre.u",
         "SELECT * FROM spyre_v2.t, (SELECT a FROM spyre.u) q",
         "SELECT * FROM (SELECT 1) q, spyre.u WHERE x IN (SELECT a FROM spyre_v2.t)",
+        "SELECT * FROM spyre_v2.a WHERE k IN spyre.b",
+        "SELECT * FROM spyre_v2.a WHERE k GLOBAL IN spyre.b",
+        "EXCHANGE TABLES spyre_v2.a AND spyre.b",
+        "RENAME TABLE spyre.a TO spyre_v2.a",
+        "SELECT * FROM remote('h', spyre.b) JOIN spyre_v2.a USING k",
     ],
 )
 def test_a_statement_spanning_both_hosts_is_refused(routed, sql):
@@ -355,3 +365,115 @@ def test_close_reaches_v2_even_when_legacy_close_fails(routed):
     with pytest.raises(RuntimeError):
         c.close()
     assert [x[0] for x in v2.calls] == ["close"]
+
+
+@pytest.mark.parametrize(
+    "params,sql",
+    [
+        (
+            {"v2db": "spyre_v2"},
+            "SELECT * FROM system.tables WHERE database = {v2db:String}",
+        ),
+        ({"x": "spyre_v2"}, "SELECT count() FROM {x:Identifier}.t"),
+        (
+            {"target_database": "ops_db"},
+            "SELECT 1 WHERE database = {target_database:String}",
+        ),
+    ],
+)
+def test_database_like_parameters_route_to_v2(routed, params, sql):
+    c, legacy, v2 = routed
+    assert c.route(sql=sql, parameters=params) is v2
+
+
+def test_a_data_parameter_equal_to_a_database_name_stays_on_legacy(routed):
+    c, legacy, v2 = routed
+    sql = "SELECT * FROM test_runs WHERE note = {note:String}"
+    assert c.route(sql=sql, parameters={"note": "spyre_v2"}) is legacy
+
+
+# ── a bad v2 setting fails at connect, and a v2 host that fails later spares v1 ──
+
+
+@pytest.mark.parametrize(
+    "bad,var",
+    [
+        ({"CLICKHOUSE_V2_USER": "v2-writer"}, "CLICKHOUSE_V2_PASSWORD"),
+        ({"CLICKHOUSE_V2_PORT": "eighty"}, "CLICKHOUSE_V2_PORT"),
+        ({"CLICKHOUSE_V2_SCHEMA_PASSWORD": "x"}, "CLICKHOUSE_V2_SCHEMA_USER"),
+    ],
+)
+def test_a_bad_v2_setting_fails_at_connect_before_anything_runs(
+    env, monkeypatch, bad, var
+):
+    for k, v in bad.items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(SystemExit, match=var):
+        client.ClickHouse.connect(role="schema" if "SCHEMA" in var else "writer")
+    assert env == []  # no connection was opened
+
+
+def test_a_v2_host_that_fails_on_first_use_raises_a_normal_exception(env, monkeypatch):
+    def fake_get_client(**kw):
+        if kw["host"] == "v2.example.com":
+            raise SystemExit("stand-in that exits")
+        env.append(kw)
+        return Rec(kw["host"], kw["database"])
+
+    monkeypatch.setattr(clickhouse_connect, "get_client", fake_get_client)
+    c = client.ClickHouse.connect()
+    with pytest.raises(client.V2Unavailable):
+        c.command("EXISTS TABLE spyre_v2.t")
+    assert c.command("SELECT 1") == "command"  # the legacy host still works
+
+
+def test_the_v1_database_may_not_be_listed_as_a_v2_one(env, monkeypatch):
+    monkeypatch.setenv("CH_V2_DATABASES", "spyre_v2,spyre")
+    with pytest.raises(SystemExit, match="CLICKHOUSE_DB"):
+        client.ClickHouse.connect()
+    monkeypatch.setenv(
+        "CLICKHOUSE_DB", "spyre_v2"
+    )  # a v2-only process: its own db is v2
+    client.ClickHouse.connect()
+    assert env[-1]["host"] == "v2.example.com"
+
+
+@pytest.mark.parametrize("raw", ["False", "OFF", " no ", "0"])
+def test_v2_secure_off_values_are_case_insensitive(monkeypatch, raw):
+    monkeypatch.setenv("CLICKHOUSE_V2_SECURE", raw)
+    assert client.ClickHouseEnv.v2_secure() is False
+
+
+def _results(tmp_path, monkeypatch, v2_get_client):
+    from spyre_clickhouse_ingest import results
+    from test_dry_run import RUN, WHEEL, XML, LiveClient
+
+    for n in range(2):
+        (tmp_path / f"junit-{n}.xml").write_text(XML.replace("test_", f"test{n}_"))
+    legacy = LiveClient()
+
+    def fake_get_client(**kw):
+        return v2_get_client(kw) if kw["host"] == "v2.example.com" else legacy
+
+    monkeypatch.setattr(clickhouse_connect, "get_client", fake_get_client)
+    results.main(
+        ["--xml-dir", str(tmp_path), "--schema", "both", "--run-id", RUN,
+         "--trigger-type", "regression", "--arch", "x86_64", "--artifact", WHEEL,
+         "--repository", "torch-spyre/torch-spyre", "--sha", "ab12"]
+    )  # fmt: skip
+    return legacy
+
+
+def test_a_v2_host_that_is_down_spares_every_files_v1_rows(env, tmp_path, monkeypatch):
+    def down(kw):
+        raise ConnectionRefusedError("v2 host down")
+
+    legacy = _results(tmp_path, monkeypatch, down)
+    v1 = [t for db, t, _ in legacy.inserts if db is None and t == "test_runs"]
+    assert len(v1) == 2  # both files' v1 rows landed
+
+
+def test_a_bad_v2_setting_stops_the_ingest_before_any_write(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLICKHOUSE_V2_USER", "v2-writer")
+    with pytest.raises(SystemExit, match="CLICKHOUSE_V2_PASSWORD"):
+        _results(tmp_path, monkeypatch, lambda kw: None)

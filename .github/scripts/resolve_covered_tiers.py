@@ -193,9 +193,21 @@ def main() -> None:
         _emit([], args.format)
         return
 
+    v2_login = tuple(
+        os.getenv(n, "").strip()
+        for n in ("CLICKHOUSE_V2_USER", "CLICKHOUSE_V2_PASSWORD")
+    )
+    if v2 and any(v2_login) and not all(v2_login):
+        print(
+            "resolve_covered_tiers: set both CLICKHOUSE_V2_USER and CLICKHOUSE_V2_PASSWORD, "
+            "or neither -- running the full tier",
+            file=sys.stderr,
+        )
+        _emit([], args.format)
+        return
     login = (
-        (os.getenv("CLICKHOUSE_V2_USER", ""), os.getenv("CLICKHOUSE_V2_PASSWORD", ""))
-        if v2 and os.getenv("CLICKHOUSE_V2_USER", "").strip()
+        v2_login
+        if v2 and all(v2_login)
         else (os.getenv("CLICKHOUSE_USER", "default"), os.getenv("CLICKHOUSE_PASS", ""))
     )
     try:

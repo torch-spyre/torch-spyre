@@ -62,6 +62,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
+| `reference.py` | `bench-reference` bundles: file format and validation, identity, approval rules, lifecycle, and the writer that runs at approval (docs/references.md) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
@@ -541,7 +542,7 @@ a view cannot serve, so they cannot be filtered by a view. The follow-up is torc
 ## Logins and hosts
 
 `ClickHouse.connect()` returns a **writer** client by default. It refuses `CREATE`, `ALTER`,
-`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `GRANT` and `REVOKE` before
+`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `REPLACE`, `GRANT` and `REVOKE` before
 they reach the server (`SchemaStatementOnWriter`); reads, inserts, `DELETE FROM` and
 `INSERT ... SELECT` pass. This catches mistakes; the writer login's grants are the real boundary.
 DDL (the applier, the sandbox tools, the ensure-table steps of the dispatch, model-ops and
@@ -561,10 +562,15 @@ ingest code and `.github/scripts` for DDL sent on a writer.
 Half a user/password pair is an error. Without `CLICKHOUSE_V2_HOST` there is one host, as before.
 With it, a connection whose database is a v2 database goes to the v2 host, and any other is a
 `RoutedClient`: statements stay on the legacy host unless they name a v2 database (`db.table`,
-`FROM db`, `USE db`, `database = 'db'`, or an insert's `database=`), ignoring comments and string
-literals. A statement naming qualified tables on both hosts raises `CrossHostStatement`. The v2
-client opens on first use. An unqualified statement always goes to the legacy host, so v2 code
-must keep qualifying its tables.
+`FROM db`, `USE db`, `merge(db, ...)`, `database = 'db'` or `LIKE`, a `{db:String}` or
+`{x:Identifier}` parameter, or an insert's `database=`), ignoring comments and string literals.
+Database names are matched case-sensitively, as ClickHouse does. A statement naming qualified
+tables on both hosts raises `CrossHostStatement`. An unqualified statement always goes to the
+legacy host, so v2 code must keep qualifying its tables. Every v2 setting is checked by
+`connect()`, so a bad one stops the process before it writes anything; the v2 client itself
+opens on first use and, if it cannot, raises `V2Unavailable`, which the ingests catch as a v2
+failure while the v1 rows still land. `CH_V2_DATABASES` may not name `CLICKHOUSE_DB` unless that
+is also `CLICKHOUSE_DB_V2` (a v2-only process).
 
 ## Write resilience
 

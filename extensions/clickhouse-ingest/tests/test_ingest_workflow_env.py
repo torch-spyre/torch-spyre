@@ -193,3 +193,23 @@ def test_v2_ingest_actions_publish_a_rows_free_manifest_and_never_upload_the_spo
             "ch-spool-manifest" in p for p in uploads
         ), name
     assert checked >= 3
+
+
+def test_the_covered_tier_lookup_refuses_half_a_v2_login(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith(("CLICKHOUSE_", "CH_"))
+    }
+    env.update(
+        CLICKHOUSE_HOST="legacy.example.com", CLICKHOUSE_DB_V2="spyre_v2",
+        CLICKHOUSE_V2_HOST="v2.example.com", CLICKHOUSE_V2_USER="w",
+    )  # fmt: skip
+    p = subprocess.run(
+        [sys.executable, str(REPO / ".github/scripts/resolve_covered_tiers.py"),
+         "--commit-sha", "ab12", "--arch", "x86_64"],
+        capture_output=True, text=True, env=env, cwd=tmp_path,
+    )  # fmt: skip
+    assert p.returncode == 0 and "set both CLICKHOUSE_V2_USER" in p.stderr
