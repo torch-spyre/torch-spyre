@@ -1,0 +1,35 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/kernel/workload-op.json",
+ "title": "kernel/op",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "op": {
+   "type": "string",
+   "pattern": "^[a-z_][a-z0-9_.]*$"
+  },
+  "dtype": {
+   "enum": [
+    "fp32",
+    "bf16",
+    "fp16",
+    "fp8"
+   ]
+  },
+  "shape": {
+   "type": "array",
+   "items": {
+    "type": "integer",
+    "minimum": 1
+   }
+  },
+  "all_ops": {
+   "type": "boolean"
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ }
+}
