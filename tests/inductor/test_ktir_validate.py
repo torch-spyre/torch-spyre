@@ -61,6 +61,11 @@ from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, Unimpleme
 
 FP16 = DataFormats.SEN169_FP16
 ADD_SIZE = [16, 512, 64]
+# Bytes between the LX addresses ``make_chained_op_specs(owned=True)`` gives
+# successive intermediates: one default fp16 buffer, so none overlaps the next.
+# The emitter does not check LX capacity (the backend does), so a long chain may
+# run past the end of LX here without the plan noticing.
+LX_SPACING = 16 * 512 * 64 * 2
 
 
 def make_op_spec(
@@ -195,11 +200,15 @@ def make_chained_op_specs(
     numbering advances over every arg rather than over the fresh inputs only.
 
     ``owned=True`` makes each intermediate an ``lx`` buffer instead: not passed
-    in, no address, threaded as a value. That is what memory planning produces by
-    default, and across a stage boundary it is refused -- so it is kept for the
-    test that pins that refusal, and for nothing else.
+    in, placed at its own LX address, stored by its producer and loaded by its
+    consumer in the next stage. That is what memory planning produces by default.
+    Intermediate ``k`` sits at ``k * LX_SPACING`` bytes, so no two overlap however
+    long the chain.
     """
-    lx = {"lx": 0}
+
+    def lx(level: int) -> dict:
+        return {"lx": level * LX_SPACING}
+
     specs, next_arg = [], 0
     for level, op in enumerate(ops):
         # The first op reads two fresh inputs; every later one reads the previous
@@ -212,9 +221,9 @@ def make_chained_op_specs(
                 op,
                 names=[*threaded, *fresh, f"buf{level}"],
                 allocations=[
-                    *([lx if owned else None] if threaded else []),
+                    *([lx(level - 1) if owned else None] if threaded else []),
                     *([None] * len(fresh)),
-                    None if last or not owned else lx,
+                    None if last or not owned else lx(level),
                 ],
                 first_arg_index=next_arg,
                 **overrides,
@@ -890,47 +899,58 @@ class TestBaseAddressElements(unittest.TestCase):
                 ktir._base_address_elements(self._arg(allocation))
 
 
-class TestThreadedAndPooledAreTwoQuestions(unittest.TestCase):
-    """The emitter's two questions about a planner-placed buffer, from ``allocation``.
+class TestLxAndPooledAreTwoAddresses(unittest.TestCase):
+    """The emitter's two readings of a planner-placed buffer, from ``allocation``.
 
-    ``is_threaded`` is how the kernel carries the value, ``pool_offset_of`` where
-    it lives, and the two spaces answer differently: LX has no base to store to, an
-    HBM-pool offset has one.  "Not passed in" is neither of these -- it is
-    ``arg_index < 0``, the frontend's own statement.
+    ``lx_address_of`` and ``pool_offset_of`` each read one space, and each answers
+    only for its own: an LX address is a byte address in the core's scratchpad,
+    an HBM-pool offset is one into the pool the wrapper passes.  "Not passed in" is
+    neither of these -- it is ``arg_index < 0``, the frontend's own statement.
     """
 
     def test_a_passed_in_hbm_buffer_is_neither(self):
         for arg in make_op_spec().args:
-            self.assertFalse(ktir.is_threaded(arg))
+            self.assertIsNone(ktir.lx_address_of(arg))
             self.assertIsNone(ktir.pool_offset_of(arg))
 
-    def test_only_lx_is_threaded(self):
-        """The split: an LX intermediate is a value, a pooled one is an address."""
+    def test_each_space_answers_only_for_itself(self):
         onstick, pooled = (
             make_op_spec(allocations=[None, None, allocation]).args[-1]
             for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000})
         )
-        self.assertTrue(ktir.is_threaded(onstick))
-        self.assertFalse(ktir.is_threaded(pooled))
+        self.assertEqual(ktir.lx_address_of(onstick), 0x1000)
         self.assertIsNone(ktir.pool_offset_of(onstick))
+        self.assertIsNone(ktir.lx_address_of(pooled))
         self.assertEqual(ktir.pool_offset_of(pooled), 0x2000)
+
+    def test_nothing_is_threaded_today(self):
+        """Every allocation the frontend writes is an address, LX included."""
+        for allocation in (None, {"lx": 0x1000}, {"hbm_pool": 0x2000}):
+            arg = make_op_spec(allocations=[None, None, allocation]).args[-1]
+            self.assertFalse(ktir.is_threaded(arg))
+
+    def test_lx_address_zero_is_an_address(self):
+        """Key presence, not truthiness: 0 is the first buffer in LX."""
+        arg = make_op_spec(allocations=[None, None, {"lx": 0}]).args[-1]
+        self.assertEqual(ktir.lx_address_of(arg), 0)
 
     def test_an_unrecognised_allocation_is_neither_and_is_refused(self):
         """Both are chosen on a positive signal, so an allocation this emitter does
-        not know is not silently threaded or pooled: it reaches the buffer
+        not know is not silently read as LX or pooled: it reaches the buffer
         rejection, which is what ``arg_index < 0`` means there."""
         spec = make_op_spec(allocations=[None, None, {"somewhere_new": 0}])
         arg = spec.args[-1]
-        self.assertFalse(ktir.is_threaded(arg))
+        self.assertIsNone(ktir.lx_address_of(arg))
         self.assertIsNone(ktir.pool_offset_of(arg))
         self.assertEqual(arg.arg_index, -1)  # not passed in, per the fixture's rule
         with self.assertRaises(NotImplementedError) as ctx:
             ktir.build_kernel_plan([spec])
         self.assertIn("is not a kernel argument", str(ctx.exception))
 
-    def test_a_threaded_buffer_nothing_reads_is_rejected(self):
-        """An intermediate whose consumer is in another kernel: not stored, and
-        not read here either, so the op that produced it would write nowhere."""
+    def test_an_lx_buffer_nothing_reads_is_rejected(self):
+        """An intermediate whose consumer is in another kernel: stored to LX, but
+        nothing here reads it, and nothing outside the kernel can rely on what is
+        left in LX after it."""
         specs = [make_op_spec(allocations=[None, None, {"lx": 0x1000}])]
         with self.assertRaises(NotImplementedError) as ctx:
             ktir.build_kernel_plan(specs)
@@ -1908,31 +1928,127 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
-class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
-    """An owned intermediate read by a later stage is refused, and says what to set."""
+class TestAnLxIntermediateCrossesAStage(unittest.TestCase):
+    """An LX intermediate is stored where it is produced and loaded where it is read.
 
-    def test_an_owned_intermediate_read_by_a_later_stage_is_refused(self):
-        with self.assertRaises(NotImplementedError) as caught:
-            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
-        message = str(caught.exception)
-        self.assertIn("written in stage 0 and read in stage 1", message)
-        self.assertIn("cannot cross a compute stage", message)
+    LX planning's ``allocation["lx"]`` is honoured: the buffer is a core-local
+    view at that address, not a value carried between stages, so it crosses a
+    stage boundary as a passed-in buffer does.
+    """
 
-    def test_the_refusal_names_the_lx_flag_and_only_it(self):
-        """The actionable half: a reader must not have to guess the variable --
-        and must not be offered HBM_POOL_PLANNING=0, which fixes nothing here and
-        is not needed for a pooled intermediate either, since this path addresses
-        one."""
+    def _plan(self, ops=("add", "mul")):
+        return ktir.build_kernel_plan(make_chained_op_specs(ops, owned=True))
+
+    def test_an_lx_intermediate_read_by_a_later_stage_is_accepted(self):
+        steps = self._plan().steps
+        self.assertEqual([step.stage for step in steps], [0, 1])
+        # Written in its own stage, loaded from its view in the next.
+        self.assertTrue(all(step.store for step in steps))
+        self.assertEqual(steps[1].ins[0][0], "buf0")
+        self.assertEqual(steps[1].ins[0][1].buffer.space, "LX")
+
+    def test_the_lx_buffer_is_at_the_planned_address_in_elements(self):
+        """A view's offset counts elements, so the byte address is divided."""
+        plan = self._plan(("add", "mul", "sub"))
+        bases = {b.buf_id: b.base_elements for b in plan.lx_buffers}
+        self.assertEqual(bases, {"buf0": 0, "buf1": LX_SPACING // 2})
+
+    def test_an_lx_buffer_takes_no_parameter(self):
+        """Nothing passes an LX buffer, so the signature is the passed-in ones."""
+        plan = self._plan()
+        self.assertNotIn("buf0", {b.buf_id for b in plan.parameter_buffers})
+        self.assertEqual([b.buf_id for b in plan.lx_buffers], ["buf0"])
+
+    def test_under_a_division_an_lx_buffer_is_one_cores_share(self):
+        """Each core's LX holds only its own share, at the same address.
+
+        The view is the per-core extent and every core's tile starts at the view's
+        origin, while an HBM buffer is the whole tensor every core indexes into by
+        its position.  Viewing the LX share as the whole tensor sends all but core
+        0 past the end of their share.
+        """
+        plan = ktir.build_kernel_plan(
+            make_chained_op_specs(("add", "mul"), owned=True, divisions={"d1": 4})
+        )
+        self.assertEqual(plan.grid, (4,))
+        store = plan.steps[0].out
+        hbm = plan.steps[0].ins[0][1]
+        # HBM: the whole tensor, each core offset along d1 by its share.
+        self.assertEqual(hbm.buffer.layout.extent, (16, 512, 64))
+        self.assertEqual(hbm.index_coeffs[1], (128,))
+        # LX: the share alone; the division contributes zero.
+        self.assertEqual(store.buffer.space, "LX")
+        self.assertEqual(store.buffer.layout.extent, (16, 128, 64))
+        self.assertEqual(store.extent, (16, 128, 64))
+        self.assertEqual(store.index_coeffs, ((0,), (0,), (0,)))
+        # The reader in the next stage sees the same share.
+        load = plan.steps[1].ins[0][1]
+        self.assertEqual(load.buffer.layout.extent, (16, 128, 64))
+        self.assertEqual(load.index_coeffs, ((0,), (0,), (0,)))
+
+    def test_an_lx_address_that_splits_an_element_is_refused(self):
+        specs = make_chained_op_specs(("add", "mul"), owned=True)
+        for spec in specs:
+            for arg in spec.args:
+                if arg.allocation and "lx" in arg.allocation:
+                    arg.allocation["lx"] = 3  # odd: splits an fp16 element
         with self.assertRaises(NotImplementedError) as caught:
-            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
-        message = str(caught.exception)
-        self.assertIn("LX_PLANNING=0", message)
-        self.assertNotIn("HBM_POOL_PLANNING", message)
+            ktir.build_kernel_plan(specs)
+        self.assertIn(
+            "not a non-negative multiple of its 2-byte element", str(caught.exception)
+        )
 
     def test_the_same_chain_is_accepted_when_the_intermediate_is_passed(self):
-        """The control, so the refusal is shown to be about the ALLOCATION only."""
+        """The control: the stages are the same whichever space holds the link."""
         steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
         self.assertEqual([step.stage for step in steps], [0, 1])
+
+
+class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
+    """The value path, kept for a space with no address: no buffer, no store.
+
+    No allocation the frontend writes today is threaded, so these drive the path
+    by declaring a stand-in space threaded. It is the path a register allocation
+    takes once memory planning gives one.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(ktir, "THREADED_SPACES", ("reg",))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _chain(ops=("add", "mul")):
+        specs = make_chained_op_specs(ops, owned=True)
+        for spec in specs:
+            for arg in spec.args:
+                if arg.allocation and "lx" in arg.allocation:
+                    arg.allocation.clear()
+                    arg.allocation["reg"] = None
+        return specs
+
+    def test_a_threaded_space_is_threaded_and_lx_is_not(self):
+        threaded = self._chain()[0].args[-1]
+        lx = make_chained_op_specs(("add", "mul"), owned=True)[0].args[-1]
+        self.assertTrue(ktir.is_threaded(threaded))
+        self.assertFalse(ktir.is_threaded(lx))
+
+    def test_its_producer_stores_nothing_and_its_reader_has_no_buffer(self):
+        """Checked on the steps the walk builds, before the stage refusal."""
+        plan = ktir.KernelPlan(ktir.PlanOptions())
+        with self.assertRaises(NotImplementedError):
+            plan.add_specs(self._chain())
+        producer, reader = plan.steps
+        self.assertFalse(producer.store)
+        self.assertIsNone(reader.ins[0][1].buffer)
+        self.assertNotIn("buf0", plan.buffers)
+
+    def test_a_threaded_value_read_by_a_later_stage_is_refused(self):
+        with self.assertRaises(NotImplementedError) as caught:
+            ktir.build_kernel_plan(self._chain())
+        message = str(caught.exception)
+        self.assertIn("written in stage 0 and read in stage 1", message)
+        self.assertIn("produces no binary", message)
 
 
 class TestStagesAreNumbered(unittest.TestCase):
@@ -2059,9 +2175,9 @@ class TestPlanFusionRewrite(FusionCase):
         """
         pair = make_absmax_pair(link={"hbm": None})
         link = pair[0].args[-1]
-        # Passed in, and neither threaded nor pooled: no planner placed it.
+        # Passed in, and neither in LX nor pooled: no planner placed it.
         self.assertGreaterEqual(link.arg_index, 0)
-        self.assertFalse(ktir.is_threaded(link))
+        self.assertIsNone(ktir.lx_address_of(link))
         self.assertIsNone(ktir.pool_offset_of(link))
         self.assertTrue(link.kernel_local)
         self.assertEqual([spec.op for spec in fuse(pair)], ["absmax"])
