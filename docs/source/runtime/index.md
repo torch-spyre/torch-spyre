@@ -162,6 +162,16 @@ Pinning applies to host buffers only. A device tensor cannot be pinned: a
 `device="spyre"` allocation with `pin_memory=True` is rejected in
 `spyre_mem.cpp`.
 
+### Non-blocking host-to-device copies
+
+`copy_(src, non_blocking=True)` and `.to("spyre", non_blocking=True)`, also with
+`device_layout=` or `dynamic=`, return before the DMA completes. Work queued
+later on the same stream sees the copied data. As on CUDA, a pageable source
+may be modified or freed as soon as the call returns: a converting copy converts
+it on the calling thread, and a same-format copy first copies it into a pinned
+staging buffer. A pinned source is read by the DMA itself, so leave it unchanged
+until the stream is synchronized.
+
 ## Eager Operations
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
