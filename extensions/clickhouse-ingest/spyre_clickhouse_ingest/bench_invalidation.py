@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import writes
 from .offline import (
     BUNDLE_FILE,
     FAILED,
@@ -624,7 +625,7 @@ def apply(
             actor, e["evidence_url"], {"channel": channel, **{k: str(v) for k, v in (props or {}).items()}},
         ])  # fmt: skip
     if rows and not dry_run:
-        client.insert("result_invalidations", rows, column_names=list(COLUMNS))
+        writes.insert(client, "result_invalidations", rows, list(COLUMNS))
     return results
 
 

@@ -1584,8 +1584,9 @@ def _note_v2_parked(
     parked_files.append(name)
     _taint(incomplete, run_id)
     print(
-        f"  [warn] v2 rows SPOOLED, not stored ({err}); replay them with `spool replay` -- "
-        "re-running this attempt would send them again under new tokens",
+        f"  [warn] v2 rows SPOOLED, not stored ({err}); `spool replay` sends only the parked "
+        "batches, and the file's later writes were not attempted: check them before "
+        "re-running (a re-run sends the parked rows again under new tokens)",
         file=sys.stderr,
     )
 

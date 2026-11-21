@@ -600,10 +600,11 @@ rows. The step summary and a 3-day manifest artifact list token, table, row coun
 
 Per-request settings (`insert_deduplication_token`, `deduplicate_blocks_in_dependent_materialized_views`,
 `async_insert_deduplicate`, `wait_for_async_insert`, `insert_quorum`) can be refused by a constrained
-writer profile (codes 164/452, or the driver's "readonly" error). An optional one is dropped once
-and the batch is sent again (for a batch that may already be stored and feeds a view, the view
-setting is never dropped: the batch is retried until the deadline and then parked as held); a
-refused dedup token or quorum is not worked around and follows the usual error classes. The engine lookup is cached per client
+writer profile (codes 164/452, or the driver's "readonly" error). `async_insert_deduplicate` and the
+view setting are dropped once and the batch is sent again (for a batch that may already be stored and
+feeds a view, the view setting is never dropped: the batch is retried until the deadline and then
+parked as held). A refused dedup token, quorum or `wait_for_async_insert` is not worked around: it
+raises `SettingRefused`, which is fatal. `spool replay` handles refusals the same way. The engine lookup is cached per client
 for its lifetime and is never invalidated: a table converted mid-process is not noticed.
 
 ### Probe
@@ -812,7 +813,10 @@ When a step exits 75 or prints `[PARKED]`:
    `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600); a batch parked for another host than the one the
    connection reaches. A batch refused before any write replays at any age. Values keep their types
    through the spool (datetime, date, Decimal, UUID, bytes, Map). After replaying a `test_case_runs`
-   batch, re-run the file's ingest: it deletes the earlier attempt's rows (below).
+   batch, re-run the file's ingest: it deletes the earlier attempt's rows (below). Replay restores
+   only what was parked: when one table of a file parks, the file's later writes (its other
+   tables, the capability verdicts, the counters) are not attempted, so check them before
+   re-running the file.
 4. A `held` batch may already be stored: check the table, send only the missing rows, then
    `spool drop TOKEN` (the full token as `spool list` prints it). `put` and `drop` take a lock file in
    the directory, so processes sharing it leave one file per token and a `held` flag is never

@@ -222,7 +222,9 @@ class Cluster:
         class R:
             pass
 
-        R.result_rows = [(self.engine, 0)]
+        R.result_rows = (
+            [(1000,)] if "merge_tree_settings" in sql else [(self.engine, 0)]
+        )
         return R()
 
     def insert(self, table, data, column_names=None, database=None, settings=None):
@@ -733,3 +735,75 @@ def test_require_flag_off_values_are_case_and_space_insensitive(monkeypatch, fla
 def test_writer_refuses_the_state_changing_verbs_too(verb):
     with pytest.raises(client.SchemaStatementOnWriter):
         client.WriterClient.check(f"{verb} TABLE a TO b")
+
+
+# ── replay and the breaker ──────────────────────────────────────────────────────
+
+
+def test_a_replay_that_retries_keeps_its_probe_slot_and_hands_it_back(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CH_WRITE_BACKOFF_S", "0.01")
+    c = Cluster()
+    c.fail = 2
+    breaker = writes.breaker_for(c, "t", "d")
+    breaker.trip(0.0, 1.0)  # open long ago: the next caller probes
+    item = put(Spool(tmp_path / "sp"), ambiguous=False)
+    assert writes.replay(c, item) == "sent"
+    assert not breaker.tripped and not breaker.probing
+
+
+def test_a_failed_replay_trips_the_breaker_and_frees_the_probe(tmp_path, monkeypatch):
+    monkeypatch.setenv("CH_WRITE_DEADLINE_S", "0.001")
+    c = Cluster()
+    c.fail = 99
+    item = put(Spool(tmp_path / "sp"), ambiguous=False)
+    assert writes.replay(c, item).startswith("not stored")
+    breaker = writes.breaker_for(c, "t", "d")
+    assert breaker.tripped and not breaker.probing
+
+
+def test_an_ambiguous_batch_is_not_replayed_when_the_dedup_window_is_unreadable(
+    tmp_path,
+):
+    class NoWindow(Cluster):
+        def query(self, sql, parameters=None):
+            if "merge_tree_settings" in sql:
+                raise DatabaseError("Code: 497. x", code=497, name="X")
+            return super().query(sql, parameters)
+
+    item = put(Spool(tmp_path / "sp"), ambiguous=True)
+    assert "unreadable" in writes.replay(NoWindow(), item)
+    assert (
+        writes.replay(
+            NoWindow(), put(Spool(tmp_path / "sp2"), "b-token", ambiguous=False)
+        )
+        == "sent"
+    )
+
+
+def test_replay_does_not_work_around_a_refused_dedup_token(tmp_path):
+    class Constrained(Cluster):
+        def insert(self, *a, **k):
+            raise DatabaseError(
+                "Code: 452. Setting insert_deduplication_token is constrained",
+                code=452,
+                name="X",
+            )
+
+    item = put(Spool(tmp_path / "sp"), ambiguous=False)
+    assert "SettingRefused" in writes.replay(Constrained(), item)
+
+
+def test_the_cells_the_token_accepts_survive_the_spool(tmp_path):
+    import datetime as dt
+    import ipaddress
+
+    row = [
+        dt.time(1, 2, 3),
+        ipaddress.ip_address("10.0.0.1"),
+        ipaddress.ip_address("::1"),
+    ]
+    spool = Spool(tmp_path / "sp")
+    spool.put("t", ["a", "b", "c"], [row], "t-1")
+    assert next(spool.pending()).rows == [row]

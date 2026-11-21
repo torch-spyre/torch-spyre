@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from .breaker import Breaker, Limits, guarded_insert
+from .breaker import Breaker, Limits, Watched, guarded_insert, settle
 from .resilience import (
     Outcome,
     Policy,
@@ -366,7 +366,9 @@ def policy_for(table: str, batch_rows: int) -> Policy:
     return policy
 
 
-def window_of(backend, table: str, database: str | None) -> int | None:
+def window_of(
+    backend, table: str, database: str | None, cached_only: bool = False
+) -> int | None:
     """The table's dedup window, read once per client (an unreadable one for LOOKUP_FAILURE_TTL_S);
     None (unknown) assumes a nonzero one."""
     cache = getattr(backend, "_spyre_windows", None)
@@ -380,6 +382,8 @@ def window_of(backend, table: str, database: str | None) -> int | None:
     hit = cache.get(key)
     if hit and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
+    if cached_only:
+        return None
     window = dedup_window(backend, table, database)
     cache[key] = (
         window,
@@ -408,6 +412,7 @@ def try_insert(
         else client
     )
     breaker = breaker_for(client, table, database)
+    blocked = breaker.blocked(time.monotonic())  # a dead host is not asked again
     out = guarded_insert(
         client,
         table,
@@ -416,10 +421,7 @@ def try_insert(
         scope=ambient_scope(),
         policy=policy_for(table, batch_rows),
         replicated=True,
-        # a dead host is not asked again: the batch goes to the spool whatever the window is
-        dedup_window=None
-        if breaker.blocked(time.monotonic())
-        else window_of(backend, table, database),
+        dedup_window=window_of(backend, table, database, cached_only=blocked),
         database=database,
         spool=spool_from_env(),
         feeds_views=found.feeds_views,
@@ -581,11 +583,14 @@ def replay(client, item) -> str:
     found = target(client, item.table, item.database)
     if not (found and found.replicated):
         return "target is not a Replicated table (or its engine is unreadable): check by hand"
-    if window_of(backend, item.table, item.database) == 0:
+    window = window_of(backend, item.table, item.database)
+    if window == 0:
         return "the table deduplicates nothing (window 0), so a resend could double: check by hand"
     if item.ambiguous:
         if not item.meta.get("token_sent", True):
             return "ambiguous and sent without a token: check by hand"
+        if window is None:
+            return "ambiguous and the table's dedup window is unreadable: check by hand"
         max_age = float(_env("CH_WRITE_REPLAY_MAX_AGE_S") or 3600)
         age = time.time() - (item.created or 0)
         if age > max_age:
@@ -594,35 +599,36 @@ def replay(client, item) -> str:
                 "window (CH_WRITE_REPLAY_MAX_AGE_S): check by hand"
             )
     policy, limits = policy_for(item.table, max(1, len(item.rows))), Limits.from_env()
-    start = time.monotonic()
-    attempt = 0
-    while True:
-        mode = breaker.acquire(time.monotonic())
-        if mode == Breaker.OPEN:
-            return "not stored: the host is unavailable (breaker open)"
-        try:
-            _send(
-                backend, item.table, item.rows, item.columns, item.database,
-                _settings(policy, item.token, True, False, found.feeds_views),
-            )  # fmt: skip
-        except Exception as err:  # noqa: BLE001
-            kind = classify(err, found.feeds_views)
-            attempt += 1
-            pause = min(policy.backoff_s * 2 ** (attempt - 1), policy.backoff_max_s)
-            spent = time.monotonic() - start
-            # The same token makes a resend safe whatever the error said.
-            if kind == "fatal" or spent + pause > policy.deadline_s:
-                if kind != "fatal":
-                    breaker.trip(
-                        time.monotonic(),
-                        limits.breaker_s,
-                        from_probe=mode == Breaker.PROBE,
-                    )
-                elif mode == Breaker.PROBE:
-                    breaker.release()
-                return f"not stored: {safe(err)}"
-            time.sleep(pause)
-        else:
-            if breaker.tripped:
-                breaker.close()
-            return "sent"
+    mode = breaker.acquire(time.monotonic())
+    if mode == Breaker.OPEN:
+        return "not stored: the host is unavailable (breaker open)"
+    watched = Watched(
+        backend, breaker, limits, found.feeds_views, time.monotonic,
+        lambda m: print(m, file=sys.stderr),
+    )  # fmt: skip
+    try:
+        deadline = policy.deadline_s
+        if mode == Breaker.PROBE:
+            deadline = min(deadline, limits.breaker_probe_s)
+        breaker.charge(0.0, time.monotonic(), limits)
+        deadline = min(deadline, breaker.remaining(time.monotonic()))
+        start, attempt = time.monotonic(), 0
+        while True:
+            try:
+                _send(
+                    watched, item.table, item.rows, item.columns, item.database,
+                    _settings(policy, item.token, True, False, found.feeds_views),
+                )  # fmt: skip
+                return "sent"
+            except Exception as err:  # noqa: BLE001
+                attempt += 1
+                pause = min(policy.backoff_s * 2 ** (attempt - 1), policy.backoff_max_s)
+                # The same token makes a resend safe whatever the error said.
+                if (
+                    classify(err, found.feeds_views) == "fatal"
+                    or time.monotonic() - start + pause > deadline
+                ):
+                    return f"not stored: {safe(err)}"
+                time.sleep(pause)
+    finally:
+        settle(watched, breaker, limits, mode, time.monotonic)

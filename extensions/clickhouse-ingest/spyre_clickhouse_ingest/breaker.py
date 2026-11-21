@@ -63,10 +63,15 @@ from .resilience import (
 TABLE_SCOPED_CODES = frozenset({252})
 SETTING_REFUSED = frozenset({164, 452})
 VIEW_DEDUP = "deduplicate_blocks_in_dependent_materialized_views"
-# insert_quorum and the dedup token are deliberately absent: dropping either could land a strict
-# table's batch unquorumed or resend it undeduplicated.
-OPTIONAL_SETTINGS = (VIEW_DEDUP, "async_insert_deduplicate", "wait_for_async_insert")
-REQUIRED_SETTINGS = ("insert_deduplication_token", "insert_quorum")
+# The dedup token, insert_quorum and wait_for_async_insert are deliberately absent: dropping them
+# could resend a batch undeduplicated, land a strict table's batch unquorumed, or acknowledge an
+# asynchronous insert before it is durable.
+OPTIONAL_SETTINGS = (VIEW_DEDUP, "async_insert_deduplicate")
+REQUIRED_SETTINGS = (
+    "insert_deduplication_token",
+    "insert_quorum",
+    "wait_for_async_insert",
+)
 
 
 @dataclass
@@ -210,16 +215,16 @@ def _refuses_setting(err: BaseException) -> bool:
 
 class SettingRefused(RuntimeError):
     """The writer profile refuses a per-request setting that cannot be dropped (the dedup token,
-    insert_quorum). `resilient_insert` reads it as fatal: a resend cannot change the answer."""
+    insert_quorum, wait_for_async_insert). `resilient_insert` reads it as fatal: a resend cannot change the answer."""
 
 
-class _Watched:
+class Watched:
     """The client as `resilient_insert` sees it: every INSERT is timed and judged for the breaker,
     and an optional setting the profile refuses is dropped once. Other attributes pass through."""
 
-    def __init__(self, client, breaker, limits, key, feeds_views, now, log):
+    def __init__(self, client, breaker, limits, feeds_views, now, log):
         self._client, self._breaker, self._limits = client, breaker, limits
-        self._key, self._feeds_views, self._now, self._log = key, feeds_views, now, log
+        self._feeds_views, self._now, self._log = feeds_views, now, log
         self.lost = 0.0  # seconds this host cost the call
         self.ok = False
         self.failed_host = False  # a host failure since the last success or answer
@@ -281,7 +286,7 @@ class _Watched:
                 self._judge(err, table, kw.get("database"), attempt, token)
                 raise
             self.ok, self.failed_host = True, False
-            self._breaker.forget_scoped(self._key(table, kw.get("database")))
+            self._breaker.forget_scoped(table_key(table, kw.get("database")))
             if self._breaker.tripped:
                 self._breaker.close()  # only a successful INSERT proves the host takes writes
             return result
@@ -296,7 +301,7 @@ class _Watched:
         host = True
         if _code(err) in TABLE_SCOPED_CODES:
             host = self._breaker.note_scoped(
-                self._key(table, database), self._now(), self._limits.budget_window_s
+                table_key(table, database), self._now(), self._limits.budget_window_s
             )
         if host:
             self.failed_host = True
@@ -304,7 +309,7 @@ class _Watched:
             self._retry_from = self._now()
 
 
-def _key(table: str, database: str | None) -> str:
+def table_key(table: str, database: str | None) -> str:
     return f"{database or ''}.{table}"
 
 
@@ -390,14 +395,14 @@ def guarded_insert(
             spool, table, rows, columns, scope, database, max(1, policy.batch_rows),
             meta, log,
         )  # fmt: skip
-    deadline = policy.deadline_s
-    if mode == Breaker.PROBE:
-        deadline = min(deadline, limits.breaker_probe_s)
-    breaker.charge(0.0, now(), limits)  # publishes the budget
-    deadline = min(deadline, breaker.remaining(now()))
-    call_policy = dataclasses.replace(policy, deadline_s=deadline)
-    watched = _Watched(client, breaker, limits, _key, feeds_views, now, log)
+    watched = Watched(client, breaker, limits, feeds_views, now, log)
     try:
+        deadline = policy.deadline_s
+        if mode == Breaker.PROBE:
+            deadline = min(deadline, limits.breaker_probe_s)
+        breaker.charge(0.0, now(), limits)  # publishes the budget
+        deadline = min(deadline, breaker.remaining(now()))
+        call_policy = dataclasses.replace(policy, deadline_s=deadline)
         return resilient_insert(
             watched,
             table,
@@ -416,8 +421,14 @@ def guarded_insert(
             log=log,
         )
     finally:
-        breaker.charge(watched.lost, now(), limits)
-        if watched.failed_host:
-            breaker.trip(now(), limits.breaker_s, from_probe=mode == Breaker.PROBE)
-        if mode == Breaker.PROBE:
-            breaker.release()
+        settle(watched, breaker, limits, mode, now)
+
+
+def settle(watched: Watched, breaker: Breaker, limits: Limits, mode: str, now) -> None:
+    """Charge what the call cost the host, trip the breaker if it ended on a host failure, and
+    hand back a probe slot that was taken."""
+    breaker.charge(watched.lost, now(), limits)
+    if watched.failed_host:
+        breaker.trip(now(), limits.breaker_s, from_probe=mode == Breaker.PROBE)
+    if mode == Breaker.PROBE:
+        breaker.release()

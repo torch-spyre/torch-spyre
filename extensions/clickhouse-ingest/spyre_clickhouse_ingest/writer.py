@@ -1183,6 +1183,16 @@ class ArtifactWriter:
         if not supersede and cls.result_recorded(
             client, db, aid, rid, kind, test_type, attempt
         ):
+            if attempt:
+                # A run that died between the insert and the delete leaves the older verdict.
+                where, params = cls._verdict_key(aid, rid, kind, test_type)
+                older = f"{where} AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}"
+                params = {**params, "attempt": attempt}
+                if cls.result_table.count_rows(client, db, older, params) > 0:
+                    client.command(
+                        f"DELETE FROM {cls.result_table.qualified(db)} WHERE {older}",
+                        parameters=params,
+                    )
             if props.get("failure_reason"):
                 cls.insert_reason(
                     client,

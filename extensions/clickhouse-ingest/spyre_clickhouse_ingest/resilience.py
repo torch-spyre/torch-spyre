@@ -464,14 +464,23 @@ def _enc(v: Any) -> Any:
         return {"$d": v.isoformat()}
     if isinstance(v, decimal.Decimal):
         return {"$dec": str(v)}
+    if isinstance(v, datetime.time):
+        return {"$t": v.isoformat()}
     if isinstance(v, uuid.UUID):
         return {"$uuid": str(v)}
     if isinstance(v, (bytes, bytearray)):
         return {"$b": bytes(v).hex()}
+    if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return {"$ip": str(v)}
+    if isinstance(v, enum.Enum):
+        return _enc(v.value)
     if isinstance(v, dict):
         return {"$map": [[_enc(k), _enc(x)] for k, x in v.items()]}
     if isinstance(v, (list, tuple)):
         return [_enc(x) for x in v]
+    item = getattr(v, "item", None)  # numpy scalars
+    if callable(item) and type(v).__module__ == "numpy":
+        return _enc(item())
     return v
 
 
@@ -483,6 +492,10 @@ def _dec(v: Any) -> Any:
             return datetime.datetime.fromisoformat(v["$dt"])
         if "$d" in v:
             return datetime.date.fromisoformat(v["$d"])
+        if "$t" in v:
+            return datetime.time.fromisoformat(v["$t"])
+        if "$ip" in v:
+            return ipaddress.ip_address(v["$ip"])
         if "$dec" in v:
             return decimal.Decimal(v["$dec"])
         if "$uuid" in v:

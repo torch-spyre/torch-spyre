@@ -168,7 +168,28 @@ def test_a_rerun_verdict_replaces_the_earlier_attempts():
 def test_a_verdict_from_this_attempt_is_not_rewritten():
     c = FakeClient(run_count=1)
     assert _verdict(c, 2)
-    assert c.commands == [] and not [i for i in c.inserts if i[0] == "artifact_results"]
+    assert not [i for i in c.inserts if i[0] == "artifact_results"]
+
+
+def test_a_rerun_after_a_crash_between_insert_and_delete_removes_the_older_verdict():
+    c = FakeClient(
+        run_count=1
+    )  # this attempt's verdict and an older one are both counted
+    assert _verdict(c, 2)
+    (sql, params) = c.commands[0]
+    assert sql.startswith("DELETE FROM db.artifact_results") and params["attempt"] == 2
+
+    class OnlyThisAttempt(FakeClient):
+        def query(self, sql, parameters=None):
+            self.queries.append((sql, parameters or {}))
+
+            class R:
+                result_rows = [(0 if "< {attempt" in sql else 1,)]
+
+            return R()
+
+    clean = OnlyThisAttempt()
+    assert _verdict(clean, 2) and clean.commands == []
 
 
 def test_no_attempt_keeps_first_write_wins_for_verdicts():
