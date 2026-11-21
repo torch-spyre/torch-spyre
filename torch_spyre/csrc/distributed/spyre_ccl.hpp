@@ -21,12 +21,17 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <spyre_comms.hpp>
+#include <string>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
+#include <vector>
 
 #include "module.h"
 
@@ -83,8 +88,19 @@ class SpyreCCLBackend : public c10d::Backend {
       std::vector<at::Tensor>& inputTensors,
       const AllgatherOptions& opts = AllgatherOptions()) override;
 
-  [[nodiscard]] c10::intrusive_ptr<Work> _allgather_base(
+  // Implements the new name; its alias _allgather_base forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> all_gather_single(
       at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      const AllgatherOptions& opts = AllgatherOptions()) override;
+
+  [[nodiscard]] c10::intrusive_ptr<Work> allgather_coalesced(
+      std::vector<std::vector<at::Tensor>>& outputTensorLists,
+      std::vector<at::Tensor>& inputTensors,
+      const AllgatherOptions& opts = AllgatherOptions()) override;
+
+  // Its alias allgather_into_tensor_coalesced forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> all_gather_single_coalesced(
+      std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs,
       const AllgatherOptions& opts = AllgatherOptions()) override;
 
   /*
@@ -107,8 +123,9 @@ class SpyreCCLBackend : public c10d::Backend {
       std::vector<at::Tensor>& inputTensors,
       const AllToAllOptions& opts = AllToAllOptions()) override;
 
-  [[nodiscard]] c10::intrusive_ptr<Work> alltoall_base(
-      at::Tensor& outputTensor, at::Tensor& inputTensor,
+  // Its alias alltoall_base forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> all_to_all_single(
+      at::Tensor& outputBuffer, at::Tensor& inputBuffer,
       std::vector<int64_t>& outputSplitSizes,
       std::vector<int64_t>& inputSplitSizes,
       const AllToAllOptions& opts = AllToAllOptions()) override;
@@ -134,6 +151,11 @@ class SpyreCCLBackend : public c10d::Backend {
       std::vector<at::Tensor>& inputTensors,
       const GatherOptions& opts = GatherOptions()) override;
 
+  // Its alias gather_into_tensor forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> gather_single(
+      at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      const GatherOptions& opts = GatherOptions()) override;
+
   /*
    * Reduce
    */
@@ -147,6 +169,16 @@ class SpyreCCLBackend : public c10d::Backend {
   [[nodiscard]] c10::intrusive_ptr<Work> reduce_scatter(
       std::vector<at::Tensor>& outputTensors,
       std::vector<std::vector<at::Tensor>>& inputTensors,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
+
+  // Its alias _reduce_scatter_base forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> reduce_scatter_single(
+      at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
+
+  // Its alias reduce_scatter_tensor_coalesced forwards here.
+  [[nodiscard]] c10::intrusive_ptr<Work> reduce_scatter_single_coalesced(
+      std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs,
       const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
 
   /*
@@ -206,6 +238,14 @@ class SpyreCCLBackend : public c10d::Backend {
   void check_single_tensor(const at::Tensor& tensor);
   void check_vector_tensor(const std::vector<at::Tensor>& tensors,
                            int min_allowed = 1, int max_allowed = 1);
+  // SUM only, on float16 or bfloat16 (DL16 on device).
+  void check_reduction(const at::Tensor& tensor, const std::string& op_name,
+                       const ReduceOp& reduce_op);
+  // `whole` is group-size copies of `part` concatenated along dim 0.
+  void check_dim0_concat(const at::Tensor& whole, const at::Tensor& part,
+                         const std::string& op_name);
+  // One tensor per rank with `like`'s sizes and device layout.
+  std::vector<at::Tensor> make_rank_buffers(const at::Tensor& like);
 };
 
 /***********************************************
@@ -224,10 +264,33 @@ class SpyreCCLWork : public Work {
       override;
 
  private:
+  // Start `schedule` and track it; the work completes once all are done.
+  void add_schedule(std::unique_ptr<spyre_comms::WorkSchedule> schedule);
+  // Take over the schedules, kept-alive tensors and completion steps of
+  // another (not yet waited) work. Used to build the coalesced ops.
+  void absorb(SpyreCCLWork& other);
+  // Run the completion steps once, then resolve the future.
+  void finish();
+
   c10::intrusive_ptr<c10::ivalue::Future> future_;
-  // Keep an allgather's borrowed input (including materialized views) alive.
-  at::Tensor input_tensor_;
-  std::shared_ptr<spyre_comms::WorkSchedule> work_schedule_;
+  // getFuture() starts one thread that waits for the work and completes the
+  // future: callers such as dist.all_gather_coalesced(async_op=True) return
+  // only the future, and nothing else would drive it to completion.
+  std::once_flag future_waiter_started_;
+  // Serializes wait(), isCompleted() and finish() between that thread and the
+  // caller.
+  std::mutex mutex_;
+  // Tensors whose device addresses spyre-comms borrows but the caller does
+  // not own: materialized inputs (allgather's cloned views), staged copies
+  // (reduce_scatter), per-rank buffers and packed tensors. Released once the
+  // work completes.
+  std::vector<at::Tensor> keep_alive_;
+  std::vector<std::shared_ptr<spyre_comms::WorkSchedule>> work_schedules_;
+  // Copies into caller-supplied outputs that can only run after the device
+  // work completes (for example assembling all_gather_single's output from
+  // per-rank buffers). Run by the first wait() or isCompleted() that sees
+  // completion, so an async caller gets the result from work.wait().
+  std::vector<std::function<void()>> on_complete_;
   bool completed_ = false;
   std::exception_ptr exception_ = nullptr;
 };

@@ -1234,6 +1234,16 @@ jobs:
             config: distributed_tests/test_allreduce.yaml
           - name: Test Multi-Spyre Reduce
             config: distributed_tests/test_reduce.yaml
+          - name: Test Multi-Spyre Allgather Single
+            config: distributed_tests/test_all_gather_single.yaml
+          - name: Test Multi-Spyre Reduce Scatter
+            config: distributed_tests/test_reduce_scatter.yaml
+          - name: Test Multi-Spyre All To All
+            config: distributed_tests/test_all_to_all.yaml
+          - name: Test Multi-Spyre Gather Single
+            config: distributed_tests/test_gather_single.yaml
+          - name: Test Multi-Spyre Allreduce Coalesced Eager
+            config: distributed_tests/test_allreduce_coalesced_eager.yaml
           - name: Test Multi-Spyre Broadcast Compiled
             config: distributed_tests/test_broadcast_compiled.yaml
           - name: Test Multi-Spyre Allgather Compiled

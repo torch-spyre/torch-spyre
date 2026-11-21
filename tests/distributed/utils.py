@@ -123,3 +123,14 @@ def _overpadded_collective_tensor(values, padded_width, device):
     )
     tensor.copy_(values)
     return tensor
+
+
+def _unique_rank_input(rank, shape, dtype):
+    # Integer values that differ between neighbouring rows and ranks, so a
+    # transfer that moves the wrong device slab (e.g. a stick tile instead of a
+    # dim-0 chunk) cannot match. They stay exact on device: DL16 holds integers
+    # up to 1024, and BF16 up to 256.
+    modulus = 251 if dtype == torch.bfloat16 else 1021
+    numel = math.prod(shape)
+    values = (torch.arange(numel) + rank * numel) % modulus
+    return values.to(dtype).reshape(shape)

@@ -7,6 +7,11 @@ This directory contains unit tests for `torch.distributed` operations against th
 * `spyreccl_backend.py` : Tests for the SpyreCCL backend availability and device mapping.
 * `test_barrier.py` : Tests for `torch.distributed.barrier()` operation
 * `test_broadcast.py` : Tests for `torch.distributed.broadcast()` operation
+* `test_all_gather_single.py` : Tests for eager `torch.distributed.all_gather_into_tensor()` / `all_gather_single()` and the coalesced all_gather forms
+* `test_reduce_scatter.py` : Tests for eager `torch.distributed.reduce_scatter_tensor()` / `reduce_scatter_single()`, `reduce_scatter()` and the coalesced form
+* `test_all_to_all.py` : Tests for eager `torch.distributed.all_to_all_single()` and `all_to_all()`
+* `test_gather_single.py` : Tests for eager `torch.distributed.gather_single()` / `gather_into_tensor()`
+* `test_allreduce_coalesced.py` : Tests for eager `torch.distributed.all_reduce_coalesced()` and `all_reduce()` in the coalescing manager
 
 ## Running the Tests
 
