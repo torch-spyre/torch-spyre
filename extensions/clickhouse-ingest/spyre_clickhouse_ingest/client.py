@@ -142,7 +142,7 @@ class WriterClient:
             return
         if not isinstance(sql, str):
             raise SchemaStatementOnWriter("statement is not text; refused on a writer")
-        lead = _strip_comments(sql).lstrip(" \t\r\n\ufeff\xa0")
+        lead = _strip_comments(sql).lstrip().lstrip("\ufeff").lstrip()
         words = [w.upper() for w in re.findall(r"[A-Za-z]+", lead)[:2]]
         verb = (
             " ".join(words)
@@ -262,6 +262,8 @@ class RoutedClient:
     )
     _DB_COLUMNS = frozenset({"database", "table_schema", "db", "db_name"})
     _COMPARE = frozenset({"IN", "LIKE", "ILIKE"})
+    # Functions whose arguments use the keyword FROM: extract(DAY FROM ts), trim(BOTH ' ' FROM x).
+    _FROM_FUNCTIONS = frozenset({"EXTRACT", "TRIM", "SUBSTRING", "POSITION", "OVERLAY"})
     _TABLE_FUNCTIONS = frozenset(
         "MERGE REMOTE REMOTESECURE CLUSTER CLUSTERALLREPLICAS".split()
     )
@@ -311,12 +313,14 @@ class RoutedClient:
             and self._is_db_column(after[1])
         )
 
-    def _hits(self, sql: str) -> tuple[bool, bool, bool]:
+    def _hits(self, sql: str) -> tuple[bool, bool, str]:
         """(names a v2 database, names a qualified table elsewhere, reads an unqualified
         table) for one statement."""
         toks = _sql_tokens(sql)
         first = toks[0][1].upper() if toks and toks[0][0] == "word" else ""
-        v2 = other = bare = False
+        v2 = other = False
+        bare = ""
+        not_clause: set[int] = set()  # FROM tokens that do not start a FROM list
         ctes = {
             toks[k][1]
             for k in range(len(toks) - 2)
@@ -351,7 +355,14 @@ class RoutedClient:
             )
             if kind == "word":
                 up = text.upper()
-                if up == "FROM":
+                if up == "FROM" and (
+                    prev in ("FILL", "DISTINCT")
+                    or func.get(depth, "") in self._FROM_FUNCTIONS
+                ):
+                    not_clause.add(
+                        i
+                    )  # WITH FILL FROM, IS [NOT] DISTINCT FROM, extract(.. FROM ..)
+                elif up == "FROM":
                     in_from[depth] = True
                 elif up == "SELECT" or up in self._ENDS_FROM:
                     in_from[depth] = False
@@ -369,13 +380,16 @@ class RoutedClient:
             elif (
                 kind == "word"
                 and not qualified
-                and (prev == "FROM" or after_join or listed)
+                and first != "SHOW"
+                and (
+                    (prev == "FROM" and i - 1 not in not_clause) or after_join or listed
+                )
                 and text not in self._names
                 and text not in ctes
                 and nxt[:1] != [("sym", "(")]
                 and text.upper() not in ("SELECT", "INFILE")
             ):
-                bare = True
+                bare = bare or text
             elif kind == "word" and text in self._names:
                 if qualified or table_arg or prev in _DB_KEYWORDS:
                     v2 = True
@@ -410,7 +424,8 @@ class RoutedClient:
                 )
             if v2 and bare:
                 raise CrossHostStatement(
-                    "statement reads an unqualified table beside a v2 one; qualify it"
+                    f"statement names a v2 database and reads {bare!r} unqualified, which "
+                    "resolves in the connection's own (legacy) database; qualify it as db.table"
                 )
             if v2:
                 return self.v2
