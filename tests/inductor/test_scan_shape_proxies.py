@@ -44,6 +44,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import sympy
+import torch
 import torch._inductor.fx_passes.post_grad as post_grad
 from torch.utils._sympy.functions import FloorDiv
 
@@ -54,9 +55,40 @@ from torch_spyre._inductor.patches import (
     _resolve_scan_shapes_by_expression,
     logger as patches_logger,
 )
+from torch_spyre._inductor.wsr.for_each_tile import _normalize_in_specs, _xs_leaf
 
 ATTR = "resolve_shape_to_proxy"
 SENTINEL = "the-proxy-for-the-whole-expression"
+
+
+class TestSymbolicTileShape(unittest.TestCase):
+    def test_scan_body_keeps_a_literal_tile_extent(self):
+        for transposed in (False, True):
+            with self.subTest(transposed=transposed):
+                _, mode, x = fake_symbolic_rows()
+                with mode:
+                    operand = x.t() if transposed else x
+                    specs, _ = _normalize_in_specs((operand,), (int(transposed),), TILE)
+                    xs = _xs_leaf(operand, specs[0])
+                # Equality on a SymInt could install a guard and hide the bug.
+                # The scan body must have a concrete tile width from the start.
+                self.assertIs(type(xs.shape[1]), int)
+                self.assertEqual(xs.shape[1], TILE)
+                self.assertIsInstance(xs.shape[0], torch.SymInt)
+
+    def test_slice_view_preserves_strides_offsets_and_values(self):
+        operand = torch.arange(8 * 12).reshape(8, 12)[2:8, 1::2]
+        for dim in (0, 1):
+            with self.subTest(dim=dim):
+                specs, _ = _normalize_in_specs((operand,), (dim,), 2)
+                xs = _xs_leaf(operand, specs[0])
+                expected = torch.stack(operand.movedim(dim, 0).split(2))
+                torch.testing.assert_close(xs, expected)
+                self.assertEqual(xs.storage_offset(), operand.storage_offset())
+                self.assertEqual(
+                    xs.untyped_storage().data_ptr(),
+                    operand.untyped_storage().data_ptr(),
+                )
 
 
 def _fake_size(expr):

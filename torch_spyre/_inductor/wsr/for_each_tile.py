@@ -469,27 +469,13 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
             raise AssertionError("GATHER spec without an index table")
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
-    # Trim to a whole number of tiles, then split. Both are views, so nothing
-    # copies, and for a concrete length the trim drops nothing.
-    #
-    # The trim is what keeps the extent a literal when the length is symbolic:
-    # given S a view cannot prove (S // G) * G == S and re-derives the extent as
-    # S // (S // G), which is 100 at S=100. Given G * (S // G) the trailing
-    # factor cancels by gcd to the literal G.
-    #
-    # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
-    # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
-    # never reaches. Under an active `torch.device` mode -- vLLM runs its model
-    # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
-    # and dynamo cannot trace the `super()` call. The free function has no body.
-    #
-    # Traced, the trim is one aten.slice.Tensor over the whole length, so the FX
-    # graph does differ. Inductor's slice lowering returns the input itself for
-    # it (start 0, step 1, the size provably within the end), so no kernel or
-    # view is emitted.
-    tiles = spec.num_tiles
-    trimmed = moved.narrow(0, 0, tiles * spec.extent)
-    return torch.unflatten(trimmed, 0, (tiles, spec.extent))
+    # Split the leading axis without asking reshape to infer either extent.
+    # In 2.15, unflatten re-derives the literal G as S // (S // G), even after
+    # trimming to G * (S // G). Scan then cannot resolve that output dimension
+    # from its bound trip count. The divisibility check in _normalize_in_specs
+    # makes this an exact, non-overlapping unfold view. Its relative indexing
+    # also composes with the runtime slice offset of an enclosing scan.
+    return moved.unfold(0, spec.extent, spec.extent).movedim(-1, 1)
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:

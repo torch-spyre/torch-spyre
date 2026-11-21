@@ -87,7 +87,7 @@ class _Graph(unittest.TestCase):
         self.addCleanup(self._exit)
         self.outputs = []
         V.graph.get_output_names = lambda: list(self.outputs)
-        self._v = mock.patch.object(torch, "__version__", "2.14.0")
+        self._v = mock.patch.object(torch, "__version__", "2.15.0")
         self._v.start()
         self.addCleanup(self._v.stop)
 
@@ -617,19 +617,19 @@ class TestHandOff(_Graph):
         self.assertEqual([op.get_name() for op in graph.operations], ["a", "b"])
 
     def test_unsupported_release_with_a_loop_raises_naming_the_release(self):
-        for text in ("2.12.0", "2.13.0", "2.15.1"):
+        for text in ("2.12.0", "2.13.0", "2.16.1"):
             with self.subTest(text), mock.patch.object(torch, "__version__", text):
                 graph = self._graph_with_loop()
                 with self.assertRaisesRegex(Unsupported, text) as ctx:
                     self._run(graph)
-                self.assertIn("supports only torch 2.14.x", str(ctx.exception))
+                self.assertIn("supports only torch 2.15.x", str(ctx.exception))
                 # Nothing is left behind for an error handler.
                 self.assertFalse(
                     any(isinstance(op, LoopNode) for op in graph.operations)
                 )
 
     def test_unsupported_release_without_a_loop_is_unaffected(self):
-        with mock.patch.object(torch, "__version__", "2.15.0"):
+        with mock.patch.object(torch, "__version__", "2.16.0"):
             graph = self._graph([self._buf("a")])
             self._run(graph)
         self.assertEqual([op.get_name() for op in graph.operations], ["a"])

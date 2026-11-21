@@ -23,7 +23,7 @@ ordinary guard miss).
 """
 
 import torch
-from torch._dynamo.decorators import _DimRange
+from unittest import mock
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
@@ -38,11 +38,17 @@ class TestMarkDynamicBare(TestCase):
         self.assertIn(0, x_dev._dynamo_dynamic_indices)
 
     def test_mark_dynamic_called_with_no_bound(self) -> None:
-        # A bare call records _DimRange(0, None, None); passing min=/max=
-        # to mark_dynamic would instead record _DimRange(0, 70, 630).
+        # 2.15 no longer creates _dynamo_dynamic_range for a bare call.
+        # Check the call itself, while still running the real marking function.
         x = torch.rand(560, 1024, dtype=torch.float16)
-        x_dev = x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
-        self.assertIn(_DimRange(0, None, None), x_dev._dynamo_dynamic_range)
+        with mock.patch.object(
+            torch._dynamo, "mark_dynamic", wraps=torch._dynamo.mark_dynamic
+        ) as mark_dynamic:
+            x_dev = x.to(
+                DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}}
+            )
+        mark_dynamic.assert_called_once_with(x_dev, 0)
+        self.assertIn(0, x_dev._dynamo_dynamic_indices)
 
 
 if __name__ == "__main__":
