@@ -528,7 +528,8 @@ contract as the call without `device_layout=`.
   given with it, as a layout for the tensor at `max` (see "Declaring with an
   explicit device layout"). `dtype=` is honoured (the conversion happens on the
   host before the transfer); a non-default `memory_format` is rejected.
-  `non_blocking=True` is accepted, but the transfer is always synchronous.
+  `non_blocking=True` returns before the transfer completes (see "Non-blocking
+  host-to-device copies" in the runtime docs).
 - Only dimension 0, the outermost dimension, can be reserved, and only one
   dimension per tensor. Negative dimensions are accepted if they resolve to
   dimension 0 (`-2` on a 2-D tensor). Reserving any other dimension raises an
