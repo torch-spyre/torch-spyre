@@ -6839,6 +6839,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
                 ),
+                "bool_1d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((64,), high=2) > 0,
+                ),
+                "bool_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "bool_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "int32_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int32_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int64_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+                "int64_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+            },
+            "expect_fail": {
+                "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
             },
         },
         ("test_sum_keepdim0", "test_sum_eager"): {
@@ -6959,6 +6997,75 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
                 ),
+                "bool_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "bool_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "int32_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int32_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int64_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+                "int64_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+            },
+            "expect_fail": {
+                "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
+            },
+        },
+        ("test_sum_default", "test_reduce_exact_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                # bool_1d (64) and bool_2d (last dim 256) are aligned to the
+                # fp16 stick size (64 elements); they pass after the bool→fp32
+                # upcast because the staggered DL16_TO_FP32 input is aligned.
+                "bool_1d": (cached_randint((64,), high=2) > 0,),
+                "bool_2d": (cached_randint((67, 256), high=2) > 0,),
+                # Unaligned bool: the bool→fp32 upcast produces a staggered
+                # DL16_TO_FP32 tensor; the backend cannot reduce a staggered
+                # input whose stick-dim size is not a multiple of 64 (#4014).
+                "bool_1d_unaligned": (cached_randint((100,), high=2) > 0,),
+                "bool_2d_unaligned": (cached_randint((1, 855), high=2) > 0,),
+                # Same problem from an fp16 compare intermediate (not a host
+                # bool, but still fp16-backed → DL16_TO_FP32 after upcast).
+                "bool_2d_unaligned_cmp": (
+                    cached_randn((1, 100), dtype=torch.float16) > 0,
+                ),
+                "int32_1d": (cached_randint((64,), dtype=torch.int32),),
+                "int32_2d": (cached_randint((67, 256), dtype=torch.int32),),
+                "int64_1d": (cached_randint((64,), dtype=torch.int64),),
+                "int64_2d": (cached_randint((67, 256), dtype=torch.int64),),
+                "fp16_1d": (cached_randn((64,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp32_1d": (cached_randn((64,), dtype=torch.float32),),
+                "fp32_2d": (cached_randn((67, 256), dtype=torch.float32),),
+            },
+            # Unaligned staggered inputs raise Unsupported until #4014 is fixed.
+            "expect_fail": {
+                "sum_bool_1d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+                "sum_bool_2d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+                "sum_bool_2d_unaligned_cmp": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
             },
         },
         # Reductions over an expand()-broadcast operand, across dim alignment,
@@ -11297,6 +11404,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_reduce_cpu(self, op, x):
         self.compare_with_cpu(lambda x: op(x), x)
 
+    def test_reduce_exact_cpu(self, op, x):
+        """Like test_reduce_cpu but with exact (atol=0, rtol=0) comparison.
+
+        Used for integer/bool reductions whose results are deterministic counts.
+        atol=rtol=0.1 (the compare_with_cpu default) would accept 436 vs 442.
+        """
+        self.compare_with_cpu(lambda x: op(x), x, atol=0, rtol=0)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
@@ -11812,43 +11927,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @expects_raise
-    def test_count_nonzero_float_dim0_rejected(self):
-        # count_nonzero sums x != 0 as an integer. The bool -> int conversion inside
-        # the reduction body nests two ops, which the reduction codegen does not take
-        # as an argument, and the compiled backend has no int32 sum either.
-        # TODO: a missing feature, not a design limit. When both are implemented
-        # this stops raising, and the test has to become a positive one.
-        x = cached_randn((67, 256))
-        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
-            self.compare_with_cpu(
-                lambda x: torch.count_nonzero(x, dim=0),
-                x,
-                run_eager=False,
-            )
-
-    @expects_raise
-    def test_count_nonzero_bool_dim0_rejected(self):
-        # count_nonzero sums the bool as an integer. The bool -> int conversion inside
-        # the reduction body nests two ops, which the reduction codegen does not take
-        # as an argument, and the compiled backend has no int32 sum either.
-        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
-        x = torch.tensor(
-            [
-                [True, False, True, False, True, False, True],
-                [False, False, True, True, False, True, False],
-                [True, True, False, False, True, False, False],
-                [False, True, False, True, False, True, True],
-                [True, False, False, True, True, False, True],
-            ],
-            dtype=torch.bool,
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
+    def test_count_nonzero_float_dim0(self):
+        # count_nonzero is (x != 0).sum(0). The reduction runs over a non-stick dim, and
+        # its input is the staggered fp32 upcast while the output is STANDARD. The
+        # staggered result is read back without restoring its order (#4393).
+        x = cached_randint((67, 256), high=2).to(torch.float16)
+        self.compare_with_cpu(
+            lambda x: torch.count_nonzero(x, dim=0),
+            x,
+            run_eager=False,
         )
-        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
-            self.compare_with_cpu(
-                lambda x: torch.count_nonzero(x, dim=0),
-                x,
-                run_eager=False,
-            )
+
+    def test_count_nonzero_float_dim1(self):
+        # Same input, reduced over the stick dim. The reduction consumes the stick, so
+        # the staggered element arrangement does not reach the output.
+        x = cached_randint((67, 256), high=2).to(torch.float16)
+        self.compare_with_cpu(
+            lambda x: torch.count_nonzero(x, dim=1),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
+    def test_count_nonzero_bool_dim0(self):
+        # count_nonzero on a host bool, reduced over a non-stick dim. The output keeps
+        # the staggered element arrangement, and the readback permutes it (#4393).
+        x = cached_randint((67, 256), high=2) > 0
+        self.compare_with_cpu(
+            lambda x: torch.count_nonzero(x, dim=0),
+            x,
+            run_eager=False,
+        )
 
     def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
@@ -11860,11 +11978,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @expects_raise
     def test_nanmean_all_dims_rejected(self):
-        # nanmean counts the non-NaN values as an integer sum. The bool -> int
-        # conversion inside the reduction body nests two ops, which the reduction
-        # codegen does not take as an argument, and the backend has no int32 sum
-        # either.
-        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
+        # nanmean decomposes to a sum over where(isnan(x), 0, x), so it contains isnan,
+        # which has no Spyre lowering.
+        # TODO: a missing feature. When isnan is implemented this stops raising, and
+        # the test has to become a positive one.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -11873,7 +11990,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
+        with pytest.raises(Exception, match=r"unimplemented operation isnan"):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
     # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
