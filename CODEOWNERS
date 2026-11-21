@@ -67,8 +67,11 @@
 /extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
 /extensions/spyre-bench/        @ashokponkumar @jabostian @anubhavjana @n-marion
 
+# bench catalog and the benchmark definitions it runs
+/benchmarks/            @ashokponkumar @jabostian @anubhavjana @n-marion
+
 # tools -- default tools owners
-/tools/                 @ani300 @dgrove-oss @tardieu @mudhakar
+/tools/                 @ani300 @dgrove-oss @tardieu @mudhakar @ashokponkumar @anubhavjana
 
 # ktir-mlir-frontend pin and its installer.
 /tools/ktir-mlir-frontend.pin  @dgrove-oss @avery-blanchard @tardieu
