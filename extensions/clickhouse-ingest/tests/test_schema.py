@@ -15,6 +15,7 @@
 """Pins the insert layer's contract. The model only changes HOW a (column_names, row) pair is
 built, so pair equality against the pre-refactor output is a complete correctness proof."""
 
+from types import SimpleNamespace
 import pytest
 from spyre_clickhouse_ingest.schema import (
     ARTIFACT_REFS,
@@ -47,6 +48,8 @@ class FakeClient:
         self.inserts.append((table, rows, column_names, database))
 
     def query(self, sql, parameters=None):
+        if "system.tables" in sql:
+            return SimpleNamespace(result_rows=[("MergeTree", 0)])  # a plain table
         self.queries.append(sql)
         self.params.append(parameters)
         asked = set(parameters["ids"])

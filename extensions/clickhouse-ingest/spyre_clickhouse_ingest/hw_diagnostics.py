@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import writes
 from .hw_schema import HwFailureDiagnostics
 
 NIL_UUID = HwFailureDiagnostics.NIL_UUID
@@ -172,7 +173,7 @@ class RecordLoader:
         ]
 
     @staticmethod
-    def insert(client, rows: list, table: str = "") -> None:
+    def insert(client, rows: list, table: str = "", resilient: bool = True) -> None:
         """Insert with explicit column names, so row order is checked, not assumed."""
         table = table or HwFailureDiagnostics.DEFAULT_TABLE
         cols = HwFailureDiagnostics.COLUMN_NAMES
@@ -181,7 +182,10 @@ class RecordLoader:
                 f"row has {len(rows[0])} values but {table} expects "
                 f"{len(cols)}: build_row and HW_COLUMN_NAMES disagree"
             )
-        client.insert(table=table, data=rows, column_names=list(cols))
+        if resilient:
+            writes.insert(client, table, rows, cols)
+        else:  # the legacy v1 table: a plain insert that fails loudly
+            client.insert(table=table, data=rows, column_names=list(cols))
 
 
 # Function API, kept so installed consumers import one definition, not a copy.

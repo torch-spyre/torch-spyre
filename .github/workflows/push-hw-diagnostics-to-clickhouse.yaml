@@ -20,6 +20,12 @@ permissions:
   contents: read
   actions: read
 
+env:
+  # Read by the ingest library: persistent spool dir, its persistence flag, v2-host requirement.
+  CH_WRITE_SPOOL: ${{ vars.CH_WRITE_SPOOL }}
+  CH_WRITE_SPOOL_PERSISTENT: ${{ vars.CH_WRITE_SPOOL_PERSISTENT }}
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+
 jobs:
   ingest:
     name: Parse logs -> ClickHouse
@@ -122,6 +128,10 @@ jobs:
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Upload JSON artifact

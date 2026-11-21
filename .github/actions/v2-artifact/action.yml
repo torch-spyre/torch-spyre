@@ -86,6 +86,22 @@ inputs:
     description: ClickHouse password.
     required: false
     default: ''
+  clickhouse-v2-host:
+    description: Endpoint for the Replicated databases; empty = clickhouse-host serves v2 too.
+    required: false
+    default: ''
+  clickhouse-v2-port:
+    description: Port of clickhouse-v2-host (defaults to clickhouse-port).
+    required: false
+    default: ''
+  clickhouse-v2-user:
+    description: Login on the v2 host (defaults to clickhouse-user).
+    required: false
+    default: ''
+  clickhouse-v2-pass:
+    description: Password for clickhouse-v2-user.
+    required: false
+    default: ''
   clickhouse-db-v2:
     description: The spyre_v2 database.
     required: false
@@ -176,6 +192,10 @@ runs:
         CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
         CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
         CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}
+        CLICKHOUSE_V2_HOST: ${{ inputs.clickhouse-v2-host }}
+        CLICKHOUSE_V2_PORT: ${{ inputs.clickhouse-v2-port }}
+        CLICKHOUSE_V2_USER: ${{ inputs.clickhouse-v2-user }}
+        CLICKHOUSE_V2_PASSWORD: ${{ inputs.clickhouse-v2-pass }}
         ICR_USERNAME: ${{ inputs.registry-username }}
         ICR_PASSWORD: ${{ inputs.registry-password }}
         ARTIFACTORY_USER: ${{ inputs.artifactory-user }}

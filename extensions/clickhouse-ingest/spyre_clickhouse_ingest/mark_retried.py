@@ -160,4 +160,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from .writes import install_exit_hook
+
+    install_exit_hook()
     main()

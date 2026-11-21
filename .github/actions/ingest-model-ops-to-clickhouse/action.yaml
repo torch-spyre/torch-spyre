@@ -56,7 +56,7 @@ inputs:
     required: false
     default: ''
   clickhouse-user:
-    description: ClickHouse user (default "default" inside the script).
+    description: ClickHouse writer login, required (the script no longer assumes a default user).
     required: false
     default: ''
   clickhouse-pass:
@@ -227,6 +227,7 @@ runs:
         source .venv/bin/activate
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CLICKHOUSE_USER:-}" ] || { echo "::error::clickhouse-user is empty: set the writer login (CLICKHOUSE_USER)"; exit 1; }
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
         python3 "${ROOT}/.github/scripts/ingest_model_ops.py" \
           --json-file       "${JSON_FILE}" \
@@ -234,3 +235,61 @@ runs:
           --branch          "${{ inputs.branch }}" \
           --sha             "${{ inputs.sha }}" \
           --run-id          "${RUN_ID}"
+
+    - name: Report rows parked by the ClickHouse ingest
+      id: ch-spool
+      if: always() && steps.gate.outputs.configured == 'true'
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json, os, pathlib, sys, time
+        temp = os.environ["RUNNER_TEMP"]
+        spool = pathlib.Path(os.environ.get("CH_WRITE_SPOOL") or temp + "/ch-spool")
+        persistent = os.environ.get("CH_WRITE_SPOOL_PERSISTENT", "").lower() in ("1", "true", "yes")
+        items, corrupt, old = [], 0, 0
+        for p in sorted(spool.glob("[0-9]*.json")) if spool.is_dir() else []:
+            try:
+                d = json.loads(p.read_text())
+                m = {k: d.get(k) for k in ("token", "table", "created", "ambiguous")}
+                m["rows"] = len(d.get("rows", []))
+            except Exception:
+                corrupt += 1
+                continue
+            try:
+                recent = float(m["created"] or 0) >= time.time() - 6 * 3600
+            except (TypeError, ValueError):
+                corrupt += 1
+                continue
+            if not recent:
+                old += 1  # left by an earlier job on a persistent spool
+            else:
+                items.append(m)
+        if not (items or corrupt):
+            sys.exit(0)
+        manifest = pathlib.Path(temp) / "ch-spool-manifest.jsonl"
+        manifest.write_text("".join(json.dumps(m) + "\n" for m in items))
+        lines = ["### ClickHouse rows parked (rows are not uploaded)", "```"]
+        lines += [json.dumps(m) for m in items] + ["```"]
+        if corrupt or old:
+            lines.append(f"{corrupt} unreadable file(s); {old} older item(s) from earlier jobs not listed.")
+        if persistent:
+            lines.append("Replay with `python -m spyre_clickhouse_ingest spool replay` on the runner that holds the spool.")
+        else:
+            lines.append("**These rows are LOST when this job ends** (the spool is on an ephemeral runner). Re-run the job; set CH_WRITE_SPOOL and CH_WRITE_SPOOL_PERSISTENT=1 on a self-hosted runner with a persistent directory to keep them.")
+        text = "\n".join(lines) + "\n"
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+            fh.write(text)
+        with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write("parked=true\n")
+        print("::warning::ClickHouse rows were parked, not stored; see the step summary")
+        sys.exit(0 if persistent else 1)
+        PY
+
+    - name: Upload the parked-rows manifest
+      if: always() && steps.ch-spool.outputs.parked == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ch-spool-manifest-model-ops-${{ github.job }}-${{ github.run_attempt }}-${{ runner.name }}-${{ github.action }}
+        path: ${{ runner.temp }}/ch-spool-manifest.jsonl
+        retention-days: 3
+        overwrite: true

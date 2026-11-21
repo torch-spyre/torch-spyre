@@ -193,12 +193,25 @@ on:
       # above already serve it -- one instance, one naming scheme.
       CLICKHOUSE_DB_V2:
         required: false
+      # Optional second endpoint for the Replicated databases; unset keeps one host.
+      CLICKHOUSE_V2_HOST:
+        required: false
+      CLICKHOUSE_V2_PORT:
+        required: false
+      CLICKHOUSE_V2_USER:
+        required: false
+      CLICKHOUSE_V2_PASSWORD:
+        required: false
 
 defaults:
   run:
     shell: bash
 
 env:
+  # Read by the ingest library: persistent spool dir, its persistence flag, v2-host requirement.
+  CH_WRITE_SPOOL: ${{ vars.CH_WRITE_SPOOL }}
+  CH_WRITE_SPOOL_PERSISTENT: ${{ vars.CH_WRITE_SPOOL_PERSISTENT }}
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
   # The baked torch-spyre source dir in the dev image (runner is FROM
   # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
   PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
@@ -962,6 +975,10 @@ jobs:
           # Without these two the v2 write is a no-op, so benchmark_runs stays empty and the
           # benchmark path is unreachable -- the perf job is its only producer.
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           schema: both
 
       # Four honesty lines. Echo only — never upload report.xml (public

@@ -50,6 +50,8 @@ class Client:
         rows = (
             self.cols
             if "system.columns" in sql
+            else [("MergeTree", 0)]
+            if "system.tables" in sql
             else [(self.ingested,)]
             if "count()" in sql
             else []

@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import bench_invalidation, sendnn, vllm
+from . import bench_invalidation, sendnn, vllm, writes
 from .identity import DerivedId, RunId
 from .offline import (
     ADMIN_KINDS,
@@ -480,6 +480,7 @@ def write_junit(db, root, meta, aid, rid, props, strict) -> None:
                 assigned_trust=props.get(TRUST_PROP, ""),
             )
     except SystemExit as exit_:
+        writes.clear_exit()  # caught here: the process may still end 0
         if exit_.code not in (0, None):
             raise BundleError(f"results exited {exit_.code}", FAILED) from None
 

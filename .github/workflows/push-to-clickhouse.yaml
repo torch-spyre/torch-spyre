@@ -130,6 +130,15 @@ on:
       CLICKHOUSE_PASS_DEV: {required: false}
       CLICKHOUSE_DB_DEV: {required: false}
       CLICKHOUSE_DB_V2_DEV: {required: false}
+      # Optional second endpoint for the Replicated databases; unset keeps one host.
+      CLICKHOUSE_V2_HOST: {required: false}
+      CLICKHOUSE_V2_PORT: {required: false}
+      CLICKHOUSE_V2_USER: {required: false}
+      CLICKHOUSE_V2_PASSWORD: {required: false}
+      CLICKHOUSE_V2_HOST_DEV: {required: false}
+      CLICKHOUSE_V2_PORT_DEV: {required: false}
+      CLICKHOUSE_V2_USER_DEV: {required: false}
+      CLICKHOUSE_V2_PASSWORD_DEV: {required: false}
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -139,6 +148,12 @@ concurrency:
 permissions:
   contents: read
   actions: read   # needed to download artifacts from the triggering run
+
+env:
+  # Read by the ingest library: persistent spool dir, its persistence flag, v2-host requirement.
+  CH_WRITE_SPOOL: ${{ vars.CH_WRITE_SPOOL }}
+  CH_WRITE_SPOOL_PERSISTENT: ${{ vars.CH_WRITE_SPOOL_PERSISTENT }}
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
 
 jobs:
   ingest:
@@ -172,16 +187,21 @@ jobs:
       # event carries no input. A secret context key must be a literal name, so
       # this is a per-name ternary, not a computed `secrets[...]` lookup. This is
       # what lets a manual DEV re-ingest happen with no edit+push to main.
-      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_HOST: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_HOST_DEV)) }}
+      CLICKHOUSE_PORT: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_PORT_DEV)) }}
+      CLICKHOUSE_USER: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_USER) || toJSON(secrets.CLICKHOUSE_USER_DEV)) }}
+      CLICKHOUSE_PASS: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_PASS) || toJSON(secrets.CLICKHOUSE_PASS_DEV)) }}
+      CLICKHOUSE_DB: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_DB) || toJSON(secrets.CLICKHOUSE_DB_DEV)) }}
       # The schema-v2 database. Every v2 statement is QUALIFIED with it rather than opening a
       # second connection, because test_cases and benchmark_runs exist in both generations
       # with incompatible shapes and an unqualified name would hit the wrong one. Empty/unset
       # makes the v2 write a no-op, which keeps an un-updated caller behaving as before.
-      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      CLICKHOUSE_DB_V2: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV)) }}
+      CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV)) }}
+      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV)) }}
+      CLICKHOUSE_V2_USER: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV)) }}
+      CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+        }}
       # Dual-write during the migration window: v1 stays authoritative, v2 accumulates the
       # same runs so the new schema can be validated against real traffic before anything
       # depends on it. No data is ported -- v1 rows cannot produce a v2 run_id -- so `both` is
@@ -452,6 +472,10 @@ jobs:
           clickhouse-pass: ${{ env.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ env.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ env.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ env.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ env.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ env.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ env.CLICKHOUSE_V2_PASSWORD }}
           schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Summary

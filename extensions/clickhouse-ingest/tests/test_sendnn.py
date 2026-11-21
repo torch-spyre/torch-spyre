@@ -115,6 +115,8 @@ def test_a_bad_sendnn_bundle_is_rejected(tmp_path, text, meta, why):
 
 
 class CapturingClient:
+    engine = "MergeTree"
+
     def __init__(self):
         self.inserted = {}
 
@@ -122,6 +124,8 @@ class CapturingClient:
         pass
 
     def query(self, sql, parameters=None):
+        if "system.tables" in sql:
+            return SimpleNamespace(result_rows=[[self.engine, 0]])
         if "count()" in sql:
             table = (
                 "artifact_results" if "artifact_results" in sql else "benchmark_runs"
@@ -135,10 +139,13 @@ class CapturingClient:
         )
 
 
+@pytest.mark.parametrize("engine", ["MergeTree", "ReplicatedMergeTree"])
 def test_a_sendnn_bundle_writes_benchmark_runs_and_a_perf_verdict(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, engine
 ):
     from spyre_clickhouse_ingest import client, resolver
+
+    monkeypatch.setattr(CapturingClient, "engine", engine)
 
     out = _bundle(tmp_path)
     ch = CapturingClient()

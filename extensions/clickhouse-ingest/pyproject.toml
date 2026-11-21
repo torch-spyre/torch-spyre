@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 spyre-mark-retried = "spyre_clickhouse_ingest.mark_retried:main"
-spyre-clickhouse-ingest = "spyre_clickhouse_ingest.__main__:main"
+spyre-clickhouse-ingest = "spyre_clickhouse_ingest.__main__:entry"
 
 [project.optional-dependencies]
 # Only the self-serve sandbox server (sandbox_server.py) needs these; the ingests never import it.

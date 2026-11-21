@@ -438,7 +438,7 @@ def main() -> None:
     from .client import ClickHouse, ClickHouseEnv
 
     db = args.database or ClickHouseEnv.target_database() or ClickHouseEnv.database()
-    client = ClickHouse.connect(database=db)
+    client = ClickHouse.connect(database=db, role="schema")
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
     print(f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}")

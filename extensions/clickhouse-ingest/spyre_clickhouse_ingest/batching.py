@@ -18,6 +18,11 @@ A 35k-case JUnit file sent as a single request outlives the connection's write t
 slow link. Batches bound each request; a failed batch is retried with backoff, but only for
 transient errors (timeouts, connection loss, 5xx).
 
+On a Replicated table the batch token is the guard instead: `already_landed` and `idempotent`
+are ignored there, and rows that could not land inside the deadline are parked and reported by
+raising BatchParked. The token covers the batch's rows and position, so changing
+CH_INGEST_BATCH_ROWS between a failed run and its resend defeats the dedup.
+
 The tables are mostly plain MergeTree, which ignores insert_deduplication_token, so a blind
 resend can double a batch. `insert_chunks` therefore resends only when an `already_landed`
 probe shows nothing of the failed batch was kept. With no probe a batch is sent once, unless
@@ -34,6 +39,9 @@ import sys
 import time
 from typing import Callable, Sequence, TypeVar
 
+from . import writes
+from .resilience import SpoolFull, WriteUnavailable, safe
+
 T = TypeVar("T")
 
 MAX_ROWS = int(os.environ.get("CH_INGEST_BATCH_ROWS", "5000"))
@@ -44,7 +52,7 @@ BACKOFF_MAX_S = 60.0
 
 # Server errors that stay wrong on a resend even when they arrive as HTTP 5xx.
 DETERMINISTIC_CODES = frozenset(
-    {16, 27, 36, 43, 47, 53, 60, 62, 81, 439, 469, 497, 516}
+    {16, 27, 36, 43, 47, 53, 60, 62, 81, 164, 452, 469, 497, 516}
 )
 
 
@@ -58,6 +66,17 @@ class BatchFailed(RuntimeError):
     def __init__(self, message: str, landed: int):
         super().__init__(message)
         self.landed = landed
+
+
+class BatchParked(BatchFailed, writes.ParkedRows):
+    """Some rows were parked in the spool, not stored: callers must not go on as if they landed.
+
+    `landed` rows of this call are stored; `parked` are held (see README, "Parked batches").
+    """
+
+    def __init__(self, message: str, landed: int, parked: int):
+        super().__init__(message, landed)
+        self.parked = parked
 
 
 class BatchAmbiguous(BatchFailed):
@@ -113,6 +132,7 @@ def insert_chunks(
     settle_s: float = SETTLE_S,
     already_landed: Callable[[], int] | None = None,
     idempotent: bool = False,
+    resilient: bool = True,
     sleep: Callable[[float], None] | None = None,
     log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
 ) -> int:
@@ -124,6 +144,24 @@ def insert_chunks(
     total = len(rows)
     if not total:
         return 0
+    out = None
+    try:
+        if resilient:  # legacy v1 callers pass False: plain inserts, no engine lookup
+            out = writes.try_insert(client, table, rows, column_names, database, size)
+    except Exception as err:  # noqa: BLE001 -- re-raised as the one failure type callers know
+        landed = getattr(getattr(err, "outcome", None), "stored", 0)
+        detail = (
+            str(err) if isinstance(err, (WriteUnavailable, SpoolFull)) else safe(err)
+        )
+        raise BatchFailed(f"{table}: {detail}", landed) from err
+    if out is not None:
+        if out.spooled:
+            raise BatchParked(
+                f"{table}: {out.spooled} row(s) parked, {out.stored} stored",
+                out.stored,
+                out.spooled,
+            )
+        return out.stored
     if not already_landed and not idempotent:
         attempts = 1
     wait_for = sleep or time.sleep

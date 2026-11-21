@@ -146,10 +146,10 @@ SETTINGS index_granularity = 8192
 # ---------------------------------------------------------------------------
 
 
-def get_client():
+def get_client(role: str = "writer"):
     """This endpoint's certificate does not validate, hence verify=False -- the only reason this
     wrapper exists rather than importing the shared factory directly."""
-    return _get_client(verify=False)
+    return _get_client(verify=False, role=role)
 
 
 def _parse_ts(ts_str: str) -> datetime:
@@ -218,7 +218,7 @@ ALTER TABLE model_ops_variants
 """
 
 
-def ensure_tables(client) -> None:
+def ensure_tables(schema_client) -> None:
     """
     Create both tables if they do not yet exist (idempotent).
     Existing tables — and their historical data — are left untouched so
@@ -226,14 +226,14 @@ def ensure_tables(client) -> None:
     Also runs idempotent ALTER TABLE migrations to add new columns.
     """
     print("[info] Ensuring tables exist (CREATE TABLE IF NOT EXISTS) ...")
-    client.command(_CREATE_SUITES_SQL)
+    schema_client.command(_CREATE_SUITES_SQL)
     print("[info]   model_ops_suites    — ok")
-    client.command(_CREATE_VARIANTS_SQL)
+    schema_client.command(_CREATE_VARIANTS_SQL)
     print("[info]   model_ops_variants  — ok")
 
     # Migrations: add new columns to pre-existing tables (safe to run repeatedly)
     print("[info] Running column migrations ...")
-    client.command(_ALTER_VARIANTS_ADD_TAGS)
+    schema_client.command(_ALTER_VARIANTS_ADD_TAGS)
     print("[info]   model_ops_variants.tags — ok")
     print()
 
@@ -504,7 +504,7 @@ def main() -> None:
     print("[info] Connected.\n")
 
     # ── Ensure tables exist (keeps historical data for regression views) ──────
-    ensure_tables(client)
+    ensure_tables(get_client(role="schema"))
 
     gha_run_id = _int(args.run_id)
     now = datetime.now(timezone.utc).replace(tzinfo=None)

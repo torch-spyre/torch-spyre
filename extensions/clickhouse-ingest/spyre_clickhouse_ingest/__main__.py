@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|spool|relay} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch|spool|relay|bench-verdicts|probe} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
-# `results` modes that never reach ClickHouse; they run on the standard library alone.
+# `results` modes that never reach ClickHouse; they run on the standard library alone, so they
+# never import `writes` (its retry module needs the `regex` package).
 OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload", "--check")
+
+
+def _offline(argv) -> bool:
+    return (
+        bool(argv)
+        and argv[0] == "results"
+        and any(a.split("=")[0] in OFFLINE_FLAGS for a in argv[1:])
+    )
 
 
 def main(argv=None):
@@ -30,6 +39,7 @@ def main(argv=None):
         "spool",
         "relay",
         "bench-verdicts",
+        "probe",
     )
     if not argv or argv[0] not in commands:
         sys.exit(
@@ -48,12 +58,33 @@ def main(argv=None):
         from .relay import main as run
     elif command == "bench-verdicts":
         from .bench_verdicts import main as run
-    elif any(a.split("=")[0] in OFFLINE_FLAGS for a in rest):
+    elif command == "probe":
+        from .probe import main as run
+    elif _offline(argv):
         from .offline import main as run
     else:
         from .results import main as run
-    return run(rest)
+    if _offline(argv):
+        return run(rest)
+    from . import writes
+
+    try:
+        rc = run(rest)
+    except SystemExit as stop:
+        if isinstance(stop.code, str):
+            raise
+        raise SystemExit(writes.exit_code(stop.code)) from None
+    return writes.exit_code(rc)
+
+
+def entry():
+    """The command-line entry: `main` plus the exit-75-on-parked-rows hook."""
+    if not _offline(sys.argv[1:]):
+        from . import writes
+
+        writes.install_exit_hook()
+    return main()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

@@ -23,7 +23,13 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.client import (
+    ClickHouseEnv,
+    client_summary,
+    get_client,
+    target_database,
+)
 from spyre_clickhouse_ingest.hw_diagnostics import (
     NIL_UUID,
     RunContext,
@@ -196,7 +202,7 @@ def main() -> None:
 
     # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
     if args.write_v1:
-        ensure_extra_columns(client, table=args.table)
+        ensure_extra_columns(get_client(role="schema"), table=args.table)
         if already_ingested(client, run_id, component, table=args.table):
             print(
                 f"[info] v1: run_id={run_id} component={component!r} already ingested "
@@ -205,7 +211,7 @@ def main() -> None:
         else:
             print(f"[info] v1: inserting {len(rows)} row(s) into {args.table} ...")
             try:
-                insert_rows(client, rows, table=args.table)
+                insert_rows(client, rows, table=args.table, resilient=False)
             except Exception as exc:
                 print(f"[error] v1 insert failed: {exc}", file=sys.stderr)
                 sys.exit(1)
@@ -214,6 +220,7 @@ def main() -> None:
     # ── v2: {CLICKHOUSE_DB_V2}.hw_failure_diagnostics (same shape, DDL-managed) ─
     # Wrapped so a v2 failure never costs the v1 rows already inserted above -- v1 stays
     # authoritative during the migration window (--schema both), same as every other writer.
+    v2_failed = False
     if args.write_v2:
         v2db = target_database()
         if not v2db:
@@ -241,11 +248,18 @@ def main() -> None:
                     )
                     insert_rows(client, rows, table=v2_table)
                     print(f"[info] v2: inserted {len(rows)} row(s) into {v2_table}")
+            except writes.ParkedRows as exc:
+                print(
+                    f"[warn] v2 rows SPOOLED, not stored ({exc}): replay with `spool replay`; "
+                    "a re-run would send them again under new tokens",
+                    file=sys.stderr,
+                )
             except Exception as exc:
                 print(
                     f"[warn] v2 write failed (v1 rows unaffected): {exc}",
                     file=sys.stderr,
                 )
+                v2_failed = True
 
     reasons: Counter = Counter(_str(r.get("failure_reason"), "none") for r in records)
     outcomes: Counter = Counter(_str(r.get("outcome"), "unknown") for r in records)
@@ -263,6 +277,14 @@ def main() -> None:
     for reason, n in sorted(reasons.items(), key=lambda x: -x[1]):
         print(f"[info]   {reason:35}: {n}")
 
+    if v2_failed and ClickHouseEnv.v2_host():
+        print(
+            "[error] v2 leg failed on the v2 host; v1 rows were written",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 
 if __name__ == "__main__":
+    writes.install_exit_hook()
     main()

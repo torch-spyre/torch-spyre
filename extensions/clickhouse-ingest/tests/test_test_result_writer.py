@@ -29,6 +29,7 @@ class FakeClient:
     def __init__(self, run_count=0):
         self.run_count = run_count
         self.inserts, self.queries, self.commands = [], [], []
+        self.recounted = False
 
     def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))
@@ -36,6 +37,8 @@ class FakeClient:
     def query(self, sql, parameters=None):
         self.queries.append((sql, parameters or {}))
         rows = [(self.run_count,)] if "count()" in sql else []
+        if "sum(total_tests)" in sql and self.recounted:
+            rows = [(self.run_count,)]
 
         class R:
             result_rows = rows
@@ -44,6 +47,8 @@ class FakeClient:
 
     def command(self, sql, parameters=None):
         self.commands.append((sql, parameters or {}))
+        if sql.startswith("INSERT INTO db.run_case_counters"):
+            self.recounted = True  # the counters now agree with the facts
 
 
 def _case(name="test_x", status="passed"):
@@ -108,10 +113,26 @@ def test_a_drop_recounts_the_run_counters_the_insert_only_mv_cannot_subtract():
     assert "source_file" not in sqls[2]
 
 
-def test_nothing_older_means_no_delete_and_no_recount():
+def test_nothing_older_and_consistent_counters_means_no_writes():
     c = FakeClient(run_count=0)
     drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
     assert c.commands == []
+
+
+def test_counters_that_disagree_with_the_facts_are_rebuilt_even_with_nothing_older():
+    class Stale(FakeClient):
+        def query(self, sql, parameters=None):
+            r = super().query(sql, parameters)
+            if "sum(total_tests)" in sql:
+                r.result_rows = [(9,)]  # the facts say 0
+            return r
+
+    c = Stale(run_count=0)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    assert any("run_case_counters" in str(x) for x in c.commands)
+    assert not any(
+        str(x).startswith("DELETE FROM db.test_case_runs") for x in c.commands
+    )
 
 
 AID = "5f0e7d3c-2b1a-5c4d-8e9f-0a1b2c3d4e5f"
@@ -367,3 +388,54 @@ def test_a_reingested_retry_replaces_rather_than_adds_verdicts():
     )
     (run,) = _rows(c, CAPABILITY_RUNS)
     assert run["props"]["run_attempt"] == "2"
+
+
+def _rebuild_commands(c):
+    return [sql for sql, _ in c.commands if "run_case_counters" in sql]
+
+
+def test_counters_rebuild_deletes_then_inserts_the_recount():
+    c = FakeClient(run_count=5)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    cmds = _rebuild_commands(c)
+    assert cmds[0].startswith("DELETE FROM db.run_case_counters WHERE ")
+    assert cmds[1].startswith("INSERT INTO db.run_case_counters (run_id, component, ")
+    assert cmds[1].endswith("GROUP BY run_id, component")
+    assert len(cmds) == 2
+
+
+class RefusingClient(FakeClient):
+    def __init__(self, refuse_with):
+        super().__init__(run_count=5)
+        self.refuse_with = refuse_with
+
+    def command(self, sql, parameters=None):
+        super().command(sql, parameters)
+        if sql.startswith("INSERT INTO db.run_case_counters"):
+            raise self.refuse_with
+
+
+def test_a_failed_rebuild_after_the_delete_raises_and_the_next_check_retries():
+    import pytest
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    c = RefusingClient(DatabaseError("Code: 60 secret-row", code=60))
+    with pytest.raises(RuntimeError, match="not rebuilt") as ei:
+        drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    assert "secret-row" not in str(ei.value)
+    # Counters are empty while the fact rows remain: the stale check sees it.
+    c2 = FakeClient(run_count=5)
+    from spyre_clickhouse_ingest.writer import TestResultWriter
+
+    assert TestResultWriter._counters_stale(c2, "db", RUN, "torch-spyre") is True
+
+
+def test_counters_staleness_check_qualifies_an_empty_database():
+    from spyre_clickhouse_ingest.writer import TestResultWriter
+
+    c = FakeClient(run_count=5)
+    TestResultWriter._counters_stale(c, "", RUN, "torch-spyre")
+    assert {s for s, _ in c.queries if "run_case_counters" in s} == {
+        "SELECT sum(total_tests) FROM run_case_counters "
+        "WHERE component = {component:String} AND run_id = {run_id:UUID}"
+    }
