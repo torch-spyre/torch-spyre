@@ -66,6 +66,7 @@
 
 /extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
 /extensions/spyre-bench/        @ashokponkumar @jabostian @anubhavjana @n-marion
+/extensions/spyre-cli/          @dushyantbehl @ChanderG @ashokponkumar @pradghos @JRosenkranz @fabianlim @mudhakar
 
 # tools -- default tools owners
 /tools/                 @ani300 @dgrove-oss @tardieu @mudhakar
