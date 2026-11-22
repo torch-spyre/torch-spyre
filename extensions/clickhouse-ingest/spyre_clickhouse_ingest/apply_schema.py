@@ -93,6 +93,15 @@ class SchemaApplier:
         "auto_statistics_types": "''",
         "default_compression_codec": "'LZ4'",
     }
+    # Tuning set on live tables when they were converted to Replicated (mutation history, dedup windows); not part of
+    # the schema, so ignored whatever the value, on either side of the comparison.
+    OPERATIONAL_TABLE_SETTINGS = frozenset(
+        {
+            "finished_mutations_to_keep",
+            "replicated_deduplication_window",
+            "replicated_deduplication_window_for_async_inserts",
+        }
+    )
     TABLE_SETTINGS = re.compile(
         r"\s+SETTINGS\s+((?:\w+\s*=\s*(?:'[^']*'|[^,\s]+)(?:\s*,\s*)?)+)"
         r"(\s+COMMENT\s+'(?:[^'\\]|\\.|'')*')?\s*$"
@@ -586,13 +595,16 @@ class SchemaApplier:
 
     @classmethod
     def without_default_settings(cls, sql: str) -> str:
-        """`sql` less the trailing SETTINGS items that sit at the server's default value."""
+        """`sql` less the trailing SETTINGS items at the server's default value, and the operational ones."""
         m = cls.TABLE_SETTINGS.search(sql)
         if not m:
             return sql
         items = re.findall(r"(\w+)\s*=\s*('[^']*'|[^,\s]+)", m.group(1))
         kept = [
-            f"{k} = {v}" for k, v in items if cls.DEFAULT_TABLE_SETTINGS.get(k) != v
+            f"{k} = {v}"
+            for k, v in items
+            if cls.DEFAULT_TABLE_SETTINGS.get(k) != v
+            and k not in cls.OPERATIONAL_TABLE_SETTINGS
         ]
         return (
             sql[: m.start()]
