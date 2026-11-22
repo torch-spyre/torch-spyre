@@ -467,6 +467,36 @@ class TestADeviceReadCountIsReadRightBeforeItsLoop(_DeviceReadHarness):
         self.assertIn("\n\t\t\t%n_1 = sdscbundle.load_value_at_address", bundle)
         self.assertIn("\n\t\t\tscf.for %i_1", bundle)
 
+    def test_a_count_written_inside_the_outer_loop_is_read_after_it(self):
+        """The count is rewritten on every outer trip, so the read has to follow
+        that write inside the outer body, not sit above the outer loop where it
+        would see the count only once, before anything wrote it."""
+        outer = LoopSpec(
+            count=sympy.Integer(4), body=[_op_spec(), self._device_read_loop()]
+        )
+        entries = [self._pool_entry(i) for i in range(3)]
+
+        bundle, _kinds = self._run([outer, _op_spec()], entries, self.POOL_SIZE)
+
+        def depth(marker):
+            line = next(line for line in bundle.splitlines() if marker in line)
+            return len(line) - len(line.lstrip("\t"))
+
+        outer_loop = "scf.for %i_0 = %c0 to %loop_bound_0 step %c1"
+        producer = 'sdsc_filename="sdsc_0.json"'
+        read = "%n_1 = sdscbundle.load_value_at_address %cnt_addr_1"
+        inner_loop = "scf.for %i_1 = %c0 to %n_1 step %c1"
+        after = 'sdsc_filename="sdsc_2.json"'
+        order = [outer_loop, producer, read, inner_loop, after]
+        positions = [bundle.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions), bundle)
+        # The producer, the read and the inner loop all sit in the outer body,
+        # and the op after the outer loop is back at its level.
+        self.assertEqual(depth(producer), depth(outer_loop) + 1, bundle)
+        self.assertEqual(depth(read), depth(outer_loop) + 1, bundle)
+        self.assertEqual(depth(inner_loop), depth(outer_loop) + 1, bundle)
+        self.assertEqual(depth(after), depth(outer_loop), bundle)
+
 
 class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
     """The backend plans every such loop for ``max_value`` trips, so a loop and
