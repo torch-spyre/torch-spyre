@@ -149,7 +149,7 @@ on:
         description: >-
           Perf job only: off (default, nothing changes) | side-by-side (also feed the same report.xml through the
           benchmarks/ catalog and file the engine's results as a connected CI run in the bench-<workflow> series) | replace (skip the
-          legacy ingest and store the catalog's rows under the legacy workflow name and run id, both schemas; fails on a report
+          legacy ingest and store the catalog's rows in v2 only, keeping the legacy workflow name and run id; fails on a report
           row no case declares).
         required: false
         type: string

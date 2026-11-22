@@ -155,5 +155,5 @@ orchestrator's. Replace fails the job when the report or its kernel breakdowns h
 Both modes are advisory (`continue-on-error`) except `replace`, where the mirror steps are the ingest. Side-by-side
 puts a second point on the HUD series until the HUD reads one series per benchmark.
 
-`replace` no longer writes the v1 series: every ingest of the workflows is v2 only. The HUD and the infra-perf reads
-must read v2 before `replace` is used as the cut-over.
+Every ingest of the workflows writes v2 only, including the default `off` legacy ingest. The HUD and the infra-perf
+reads must read v2 once this merges, not only when `replace` is adopted.
