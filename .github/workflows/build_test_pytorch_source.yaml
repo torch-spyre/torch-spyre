@@ -175,7 +175,7 @@ jobs:
         uses: ./.github/actions/build-pytorch-from-source
 
       - name: Upload PyTorch wheel
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pytorch-wheel-${{ inputs.pytorch_sha }}
           path: pytorch/dist/*.whl
@@ -222,7 +222,7 @@ jobs:
           pytorch_sha: ${{ inputs.pytorch_sha }}
 
       - name: Upload torch-spyre wheel
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
           path: torch-spyre/dist/*.whl
@@ -540,7 +540,7 @@ jobs:
             --summary-title "Upstream Beta test results"
 
       - name: Upload merged JUnit XML reports
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upstream-beta-reports-${{ inputs.pytorch_sha }}
           path: xml_artifacts/**/*.xml

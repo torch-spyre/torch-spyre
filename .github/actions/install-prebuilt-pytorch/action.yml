@@ -31,12 +31,13 @@ runs:
   using: composite
   steps:
     - name: Download prebuilt PyTorch wheel
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: ${{ github.workspace }}/prebuilt-pytorch-wheel
         run-id: ${{ inputs.run_id }}
         github-token: ${{ inputs.github_token }}
+        digest-mismatch: warn
 
     - name: Reinstall prebuilt PyTorch
       shell: bash
