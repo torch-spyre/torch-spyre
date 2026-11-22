@@ -107,7 +107,6 @@ def test_a_perf_report_records_the_purpose(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "case, kwargs, extra",
     [
-        ("v1 schema (the default)", {}, []),
         ("explicit v1", {}, ["--schema", "v1"]),
         ("CLICKHOUSE_DB_V2 unset", {"db_v2": ""}, ["--schema", "v2"]),
         (

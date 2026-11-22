@@ -180,15 +180,27 @@ def test_the_workflow_is_advisory_and_serialised():
             assert step["continue-on-error"] == "true", step["id"]
 
 
+def _scalars(node, key=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _scalars(v, str(k))
+    elif isinstance(node, list):
+        for v in node:
+            yield from _scalars(v, key)
+    elif isinstance(node, str):
+        yield key, " ".join(node.split())
+
+
 def test_prod_credentials_are_reachable_only_through_an_explicit_prod():
     text = WORKFLOW.read_text()
-    for line in text.splitlines():
+    # Per YAML scalar, so a long expression wrapped over several lines is one unit.
+    for key, value in _scalars(yaml.safe_load(text)):
         if (
-            "secrets.CLICKHOUSE_" in line
-            and "PROD_SET" not in line
-            and "_DEV" not in line.split("&&")[0]
+            "secrets.CLICKHOUSE_" in value
+            and key != "PROD_SET"
+            and "_DEV" not in value.split("&&")[0]
         ):
-            assert "== 'prod' &&" in line, line
+            assert "== 'prod' &&" in value, value
     assert "inputs.clickhouse_env || 'dev'" in text
     assert "vars.BENCH_CLICKHOUSE_ENV" not in text
 
@@ -302,7 +314,7 @@ def test_the_legacy_perf_ingest_is_skipped_only_in_replace_mode():
     steps = perf_steps()
     assert "inputs.bench_mode != 'replace'" in steps["ingest"]["if"]
     assert steps["ingest"]["with"]["workflow"] == "${{ github.workflow }}"
-    assert steps["ingest"]["with"]["schema"] == "both"
+    assert "schema" not in steps["ingest"]["with"]  # the ingest action writes v2 only
 
 
 @pytest.mark.parametrize("step", ["bench-mirror", "bench-ingest-dir"])
@@ -315,7 +327,7 @@ def test_the_mirror_is_advisory_outside_replace(step):
 def test_side_by_side_files_a_connected_ci_run_in_its_own_series():
     with_ = perf_steps()["bench-ingest-dir"]["with"]
     assert with_["workflow"] == "${{ format('bench-{0}', github.workflow) }}"
-    assert with_["channel-trust"] == "ci" and with_["schema"] == "v2"
+    assert with_["channel-trust"] == "ci" and "schema" not in with_
     assert "run-id" not in with_ and "purpose" not in with_
     assert (
         "inputs.bench_mode == 'side-by-side'" in perf_steps()["bench-ingest-dir"]["if"]
@@ -325,13 +337,13 @@ def test_side_by_side_files_a_connected_ci_run_in_its_own_series():
     assert mirror["env"]["BENCH_SUITE_FROM"] == "${{ env.RESULTS_DIR }}"
 
 
-def test_replace_keeps_the_legacy_series_run_id_and_both_schemas():
+def test_replace_keeps_the_legacy_series_run_id_and_writes_v2_only():
     step = perf_steps()["bench-ingest"]
     assert "inputs.bench_mode == 'replace'" in step["if"]
     assert "continue-on-error" not in step
     with_ = step["with"]
     assert with_["workflow"] == "${{ github.workflow }}"
-    assert with_["run-id"] == "${{ inputs.run_id }}" and with_["schema"] == "both"
+    assert with_["run-id"] == "${{ inputs.run_id }}" and "schema" not in with_
 
 
 def test_the_banner_reads_the_ingest_step_of_the_active_mode():
