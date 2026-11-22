@@ -1,5 +1,10 @@
 # spyre-bench concepts
 
+> **Writing definitions?** The end-to-end developer guides (benchmarks, environments, data, metrics, analyses, packs,
+> safe commands, debugging, contributing) are in [`dev/`](dev/README.md). This page is the reference they link to.
+
+> **Using the platform** (reading verdicts, running, launching, comparing, uploading): [`user/README.md`](user/README.md).
+
 ## The model in one page
 
 A **catalog** is a folder of YAML documents. Each document has an envelope (`apiVersion: bench/v1alpha1`, `kind`,
@@ -305,7 +310,7 @@ A Benchmark states how to run its cases with `run.command`, an argv array (never
 | Phase | Tokens |
 |---|---|
 | `plan` (case values) | `{case}`, `{benchmark}`, `{component}`, `{environment}`, and every identity value by dotted name (`{case.op}`, `{case.shape}`, `{case.load.iterations}`, `{system.precision}`); a list joins with `,`. An unknown token is a plan error |
-| `run` | `{run_id}`, `{subject_id}`, `{arch}`, `{repeat}` (from 1), `{repeats}` (the case's total repeats, cold plus warm for `cache: both`), `{cache}`, `{profile_level}`, `{raw_dir}`, `{repeat_dir}`, `{out_dir}`, `{python}` |
+| `run` | `{run_id}`, `{subject_id}`, `{arch}`, `{repeat}` (from 1), `{repeats}` (the case's total repeats, cold plus warm for `cache: both`), `{cache}`, `{profile_level}`, `{raw_dir}`, `{repeat_dir}`, `{out_dir}`, `{python}`, `{pin_wrapper}` (the generated rank-pinning script; see [pinning.md](pinning.md)) |
 
 A command's environment is an allowlist, matched case-insensitively: `PATH HOME USER LOGNAME SHELL TMPDIR TMP TEMP TERM TZ VIRTUAL_ENV CI LD_LIBRARY_PATH LANG LANGUAGE PWD HOSTNAME NODE_NAME`; proxies (`HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY`, either case); certificates (`SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE`); build (`MAKEFLAGS MAKELEVEL MFLAGS CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LIBRARY_PATH CPATH`); caches (`HF_HOME HF_HUB_CACHE HF_HUB_OFFLINE TRANSFORMERS_OFFLINE TRANSFORMERS_CACHE`); and the prefixes `LC_ PYTHON SPYRE_ OMP_ MKL_ OPENBLAS_ NUMEXPR_ XDG_ CUDA_ TORCH_ VLLM_ KMP_ GOMP_ HF_DATASETS_ CMAKE_ CCACHE_`, plus any `--pass-env-prefix PREFIX` (repeatable; `BENCH_PASS_ENV_PREFIXES`, comma list; matched case-insensitively on both sides). Two filters apply to every name inherited this way, prefixes included. (1) A name with a WHOLE segment (split on `_ - .`) in `TOKEN PASS PASSWD PW SECRET KEY CRED CREDENTIAL AUTH COOKIE BEARER DSN PAT SESSION PRIVATE CERTKEY APIKEY SECRETKEY PRIVKEY PRIVATEKEY ACCESSKEY AUTHKEY PASSPHRASE` is withheld (`SPYRE_BYPASS`, `SPYRE_KEYBOARD`, `PWD` pass; `SPYRE_KEY` does not). (2) A value that embeds URL credentials (`scheme://user:pw@host`, empty user included) or is token-shaped is withheld: a JWT, a `Bearer`/`Basic` credential, a vendor prefix (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `hf_`, `xox?-`, `AKIA`, `glpat-`, `npm_`, `AIza`, `ya29.`, `pypi-`), base64 with `=` padding, or a 32+ character alphanumeric run (no `_`, `-`, `.` or `/`) that mixes letters and digits. UUIDs, dashed host names, paths and pure hex runs (a commit sha, a digest) are not token-shaped. Every withheld name is listed in `status.json` notes with its reason (`secret-looking name` or `credential-looking value`), never the value. The engine's own `BENCH_RUN_ID`, `BENCH_CASE`, `BENCH_REPEAT`, `BENCH_REPEATS`, `BENCH_CACHE`, `BENCH_PROFILE_LEVEL`, `BENCH_RAW_DIR`, `BENCH_REPEAT_DIR`, `BENCH_SUBJECT_ID` and `BENCH_QUIET` are added. Nothing else (inherited `BENCH_*`, `CLICKHOUSE_*`, tokens, ...) reaches a command unless named with `--pass-env NAME` (repeatable; `BENCH_PASS_ENV`, comma list), which passes the variable as it is, secret-looking name or value included (a name matching a passed prefix but secret-looking still needs `--pass-env`). `run.allow_empty: true` declares that a command that exits 0 with no raw output
 and no `metrics.json` is fine. `examples/run-demo` is a runnable catalog with a stub command.
@@ -401,7 +406,7 @@ results/bench/
   `--force-new-run`. A run that ingests refuses a `--run-id` an earlier run in the same `--out` may have ingested
   under; a run that does not ingest repeats ids freely; two runs in different directories that share `RUN_ID` are not
   detected. Tokens: `{python} {run_id} {run_key} {subject_id} {arch} {component} {raw_dir} {out_dir} {case}
-  {profile}`. Tests drive the real bundle-ingest code with 2 and 3 cases per profile and a mixed plan (warehouse
+  {profile} {test_type}` (`perf` or `quality`). Tests drive the real bundle-ingest code with 2 and 3 cases per profile and a mixed plan (warehouse
   faked), build real offline bundles from the defaults and parse all four with the ingest's own argument parser when
   it is importable. The engine's tests do not run the ingest against a live ClickHouse.
 - **Rows landed.** With `--ingest` and `--store clickhouse`, the engine polls `benchmark_runs` for each stored run id (up
