@@ -30,9 +30,10 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   works across compiled calls, but a multi-op graph with a sharded
   intermediate is rejected. Everything else that would touch sharded
   storage is rejected at compile time with a message saying why.
-* **Host copies only.** Sharded tensors copy to and from the CPU
-  (whole-tensor, no dtype change). Device-to-device copies and fills are
-  rejected because they take a single device address.
+* **Host copies and fills.** Sharded tensors copy to and from the CPU
+  (whole-tensor, no dtype change), and eager `fill_`/`zero_` fill each
+  shard's own allocation. Device-to-device copies are rejected because they
+  take a single device address.
 
 Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
@@ -230,14 +231,17 @@ implements:
   view (below) is copied to the CPU from only the shards it overlaps: each
   is copied whole into a CPU buffer and the part inside the box is taken
   from there. Copies into a box view are rejected.
+* `fill_sharded` — eager `fill_`/`zero_`, one shard at a time through
+  `spyre_shard_view`; it accepts only the whole tensor, so fills of box
+  views are rejected.
 * `shard_device_address` — the launch-time resolver: given a sharded
   tensor and a shard index, returns the device address of that shard's
   allocation. It cross-checks the tensor's actual shard count and
   per-shard bytes against what the kernel was compiled for, so a stale
   kernel or a differently-sharded tensor fails at launch, not silently. It
   also requires the whole tensor: a box view starts elsewhere in the shards.
-* Fail-closed guards: `set_`, `resize_`, and fills reject sharded storage
-  (they would reinterpret or partially write it); the view constructors and
+* Fail-closed guards: `set_` and `resize_` reject sharded storage (they
+  would reinterpret it); the view constructors and
   in-place `as_strided_` reject any view of sharded storage that keeps no
   mapping from its elements onto the shards (`check_sharded_view` in
   [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp)).

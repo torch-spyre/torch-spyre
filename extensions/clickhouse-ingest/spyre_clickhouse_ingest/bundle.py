@@ -23,9 +23,11 @@ Exit codes: 0 ingested or already ingested, 1 failed (retry), 2 rejected, 3 inco
 """
 
 import contextlib
+import getpass
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +37,7 @@ from .offline import (
     ADMIN_KINDS,
     FAILED,
     MANUAL_PREFIX,
+    REJECTED,
     STATUS,
     CHANNEL_TRUST,
     BundleError,
@@ -280,6 +283,83 @@ def receipt_text(report: dict) -> str:
     return "\n".join(f"{k:<14} {v}" for k, v in rows if v)
 
 
+def _ingest_reference(root: Path, meta: dict, args) -> dict:
+    """A bench-reference bundle at approval: the one writer of component `reference`.
+
+    An authorised-caller-only entry point: the approval route (or the reference credential's job) has
+    already checked who may approve and passes the outcome as --bundle-prop approved_by / upload_id /
+    submitted_by [/ approval_reason, approval_override, terms_ack_by, approved_at, promote=0,
+    register_missing=1]; none of it is verified here beyond the self-approval backstop. Without
+    approved_by only a dry run is allowed. The submitter comes from the stored upload (submitted_by),
+    never from the bundle.
+    """
+    import uuid
+
+    from . import reference as ref
+    from .client import ClickHouse, ClickHouseEnv
+
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    sha = digest(root)
+    submitter = extra.get("submitted_by", "")
+    approver = extra.get("approved_by", "")
+    if not args.dry_run:
+        if not (approver and extra.get("upload_id") and submitter):
+            raise BundleError(
+                "a reference is written at approval: pass --bundle-prop approved_by=<login>, "
+                "submitted_by=<login> and upload_id=<id>"
+            )
+        if (
+            ref.norm_login(approver) == ref.norm_login(submitter)
+            and extra.get("approval_override") != "1"
+        ):
+            raise BundleError(
+                "the submitter cannot approve their own reference; an admin approval is flagged approval_override=1"
+            )
+        if extra.get("approved_at"):
+            try:
+                datetime.fromisoformat(extra["approved_at"].replace("Z", "+00:00"))
+            except ValueError:
+                raise BundleError("approved_at is not an ISO-8601 time") from None
+    submitter = submitter or args.uploader or getpass.getuser()
+    upload_id = extra.get("upload_id") or str(uuid.uuid5(uuid.NAMESPACE_URL, sha))
+    try:
+        upload_id = str(uuid.UUID(upload_id))
+    except ValueError:
+        raise BundleError(f"upload_id {upload_id!r} is not a UUID") from None
+    db = ClickHouseEnv.target_database()
+    if not db:
+        raise BundleError("no database: set CLICKHOUSE_DB_V2", FAILED)
+    try:
+        client = ClickHouse.connect(database=db)
+        if args.dry_run:
+            client.set_client_setting("readonly", "2")
+    except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
+        raise BundleError(f"spyre_v2 unreachable: {err!r}", FAILED) from None
+    selfie = ref.norm_login(approver) == ref.norm_login(submitter)
+    # The override flag is an audit record the caller asserts; only a self-approval is forced to carry it.
+    approval = {"ref.approved_by": ref.norm_login(approver), "ref.approval_reason": extra.get("approval_reason", ""),
+                "ref.approval_override": "1" if selfie else extra.get("approval_override", ""),
+                "ref.approval_self": "1" if selfie else extra.get("approval_self", ""),
+                "ref.terms_ack_by": extra.get("terms_ack_by", "")}  # fmt: skip
+    ctx = ref.WriteContext(submitter=submitter, upload_id=upload_id, approval=approval, bundle_sha256=sha,
+                           bundle_url=args.bundle_url, promote=extra.get("promote", "1") != "0",
+                           register_missing=extra.get("register_missing") == "1", approved_at=extra.get("approved_at", ""))  # fmt: skip
+    try:
+        out = ref.write(
+            client, db, ref.load(root / "results" / ref.FILE), ctx, args.dry_run
+        )
+    except ref.ReferenceError as err:
+        raise BundleError(str(err), FAILED if err.retry else REJECTED) from None
+    except Exception as err:  # noqa: BLE001 -- never a traceback after a partial write: the same upload resumes
+        raise BundleError(f"reference write crashed: {err!r}", FAILED) from None
+    return {
+        **out,
+        "bundle_sha256": sha,
+        "test_type": meta["test_type"],
+        "run_key": f"manual:{ref.norm_login(submitter)}:{upload_id}",
+    }
+
+
 def _ingest_invalidation(root: Path, args) -> dict:
     """The invalidation writer owns the kind; the channel rules of the other admin kinds still apply."""
     if args.expect_key:
@@ -305,6 +385,12 @@ def _ingest(root: Path, args) -> dict:
     if bench_invalidation.is_bundle(root):
         return _ingest_invalidation(root, args)
     meta = check(root)
+    if meta.get("kind") == "bench-reference":
+        if getattr(args, "append_to_run", False):
+            raise BundleError(
+                "--append-to-run does not apply to a bench-reference bundle"
+            )
+        return _ingest_reference(root, meta, args)
     key = run_key(meta)
     if not is_manual(key) and args.trusted_job_prefix:
         if not any(key.startswith(p) for p in args.trusted_job_prefix):
