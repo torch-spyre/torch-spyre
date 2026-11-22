@@ -876,9 +876,9 @@ def test_box_views_of_sharded_fail_in_other_consumers():
 
     with pytest.raises(RuntimeError, match="copies into a view of a sharded"):
         v.copy_(torch.zeros(v.shape, dtype=v.dtype))
-    with pytest.raises(RuntimeError, match="does not support sharded Spyre tensors"):
+    with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
         v.fill_(0)
-    with pytest.raises(RuntimeError, match="does not support sharded Spyre tensors"):
+    with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
         v.zero_()
     with pytest.raises(TypeError, match="does not support views of sharded"):
         torch.spyre.sharding_info(v)
