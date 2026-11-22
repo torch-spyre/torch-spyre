@@ -867,7 +867,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
     The candidate unit test also probes real sibling and nested group IDs
     to prove that the scope gate rejects them before layout inspection.
     """
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_info import LoopInfo
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     groups_seen = set()
@@ -877,8 +877,8 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
         cons_info = getattr(consumer, "loop_info", None)
         if prod_info is None and cons_info is None:
             return
-        assert isinstance(prod_info, CoarseTileInfo)
-        assert isinstance(cons_info, CoarseTileInfo)
+        assert isinstance(prod_info, LoopInfo)
+        assert isinstance(cons_info, LoopInfo)
         assert prod_info.loop_group_id == cons_info.loop_group_id, (
             f"cross-group relayout: {producer.get_name()} "
             f"{prod_info.loop_group_id} -> {consumer.get_name()} "
@@ -911,7 +911,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch, coopt):
         )
         for op in [consumer_op, *(op_by_name.get(name) for name in parent_names)]:
             info = getattr(op, "loop_info", None)
-            if isinstance(info, CoarseTileInfo):
+            if isinstance(info, LoopInfo):
                 groups_seen.add(info.loop_group_id)
         for parent, candidates in out.items():
             if candidates:

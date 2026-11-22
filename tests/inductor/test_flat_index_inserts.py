@@ -12,36 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Where an op inserted "after" an anchor lands, relative to a loop.
+"""Where the copy-back of a slice mutation lands, relative to a loop (stage 8.3/8.5).
 
-A pass handed the flat :class:`OpsView` that inserts at ``index(anchor) + k`` puts the
-op before whatever follows the anchor, in the list that holds THAT op. When the anchor
-is the last op of a loop body the follower is outside the loop, so the op lands outside
-it: the bug #6101 fixed in ``reorder_nonstick_dims_mutation`` (a scatter's copy-back ran
-once, after the loop, while carrying the loop's ``loop_group_id``).
-
-This file records an audit of the other flat-index "insert after" sites:
+An op inserted at ``index(anchor) + k`` of a flat list lands before whatever follows the
+anchor, in the list that holds THAT op. When the anchor is the last op of a loop body the
+follower is outside the loop, so the op lands outside it: the bug #6101 fixed in
+``reorder_nonstick_dims_mutation`` (a scatter's copy-back ran once, after the loop,
+while carrying the loop's ``loop_group_id``). ``OpsView`` no longer edits at all (its
+mutators raise), so a pass names the anchor with ``insert_after`` / ``move_after``.
 
 * ``insert_restickify._bracket_mutation`` (the copy-back after a graph-input slice
-  mutation) used ``index(mutation) + 2``. It now uses ``insert_after``. No compiled graph
-  reaches it with a loop member today (a ``for_each_tile`` body cannot mutate a graph
-  input: Dynamo refuses input mutation in a higher-order op, and a carry initialised
-  from a graph input is copied to an internal buffer, which takes a branch that inserts
-  nothing), so its placement is pinned here on a real tree.
-* ``GraphEditor.push_allocation_with_clone`` with a ``lower_anchor`` (the post-loop
-  drain) inserts at ``index(anchor) + 1`` on purpose: the anchor is the loop's last
-  member and the clone belongs after the loop. That is pinned here so it is not
-  "fixed".
-* ``lx_context_switching``'s restore (``index(target_op) + 1``) is not changed. Its
-  target is an extern kernel, and a body whose extern kernel reads a value the loop
-  writes is refused by the loop scheduler. One that reads only a loop-invariant value
-  does reach the bracket, and the compile then fails in ``compute_ancestors`` for a
-  reason that is not the restore's placement (#6217: placing the restore with
-  ``insert_after`` gives the same error). Not covered here.
-* ``push_allocation_with_clone``'s output clone without a ``lower_anchor`` (placed after
-  ``_last_writer``) is reached only for a graph output with no drain plan
-  (``allocator.py``); a loop's output has one. No loop-member case that reaches it was
-  found, so it is not changed or tested.
+  mutation) places both copies next to the mutation, in the list that holds it. No
+  compiled graph reaches it with a loop member today (a ``for_each_tile`` body cannot
+  mutate a graph input: Dynamo refuses input mutation in a higher-order op, and a carry
+  initialised from a graph input is copied to an internal buffer, which takes a branch
+  that inserts nothing), so its placement is pinned here on a real tree.
+* The allocator's clone placement (``GraphEditor._place_clone``) is pinned in
+  ``test_graph_editor_placement.py``.
+* ``lx_context_switching``'s restore is not changed. Its target is an extern kernel,
+  and a body whose extern kernel reads a value the loop writes is refused by the loop
+  scheduler. One that reads only a loop-invariant value does reach the bracket, and the
+  compile then fails in ``compute_ancestors`` for a reason that is not the restore's
+  placement (#6217). Not covered here.
 """
 
 from types import SimpleNamespace
@@ -53,7 +45,7 @@ import torch
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import insert_restickify
 from torch_spyre._inductor.insert_restickify import _bracket_mutation
-from torch_spyre._inductor.loop_node import LoopNode, OpsView, insert_after
+from torch_spyre._inductor.loop_node import LoopNode, OpsView
 
 
 class _Op:
@@ -87,30 +79,6 @@ def _where(graph, node, op):
     if op in graph.operations:
         return "top level"
     return "nowhere"
-
-
-class TestTheFlatIndexRule:
-    def test_after_the_last_body_op_a_flat_index_lands_outside_the_loop(self):
-        graph, node, body, *_ = _tree()
-        view = OpsView(graph.operations)
-        new = _Op("new")
-        view.insert(list(view).index(body[-1]) + 1, new)
-        assert _where(graph, node, new) == "top level"
-
-    def test_after_a_middle_body_op_a_flat_index_lands_inside(self):
-        graph, node, body, *_ = _tree()
-        view = OpsView(graph.operations)
-        new = _Op("new")
-        view.insert(list(view).index(body[1]) + 1, new)
-        assert _where(graph, node, new) == "inside the loop"
-
-    def test_insert_after_keeps_the_op_next_to_its_anchor(self):
-        graph, node, body, *_ = _tree()
-        view = OpsView(graph.operations)
-        new = _Op("new")
-        insert_after(view, body[-1], new)
-        assert _where(graph, node, new) == "inside the loop"
-        assert node.body[-1] is new
 
 
 class TestBracketMutation:
@@ -160,24 +128,6 @@ class TestBracketMutation:
             "buf_copyback",
             "b",
         ]
-
-
-class TestThePostLoopDrain:
-    """The allocator's clone with a ``lower_anchor`` is meant to land AFTER the loop:
-    the anchor is the loop's last member. Inserting at ``index(anchor) + 1`` through the
-    flat view does that, by the rule above.
-
-    This documents the rule that placement relies on. It exercises ``OpsView.insert``,
-    not ``GraphEditor.push_allocation_with_clone``, so it does not guard the allocator:
-    a change there is not caught here."""
-
-    def test_a_clone_after_the_loops_last_member_lands_after_the_loop(self):
-        graph, node, body, before, after = _tree()
-        view = OpsView(graph.operations)
-        clone = _Op("drain")
-        view.insert(list(view).index(body[-1]) + 1, clone)
-        assert _where(graph, node, clone) == "top level"
-        assert graph.operations == [before, node, clone, after]
 
 
 class TestTheProductionPath:

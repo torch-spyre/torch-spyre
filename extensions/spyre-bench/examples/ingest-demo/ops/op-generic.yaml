@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# profile generic: the keys are the prop names, listed sorted; tags are hashed as given.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-generic}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: ingest-demo-fp16
+  workload: {type: kernel/op, op: add, dtype: fp16, shape: [1, 512], load: {executor: iterations, iterations: 128, warmup_iterations: 16}}
+  run: {repeats: 1, timeout: 30m, est: 2m, isolation: process}
+  identity:
+    mode: ingest
+    profile: generic
+    tags: [domain__demo-ops]
+    discriminators:
+      - {key: iterations, from: case.load.iterations}
+      - {key: op, from: case.op}
+  variants:
+    - name: op_generic_add

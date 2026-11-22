@@ -1,0 +1,197 @@
+[
+ {
+  "in": {
+   "text": "/spyre-bench sanity"
+  },
+  "out": {
+   "flags": {
+    "bench": "sanity"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/bench sanity"
+  },
+  "out": {
+   "flags": {
+    "bench": "sanity"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "please\n/spyre-bench decoder+startup@sanity reuse=only force=a_1\nthanks"
+  },
+  "out": {
+   "flags": {
+    "bench": "decoder+startup@sanity",
+    "force": "a_1",
+    "reuse": "only"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench torch-spyre:a,b budget=3 sha=abcdef123456"
+  },
+  "out": {
+   "flags": {
+    "bench": "torch-spyre:a,b",
+    "budget": "3",
+    "sha": "abcdef123456"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity type=quality"
+  },
+  "out": {
+   "flags": {
+    "bench": "sanity",
+    "type": "quality"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity TEST_TYPE=quality"
+  },
+  "out": {
+   "flags": {
+    "TEST_TYPE": "quality",
+    "bench": "sanity"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity test_type=perf"
+  },
+  "out": {
+   "flags": {
+    "bench": "sanity",
+    "test_type": "perf"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity arch=ppc64le"
+  },
+  "out": {
+   "flags": {
+    "arch": "ppc64le",
+    "bench": "sanity"
+   },
+   "kind": "run"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench confirm"
+  },
+  "out": {
+   "flags": {},
+   "kind": "confirm"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench cancel"
+  },
+  "out": {
+   "flags": {},
+   "kind": "cancel"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench confirm now"
+  },
+  "out": {
+   "error": "'confirm' takes no arguments"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity reuse"
+  },
+  "out": {
+   "error": "'reuse': expected key=value"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench sanity reuse=only reuse=never"
+  },
+  "out": {
+   "error": "flag 'reuse' given twice"
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-benchmark sanity"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "  /spyre-bench sanity"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "> /spyre-bench sanity"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "```\n/spyre-bench sanity\n```"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "<!-- /spyre-bench sanity -->"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "no command here"
+  },
+  "out": {
+   "kind": null
+  }
+ },
+ {
+  "in": {
+   "text": "/spyre-bench"
+  },
+  "out": {
+   "flags": {},
+   "kind": "run"
+  }
+ }
+]

@@ -1239,6 +1239,8 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->reserved_dims = {
       {dim, ReservedDimInfo{min_size, max_size, granularity}}};
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (reserved dim=" << dim
                         << " min=" << min_size << " max=" << max_size
                         << " granularity=" << granularity
@@ -1341,6 +1343,8 @@ at::Tensor spyre_empty_reserved_with_layout(
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->reserved_dims = {
       {dim, ReservedDimInfo{min_size, max_size, granularity}}};
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (explicit, reserved dim=" << dim
                         << " min=" << min_size << " max=" << max_size
                         << " granularity=" << granularity
@@ -1390,6 +1394,8 @@ at::Tensor spyre_empty_with_layout(
                   " must be <= max=", info.max, " at dim ", rdim);
     }
     spyre_tensor_impl->reserved_dims = std::move(*reserved_dims);
+    spyre_tensor_impl->dma_sizes = size.vec();
+    spyre_tensor_impl->dma_strides = stride.vec();
   }
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
@@ -1959,6 +1965,23 @@ std::vector<int64_t> pinned_reserved_layout_size(
     const SpyreTensorImpl& self_impl, const at::Tensor& self,
     c10::IntArrayRef size_int) {
   std::vector<int64_t> layout_size = size_int.vec();
+  if (!self_impl.reserved_dims.empty()) {
+    // reserved_dims keys are absolute dim indices. If the shape, strides or
+    // offset no longer match the allocation, a key can name a different axis
+    // than it did, and every check below would validate the wrong dimension.
+    // That happens after an in-place change (t_, squeeze_, as_strided_, ...)
+    // and on a view that changed the geometry (a slice, a reshape). Fail rather
+    // than trust it; falling through as "unreserved" would reallocate instead.
+    TORCH_CHECK(self_impl.has_intact_reservation(),
+                "resize_ on a max-reserved Spyre tensor: this tensor's shape, "
+                "strides or storage offset no longer match the allocation, so "
+                "the reservation no longer refers to the same axis. This "
+                "happens after an in-place change (t_(), transpose_(), "
+                "squeeze_(), as_strided_()) and on a view that changed the "
+                "geometry (a slice, a reshape). current shape=",
+                self.sizes(), ", shape at allocation=",
+                c10::IntArrayRef(self_impl.dma_sizes));
+  }
   {
     // Scope today: at most one entry, so this loop runs once; the guard is
     // already written per-dim so a later second entry needs no changes here.
@@ -2079,6 +2102,8 @@ const at::Tensor& spyre_resize_(
       (new_numel <= self.numel() || reserved_and_growing) && last_dim_ok) {
     self_impl->set_sizes_contiguous(size_int);
     self_impl->spyre_layout = new_layout;
+    self_impl->dma_sizes = size_int.vec();
+    self_impl->dma_strides = self_impl->strides().vec();
     SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
                           << " layout=" << self_impl->spyre_layout.toString();
     return self;
@@ -2103,24 +2128,87 @@ const at::Tensor& spyre_resize_(
   self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
   self_impl->set_sizes_contiguous(size_int);
   self_impl->spyre_layout = new_layout;
+  self_impl->dma_sizes = size_int.vec();
+  self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();
   return self;
 }
 
+namespace {
+
+// Launch a device-side MEMORY_FILL DMA over one composite address: every
+// stick of it, padding included. createFillAsyncParams converts value to the
+// dtype-specific fill pattern; launchFillAsync submits it.
+void launch_device_fill(const flex::CompositeAddress* addr, double value,
+                        c10::ScalarType scalar_type) {
+  // Map torch dtype to DataFormats for the value->pattern conversion, which
+  // flex::createFillAsyncParams performs internally.
+  DataFormats dtype = get_device_dtype(scalar_type);
+
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
+
+  auto* params =
+      flex::createFillAsyncParams(addr, value, dtype, /*use_dmai=*/true);
+  struct Guard {
+    flex::FillAsyncParams* p;
+    ~Guard() {
+      flex::destroyFillAsyncParams(p);
+    }
+  } guard{params};
+  SpyreStream stream;
+  stream.launchFillAsync(params);
+}
+
+// Fill a sharded tensor one shard at a time: each shard is its own
+// single-chunk allocation, so a fill of each shard view covers the whole
+// tensor. Only whole sharded tensors reach this (views of sharded tensors are
+// rejected when created); the checks mirror copy_sharded's.
+void fill_sharded(const at::Tensor& sharded, double value) {
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
+              "sharded Spyre tensors only support whole-tensor fills");
+  const auto& info = *sharding_of(sharded)->sharding;
+  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "metadata no longer matches the sharded allocation (",
+              sharded.sizes(), " vs ", info.global_shape, ")");
+  TORCH_CHECK(sharded.scalar_type() == info.dtype,
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "dtype no longer matches the sharded allocation (",
+              sharded.scalar_type(), " vs ", info.dtype, ")");
+  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+    at::Tensor shard = spyre_shard_view(sharded, i);
+    launch_device_fill(get_composite_address(shard), value,
+                       shard.scalar_type());
+  }
+}
+
+}  // namespace
+
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   TORCH_CHECK(self.is_privateuseone(),
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
-  // Sharded storage is a table of per-shard allocations whose layout
-  // describes one shard, so the checks below do not apply to it. Reject it
-  // here with the sharding message; get_composite_address would too, but only
-  // after the partial-view check below had misreported it.
-  TORCH_CHECK(!spyre_is_sharded(self),
-              "this operation does not support sharded Spyre tensors yet "
-              "(sharded storage can only be copied to or from the CPU)");
+  // A sharded tensor's layout describes one shard, not the whole tensor, so
+  // the view checks below do not apply to it; fill_sharded fills each shard
+  // and rejects anything but the whole tensor.
+  if (spyre_is_sharded(self)) {
+    fill_sharded(self, value);
+    return self;
+  }
 
   // The device-side MEMORY_FILL below writes every stick of the composite
   // address, i.e. the whole storage, so it is only correct when self covers
@@ -2154,7 +2242,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   const auto* root_impl =
       static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
   int64_t whole_elements = -1;  // -1: unknown, do not check the root
-  if (!root_impl->reserved_dims.empty()) {
+  if (root_impl->has_intact_reservation()) {
     whole_elements = root.numel();
   } else if (!root_impl->spyre_layout.valid_elements.empty()) {
     whole_elements = 1;
@@ -2180,36 +2268,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "). Fill the whole tensor, or fill a CPU copy and copy it "
               "back.");
 
-  // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // flex::createFillAsyncParams performs internally.
-  DataFormats dtype = get_device_dtype(self.scalar_type());
-
-  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
-  // formats. Zero is the all-zero bit pattern in every format, and the fill
-  // writes raw bytes, so a zero fill of fp8 storage can use any supported
-  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
-  // have, so reject it here instead of failing inside the runtime.
-  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
-    TORCH_CHECK(value == 0.0,
-                "fill_ of a float8 Spyre tensor is only supported with the "
-                "value 0 (the device fill has no fp8 pattern); got ",
-                value);
-    dtype = DataFormats::SEN169_FP16;
-  }
-
-  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
-  // to the dtype-specific fill pattern; launchFillAsync submits it.
-  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
-                                             dtype, /*use_dmai=*/true);
-  struct Guard {
-    flex::FillAsyncParams* p;
-    ~Guard() {
-      flex::destroyFillAsyncParams(p);
-    }
-  } guard{params};
-  SpyreStream stream;
-  stream.launchFillAsync(params);
-
+  launch_device_fill(get_composite_address(self), value, self.scalar_type());
   return self;
 }
 

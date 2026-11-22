@@ -110,18 +110,17 @@ class TestReservationResizeGuard(TestCase):
             self.x_dev.resize_((1024,))
 
     def test_resize_after_in_place_transpose_rejected(self) -> None:
-        # t_() swaps the axes and leaves the reservation's dim index alone. The
-        # per-dim check still refuses the resize, since dim 1 would change; this
-        # is no longer the axis-identity guard.
+        # t_() swaps the axes but leaves the reservation's dim index alone,
+        # so resize_ would validate the wrong axis. It must refuse.
         d = self.x_dev.detach()
         d.t_()
-        with self.assertRaisesRegex(RuntimeError, "may only change the reserved dim"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1024, 140))
 
     def test_resize_after_in_place_rank_change_rejected(self) -> None:
         d = self.x_dev.detach()
         d.unsqueeze_(0)
-        with self.assertRaisesRegex(RuntimeError, "may only change the reserved dim"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1, DIM_MAX, 1024))
 
     def test_resize_after_valid_resize_still_allowed(self) -> None:
@@ -293,7 +292,7 @@ class TestReservationWithExplicitLayout(TestCase):
 
     def test_write_after_resize_reads_back(self) -> None:
         # The other half of #6027: a host-to-device write through the pinned
-        # layout with the real size below max, after a shrink, then a read back.
+        # layout with dma_sizes below max, after a shrink, then a read back.
         d = self._declare(C_MAX)
         d.resize_((9, E, 1))
         new_ids = self.ids[:9] + 1000

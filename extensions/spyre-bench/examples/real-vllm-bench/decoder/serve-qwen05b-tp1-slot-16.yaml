@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-qwen05b-tp1-slot-16, description: 'serving a recorded chat dataset (vllm bench serve)', owner: spyre-inference}
+spec:
+  type: perf
+  level: service
+  tier: extended
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/serve}
+  metrics: {required: [llm.ttft.p99, llm.itl.median, llm.output_throughput], headline: [llm.ttft.p99]}
+  run:
+    cache: warm
+    repeats: 1
+    command: [uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --suite, nightly, --bench-types, serve, --tests, "{case}", --results-dir, "{raw_dir}"]
+  est_hours: 1.0
+  identity:
+    mode: ingest
+    profile: vllm
+    name: serve_qwen05b_tp1_slot-16
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: serve}
+      - {key: tensor_parallel, value: 1}
+      - {key: input_len, value: ""}
+      - {key: output_len, value: ""}
+  variants:
+    - name: serve_qwen05b_tp1_slot-16
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: qwen2.5-0.5b-instruct, model: qwen2.5-0.5b-instruct, precision: fp16, tp: 1, flags: {load-format: auto, max-num-seqs: 4, max-num-batched-tokens: 512, max-model-len: 4096}}
+      workload:
+        type: llm/serve
+        endpoint: /v1/completions
+        load: {executor: closed, concurrency: 4, requests: 100}
+        inputs: [{name: prompts, dataset: slot-16}]
+        sampling: {ignore_eos: true}
+        flags: {dataset-name: custom, percentile-metrics: 'ttft,tpot,itl,e2el', metric-percentiles: '99,100'}

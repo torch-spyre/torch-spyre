@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A data-producing benchmark: no SLO, no timing metrics required. It produces the generated Asset the parity case reads.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: reference-outputs-demo-llm-a, owner: example-team}
+spec:
+  type: quality
+  level: service
+  tier: extended
+  system: demo-llm-a-tp1-fp16-mml100
+  workload:
+    type: llm/generate
+    inputs: [{name: prompts, dataset: parity-prompts}]
+    sampling: {temperature: 0, max_tokens: 128}
+    load: {executor: batch, requests: 64}
+    outputs: [{name: outputs, asset: demo-llm-a-reference-outputs, format: jsonl, capture: [prompt_id, text, token_ids, logprobs]}]
+  environment: ref-1card
+  run: {timeout: 30m, est: 10m}
+  relations:
+    - {type: produces, target: demo-llm-a-reference-outputs}
+    - {type: reference_for, target: parity-demo-llm-a}
+  variants:
+    - name: reference_outputs_demoa

@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# One case per distinct decoder System; cold and warm are measured in the same case (cache both).
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: startup-decoder, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: core
+  system: demo-llm-a-tp4-fp16
+  workload: {type: llm/startup, phases: [load, compile, warmup, ready], cache: [cold, warm]}
+  environment: ref-8card-one-node
+  metrics: {required: [llm.startup.cold, llm.startup.warm, spyre.compile.time], headline: [llm.startup.cold]}
+  run: {cache: both, timeout: 60m, est: 15m}
+  derive:
+    from: {suites: [decoder]}
+    per: system
+    name_template: startup_{system.token}_tp{system.tp}_len{system.flags.max-model-len}_seqs{system.flags.max-num-seqs}

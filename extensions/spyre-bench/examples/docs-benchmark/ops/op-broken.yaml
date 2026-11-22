@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Commands that fail on purpose, to practise reading a failed run.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-broken, owner: example-team}
+spec:
+  type: perf
+  level: kernel
+  tier: extended
+  system: op-lib-cpu-fp32
+  workload: {type: kernel/op, op: broken, dtype: fp32, shape: [1], load: {executor: iterations, iterations: 1}}
+  run: {repeats: 1, timeout: 1m}
+  variants:
+    - name: op_fails
+      workload: {type: kernel/op, op: fails, dtype: fp32, shape: [1], load: {executor: iterations, iterations: 1}}
+      run: {command: ["{python}", "-c", "import sys; sys.stderr.write('boom\\n'); sys.exit(3)"]}
+    - name: op_silent
+      workload: {type: kernel/op, op: silent, dtype: fp32, shape: [1], load: {executor: iterations, iterations: 1}}
+      run: {command: ["{python}", "-c", "pass"]}

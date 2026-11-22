@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-mul}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: run-demo-fp16
+  workload: {type: kernel/op, op: mul, dtype: fp16, shape: [1, 512], load: {executor: iterations, iterations: 100, warmup_iterations: 3}}
+  run:
+    repeats: 2
+    timeout: 5m
+    est: 1m
+    isolation: process
+    command: ["{python}", "stub_bench.py", "--op", "{case.op}", "--shape", "{case.shape}", "--raw", "{raw_dir}", "--repeat", "{repeat}", "--out", "{repeat_dir}"]
+  variants:
+    - name: op_mul_fp16
