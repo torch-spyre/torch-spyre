@@ -395,12 +395,16 @@ runs:
         TRIGGER_TYPE_IN: ${{ inputs.trigger-type }}
       run: |
         source "${VENV}/bin/activate"
-        # Resolve host/port and user/password as pairs: the v2 pair when its first member is set, else the old pair.
-        if [ -n "${CH_V2_HOST_IN}" ]; then CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}"; else CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"; fi
-        if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        # Host and login resolve as one unit: a v2 host never receives the deprecated login.
+        if [ -n "${CH_V2_HOST_IN}" ]; then
+          CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}" CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"
+        else
+          CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"
+          if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        fi
         if [ -n "${SCHEMA_IN}" ] && [ "${SCHEMA_IN}" != v2 ]; then echo "::warning::the schema input is deprecated and ignored: writing v2 only"; fi
         if [ -n "${CH_DB_OLD_IN}" ] && [ "${CH_DB_OLD_IN}" != "${CH_DB_V2_IN}" ]; then echo "::warning::the clickhouse-db input is deprecated and ignored: writing to ${CH_DB_V2_IN}"; fi
-        [ -n "${CH_USER_IN}" ] && [ -n "${CH_PASS_IN}" ] || { echo "::error::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass"; exit 1; }
+        [ -n "${CH_USER_IN}" ] && [ -n "${CH_PASS_IN}" ] || { echo "::error::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass (a v2 host never gets the deprecated login)"; exit 1; }
         export CLICKHOUSE_HOST="${CH_HOST_IN}" CLICKHOUSE_V2_HOST="${CH_HOST_IN}"
         export CLICKHOUSE_USER="${CH_USER_IN}" CLICKHOUSE_V2_USER="${CH_USER_IN}"
         export CLICKHOUSE_PASS="${CH_PASS_IN}" CLICKHOUSE_V2_PASSWORD="${CH_PASS_IN}"

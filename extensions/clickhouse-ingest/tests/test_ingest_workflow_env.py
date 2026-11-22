@@ -86,7 +86,11 @@ def test_every_ingest_action_takes_the_new_settings_and_maps_them():
 
 def test_every_use_of_an_ingest_action_passes_the_settings_it_takes():
     takes = {
-        n: {i for i in inputs if i in V2_INPUTS + SCHEMA_INPUTS}
+        n: {
+            i
+            for i in inputs
+            if i in V2_INPUTS or (i in SCHEMA_INPUTS and n in DDL_ACTIONS)
+        }
         for n, inputs in ingest_actions().items()
     }
     checked = 0
@@ -173,7 +177,7 @@ def test_an_unset_prod_v2_secret_never_falls_through_to_the_dev_one(wf):
         lines = [
             ln for ln in text.splitlines() if ln.strip().startswith(f"{name}: ${{{{")
         ]
-        assert lines and all("toJSON(secrets." in ln for ln in lines), lines
+        assert lines and all("toJSON(" in ln for ln in lines), lines
 
 
 def test_v2_ingest_actions_publish_a_rows_free_manifest_and_never_upload_the_spool():

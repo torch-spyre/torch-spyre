@@ -101,8 +101,11 @@ def ingest(action, tmp_path, inputs, fake_exit=0):
 @pytest.mark.parametrize("name, inputs, host, user, port", [
     ("old inputs only", OLD, "old.host", "old", "1111"),
     ("v2 inputs only", NEW, "new.host", "new", "2222"),
-    ("mixed: pairs resolve together", {**OLD, "clickhouse-v2-host": "new.host", "clickhouse-v2-pass": "newpw"},
-     "new.host", "old", None),
+    ("a v2 host takes the v2 login and port, never the deprecated ones", {**OLD, **NEW}, "new.host", "new", "2222"),
+    ("a v2 host without a v2 port does not inherit the deprecated port", {**OLD, **NEW, "clickhouse-v2-port": ""},
+     "new.host", "new", None),
+    ("a deprecated host with a v2 login keeps its own port", {**OLD, "clickhouse-v2-user": "new",
+     "clickhouse-v2-pass": "newpw"}, "old.host", "new", "1111"),
 ])  # fmt: skip
 def test_the_effective_connection_per_caller_shape(
     tmp_path, action, name, inputs, host, user, port
@@ -149,6 +152,20 @@ def test_a_non_v2_schema_warns_and_is_ignored(tmp_path, action):
 
 
 @pytest.mark.parametrize("action", [XML, HW])
+@pytest.mark.parametrize("v2", [{}, {"clickhouse-v2-pass": "newpw"}])
+def test_a_v2_host_never_receives_the_deprecated_login(tmp_path, action, v2):
+    inputs = {**OLD, "clickhouse-v2-host": "dev.host", **v2}
+    rc, seen, out = ingest(action, tmp_path, inputs)
+    assert rc != 0 and not seen and "login is missing" in out
+
+
+@pytest.mark.parametrize("action", [XML, HW])
+def test_a_v2_host_with_its_own_login_ignores_the_deprecated_one(tmp_path, action):
+    rc, seen, _ = ingest(action, tmp_path, {**OLD, **NEW})
+    assert rc == 0 and seen["CLICKHOUSE_USER"] == "new" and seen["CLICKHOUSE_PASS"] == "newpw"  # fmt: skip
+
+
+@pytest.mark.parametrize("action", [XML, HW])
 def test_a_v2_user_with_only_the_old_password_is_not_a_mixed_pair(tmp_path, action):
     inputs = {
         "clickhouse-v2-host": "h",
@@ -178,7 +195,8 @@ def test_xml_passes_strict_unless_strict_is_false(tmp_path):
         assert ("--strict" in (d / "argv").read_text().split()) is want
 
 
-def test_v2_artifact_overrides_the_callers_job_env(tmp_path):
+def run_v2_artifact(tmp_path, inputs):
+    """The ensure step as GitHub runs it (`bash --noprofile --norc -eo pipefail`), with a fake interpreter."""
     action = ACTIONS / "v2-artifact/action.yml"
     s = next(
         x
@@ -188,34 +206,71 @@ def test_v2_artifact_overrides_the_callers_job_env(tmp_path):
     (tmp_path / "venv/bin").mkdir(parents=True)
     py = tmp_path / "venv/bin/python"
     py.write_text(
-        '#!/bin/bash\nenv | grep -E "^CLICKHOUSE_" | sort > "$ENV_OUT"\necho "{}"\n'
+        '#!/bin/bash\nenv | grep -E "^CLICKHOUSE_" | sort > "$ENV_OUT"\nprintf "%s\\n" "$@" >> "$ENV_OUT.argv"\necho "{}"\n'
     )
     py.chmod(0o755)
-    env = env_of(
-        s,
-        {
-            "clickhouse-v2-host": "new.host",
-            "clickhouse-v2-user": "new",
-            "clickhouse-v2-pass": "newpw",
-        },
-    )
+    env = env_of(s, inputs)
     env.update(VENV=str(tmp_path / "venv"), PATH="/usr/bin:/bin", ENV_OUT=str(tmp_path / "seen"),
                GITHUB_OUTPUT=str(tmp_path / "o"), GITHUB_STEP_SUMMARY=str(tmp_path / "sum"),
                CLICKHOUSE_V2_HOST="evil.host", CLICKHOUSE_V2_USER="evil", CLICKHOUSE_V2_PASSWORD="evilpw",
                CLICKHOUSE_V2_PORT="9", CLICKHOUSE_PORT="9")  # fmt: skip
     r = subprocess.run(
-        ["bash", "-c", s["run"]], env=env, cwd=tmp_path, capture_output=True, text=True
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", s["run"]],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    seen_file = tmp_path / "seen"
+    seen = dict(ln.split("=", 1) for ln in seen_file.read_text().splitlines()) if seen_file.exists() else {}  # fmt: skip
+    return r, seen
+
+
+def test_v2_artifact_overrides_the_callers_job_env(tmp_path):
+    # Every multi-line input is empty here: repeat() must not return 1 and kill the -e step.
+    r, seen = run_v2_artifact(
+        tmp_path,
+        {"artifact": "id:x", "arch": "x86_64", **NEW, "clickhouse-v2-port": ""},
     )
     assert r.returncode == 0, r.stdout + r.stderr
-    seen = dict(
-        line.split("=", 1) for line in (tmp_path / "seen").read_text().splitlines()
-    )
     assert seen["CLICKHOUSE_V2_HOST"] == seen["CLICKHOUSE_HOST"] == "new.host"
     assert (
         seen["CLICKHOUSE_V2_USER"] == "new"
         and seen["CLICKHOUSE_V2_PASSWORD"] == "newpw"
     )
     assert "CLICKHOUSE_PORT" not in seen and "CLICKHOUSE_V2_PORT" not in seen
+
+
+def test_v2_artifact_passes_each_non_empty_line_once(tmp_path):
+    r, _ = run_v2_artifact(
+        tmp_path,
+        {
+            "artifact": "id:x",
+            "arch": "x86_64",
+            **NEW,
+            "tag": "a\n\n  b  \n",
+            "source": "",
+        },
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = (tmp_path / "seen.argv").read_text().split("\n")
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--tag"] == ["a", "b"]
+    assert "--source" not in argv
+
+
+@pytest.mark.parametrize("v2", [{}, {"clickhouse-v2-pass": "newpw"}])
+def test_v2_artifact_never_sends_the_deprecated_login_to_a_v2_host(tmp_path, v2):
+    r, seen = run_v2_artifact(
+        tmp_path,
+        {
+            "artifact": "id:x",
+            "arch": "x86_64",
+            **OLD,
+            "clickhouse-v2-host": "dev.host",
+            **v2,
+        },
+    )
+    assert r.returncode != 0 and not seen and "login is missing" in r.stdout
 
 
 def test_the_actions_write_v2_even_when_the_job_sets_ingest_schema_both(tmp_path):
@@ -248,3 +303,24 @@ def test_the_hw_script_passes_strict_unless_strict_is_false(tmp_path):
         d.mkdir()
         ingest(HW, d, {**NEW, "strict": strict})
         assert ("--strict" in (d / "seen.argv").read_text().split()) is want
+
+
+def test_the_hw_action_run_blocks_interpolate_no_expression():
+    for st in yaml.safe_load(HW.read_text())["runs"]["steps"]:
+        assert "${{" not in st.get("run", ""), st.get("name")
+
+
+@pytest.mark.parametrize(
+    "table, ok",
+    [
+        ("my_table", True),
+        ("spyre.t", False),
+        ("t; DROP TABLE x", False),
+        ("$(id)", False),
+    ],
+)
+def test_the_hw_table_input_must_be_an_identifier(tmp_path, table, ok):
+    rc, _, out = ingest(HW, tmp_path, {**NEW, "table": table})
+    argv = (tmp_path / "seen.argv").read_text().split() if ok else []
+    assert (rc == 0) is ok
+    assert ("--table" in argv) is ok and (ok or "plain SQL identifier" in out)  # fmt: skip

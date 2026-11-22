@@ -114,6 +114,14 @@ inputs:
     description: Deprecated and ignored (the legacy database); everything is written to clickhouse-db-v2.
     required: false
     default: ''
+  clickhouse-schema-user:
+    description: Deprecated and ignored (CI runs no DDL); kept so older callers raise no unexpected-input warning.
+    required: false
+    default: ''
+  clickhouse-schema-pass:
+    description: Deprecated and ignored, see clickhouse-schema-user.
+    required: false
+    default: ''
   schema:
     description: Deprecated and ignored; the schema is always v2.
     required: false
@@ -235,17 +243,29 @@ runs:
         SCHEMA_IN: ${{ inputs.schema }}
         STRICT_IN: ${{ inputs.strict }}
         RUN_URL_IN: ${{ inputs.run-url }}
+        SERVER_URL: ${{ github.server_url }}
+        TABLE_IN: ${{ inputs.table }}
+        THREADED_RUN_ID_IN: ${{ inputs.threaded-run-id }}
+        COMPONENT_IN: ${{ inputs.component }}
+        ARCH_IN: ${{ inputs.arch }}
+        JENKINS_RUN_KEY_IN: ${{ inputs.jenkins-run-key }}
+        TRIGGER_TYPE_IN: ${{ inputs.trigger-type || inputs.workflow-name }}
+        ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
         REPO: ${{ inputs.repository || github.repository }}
         RUN_ID: ${{ inputs.gha-run-id }}
       run: |
         set -euo pipefail
         source .venv/bin/activate
-        # Resolve host/port and user/password as pairs: the v2 pair when its first member is set, else the old pair.
-        if [ -n "${CH_V2_HOST_IN}" ]; then CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}"; else CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"; fi
-        if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        # Host and login resolve as one unit: a v2 host never receives the deprecated login.
+        if [ -n "${CH_V2_HOST_IN}" ]; then
+          CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}" CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"
+        else
+          CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"
+          if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        fi
         if [ -n "${SCHEMA_IN}" ] && [ "${SCHEMA_IN}" != v2 ]; then echo "::warning::the schema input is deprecated and ignored: writing v2 only"; fi
         if [ -n "${CH_DB_OLD_IN}" ] && [ "${CH_DB_OLD_IN}" != "${CH_DB_V2_IN}" ]; then echo "::warning::the clickhouse-db input is deprecated and ignored: writing to ${CH_DB_V2_IN}"; fi
-        [ -n "${CH_USER_IN}" ] && [ -n "${CH_PASS_IN}" ] || { echo "::error::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass"; exit 1; }
+        [ -n "${CH_USER_IN}" ] && [ -n "${CH_PASS_IN}" ] || { echo "::error::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass (a v2 host never gets the deprecated login)"; exit 1; }
         export CLICKHOUSE_HOST="${CH_HOST_IN}" CLICKHOUSE_V2_HOST="${CH_HOST_IN}"
         export CLICKHOUSE_USER="${CH_USER_IN}" CLICKHOUSE_V2_USER="${CH_USER_IN}"
         export CLICKHOUSE_PASS="${CH_PASS_IN}" CLICKHOUSE_V2_PASSWORD="${CH_PASS_IN}"
@@ -253,21 +273,24 @@ runs:
         unset CLICKHOUSE_PORT CLICKHOUSE_V2_PORT
         [ -z "${CH_PORT_IN}" ] || export CLICKHOUSE_PORT="${CH_PORT_IN}" CLICKHOUSE_V2_PORT="${CH_PORT_IN}"
         export INGEST_SCHEMA=v2
-        RUN_URL="${RUN_URL_IN:-${{ github.server_url }}/${REPO}/actions/runs/${RUN_ID}}"
+        RUN_URL="${RUN_URL_IN:-${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}}"
         TABLE_ARGS=()
         [ "${STRICT_IN}" = false ] || TABLE_ARGS+=(--strict)
-        [ -n "${{ inputs.table }}" ] && TABLE_ARGS+=(--table "${{ inputs.table }}")
+        if [ -n "${TABLE_IN}" ]; then
+          [[ "${TABLE_IN}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "::error::the table input must be a plain SQL identifier"; exit 1; }
+          TABLE_ARGS+=(--table "${TABLE_IN}")
+        fi
         rc=0
         python3 "${ROOT}/.github/scripts/ingest_hw_diagnostics.py" \
           --json-file      "${JSON_FILE}" \
-          --run-id         "${{ inputs.threaded-run-id }}" \
-          --component      "${{ inputs.component }}" \
-          --arch           "${{ inputs.arch }}" \
+          --run-id         "${THREADED_RUN_ID_IN}" \
+          --component      "${COMPONENT_IN}" \
+          --arch           "${ARCH_IN}" \
           --gha-run-id     "${RUN_ID}" \
-          --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
-          --trigger-type   "${{ inputs.trigger-type || inputs.workflow-name }}" \
+          --jenkins-run-key "${JENKINS_RUN_KEY_IN}" \
+          --trigger-type   "${TRIGGER_TYPE_IN}" \
           --run-url        "${RUN_URL}" \
-          --artifact-id    "${{ inputs.artifact-id }}" \
+          --artifact-id    "${ARTIFACT_ID_IN}" \
           ${TABLE_ARGS[@]+"${TABLE_ARGS[@]}"} || rc=$?
         # strict=false: parked rows (exit 75) are a warning, not a failed step.
         if [ "${rc}" -eq 75 ] && [ "${STRICT_IN}" = false ]; then
