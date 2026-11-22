@@ -22,7 +22,7 @@ See docs/tools/README.md for usage. In short:
 
 Set SPYRE_LOG_PASSES=splice_while_loops (or another pass name, or "all")
 together with --debug to additionally dump per-pass IR snapshots, e.g.
-immediately after splice_while_loops stamps loop_info and before later
+immediately after splice_while_loops builds the loop node and before later
 passes (split_multi_ops, stickification, work division, scratchpad
 planning) touch anything.
 """
