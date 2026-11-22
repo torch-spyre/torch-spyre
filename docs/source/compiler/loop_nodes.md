@@ -47,23 +47,17 @@ structure carries the loop from the first pass after the lowering to codegen.
 
 Two lowerings produce loops. Both end by building nodes:
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false}}}%%
-flowchart TD
-    A["for_each_tile call"] -->|splice_while_loops| C
-    B["span-overflow or allocator tiling"] -->|tile_groups| C
-    C["ops with a LoopMember"] -->|build nodes| D
-    D["LoopNode in graph.operations"] --> E["pre-scheduling passes"]
-    E -->|hand off| F["LoopSchedulerNode"]
-    F -->|SpyreKernel| G["LoopSpec"]
-    G -->|codegen| H["scf.for in bundle.mlir"]
-```
+:::{figure} ../_static/images/wsr/loop-node-pipeline.svg
+:alt: From a lowering to a LoopNode, a LoopSchedulerNode, a LoopSpec and an scf.for
+:width: 60%
+:align: center
 
-Read the boxes as: the lowering's build-time record on each op (`C`), the node
-that owns the loop facts (`D`), passes that read with `loop_facts`, edit with the
-`loop_node` helpers and are checked by `loop_checker` (`E`), one scheduler node per
-loop (`F`), the serializable tree (`G`), and the loop with late-bound addresses
-(`H`).
+Both lowerings put a `LoopMember` on each op; the node build turns those into one
+`LoopNode`, which owns the loop facts. The passes read it with `loop_facts`, edit it
+with the `loop_node` helpers and are checked by `loop_checker`. It is handed to the
+scheduler as one `LoopSchedulerNode`, becomes one `LoopSpec` in codegen, and is
+emitted as an `scf.for` with late-bound addresses.
+:::
 
 | Stage | Loop identity | Form |
 |---|---|---|

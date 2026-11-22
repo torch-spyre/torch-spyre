@@ -80,24 +80,17 @@ after the outer body is spliced is also lowered. A `WhileLoop` that does
 not prove out as a tile scan is left in place for the upstream default
 path.
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false}}}%%
-flowchart TD
-    A["for_each_tile WhileLoop"] --> B{"bounded tile scan?"}
-    B -->|yes| C["splice the body"]
-    C --> D["synthesize dim hints"]
-    D --> E["build a LoopNode"]
-    E --> F{"WhileLoop left?"}
-    F -->|"yes (nested)"| B
-    F -->|no| G["continue pre-scheduling"]
-    B -->|no| H["leave for upstream path"]
-```
+:::{figure} ../_static/images/wsr/for-each-tile-lowering.svg
+:alt: Flow of the splice_while_loops pass proving, splicing, and wrapping a for_each_tile WhileLoop in a LoopNode, then re-running to a fixed point for nested loops
+:width: 70%
+:align: center
 
 `splice_while_loops` proves each `for_each_tile` `WhileLoop`, splices its
 body into the enclosing graph, and wraps the spliced body in a `LoopNode`. The
 pass re-runs until no `WhileLoop` remains, so a nested `for_each_tile` is lowered
 once its enclosing body has been spliced. A `WhileLoop` that does not prove
 out as a tile scan is left for the upstream default path.
+:::
 
 | # | Pass | Module | Notes |
 |---|---|---|---|
