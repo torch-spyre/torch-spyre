@@ -26,7 +26,7 @@ missing unless BENCH_OPTIONAL is set (and BENCH_REQUIRED is not). Kernel names a
 """
 
 import argparse
-import re
+import regex as re
 import json
 import os
 import subprocess

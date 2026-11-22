@@ -27,8 +27,7 @@ make bench-list bench-plan bench-run bench-verdict bench-smoke bench-report
 make bench-nightly-smoke                 # plan -> run -> verdict -> report with the stub, no cards
 ```
 
-These targets require the `spyre-bench` package. Until torch-spyre#6298 is merged, install it from that PR
-branch; afterwards from `main`:
+These targets require the `spyre-bench` package:
 
 ```bash
 uv pip install 'spyre-bench @ git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/spyre-bench'
