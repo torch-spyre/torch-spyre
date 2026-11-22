@@ -595,10 +595,12 @@ _V2_BENCH_ID_KEYS = (
 _BENCH_TABLES = (schema_model.BENCHMARKS, schema_model.BENCHMARK_RUNS)
 
 
-def _v2_unavailable(failed: list, name: str, db: str) -> None:
+def _v2_unavailable(
+    failed: list, name: str, db: str, tables: str = "benchmark"
+) -> None:
     failed.append(name)
     print(
-        f"  [error] {name} not written: the {db} benchmark tables are absent, incomplete "
+        f"  [error] {name} not written: the {db} {tables} tables are absent, incomplete "
         "or not readable by this login",
         file=sys.stderr,
     )
@@ -2027,6 +2029,12 @@ def main(argv=None, assigned_trust=""):
             "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
             file=sys.stderr,
         )
+        if args.strict and not args.write_v1:
+            print(
+                "  [error] v2: --strict, and no v2 database is configured",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     client.command("SELECT 1")
     print("Connected.\n")
     if args.purpose and not v2db:
@@ -2140,6 +2148,8 @@ def main(argv=None, assigned_trust=""):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
+                    if not args.write_v1:
+                        v2_failed_files.append(xml_path.name)
                     _purpose_skipped(args, "no v2 run id could be derived")
                 elif benchmarks_already_ingested(
                     client,
@@ -2175,6 +2185,14 @@ def main(argv=None, assigned_trust=""):
                             file=sys.stderr,
                         )
                         _purpose_skipped(args, "its v2 rows were parked")
+                    except Exception as _v2_err:
+                        v2_failed_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 write failed: {_v2_err!r}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 write failed")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
@@ -2240,6 +2258,8 @@ def main(argv=None, assigned_trust=""):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
+                    if not args.write_v1:
+                        v2_failed_files.append(xml_path.name)
                     _purpose_skipped(args, "no v2 run id could be derived")
                 elif benchmarks_already_ingested(
                     client,
@@ -2275,6 +2295,14 @@ def main(argv=None, assigned_trust=""):
                             file=sys.stderr,
                         )
                         _purpose_skipped(args, "its v2 rows were parked")
+                    except Exception as _v2_err:
+                        v2_failed_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 write failed: {_v2_err!r}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 write failed")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
@@ -2360,7 +2388,15 @@ def main(argv=None, assigned_trust=""):
             # abort the loop and drop every remaining file's v1 insert.
             _v2_run_id = ""
             try:
-                if v2db and tables_present(client, v2db):
+                if v2db and not tables_present(client, v2db):
+                    if not args.write_v1:
+                        _v2_unavailable(
+                            v2_failed_files,
+                            xml_path.name,
+                            v2db,
+                            "functional-test (test_cases, test_case_runs)",
+                        )
+                elif v2db:
                     _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
                     _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
                     _v2_run_id = run_id_for(
@@ -2376,6 +2412,8 @@ def main(argv=None, assigned_trust=""):
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
+                        if not args.write_v1:
+                            v2_failed_files.append(xml_path.name)
                     elif not args.run_attempt and TestResultWriter.rows_of_file(
                         client,
                         v2db,

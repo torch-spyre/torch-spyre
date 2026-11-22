@@ -111,3 +111,81 @@ def test_a_failed_v2_write_exits_only_under_strict(
 def test_the_default_schema_is_v2(monkeypatch):
     monkeypatch.delenv("INGEST_SCHEMA", raising=False)
     assert results.build_parser().parse_args(["--xml-dir", "x"]).schema == "v2"
+
+
+def _code(monkeypatch, tmp_path, xml, client, *args, **kw):
+    try:
+        ingest(monkeypatch, tmp_path, xml, client, *args, **kw)
+        return 0
+    except SystemExit as e:
+        return e.code
+
+
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_missing_functional_tables_are_a_failed_v2_write_not_a_silent_skip(
+    monkeypatch, tmp_path, capsys, flags, code
+):
+    rc = _code(
+        monkeypatch,
+        tmp_path,
+        JUNIT,
+        Client(tables=False),
+        *flags,
+        "--schema",
+        "v2",
+        tier="regression",
+    )
+    assert rc == code
+    assert "test_cases, test_case_runs) tables are absent" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_an_underivable_run_id_is_a_failed_v2_write(
+    monkeypatch, tmp_path, capsys, flags, code
+):
+    monkeypatch.setattr(results, "run_id_for", lambda *a, **k: "")
+    rc = _code(
+        monkeypatch,
+        tmp_path,
+        JUNIT,
+        Client(),
+        *flags,
+        "--schema",
+        "v2",
+        tier="regression",
+    )
+    assert rc == code
+    assert "run_id not derivable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_schema_v2_without_a_v2_database_fails_under_strict(
+    monkeypatch, tmp_path, flags, code
+):
+    rc = _code(
+        monkeypatch,
+        tmp_path,
+        JUNIT,
+        Client(),
+        *flags,
+        "--schema",
+        "v2",
+        tier="regression",
+        db_v2="",
+    )
+    assert rc == code
+
+
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_a_refused_benchmark_insert_is_a_failed_v2_write(
+    monkeypatch, tmp_path, capsys, flags, code
+):
+    from spyre_clickhouse_ingest.batching import BatchFailed
+
+    def refuse(*a, **k):
+        raise BatchFailed("refused", 0, 1)
+
+    monkeypatch.setattr(results, "insert_benchmarks", refuse)
+    rc = _code(monkeypatch, tmp_path, PERF, Client(), *flags, "--schema", "v2")
+    assert rc == code
+    assert "v2 write failed" in capsys.readouterr().err
