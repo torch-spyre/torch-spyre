@@ -32,6 +32,10 @@ MULTI_RUNNER = "spyre_pf_x2"
 # generate_matrix's config_root (which can point at a subdir, e.g. model_ops_tests).
 MULTI_CONFIG_ROOT = "tests/configs"
 
+# _test_matrix.yaml's legs_complete job: `name:` there must keep matching this, or the
+# early wave polls to its deadline instead of stopping when the matrix finishes.
+FANIN_JOB_NAME = "Test matrix fan-in ({call_id})"
+
 
 def _report_stem(config: str) -> str:
     """`basename "${CONFIG%.yaml}"`, the shell the test jobs use to name a report."""
@@ -96,11 +100,30 @@ def build_matrix(
         if entry_key(entry) in seen:
             continue
         seen.add(entry_key(entry))
-        # A missing runner label would leave `runs-on` unsatisfiable and the leg would
-        # hang until the job timeout instead of failing loudly.
-        assert entry["runner"], f"no runner label for {entry['name']!r}"
         entries.append(entry)
     return entries
+
+
+TRANSIENT_HTTP_CODES = ("429", "502", "503", "504")
+
+
+def _gh(args: list, max_attempts: int = 5, base_delay: int = 2, text: bool = False):
+    """`gh api`, retrying only a transient 5xx or a rate-limit 429.
+
+    Same idiom as download_run_xml_artifacts.py. Retrying a permanent 404 would just burn
+    the budget a real 502 needs, so only these codes are retried.
+    """
+    for attempt in range(1, max_attempts + 1):
+        result = subprocess.run(["gh", "api", *args], capture_output=True, text=text)
+        if result.returncode == 0:
+            return result
+        err = result.stderr if text else result.stderr.decode("utf-8", "replace")
+        if not any(c in err for c in TRANSIENT_HTTP_CODES) or attempt == max_attempts:
+            raise RuntimeError(f"gh api {args[0]} failed: {err.strip()}")
+        delay = base_delay * (2 ** (attempt - 1))
+        print(f"[retry] gh api attempt {attempt}/{max_attempts}, again in {delay}s")
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def list_artifacts(repo: str, run_id: str):
@@ -112,17 +135,13 @@ def list_artifacts(repo: str, run_id: str):
     retried and the gate would report green. --paginate applies --jq per page and
     concatenates (gh rejects --slurp with --jq), so parse a per-object JSON stream.
     """
-    listing = subprocess.run(
+    listing = _gh(
         [
-            "gh",
-            "api",
             "--paginate",
             f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
             "--jq",
             ".artifacts[] | {id: .id, name: .name}",
         ],
-        capture_output=True,
-        check=True,
         text=True,
     )
     return {
@@ -135,11 +154,7 @@ def download_suites(repo: str, names_to_ids: dict, out_dir: Path):
     """Each named descriptor artifact's suite.json, in sorted-by-name order."""
     suites = []
     for name in sorted(names_to_ids):
-        result = subprocess.run(
-            ["gh", "api", f"/repos/{repo}/actions/artifacts/{names_to_ids[name]}/zip"],
-            capture_output=True,
-            check=True,
-        )
+        result = _gh([f"/repos/{repo}/actions/artifacts/{names_to_ids[name]}/zip"])
         dest = out_dir / name
         dest.mkdir(parents=True, exist_ok=True)
         zip_path = out_dir / f"{name}.zip"
@@ -174,32 +189,68 @@ def select(artifacts: dict, prefix: str):
     return single, multi
 
 
-def wait_for_failure(repo, run_id, prefix, marker, poll_secs, deadline_secs):
+def fanin_complete(repo: str, run_id: str, attempt: str, job_name: str) -> bool:
+    """Has _test_matrix.yaml's fan-in job finished, i.e. is every test leg done?
+
+    Read off the job's own completion rather than anything it uploads: an artifact is one
+    more thing that can fail to appear, and a poller that misses the end of the matrix
+    stalls the final wave behind it. The name carries generate_matrix's call_id, so a run
+    holding two calls of this workflow (runtests_nightly.yaml) matches only its own; the
+    attempts endpoint scopes it to this attempt. A rename here is caught by
+    tests/test_collect_retry_suites.py, and bounded by --deadline-secs regardless.
+    """
+    jobs = _gh(
+        [
+            "--paginate",
+            f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+            "--jq",
+            ".jobs[] | {name: .name, status: .status}",
+        ],
+        text=True,
+    )
+    return any(
+        job_name in obj["name"] and obj["status"] == "completed"
+        for obj in (json.loads(ln) for ln in jobs.stdout.splitlines() if ln.strip())
+    )
+
+
+def wait_for_failure(
+    repo, run_id, attempt, prefix, fanin_job, poll_secs, deadline_secs
+):
     """Poll until the first descriptor appears, the matrix fans in, or the deadline passes.
 
-    Returning at the first failure is the point of the early wave. Returning on `marker`
-    (the fan-in job's artifact) is what keeps a green run fast: without it this would poll
-    to the deadline on every run that never fails.
+    Returning at the first failure is the point of the early wave. Returning on the fan-in
+    is what keeps a green run fast: without it this would poll to the deadline on every
+    run that never fails, and the final wave waits on this job.
 
-    A visible marker means every leg has finished, and a leg uploads its descriptor before
-    it finishes, so no failure is still in flight -- at worst an upload is not yet visible
+    Fan-in means every leg has finished, and a leg uploads its descriptor before it
+    finishes, so no failure is still in flight -- at worst an upload is not yet visible
     through the eventually-consistent artifacts API, and the final wave, which lists again
     after the fan-in, picks it up.
+
+    An API call that fails outright is logged and polled again rather than raised: the
+    whole of this wave is a head start, so losing it to one 502 an hour into a run would
+    be a poor trade. Only the deadline gives up, and the final wave still retries every
+    failed suite.
     """
     deadline = time.monotonic() + deadline_secs
+    artifacts: dict = {}
     while True:
-        artifacts = list_artifacts(repo, run_id)
-        single, multi = select(artifacts, prefix)
-        if single or multi:
-            print(
-                f"First failure(s) visible: {len(single)} single, {len(multi)} multi."
-            )
-            return artifacts
-        if marker in artifacts:
-            print(
-                "Test matrix fanned in with no failed-suite descriptor; nothing to do."
-            )
-            return artifacts
+        try:
+            artifacts = list_artifacts(repo, run_id)
+            single, multi = select(artifacts, prefix)
+            if single or multi:
+                print(
+                    f"First failure(s) visible: {len(single)} single, {len(multi)} multi."
+                )
+                return artifacts
+            if fanin_complete(repo, run_id, attempt, fanin_job):
+                print(
+                    "Test matrix fanned in with no failed-suite descriptor; nothing to do."
+                )
+                return artifacts
+        except (RuntimeError, OSError, ValueError) as err:
+            print(f"::warning::Could not read the run's state, retrying: {err}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             # Safety valve only: the final wave still retries everything that failed.
@@ -214,10 +265,9 @@ def wait_for_failure(repo, run_id, prefix, marker, poll_secs, deadline_secs):
 def build_parser() -> argparse.ArgumentParser:
     """The CLI.
 
-    The flag-carrying options (--extra-test-flags, --extra-test-flags-multi) hold values
-    that start with a dash -- "-v" on a PR, "--cpu-compile -vvv -s" on nightly -- which
-    argparse reads as another option unless the caller uses the --opt=value form. The
-    workflow spells those two that way; tests/test_collect_retry_suites.py pins it.
+    --extra-test-flags and --extra-test-flags-multi carry values that start with a dash
+    ("-v", "--cpu-compile -vvv -s"), which argparse reads as another option unless the
+    caller uses the --opt=value form. Every caller must spell those two that way.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="owner/repo")
@@ -244,24 +294,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wait-for-failure",
         action="store_true",
-        help="Early wave: poll until the first failure, the fan-in marker, or the deadline",
+        help="Early wave: poll until the first failure, the fan-in, or the deadline",
+    )
+    parser.add_argument(
+        "--fanin-job-name",
+        default=FANIN_JOB_NAME,
+        help=(
+            "Display name of _test_matrix.yaml's fan-in job, whose completion means every "
+            "test leg is done. '{call_id}' is substituted"
+        ),
     )
     parser.add_argument(
         "--poll-secs",
         type=int,
         default=60,
         help=(
-            "Seconds between artifact listings. A minute is deliberately unhurried: the "
-            "retry it starts takes many minutes, so finer polling buys noise, while "
-            "GITHUB_TOKEN's REST budget is per repository per hour and nightly runs two "
-            "of these pollers at once alongside the rest of CI."
+            "Seconds between artifact listings. A minute: the retry it starts takes "
+            "many minutes, and GITHUB_TOKEN's REST budget is per repository per hour."
         ),
     )
     parser.add_argument(
         "--deadline-secs",
         type=int,
-        default=4 * 60 * 60,
-        help="Cap on --wait-for-failure polling; the final wave covers whatever is missed",
+        default=90 * 60,
+        help=(
+            "Cap on --wait-for-failure polling. Bounds how long the poller can idle if "
+            "it never sees the fan-in; the final wave covers whatever is missed"
+        ),
     )
     parser.add_argument(
         "--exclude-matrix",
@@ -275,13 +334,18 @@ def main() -> None:
     args = build_parser().parse_args()
 
     prefix = f"{args.call_id}-{args.run_attempt}-"
-    marker = f"legs-complete-{args.call_id}-{args.run_attempt}"
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.wait_for_failure:
         artifacts = wait_for_failure(
-            args.repo, args.run_id, prefix, marker, args.poll_secs, args.deadline_secs
+            args.repo,
+            args.run_id,
+            args.run_attempt,
+            prefix,
+            args.fanin_job_name.format(call_id=args.call_id),
+            args.poll_secs,
+            args.deadline_secs,
         )
     else:
         artifacts = list_artifacts(args.repo, args.run_id)

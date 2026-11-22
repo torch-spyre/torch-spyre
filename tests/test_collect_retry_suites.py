@@ -225,7 +225,7 @@ def test_same_named_suites_on_different_configs_both_retry(collect):
 
 def test_a_descriptor_with_no_runner_is_still_schedulable(collect):
     # An entry with an empty runner label would leave `runs-on` unsatisfiable and the leg
-    # would hang until the job timeout instead of failing loudly.
+    # would sit unscheduled until the job timeout.
     entries = build(
         collect, singles=[{"name": "Eager", "config": "eager.yaml", "runner": ""}]
     )
@@ -280,9 +280,68 @@ def test_select_scopes_to_this_call_and_attempt(collect):
         "failed-suite-def456-1-0": 4,
         # An earlier attempt, whose artifacts outlive it.
         "failed-suite-abc123-2-0": 5,
-        "legs-complete-abc123-1": 6,
-        "test_spyre_config.xml": 7,
+        "test_spyre_config.xml": 6,
     }
     single, multi = collect.select(artifacts, "abc123-1-")
     assert sorted(single) == ["failed-suite-abc123-1-0", "failed-suite-abc123-1-7"]
     assert sorted(multi) == ["failed-suite-multi-abc123-1-3"]
+
+
+# ---------------------------------------------------------------------------
+# The couplings to _test_matrix.yaml that a one-sided edit would silently break.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def collector_steps():
+    """The `run:` body of every step in _test_matrix.yaml that invokes the collector."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "_test_matrix.yaml").read_text()
+    )
+    # The invocation, not a mention: another job's comment names the script too.
+    invocation = "python3 .github/scripts/collect_retry_suites.py"
+    steps = [
+        step.get("run", "")
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if invocation in step.get("run", "")
+    ]
+    # One per wave: the early (polling) collector and the final one.
+    assert len(steps) == 2, steps
+    return steps
+
+
+@pytest.mark.parametrize("option", ["--extra-test-flags", "--extra-test-flags-multi"])
+def test_the_workflow_passes_the_flag_options_as_opt_equals_value(
+    collector_steps, option
+):
+    # argparse reads a bare "-v" as another option and exits 2, which took out both
+    # collector jobs before the workflow was spelled this way.
+    for step in collector_steps:
+        assert f"{option}=" in step, f"{option} must use --opt=value form:\n{step}"
+        assert f"{option} " not in step, f"{option} given a separate argument:\n{step}"
+
+
+def test_the_fanin_job_name_matches_the_job_the_poller_waits_on(collect):
+    # The poller stops when this job completes; a rename on either side leaves it polling
+    # to its deadline, which holds up the final wave behind it.
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "_test_matrix.yaml").read_text()
+    )
+    declared = workflow["jobs"]["legs_complete"]["name"]
+    # The job interpolates call_id where the script's template has its placeholder.
+    assert declared.split("${{")[0] == collect.FANIN_JOB_NAME.split("{call_id}")[0]
+    assert declared.endswith(")") and collect.FANIN_JOB_NAME.endswith(")")
+
+
+def test_the_early_collector_tolerates_its_own_failure(collect):
+    """The early wave is only a head start; its failures must not reach the caller's gate."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "_test_matrix.yaml").read_text()
+    )
+    assert workflow["jobs"]["collect_failed_suites_early"]["continue-on-error"] is True
+    # The final collector must NOT: it is the only thing that reads every descriptor.
+    assert "continue-on-error" not in workflow["jobs"]["collect_failed_suites"]
