@@ -35,12 +35,15 @@ spyre-bench validate examples/llm-demo --central examples/central
 spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-example
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
 spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
+spyre-bench dataset add ./data.jsonl --display-name "Name" --license internal   # dry run; --apply writes
+spyre-bench dataset list --benchmarks-dir examples/llm-demo --central examples/central
 spyre-bench gen-schemas --check
 spyre-bench analyze --help
 spyre-bench plan --catalog examples/run-demo --central examples/central --purpose nightly --arch x86_64 \
     --reference-node --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan.json
 spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
 spyre-bench verdict --run-id <uuid> --store clickhouse --json
+spyre-bench upload results/bench                 # seal and check a lab run; --apply sends it to the inbox
 ```
 
 The `runners` declared by the kernel and comms packs name entry points supplied by the producer packages, not shipped here; `run` executes each Benchmark's own `run.command`.
@@ -66,6 +69,7 @@ plan = engine.plan(cat, {"purpose": "pr", "selection": {"tier": "sanity"}}, leg)
 |---|---|
 | `spyre_bench/engine.py` | registry, catalog validation, case expansion, identity, plan, reuse, invalidation, qualification, validity |
 | `spyre_bench/validate.py`, `explain.py`, `analysis.py`, `gen_schemas.py`, `cli.py` | the CLI verbs (`analysis.py` also evaluates `derive` and `compare`) |
+| `spyre_bench/reference.py`, `reference_client.py` | the `reference` verb (create, validate, seal, submit, compare) and its dashboard client |
 | `spyre_bench/plan.py`, `run.py`, `verdict.py`, `store.py`, `planfile.py`, `cliutil.py` | the `plan`, `run` and `verdict` verbs, the stores behind them (none, ClickHouse, in-memory), the `plan.json` constants and token templates, shared CLI plumbing |
 | `spyre_bench/ingest_adapter.py`, `ids.py` | the only import of the ingest derivation; the `ids` verb |
 | `spyre_bench/placement.py` | observed CPU placement (`run.exec.*`) from `/proc` and `/sys` |

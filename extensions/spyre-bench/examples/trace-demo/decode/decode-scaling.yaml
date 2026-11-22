@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# One decode workload at tensor-parallel 1, 2 and 4, each on that many cards; per-step values of each run reach the store
+# through the trace bundle (schema 87).
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-tp1}
+spec: {type: llm/vllm, backend: spyre, token: demoa, model: demo-llm-a, precision: fp16, tp: 1}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-tp2}
+spec: {base: demo-llm-a-tp1, patch: {tp: 2}}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-tp4}
+spec: {base: demo-llm-a-tp1, patch: {tp: 4}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: decode-scaling}
+spec:
+  type: perf
+  level: model
+  tier: sanity
+  system: demo-llm-a-tp1
+  environment: cards-1
+  workload:
+    type: llm/latency
+    shape: {batch_size: 1, input_len: 512, output_len: 129}
+    load: {executor: iterations, iterations: 10, warmup_iterations: 2}
+  run: {timeout: 30m, est: 10m}
+  matrix:
+    name_template: decode_scaling_tp{system.tp}
+    axes:
+      tp:
+        - {token: tp1, patch: {}}
+        - {token: tp2, patch: {system: demo-llm-a-tp2, environment: cards-2}}
+        - {token: tp4, patch: {system: demo-llm-a-tp4, environment: cards-4}}

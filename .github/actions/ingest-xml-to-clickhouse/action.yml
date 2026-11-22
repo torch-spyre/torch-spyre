@@ -2,7 +2,7 @@ name: Ingest JUnit XML into ClickHouse
 description: >
   Parse JUnit/benchmark XML files in a directory and insert their rows into
   ClickHouse via `python -m spyre_clickhouse_ingest results` (or, with vllm-results-dir /
-  sendnn-report / benchmarks-dir / tables-dir, those kinds into spyre_v2). This is the SINGLE ingest
+  sendnn-report / benchmarks-dir / tables-dir / bench-dir, those kinds into spyre_v2). This is the SINGLE ingest
   implementation shared by two callers: the push-to-clickhouse.yaml
   workflow_run job (which downloads uploaded artifacts first) and the perf job
   in _test_matrix.yaml (which pushes its report.xml INLINE on the card runner,
@@ -18,7 +18,7 @@ inputs:
   vllm-results-dir:
     description: >
       vLLM bench *.json to ingest instead of XML (v2 only; perf verdict). Set at most one of
-      xml-dir, vllm-results-dir, sendnn-report, benchmarks-dir, tables-dir.
+      xml-dir, vllm-results-dir, sendnn-report, benchmarks-dir, tables-dir, bench-dir.
     required: false
     default: ''
   sendnn-report:
@@ -36,6 +36,21 @@ inputs:
       One <table>.json per results table ({"rows": [...]}: test_case_runs, benchmark_runs,
       capability_runs, artifact_results) to ingest instead of XML (v2 only); trigger-type is the
       bundle's one tier, and component names the suite's owner. Format: extensions/clickhouse-ingest/docs/table-formats.md.
+    required: false
+    default: ''
+  bench-dir:
+    description: >
+      A spyre-bench results directory (its result.json files) to ingest as a `bench` bundle instead of
+      XML (v2 only). Needs channel-trust; trigger-type is the tier (perf or quality), and workflow names
+      the verdict series when the trust is ci.
+    required: false
+    default: ''
+  channel-trust:
+    description: >
+      Trust this channel records for bench-dir: ci | lab | external. Empty records external. Only a
+      workflow that runs on trusted code with its own ClickHouse secrets may pass ci; the action
+      accepts ci only on push, schedule and workflow_dispatch events (a PR- or comment-triggered
+      run passes lab); it cannot tell which code produced the results. Setting it without bench-dir is an error.
     required: false
     default: ''
   perf:
@@ -108,6 +123,12 @@ inputs:
     default: ''
   pr-number:
     description: PR number associated with the rows (empty on non-PR runs).
+    required: false
+    default: ''
+  purpose:
+    description: >
+      Why the run happened (nightly | weekly | merge | on-demand | ...), recorded as run.purpose on the perf
+      rows; only nightly, weekly and merge runs join verdict baselines. Empty records none.
     required: false
     default: ''
   ci-event:
@@ -212,9 +233,29 @@ runs:
       shell: bash
       env:
         CH_HOST: ${{ inputs.clickhouse-host }}
-        XML_DIR: ${{ inputs.xml-dir }}${{ inputs.vllm-results-dir }}${{ inputs.sendnn-report }}${{ inputs.benchmarks-dir }}${{ inputs.tables-dir }}
+        XML_DIR: ${{ inputs.xml-dir }}${{ inputs.vllm-results-dir }}${{ inputs.sendnn-report }}${{ inputs.benchmarks-dir }}${{ inputs.tables-dir }}${{ inputs.bench-dir
+          }}
         VENV: ${{ inputs.venv }}
+        BENCH_DIR_G: ${{ inputs.bench-dir }}
+        OTHER_DIRS_G: ${{ inputs.xml-dir }}${{ inputs.vllm-results-dir }}${{ inputs.sendnn-report }}${{ inputs.benchmarks-dir }}${{ inputs.tables-dir }}
+        TRUST_G: ${{ inputs.channel-trust }}
       run: |
+        if [ -n "${BENCH_DIR_G}" ] && [ -n "${OTHER_DIRS_G}" ]; then
+          echo "::error::bench-dir cannot be combined with another results input."
+          exit 1
+        fi
+        if [ -n "${TRUST_G}" ] && [ -z "${BENCH_DIR_G}" ]; then
+          echo "::error::channel-trust applies to bench-dir only."
+          exit 1
+        fi
+        if [ "${TRUST_G}" = ci ]; then
+          case "${GITHUB_EVENT_NAME}" in
+            push|schedule|workflow_dispatch) ;;
+            *)
+              echo "::error::channel-trust ci is accepted only on push, schedule and workflow_dispatch events, not ${GITHUB_EVENT_NAME}: the results may come from code a PR author controls."
+              exit 1 ;;
+          esac
+        fi
         if [ -z "${CH_HOST}" ]; then
           echo "::notice::ClickHouse host not configured — skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
@@ -310,6 +351,8 @@ runs:
         TAG_DATE_IN: ${{ inputs.tag-date }}
         REPOSITORY_IN: ${{ inputs.repository }}
         CI_EVENT_IN: ${{ inputs.ci-event }}
+        PURPOSE_IN: ${{ inputs.purpose }}
+        BRANCH_IN: ${{ inputs.branch }}
         RUN_ATTEMPT_IN: ${{ inputs.run-attempt }}
         VENV: ${{ inputs.venv || '.venv' }}
         XML_DIR_IN: ${{ inputs.xml-dir }}
@@ -317,7 +360,16 @@ runs:
         SENDNN_IN: ${{ inputs.sendnn-report }}
         BENCH_DIR_IN: ${{ inputs.benchmarks-dir }}
         TABLES_DIR_IN: ${{ inputs.tables-dir }}
+        BENCH_RESULTS_IN: ${{ inputs.bench-dir }}
+        CHANNEL_TRUST_IN: ${{ inputs.channel-trust }}
         PERF_IN: ${{ inputs.perf }}
+        WORKFLOW_IN: ${{ inputs.workflow }}
+        SHA_IN: ${{ inputs.sha }}
+        RUN_ID_IN: ${{ inputs.run-id }}
+        GHA_RUN_ID_IN: ${{ inputs.gha-run-id }}
+        TRIGGERED_AT_IN: ${{ inputs.triggered-at }}
+        PR_NUMBER_IN: ${{ inputs.pr-number }}
+        TRIGGER_TYPE_IN: ${{ inputs.trigger-type }}
       run: |
         source "${VENV}/bin/activate"
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
@@ -334,6 +386,7 @@ runs:
         [ -n "${RUN_ATTEMPT_IN}" ] && ARGS+=(--run-attempt "${RUN_ATTEMPT_IN}")
         [ -n "${REPOSITORY_IN}" ] && ARGS+=(--repository "${REPOSITORY_IN}")
         [ -n "${CI_EVENT_IN}" ] && ARGS+=(--ci-event "${CI_EVENT_IN}")
+        [ -n "${PURPOSE_IN}" ] && ARGS+=(--purpose "${PURPOSE_IN}")
         [ -n "${ARTIFACT_IN}" ] && ARGS+=(--artifact "${ARTIFACT_IN}")
         [ -n "${ARTIFACT_ID_IN}" ] && [ -z "${ARTIFACT_IN}" ] && ARGS+=(--artifact-id "${ARTIFACT_ID_IN}")
         [ -n "${TAG_FAMILY_IN}" ] && ARGS+=(--tag-family "${TAG_FAMILY_IN}")
@@ -347,21 +400,23 @@ runs:
         elif [ -n "${SENDNN_IN}" ]; then ARGS+=(--kind sendnn --sendnn-report "${SENDNN_IN}")
         elif [ -n "${BENCH_DIR_IN}" ]; then ARGS+=(--benchmarks-dir "${BENCH_DIR_IN}")
         elif [ -n "${TABLES_DIR_IN}" ]; then ARGS+=(--tables-dir "${TABLES_DIR_IN}")
+        elif [ -n "${BENCH_RESULTS_IN}" ]; then ARGS+=(--bench-dir "${BENCH_RESULTS_IN}")
         else ARGS+=(--xml-dir "${XML_DIR_IN}")
         fi
-        [ -n "${VLLM_DIR_IN}${SENDNN_IN}${BENCH_DIR_IN}${TABLES_DIR_IN}" ] && \
+        [ -n "${BENCH_RESULTS_IN}" ] && [ -n "${CHANNEL_TRUST_IN}" ] && ARGS+=(--channel-trust "${CHANNEL_TRUST_IN}")
+        [ -n "${VLLM_DIR_IN}${SENDNN_IN}${BENCH_DIR_IN}${TABLES_DIR_IN}${BENCH_RESULTS_IN}" ] && \
           ARGS+=(--run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
         while IFS= read -r kv; do
           kv="${kv//[[:space:]]/}"
           [ -n "${kv}" ] && ARGS+=(--perf "${kv}")
         done <<< "${PERF_IN}"
         python -m spyre_clickhouse_ingest results \
-          --workflow "${{ inputs.workflow }}" \
-          --branch "${{ inputs.branch }}" \
-          --sha "${{ inputs.sha }}" \
-          --run-id "${{ inputs.run-id }}" \
-          --gha-run-id "${{ inputs.gha-run-id }}" \
-          --triggered-at "${{ inputs.triggered-at }}" \
-          --pr-number "${{ inputs.pr-number }}" \
-          --trigger-type "${{ inputs.trigger-type }}" \
+          --workflow "${WORKFLOW_IN}" \
+          --branch "${BRANCH_IN}" \
+          --sha "${SHA_IN}" \
+          --run-id "${RUN_ID_IN}" \
+          --gha-run-id "${GHA_RUN_ID_IN}" \
+          --triggered-at "${TRIGGERED_AT_IN}" \
+          --pr-number "${PR_NUMBER_IN}" \
+          --trigger-type "${TRIGGER_TYPE_IN}" \
           "${ARGS[@]}"
