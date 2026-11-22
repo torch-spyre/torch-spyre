@@ -66,6 +66,7 @@
 
 /extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
 /extensions/spyre-bench/        @ashokponkumar @jabostian @anubhavjana @n-marion
+/extensions/spyre-cli/          @ashokponkumar @pradghos @JRosenkranz @mudhakar
 
 # bench catalog, its make wrappers and the on-demand guide
 /benchmarks/            @ashokponkumar @jabostian @anubhavjana @n-marion
