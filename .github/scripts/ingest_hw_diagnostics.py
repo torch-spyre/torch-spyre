@@ -23,6 +23,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.batching import BatchParked
 from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
 from spyre_clickhouse_ingest.hw_diagnostics import (
     NIL_UUID,
@@ -196,7 +198,8 @@ def main() -> None:
 
     # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
     if args.write_v1:
-        ensure_extra_columns(client, table=args.table)
+        writes.note_v1_written()
+        ensure_extra_columns(get_client(role="schema"), table=args.table)
         if already_ingested(client, run_id, component, table=args.table):
             print(
                 f"[info] v1: run_id={run_id} component={component!r} already ingested "
@@ -239,8 +242,10 @@ def main() -> None:
                     print(
                         f"[info] v2: inserting {len(rows)} row(s) into {v2_table} ..."
                     )
-                    insert_rows(client, rows, table=v2_table)
+                    insert_rows(client, rows, table=v2_table, resilient=True)
                     print(f"[info] v2: inserted {len(rows)} row(s) into {v2_table}")
+            except BatchParked as exc:
+                print(f"[warn] v2 rows parked, not stored: {exc}", file=sys.stderr)
             except Exception as exc:
                 print(
                     f"[warn] v2 write failed (v1 rows unaffected): {exc}",
@@ -265,4 +270,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(writes.run_cli(main))

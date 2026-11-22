@@ -136,6 +136,11 @@ jobs:
       PROD_SET: ${{ secrets.CLICKHOUSE_HOST != '' && secrets.CLICKHOUSE_PASS != '' && secrets.CLICKHOUSE_DB_V2 != '' }}
       # Non-secret names the benchmark command needs from the runner setup (the engine passes an allowlist only).
       BENCH_PASS_ENV: ${{ vars.BENCH_PASS_ENV }}
+      CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+      CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+      CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+      CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+      CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -289,6 +294,10 @@ jobs:
           clickhouse-pass: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
           clickhouse-db: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
           clickhouse-db-v2: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+          clickhouse-v2-host: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_V2_HOST_DEV }}
+          clickhouse-v2-port: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_V2_PORT_DEV }}
+          clickhouse-v2-user: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_USER || secrets.CLICKHOUSE_V2_USER_DEV }}
+          clickhouse-v2-pass: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_PASSWORD || secrets.CLICKHOUSE_V2_PASSWORD_DEV }}
           schema: v2
 
       # The verdict only SELECTs, but reads the same connection the ingest used; it is set on this step alone.
@@ -301,6 +310,10 @@ jobs:
           CLICKHOUSE_USER: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
           CLICKHOUSE_PASS: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
           CLICKHOUSE_DB_V2: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+          CLICKHOUSE_V2_HOST: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_V2_HOST_DEV }}
+          CLICKHOUSE_V2_PORT: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_V2_PORT_DEV }}
+          CLICKHOUSE_V2_USER: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_USER || secrets.CLICKHOUSE_V2_USER_DEV }}
+          CLICKHOUSE_V2_PASSWORD: ${{ env.BENCH_CLICKHOUSE_ENV == 'prod' && secrets.CLICKHOUSE_V2_PASSWORD || secrets.CLICKHOUSE_V2_PASSWORD_DEV }}
           # The ingest threads --run-id verbatim (RunId.for_args), so the engine run id is the stored one; the
           # target fails loudly when no row exists under it.
           BENCH_RUN_ID: ${{ steps.collect.outputs.stored_run_id || steps.collect.outputs.run_id }}

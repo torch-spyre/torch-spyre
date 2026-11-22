@@ -225,6 +225,15 @@ jobs:
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
       CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      # toJSON: an unset prod secret must not fall through to the dev one.
+      CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV))
+        }}
+      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV))
+        }}
+      CLICKHOUSE_V2_USER: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
+        }}
+      CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+        }}
 
   # Reports whether any upstream PyTorch config carries this tier, so run-upstream-tests is skipped rather than handed an empty matrix.
   upstream-configs:
@@ -288,6 +297,15 @@ jobs:
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
       CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      # toJSON: an unset prod secret must not fall through to the dev one.
+      CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV))
+        }}
+      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV))
+        }}
+      CLICKHOUSE_V2_USER: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
+        }}
+      CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+        }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml

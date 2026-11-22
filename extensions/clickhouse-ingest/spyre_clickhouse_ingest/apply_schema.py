@@ -1128,7 +1128,7 @@ def main() -> None:
         os.environ.setdefault(
             "CLICKHOUSE_SEND_RECEIVE_TIMEOUT", str(SchemaApplier.DDL_TIMEOUT + 300)
         )
-    client = ClickHouse.connect(database=db)
+    client = ClickHouse.connect(database=db, role="schema")
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
     print(
