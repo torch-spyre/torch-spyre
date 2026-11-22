@@ -1,0 +1,418 @@
+name: bench-pr-comment
+# Runs for other comments are named apart so the per-user rate limit counts only /spyre-bench requests.
+run-name: >-
+  ${{ ((github.event_name == 'issue_comment' && !(contains(github.event.comment.body, '/spyre-bench ') || endsWith(github.event.comment.body, '/spyre-bench')
+  || contains(github.event.comment.body, '/bench ') || endsWith(github.event.comment.body, '/bench')))
+  || (github.event_name == 'pull_request_target' && github.event.label.name != 'bench')) && 'bench-pr-comment (ignored)'
+  || format('bench-pr-comment pr={0} by={1}', github.event.issue.number || github.event.pull_request.number, github.event.comment.user.login || github.event.sender.login)
+  }}
+
+# `/spyre-bench <selection> [key=value ...]` (`/bench` is the deprecated spelling) on a pull request, or the `bench` label: authorize -> preview comment ->
+# dispatch bench-on-demand (same-repository heads) or bench-on-demand-fork (fork heads, no secrets, nothing stored).
+# Grammar, policy and threat model: extensions/spyre-bench/docs/README.md ("On-demand benchmarks for a PR") and
+# docs/source/contributing/bench_on_demand.md.
+#
+# Trust: this workflow runs from the default branch (issue_comment and pull_request_target never use the PR's copy)
+# with the engine installed from the default branch. The PR head is fetched as data only (benchmarks/*.yaml, parsed,
+# never executed here) in a step that has no token. Nothing is posted for a commenter without write access.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: bench-pr-comment-${{ github.event.comment.id || format('{0}-{1}', github.event.pull_request.number, github.run_id) }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Nothing past this job runs, and nothing is posted, for a commenter who cannot write.
+  gate:
+    name: Can the commenter write?
+    # Dark until the owner sets the repository variable BENCH_ONDEMAND_ENABLED to 'true' (and enables the engine policy file).
+    if: >-
+      vars.BENCH_ONDEMAND_ENABLED == 'true' && ((github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+      && github.event.comment.user.type != 'Bot'
+      && (contains(github.event.comment.body, '/spyre-bench ') || endsWith(github.event.comment.body, '/spyre-bench') || contains(github.event.comment.body,
+      '/bench ') || endsWith(github.event.comment.body, '/bench')))
+      || (github.event_name == 'pull_request_target' && github.event.label.name == 'bench'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      writer: ${{ steps.perm.outputs.writer }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ACTOR: ${{ github.event.comment.user.login || github.event.sender.login }}
+    steps:
+      - name: Read the permission from the API
+        id: perm
+        run: |
+          perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission 2>/dev/null || echo none)
+          case "${perm}" in
+            write | maintain | admin) echo "writer=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "writer=false" >> "$GITHUB_OUTPUT"; echo "::notice::${ACTOR} cannot write; ignoring" ;;
+          esac
+
+  request:
+    name: Authorize, preview, dispatch
+    needs: [gate]
+    if: ${{ needs.gate.outputs.writer == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+      ACTOR: ${{ github.event.comment.user.login || github.event.sender.login }}
+      ASSOCIATION: ${{ github.event.comment.author_association || '' }}
+      COMMENT_BODY: ${{ github.event.comment.body || '/spyre-bench sanity' }}
+      W: ${{ github.workspace }}/.bench-request
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Checkout the engine (default branch)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            extensions/spyre-bench
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Install the engine
+        run: |
+          uv venv .bench-venv
+          uv pip install --python .bench-venv/bin/python 'pyyaml==6.0.2' 'regex==2024.11.6' ./base/extensions/spyre-bench ./base/extensions/clickhouse-ingest
+          mkdir -p "$W"
+          echo "BENCH=${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" >> "$GITHUB_ENV"
+
+      # Facts come from the API, never from the event payload alone: permission, head sha and head repo can change.
+      - name: Gather facts
+        id: facts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${COMMENT_BODY}" > "$W/comment.txt"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$W/started"
+          perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission 2>/dev/null || echo none)
+          gh api "repos/${REPO}/pulls/${PR}" > "$W/pr.json"
+          jq -n --arg login "${ACTOR}" --arg perm "${perm}" --arg assoc "${ASSOCIATION}" \
+            '{login: $login, permission: $perm, association: $assoc}' > "$W/actor.json"
+          jq --arg repo "${REPO}" \
+            '{number: .number, base_repo: $repo, head_repo: (.head.repo.full_name // "deleted/deleted"),
+              head_sha: .head.sha, state: .state}' "$W/pr.json" > "$W/prfacts.json"
+          {
+            echo "head_repo=$(jq -r .head_repo "$W/prfacts.json")"
+            echo "head_sha=$(jq -r .head_sha "$W/prfacts.json")"
+            echo "open=$(jq -r '.state == "open"' "$W/prfacts.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Parse the comment
+        id: parse
+        run: |
+          set +e -uo pipefail
+          "$BENCH" ondemand parse --comment-file "$W/comment.txt" --host github.com --default-product torch-spyre \
+            > "$W/parsed.json" 2> "$W/parse.err"
+          code=$?
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "kind=$(jq -r '.command // "none"' "$W/parsed.json" 2>/dev/null || echo none)" >> "$GITHUB_OUTPUT"
+          [ "${code}" -ne 0 ] || jq .request "$W/parsed.json" > "$W/request.json"
+
+      - name: Say why a comment could not be used
+        if: ${{ steps.parse.outputs.code == '2' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Could not read that request."
+            echo
+            sed -e 's/^error: //' "$W/parse.err" | "$BENCH" ondemand sanitize --limit 600
+            echo
+            echo "Usage: \`/spyre-bench <selection> [reuse=...] [force=...]\`; \`/spyre-bench confirm\`; \`/spyre-bench cancel\`."
+          } > "$W/body.md"
+          gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/body.md" > /dev/null
+
+      - name: Cancel
+        if: ${{ steps.parse.outputs.kind == 'cancel' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for workflow in bench-on-demand.yml bench-on-demand-fork.yml; do
+            for status in queued in_progress waiting pending requested; do
+              gh run list --workflow "$workflow" --status "$status" --limit 50 --json databaseId,displayTitle \
+                | jq -r --arg pr "pr=${PR} " '.[] | select(.displayTitle | contains($pr)) | .databaseId' \
+                | while read -r id; do gh run cancel "$id" || true; done
+            done
+          done
+          gh api "repos/${REPO}/issues/${PR}/comments" -f body="Benchmark run for this pull request cancelled." > /dev/null
+
+      # Only the bot's own preview comments count, and only a recent one.
+      - name: Read the pending request (confirm)
+        id: pending
+        if: ${{ steps.parse.outputs.kind == 'confirm' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A preview is spent once the bot has said it started, finished or cancelled after it.
+          gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            | jq -rs '[.[][] | select(.user.login == "github-actions[bot]" and .user.type == "Bot")] as $bot
+                | ([$bot[] | select(.body | startswith("<!-- spyre-bench-preview/1 -->"))] | last) as $pv
+                | if $pv == null then ""
+                  elif ([$bot[] | select(.created_at > $pv.updated_at and (.body | test("\\A(Benchmark run started|Benchmark run for this pull request cancelled|### Benchmark run finished)")))] | length) > 0 then ""
+                  else $pv.body end' > "$W/pending.txt"
+          cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          if "$BENCH" ondemand state < "$W/pending.txt" > "$W/state.json" && jq -e --arg c "${cutoff}" '.ts >= $c' "$W/state.json" > /dev/null; then
+            jq .request "$W/state.json" > "$W/request.json"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            gh api "repos/${REPO}/issues/${PR}/comments" -f body="Nothing is waiting for a confirmation on this pull request." > /dev/null
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Proceed?
+        id: go
+        env:
+          KIND: ${{ steps.parse.outputs.kind }}
+          OPEN: ${{ steps.facts.outputs.open }}
+          FOUND: ${{ steps.pending.outputs.found }}
+        run: |
+          if [ "${KIND}" = run ] || { [ "${KIND}" = confirm ] && [ "${FOUND}" = true ]; }; then
+            [ "${OPEN}" = true ] && echo "go=true" >> "$GITHUB_OUTPUT" || echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The user the limit is charged to is the requester: the commenter, or whoever asked before a /spyre-bench confirm.
+      - name: Count this user's recent requests
+        if: ${{ steps.go.outputs.go == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.parse.outputs.kind }}
+        run: |
+          set -euo pipefail
+          user="${ACTOR}"
+          if [ "${KIND}" = confirm ]; then user=$(jq -r '.requester.login // ""' "$W/state.json"); fi
+          since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+          # Rate: this user's /spyre-bench requests in the last hour. They count toward the hourly limit only (rate rows).
+          gh run list --workflow bench-pr-comment.yml --user "${user}" --created ">=${since}" --limit 200 --json databaseId,createdAt,displayTitle \
+            | jq --arg actor "${user}" --arg self "${RUN_ID}" \
+              '[.[] | select((.databaseId | tostring) != $self and (.displayTitle | endswith(" by=" + $actor)))
+                | {id: ("req" + (.databaseId | tostring)), pr: 0, user: $actor, ts: .createdAt, state: "done", est: 0, clean: false}]' \
+            > "$W/rate.json"
+          # Window and supersede: every measuring run (a cancelled one still counts: it may have run for hours) of the last 24 hours (both workflows), charged the whole per-request
+          # limit because the run's own estimate is not known here. Rows never count toward the hourly rate.
+          limit=$("$BENCH" ondemand limit --host github.com | jq .request_device_hours)
+          day=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          for wf in bench-on-demand.yml bench-on-demand-fork.yml; do
+            gh run list --workflow "$wf" --created ">=${day}" --limit 200 --json databaseId,createdAt,displayTitle,status,conclusion
+          done | jq -s --argjson limit "${limit}" '[.[][] | (.displayTitle | capture("pr=(?<pr>[0-9]+) by=(?<by>.*)$")?) as $t | select($t != null)
+                | {id: ("run" + (.databaseId | tostring)), pr: $t.pr, user: $t.by, ts: .createdAt, est: $limit, clean: false, rate: false,
+                   state: (if .status != "completed" then "active" else "done" end)}]' > "$W/window.json"
+          jq -s 'add' "$W/rate.json" "$W/window.json" > "$W/runs.json"
+
+      - name: Authorize (policy, permission, fork sha)
+        id: auth1
+        if: ${{ steps.go.outputs.go == 'true' }}
+        env:
+          KIND: ${{ steps.parse.outputs.kind }}
+        run: |
+          set +e -uo pipefail
+          if [ "${KIND}" = confirm ]; then
+            jq '{pinned_sha: (.pinned_sha // ""), requester: (.requester // null), approval: (.approval // null),
+                 requested_at: (.ts // null)}' "$W/state.json" > "$W/recorded.json"
+          else
+            echo '{"pinned_sha": "", "requester": null, "approval": null, "requested_at": null}' > "$W/recorded.json"
+          fi
+          if jq -e '.clean == true' "$W/request.json" > /dev/null; then
+            echo '{"reasons": ["clean runs are not available on this route yet"]}' > "$W/decision.json"
+            echo "code=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -n --slurpfile actor "$W/actor.json" --slurpfile pr "$W/prfacts.json" --slurpfile req "$W/request.json" \
+            --slurpfile runs "$W/runs.json" --slurpfile rec "$W/recorded.json" \
+            --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg kind "${KIND}" \
+            '{host: "github.com", now: $now, actor: $actor[0], pr: $pr[0], request: $req[0], history: $runs[0],
+              pinned_sha: $rec[0].pinned_sha, requester: $rec[0].requester, approval: $rec[0].approval,
+              requested_at: $rec[0].requested_at,
+              confirmed: ($kind == "confirm"), stage: "request", request_id: ""}' > "$W/facts.json"
+          "$BENCH" ondemand authorize --facts "$W/facts.json" > "$W/decision.json"
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse
+        if: ${{ steps.auth1.outputs.code == '2' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Not run:"
+            jq -r '(.reasons // []) | if length == 0 then ["the request could not be checked"] else . end | .[] | "- " + .' "$W/decision.json" 2>/dev/null || echo "- the request could not be checked"
+          } > "$W/body.md"
+          gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/body.md" > /dev/null
+
+      # Data only: the head's benchmark definitions are parsed by the default-branch engine, never run. For a fork
+      # the commenter has named the commit (sha=) and `authorize` has checked it against the head read from the API.
+      - name: Fetch the head's benchmark definitions
+        if: ${{ steps.auth1.outputs.code == '0' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ steps.facts.outputs.head_repo }}
+          ref: ${{ steps.facts.outputs.head_sha }}
+          path: pr
+          persist-credentials: false
+          sparse-checkout: benchmarks
+          sparse-checkout-cone-mode: false
+
+      # No token in this step's environment: the head's YAML is parsed here. Symlinks are removed first so a file
+      # cannot point the parser at the runner's files.
+      - name: Plan
+        id: plan
+        if: ${{ steps.auth1.outputs.code == '0' }}
+        run: |
+          set +e -uo pipefail
+          find pr -type l -delete
+          if jq -e '[.selections[].product] | any(. != "torch-spyre")' "$W/request.json" > /dev/null; then
+            echo "This repository runs torch-spyre benchmarks only; drop the other product from the request." > "$W/plan.err"
+            echo "code=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! "$BENCH" ondemand engine-request --request "$W/request.json" --product torch-spyre > "$W/engine-request.json" 2> "$W/plan.err"; then
+            echo "code=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          timeout 120 "$BENCH" plan --catalog pr/benchmarks --request "$W/engine-request.json" --arch x86_64 \
+            --json --out "$W/plan.json" > "$W/plan.out" 2> "$W/plan.err"
+          code=$?
+          if [ "${code}" -eq 0 ] || [ "${code}" -eq 4 ]; then [ -s "$W/plan.json" ] || code=2; fi
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+
+      - name: Say why the plan failed
+        if: ${{ steps.plan.outputs.code != '' && steps.plan.outputs.code != '0' && steps.plan.outputs.code != '4' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Could not plan that request."
+            echo
+            sed -e 's/^error: //' "$W/plan.err" | "$BENCH" ondemand sanitize --limit 600
+          } > "$W/body.md"
+          gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/body.md" > /dev/null
+
+      - name: Authorize again with the plan
+        id: auth2
+        if: ${{ steps.plan.outputs.code == '0' || steps.plan.outputs.code == '4' }}
+        run: |
+          set +e -uo pipefail
+          jq --slurpfile plan "$W/plan.json" \
+            '.stage = "planned" | .plan = $plan[0] | .estimate_device_hours = $plan[0].estimate.device_hours' \
+            "$W/facts.json" > "$W/facts2.json"
+          "$BENCH" ondemand authorize --facts "$W/facts2.json" > "$W/decision.json"
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          echo "state=$(jq -r .state "$W/decision.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Post the preview
+        id: preview
+        if: ${{ steps.auth2.outputs.code != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTH2_CODE: ${{ steps.auth2.outputs.code }}
+          KIND: ${{ steps.parse.outputs.kind }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # A confirm keeps the original time and requester, so confirming never extends or re-owns a request.
+          if [ "${KIND}" = confirm ]; then
+            jq '{ts: .ts, requester: .requester}' "$W/state.json" > "$W/origin.json"
+          else
+            jq -n --arg now "${now}" --slurpfile a "$W/actor.json" '{ts: $now, requester: $a[0]}' > "$W/origin.json"
+          fi
+          state=$(jq -c --slurpfile d "$W/decision.json" --slurpfile p "$W/plan.json" --slurpfile o "$W/origin.json" \
+            '{request: ., pinned_sha: $d[0].pinned_sha, approval: $d[0].approval, estimate_device_hours: $p[0].estimate.device_hours,
+              ts: $o[0].ts, requester: $o[0].requester}' "$W/request.json")
+          if ! "$BENCH" ondemand preview --plan "$W/plan.json" --request "$W/request.json" --host github.com \
+            --note "Reuse is looked up when the run starts, so the counts above assume nothing is reusable yet." \
+            --note "Head commit: $(jq -r .head_sha "$W/prfacts.json" | cut -c1-12)" \
+            --state "${state}" > "$W/preview.md" 2> "$W/preview.err"; then
+            { echo "Could not render the plan for that request."; echo; "$BENCH" ondemand sanitize --limit 300 < "$W/preview.err"; } > "$W/body.md"
+            gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/body.md" > /dev/null
+            exit 1
+          fi
+          if [ "${AUTH2_CODE}" != 0 ]; then
+            { echo; echo "Not run:"; jq -r '.reasons[] | "- " + .' "$W/decision.json"; } >> "$W/preview.md"
+          fi
+          existing=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            | jq -rs '[.[][] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- spyre-bench-preview/1 -->")))] | last | .id // empty')
+          if [ -n "${existing}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@"$W/preview.md" > /dev/null
+          else
+            gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"$W/preview.md" > /dev/null
+          fi
+
+      - name: Dispatch the run
+        if: ${{ steps.auth2.outputs.state == 'admit' && steps.preview.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REPO: ${{ steps.facts.outputs.head_repo }}
+          HEAD_SHA: ${{ steps.facts.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # A cancel or another confirm that landed while this run was planning wins: the preview is spent.
+          started=$(cat "$W/started")
+          newer=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" | jq -es --arg t "${started}" \
+            '[.[][] | select(.user.login == "github-actions[bot]" and .created_at > $t and (.body | test("\\A(Benchmark run started|Benchmark run for this pull request cancelled)")))] | length') || { echo "::error::could not read the comments; not dispatching"; exit 1; }
+          if [ "${newer}" != 0 ]; then
+            echo "::warning::a newer start or cancel exists; not dispatching"
+            exit 0
+          fi
+          # The decision is bound to this sha; refuse if the head moved while we were planning.
+          [ "$(gh api "repos/${REPO}/pulls/${PR}" --jq .head.sha)" = "${HEAD_SHA}" ] || { echo "::warning::head moved; not dispatching"; exit 0; }
+          "$BENCH" ondemand env --request "$W/request.json" --product torch-spyre > "$W/bench-env.json"
+          if [ "${HEAD_REPO,,}" = "${REPO,,}" ]; then
+            gh workflow run bench-on-demand.yml --ref "${DEFAULT_BRANCH}" \
+              -f ref="${HEAD_SHA}" -f pr_number="${PR}" -f requested_by="${ACTOR}" \
+              -f bench_env="$(jq -c . "$W/bench-env.json")" -f ingest=true -f clickhouse_env=dev
+          else
+            gh workflow run bench-on-demand-fork.yml --ref "${DEFAULT_BRANCH}" \
+              -f ref="${HEAD_SHA}" -f repository="${HEAD_REPO}" -f pr_number="${PR}" -f requested_by="${ACTOR}" \
+              -f bench_env="$(jq -c . "$W/bench-env.json")"
+          fi
+          gh api "repos/${REPO}/issues/${PR}/comments" -f body="Benchmark run started for ${HEAD_SHA:0:12}. A newer /spyre-bench request on this pull request cancels it; /spyre-bench cancel stops it." > /dev/null
+
+  # The label is a one-shot trigger: take it off whatever happened, so it can be applied again.
+  unlabel:
+    name: Take the label off
+    needs: [gate, request]
+    if: ${{ always() && github.event_name == 'pull_request_target' && github.event.label.name == 'bench' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Remove it
+        run: gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/bench" > /dev/null || true
