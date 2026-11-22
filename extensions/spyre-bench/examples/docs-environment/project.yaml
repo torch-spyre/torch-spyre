@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: docs-environment, owner: example-team}
+spec:
+  component: docs-environment
+  packs: [{name: kernel, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: two-cards
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.node.class, env.label.cpu_pinning]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke}
+spec:
+  cases: [op_scale_n1024]
+  run: {repeats_min: 1}

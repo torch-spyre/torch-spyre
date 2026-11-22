@@ -1,0 +1,34 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/workload-startup.json",
+ "title": "llm/startup: derived workload of a System",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "phases": {
+   "type": "array",
+   "items": {
+    "enum": [
+     "load",
+     "compile",
+     "warmup",
+     "ready"
+    ]
+   },
+   "minItems": 1
+  },
+  "cache": {
+   "type": "array",
+   "items": {
+    "enum": [
+     "cold",
+     "warm"
+    ]
+   },
+   "minItems": 1
+  }
+ },
+ "required": [
+  "cache"
+ ]
+}

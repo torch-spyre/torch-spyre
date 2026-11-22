@@ -29,9 +29,11 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
 from torch_spyre._C import (
+    get_device_dtype,
     get_device_size_in_bytes,
     get_reserved_dims,
     get_spyre_tensor_layout,
+    SpyreTensorLayout,
 )
 
 DEVICE = torch.device("spyre")
@@ -112,13 +114,13 @@ class TestReservationResizeGuard(TestCase):
         # so resize_ would validate the wrong axis. It must refuse.
         d = self.x_dev.detach()
         d.t_()
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1024, 140))
 
     def test_resize_after_in_place_rank_change_rejected(self) -> None:
         d = self.x_dev.detach()
         d.unsqueeze_(0)
-        with self.assertRaisesRegex(RuntimeError, "changed in place"):
+        with self.assertRaisesRegex(RuntimeError, "no longer match the allocation"):
             d.resize_((1, DIM_MAX, 1024))
 
     def test_resize_after_valid_resize_still_allowed(self) -> None:
@@ -232,6 +234,84 @@ class TestReservationBoundaries(TestCase):
         x_dev.resize_((DIM_MAX, 4, 1024))
         self.assertEqual(x_dev.untyped_storage().data_ptr(), ptr)
         self.assertEqual(str(get_spyre_tensor_layout(x_dev)), layout)
+
+
+# A declaration together with an explicit device layout (#6027). The layout is
+# the one a paged-attention index uses: logical [C, E, 1] int32 as device
+# [C, 1, E, 32], one id per 128-byte stick, with the reserved chunk count C whole
+# at device dim 0. C_MAX chunks are reserved, C_MIN is the configured floor.
+C_MAX, C_MIN, E = 16, 8, 32
+ONE_ID_PER_STICK = 32
+
+
+def _chunk_major_layout(num_chunks: int) -> SpyreTensorLayout:
+    return SpyreTensorLayout(
+        [num_chunks, 1, E, ONE_ID_PER_STICK],
+        [E, 0, 1, 0],
+        get_device_dtype(torch.int32),
+        {(0,): num_chunks, (2,): E, (1, 3): 1},
+    )
+
+
+class TestReservationWithExplicitLayout(TestCase):
+    def setUp(self) -> None:
+        self.ids = torch.arange(C_MAX * E, dtype=torch.int32).reshape(C_MAX, E, 1)
+        self.spec = {0: {"min": C_MIN, "max": C_MAX, "granularity": 1}}
+
+    def _declare(self, rows: int) -> torch.Tensor:
+        return (
+            self.ids[:rows]
+            .contiguous()
+            .to(DEVICE, device_layout=_chunk_major_layout(C_MAX), dynamic=self.spec)
+        )
+
+    def test_transfer_at_max_reads_back(self) -> None:
+        d = self._declare(C_MAX)
+        self.assertEqual(get_reserved_dims(d), self.spec)
+        self.assertTrue(torch.equal(d.cpu(), self.ids))
+
+    def test_transfer_below_max_reads_back(self) -> None:
+        # The real rows go into the front of the reserved buffer, in the
+        # explicit layout, and come back as they went in.
+        d = self._declare(12)
+        self.assertEqual(tuple(d.shape), (12, E, 1))
+        self.assertTrue(torch.equal(d.cpu(), self.ids[:12]))
+
+    def test_resize_reads_back_in_the_explicit_layout(self) -> None:
+        # The defect #6027 records: resize_ used to rebuild the layout from
+        # the host size, so the first rows read back wrong under a custom
+        # layout. The layout now stays the allocation's.
+        d = self._declare(C_MAX)
+        layout = str(get_spyre_tensor_layout(d))
+        ptr = d.untyped_storage().data_ptr()
+        for rows in (9, C_MIN, C_MAX, 11):
+            d.resize_((rows, E, 1))
+            self.assertEqual(str(get_spyre_tensor_layout(d)), layout, f"at {rows}")
+            self.assertEqual(d.untyped_storage().data_ptr(), ptr, f"at {rows}")
+            self.assertTrue(torch.equal(d.cpu(), self.ids[:rows]), f"at {rows} rows")
+
+    def test_write_after_resize_reads_back(self) -> None:
+        # The other half of #6027: a host-to-device write through the pinned
+        # layout with dma_sizes below max, after a shrink, then a read back.
+        d = self._declare(C_MAX)
+        d.resize_((9, E, 1))
+        new_ids = self.ids[:9] + 1000
+        d.copy_(new_ids)
+        self.assertTrue(torch.equal(d.cpu(), new_ids))
+
+    def test_default_layout_control(self) -> None:
+        # The same sizes through the derived layout: the control the issue's
+        # reproducer compared against.
+        d = self.ids.to(DEVICE, dynamic=self.spec)
+        for rows in (9, C_MIN, C_MAX):
+            d.resize_((rows, E, 1))
+            self.assertTrue(torch.equal(d.cpu(), self.ids[:rows]), f"at {rows} rows")
+
+    def test_layout_for_a_smaller_max_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "extent max=16, got 12"):
+            self.ids.to(
+                DEVICE, device_layout=_chunk_major_layout(12), dynamic=self.spec
+            )
 
 
 if __name__ == "__main__":

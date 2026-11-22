@@ -55,7 +55,9 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
@@ -77,6 +79,8 @@ from for_each_tile_fixtures import (
     COLS,
     ROWS,
     D,
+    EMBED_TILE,
+    EMBED_TOKENS,
     K,
     LK,
     LQ,
@@ -99,6 +103,8 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     carried_expert_sum_fn,
     carried_reduction_fn,
+    embedding_restickify_inputs,
+    embedding_restickify_table_fn,
     fill_add_tiled_fn,
     matmul_x_yt_nested_fn,
     matmul_x_yt_tile_m_fn,
@@ -833,6 +839,16 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile fails to preserve input EA tag in identity op. The "
+            "output is incorrectly tagged STANDARD (default) when data is "
+            "staggered it causes EA DCI to incorrectly apply / restore EA. "
+            "See issue #6462."
+        ),
+    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
@@ -1656,6 +1672,73 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         ref = x.float().t() @ y.float()
         self._check(restickify_matmul_xt_y_fn, (x, y), ref, trips=2, atol=0.5)
 
+    def test_embedding_restickify_table_no_span_overflow(self):
+        """Regression test for issue #6277.
+
+        F.embedding(ids, table) inside a for_each_tile loop, with `table` a
+        (49216, 4096) fp16 gather source (~403 MB) and only `ids` tiled. The
+        indirect-access layout the embedding needs forces insert_restickify
+        to build a full, untiled relayout copy of `table` inside the loop
+        body -- a copy whose per-core span (403 MB) only clears the 256 MB
+        hardware limit if the work-division planner is free to split its row
+        dim across cores. Before the fix, _transfer_loop_info left the
+        embedding consumer's own loop_tiled_dims on that copy's deep-copied
+        LoopInfo, which coarse_tile_local_dim_split_domains misread as
+        "the copy's row dim is loop-tiled" and pinned its core split to 1,
+        making every split attempt fail with "per-core tensor span 384.500
+        MB ... exceeds hardware limit of 256.00 MB" -- reproduced by
+        temporarily reverting the two-line fix in insert_restickify.py's
+        `elif hasattr(op, "loop_info")` branch. The sibling non-looped case
+        (same bug class, no loop involved) is covered by
+        test_embedding_large_vocab_table_no_span_overflow in
+        test_indirect_access_gather.py.
+
+        atol/rtol are tighter than this class's matmul-oriented 0.1 default:
+        embedding is a pure index copy with no arithmetic, so device output
+        must match the CPU reference up to fp16 round-trip only, the same
+        tolerance indirect_access_common.run_e2e uses by default for the
+        gather-op family.
+
+        Written against run_and_get_code directly rather than this class's
+        shared ``_check`` helper: ``_check``'s ``ops=`` check looks for a
+        literal ``op='ReStickifyOpHBM'`` in the generated SDSC source, which
+        is how restickify shows up for the *other* tests in this class (a
+        per-trip relayout handled by ``_transfer_loop_info``'s first
+        branch). The copy this test exercises is the *loop-invariant*
+        full-table case handled by that function's ``elif hasattr(op,
+        "loop_info")`` branch -- the one the fix touches -- which SDSC
+        lowers to a plain ``op='identity'`` whose ``debug_handle.ir_chain``
+        names the restickify IR node (``'restickify_default'``) instead.
+        """
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        table, ids = embedding_restickify_inputs()
+        ref = F.embedding(ids.flatten().long(), table)
+
+        compiled = torch.compile(
+            embedding_restickify_table_fn, backend="inductor", fullgraph=True
+        )
+        out, code = run_and_get_code(
+            compiled, table.to(DEVICE_NAME), ids.to(DEVICE_NAME)
+        )
+        src = "\n".join(code)
+
+        self.assertIn("LoopSpec(", src)
+        counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
+        self.assertEqual(
+            counts,
+            [EMBED_TOKENS // EMBED_TILE],
+            f"unexpected loop trip counts in:\n{src}",
+        )
+        self.assertIn(
+            "restickify_default",
+            src,
+            f"expected the gather table's restickify copy in:\n{src}",
+        )
+
+        torch.testing.assert_close(out.cpu().float(), ref.float(), atol=0.01, rtol=0.01)
+
     def test_restickify_add_nested_tiles(self):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
         ref = a.float().t() + x.float()
@@ -2336,6 +2419,106 @@ class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
                 out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
             )
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
+# #6496: shapes for a loop whose first reduction is over rows of Q and whose
+# body also has ops of other sizes (the K page), with Q built before the loop.
+FS_E, FS_KV, FS_QG, FS_D, FS_N, FS_PAGES = 4, 2, 4, 128, 128, 2
+
+
+def rows_max_scores_fn(query, rows, k_pages):
+    """Running max of normalized-Q @ K_page^T scores over the K pages.
+
+    Q comes from an index_select before the loop, a [4, 8, 128] pointwise
+    node with as many elements as the loop's first reduction (32 rows x 128).
+    """
+    q = query.index_select(0, rows).reshape(FS_E, FS_KV, FS_QG, FS_D)
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        qn = q / q.abs().amax(-1, keepdim=True)
+        k = k_page[0] * 0.5
+        sc = qn @ k.transpose(-2, -1)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_E, FS_KV, FS_QG, 1),
+        float("-inf"),
+        dtype=torch.float16,
+        device=query.device,
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+def rows_max_scores_reference(query, rows, k_pages):
+    q = query.float().index_select(0, rows.long()).reshape(FS_E, FS_KV, FS_QG, FS_D)
+    qn = q / q.abs().amax(-1, keepdim=True)
+    sc = qn.unsqueeze(0) @ (k_pages.float() * 0.5).transpose(-2, -1)
+    return sc.amax(-1, keepdim=True).amax(0)
+
+
+def fp8_folded_rows_max_fn(q, k_pages):
+    """The prefill body of #6496: Q rows folded and FP8-quantized in the loop."""
+    rows = 4
+
+    def body(carry, tiles):
+        k_page, q = tiles
+        folded = q.reshape(FS_KV, FS_QG * rows, FS_D)
+        scale = torch.ops.spyre.quantscalepertokenfp8(folded, 1.0)
+        q8 = torch.ops.spyre.quantize_fp8_with_scale(folded, scale)
+        k8 = torch.ops.spyre.qfp8wt(k_page[0].transpose(-2, -1).contiguous())
+        sc = torch.ops.spyre.scaled_bmm(q8, k8, out_dtype=torch.float16) * scale
+        sc = sc.reshape(FS_KV, FS_QG, rows, FS_N)
+        return torch.maximum(carry, sc.amax(-1, keepdim=True)), None
+
+    init = torch.full(
+        (FS_KV, FS_QG, rows, 1), float("-inf"), dtype=torch.float16, device=q.device
+    )
+    return for_each_tile(body, (k_pages, q), dims=(0, None), tile_size=1, init=init)[0]
+
+
+class TestForEachTileFusionScoringE2E(_DynamoResetTestCase):
+    """A loop next to a node outside it that has the loop's first-reduction size.
+
+    The loop's scheduler node holds ops of several sizes and takes its group
+    from its first reduction. Inductor's fusion scoring
+    (``_try_reindex_pointwise_for_reduction``) runs before Spyre declines the
+    fusion and used to assert on such a loop ("expected pointwise sizes to
+    match pointwise_numel * red_numel", #6496). Spyre turns the reindex off.
+    """
+
+    def test_reduction_over_rows_of_a_tensor_built_before_the_loop(self):
+        torch.manual_seed(0)
+        query = torch.randn(2, FS_KV * FS_QG, FS_D, dtype=torch.float16)
+        rows = torch.arange(2, dtype=torch.int32).repeat(2)
+        k_pages = torch.randn(FS_PAGES, FS_E, FS_KV, FS_N, FS_D, dtype=torch.float16)
+
+        compiled = torch.compile(rows_max_scores_fn, dynamic=False, fullgraph=True)
+        out = compiled(*(t.to(DEVICE_NAME) for t in (query, rows, k_pages)))
+
+        torch.testing.assert_close(
+            out.cpu().float(),
+            rows_max_scores_reference(query, rows, k_pages),
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_fp8_quantize_of_rows_folded_in_the_loop(self):
+        """Compiles and runs; numerics of the FP8 block are covered elsewhere."""
+        torch.manual_seed(0)
+        q = torch.randn(FS_KV, FS_QG, 4, FS_D, dtype=torch.float16)
+        k_pages = (
+            (torch.randn(FS_PAGES, FS_KV, FS_N, FS_D) * 100)
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+            .to(torch.float16)
+        )
+
+        compiled = torch.compile(fp8_folded_rows_max_fn, dynamic=False, fullgraph=True)
+        out = compiled(q.to(DEVICE_NAME), k_pages.to(DEVICE_NAME)).cpu()
+
+        self.assertEqual(tuple(out.shape), (FS_KV, FS_QG, 4, 1))
+        self.assertTrue(torch.isfinite(out).all())
 
 
 if __name__ == "__main__":

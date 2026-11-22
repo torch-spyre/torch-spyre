@@ -427,17 +427,16 @@ flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
 buffers crossing the loop boundary are classified) are documented in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md).
 
-A buffer that crosses the loop boundary and has a non-empty
-`output_tiled_dims`/`tiled_dims_per_read` entry at a given level (see
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#attribute-contract-on-iroperation))
+A buffer that crosses the loop boundary and whose access has a nonzero
+coefficient on the loop variable of a given level (`loop_facts.read_advance` /
+`output_advance`)
 advances its base address once per loop iteration at that level, so its HBM
 pool allocation must be sized for every tile it will occupy across the
 loop's run, not just one. `hbm_pool_planning.py`'s `_compute_size_bytes` sizes
 each buffer from its full `FixedTiledLayout.device_layout.device_size`, which
 spans every tile the buffer occupies across the loop; sizing it for a single
 tile would let the loop overrun into whatever buffer the allocator packed
-next to it. A buffer whose `output_tiled_dims`/`tiled_dims_per_read` entries
-are empty at every level, by contrast, never advances and is a candidate for
+next to it. A buffer whose accesses have no loop-variable term at any level, by contrast, never advances and is a candidate for
 a fixed-address LX scratchpad slot instead. See
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
 `accum_tile` buffers this distinction matters most for.
