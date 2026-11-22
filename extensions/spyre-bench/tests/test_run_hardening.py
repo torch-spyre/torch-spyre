@@ -994,8 +994,16 @@ class RealSqlTests(unittest.TestCase):
         "49-result-uploads.sql",
         "50-artifact-views.sql",
         "60-benchmark-views.sql",
-        "62-benchmark-verdicts.sql",
     )
+    # Present once the benchmark schema stack is in the ingest; 62 reads a view that stack defines, so it goes last.
+    STACK = (
+        "81-bench-environments.sql",
+        "82-run-placements.sql",
+        "83-result-invalidations.sql",
+        "84-bench-views.sql",
+        "85-benchmark-verdict-views.sql",
+    )
+    LAST = ("62-benchmark-verdicts.sql",)
 
     @classmethod
     def setUpClass(cls):
@@ -1007,9 +1015,23 @@ class RealSqlTests(unittest.TestCase):
         finally:
             sys.path.remove(str(EXT.parent / "clickhouse-ingest"))
         cls.session = chdb_session.Session()
-        for name in cls.FILES:
-            for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
-                cls.session.query(stmt)
+        pending = [
+            stmt
+            for name in cls.FILES + tuple(n for n in cls.STACK if (SCHEMA_DIR / n).exists()) + cls.LAST
+            for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text())
+        ]
+        while (
+            pending
+        ):  # views of the stack and 62 reference each other across files: retry until a pass makes no progress
+            failed = []
+            for stmt in pending:
+                try:
+                    cls.session.query(stmt)
+                except Exception:  # noqa: BLE001
+                    failed.append(stmt)
+            if len(failed) == len(pending):
+                cls.session.query(failed[0])
+            pending = failed
         cls.db = str(cls.session.query("SELECT currentDatabase()", "TSV")).strip()
         cls.seed()
         cls.store = stores.ClickHouseStore(client=ChdbClient(cls.session), database=cls.db)
