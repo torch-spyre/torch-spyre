@@ -172,8 +172,9 @@ jobs:
       # per-name ternary; toJSON keeps an unset prod secret from falling through to the dev one.
       CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
         || secrets.CLICKHOUSE_HOST_DEV)) }}
-      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV
-        || secrets.CLICKHOUSE_PORT_DEV)) }}
+      CLICKHOUSE_V2_PORT: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+        && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+        && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
       CLICKHOUSE_DB_V2: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV)) }}
       CLICKHOUSE_V2_USER: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV)) }}
       CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(inputs.clickhouse_env != 'dev' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))

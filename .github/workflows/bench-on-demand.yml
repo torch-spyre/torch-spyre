@@ -133,6 +133,9 @@ jobs:
       CLICKHOUSE_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
         || secrets.CLICKHOUSE_HOST_DEV)) }}
       DO_INGEST: ${{ !inputs.smoke && inputs.ingest }}
+      # Prod needs a host and the scoped login; guards against a silent skip of a prod request.
+      PROD_SET: ${{ (secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) != '' && secrets.CLICKHOUSE_V2_USER != '' && secrets.CLICKHOUSE_V2_PASSWORD
+        != '' }}
       # Non-secret names the benchmark command needs from the runner setup (the engine passes an allowlist only).
       BENCH_PASS_ENV: ${{ vars.BENCH_PASS_ENV }}
       CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
@@ -257,6 +260,10 @@ jobs:
         if: ${{ !inputs.smoke && steps.run.outcome != 'skipped' }}
         continue-on-error: true
         run: |
+          if [ "${BENCH_CLICKHOUSE_ENV}" = "prod" ] && [ "${DO_INGEST}" = "true" ] && [ "${PROD_SET}" != "true" ]; then
+            echo "::error::prod selected but the prod ClickHouse host or v2 login is not set; refusing to skip or fall back to dev"
+            exit 1
+          fi
           .bench-venv/bin/python benchmarks/tools/collect_ingest_xml.py "${BENCH_RESULTS_DIR}" "${BENCH_RESULTS_DIR}/ingest-xml" --github-output
           if [ "$(find "${BENCH_RESULTS_DIR}/ingest-xml" -name '*.xml' | wc -l)" -gt 0 ] && [ -n "${CLICKHOUSE_HOST}" ] && [ "${DO_INGEST}" = "true" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -285,8 +292,9 @@ jobs:
           torch-spyre-dir: ${{ github.workspace }}
           clickhouse-v2-host: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
             || secrets.CLICKHOUSE_HOST_DEV)) }}
-          clickhouse-v2-port: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV
-            || secrets.CLICKHOUSE_PORT_DEV)) }}
+          clickhouse-v2-port: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
           clickhouse-v2-user: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
             }}
           clickhouse-v2-pass: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
@@ -300,8 +308,9 @@ jobs:
         if: ${{ !inputs.smoke && steps.ingest.outcome == 'success' }}
         continue-on-error: true
         env:
-          CLICKHOUSE_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV
-            || secrets.CLICKHOUSE_PORT_DEV)) }}
+          CLICKHOUSE_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
           CLICKHOUSE_USER: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
             }}
           CLICKHOUSE_PASS: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
@@ -310,8 +319,9 @@ jobs:
             }}
           CLICKHOUSE_V2_HOST: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
             || secrets.CLICKHOUSE_HOST_DEV)) }}
-          CLICKHOUSE_V2_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_V2_PORT_DEV
-            || secrets.CLICKHOUSE_PORT_DEV)) }}
+          CLICKHOUSE_V2_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
           CLICKHOUSE_V2_USER: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
             }}
           CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))

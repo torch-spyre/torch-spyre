@@ -121,7 +121,8 @@ jobs:
           arch: ${{ env.LEG_ARCH }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}
           clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}

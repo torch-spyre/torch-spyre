@@ -955,6 +955,8 @@ jobs:
         if: ${{ env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode != 'replace' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
+          # strict (the default) on purpose: this step is the only writer and the report is never uploaded,
+          # so a failed or parked write is lost data and must show red.
           xml-dir: ${{ env.RESULTS_DIR }}
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
@@ -976,7 +978,8 @@ jobs:
           # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
           torch-spyre-dir: ${{ github.workspace }}
           clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
@@ -1045,7 +1048,8 @@ jobs:
           artifact-id: ${{ needs.artifact_identity.outputs.record }}
           torch-spyre-dir: ${{ github.workspace }}
           clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
@@ -1057,6 +1061,7 @@ jobs:
         if: ${{ !cancelled() && env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode == 'replace' && steps.bench-mirror.outcome == 'success' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
+          # strict (the default) on purpose: in replace mode this is the only writer of the perf rows.
           xml-dir: ${{ github.workspace }}/bench-results/ingest-xml
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
@@ -1071,7 +1076,8 @@ jobs:
           artifact-id: ${{ needs.artifact_identity.outputs.record }}
           torch-spyre-dir: ${{ github.workspace }}
           clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
