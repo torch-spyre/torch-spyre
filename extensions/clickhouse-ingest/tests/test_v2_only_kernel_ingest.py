@@ -1,0 +1,113 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""A v2-only kernel report is written without the v1 kernel tables."""
+
+import pytest
+
+from test_bench_purpose_main import JUNIT, PERF, Client, ingest
+
+from spyre_clickhouse_ingest import results
+from spyre_clickhouse_ingest.schema import BENCHMARK_RUNS
+
+KERNEL = (
+    '<?xml version="1.0"?><testsuites><testsuite name="s" timestamp="2026-01-01T00:00:00Z">'
+    '<testcase classname="kernel_benchmark" name="k" time="1.0"><properties>'
+    '<property name="tag" value="kernel__matmul"/><property name="tag" value="op__mm"/>'
+    "</properties></testcase></testsuite></testsuites>"
+)
+
+
+def _written(client):
+    return sum(
+        len(rows) for table, rows in client.inserts if table == BENCHMARK_RUNS.name
+    )
+
+
+def test_a_kernel_report_lands_in_v2_when_the_v1_kernel_tables_are_absent(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(results, "_table_exists", lambda *a: False)
+    monkeypatch.setattr(results, "_absent_columns", lambda *a: ("run_type",))
+    c = Client()
+    ingest(monkeypatch, tmp_path, KERNEL, c, "--schema", "v2", tier="regression")
+    assert _written(c) == 1
+
+
+def test_a_v1_kernel_write_still_needs_the_v1_kernel_tables(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(results, "_table_exists", lambda *a: False)
+    monkeypatch.setattr(results, "_absent_columns", lambda *a: ())
+    c = Client()
+    ingest(monkeypatch, tmp_path, KERNEL, c, "--schema", "both", tier="regression")
+    assert _written(c) == 0 and "no perf_kernels table" in capsys.readouterr().err
+
+
+class NoProbe(Client):
+    """A login with no SHOW TABLES grant: EXISTS TABLE is denied, system.columns lists nothing."""
+
+    def __init__(self):
+        super().__init__(tables=False)
+
+    def command(self, sql, parameters=None):
+        if sql.startswith("EXISTS"):
+            raise RuntimeError("ACCESS_DENIED")
+        return super().command(sql, parameters)
+
+
+@pytest.mark.parametrize("strict, code", [(["--strict"], 1), ([], 0)])
+def test_a_denied_benchmark_probe_fails_a_v2_only_perf_report_under_strict(
+    monkeypatch, tmp_path, capsys, strict, code
+):
+    monkeypatch.delenv("CLICKHOUSE_V2_HOST", raising=False)
+    try:
+        ingest(monkeypatch, tmp_path, PERF, NoProbe(), *strict, "--schema", "v2")
+        rc = 0
+    except SystemExit as e:
+        rc = e.code
+    err = capsys.readouterr().err
+    assert rc == code and "benchmark gate failed" in err
+    assert "not written" in err
+
+
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_a_failed_v2_write_exits_only_under_strict(
+    monkeypatch, tmp_path, capsys, flags, code
+):
+    def boom(*a, **k):
+        raise RuntimeError("denied")
+
+    monkeypatch.setattr(results, "replace_case_attempt", boom)
+    try:
+        ingest(
+            monkeypatch,
+            tmp_path,
+            JUNIT,
+            Client(),
+            *flags,
+            "--schema",
+            "v2",
+            tier="regression",
+        )
+        rc = 0
+    except SystemExit as e:
+        rc = e.code
+    assert rc == code
+    assert "v2 write failed" in capsys.readouterr().err
+
+
+def test_the_default_schema_is_v2(monkeypatch):
+    monkeypatch.delenv("INGEST_SCHEMA", raising=False)
+    assert results.build_parser().parse_args(["--xml-dir", "x"]).schema == "v2"

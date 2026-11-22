@@ -595,6 +595,15 @@ _V2_BENCH_ID_KEYS = (
 _BENCH_TABLES = (schema_model.BENCHMARKS, schema_model.BENCHMARK_RUNS)
 
 
+def _v2_unavailable(failed: list, name: str, db: str) -> None:
+    failed.append(name)
+    print(
+        f"  [error] {name} not written: the {db} benchmark tables are absent, incomplete "
+        "or not readable by this login",
+        file=sys.stderr,
+    )
+
+
 def benchmark_tables_present(client, db: str) -> bool:
     """Both benchmark tables exist in `db` AND carry every column the writer inserts.
 
@@ -1859,8 +1868,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
-        "all recorded; by default that is a warning and the cases still land",
+        help="exit 1 when a v2 write failed, or when --artifact/--artifact-id named an artifact "
+        "but its verdicts were not all recorded; by default those are warnings and the cases "
+        "still land",
     )
     # Backfill/replay — deliberate replays only. Forward nightlies leave these unset so
     # Run Evidence shows Unavailable. Never rewrite created_at.
@@ -1882,21 +1892,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Must include a time (e.g. 2026-10-07T15:30:00Z); date-only is rejected. "
         "Omit on forward nightlies; blank/whitespace is rejected.",
     )
-    # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
-    # behaving exactly as before -- this script runs from inside a BAKED image, so old images
-    # and new ones coexist for as long as it takes every product image to be rebuilt.
-    #
-    # v1 is not a permanent home: test_runs, run_properties, perf_benchmarks and perf_kernels
-    # have NO v2 equivalent because v2 replaces them outright -- run_properties becomes
-    # test_cases.tags, test_runs is derivable from test_case_runs, and the two perf tables
-    # collapse into benchmarks + benchmark_runs. The v2 DDL in spyre-frameworks deliberately
-    # does not define them. Both is the migration window; v2 is the destination.
+    # Which schema generation to write; v2 unless asked otherwise. v1 and both stay as an explicit
+    # opt-in for a caller that still needs the legacy tables (test_runs, run_properties,
+    # perf_benchmarks, perf_kernels), which v2 replaces with test_case_runs and benchmark_runs.
     parser.add_argument(
         "--schema",
         choices=["v1", "v2", "both"],
-        default=os.environ.get("INGEST_SCHEMA", "v1"),
-        help="Which schema generation to write: v1 (default, the legacy tables), v2 (the "
-        "replacement tables only), or both (the migration window). Also settable via "
+        default=os.environ.get("INGEST_SCHEMA", "v2"),
+        help="Which schema generation to write: v2 (default, the replacement tables only), v1 (the "
+        "legacy tables) or both (the migration window). Also settable via "
         "INGEST_SCHEMA so a workflow can set it once for every leg.",
     )
     add_offline_options(parser)
@@ -2081,18 +2085,14 @@ def main(argv=None, assigned_trust=""):
         # Kernel first: is_benchmark_xml() also matches these.
         if is_kernel_benchmark_xml(root):
             print("  Detected: per-kernel breakdown XML")
-            # Both halves of the migration are required, and it can land partially.
-            # Without perf_kernels there is nowhere to put the kernels; without
-            # run_type the run row cannot be marked as a kernel run. Either way the
-            # result would be a benchmark_runs row with nothing behind it and no
-            # marker — the "run that measured nothing" this branch exists to stop.
-            # Checked before anything is written, so the skip stays retryable: no
-            # source_file is recorded, and a later run re-ingests the file.
+            # The v1 kernel tables are a precondition only for the v1 write; checked before
+            # anything is written, so the skip stays retryable (no source_file is recorded).
             missing = []
-            if not _table_exists(client, "perf_kernels"):
-                missing.append("no perf_kernels table")
-            if _absent_columns(client, "benchmark_runs", ("run_type",)):
-                missing.append("no benchmark_runs.run_type column")
+            if args.write_v1:
+                if not _table_exists(client, "perf_kernels"):
+                    missing.append("no perf_kernels table")
+                if _absent_columns(client, "benchmark_runs", ("run_type",)):
+                    missing.append("no benchmark_runs.run_type column")
             if missing:
                 print(
                     f"  [warn] {' and '.join(missing)} — skipping this kernel XML. "
@@ -2177,6 +2177,9 @@ def main(argv=None, assigned_trust=""):
                         _purpose_skipped(args, "its v2 rows were parked")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
+
+            if not bench_ready and v2db and not args.write_v1:
+                _v2_unavailable(v2_failed_files, xml_path.name, v2db)
 
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
@@ -2274,6 +2277,9 @@ def main(argv=None, assigned_trust=""):
                         _purpose_skipped(args, "its v2 rows were parked")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
+
+            if not bench_ready and v2db and not args.write_v1:
+                _v2_unavailable(v2_failed_files, xml_path.name, v2db)
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
@@ -2459,6 +2465,9 @@ def main(argv=None, assigned_trust=""):
         )
     if args.dry_run:
         print("  dry run -- nothing written; would write:\n" + client.report())
+    if args.strict and v2_failed_files:
+        print("  [error] v2: --strict, and a v2 write failed", file=sys.stderr)
+        sys.exit(1)
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"
