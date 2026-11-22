@@ -183,7 +183,7 @@ def main() -> None:
         or "443"
     )
     url = f"https://{host}:{port}" if host else ""
-    db = os.getenv("CLICKHOUSE_DB_V2", "").strip()
+    db = os.getenv("CLICKHOUSE_DB_V2", "").strip() or "spyre_v2"
     if not url or not db:
         print(
             "resolve_covered_tiers: CLICKHOUSE_HOST/CLICKHOUSE_DB_V2 unset -- "
@@ -197,7 +197,7 @@ def main() -> None:
         os.getenv(n, "").strip()
         for n in ("CLICKHOUSE_V2_USER", "CLICKHOUSE_V2_PASSWORD")
     )
-    if v2 and any(v2_login) and not all(v2_login):
+    if any(v2_login) and not all(v2_login):
         print(
             "resolve_covered_tiers: set both CLICKHOUSE_V2_USER and CLICKHOUSE_V2_PASSWORD, "
             "or neither -- running the full tier",
@@ -207,7 +207,7 @@ def main() -> None:
         return
     login = (
         v2_login
-        if v2 and all(v2_login)
+        if all(v2_login)
         else (os.getenv("CLICKHOUSE_USER", "default"), os.getenv("CLICKHOUSE_PASS", ""))
     )
     try:

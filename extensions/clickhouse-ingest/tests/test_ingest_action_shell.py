@@ -29,7 +29,9 @@ ACTION = (
     / ".github/actions/ingest-xml-to-clickhouse/action.yml"
 )
 HOSTILE = "x$(touch PWNED)`touch PWNED`\"; touch PWNED; '\nnext line $HOME"
-INPUT = re.compile(r"\$\{\{\s*inputs\.([\w-]+)\s*(?:\|\|\s*'([^']*)')?\s*\}\}")
+INPUT = re.compile(
+    r"\$\{\{\s*inputs\.([\w-]+)\s*(?:\|\|\s*inputs\.([\w-]+))?\s*(?:\|\|\s*'([^']*)')?\s*\}\}"
+)
 
 
 def steps():
@@ -45,8 +47,15 @@ def run_ingest_step(tmp_path, hostile):
     step = next(
         s for s in steps() if s.get("name") == "Ingest XML files into ClickHouse"
     )
+    hostile = {"clickhouse-v2-user": "writer", "clickhouse-v2-pass": "pw", **hostile}
     env = {
-        k: INPUT.sub(lambda m: hostile.get(m.group(1), m.group(2) or ""), v)
+        k: INPUT.sub(
+            lambda m: hostile.get(m.group(1))
+            or hostile.get(m.group(2) or "")
+            or m.group(3)
+            or "",
+            v,
+        )
         for k, v in step["env"].items()
     }
     env["VENV"] = str(tmp_path / "venv")

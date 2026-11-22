@@ -36,14 +36,12 @@ VARS = (
     "CH_REQUIRE_V2_HOST", "CH_V2_DATABASES", "CH_WRITE_RESILIENCE", "CH_WRITE_STRICT",
     "CH_WRITE_DEADLINE_S",
 )  # fmt: skip
-# Ingest actions whose script runs ensure-table DDL.
+# Ingest actions whose script runs ensure-table DDL (the hw-diagnostics one writes v2 only and runs none).
 DDL_ACTIONS = {
-    "ingest-hw-diagnostics-to-clickhouse",
     "ingest-model-ops-to-clickhouse",
     "ingest-pytorch-dispatch-to-clickhouse",
 }
 DDL_SCRIPTS = (
-    "ingest_hw_diagnostics.py",
     "ingest_model_ops.py",
     "ingest_pytorch_dispatch.py",
 )

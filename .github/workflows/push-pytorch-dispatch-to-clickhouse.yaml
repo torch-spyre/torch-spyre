@@ -1,3 +1,6 @@
+# REMAINING V1 WRITER, kept on purpose: pytorch_ci_dispatches has no v2 table yet.
+# Depends on the legacy *_DEV secrets (CLICKHOUSE_HOST_DEV/PORT_DEV/USER_DEV/PASS_DEV/DB_DEV);
+# its steps are non-fatal, so removing them would fail silently.
 name: push-pytorch-dispatch-to-clickhouse
 
 # Entry point for repository_dispatch events sent by pytorch/pytorch's CI
