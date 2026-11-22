@@ -13,6 +13,7 @@ spec:
   runner: kernel-bench
   default_suites:
     - ops
+    - models
   default_environment: one-device
   visibility: public
   series_labels:
@@ -23,6 +24,15 @@ kind: Suite
 metadata:
   name: ops
   description: Operator-level kernel benchmarks, one Benchmark per operation name.
+spec:
+  type: perf
+  pr_selectable: true
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata:
+  name: models
+  description: Model-level benchmarks (a full model or one block), one Benchmark per model name.
 spec:
   type: perf
   pr_selectable: true
@@ -48,9 +58,22 @@ metadata:
   description: One case, one repeat; never ingested.
 spec:
   cases:
-    - pointwise_add_prefill
+    - matmul_prefill-n4096
   run:
     repeats_min: 1
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-sanity
+  description: Smallest operator set a PR may request.
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: sanity
 ---
 apiVersion: bench/v1alpha1
 kind: Selection
@@ -77,3 +100,30 @@ spec:
     groupings:
       tier:
         at_most: extended
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: models-core
+  description: Default model set.
+spec:
+  selector:
+    suites:
+      - models
+    groupings:
+      tier:
+        at_most: core
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: perf-core
+  description: Operators and models of the default perf set, what one perf-suite report holds.
+spec:
+  selector:
+    suites:
+      - ops
+      - models
+    groupings:
+      tier:
+        at_most: core
