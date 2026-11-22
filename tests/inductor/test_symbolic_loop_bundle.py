@@ -523,5 +523,86 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
         self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
 
+class TestADeviceReadCountSurvivesTheRealSerializer(unittest.TestCase):
+    """The generated wrapper rebuilds the LoopSpecs from source before the
+    bundle is written, so a count source the serializer drops never reaches it."""
+
+    @staticmethod
+    def _round_trip(spec):
+        from torch._inductor.utils import IndentedBuffer
+
+        from torch_spyre._inductor.spyre_kernel import (
+            _codegen_op_spec_list,
+            _sympy_literal,
+        )
+
+        buf = IndentedBuffer()
+        _codegen_op_spec_list([spec], buf, _sympy_literal)
+        source = buf.getvalue()
+        namespace = {
+            "LoopSpec": LoopSpec,
+            "CountSource": CountSource,
+            "sympify": sympy.sympify,
+        }
+        return eval(f"[{source}]", namespace), source  # noqa: S307
+
+    def test_the_count_source_comes_back_intact(self):
+        source = CountSource(pool_offset=4096, max_value=16)
+        spec = LoopSpec(count=sympy.Integer(16), body=[], count_from_buffer=source)
+
+        (reloaded,), text = self._round_trip(spec)
+
+        self.assertIn("count_from_buffer", text)
+        self.assertEqual(reloaded.count_from_buffer, source)
+
+    def test_a_loop_without_one_writes_nothing_new(self):
+        """Every existing generated wrapper stays byte-for-byte the same."""
+        spec = LoopSpec(count=sympy.Integer(16), body=[])
+
+        (reloaded,), text = self._round_trip(spec)
+
+        self.assertNotIn("count_from_buffer", text)
+        self.assertIsNone(reloaded.count_from_buffer)
+
+
+class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
+    """The read and its address live in the bundle, not in any SDSC JSON, so
+    without an entry of its own a device-read loop and a constant loop with the
+    same body and maximum share one binary."""
+
+    @staticmethod
+    def _key(source):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        return compute_specs_hash(
+            [LoopSpec(count=sympy.Integer(16), body=[], count_from_buffer=source)]
+        )
+
+    def test_a_constant_loop_and_a_device_read_one_do_not_share_an_entry(self):
+        self.assertNotEqual(
+            self._key(None), self._key(CountSource(pool_offset=0, max_value=16))
+        )
+
+    def test_two_pool_offsets_do_not_share_an_entry(self):
+        self.assertNotEqual(
+            self._key(CountSource(pool_offset=0, max_value=16)),
+            self._key(CountSource(pool_offset=4096, max_value=16)),
+        )
+
+    def test_two_maxima_do_not_share_an_entry(self):
+        self.assertNotEqual(
+            self._key(CountSource(pool_offset=0, max_value=16)),
+            self._key(CountSource(pool_offset=0, max_value=8)),
+        )
+
+    def test_the_same_source_does_share_one(self):
+        """The count read at run time is not part of the key, so every call of
+        the same kernel, whatever count it reads, reuses one binary."""
+        self.assertEqual(
+            self._key(CountSource(pool_offset=0, max_value=16)),
+            self._key(CountSource(pool_offset=0, max_value=16)),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

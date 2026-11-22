@@ -37,7 +37,7 @@ from .sharded_hbm import placement_of
 # .ktir(...) kernel definitions evaluate their OpSpec source text against.
 SPYRE_WRAPPER_IMPORTS = """
                 from torch_spyre._inductor.op_spec import wrapper_sympify as sympify
-                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, CountSource, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, _spyre_empty_sharded
                 import subprocess
