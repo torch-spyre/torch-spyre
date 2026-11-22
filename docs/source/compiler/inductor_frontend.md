@@ -81,15 +81,16 @@ not prove out as a tile scan is left in place for the upstream default
 path.
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
 flowchart TD
-    A["for_each_tile region arrives<br/>as a WhileLoop op"] --> B{"try_prove_for_each_tile:<br/>bounded tile scan?"}
-    B -->|yes| C["Splice the loop body<br/>into the enclosing graph"]
-    C --> D["Synthesize dim hints<br/>for the spliced group"]
-    D --> E["Record the loop<br/>(_stamp_direct_loop_info) and<br/>build a LoopNode (collapse)"]
-    E --> F{"Any WhileLoop left?<br/>(nested for_each_tile)"}
-    F -->|"yes, fixed point"| B
-    F -->|no| G["Continue pre-scheduling:<br/>propagate_named_dims, assign_dim_hints, ..."]
-    B -->|"not a tile scan"| H["Left in place for the<br/>upstream default path"]
+    A["for_each_tile WhileLoop"] --> B{"bounded tile scan?"}
+    B -->|yes| C["splice the body"]
+    C --> D["synthesize dim hints"]
+    D --> E["build a LoopNode"]
+    E --> F{"WhileLoop left?"}
+    F -->|"yes (nested)"| B
+    F -->|no| G["continue pre-scheduling"]
+    B -->|no| H["leave for upstream path"]
 ```
 
 `splice_while_loops` proves each `for_each_tile` `WhileLoop`, splices its

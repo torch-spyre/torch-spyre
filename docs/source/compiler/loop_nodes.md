@@ -48,15 +48,22 @@ structure carries the loop from the first pass after the lowering to codegen.
 Two lowerings produce loops. Both end by building nodes:
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
 flowchart TD
-    A["for_each_tile call<br/>(user-written loop)"] -->|"splice_while_loops"| C
-    B["span-overflow pass or<br/>allocator tiling"] -->|"tile_groups"| C
-    C["ops carrying a LoopMember<br/>(the lowering's build-time record)"] -->|"collapse / build_pending_loop_nodes"| D
-    D["LoopNode in graph.operations<br/>(owns the loop facts)"] --> E["pre-scheduling passes<br/>read with loop_facts, edit with loop_node helpers,<br/>checked by loop_checker"]
-    E -->|"_hand_off_loop_nodes"| F["LoopSchedulerNode<br/>(one scheduler node per loop)"]
-    F -->|"SpyreKernel"| G["LoopSpec<br/>(serializable tree node)"]
-    G -->|"codegen"| H["scf.for with late-bound addresses<br/>in bundle.mlir"]
+    A["for_each_tile call"] -->|splice_while_loops| C
+    B["span-overflow or allocator tiling"] -->|tile_groups| C
+    C["ops with a LoopMember"] -->|build nodes| D
+    D["LoopNode in graph.operations"] --> E["pre-scheduling passes"]
+    E -->|hand off| F["LoopSchedulerNode"]
+    F -->|SpyreKernel| G["LoopSpec"]
+    G -->|codegen| H["scf.for in bundle.mlir"]
 ```
+
+Read the boxes as: the lowering's build-time record on each op (`C`), the node
+that owns the loop facts (`D`), passes that read with `loop_facts`, edit with the
+`loop_node` helpers and are checked by `loop_checker` (`E`), one scheduler node per
+loop (`F`), the serializable tree (`G`), and the loop with late-bound addresses
+(`H`).
 
 | Stage | Loop identity | Form |
 |---|---|---|
