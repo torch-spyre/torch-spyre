@@ -240,8 +240,8 @@ EXISTS` and `ADD ... IF NOT EXISTS`/`DROP ... IF EXISTS` are idempotent; an `INS
 
 If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
 keep running on the other replicas, and its ledger row is not written. Migrations marked
-`-- RERUNNABLE` (`grep -l RERUNNABLE schema/migrations/*.sql`: today `007`, `009`, `010`, `012` and
-`023`) can be run again with `--cluster <c> --rerun <migration.sql>`, which first re-checks that the
+`-- RERUNNABLE` (`grep -l RERUNNABLE schema/migrations/*.sql`: today `007`, `009`, `010`, `012`, `023`,
+`025`, `028` and `029`) can be run again with `--cluster <c> --rerun <migration.sql>`, which first re-checks that the
 tables it inserts into are Replicated. Any other migration must not be rerun, in particular the
 unmarked ones that insert rows (`002`, `003`, `006`, `013`, `019`): look at what ran
 (`system.query_log`), run its remaining statements by hand on the connected replica, and record it.
