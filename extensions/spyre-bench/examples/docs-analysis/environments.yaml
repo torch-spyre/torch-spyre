@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: two-cards, description: "two cards of one metal-a host; co-tenants are observed, not excluded"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 2, selectors: [{attribute: spyre.profile, eq: a}]}]
+  host: {node_class: metal-a, arch: x86_64, exclusive: false}
+  labels: {node.class: metal-a, device.count: 2}
+  policy: {validity_floor: shared_env}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: two-cards-local, description: "same request, process tree kept on the CPUs local to the devices"}
+spec:
+  base: two-cards
+  patch:
+    host: {cpu_pinning: {policy: device_local, require_verified: true}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: two-cards-explicit}
+spec:
+  base: two-cards
+  patch:
+    host: {cpu_pinning: {policy: explicit, cpus: "0-7,16-23"}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: two-cards-clean, description: "reference purposes: wait for the node, hold it, release it"}
+spec:
+  base: two-cards
+  patch:
+    host: {reference_node: true, exclusive: true, clean: {mode: wait, max_wait: 4h, max_hold: 3h}}
+    policy: {validity_floor: valid}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: pair-of-hosts, description: "two hosts and a fast link; the interconnect is part of what the case needs"}
+spec:
+  nodes: 2
+  devices:
+    requests: [{name: sockets, device_class: cpu/socket, count: 1, per_node: true}]
+    constraints: [{match_attribute: cpu.cores, requests: [sockets], scope: per_node}]
+  interconnect:
+    requests: [{name: fabric, device_class: net/link, count: 1, selectors: [{attribute: net.gbps, gte: 10}]}]
+  host: {node_class: metal-a, arch: x86_64, exclusive: true}
+  labels: {node.class: metal-a, device.count: 0}

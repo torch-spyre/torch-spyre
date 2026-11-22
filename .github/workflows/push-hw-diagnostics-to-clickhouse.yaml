@@ -20,6 +20,15 @@ permissions:
   contents: read
   actions: read
 
+env:
+  # Read by the ingest library: fail when a v2 database has no v2 host; the v2 database list.
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+  CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+  # Kill switch, red-on-park and the per-call retry deadline of the v2 write path.
+  CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+  CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+  CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
+
 jobs:
   ingest:
     name: Parse logs -> ClickHouse
@@ -122,6 +131,12 @@ jobs:
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD }}
           schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Upload JSON artifact

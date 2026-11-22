@@ -174,8 +174,14 @@ def main() -> None:
     # secrets never existed -- so this lookup always took its unset branch and every run
     # silently executed the full tier. Host+port rather than a pre-built URL for the same
     # reason: those are the secrets that exist.
-    host = os.getenv("CLICKHOUSE_HOST", "").strip()
-    port = os.getenv("CLICKHOUSE_PORT", "443").strip() or "443"
+    # The v2 tables live on CLICKHOUSE_V2_HOST when one is configured.
+    v2 = "V2_" if os.getenv("CLICKHOUSE_V2_HOST", "").strip() else ""
+    host = os.getenv(f"CLICKHOUSE_{v2}HOST", "").strip()
+    port = (
+        os.getenv(f"CLICKHOUSE_{v2}PORT", "").strip()
+        or os.getenv("CLICKHOUSE_PORT", "").strip()
+        or "443"
+    )
     url = f"https://{host}:{port}" if host else ""
     db = os.getenv("CLICKHOUSE_DB_V2", "").strip()
     if not url or not db:
@@ -187,11 +193,27 @@ def main() -> None:
         _emit([], args.format)
         return
 
+    v2_login = tuple(
+        os.getenv(n, "").strip()
+        for n in ("CLICKHOUSE_V2_USER", "CLICKHOUSE_V2_PASSWORD")
+    )
+    if v2 and any(v2_login) and not all(v2_login):
+        print(
+            "resolve_covered_tiers: set both CLICKHOUSE_V2_USER and CLICKHOUSE_V2_PASSWORD, "
+            "or neither -- running the full tier",
+            file=sys.stderr,
+        )
+        _emit([], args.format)
+        return
+    login = (
+        v2_login
+        if v2 and all(v2_login)
+        else (os.getenv("CLICKHOUSE_USER", "default"), os.getenv("CLICKHOUSE_PASS", ""))
+    )
     try:
         tiers = covered_tiers(
             url,
-            os.getenv("CLICKHOUSE_USER", "default"),
-            os.getenv("CLICKHOUSE_PASS", ""),
+            *login,
             db,
             args.commit_sha,
             args.arch,

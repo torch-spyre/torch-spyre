@@ -124,6 +124,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
 
       - name: Summary
         if: always()
@@ -307,6 +309,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
 
   build_and_test:
     needs: gate_and_build
