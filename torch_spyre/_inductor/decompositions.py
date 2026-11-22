@@ -36,6 +36,7 @@ from torch._prims_common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
     canonicalize_dim,
     elementwise_dtypes,
+    reduction_dims,
 )
 
 from .constants import (
@@ -1840,6 +1841,131 @@ def spyre_layer_norm(
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+DimArg = Optional[Union[int, Sequence[int]]]
+
+
+def _spyre_var_reduction_dims(x: torch.Tensor, dim: DimArg) -> tuple[int, ...]:
+    """Canonical reduced dims with torch.var semantics.
+
+    ``dim`` may be an int (the schema is ``int[1]?``), a sequence, ``None``, or an
+    empty sequence; the last two both mean "all dims" (torch/_refs var).
+    Negative dims are canonicalised and duplicates rejected by ``reduction_dims``.
+    """
+    if isinstance(dim, int):
+        dim = [dim]
+    if dim is not None and len(dim) == 0:
+        dim = None
+    return reduction_dims(x.shape, dim)
+
+
+def _spyre_var_mean_two_pass(
+    x: torch.Tensor,
+    dim: DimArg,
+    correction: Optional[Union[int, float]],
+    keepdim: bool,
+    return_mean: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Two-pass variance (and optionally the mean) over ``dim``.
+
+    var = mean((x - mean(x))**2) * N / (N - correction)
+
+    Spyre has no Welford lowering (``spyre_kernel.py`` returns UnimplementedOp
+    for welford_reduce/welford_combine), so Inductor's var lowering cannot be
+    used. This uses only ops Spyre lowers natively: ``mean`` (a SpyreReduction
+    in the input dtype), pointwise sub/mul. ``mean`` of the squared deviations,
+    rather than ``sum``, keeps every intermediate at var's magnitude instead of
+    N*var. Computed in the input dtype, like Spyre's own mean lowering.
+
+    Returns ``(var, mean_out)``; ``mean_out`` is None unless ``return_mean``.
+    """
+    if not x.dtype.is_floating_point:
+        raise Unsupported(f"var/std on a tensor of dtype {x.dtype}")
+    if x.dim() == 0:
+        raise Unsupported("var/std of a 0-d tensor")
+    if isinstance(correction, (torch.SymInt, torch.SymFloat)):
+        raise Unsupported("var/std with a symbolic correction")
+    dims = _spyre_var_reduction_dims(x, dim)
+    sizes = [x.shape[d] for d in dims]
+    if not all(isinstance(s, int) for s in sizes):
+        raise Unsupported(
+            f"var/std over a dimension of symbolic size (reduced sizes {sizes})"
+        )
+    n = math.prod(sizes)
+    c = 1.0 if correction is None else float(correction)
+    if n - c <= 0:
+        raise Unsupported(f"var/std with N - correction <= 0 (N={n}, correction={c})")
+    dims_list = list(dims)
+
+    if keepdim or not return_mean:
+        # rms_norm idiom: keepdim=True mean broadcasts directly.
+        mean_b = torch.mean(x, dim=dims_list, keepdim=True)
+        mean_out = mean_b if return_mean else None
+    else:
+        # var_mean/std_mean with keepdim=False must return the squeezed mean;
+        # reduce once and unsqueeze back for the broadcast (SDPA idiom,
+        # same as torch/_refs _unsqueeze_multiple).
+        mean_out = torch.mean(x, dim=dims_list, keepdim=False)
+        mean_b = mean_out
+        for d in sorted(dims_list):
+            mean_b = torch.unsqueeze(mean_b, d)
+
+    diff = x - mean_b
+    var = torch.mean(diff * diff, dim=dims_list, keepdim=keepdim)
+    if c != 0.0:
+        var = var * (n / (n - c))
+    return var, mean_out
+
+
+@register_spyre_decompositions([torch.ops.aten.var.correction])
+def spyre_var_correction(
+    x: torch.Tensor,
+    dim: DimArg = None,
+    *,
+    correction: Optional[Union[int, float]] = None,
+    keepdim: bool = False,
+) -> torch.Tensor:
+    var, _ = _spyre_var_mean_two_pass(x, dim, correction, keepdim, return_mean=False)
+    return var
+
+
+@register_spyre_decompositions([torch.ops.aten.std.correction])
+def spyre_std_correction(
+    x: torch.Tensor,
+    dim: DimArg = None,
+    *,
+    correction: Optional[Union[int, float]] = None,
+    keepdim: bool = False,
+) -> torch.Tensor:
+    # Overrides the core ref decomposition (torch/_refs std), which upcasts to
+    # the opmath dtype first; here std uses the same input and math as var.
+    var, _ = _spyre_var_mean_two_pass(x, dim, correction, keepdim, return_mean=False)
+    return torch.sqrt(var)
+
+
+@register_spyre_decompositions([torch.ops.aten.var_mean.correction])
+def spyre_var_mean_correction(
+    x: torch.Tensor,
+    dim: DimArg = None,
+    *,
+    correction: Optional[Union[int, float]] = None,
+    keepdim: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    var, mean = _spyre_var_mean_two_pass(x, dim, correction, keepdim, return_mean=True)
+    return var, mean
+
+
+@register_spyre_decompositions([torch.ops.aten.std_mean.correction])
+def spyre_std_mean_correction(
+    x: torch.Tensor,
+    dim: DimArg = None,
+    *,
+    correction: Optional[Union[int, float]] = None,
+    keepdim: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    var, mean = _spyre_var_mean_two_pass(x, dim, correction, keepdim, return_mean=True)
+    return torch.sqrt(var), mean
 
 
 @register_spyre_decompositions([torch.ops.aten.silu.default])

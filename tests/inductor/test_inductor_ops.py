@@ -216,6 +216,28 @@ CORE_REDUCTION_EDGE_MULTIDIM_KEEPDIM_PARAM_SETS = {
 }
 
 
+# var/std go through the Spyre two-pass decomposition (decompositions.py,
+# _spyre_var_mean_two_pass). Unit-scale inputs, so var ~ 1 and std ~ 1: the
+# 0.1/0.01-scale sets above would pass atol=0.1 even if var/std came out 0.
+VAR_STD_OPS_DICT = {"var": torch.var, "std": torch.std}
+
+VAR_STD_DIM_PARAM_SETS = {
+    "2d_dim_0": (0, cached_randn((67, 256))),
+    "2d_dim_neg1": (-1, cached_randn((67, 256))),
+    "3d_dim_1": (1, cached_randn((67, 71, 256))),
+    "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
+    "pad_2d_dim_0": (0, cached_randn((63, 129))),
+    "pad_2d_dim_1": (1, cached_randn((63, 129))),
+    # Mean far from zero: E[x^2]-E[x]^2 would cancel here; two-pass must not.
+    "offset_2d_dim_0": (0, cached_randn((67, 256)) + 16.0),
+    "offset_2d_dim_neg1": (-1, cached_randn((67, 256)) + 16.0),
+    "3d_dim_12": ((1, 2), cached_randn((67, 71, 256))),
+    "4d_dim_23": ((2, 3), cached_randn((6, 7, 12, 64))),
+    "4d_unsorted_30": ((3, 0), cached_randn((4, 6, 8, 64))),
+    "pad_3d_dim_01": ((0, 1), cached_randn((3, 7, 9))),
+}
+
+
 INDEX_REDUCTION_KEEPDIM_PARAM_SETS = {
     name: (
         dim,
@@ -2613,6 +2635,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         0, 2, 3, 4, 1
                     ),
                 ),
+            },
+        },
+        ("test_var_std", "test_var_std_dim_cpu"): {
+            "ops_dict": VAR_STD_OPS_DICT,
+            "param_sets": {
+                f"{name}_keepdim{int(keepdim)}": (dim, keepdim, x)
+                for name, (dim, x) in VAR_STD_DIM_PARAM_SETS.items()
+                for keepdim in (False, True)
+            },
+        },
+        ("test_var_std_correction", "test_var_std_correction_cpu"): {
+            "ops_dict": VAR_STD_OPS_DICT,
+            "param_sets": {
+                "c0": (0,),
+                "c2": (2,),
+                "c0p5": (0.5,),
+            },
+        },
+        ("test_var_std_all_dims", "test_var_std_all_dims_cpu"): {
+            "ops_dict": VAR_STD_OPS_DICT,
+            "param_sets": {
+                "1d": (cached_randn((512,)),),
+                "2d": (cached_randn((32, 64)),),
+                "3d": (cached_randn((1, 11, 4096)),),
             },
         },
         ("test_min_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -5699,8 +5745,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # is registered this stops raising, and the case has to become a positive one.
             "expect_raise": {"eval_mode": "Could not run 'aten::native_batch_norm'"},
         },
-        # TODO: group_norm fails layout propagation with a stick incompatibility
-        # (issue #3287).
+        # TODO: var_mean now decomposes (two-pass) and compiled passes; remaining
+        # failure is eager only: InductorError: Unsupported: Unexpected stick
+        # expression Mod(d2, 16) (innermost stride 16 < 64 elems/stick) (#3287)
         ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
             "param_sets": {
                 "8_groups": (
@@ -5710,8 +5757,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "expect_fail": {
-                "8_groups": "compile fails in split_multi_ops with KeyError: 'No FX "
-                "node for buf...', #3287"
+                "8_groups": "eager fails: InductorError: Unsupported: Unexpected "
+                "stick expression Mod(d2, 16), #3287"
             },
         },
         # beta is a Python constant folded into the traced graph. beta=2 stays
@@ -11929,65 +11976,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.std yet (stable "
-            "error signature: InductorError: KeyError: 'No FX node for buf...', "
-            "the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_std_dim0_known_xfail(self):
+    # var/std/var_mean/std_mean: Spyre two-pass decomposition
+    # (decompositions.py _spyre_var_mean_two_pass). Formerly strict xfails
+    # ("No FX node for buf", #3287 / #1688).
+    _VAR_STD_TOL = {"atol": 0.05, "rtol": 0.05}
+
+    def test_std_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.std(x, dim=0, keepdim=False), x, run_eager=False
+            lambda x: torch.std(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.var yet (stable "
-            "error signature: InductorError: KeyError: 'No FX node for buf...', "
-            "the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_var_dim0_known_xfail(self):
+    def test_var_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.var(x, dim=0, keepdim=False), x, run_eager=False
+            lambda x: torch.var(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.std_mean yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_std_mean_dim0_known_xfail(self):
+    def test_std_mean_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, run_eager=False
+            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.var_mean yet "
-            "(stable error signature: InductorError: NotImplementedError: "
-            "Pointwise)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_var_mean_dim0_known_xfail(self):
+    def test_var_mean_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, run_eager=False
+            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
         )
+
+    def test_var_mean_keepdim_fp16(self):
+        x = cached_randn((67, 256))
+        self.compare_with_cpu(
+            lambda x: torch.var_mean(x, dim=-1, keepdim=True), x, **self._VAR_STD_TOL
+        )
+
+    def test_std_mean_keepdim_fp16(self):
+        x = cached_randn((67, 256))
+        self.compare_with_cpu(
+            lambda x: torch.std_mean(x, dim=-1, keepdim=True), x, **self._VAR_STD_TOL
+        )
+
+    def test_var_plus_std_same_input(self):
+        # The upstream #182945 test function. On Spyre this runs 4 mean
+        # reductions (no FX CSE at inference); it asserts correctness only.
+        x = cached_randn((64, 4096))
+        self.compare_with_cpu(
+            lambda x: torch.var(x, dim=-1) + torch.std(x, dim=-1),
+            x,
+            **self._VAR_STD_TOL,
+        )
+
+    def test_var_std_dim_cpu(self, op, dim, keepdim, x):
+        self.compare_with_cpu(
+            lambda x: op(x, dim=dim, keepdim=keepdim), x, **self._VAR_STD_TOL
+        )
+
+    def test_var_std_correction_cpu(self, op, correction):
+        x = cached_randn((67, 256))
+        self.compare_with_cpu(
+            lambda x: op(x, dim=-1, correction=correction), x, **self._VAR_STD_TOL
+        )
+
+    def test_var_std_all_dims_cpu(self, op, x):
+        self.compare_with_cpu(lambda x: op(x), x, **self._VAR_STD_TOL)
 
     @expects_raise
     def test_cumprod_dim0_rejected(self):
