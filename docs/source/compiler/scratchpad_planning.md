@@ -318,7 +318,9 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
    `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
    HBM input that is read more than once *and* fits on LX. The clone output
-   becomes a fresh LX-eligible buffer.
+   becomes a fresh LX-eligible buffer. An input the graph writes in place is
+   never cloned: the write lands in HBM, so the clone would go stale for every
+   later read.
 2. **Buffer analysis.** `_generate_buffers` produces one
    `LifetimeBoundBuffer` per buffer, *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`

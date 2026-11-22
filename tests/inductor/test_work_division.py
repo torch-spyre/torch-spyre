@@ -693,7 +693,7 @@ class TestEmptyLxEligibility(unittest.TestCase):
             allocator_module, "clone_at_graph_boundaries", return_value=True
         ):
             reason = allocator._input_residency_reason(
-                graph, "value", [0, 1], division_is_fixed=False
+                graph, "value", [0, 1], mutated_buffers=set(), division_is_fixed=False
             )
         self.assertEqual(reason, "empty tensor")
         with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
