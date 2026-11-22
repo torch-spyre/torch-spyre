@@ -606,6 +606,21 @@ def _v2_unavailable(
     )
 
 
+def _already_ingested_v2(
+    client, db, run_id, component, kind, source_file, failed, incomplete, name
+):
+    """True when the report is already in v2; None when the read itself failed (recorded as a v2 failure)."""
+    try:
+        return benchmarks_already_ingested(
+            client, db, run_id, component, kind, source_file
+        )
+    except Exception as err:
+        failed.append(name)
+        incomplete.add(str(run_id))
+        print(f"  [warn] v2 dedup read failed: {err!r}", file=sys.stderr)
+        return None
+
+
 def benchmark_tables_present(client, db: str) -> bool:
     """Both benchmark tables exist in `db` AND carry every column the writer inserts.
 
@@ -2131,6 +2146,7 @@ def main(argv=None, assigned_trust=""):
 
             run_id = uuid.uuid4().int >> 64
             print(f"  run_id={run_id}  kernels={len(kernels)}")
+            _stored = args.write_v1
 
             if args.write_v1:
                 insert_benchmark_run(client, run_id, run_meta)
@@ -2151,14 +2167,21 @@ def main(argv=None, assigned_trust=""):
                     if not args.write_v1:
                         v2_failed_files.append(xml_path.name)
                     _purpose_skipped(args, "no v2 run id could be derived")
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "kernel",
-                    run_meta["source_file"],
-                ):
+                elif (
+                    _dedup := _already_ingested_v2(
+                        client,
+                        v2db,
+                        _v2_run_id,
+                        component_of(args, COMPONENT_DEFAULT),
+                        "kernel",
+                        run_meta["source_file"],
+                        v2_failed_files,
+                        incomplete_runs,
+                        xml_path.name,
+                    )
+                ) is None:
+                    _purpose_skipped(args, "its v2 dedup read failed")
+                elif _dedup:
                     print(
                         f"  v2: already ingested kernel report for "
                         f"run_id={_v2_run_id} — skipping"
@@ -2177,6 +2200,8 @@ def main(argv=None, assigned_trust=""):
                         )
                         print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
                         _purpose_state(args)["rows"] += _n if args.purpose else 0
+                        _stored = True
+                        _stored = True
                     except BatchParked as _v2_parked:
                         v2_parked_files.append(xml_path.name)
                         incomplete_runs.add(str(_v2_run_id))
@@ -2199,8 +2224,13 @@ def main(argv=None, assigned_trust=""):
             if not bench_ready and v2db and not args.write_v1:
                 _v2_unavailable(v2_failed_files, xml_path.name, v2db)
 
-            total_kernels += len(kernels)
-            print(f"  Inserted {len(kernels)} kernel rows")
+            if _stored:
+                total_kernels += len(kernels)
+                print(f"  Inserted {len(kernels)} kernel rows")
+            else:
+                print(
+                    f"  No kernel rows stored from {xml_path.name} (see the v2 lines above)"
+                )
 
         elif is_benchmark_xml(root, xml_path):
             print("  Detected: performance benchmark XML")
@@ -2241,6 +2271,7 @@ def main(argv=None, assigned_trust=""):
             # benchmark_runs.run_id is UInt64 — use a random 64-bit int
             run_id = uuid.uuid4().int >> 64  # positive 64-bit int
             print(f"  run_id={run_id}  benchmarks={len(benchmarks)}")
+            _stored = args.write_v1
 
             if args.write_v1:
                 insert_benchmark_run(client, run_id, run_meta)
@@ -2261,14 +2292,21 @@ def main(argv=None, assigned_trust=""):
                     if not args.write_v1:
                         v2_failed_files.append(xml_path.name)
                     _purpose_skipped(args, "no v2 run id could be derived")
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "benchmark",
-                    run_meta["source_file"],
-                ):
+                elif (
+                    _dedup := _already_ingested_v2(
+                        client,
+                        v2db,
+                        _v2_run_id,
+                        component_of(args, COMPONENT_DEFAULT),
+                        "benchmark",
+                        run_meta["source_file"],
+                        v2_failed_files,
+                        incomplete_runs,
+                        xml_path.name,
+                    )
+                ) is None:
+                    _purpose_skipped(args, "its v2 dedup read failed")
+                elif _dedup:
                     print(
                         f"  v2: already ingested benchmark report for "
                         f"run_id={_v2_run_id} — skipping"
@@ -2309,8 +2347,13 @@ def main(argv=None, assigned_trust=""):
             if not bench_ready and v2db and not args.write_v1:
                 _v2_unavailable(v2_failed_files, xml_path.name, v2db)
 
-            total_benchmarks += len(benchmarks)
-            print(f"  Inserted {len(benchmarks)} benchmark rows")
+            if _stored:
+                total_benchmarks += len(benchmarks)
+                print(f"  Inserted {len(benchmarks)} benchmark rows")
+            else:
+                print(
+                    f"  No benchmark rows stored from {xml_path.name} (see the v2 lines above)"
+                )
 
         else:
             print("  Detected: test-result XML")
@@ -2506,6 +2549,16 @@ def main(argv=None, assigned_trust=""):
     if args.strict and v2_failed_files:
         print("  [error] v2: --strict, and a v2 write failed", file=sys.stderr)
         sys.exit(1)
+    if not args.strict:
+        for failed, what in (
+            (v2_failed_files, f"v2 write failed for {len(v2_failed_files)} file(s)"),
+            (not verdicts_recorded, "the artifact's verdicts were not all recorded"),
+            (getattr(args, "misc_tags", None), "a tag fell back to misc"),
+        ):
+            if failed:
+                print(
+                    f"::warning title=ClickHouse::{what}; strict is false, so the step passes"
+                )
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"

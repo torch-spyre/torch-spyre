@@ -22,6 +22,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import regex as re
 from spyre_clickhouse_ingest import writes
 from spyre_clickhouse_ingest.batching import BatchParked
 from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
@@ -108,6 +109,13 @@ def main() -> None:
         help="exit 1 when the insert fails; otherwise a failure is a warning",
     )
     args = parser.parse_args()
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.table):
+        print(
+            f"[error] --table must be a plain SQL identifier: {args.table!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     json_path = Path(args.json_file)
     if not json_path.exists():
@@ -208,6 +216,11 @@ def main() -> None:
         print(f"[warn] rows parked, not stored: {exc}", file=sys.stderr)
     except Exception as exc:
         print(f"[error] insert into {table} failed: {exc}", file=sys.stderr)
+        if not args.strict:
+            one_line = " ".join(str(exc).split())[:300]
+            print(
+                f"::warning title=ClickHouse::insert into {table} failed, strict is false: {one_line}"
+            )
         sys.exit(1 if args.strict else 0)
 
     reasons: Counter = Counter(_str(r.get("failure_reason"), "none") for r in records)

@@ -189,3 +189,35 @@ def test_a_refused_benchmark_insert_is_a_failed_v2_write(
     rc = _code(monkeypatch, tmp_path, PERF, Client(), *flags, "--schema", "v2")
     assert rc == code
     assert "v2 write failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("report", [KERNEL, PERF], ids=["kernel", "benchmark"])
+@pytest.mark.parametrize("flags, code", [(["--strict"], 1), ([], 0)])
+def test_a_failed_dedup_read_is_a_failed_v2_write_not_a_crash(
+    monkeypatch, tmp_path, capsys, report, flags, code
+):
+    def unreadable(*a, **k):
+        raise RuntimeError("read denied")
+
+    monkeypatch.setattr(results, "benchmarks_already_ingested", unreadable)
+    rc = _code(
+        monkeypatch, tmp_path, report, Client(), *flags, "--schema", "v2",
+        tier="regression" if report is KERNEL else "perf",
+    )  # fmt: skip
+    cap = capsys.readouterr()
+    assert rc == code and "v2 dedup read failed" in cap.err
+    assert "Inserted" not in cap.out
+    assert ("::warning title=ClickHouse::v2 write failed" in cap.out) is (code == 0)
+
+
+@pytest.mark.parametrize("report", [KERNEL, PERF], ids=["kernel", "benchmark"])
+def test_an_unavailable_v2_prints_no_inserted_line(
+    monkeypatch, tmp_path, capsys, report
+):
+    monkeypatch.setattr(results, "benchmark_tables_present", lambda *a: False)
+    _code(
+        monkeypatch, tmp_path, report, Client(), "--schema", "v2",
+        tier="regression" if report is KERNEL else "perf",
+    )  # fmt: skip
+    cap = capsys.readouterr()
+    assert "Inserted" not in cap.out and "rows stored" in cap.out
