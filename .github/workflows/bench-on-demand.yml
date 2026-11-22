@@ -261,7 +261,9 @@ jobs:
         continue-on-error: true
         run: |
           bench_env="${BENCH_CLICKHOUSE_ENV,,}"
-          case "${bench_env}" in dev|prod) ;; *) echo "::error::clickhouse_env must be dev or prod, got '${BENCH_CLICKHOUSE_ENV}'"; exit 1 ;; esac
+          if [ "${DO_INGEST}" = "true" ]; then
+            case "${bench_env}" in dev|prod) ;; *) echo "::error::clickhouse_env must be dev or prod, got '${BENCH_CLICKHOUSE_ENV}'"; exit 1 ;; esac
+          fi
           if [ "${bench_env}" = "prod" ] && [ "${DO_INGEST}" = "true" ] && [ "${PROD_SET}" != "true" ]; then
             echo "::error::prod selected but the prod ClickHouse host or v2 login is not set; refusing to fall back to dev"
             exit 1
