@@ -1071,6 +1071,10 @@ jobs:
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           schema: v2
 
       # replace: the per-case XMLs under the legacy workflow name and run id (a bench-dir run derives its own
@@ -1099,6 +1103,10 @@ jobs:
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           schema: both
 
       # Four honesty lines. Echo only — never upload report.xml (public
