@@ -69,7 +69,8 @@ logger = get_inductor_logger("insert_restickify")
 #   op.committed_stl          set by optimize_restickify; consumed+deleted by finalize_layouts
 #   op.layouts                set by propagate_layouts / stickify; consumed+deleted by finalize_layouts
 #   op.restick_cost_fn        set by propagate_layouts; consumed+deleted by finalize_layouts
-#   op.loop_member              set by coarse_tile; read (and cloned) by insert_restickify_on_node_inputs
+#   (loop facts)              owned by the LoopNodes once built; insert_restickify_on_node_inputs
+#                             records the copy's tiling with loop_node.record_member
 #   op._restickify_plan       set by propagate_layouts; consumed+deleted by insert_post_mutation_restickify
 #   op._tiled_reduction_accum_name  set by coarse_tile; read by finalize_layouts
 #   op._input_layout_overrides      set by insert_post_mutation_restickify; read by codegen

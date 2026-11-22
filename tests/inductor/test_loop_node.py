@@ -900,6 +900,48 @@ class TestNodeFacts(unittest.TestCase):
         self.assertNotIn("clone", node.tiling)
         self.assertFalse(is_looped(clone))
 
+    def test_an_allocator_drain_or_hoisted_clone_is_not_a_member(self):
+        """The allocator clears the donor marker for a clone that is neither a member
+        nor a carry (``_clear_loop_membership_metadata``), so a copy of a member placed
+        in the body still reads as not looped."""
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _clear_loop_membership_metadata,
+        )
+
+        graph, node, a, b = self._tiled_pair()
+        clone = _Op("clone")
+        copy_op_metadata(a, clone)
+        _clear_loop_membership_metadata(clone)
+        insert_before(graph.operations, b, clone)
+        self.assertNotIn("clone", node.tiling)
+        self.assertFalse(is_looped(clone))
+
+    def test_a_probe_that_inherits_membership_drops_its_donor_marker(self):
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+
+        graph, node, a, b = self._tiled_pair()
+        probe = _Op("a")
+        copy_op_metadata(a, probe)
+        self.assertTrue(hasattr(probe, "_member_like"))
+        inherit_loop_membership(a, probe)
+        self.assertFalse(hasattr(probe, "_member_like"))
+        self.assertTrue(is_looped(probe))
+
+    def test_a_loop_that_mixes_the_tiling_lowering_with_another_is_refused(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_member.strict_loop_vars = True
+        with self.assertRaisesRegex(RuntimeError, "holds ops of the loop-tiling"):
+            collapse(_graph([a, b]))
+
+    def test_a_loop_the_tiling_lowering_made_is_strict_as_a_whole(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        collapse(graph)
+        (node,) = graph.operations
+        self.assertTrue(node.strict_loop_vars)
+
     def test_an_unstamped_op_in_a_body_is_not_a_member(self):
         """Being placed in a body is not being a member of the loop: an LX clone
         beside a body consumer runs every trip but tiles nothing and has no entry, so

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only loop facts over the per-op ``loop_member`` metadata.
+"""Read-only loop facts: the one read API for "which loops is this op in".
 
-Every function derives its answer from ``getattr(op, "loop_member", None)`` on
-each call; nothing is cached and nothing is mutated.  This gives later stages
-of the loop refactor one stable read API: when the storage behind it changes,
-only this module changes, not its readers.
+Once the pipeline has built an op's ``LoopNode``s they own the facts (group path,
+trip count, tiled dims, ``strict_loop_vars``) and every function here asks them
+(through ``op._loop_chain``). An op no node holds yet, a loop still being lowered,
+answers from its ``loop_member``, the lowering's build-time record
+(:func:`pending_levels`). Nothing is cached and nothing is mutated.
 """
 
 from __future__ import annotations
@@ -93,9 +94,9 @@ def _levels(loop_member) -> tuple[LoopLevel, ...]:
 
 
 def pending_levels(op: Operation) -> tuple[LoopLevel, ...]:
-    """The levels ``op.loop_member`` (the per-op stamp) describes; ``()`` if none or
-    malformed. Readers use :func:`enclosing_loops`; this is the stamp itself, for
-    the loop checker's comparison with the nodes and for an op no node holds."""
+    """The levels ``op.loop_member`` (the lowering's build-time record) describes;
+    ``()`` if none or malformed. Readers use :func:`enclosing_loops`; this is the
+    record itself, for an op no node holds yet."""
     return _levels(getattr(op, "loop_member", None))
 
 
@@ -164,8 +165,9 @@ def strict_loop_vars(op: Operation) -> bool:
 
 
 def is_looped(op: Operation) -> bool:
-    """True if a counted loop encloses ``op`` (it runs inside, or is stamped for, a
-    loop). An ``ExternKernel`` that keeps its stamp counts."""
+    """True if ``op`` is a member of a counted loop: its nodes hold its tiling (or, for
+    an op no node holds yet, it carries the lowering's ``loop_member``). An op merely
+    placed in a loop body, such as an LX clone beside a consumer, is not a member."""
     return bool(enclosing_loops(op))
 
 

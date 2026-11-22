@@ -15,11 +15,14 @@
 """``LoopNode``: a counted loop held as one operation in ``graph.operations``.
 
 ``splice_while_loops`` flattens each ``for_each_tile`` loop into ordinary ops
-stamped with ``loop_member``.  Its final step, :func:`collapse`, wraps each loop's
-ops into a ``LoopNode`` (nested for a nested loop), so a loop is a structural
-unit from the first pass after the splice.  ``loop_member`` stays on the leaf
-ops: the node adds structure and the per-loop facts (induction variable, trip
-count, carries) but replaces nothing yet.
+carrying a build-time record, ``loop_member`` (:class:`LoopMember`).  Its final
+step, :func:`collapse`, wraps each loop's ops into a ``LoopNode`` (nested for a
+nested loop), so a loop is a structural unit from the first pass after the splice,
+and records the loop's facts in the node (group id, trip count, induction variable,
+carries, each member's tiled dims, ``strict_loop_vars``) and the chain of nodes
+around each leaf op (``_loop_chain``).  The record is then deleted from every op a
+node holds: after the build the nodes are the only owner of the facts, and a pass
+that adds an op to a loop says what it tiles with :func:`record_member`.
 
 Passes that read the graph flat run against :class:`OpsView`, which iterates
 the leaf ops in program order and refuses edits: a pass that changes the graph
@@ -88,8 +91,9 @@ class LoopMember:
 
     The lowerings (``for_each_tile`` and the loop-tiling lowering) write it as they
     build a loop; ``collapse`` / ``build_pending_loop_nodes`` read it to build the
-    ``LoopNode``s and record the facts in them. After that the nodes own the facts and
-    this is no longer read (stage 9.4.3 deletes it from every op a node holds). It
+    ``LoopNode``s and record the facts in them, then delete it from every op a node
+    holds: from then on the nodes own the facts. (A member is an op whose nodes hold
+    a tiling entry for it; this record is what the lowerings write BEFORE that.) It
     holds the loop's own facts only. An access's per-trip advance is the loop
     variable's coefficient in the access's index (``loop_facts.read_advance``).
 
@@ -544,6 +548,8 @@ def inherit_loop_membership(source: ir.Operation, target: ir.Operation) -> None:
     name): it is a member of the same loops. The nodes' tiling is keyed by name, so
     only the pointer to the nodes needs copying."""
     target._loop_chain = tuple(getattr(source, "_loop_chain", ()))  # type: ignore[attr-defined]
+    if hasattr(target, "_member_like"):  # a copy made by copy_op_metadata
+        del target._member_like  # type: ignore[attr-defined]
 
 
 def _drop_spent_records(entry: ir.Operation) -> None:
@@ -912,10 +918,21 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
         _fill_tiling(entry)
     for node in _nodes_in(operations):
         node.facts_recorded = True
-        node.strict_loop_vars = any(
-            getattr(getattr(leaf, "loop_member", None), "strict_loop_vars", False)
+        flags = {
+            bool(leaf.loop_member.strict_loop_vars)
             for leaf in all_ops(node.body)
-        )
+            if getattr(leaf, "loop_member", None) is not None
+        }
+        if len(flags) > 1:
+            # strict_loop_vars is a property of the loop, not of an op: the
+            # loop-tiling lowering makes whole loops and refuses an op that is
+            # already in one. A node that mixes the two would read a for_each_tile
+            # op's "lists no loop variable" as a compiler bug.
+            raise RuntimeError(
+                f"{node.get_name()} holds ops of the loop-tiling lowering and of "
+                "another lowering"
+            )
+        node.strict_loop_vars = flags == {True}
         # The nodes own the facts now: the lowering's record is spent. Removing it
         # means nothing after the build can read it by accident.
         for leaf in all_ops(node.body):

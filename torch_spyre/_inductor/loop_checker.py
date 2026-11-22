@@ -32,7 +32,10 @@ What it checks:
    body.
 6. An op in nodes the pipeline built points at exactly those nodes and carries no
    ``loop_member``: once the nodes are built they own the loop facts, and a pass
-   that adds an op to a loop says what it tiles with ``record_member``.
+   that adds an op to a loop says what it tiles with ``record_member``. An op whose
+   index uses an enclosing loop's variable must hold a tiling entry in those nodes
+   (an op without one reads as "not in the loop", which would drop its advance
+   silently).
 
 A loop no node covers is not checked: span-overflow tiling still stamps flat
 loop ops (stage 7a replaces it), and ``build_loop_scheduler_nodes`` groups them
@@ -313,11 +316,24 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             # one: skip tracing every op's dependencies.
             continue
         mine = {n.induction for n in enclosing if n.induction is not None}
-        stray = (_index_symbols(op) & all_inductions) - mine
+        symbols = _index_symbols(op)
+        stray = (symbols & all_inductions) - mine
         if stray:
             problems.append(
                 f"{op.get_name()} indexes with {sorted(map(str, stray))}, not "
                 "the induction variable of any loop enclosing it"
+            )
+        if (
+            symbols & mine
+            and all(n.facts_recorded for n in enclosing)
+            and any(op.get_name() not in n.tiling for n in enclosing)
+        ):
+            problems.append(
+                f"{op.get_name()} advances with the loop variable "
+                f"{sorted(map(str, symbols & mine))} but its nodes hold no tiling for "
+                "it, so it reads as not in the loop: a pass that puts an op that "
+                "advances with a loop into it says what it tiles with record_member "
+                "(or builds it with copy_op_metadata from a member)"
             )
 
     def carries(entries: list[ir.Operation]) -> None:

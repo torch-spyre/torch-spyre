@@ -268,12 +268,12 @@ class TestNodeChainRule(unittest.TestCase):
     """Rule 6: an op in nodes the pipeline built points at them and carries no
     ``loop_member`` (the nodes own the facts once they are built)."""
 
-    def _built(self):
+    def _built(self, index=sympy.Integer(0)):
         from types import SimpleNamespace
 
         from torch_spyre._inductor.loop_node import LoopMember, collapse
 
-        a, b = _LoopOp("a", (0,)), _LoopOp("b", (0,))
+        a, b = _LoopOp("a", (0,), index=index), _LoopOp("b", (0,), index=index)
         for op in (a, b):
             op.loop_member = LoopMember(
                 loop_group_id=(0,),
@@ -282,7 +282,7 @@ class TestNodeChainRule(unittest.TestCase):
                 loop_tiled_reduction_dims=[[]],
             )
         graph = SimpleNamespace(operations=[a, b])
-        collapse(graph)
+        collapse(graph, inductions={0: U0})
         return graph, a, b
 
     def test_a_built_node_is_clean_and_its_members_lose_the_record(self):
@@ -304,6 +304,36 @@ class TestNodeChainRule(unittest.TestCase):
         (problem,) = find_violations(graph.operations)
         self.assertIn("a: carries a loop_member inside built nodes", problem)
         self.assertIn("record_member", problem)
+
+    def test_an_op_that_advances_with_the_loop_but_holds_no_tiling_is_reported(self):
+        """Without an entry an op reads as "not in the loop", which would drop its
+        advance silently; the loop variable in its index is what gives it away."""
+        from torch_spyre._inductor.loop_node import insert_before, record_member
+
+        graph, a, b = self._built(index=4 * U0)
+        self.assertEqual(find_violations(graph.operations), [])
+        late = _Op("late", index=4 * U0)
+        insert_before(graph.operations, b, late)
+        problems = find_violations(graph.operations)
+        self.assertTrue(
+            any("late advances with the loop variable" in p for p in problems),
+            problems,
+        )
+        self.assertTrue(any("record_member" in p for p in problems), problems)
+        record_member(late, [([], [])])
+        self.assertTrue(
+            not any("late advances" in p for p in find_violations(graph.operations))
+        )
+
+    def test_an_op_that_does_not_use_the_loop_variable_needs_no_entry(self):
+        from torch_spyre._inductor.loop_node import insert_before
+
+        graph, a, b = self._built(index=4 * U0)
+        once = _Op("once")  # index 0: a once-op beside the members
+        insert_before(graph.operations, b, once)
+        self.assertTrue(
+            not any("once advances" in p for p in find_violations(graph.operations))
+        )
 
     def test_an_op_with_no_recorded_chain_is_reported(self):
         graph, a, b = self._built()
