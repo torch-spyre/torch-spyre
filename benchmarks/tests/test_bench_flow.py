@@ -16,6 +16,7 @@
 
 import json
 import os
+import regex as re
 import shutil
 import subprocess
 import sys
@@ -191,18 +192,105 @@ def _scalars(node, key=""):
         yield key, " ".join(node.split())
 
 
+_SECRET = re.compile(r"secrets\.(CLICKHOUSE_\w+)")
+_EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+PROD_GUARD = "== 'prod' &&"
+
+
+def unguarded_prod_secret_expressions(text):
+    """Every `${{ }}` expression that reads a non-_DEV CLICKHOUSE secret without the explicit prod guard."""
+    bad = []
+    for key, value in _scalars(yaml.safe_load(text)):
+        if key == "PROD_SET":
+            continue
+        for expr in _EXPR.findall(value):
+            expr = " ".join(expr.split())
+            prod_refs = [n for n in _SECRET.findall(expr) if not n.endswith("_DEV")]
+            if prod_refs and PROD_GUARD not in expr:
+                bad.append(expr)
+    return bad
+
+
 def test_prod_credentials_are_reachable_only_through_an_explicit_prod():
     text = WORKFLOW.read_text()
-    # Per YAML scalar, so a long expression wrapped over several lines is one unit.
-    for key, value in _scalars(yaml.safe_load(text)):
-        if (
-            "secrets.CLICKHOUSE_" in value
-            and key != "PROD_SET"
-            and "_DEV" not in value.split("&&")[0]
-        ):
-            assert "== 'prod' &&" in value, value
+    assert unguarded_prod_secret_expressions(text) == []
     assert "inputs.clickhouse_env || 'dev'" in text
     assert "vars.BENCH_CLICKHOUSE_ENV" not in text
+
+
+def _mutated(tmp_path, extra_env=None, extra_run=None):
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    step = wf["jobs"]["bench"]["steps"][0]
+    if extra_env:
+        step.setdefault("env", {}).update(extra_env)
+    if extra_run:
+        step["run"] = extra_run
+    path = tmp_path / "wf.yml"
+    path.write_text(yaml.safe_dump(wf))
+    return path.read_text()
+
+
+@pytest.mark.parametrize(
+    "extra_env,extra_run",
+    [
+        (
+            {"LEAK": "${{ secrets.CLICKHOUSE_HOST_DEV || secrets.CLICKHOUSE_HOST }}"},
+            None,
+        ),
+        (
+            None,
+            "echo ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || '' }}\n"
+            "echo ${{ secrets.CLICKHOUSE_HOST }}\n",
+        ),
+    ],
+    ids=["dev-prefix-exemption", "unguarded-in-shell-block"],
+)
+def test_the_prod_guard_check_catches_leaks(tmp_path, extra_env, extra_run):
+    assert unguarded_prod_secret_expressions(_mutated(tmp_path, extra_env, extra_run))
+
+
+def test_the_prod_guard_check_accepts_guarded_and_dev_only_expressions(tmp_path):
+    ok = {
+        "A": "${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}",
+        "B": "${{ secrets.CLICKHOUSE_HOST_DEV }}",
+    }
+    assert unguarded_prod_secret_expressions(_mutated(tmp_path, ok)) == []
+
+
+def _collect_guard_snippet():
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    run = next(
+        s["run"] for s in wf["jobs"]["bench"]["steps"] if s.get("id") == "collect"
+    )
+    head = run.split('if [ "${bench_env}" = "prod" ]')[0]
+    return head
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize(
+    "env_value,do_ingest,rc",
+    [
+        ("prod", "true", 0),
+        ("PROD", "true", 0),
+        ("dev", "true", 0),
+        ("staging", "true", 1),
+        ("prod ", "true", 1),
+        ("staging", "false", 0),
+        ("prod ", "false", 0),
+    ],
+)
+def test_the_clickhouse_env_guard_only_rejects_when_ingesting(env_value, do_ingest, rc):
+    r = subprocess.run(
+        ["bash", "-c", _collect_guard_snippet()],
+        env={
+            "PATH": os.environ["PATH"],
+            "BENCH_CLICKHOUSE_ENV": env_value,
+            "DO_INGEST": do_ingest,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == rc, r.stdout + r.stderr
 
 
 def test_results_leave_only_through_the_ingest_action():
