@@ -78,15 +78,15 @@ inputs:
     required: false
     default: ''
   clickhouse-port:
-    description: Deprecated, see clickhouse-host.
+    description: Deprecated, see clickhouse-host. Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-user:
-    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together).
+    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together). Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-pass:
-    description: Deprecated, see clickhouse-user.
+    description: Deprecated, see clickhouse-user. Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-v2-host:
@@ -268,7 +268,7 @@ runs:
         msg="v2 artifact ${ARTIFACT} was not resolved or recorded (see the log above)."
         echo "::error title=v2 artifact::${msg}"
         echo "- :x: ${msg}" >> "$GITHUB_STEP_SUMMARY"
-        [ "${STRICT}" = "true" ] && exit 1
+        [ "${STRICT}" = false ] || exit 1
         exit 0
 
     # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.

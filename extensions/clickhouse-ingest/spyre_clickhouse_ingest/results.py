@@ -2201,7 +2201,6 @@ def main(argv=None, assigned_trust=""):
                         print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
                         _purpose_state(args)["rows"] += _n if args.purpose else 0
                         _stored = True
-                        _stored = True
                     except BatchParked as _v2_parked:
                         v2_parked_files.append(xml_path.name)
                         incomplete_runs.add(str(_v2_run_id))
@@ -2325,6 +2324,7 @@ def main(argv=None, assigned_trust=""):
                         )
                         print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
                         _purpose_state(args)["rows"] += _n if args.purpose else 0
+                        _stored = True
                     except BatchParked as _v2_parked:
                         v2_parked_files.append(xml_path.name)
                         incomplete_runs.add(str(_v2_run_id))

@@ -99,15 +99,15 @@ inputs:
     required: false
     default: ''
   clickhouse-port:
-    description: Deprecated, see clickhouse-host.
+    description: Deprecated, see clickhouse-host. Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-user:
-    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together).
+    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together). Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-pass:
-    description: Deprecated, see clickhouse-user.
+    description: Deprecated, see clickhouse-user. Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-db:

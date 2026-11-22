@@ -195,7 +195,7 @@ def test_xml_passes_strict_unless_strict_is_false(tmp_path):
         assert ("--strict" in (d / "argv").read_text().split()) is want
 
 
-def run_v2_artifact(tmp_path, inputs):
+def run_v2_artifact(tmp_path, inputs, fail=False):
     """The ensure step as GitHub runs it (`bash --noprofile --norc -eo pipefail`), with a fake interpreter."""
     action = ACTIONS / "v2-artifact/action.yml"
     s = next(
@@ -206,11 +206,11 @@ def run_v2_artifact(tmp_path, inputs):
     (tmp_path / "venv/bin").mkdir(parents=True)
     py = tmp_path / "venv/bin/python"
     py.write_text(
-        '#!/bin/bash\nenv | grep -E "^CLICKHOUSE_" | sort > "$ENV_OUT"\nprintf "%s\\n" "$@" >> "$ENV_OUT.argv"\necho "{}"\n'
+        '#!/bin/bash\nenv | grep -E "^CLICKHOUSE_" | sort > "$ENV_OUT"\nprintf "%s\\n" "$@" >> "$ENV_OUT.argv"\necho "{}"\nexit ${FAKE_RC:-0}\n'
     )
     py.chmod(0o755)
     env = env_of(s, inputs)
-    env.update(VENV=str(tmp_path / "venv"), PATH="/usr/bin:/bin", ENV_OUT=str(tmp_path / "seen"),
+    env.update(VENV=str(tmp_path / "venv"), PATH="/usr/bin:/bin", ENV_OUT=str(tmp_path / "seen"), FAKE_RC="1" if fail else "0",
                GITHUB_OUTPUT=str(tmp_path / "o"), GITHUB_STEP_SUMMARY=str(tmp_path / "sum"),
                CLICKHOUSE_V2_HOST="evil.host", CLICKHOUSE_V2_USER="evil", CLICKHOUSE_V2_PASSWORD="evilpw",
                CLICKHOUSE_V2_PORT="9", CLICKHOUSE_PORT="9")  # fmt: skip
@@ -271,6 +271,17 @@ def test_v2_artifact_never_sends_the_deprecated_login_to_a_v2_host(tmp_path, v2)
         },
     )
     assert r.returncode != 0 and not seen and "login is missing" in r.stdout
+
+
+@pytest.mark.parametrize("strict, code", [("false", 0), ("true", 1), ("", 1)])
+def test_v2_artifact_fails_unless_strict_is_false(tmp_path, strict, code):
+    r, _ = run_v2_artifact(
+        tmp_path,
+        {"artifact": "id:x", "arch": "x86_64", **NEW, "strict": strict},
+        fail=True,
+    )
+    assert r.returncode == code, r.stdout + r.stderr
+    assert "was not resolved or recorded" in r.stdout
 
 
 def test_the_actions_write_v2_even_when_the_job_sets_ingest_schema_both(tmp_path):

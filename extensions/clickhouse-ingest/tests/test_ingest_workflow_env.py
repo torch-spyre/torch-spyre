@@ -15,6 +15,7 @@
 """Wherever the ClickHouse settings travel in CI, the v2-host and schema-login settings travel too."""
 
 from pathlib import Path
+import regex as re
 
 import pytest
 import yaml
@@ -177,7 +178,9 @@ def test_an_unset_prod_v2_secret_never_falls_through_to_the_dev_one(wf):
         lines = [
             ln for ln in text.splitlines() if ln.strip().startswith(f"{name}: ${{{{")
         ]
-        assert lines and all("toJSON(" in ln for ln in lines), lines
+        assert lines and all(re.search(r"toJSON\(\(?secrets\.", ln) for ln in lines), (
+            lines
+        )
 
 
 def test_v2_ingest_actions_publish_a_rows_free_manifest_and_never_upload_the_spool():
@@ -239,3 +242,49 @@ def _covered(tmp_path, **extra):
 def test_the_covered_tier_lookup_never_tries_the_default_user(tmp_path):
     p = _covered(tmp_path, CLICKHOUSE_HOST="h.example.com", CLICKHOUSE_DB_V2="spyre_v2")
     assert p.returncode == 0 and "no ClickHouse login" in p.stderr
+
+
+def _mappings(node):
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _mappings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _mappings(v)
+
+
+def _flat(expr):
+    return re.sub(r"\s+", " ", str(expr))
+
+
+def _paired(host, port, suffix=""):
+    return (
+        f"(secrets.{host}{suffix} && secrets.{port}{suffix}) || "
+        f"(!secrets.{host}{suffix} && secrets.CLICKHOUSE_PORT{suffix}) || ''"
+    )
+
+
+V2_PORT_KEYS = (
+    ("CLICKHOUSE_V2_PORT", "CLICKHOUSE_V2_HOST"),
+    ("clickhouse-v2-port", "clickhouse-v2-host"),
+)
+
+
+def test_a_v2_port_follows_the_host_it_is_sent_with():
+    """A host that falls back to the legacy secret takes the port as a pair, never V2_PORT alone."""
+    checked = 0
+    docs = [d for _, d, _ in workflows()] + [d for _, d in actions()]
+    for doc in docs:
+        for m in _mappings(doc):
+            for port_key, host_key in V2_PORT_KEYS:
+                if port_key not in m or host_key not in m:
+                    continue
+                host, port = _flat(m[host_key]), _flat(m[port_key])
+                if "secrets.CLICKHOUSE_HOST" not in host:
+                    continue
+                checked += 1
+                assert _paired("CLICKHOUSE_V2_HOST", "CLICKHOUSE_V2_PORT") in port, port
+                if "_DEV" in port:
+                    assert _paired("CLICKHOUSE_V2_HOST", "CLICKHOUSE_V2_PORT", "_DEV") in port, port  # fmt: skip
+    assert checked >= 5

@@ -221,3 +221,18 @@ def test_an_unavailable_v2_prints_no_inserted_line(
     )  # fmt: skip
     cap = capsys.readouterr()
     assert "Inserted" not in cap.out and "rows stored" in cap.out
+
+
+@pytest.mark.parametrize(
+    "xml,tier,kind",
+    [(KERNEL, "regression", "kernel"), (PERF, "perf", "benchmark")],
+)
+def test_a_stored_v2_only_report_is_counted_as_stored(
+    monkeypatch, tmp_path, capsys, xml, tier, kind
+):
+    c = Client()
+    ingest(monkeypatch, tmp_path, xml, c, "--schema", "v2", tier=tier)
+    out = capsys.readouterr().out
+    assert _written(c) == 1
+    assert f"Inserted 1 {kind} rows" in out
+    assert f"No {kind} rows stored" not in out

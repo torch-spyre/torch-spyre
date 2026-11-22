@@ -66,7 +66,7 @@ XML pipeline ends here.
 | `purpose` | `run.purpose` of the perf rows (`nightly`, `weekly`, `merge`, `on-demand`, ...); only the first three join verdict baselines. Empty records none. |
 | `strict` | `true` (default) passes `--strict`: a failed v2 write, an unrecorded artifact verdict or a misc-tag fallback fails the step. `false` makes those warnings. |
 | `clickhouse-v2-*`, `clickhouse-db-v2` | The scoped v2 login and its endpoint (database default `spyre_v2`); empty `clickhouse-v2-host` is a clean no-op. Everything is written to the v2 database only. |
-| `clickhouse-host` / `-port` / `-user` / `-pass` | Deprecated: used when the matching `clickhouse-v2-*` input is empty. `clickhouse-db` and `schema` are ignored (a non-v2 `schema` warns); the action always writes v2. A host from either name with no login fails the step; a `clickhouse-v2-host` is always paired with `clickhouse-v2-user`/`-pass` and never receives the deprecated `clickhouse-user`/`-pass`. |
+| `clickhouse-host` / `-port` / `-user` / `-pass` | Deprecated: used only when `clickhouse-v2-host` is empty; once it is set, the deprecated port, user and pass are never used. `clickhouse-db` and `schema` are ignored (a non-v2 `schema` warns); the action always writes v2. A host from either name with no login fails the step; a `clickhouse-v2-host` is always paired with `clickhouse-v2-user`/`-pass`. |
 
 ### `ingest-hw-diagnostics-to-clickhouse`
 
