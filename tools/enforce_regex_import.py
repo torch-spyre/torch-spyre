@@ -67,7 +67,7 @@ def main() -> int:
         # Writes offline results bundles on air-gapped test hosts, from a --no-deps wheel or
         # as a single copied file, so it runs on the standard library alone.
         "extensions/clickhouse-ingest/spyre_clickhouse_ingest/offline.py",
-        # offline.py validates a bench-reference bundle through it, so it stays standard-library-only too.
+        # offline.py imports it in the wheel, which air-gapped hosts install with --no-deps (no `regex`).
         "extensions/clickhouse-ingest/spyre_clickhouse_ingest/reference.py",
     }
 

@@ -16,6 +16,18 @@ spec:
     levels: [kernel, layer, graph]
   runners:
     - {name: harness-a, protocol: process/v1, command: [python3, -m, spyre_bench.kernel.bench_runner]}
+  attributes:
+    - {key: role.moe.expert_id, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: MoE expert index of each tile; absent means not captured"}
+    - {key: role.moe.tile_index, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: tile index within the expert; absent means not captured"}
+    - {key: role.moe.tokens, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: real tokens in each tile; absent means not captured"}
+    - {key: role.moe.cores, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: cores used by each tile; absent means not captured"}
+    - {key: role.moe.start_us, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: tile start time; absent means not captured"}
+    - {key: role.moe.end_us, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: tile end time; absent means not captured"}
+    - {key: role.moe.e_sel, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: experts selected per decode step; absent means not captured"}
+    - {key: role.moe.loop_trips_max, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: largest expert-loop trip count per step; absent means not captured"}
+    - {key: role.moe.tokens_routed_hist, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "name of the trace signal that holds: tokens routed to each expert per step; absent means not captured"}
   metrics:
-    - {name: kernel.time.mean, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
-    - {name: kernel.total_duration, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.time.mean, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.total_duration, class: kernel_time, unit: s, direction: lower_is_better, category: performance, statistic: sum, compare: relative, noise: {min_repeats: 1}}
+    - {name: kernel.moe.fetch_bytes, class: kernel_time, unit: By, direction: lower_is_better, category: diagnostic, statistic: mean, compare: relative, noise: {min_repeats: 1}, description: "expert weight bytes fetched per launch"}
+    - {name: kernel.moe.loop_trips, class: kernel_time, unit: "{trip}", direction: none, category: diagnostic, statistic: max, compare: exact, noise: {min_repeats: 1}, description: "largest runtime trip count of the expert loop"}

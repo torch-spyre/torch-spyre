@@ -2293,6 +2293,23 @@
         "$ref": "#/$defs/metric"
        }
       },
+      "context": {
+       "type": "object",
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "description": "metric-context facets only the author knows (token_basis, timer, ...); never identity"
+      },
       "env": {
        "$ref": "#/$defs/env"
       },
@@ -3262,13 +3279,82 @@
             "none",
             "device_local",
             "per_device",
-            "explicit"
+            "explicit",
+            "platform"
            ]
           },
           "cpus": {
            "type": "string",
            "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$",
            "description": "CPU list such as 0-7,16; only for policy explicit"
+          },
+          "cpus_by_device": {
+           "type": "array",
+           "items": {
+            "type": "string",
+            "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$"
+           },
+           "minItems": 1,
+           "description": "one CPU list per device, in device order; per_device only"
+          },
+          "assign": {
+           "type": "object",
+           "additionalProperties": false,
+           "properties": {
+            "cores_per_device": {
+             "type": "integer",
+             "minimum": 1
+            },
+            "spread": {
+             "enum": [
+              "pack",
+              "spread",
+              "round_robin"
+             ]
+            },
+            "smt": {
+             "enum": [
+              "primary_only",
+              "siblings",
+              "both"
+             ]
+            },
+            "reserve": {
+             "type": "integer",
+             "minimum": 0
+            },
+            "reserve_cpus": {
+             "type": "string",
+             "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$"
+            },
+            "spread_scope": {
+             "enum": [
+              "all",
+              "socket"
+             ]
+            },
+            "llc_align": {
+             "type": "boolean"
+            }
+           },
+           "required": [
+            "cores_per_device"
+           ],
+           "description": "per_device only: generate the lists at run time from the host topology"
+          },
+          "layout": {
+           "enum": [
+            "tree",
+            "ranks"
+           ],
+           "description": "tree: pin the command's process tree; ranks: also pin each rank by LOCAL_RANK behind {pin_wrapper} (per_device only)"
+          },
+          "launcher": {
+           "enum": [
+            "taskset",
+            "numactl"
+           ],
+           "description": "tool that applies the CPUs"
           },
           "require_verified": {
            "type": "boolean",
@@ -3481,6 +3567,17 @@
      "type": "object",
      "additionalProperties": false,
      "properties": {
+      "applies_to": {
+       "type": "array",
+       "items": {
+        "enum": [
+         "perf",
+         "quality"
+        ]
+       },
+       "minItems": 1,
+       "description": "test types the policy judges; default [perf]. A quality policy replaces the clean, qualification, cv and warm-up requirements with the gates listed per row; mixed lists are rejected"
+      },
       "purposes": {
        "type": "object",
        "additionalProperties": {
@@ -3531,6 +3628,13 @@
              "required",
              "optional"
             ]
+           },
+           "gates": {
+            "type": "array",
+            "items": {
+             "$ref": "#/$defs/metric"
+            },
+            "description": "quality policies: pack gate ids evaluated for the row, e.g. llm.records_complete"
            }
           },
           "description": "gates a result must pass to earn `valid`; failing one caps the validity (qualification: unqualified_env, clean: shared_env, the rest: suspect)"
@@ -4100,6 +4204,54 @@
         "metric"
        ],
        "description": "a table of per-cell statistics over `by` within each `across` combination; metric may be derive.name"
+      },
+      "reference": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "case": {
+         "$ref": "#/$defs/case_name"
+        },
+        "value": {
+         "type": "number"
+        },
+        "stderr": {
+         "type": "number",
+         "minimum": 0
+        },
+        "n": {
+         "type": "integer",
+         "minimum": 1
+        },
+        "label": {
+         "type": "string",
+         "description": "abstract name of an inline reference, e.g. cpu-fp32-ref"
+        },
+        "stderr_metric": {
+         "$ref": "#/$defs/metric"
+        },
+        "tolerance": {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "stderr": {
+           "type": "number",
+           "minimum": 0,
+           "description": "allowed shortfall in combined standard errors; a single run is `regressed` only from 4 combined standard errors, a smaller shortfall past the allowance is `suspected`"
+          },
+          "abs": {
+           "type": "number",
+           "minimum": 0,
+           "description": "practical floor: a shortfall below it is never worse"
+          }
+         },
+         "description": "at least one of stderr, abs; both set = the larger allowance"
+        }
+       },
+       "required": [
+        "tolerance"
+       ],
+       "description": "quality: compare the score of each selected Result with a reference (the Result of `case`, or an inline value with its stderr or n); `metric` is the score. Advisory: never gates, and a Result whose validity is suspect or invalid is reported as such, never as regressed"
       }
      },
      "required": [
@@ -4545,6 +4697,32 @@
             "minimum": 0
            }
           }
+         },
+         "class": {
+          "type": "string",
+          "pattern": "^(x-)?[a-z][a-z0-9_-]*$",
+          "description": "metric class of the metric-context vocabulary; default: matched by name"
+         },
+         "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+           "required": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "pattern": "^[a-z0-9_|-]+$"
+            }
+           },
+           "optional": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "pattern": "^[a-z0-9_-]+$"
+            }
+           }
+          },
+          "description": "facets numbers of this metric must carry; `required` replaces the class default"
          },
          "otel": {
           "type": "string"

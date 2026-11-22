@@ -37,6 +37,7 @@ packages = ["spyre_bench"]
 [tool.setuptools.package-data]
 spyre_bench = [
     "core/pack.yaml",
+    "core/metric-context.yaml",
     "core/schemas/*.json",
     "core/schemas/tool-output/*.json",
     "packs/index.yaml",

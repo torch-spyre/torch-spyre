@@ -21,6 +21,7 @@ import importlib.util
 CONTRACT_VERSION = 1
 INGEST_MODULE = "spyre_clickhouse_ingest.identity"
 INGEST_DIST = "spyre-clickhouse-ingest"
+INVALIDATION_MODULE = "spyre_clickhouse_ingest.bench_invalidation"
 # Known answers, each element pinning one property of the ingest rule: tags are stripped, lower-cased, deduplicated,
 # sorted, raw (no alias or namespace handling, empty dropped, non-str stringified); values only strip and lower-case
 # (no NFC/NFKC/casefold, inner whitespace kept, bool/float/None via str, no truncation); keys keep case and padding, an
@@ -58,6 +59,11 @@ PROFILE_SOURCES = {
     "vllm-sweep": ("spyre_clickhouse_ingest.vllm", "SWEEP_ID_KEYS"),
 }
 
+OFFLINE_MODULE = "spyre_clickhouse_ingest.offline"
+# The offline module's bench support: absent in an ingest that predates bench bundles.
+OFFLINE_NEEDS = ("bench_inputs", "content_digest", "receipt_id")
+UPGRADE_HINT = "upgrade the ingest first (a kit sealed by a newer ingest than the receiving one is refused)"
+
 _state = {}
 
 
@@ -92,6 +98,21 @@ def _load():
             )
     _state.update(derive=derive, namespace=str(namespace))
     return derive
+
+
+def offline():
+    """The ingest's stdlib-only sealing and upload module (it reads bundle.schema.json beside itself, so the whole
+    package is needed; a vendored identity module is not enough)."""
+    try:
+        mod = importlib.import_module(OFFLINE_MODULE)
+    except Exception as e:  # noqa: BLE001 - any import-time failure means the module is unusable
+        raise IngestUnavailable(f"{OFFLINE_MODULE} is not importable ({type(e).__name__}: {e}); {HINT}") from e
+    missing = [n for n in OFFLINE_NEEDS if not hasattr(mod, n)]
+    if missing:
+        raise IngestUnavailable(
+            f"{OFFLINE_MODULE} ({getattr(mod, '__file__', 'unknown path')}) lacks {missing}: it predates bench bundles; {UPGRADE_HINT}"
+        )
+    return mod
 
 
 def reset():
@@ -136,6 +157,14 @@ def profile_keys(profile):
     """The ingest's key list for a profile, or None when it cannot be read (see profile_status)."""
     kind, value = profile_status(profile)
     return value if kind == "keys" else None
+
+
+def invalidation():
+    """The ingest's invalidation module (preview, write rules, bundle kind), or IngestUnavailable with how to install it."""
+    try:
+        return importlib.import_module(INVALIDATION_MODULE)
+    except Exception as e:  # noqa: BLE001 - any import-time failure means the module is unusable
+        raise IngestUnavailable(f"{INVALIDATION_MODULE} is not importable ({type(e).__name__}: {e}); {HINT}") from e
 
 
 def info():

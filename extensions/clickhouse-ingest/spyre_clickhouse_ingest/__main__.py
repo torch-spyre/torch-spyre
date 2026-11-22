@@ -43,10 +43,10 @@ def main(argv=None):
         from .ci_run_timings import main as run
     elif command == "dispatch":
         from .dispatch import main as run
-    elif command == "vllm-trace":
-        from .vllm_trace import main as run
     elif command == "spool":
         from .spool_cli import main as run
+    elif command == "vllm-trace":
+        from .vllm_trace import main as run
     elif command == "relay":
         from .relay import main as run
     elif command == "bench-verdicts":

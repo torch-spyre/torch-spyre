@@ -117,6 +117,23 @@
       "$ref": "#/$defs/metric"
      }
     },
+    "context": {
+     "type": "object",
+     "additionalProperties": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     },
+     "description": "metric-context facets only the author knows (token_basis, timer, ...); never identity"
+    },
     "env": {
      "$ref": "#/$defs/env"
     },

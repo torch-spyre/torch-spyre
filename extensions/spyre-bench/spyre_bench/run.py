@@ -40,12 +40,23 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from spyre_bench import cliutil, engine, ingest_adapter, placement, planfile, store as stores
+from spyre_bench import (
+    cliutil,
+    engine,
+    ingest_adapter,
+    pinning_plan,
+    pinning_run,
+    placement,
+    planfile,
+    quality,
+    store as stores,
+)
 from spyre_bench.cliutil import UsageError
 
 POLL_S = 0.5
 DEFAULT_TIMEOUT_S = 3600
 LANDED_POLL_S = 5
+CASE_LABEL = "bench.case"
 INGEST_BASE = ["{python}", "-I", "-m", "spyre_clickhouse_ingest", "results"]
 # perf-kernel takes the engine's --run-id verbatim; the bundle profiles derive their own run_id from the run key.
 BUNDLE_TAIL = [
@@ -54,7 +65,7 @@ BUNDLE_TAIL = [
     "--arch",
     "{arch}",
     "--trigger-type",
-    "perf",
+    "{test_type}",
     "--jenkins-run-key",
     "{run_key}",
     "--schema",
@@ -142,6 +153,12 @@ def check_records(plan):
         pin = rec.get("pinning")
         if pin is not None and not (isinstance(pin, dict) and isinstance(pin.get("policy", "none"), str)):
             raise UsageError(f"{where} ({rec['name']}): pinning must be a mapping with a string policy or null")
+        if (pin or {}).get("layout") == "ranks" and not any(
+            "{" + pinning_run.WRAPPER_TOKEN + "}" in str(w) for w in rec.get("command") or ()
+        ):
+            raise UsageError(
+                f"{where} ({rec['name']}): cpu_pinning layout ranks needs the command to run behind {{pin_wrapper}}"
+            )
         labels = rec.get("labels")
         if labels is not None and not (
             isinstance(labels, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items())
@@ -181,6 +198,7 @@ def run_values(rec, ctx, repeat, cache, raw_dir, repeat_dir):
         "repeat_dir": repeat_dir,
         "out_dir": ctx["out"],
         "python": sys.executable,
+        "pin_wrapper": str(Path(repeat_dir) / pinning_run.WRAPPER_NAME),
     }
 
 
@@ -308,9 +326,24 @@ def finish_pumps(proc, pumps):
 
 
 def execute_command(
-    argv, env, cwd, out_path, err_path, timeout_s, pin, device_numa, popen, max_log=DEFAULT_LOG_BYTES, truncated=None
+    argv,
+    env,
+    cwd,
+    out_path,
+    err_path,
+    timeout_s,
+    pin,
+    device_numa,
+    popen,
+    max_log=DEFAULT_LOG_BYTES,
+    truncated=None,
+    markers=None,
+    sys_root="/sys",
 ):
     """(returncode | None, reason, pinning props | None). Logs are capped; the group is killed on timeout or interrupt.
+
+    `pin` is the request the process tree is judged against; `markers` (wrapper paths, possibly empty) tells the observer
+    the engine launched the tree under a pinning tool, so samples taken while it is still that tool are skipped.
 
     `truncated`, when given, receives "stdout" / "stderr" for each capped log. A log that could not be written turns a
     zero exit into reason `log_write_failed:<errno>`; output a detached process writes after the command exits is dropped.
@@ -331,12 +364,17 @@ def execute_command(
     pumps = [Capture(proc.stdout, out_path, max_log), Capture(proc.stderr, err_path, max_log)]
     for pump in pumps:
         pump.start()
+    started = placement.starttime(proc.pid) if pin else None
     deadline = time.monotonic() + timeout_s
     result = None
     try:
         while result is None:
             if pin:
-                samples.append(placement.verify_pinning(pin, proc.pid, device_numa))
+                sample = placement.verify_pinning(
+                    pin, proc.pid, device_numa, sys_root=sys_root, expected_starttime=started, markers=markers
+                )
+                if sample is not None:
+                    samples.append(sample)
             try:
                 rc = proc.wait(timeout=max(0.01, min(POLL_S, deadline - time.monotonic())))
                 result = (rc, "" if rc == 0 else f"exit_{rc}")
@@ -439,9 +477,14 @@ def run_case(rec, ctx, popen):
     timeout_s = (float(rec.get("timeout_min") or 0) * 60) or DEFAULT_TIMEOUT_S
     if ctx["timeout"]:
         timeout_s = min(timeout_s, ctx["timeout"])
-    pin = rec.get("pinning")
-    pin = pin if pin and (pin.get("policy", "none") != "none" or pin.get("require_verified")) else None
     device_numa = (ctx["env_file"].get("fingerprint") or {}).get("env.fp.device.numa_node", "")
+    try:
+        pinned = pinning_run.prepare(rec.get("pinning"), device_numa, ctx["sys_root"])
+    except pinning_plan.PinningError as e:
+        raise UsageError(f"case {rec['name']}: {e}") from None
+    outcome["_notes"] += pinned.notes
+    pin = pinned.observer_request() if pinned.observes else None
+    uses_wrapper = any("{" + pinning_run.WRAPPER_TOKEN + "}" in str(w) for w in rec["command"])
     sidecar_seen = False
     for repeat, cache in schedule:
         rdir = case_dir / f"repeat-{repeat:03d}"
@@ -451,6 +494,7 @@ def run_case(rec, ctx, popen):
             argv = planfile.render_tokens(rec["command"], vals, RUN_PHASE_TOKENS, f"case {rec['name']}")
         except ValueError as e:
             raise UsageError(str(e)) from None
+        argv = pinned.wrap(argv, rdir, uses_wrapper)
         started = now()
         capped = []
         rc, reason, pinning = execute_command(
@@ -465,7 +509,10 @@ def run_case(rec, ctx, popen):
             popen,
             max_log=ctx["max_log"],
             truncated=capped,
+            markers=pinned.markers(rdir),
+            sys_root=ctx["sys_root"],
         )
+        pinning = pinned.recorded(pinning)
         ended = now()
         samples, props, warm, notes = read_sidecar(rdir, ctx["max_metrics"])
         sidecar_seen = sidecar_seen or (rdir / "metrics.json").is_file()
@@ -510,7 +557,7 @@ def run_case(rec, ctx, popen):
         outcome.update(status="failed", reason="no_output")  # exit 0 with nothing recorded is not a run
     size = sum(f.stat().st_size for f in raw_dir.rglob("*") if f.is_file())
     if size > ctx["max_raw"]:
-        outcome["_notes"] = [f"raw output is {size} bytes, over the {ctx['max_raw']} byte warning threshold"]
+        outcome["_notes"] += [f"raw output is {size} bytes, over the {ctx['max_raw']} byte warning threshold"]
     return outcome
 
 
@@ -552,8 +599,16 @@ def build_case_result(cat, rec, outcome, ctx):
     ]
     purpose = ctx["plan"].get("purpose") or ""
     validity = None
-    policy = cat.policy.spec if cat.policy else None
-    if policy and purpose in policy["purposes"]:
+    pol_doc = cat.policy_of(case)
+    policy = pol_doc.spec if pol_doc else None
+    if policy and purpose in policy["purposes"] and case["type"] == "quality":
+        ok = [r for r in outcome["_repeats"] if r["status"] == "ok"]
+        want = quality.expected(case)
+        state, reasons = quality.validity_of(
+            policy, purpose, [quality.repeat_facts(r, want) for r in ok], measured=any(r["samples"] for r in ok)
+        )
+        validity = (state, reasons, purpose, "internal")
+    elif policy and purpose in policy["purposes"]:
         ok = [r for r in outcome["_repeats"] if r["status"] == "ok"]
         warm_ok = [r for r in ok if r["props"].get("run.cache") != "cold"]  # cold repeats discard nothing by design
         facts = {
@@ -578,9 +633,13 @@ def build_case_result(cat, rec, outcome, ctx):
         envf.get("observations") or {},
         rec.get("labels") or {},
         reps,
-        request={"name": env_name, "spec_digest": cat.digest("Environment", env_name)} if env_name else None,
+        request={"name": env_name, "spec_digest": engine.request_digest(cat, env_name, rec.get("pinning"))}
+        if env_name
+        else None,
         validity=validity,
+        pinning=rec.get("pinning"),
     )
+    result["metadata"]["labels"] = {CASE_LABEL: rec["name"]}  # the Result is named after its run; analyses name cases
     dropped = sorted(set(envf.get("fingerprint") or {}) - set(fingerprint))
     return result, (f"fingerprint keys not in the registry were dropped: {dropped}" if dropped else "")
 
@@ -629,6 +688,7 @@ def ingest_commands(outcomes, recs, ctx):
             "out_dir": ctx["out"],
             "case": rec["name"],
             "profile": profile,
+            "test_type": rec.get("test_type") or "perf",
         }
         custom = bool(ctx["ingest_cmd"] or rec.get("ingest"))
         try:
@@ -815,6 +875,11 @@ def terminate_as_interrupt():
 def render_commands(plan, selected, ctx):
     lines = []
     for rec in selected:
+        device_numa = (ctx["env_file"].get("fingerprint") or {}).get("env.fp.device.numa_node", "")
+        try:
+            pinned = pinning_run.prepare(rec.get("pinning"), device_numa, ctx["sys_root"])
+        except pinning_plan.PinningError as e:
+            raise UsageError(f"case {rec['name']}: {e}") from None
         for repeat, cache in repeat_schedule(rec):
             vals = run_values(rec, ctx, repeat, cache, f"<out>/cases/{planfile.slug(rec['name'])}/raw", "<repeat_dir>")
             try:
@@ -825,6 +890,8 @@ def render_commands(plan, selected, ctx):
                 )
             except ValueError as e:
                 raise UsageError(str(e)) from None
+            if argv and pinned.launches:
+                argv = pinned.plan.prefix(pinned.tool) + argv
             lines.append({"case": rec["name"], "repeat": repeat, "cache": cache, "argv": argv})
     return lines
 
@@ -899,6 +966,7 @@ def execute(a, st=None, popen=subprocess.Popen):
         "workdir": workdir,
         "timeout": timeout,
         "env_file": envf,
+        "sys_root": cliutil.pick(a.sys_root, "BENCH_SYS_ROOT", "/sys"),
         "quiet": cliutil.flag_on(a.quiet, "BENCH_QUIET"),
         "ingest_cmd": cliutil.pick(a.ingest_cmd, "BENCH_INGEST_CMD"),
         "ingest_timeout": ingest_timeout,
@@ -1233,6 +1301,7 @@ def parser():
     ap.add_argument(
         "--max-raw-bytes", help="raw output size that triggers a warning (BENCH_MAX_RAW_BYTES, default 1 GiB)"
     )
+    ap.add_argument("--sys-root", help=argparse.SUPPRESS)  # test hook: a described host topology instead of /sys
     ap.add_argument("--dry-run", action="store_true", help="print the commands; create and run nothing")
     ap.add_argument("--json", action="store_true", help="print run.json (or the dry-run commands)")
     return ap
