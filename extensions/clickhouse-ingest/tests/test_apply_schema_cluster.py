@@ -1462,6 +1462,31 @@ def test_a_file_setting_with_a_default_sibling_keeps_the_real_one():
     assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") == ""
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        " SETTINGS finished_mutations_to_keep = 5000",
+        " SETTINGS replicated_deduplication_window = 0, replicated_deduplication_window_for_async_inserts = 0",
+        " SETTINGS finished_mutations_to_keep = 100, replicated_deduplication_window = 7",
+    ],
+)
+def test_operational_table_settings_are_not_drift_whatever_the_value(tail):
+    live = FILE_PLAIN + tail
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), live, "db") == ""
+    assert SchemaApplier.differs(FormatOnly(), _obj(live), FILE_PLAIN, "db") == ""
+    conv = replicated(FILE_PLAIN, "db", "t") + tail
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), conv, "db") == ""
+
+
+def test_an_operational_setting_beside_a_real_one_still_reports_the_real_one():
+    live = (
+        FILE_PLAIN + " SETTINGS finished_mutations_to_keep = 5000, storage_policy = 'x'"
+    )
+    assert SchemaApplier.differs(FormatOnly(), _obj(FILE_PLAIN), live, "db") != ""
+    file = FILE_PLAIN + " SETTINGS storage_policy = 'x'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(file), live, "db") == ""
+
+
 DEFAULTS_SQL = " SETTINGS index_granularity = 8192, auto_statistics_types = '', default_compression_codec = 'LZ4'"
 
 
