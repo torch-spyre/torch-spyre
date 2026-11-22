@@ -14,7 +14,10 @@
 
 # Owner(s): ["module: cpp"]
 
-# NOTE: All tests here should run on their own subprocess
+# NOTE: All tests here should run on their own subprocess. Never initialize
+# the Spyre runtime in the parent process: opening the card takes exclusive
+# VFIO access, so a child subprocess that then tries to open it fails with
+# "Device or resource busy".
 import os
 
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -170,14 +173,9 @@ class TestSpyre(TestCase):
         ``RuntimeError: RuntimeContext not created``.
 
         Runs in a subprocess so an already-initialized runtime from another
-        test cannot mask the regression. Skipped when Spyre hardware is not
-        available.
+        test cannot mask the regression; a parent-process probe would itself
+        start the runtime (and take the VFIO device) before the child runs.
         """
-        import os
-
-        if not _is_spyre_hardware_available():
-            self.skipTest("Spyre hardware not available")
-
         import subprocess
         import sys
         import textwrap
@@ -199,6 +197,9 @@ class TestSpyre(TestCase):
 
             assert y.device.type == "spyre", f"expected spyre device, got {y.device}"
             assert torch.equal(y.cpu(), x), "device_layout transfer corrupted data"
+            assert torch.spyre.is_initialized() is True, (
+                "device_layout transfer did not initialize the runtime"
+            )
             print("OK")
         """)
 
@@ -221,16 +222,70 @@ class TestSpyre(TestCase):
         )
         assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
+    def test_empty_device_layout_first_op_initializes_runtime(self):
+        """``torch.empty(..., device_layout=...)`` must initialize the Spyre
+        runtime even when it is the first Spyre device operation in a fresh
+        process (issue #6129).
 
-def _is_spyre_hardware_available() -> bool:
-    """Return True if Spyre hardware can be initialized in this process."""
-    try:
-        import torch
+        ``spyre_empty`` calls ``empty_with_layout()`` directly via pybind11,
+        bypassing the ATen dispatcher path that ordinarily self-inits the
+        runtime. Without an explicit ``_lazy_init()`` first, a fresh process
+        raises ``RuntimeError: RuntimeContext not created``.
 
-        x = torch.empty(1, device="spyre")
-        return x.device.type == "spyre"
-    except (ImportError, RuntimeError):
-        return False
+        Runs in a subprocess so an already-initialized runtime from another
+        test cannot mask the regression; a parent-process probe would itself
+        start the runtime (and take the VFIO device) before the child runs.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre
+            from torch_spyre._C import SpyreTensorLayout
+
+            # This must be the first Spyre device operation: do not call
+            # anything that touches the runtime before this.
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized before torch.empty(device_layout=)"
+            )
+
+            stl = SpyreTensorLayout([4, 64], torch.float16)
+            y = torch.empty(
+                (4, 64),
+                dtype=torch.float16,
+                device=torch.device("spyre"),
+                device_layout=stl,
+            )
+
+            assert y.device.type == "spyre", f"expected spyre device, got {y.device}"
+            assert tuple(y.shape) == (4, 64), f"unexpected shape {tuple(y.shape)}"
+            assert y.dtype == torch.float16, f"unexpected dtype {y.dtype}"
+            assert torch.spyre.is_initialized() is True, (
+                "torch.empty(device_layout=) did not initialize the runtime"
+            )
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
 
 if __name__ == "__main__":
