@@ -575,6 +575,12 @@ opens on first use and, if it cannot, raises `V2Unavailable`, which the ingests 
 failure while the v1 rows still land. `CH_V2_DATABASES` may not name `CLICKHOUSE_DB` unless that
 is also `CLICKHOUSE_DB_V2` (a v2-only process).
 
+## Replicated clusters
+
+`apply_schema --cluster <name>` (or `CLICKHOUSE_CLUSTER`, `CLICKHOUSE_KEEPER_PATH`) applies the
+schema `ON CLUSTER` onto Replicated tables; see
+[`schema/README.md`](schema/README.md#applying-on-a-replicated-cluster).
+
 ## Write resilience
 
 `resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
