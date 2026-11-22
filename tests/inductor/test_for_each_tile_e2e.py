@@ -67,7 +67,7 @@ from torch_spyre._inductor.constants import RESTICKIFY_OP
 from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+from torch_spyre._inductor.wsr.for_each_tile import Gather, for_each_tile
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -2518,6 +2518,154 @@ class TestForEachTileFusionScoringE2E(_DynamoResetTestCase):
 
         self.assertEqual(tuple(out.shape), (FS_KV, FS_QG, 4, 1))
         self.assertTrue(torch.isfinite(out).all())
+
+
+class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
+    """for_each_tile(out=...) on device: each step writes its tile into the caller's tensor.
+
+    ``TestCallerOwnedOutput`` in test_for_each_tile.py checks the post-grad graph on
+    CPU. These compile through the Spyre backend, where the destination reaches the
+    loop as a MUTATED ADDITIONAL INPUT of the ``while_loop``, written by an
+    ``index_put`` in the body, which ``splice_while_loop`` rebinds to the caller's
+    buffer. Each test checks the caller's tensor after the call.
+    """
+
+    TRIPS, ROWS = 4, 32
+
+    def _run(self, fn, *args):
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        with (
+            torch.inference_mode(),
+            warnings.catch_warnings(),
+            config.patch(backend_loop_unroll=False),
+        ):
+            warnings.simplefilter("error", FallbackWarning)
+            return torch.compile(fn, fullgraph=True, dynamic=False)(*args)
+
+    @staticmethod
+    def _scatter_rows_fn(read_after=False):
+        """Trip ``i`` writes ``values[i] + 1`` into ``pool[index[i]]``."""
+
+        def fn(values, index, pool):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v[0] + 1
+
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index),
+                out=pool,
+            )
+            return pool * 2 if read_after else None
+
+        return fn
+
+    def _scatter_rows_inputs(self, width):
+        """Values, the index table on device, the initial pool and the expected pool.
+
+        The index table is ``[trips, rows]`` int32 with each trip's row starting at a
+        stick boundary (the layout #5157's scatter carry requires). All rows are
+        distinct, and the pool rows nothing writes must keep their initial value.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        trips, rows = self.TRIPS, self.ROWS
+        generator = torch.Generator().manual_seed(931)
+        values = (
+            torch.randn(trips, rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        index = torch.randperm(6 * rows, generator=generator)[: trips * rows]
+        index = index.reshape(trips, rows).contiguous()
+        initial = torch.full((6 * rows, width), 3.0, dtype=torch.float16)
+        expected = initial.float()
+        expected[index.reshape(-1)] = values.reshape(-1, width).float() + 1
+        index_layout = SpyreTensorLayout(
+            device_size=[trips, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips, (1, 2): rows},
+        )
+        index = index.to(torch.int32).to(DEVICE_NAME, device_layout=index_layout)
+        return values.to(DEVICE_NAME), index, initial, expected
+
+    @expects_raise
+    def test_out_dim_int_is_rejected(self):
+        """``out_dim=int`` with ``out=`` is refused at lowering, not miscompiled.
+
+        Its write position is the step counter, a carry the indirect-access path
+        cannot index by. TODO: lower that write as a tile-advancing write (the
+        counter equals the loop variable); this test then becomes value checks for
+        ``out_dim=0`` and ``out_dim=1``.
+        """
+        from torch._inductor.exc import InductorError
+
+        def split(out_dim):
+            def fn(x, y, dest):
+                def body(_, ops):
+                    a, b = ops
+                    return None, a @ b
+
+                dims = (0, None) if out_dim == 0 else (None, 1)
+                for_each_tile(
+                    body, (x, y), dims=dims, tile_size=64, out_dim=out_dim, out=dest
+                )
+
+            return fn
+
+        x = cached_xavier((128, 256)).to(DEVICE_NAME)
+        y = cached_xavier((256, 128), differentiation=1).to(DEVICE_NAME)
+        for out_dim in (0, 1):
+            with self.subTest(out_dim=out_dim):
+                dest = torch.zeros(128, 128, dtype=torch.float16).to(DEVICE_NAME)
+                with self.assertRaisesRegex(
+                    InductorError, r"out_dim=int\) is not supported on Spyre"
+                ):
+                    self._run(split(out_dim), x, y, dest)
+
+    def test_gather_rows_into_caller_pool(self):
+        """KV-cache-style write into a pool uploaded with the default layout.
+
+        The scatter wants the indexed dim outermost, so the pool is copied in and
+        out around each trip's write; the next test avoids that.
+        """
+        values, index, initial, expected = self._scatter_rows_inputs(width=64)
+        pool = initial.to(DEVICE_NAME)
+        self._run(self._scatter_rows_fn(), values, index, pool)
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+
+    def test_gather_rows_into_indirect_access_pool(self):
+        """A pool in the indirect-access layout (indexed dim outermost) is written in place.
+
+        The loop body holds only the tile's ``+ 1`` and the scatter, with no copy of
+        the pool around it, and a read of the pool later in the same graph sees every
+        trip's rows. Two sticks per row.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        values, index, initial, expected = self._scatter_rows_inputs(width=128)
+        pool = _dma_to_spyre_indirect_access(initial)
+        result: dict = {}
+        with (
+            # A cache hit would skip the pipeline the recorder inspects.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            doubled = self._run(
+                self._scatter_rows_fn(read_after=True), values, index, pool
+            )
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 2, result["in_body"])
+        torch.testing.assert_close(pool.cpu().float(), expected, atol=0.005, rtol=0.02)
+        torch.testing.assert_close(
+            doubled.cpu().float(), expected * 2, atol=0.01, rtol=0.02
+        )
 
 
 if __name__ == "__main__":

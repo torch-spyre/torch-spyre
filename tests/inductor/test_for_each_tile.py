@@ -98,6 +98,7 @@ Run:
 """
 
 import contextlib
+import functools
 import itertools
 import os
 import sys
@@ -106,6 +107,7 @@ import warnings
 from typing import NamedTuple
 from unittest import mock
 
+import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
 
@@ -155,10 +157,15 @@ def live_nodes(gm, depth=0):
     `get_attr`: after the decomposition the module still carries the original
     `scan_combine_graph_*` attribute, a dead copy of what became the loop body, and
     walking that would count every node in the nest twice.
+
+    `x.copy_(x)` is skipped: reinplacing leaves it behind once a mutated input is
+    written in place, and Inductor lowers it to nothing.
     """
     found: list[tuple[int, str]] = []
     for node in gm.graph.nodes:
         if node.op != "call_function":
+            continue
+        if node.target is torch.ops.aten.copy_.default and node.args[0] is node.args[1]:
             continue
         found.append((depth, str(node.target)))
         for arg in node.args:
@@ -1374,6 +1381,37 @@ class TestScanInputAliasing(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "(?i)mutation"):
             self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
 
+    def test_mutating_an_aliased_input_is_rejected_without_grad(self):
+        """Under no_grad torch 2.14's scan accepts mutated captures, but not aliased ones.
+
+        `k` and `v` share a storage, and functionalization treats them as independent
+        inputs, so a write to `k` would not be seen through `v`.
+        """
+
+        def body(c, x_t, k, v):
+            k.add_(1.0)
+            return c + 1, x_t @ v.T
+
+        with torch.no_grad(), self.assertRaisesRegex(Exception, "(?i)mutation"):
+            self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
+
+    def test_out_sharing_a_storage_with_an_operand_is_rejected(self):
+        """for_each_tile's out= destination may not share a storage with an operand."""
+
+        def fn(x, buf):
+            w, dest = buf[:4], buf[4:]
+
+            def body(_, tiles):
+                x_tile, w_whole = tiles
+                return None, x_tile @ w_whole
+
+            return for_each_tile(
+                body, (x, w), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )[1]
+
+        with torch.no_grad(), self.assertRaisesRegex(Exception, "(?i)mutation"):
+            self._compile(fn)(self.x, torch.randn(12, 6))
+
     def test_returning_an_input_is_rejected(self):
         fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, k))
         with self.assertRaisesRegex(Exception, "(?i)aliasing"):
@@ -2109,6 +2147,404 @@ class TestSliceTileSpecValidation(unittest.TestCase):
                 tile_size=3,
                 init=torch.zeros(2, 8),
             )
+
+
+class TestWhileLoopMutationBackportProbe(unittest.TestCase):
+    """Detects when the pinned torch no longer needs torch-spyre's 2.14 backport.
+
+    `_patch_while_loop_additional_input_mutation` backports pytorch/pytorch#195393,
+    which torch 2.15 carries: a while_loop declares its writes to the tensors it
+    captures. The probe runs the stock `WhileLoop.create`, with the patch undone. On
+    2.14 the write is lost, which `TestCallerOwnedOutput` relies on the patch to
+    prevent. A strict XPASS means the pinned torch has the fix: delete the patch,
+    its call in `_patch_tensor_for_spyre`, and this probe.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "torch 2.14's WhileLoop.create registers no MutationOutput for a mutated "
+            "additional input (pytorch/pytorch#195393, in torch 2.15), so Inductor "
+            "drops the loop and the read of dest after it sees zeros"
+        ),
+    )
+    def test_stock_while_loop_keeps_a_write_to_a_captured_tensor(self):
+        from torch._higher_order_ops.scan import scan
+        from torch._inductor import config as inductor_config
+        from torch._inductor import ir
+
+        create = ir.WhileLoop.create.__func__
+        stock = classmethod(getattr(create, "__wrapped__", create))
+
+        def fn(x, dest):
+            def step(carry, x_t):
+                i, pad = carry
+                dest.view(4, 2, 6).index_copy_(0, i.reshape(1), (2 * x_t).unsqueeze(0))
+                # The second carry avoids 2.14's single-flat-output bug (#197832).
+                return (i + 1, pad + 1), ()
+
+            zero = torch.zeros((), dtype=torch.int64)
+            scan(step, (zero, zero + 1), x.view(4, 2, 6))
+            return dest.sum(dim=0)
+
+        x = torch.randn(8, 6)
+        torch._dynamo.reset()
+        with (
+            torch.no_grad(),
+            mock.patch.object(ir.WhileLoop, "create", stock),
+            # A cache hit would replay a graph compiled with the patch.
+            inductor_config.patch(force_disable_caches=True),
+        ):
+            dest = torch.zeros(8, 6)
+            col_sums = torch.compile(fn, backend="inductor", fullgraph=True)(x, dest)
+        torch.testing.assert_close(dest, 2 * x)
+        torch.testing.assert_close(col_sums, (2 * x).sum(dim=0))
+
+
+class TestCallerOwnedOutput(unittest.TestCase):
+    """`out=`: every step writes its output tile into the caller's tensor, in place.
+
+    Same instrument as TestForEachTileLowering: the post-grad graphs, while_loop
+    bodies included, must hold one while_loop per level and NO materialization -- no
+    stacked `ys`, no fold copy (which `out_dim=1` costs without `out=`, case B), and no
+    clone of the destination, which is what writing in place is for. The destination
+    must hold the result afterwards, and the call returns the caller's tensor itself.
+    """
+
+    def _assert_writes_in_place(self, fn, make_args, ref, *, loops=1):
+        """Check `fn` eagerly and compiled, each on fresh arguments, under no_grad.
+
+        `make_args()` returns fresh inputs whose last one is the destination, and
+        `fn(*args)` returns `(final_carry, out)` exactly as for_each_tile does.
+        `ref` is the expected destination contents.
+        """
+        torch._dynamo.reset()
+        with torch.no_grad():
+            args = make_args()
+            _, out = fn(*args)
+            self.assertIs(out, args[-1])
+            torch.testing.assert_close(args[-1], ref)
+
+            args = make_args()
+            with post_grad_graphs() as graphs:
+                compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+                (_, out), code = run_and_get_code(compiled, *args)
+        torch.testing.assert_close(args[-1], ref)
+        torch.testing.assert_close(out, ref)
+        self.assertEqual(out.data_ptr(), args[-1].data_ptr())
+
+        self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
+        nodes = live_nodes(graphs[-1])
+        found_loops = [t for _, t in nodes if "while_loop" in t]
+        copies = [(d, t) for d, t in nodes if any(m in t for m in MATERIALIZE)]
+        self.assertEqual(len(found_loops), loops, f"while_loop nodes: {found_loops}")
+        self.assertEqual(copies, [], f"materializations: {copies}")
+        self.assertEqual("\n".join(code).count("while should_loop:"), loops)
+
+    def test_out_dim_0(self):
+        """Case A into a caller buffer: tile `i` lands at `out[2*i : 2*i + 2]`."""
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
+    def test_out_dim_1_needs_no_fold_copy(self):
+        """Case B into a caller buffer: the fold copy case B pays is gone."""
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_whole, y_tile = ops
+                return None, x_whole @ y_tile
+
+            return for_each_tile(
+                body, (X, Y), dims=(None, 1), tile_size=2, out_dim=1, out=dest
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
+    def test_destination_is_a_view_of_a_larger_tensor(self):
+        """`out` is a column band of a wider tensor; the other columns stay intact."""
+        (X, Y), ref = matmul_inputs()
+        wide = torch.randn(M, N + 4)
+
+        def fn(X, Y, wide):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            dest = wide[:, 2 : 2 + N]
+            for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )
+            return None, wide
+
+        expected = wide.clone()
+        expected[:, 2 : 2 + N] = ref
+        torch._dynamo.reset()
+        with torch.no_grad():
+            eager_wide = wide.clone()
+            fn(X, Y, eager_wide)
+            torch.testing.assert_close(eager_wide, expected)
+            compiled_wide = wide.clone()
+            with post_grad_graphs() as graphs:
+                torch.compile(fn, backend="inductor", fullgraph=True)(
+                    X, Y, compiled_wide
+                )
+        torch.testing.assert_close(compiled_wide, expected)
+        nodes = live_nodes(graphs[-1])
+        copies = [(d, t) for d, t in nodes if any(m in t for m in MATERIALIZE)]
+        self.assertEqual(copies, [], f"materializations: {copies}")
+
+    def test_destination_read_after_the_loop(self):
+        """Reads of `out` later in the same graph see the loop's writes.
+
+        On torch 2.14 they need `_patch_while_loop_additional_input_mutation`: without
+        it the while_loop does not declare its write to `out`, so the reads are not
+        ordered after it, and the loop itself is dropped as dead code.
+        """
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+            )
+            return dest.sum(dim=0), dest * 2
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            dest = torch.zeros(M, N)
+            col_sums, doubled = torch.compile(fn, backend="inductor", fullgraph=True)(
+                X, Y, dest
+            )
+        torch.testing.assert_close(dest, ref)
+        torch.testing.assert_close(col_sums, ref.sum(dim=0))
+        torch.testing.assert_close(doubled, ref * 2)
+
+    def test_pytree_out(self):
+        """Two output leaves, written into two caller buffers in flattened order."""
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dests):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                prod = x_tile @ y_whole
+                return None, {"prod": prod, "relu": prod.relu()}
+
+            return for_each_tile(
+                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dests
+            )
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            for name, run in (
+                ("eager", fn),
+                ("compiled", torch.compile(fn, backend="inductor", fullgraph=True)),
+            ):
+                with self.subTest(name):
+                    dests = {"prod": torch.zeros(M, N), "relu": torch.zeros(M, N)}
+                    run(X, Y, dests)
+                    torch.testing.assert_close(dests["prod"], ref)
+                    torch.testing.assert_close(dests["relu"], ref.relu())
+
+    def test_reduction_level_with_out(self):
+        """Split-K whose carry accumulates while each step's partial product is kept.
+
+        Step `i`'s `(M, N)` partial product lands at rows `i*M : (i+1)*M` of `out`,
+        and the carry still returns the full product.
+        """
+        (X, Y), ref = matmul_inputs()
+        TK = 3
+        nK = K // TK
+        partials = torch.cat(
+            [X[:, i * TK : (i + 1) * TK] @ Y[i * TK : (i + 1) * TK] for i in range(nK)]
+        )
+
+        def fn(X, Y, dest):
+            def body(acc, ops):
+                x_tile, y_tile = ops
+                prod = x_tile @ y_tile
+                return acc + prod, prod
+
+            return for_each_tile(
+                body,
+                (X, Y),
+                dims=(-1, 0),
+                tile_size=TK,
+                init=torch.zeros(M, N),
+                out_dim=0,
+                out=dest,
+            )
+
+        self._assert_writes_in_place(
+            fn, lambda: (X, Y, torch.zeros(nK * M, N)), partials
+        )
+        with torch.no_grad():
+            acc, _ = fn(X, Y, torch.zeros(nK * M, N))
+        torch.testing.assert_close(acc, ref)
+
+    def test_reverse_lands_in_natural_order(self):
+        (X, Y), ref = matmul_inputs()
+
+        def fn(X, Y, dest):
+            def body(_, ops):
+                x_tile, y_whole = ops
+                return None, x_tile @ y_whole
+
+            return for_each_tile(
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=0,
+                out=dest,
+                reverse=True,
+            )
+
+        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+
+    def test_gather_scatters_one_row_per_step(self):
+        """`out_dim=Gather(0, index)`: step `i` writes its row at `pool[index[i]]`.
+
+        The rows `index` names are distinct, so the result is well defined. Under
+        `reverse=True` the index row travels with the tile it belongs to, so the
+        pool ends up the same.
+        """
+        torch.manual_seed(0)
+        n, P, D = 5, 11, 6
+        values = torch.randn(n, D)
+        index = torch.randperm(P)[:n]
+        initial = torch.randn(P, D)
+        expected = initial.clone()
+        expected[index] = values * 2
+
+        def fn(values, pool, reverse):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v * 2
+
+            return for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index),
+                out=pool,
+                reverse=reverse,
+            )
+
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                self._assert_writes_in_place(
+                    functools.partial(fn, reverse=reverse),
+                    lambda: (values, initial.clone()),
+                    expected,
+                )
+
+    def test_gather_scatters_index_rows(self):
+        """A `[trip count, rows]` index writes `rows` rows per step (#5157's shape)."""
+        torch.manual_seed(1)
+        n, rows, P, D = 3, 4, 20, 6
+        values = torch.randn(n * rows, D)
+        index = torch.randperm(P)[: n * rows].reshape(n, rows).contiguous()
+        initial = torch.randn(P, D)
+        expected = initial.clone()
+        expected[index.reshape(-1)] = values + 1
+
+        def fn(values, pool):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v + 1
+
+            return for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=rows,
+                out_dim=Gather(0, index),
+                out=pool,
+            )
+
+        self._assert_writes_in_place(fn, lambda: (values, initial.clone()), expected)
+
+    def _split_m(self, out_dim=0, out=None, **kwargs):
+        (X, Y), _ = matmul_inputs()
+
+        def body(_, ops):
+            x_tile, y_whole = ops
+            return None, x_tile @ y_whole
+
+        return for_each_tile(
+            body,
+            (X, Y),
+            dims=(0, None),
+            tile_size=2,
+            out_dim=out_dim,
+            out=out,
+            **kwargs,
+        )
+
+    def test_grad_mode_is_rejected(self):
+        with torch.enable_grad(), self.assertRaisesRegex(RuntimeError, "grad mode"):
+            self._split_m(out=torch.zeros(M, N))
+
+    def test_invalid_destinations_are_rejected(self):
+        cases = {
+            "out without out_dim": (
+                dict(out_dim=None, init=torch.zeros(())),
+                ValueError,
+                "needs out_dim",
+            ),
+            "size not a multiple of the tiles": (
+                dict(out=torch.zeros(M + 1, N)),
+                ValueError,
+                "not a multiple",
+            ),
+            "Gather without out": (
+                dict(out_dim=Gather(0, torch.arange(M // 2)), out=None),
+                ValueError,
+                "pass that destination as out=",
+            ),
+            "Gather index with the wrong row count": (
+                dict(out_dim=Gather(0, torch.arange(3)), out=torch.zeros(M, N)),
+                ValueError,
+                "rows for 4 tiles",
+            ),
+            "non-tensor out leaf": (
+                dict(out=(torch.zeros(M, N), 1)),
+                ValueError,
+                "pytree of tensors",
+            ),
+        }
+        with torch.no_grad():
+            for name, (kwargs, exc, msg) in cases.items():
+                with self.subTest(name), self.assertRaisesRegex(exc, msg):
+                    self._split_m(**{"out": torch.zeros(M, N), **kwargs})
+
+    def test_rejected_in_a_decomposition(self):
+        """Under make_fx the scan bypasses functionalization; the write would be lost."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        from torch_spyre._inductor.errors import Unsupported
+
+        def fn(dest):
+            return self._split_m(out=dest)[1]
+
+        with torch.no_grad(), self.assertRaisesRegex(Unsupported, "decomposition"):
+            make_fx(fn, tracing_mode="fake")(torch.zeros(M, N))
 
 
 if __name__ == "__main__":
