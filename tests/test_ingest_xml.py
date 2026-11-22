@@ -373,6 +373,7 @@ FULL_RUN_SCHEMA = {
 
 def _run_main(ingest, monkeypatch, xml_path, client, extra_argv=None):
     monkeypatch.setenv("CLICKHOUSE_HOST", "stub")
+    monkeypatch.setenv("INGEST_SCHEMA", "v1")  # these tests cover the legacy v1 writer
     monkeypatch.setattr(ingest, "get_client", lambda: client)
     argv = ["ingest_xml.py", "--xml-file", str(xml_path)]
     if extra_argv:

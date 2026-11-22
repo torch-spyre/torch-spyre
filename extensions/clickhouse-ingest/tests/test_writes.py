@@ -432,14 +432,11 @@ def test_the_relay_and_bench_verdicts_keep_their_own_status(monkeypatch, command
     assert cli.main([command]) == 0
 
 
-def test_the_hw_script_exits_75_for_a_v2_only_park_and_0_beside_v1(
-    monkeypatch, tmp_path
-):
+def test_the_hw_script_exits_75_when_its_v2_rows_are_parked(monkeypatch, tmp_path):
     import runpy
 
     from spyre_clickhouse_ingest import client as ch
     from spyre_clickhouse_ingest import hw_diagnostics as hw
-    from spyre_clickhouse_ingest import hw_schema
 
     script = (
         Path(__file__).resolve().parents[3] / ".github/scripts/ingest_hw_diagnostics.py"
@@ -468,17 +465,15 @@ def test_the_hw_script_exits_75_for_a_v2_only_park_and_0_beside_v1(
     monkeypatch.setattr(hw, "filter_suite_records", lambda r: r)
     monkeypatch.setattr(hw, "build_row", lambda rec, ctx: ["row"])
     monkeypatch.setattr(hw, "insert_rows", parks)
-    monkeypatch.setattr(hw_schema, "ensure_extra_columns", lambda *a, **k: None)
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
     run = "00000000-0000-4000-8000-000000000001"
     (tmp_path / "x.json").write_text("[]")
-    for schema_gen, code in (("v2", writes.EXIT_PARKED), ("both", 0)):
-        writes.reset()
-        monkeypatch.setattr(sys, "argv", [str(script), "--json-file", str(tmp_path / "x.json"),
-                            "--run-id", run, "--schema", schema_gen])  # fmt: skip
-        with pytest.raises(SystemExit) as e:
-            runpy.run_path(str(script), run_name="__main__")
-        assert (e.value.code or 0) == code, schema_gen
+    writes.reset()
+    monkeypatch.setattr(sys, "argv", [str(script), "--json-file", str(tmp_path / "x.json"),
+                        "--run-id", run])  # fmt: skip
+    with pytest.raises(SystemExit) as e:
+        runpy.run_path(str(script), run_name="__main__")
+    assert e.value.code == writes.EXIT_PARKED
 
 
 # ── what replay refuses or restores ─────────────────────────────────────────────

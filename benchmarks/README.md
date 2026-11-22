@@ -148,9 +148,12 @@ files the engine's own results as a connected CI run (`bench-dir`, `channel-trus
 next to the unchanged legacy ingest. That run has its own run id, carries the per-case rows only (kernel rows stay with
 the legacy ingest), and the action refuses `ci` on `pull_request` and `workflow_run` events (the perf job never runs on
 those). `replace` skips the legacy ingest and stores the per-case XMLs (kernel rows included) under the legacy workflow
-name and run id with both schemas, because a `bench-dir` run derives its run id from the engine run and cannot carry the
+name and run id (v2 only), because a `bench-dir` run derives its run id from the engine run and cannot carry the
 orchestrator's. Replace fails the job when the report or its kernel breakdowns hold a row no case declares
 (`check_report_coverage.py --strict`).
 
 Both modes are advisory (`continue-on-error`) except `replace`, where the mirror steps are the ingest. Side-by-side
 puts a second point on the HUD series until the HUD reads one series per benchmark.
+
+`replace` no longer writes the v1 series: every ingest of the workflows is v2 only. The HUD and the infra-perf reads
+must read v2 before `replace` is used as the cut-over.

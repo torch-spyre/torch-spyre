@@ -189,21 +189,13 @@ on:
       # path the way the matrix suites do. Instead the perf job pushes it inline.
       # All optional: a caller that omits them (or a non-perf run) simply skips
       # the inline push, leaving every existing caller byte-for-byte unchanged.
+      # CLICKHOUSE_HOST/PORT only back up the v2 endpoint; the scoped v2 login is the credential.
       CLICKHOUSE_HOST:
         required: false
       CLICKHOUSE_PORT:
         required: false
-      CLICKHOUSE_USER:
-        required: false
-      CLICKHOUSE_PASS:
-        required: false
-      CLICKHOUSE_DB:
-        required: false
-      # The v2 database for the covered-tier lookup. The other four CLICKHOUSE_* secrets
-      # above already serve it -- one instance, one naming scheme.
       CLICKHOUSE_DB_V2:
         required: false
-      # Optional second endpoint for the v2 databases; unset keeps one host.
       CLICKHOUSE_V2_HOST:
         required: false
       CLICKHOUSE_V2_PORT:
@@ -297,14 +289,9 @@ jobs:
           ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
           DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           DELTA_ARCH: ${{ inputs.runner_label }}
-          # Same secrets the ingest path uses. Previously these read a SPYRE_CH_* set of
-          # vars/secrets that was never configured in any repo or org, so the lookup always
-          # took its unset branch and every run silently ran the FULL tier -- the delta could
-          # not fire at all. Absent secrets still fail open, by design.
+          # Absent secrets fail open: the lookup is skipped and the full tier runs.
           CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
           CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
           CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
           CLICKHOUSE_V2_HOST: ${{ secrets.CLICKHOUSE_V2_HOST }}
           CLICKHOUSE_V2_PORT: ${{ secrets.CLICKHOUSE_V2_PORT }}
@@ -366,7 +353,7 @@ jobs:
           COVERED_RUNS="[]"
           # Guard on the HOST, which is what the resolver needs; SPYRE_CH_URL was never set
           # by anything, so this condition could never be true and the delta never ran.
-          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_HOST:-}" ]; then
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_V2_HOST:-${CLICKHOUSE_HOST:-}}" ]; then
             _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
               --commit-sha "${DELTA_SHA}" \
               --arch "${DELTA_ARCH}" \
@@ -853,7 +840,7 @@ jobs:
       # Mapped to env so the inline-ingest step can gate on it: secrets cannot be
       # used in a step `if:`. Empty (caller passed no ClickHouse secrets) => the
       # ingest step is skipped and the perf run still succeeds.
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_INGEST_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
     steps:
       # ALWAYS sparse-checkout .github from the workflow ref, in BOTH prebaked
       # and normal mode. `uses: ./.github/actions/*` resolves the action
@@ -960,14 +947,16 @@ jobs:
       # cannot ride the push-to-clickhouse.yaml artifact-download path the
       # matrix suites use. The composite action is the SAME ingest
       # implementation that workflow reuses, so there is one code path, not two.
-      # Gated on CLICKHOUSE_HOST: a caller that passes no ClickHouse secrets
+      # Gated on the ClickHouse host: a caller that passes no ClickHouse secrets
       # skips the push and the perf run still succeeds. Nightly has secrets, so
       # --trigger-type perf + 0 parsed records fails the ingest step.
       - name: Ingest perf report into ClickHouse (inline, no artifact)
         id: ingest
-        if: ${{ env.CLICKHOUSE_HOST != '' && inputs.bench_mode != 'replace' }}
+        if: ${{ env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode != 'replace' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
+          # strict (the default) on purpose: this step is the only writer and the report is never uploaded,
+          # so a failed or parked write is lost data and must show red.
           xml-dir: ${{ env.RESULTS_DIR }}
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
@@ -988,19 +977,12 @@ jobs:
           # Workspace sparse-checkout of this ref's .github — not the baked
           # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
           torch-spyre-dir: ${{ github.workspace }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          # Without these two the v2 write is a no-op, so benchmark_runs stays empty and the
-          # benchmark path is unreachable -- the perf job is its only producer.
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
-          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
-          schema: both
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       # bench_mode != off: the report just produced, split into the benchmarks/ catalog's cases (no second suite run).
       - name: Install uv (bench mirror)
@@ -1050,7 +1032,7 @@ jobs:
       # on pull_request / workflow_run events (this job never runs on pull_request).
       - name: Ingest the engine results into ClickHouse (side-by-side)
         id: bench-ingest-dir
-        if: ${{ !cancelled() && env.CLICKHOUSE_HOST != '' && inputs.bench_mode == 'side-by-side' && steps.bench-mirror.outcome == 'success' }}
+        if: ${{ !cancelled() && env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode == 'side-by-side' && steps.bench-mirror.outcome == 'success' }}
         continue-on-error: true
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -1065,25 +1047,21 @@ jobs:
           platform: x86_64
           artifact-id: ${{ needs.artifact_identity.outputs.record }}
           torch-spyre-dir: ${{ github.workspace }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
-          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
-          schema: v2
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       # replace: the per-case XMLs under the legacy workflow name and run id (a bench-dir run derives its own
       # run id from the engine run, so it cannot carry the orchestrator's), kernel rows included.
       - name: Ingest the mirrored rows into ClickHouse (replace)
         id: bench-ingest
-        if: ${{ !cancelled() && env.CLICKHOUSE_HOST != '' && inputs.bench_mode == 'replace' && steps.bench-mirror.outcome == 'success' }}
+        if: ${{ !cancelled() && env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode == 'replace' && steps.bench-mirror.outcome == 'success' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
+          # strict (the default) on purpose: in replace mode this is the only writer of the perf rows.
           xml-dir: ${{ github.workspace }}/bench-results/ingest-xml
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
@@ -1097,17 +1075,12 @@ jobs:
           platform: x86_64
           artifact-id: ${{ needs.artifact_identity.outputs.record }}
           torch-spyre-dir: ${{ github.workspace }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
-          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
-          clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
           clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
           clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
-          schema: both
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       # Four honesty lines. Echo only — never upload report.xml (public
       # artifacts would leak benchmark numbers).
