@@ -535,8 +535,11 @@ class _Pool:
     ones whose LX planning stopped at its time limit (``_count_time_limited_solves``).
     """
 
-    def __init__(self, workers: int, timeout_s: float) -> None:
+    def __init__(
+        self, workers: int, timeout_s: float, placeholders: bool = False
+    ) -> None:
         self.workers = workers
+        self.placeholders = placeholders  # the caller may switch it while open
         self.timeout_s = timeout_s
         self.open = True
         self.running: dict[int, float] = {}  # pid -> start time
@@ -729,7 +732,8 @@ def fork_inner_compiles(
     """Run each Spyre inner compile in a forked child, at most ``workers`` at once.
 
     Yields the pool. Leaving the block waits for every child, or kills them all if
-    the block raised. With ``placeholders`` the stand-ins return zero tensors in
+    the block raised. With ``placeholders`` (``pool.placeholders``, which the caller
+    may switch while the block runs) the stand-ins return zero tensors in
     the layouts the children report instead of raising, so a traced forward runs
     to its end: a forward that branches on tensor values traces other graphs than
     the real run (a recompile in the second run, nothing wrong); see the module
@@ -738,7 +742,7 @@ def fork_inner_compiles(
     import torch_spyre._inductor as spyre_inductor
 
     original = spyre_inductor._spyre_inner_compile
-    pool = _Pool(max(1, workers), timeout_s)
+    pool = _Pool(max(1, workers), timeout_s, placeholders)
 
     def inner_compile(*args: Any, **kwargs: Any) -> Any:
         if _fx_cache_holds(*args, **kwargs):
@@ -749,7 +753,7 @@ def fork_inner_compiles(
         gm = kwargs.get("gm", args[0] if args else None)
         _warn_collectives_in_lx(gm)
         label = _graph_label(gm, kwargs)
-        if not placeholders:
+        if not pool.placeholders:
             pool.submit(lambda: original(*args, **kwargs), label=label)
             return _StandIn(pool)
         outputs = _output_metadata(gm)
