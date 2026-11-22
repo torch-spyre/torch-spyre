@@ -29,13 +29,15 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
-#include <flex/memory_interface/pool_lifecycle.hpp>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "job_plan.h"
@@ -70,7 +72,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 5;
 static constexpr int32_t kPoolDescriptorPickleVersion = 1;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
@@ -565,14 +567,6 @@ PYBIND11_MODULE(_C, m) {
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
-      .def(
-          py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
-                   spyre::ElementArrangement,
-                   std::map<std::vector<int64_t>, int64_t>>(),
-          py::arg("device_size"), py::arg("stride_map"),
-          py::arg("device_dtype"),
-          py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
-          py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{})
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
                     std::map<std::vector<int64_t>, int64_t>,
                     spyre::ElementArrangement>(),
@@ -603,7 +597,7 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[3].cast<std::vector<int64_t>>(),
-                                              t[4].cast<DataFormats>());
+                                              t[4].cast<DataFormats>(), {});
             } else if (version == 2) {
               // Version 2: (version, device_size, stride_map, device_dtype)
               if (t.size() != 4) {
@@ -612,10 +606,11 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[2].cast<std::vector<int64_t>>(),
-                                              t[3].cast<DataFormats>());
+                                              t[3].cast<DataFormats>(), {});
             } else if (version == 3) {
               // Version 3: (version, device_size, stride_map, device_dtype,
-              // element_arrangement)
+              // element_arrangement) — stride_map may contain legacy -1
+              // entries, which the constructor normalizes to 0
               if (t.size() != 5) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v3: wrong tuple size");
@@ -623,11 +618,16 @@ PYBIND11_MODULE(_C, m) {
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
-                  t[4].cast<spyre::ElementArrangement>());
-            } else if (version == 4) {
+                  {}, t[4].cast<spyre::ElementArrangement>());
+            } else if (version == 4 || version == 5) {
+              // Version 4: (version, device_size, stride_map, device_dtype,
+              // element_arrangement, valid_elements); stride_map may contain
+              // legacy -1 entries. Version 5: same layout, written with 0 in
+              // place of -1. The constructor normalizes -1 to 0 for both.
               if (t.size() != 6) {
-                throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
+                throw py::value_error("Invalid SpyreTensorLayout pickle v" +
+                                      std::to_string(version) +
+                                      ": wrong tuple size");
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
@@ -640,10 +640,32 @@ PYBIND11_MODULE(_C, m) {
                   std::to_string(version));
             }
           }));
-
-  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
-        py::arg("size"), py::arg("stride"), py::arg("dtype"),
-        py::arg("device_layout"), py::arg("device") = py::none());
+  m.def(
+      "spyre_empty_with_layout",
+      [](c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+         spyre::SpyreTensorLayout device_layout,
+         std::optional<c10::Device> device,
+         std::optional<std::map<int64_t, std::tuple<int64_t, int64_t, int64_t>>>
+             reserved_dims) {
+        // Python passes {dim: (min, max, granularity)}; convert it to
+        // ReservedDimInfo. get_reserved_dims does the reverse conversion.
+        std::optional<std::map<int64_t, spyre::ReservedDimInfo>> typed;
+        if (reserved_dims.has_value()) {
+          typed.emplace();
+          for (const auto& [dim, t] : *reserved_dims) {
+            (*typed)[dim] = spyre::ReservedDimInfo{
+                std::get<0>(t), std::get<1>(t), std::get<2>(t)};
+          }
+        }
+        return spyre::spyre_empty_with_layout(size, stride, dtype,
+                                              device_layout, device, typed);
+      },
+      py::arg("size"), py::arg("stride"), py::arg("dtype"),
+      py::arg("device_layout"), py::arg("device") = py::none(),
+      py::arg("reserved_dims") = py::none(),
+      "Allocate a Spyre tensor with an explicit device layout. If "
+      "`reserved_dims` ({dim: (min, max, granularity)}) is given it is "
+      "stamped on the tensor so get_reserved_dims() returns it.");
   m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
         py::arg("stride"), py::arg("dtype"), py::arg("dim"),
         py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
@@ -653,6 +675,16 @@ PYBIND11_MODULE(_C, m) {
         "stored on the tensor for the runtime resize_ guard to check. "
         "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
         "granularity}}).");
+  m.def("spyre_empty_reserved_with_layout",
+        &spyre::spyre_empty_reserved_with_layout, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("device_layout"),
+        py::arg("dim"), py::arg("min_size"), py::arg("max_size"),
+        py::arg("granularity"),
+        "spyre_empty_reserved with an explicit device layout. The layout "
+        "describes the buffer at `max_size`: the reserved host dimension must "
+        "occupy one whole device dimension, not the stick-elements one, with "
+        "extent `max_size`. Backs tensor.to(\"spyre\", dynamic={...}, "
+        "device_layout=...).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -946,13 +978,19 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value, int64_t num_shards) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value,
-                                       num_shards};
+                       int64_t dim_index, int64_t value, int64_t num_shards,
+                       int64_t granularity, int64_t max_value) {
+             return spyre::SymbolicArg{kind,     tensor_id,  dim_index,
+                                       value,    num_shards, granularity,
+                                       max_value};
            }),
            py::arg("kind"), py::arg("tensor_id"),
            py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1},
-           py::arg("num_shards") = int64_t{-1})
+           py::arg("num_shards") = int64_t{-1},
+           py::arg("granularity") = int64_t{-1},
+           py::arg("max_value") = int64_t{-1})
+      .def_readwrite("granularity", &spyre::SymbolicArg::granularity)
+      .def_readwrite("max_value", &spyre::SymbolicArg::max_value)
       .def_readwrite("num_shards", &spyre::SymbolicArg::num_shards)
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
       .def_readwrite("value", &spyre::SymbolicArg::value)
@@ -1037,11 +1075,12 @@ PYBIND11_MODULE(_C, m) {
       "bytes.");
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can verify the HostComputeArg ordering without needing
-  // a live HCM or device execution. Returns one integer (CompositeAddress*
-  // cast to uintptr_t) per resolved slot — same tensor yields the same
-  // integer, different tensor yields a different integer, so any ordering bug
-  // inside resolveSymbolicArgs is directly visible as a mismatched int vector.
+  // that Python tests can verify what each correction slot resolves to without
+  // needing a live HCM or device execution. Returns one integer per slot. An
+  // address slot gives the CompositeAddress* cast to uintptr_t, so the same
+  // tensor yields the same integer and a different tensor a different one, and
+  // a dimension slot gives the size itself. Any ordering bug inside
+  // resolveSymbolicArgs is therefore visible as a mismatched int vector.
   // The "_" prefix signals this is not part of the stable public API.
   m.def(
       "_resolve_symbolic_args",
@@ -1050,22 +1089,27 @@ PYBIND11_MODULE(_C, m) {
         const auto resolved =
             spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
                                                                symbolic_args);
-        std::vector<uintptr_t> addrs;
-        addrs.reserve(resolved.size());
+        std::vector<uintptr_t> values;
+        values.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          if (const auto* value = std::get_if<int64_t>(&host_arg)) {
-            addrs.push_back(static_cast<uintptr_t>(*value));
+          // A slot holds an address or a size (a kDimension slot, and a
+          // kShardAddress slot already resolved to a device address), so read
+          // whichever alternative is there rather than naming one: naming the
+          // other kind throws.
+          if (const auto* size = std::get_if<int64_t>(&host_arg)) {
+            values.push_back(static_cast<uintptr_t>(*size));
           } else {
-            addrs.push_back(reinterpret_cast<uintptr_t>(
+            values.push_back(reinterpret_cast<uintptr_t>(
                 std::get<const flex::CompositeAddress*>(host_arg)));
           }
         }
-        return addrs;
+        return values;
       },
       py::arg("tensors"), py::arg("symbolic_args"),
-      "Test-only: resolve a symbolic_args payload to a list of device-address "
-      "integers (CompositeAddress* cast to uintptr_t). Same tensor yields the "
-      "same integer; different tensor yields a different integer.");
+      "Test-only: resolve a symbolic_args payload to a list of integers, one "
+      "per slot. An address slot gives the CompositeAddress* cast to uintptr_t "
+      "and a dimension slot gives the size. Same tensor yields the same "
+      "address integer; a different tensor yields a different one.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
@@ -1190,7 +1234,7 @@ PYBIND11_MODULE(_C, m) {
         TORCH_CHECK(allocator != nullptr,
                     "num_memory_domains requires the Flex runtime to be "
                     "initialized");
-        return allocator->topology().num_domains();
+        return allocator->topology().numDomains();
       },
       "Number of memory domains in the Flex device topology.");
 

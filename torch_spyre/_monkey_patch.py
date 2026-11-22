@@ -112,35 +112,18 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
             raise ValueError(
                 f"dynamic={{{dim}: ...}}: {name}={value!r} must be a positive int"
             )
-    if dim_min > dim_max:
-        raise ValueError(f"dynamic={{{dim}: ...}}: min={dim_min} exceeds max={dim_max}")
-    if dim_max % granularity != 0:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of "
-            f"granularity={granularity}"
-        )
-
     # Local import: this file must stay importable before torch_spyre's
     # own submodules are guaranteed ready (see _UNSET above), and reading
     # the Inductor layer's config from the eager transfer path is itself
-    # a deliberate dependency edge -- a single source of truth for
-    # max_buckets and min_reserved_dim_size beats duplicated constants that
-    # can drift from it.
+    # a deliberate dependency edge -- one validator shared with the
+    # compiler's derived output contracts (reserved_dims_contract.py) beats
+    # a duplicated, independently maintained copy of the same rules.
     from torch_spyre._inductor import config as inductor_config
 
-    if dim_min < inductor_config.min_reserved_dim_size:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: min={dim_min} is below the minimum "
-            f"supported reservation floor ({inductor_config.min_reserved_dim_size})"
-        )
-
-    num_buckets = dim_max // granularity
-    if num_buckets > inductor_config.max_buckets:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} / granularity={granularity} = "
-            f"{num_buckets} buckets, exceeding the cap of "
-            f"{inductor_config.max_buckets} (config.max_buckets)"
-        )
+    for violation in inductor_config.reservation_violations(
+        dim_min, dim_max, granularity
+    ):
+        raise ValueError(f"dynamic={{{dim}: ...}}: {violation}")
 
     if not (0 <= dim < len(size)):
         raise ValueError(
@@ -197,43 +180,30 @@ def _parse_dynamic_to_args(self, args, kwargs):
     return dtype
 
 
-def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
-    """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
-    import warnings
+def _reserve_and_copy(src, spec: _DynamicSpec, allocate) -> "torch.Tensor":
+    """Allocate at the ceiling, copy the real data in, mark the dim dynamic.
 
+    The shared body of the two reserved transfers. ``allocate(size, stride,
+    dtype)`` is the native allocation: ``spyre_empty_reserved`` with the layout
+    derived from the shape, or ``spyre_empty_reserved_with_layout`` with the
+    layout given. Everything else is the same for both, so it lives here once.
+    """
     import torch
 
-    # This path calls spyre_empty_reserved directly via pybind11, bypassing
-    # the ATen dispatcher path that ordinarily self-inits the runtime (via
-    # the H2D stream pool inside spyre_copy_from -> getCurrentStream). On a
-    # fresh process this can be the very first device op, so the runtime
-    # must be brought up explicitly here first.
+    # This path calls the allocator directly via pybind11, bypassing the ATen
+    # dispatcher path that ordinarily self-inits the runtime (via the H2D
+    # stream pool inside spyre_copy_from -> getCurrentStream). On a fresh
+    # process this can be the very first device op, so the runtime must be
+    # brought up explicitly here first.
     ensure_runtime_initialized()
 
     # Local import, same lazy-import convention as the rest of this file
     # (see _UNSET above): torch_spyre._C is a native extension module and
     # this file must stay importable before it's guaranteed ready.
-    from torch_spyre._C import copy_tensor, spyre_empty_reserved
+    from torch_spyre._C import copy_tensor
 
-    dst = spyre_empty_reserved(
-        src.size(),
-        src.stride(),
-        src.dtype,
-        spec.dim,
-        spec.min,
-        spec.max,
-        spec.granularity,
-    )
+    dst = allocate(src.size(), src.stride(), src.dtype)
     copy_tensor(src, dst, non_blocking=False)
-
-    warnings.warn(
-        'tensor.to("spyre", dynamic=...) reserves the buffer at max, but compiled '
-        "kernels are still built for the size at first compile, so running a "
-        "compiled function at another size returns wrong values without an "
-        "error. Tracked in #5937.",
-        UserWarning,
-        stacklevel=3,
-    )
 
     # mark_dynamic must run eagerly, before any compile, so Dynamo treats
     # `dim` as symbolic from the first trace.
@@ -243,10 +213,51 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     # tile_size == 0), wsr/for_each_tile.py) then raises
     # ConstraintViolationError, because not every value in the range is a
     # multiple. The declared range reaches the compiler through
-    # get_reserved_dims instead, read once per compile by a later compiler
-    # change, which emits the range checks inside the trace.
+    # get_reserved_dims instead: the Spyre compile_fx wrapper reads it once per
+    # compile from the graph inputs and builds a for_each_tile loop's geometry
+    # at the declared maximum, with the size bound at launch. The range checks
+    # inside the trace are still written by the traced function.
     torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
+
+
+def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
+    """Reserve at the ceiling with the layout derived from the shape."""
+    from torch_spyre._C import spyre_empty_reserved
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved(
+            size, stride, dtype, spec.dim, spec.min, spec.max, spec.granularity
+        )
+
+    return _reserve_and_copy(src, spec, allocate)
+
+
+def _transfer_reserved_with_layout(src, spec: _DynamicSpec, device_layout):
+    """``_transfer_reserved`` with the device layout given instead of derived.
+
+    The layout describes the buffer at ``max``, so the reserved host dimension
+    must occupy exactly one device dimension of it, whole (the one whose
+    stride-map entry is the host stride of the reserved dimension), not the
+    stick-elements dimension, with extent ``max``. The native allocation
+    checks that before anything is allocated and raises a ``RuntimeError``
+    naming the rule it broke.
+    """
+    from torch_spyre._C import spyre_empty_reserved_with_layout
+
+    def allocate(size, stride, dtype):
+        return spyre_empty_reserved_with_layout(
+            size,
+            stride,
+            dtype,
+            device_layout,
+            spec.dim,
+            spec.min,
+            spec.max,
+            spec.granularity,
+        )
+
+    return _reserve_and_copy(src, spec, allocate)
 
 
 def _sharding_key(tensor) -> tuple | None:
@@ -271,62 +282,6 @@ def _sharding_key(tensor) -> tuple | None:
         return None
     info = _C._spyre_sharding_info(tensor)
     return (info["shard_dim"], info["num_shards"], info["shard_device_bytes"])
-
-
-def _add_ea(src_tensor, res_tensor) -> None:
-    """Update the EA tag after an eager transfer handled by ``orig_to``.
-
-    Same-device dtype-changing casts return through ``to_dtype_d2d`` before
-    this helper is reached; their EA is propagated by the compiled graph.
-    """
-    if res_tensor.dtype == src_tensor.dtype:
-        return
-
-    import torch
-    from torch_spyre._inductor.dtype_ops import DtypeOpTable
-    from torch_spyre._inductor.constants import STAGGERED_EAS
-    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
-
-    # Skip FakeTensor tracing contexts during torch.compile
-    if (
-        torch.compiler.is_compiling()
-        or isinstance(src_tensor, torch._subclasses.FakeTensor)
-        or isinstance(res_tensor, torch._subclasses.FakeTensor)
-    ):
-        return
-
-    from torch_spyre._C import (
-        get_spyre_tensor_layout,
-        set_spyre_tensor_layout,
-    )
-
-    # TODO EA torch.bool as it can be fp16 or fp32
-
-    try:
-        src_layout = get_spyre_tensor_layout(src_tensor)
-    except RuntimeError:
-        return
-
-    if src_layout is None:
-        return
-
-    input_ea = src_layout.element_arrangement
-    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
-
-    try:
-        res_layout = get_spyre_tensor_layout(res_tensor)
-    except RuntimeError:
-        return
-
-    if res_layout is None:
-        return
-
-    stl = res_layout.with_element_arrangement(fmt)
-    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-    if src_tensor.dtype != torch.float32 and is_staggered_ea:
-        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
-
-    set_spyre_tensor_layout(res_tensor, stl)
 
 
 def _patch_tensor_for_spyre():
@@ -378,16 +333,15 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
         if dynamic is not None:
-            if device_layout is not None:
-                raise ValueError(
-                    "dynamic= cannot be combined with device_layout=: a "
-                    "reserved tensor's layout is derived from its max size"
-                )
             dtype = _parse_dynamic_to_args(self, args, kwargs)
             spec = _parse_dynamic_spec(dynamic, self.size())
             # Convert on the host first: the reserved buffer is allocated
             # and filled at the dtype the caller asked for.
             src = self if dtype is None or dtype == self.dtype else orig_to(self, dtype)
+            if device_layout is not None:
+                # The caller's layout describes the buffer at the declared
+                # max; it is checked against the declaration, not derived.
+                return _transfer_reserved_with_layout(src, spec, device_layout)
             return _transfer_reserved(src, spec)
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
@@ -436,10 +390,7 @@ def _patch_tensor_for_spyre():
                 # function entry), so this dtype-only op drops no layout request.
                 return torch.ops.spyre.to_dtype_d2d(self, _dtype, self.storage_offset())
 
-            res = orig_to(self, *args, **kwargs)
-            if res.device.type == DEVICE_NAME:
-                _add_ea(self, res)
-            return res
+            return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
@@ -636,6 +587,8 @@ def _patch_tensor_for_spyre():
         expected_offset = value.storage_offset()
         # Sharded storage compiles to a different (non-unified) kernel.
         expected_sharding = _sharding_key(value)
+        # The declared (min, max, granularity): the layout only reflects max.
+        expected_reserved = _reserved_dims_key(value)
 
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
@@ -647,10 +600,11 @@ def _patch_tensor_for_spyre():
                     x.device_tensor_layout() == expected_layout
                     and x.storage_offset() == expected_offset
                     and _sharding_key(x) == expected_sharding
+                    and _reserved_dims_key(x) == expected_reserved
                 )
             ),
             [
-                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset} and sharding == {expected_sharding}"
+                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset} and sharding == {expected_sharding} and reserved_dims == {expected_reserved}"
             ],
             guard.user_stack,
         )
@@ -698,12 +652,17 @@ def _patch_tensor_for_spyre():
                 layout,
                 offset,
                 _sharding_key(value),
+                _reserved_dims_key(value),
             )
 
         def _spyre_tensor_reuse_eval(value, metadata):
-            base_metadata, expected_layout, expected_offset, expected_sharding = (
-                metadata
-            )
+            (
+                base_metadata,
+                expected_layout,
+                expected_offset,
+                expected_sharding,
+                expected_reserved,
+            ) = metadata
             if not isinstance(value, torch.Tensor):
                 return False
             if extract_tensor_metadata(value) != base_metadata:
@@ -715,6 +674,7 @@ def _patch_tensor_for_spyre():
                 value.device_tensor_layout() == expected_layout
                 and value.storage_offset() == expected_offset
                 and _sharding_key(value) == expected_sharding
+                and _reserved_dims_key(value) == expected_reserved
             )
 
         _spyre_reuse_spec = GuardCheckSpec(
@@ -762,6 +722,35 @@ def _patch_tensor_for_spyre():
         import warnings
 
         warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
+
+
+def _patch_fake_tensor_device_init():
+    """Force ``FakeTensorMode.avoid_device_init`` to True for the Spyre backend.
+
+    A workaround to let FakeTensors on Spyre really be Fake - ie not use the device.
+    Without this patch, we observe device memcpy's during compilation
+    where this is not expected/needed.
+
+    TODO: Once upstream Pytorch issue: #203190 is resolved, this can be removed.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    # using __dict__ to be resilient to changes in FakeTensorMode
+    # such as the open PR: https://github.com/pytorch/pytorch/pull/202561
+    current = FakeTensorMode.__dict__.get("avoid_device_init", None)
+
+    if current is None:
+        import warnings
+
+        warnings.warn(
+            "Failed to install patch to avoid device init under FakeTensor: real tensors used on Spyre for compilation!"
+        )
+        return
+
+    def _spyre_avoid_device_init(self):
+        return True
+
+    FakeTensorMode.avoid_device_init = property(_spyre_avoid_device_init)
 
 
 def _patch_invoke_subgraph_decompositions():
@@ -1556,9 +1545,30 @@ def _patch_safetensors_for_spyre() -> None:
         _st_torch.load_model = _spyre_load_model
 
 
+def _reserved_dims_key(tensor):
+    """An ordered, hashable form of a tensor's ``dynamic=`` reservation, or None.
+
+    A declared dim's (min, max, granularity) is baked into whatever is compiled
+    from the tensor (the stamp on its outputs, the kernels built from it), but
+    the layout the cache and the guards already compare reflects only ``max``
+    and the fake input carries only a symbol. Anything that decides whether a
+    compiled result can be reused for this tensor has to compare this too.
+    """
+    from torch_spyre._C import get_reserved_dims
+
+    reserved = get_reserved_dims(tensor)
+    if not reserved:
+        return None
+    return tuple(
+        (dim, spec["min"], spec["max"], spec["granularity"])
+        for dim, spec in sorted(reserved.items())
+    )
+
+
 def _patch_fx_graph_hash():
     """
-    Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key.
+    Extends FxGraphHashDetails to include SpyreTensorLayout and each input's
+    ``dynamic=`` reservation in the cache key.
     """
     import torch
     from torch._inductor.codecache import FxGraphHashDetails
@@ -1585,6 +1595,7 @@ def _patch_fx_graph_hash():
         spyre_layouts = []
         spyre_offsets = []
         spyre_shardings = []
+        spyre_reserved_dims = []
         # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
         inputs_to_use = (
             real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
@@ -1597,16 +1608,21 @@ def _patch_fx_graph_hash():
                 spyre_layouts.append(layout)
                 spyre_offsets.append(offset)
                 spyre_shardings.append(_sharding_key(inp))
+                spyre_reserved_dims.append(_reserved_dims_key(inp))
             else:
                 spyre_layouts.append(None)
                 spyre_offsets.append(None)
                 spyre_shardings.append(None)
+                spyre_reserved_dims.append(None)
 
         # Both fields are pickled into cache key to prevent reuse across offsets (#3770)
         self.spyre_layouts = spyre_layouts
         self.spyre_offsets = spyre_offsets
         # Sharded inputs compile to non-unified kernels (sharded_hbm.py).
         self.spyre_shardings = spyre_shardings
+        # Two declarations that differ only in min or granularity have the same
+        # layout, so without this they share one entry.
+        self.spyre_reserved_dims = spyre_reserved_dims
 
     FxGraphHashDetails.__init__ = _spyre_init
     FxGraphHashDetails._spyre_hash_patched = True

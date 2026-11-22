@@ -22,12 +22,16 @@ exceed the configured bucket cap. Also covers negative-dim canonicalization
 and unknown-key rejection in the same validation pass.
 """
 
+import warnings
+
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
 from torch_spyre._C import (
+    get_device_dtype,
     get_reserved_dims,
+    get_spyre_tensor_layout,
     spyre_empty_reserved,
     SpyreTensorLayout,
 )
@@ -81,6 +85,18 @@ class TestDynamicDeclarationValidation(TestCase):
         self._assert_rejected(
             {"min": 8, "max": over_cap, "granularity": 8},
             "exceeding the cap",
+        )
+
+    def test_default_cap_is_256_buckets(self) -> None:
+        # The default as a user sees it: 256 buckets are accepted and 257 are
+        # refused (#6432). `MAX_BUCKETS` overrides it per process.
+        self.assertEqual(inductor_config.max_buckets, 256)
+        spec = {"min": 8, "max": 2048, "granularity": 8}
+        x_dev = self.x.to(DEVICE, dynamic={0: spec})
+        self.assertEqual(get_reserved_dims(x_dev), {0: spec})
+        self._assert_rejected(
+            {"min": 8, "max": 2056, "granularity": 8},
+            "257 buckets, exceeding the cap of 256",
         )
 
     def test_real_size_outside_declared_range_rejected(self) -> None:
@@ -175,22 +191,111 @@ class TestDynamicDeclarationValidation(TestCase):
         with self.assertRaisesRegex(RuntimeError, "overflow"):
             spyre_empty_reserved((560, 1024), (1024, 1), torch.float16, 0, 70, 2**62, 2)
 
-    def test_device_layout_with_dynamic_rejected(self) -> None:
-        # An explicit layout would be silently ignored otherwise.
+    def test_device_layout_not_at_max_rejected(self) -> None:
+        # The explicit layout describes the buffer at the declared max. A
+        # layout for today's 560 rows would be silently too small for 630.
         stl = SpyreTensorLayout((560, 1024), torch.float16)
-        with self.assertRaisesRegex(ValueError, "device_layout"):
+        with self.assertRaisesRegex(RuntimeError, "extent max=630, got 560"):
             self.x.to(
                 DEVICE,
                 device_layout=stl,
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
 
-    def test_reserved_transfer_warns_about_compiled_kernels(self) -> None:
-        # The buffer is reserved at max, but compiled kernels are not yet built
-        # for the reserved size. The transfer says so instead of staying silent.
-        with self.assertWarns(UserWarning) as cm:
+    def test_device_layout_reserved_dim_on_stick_rejected(self) -> None:
+        # dim_order [1, 0] makes host dim 0 the stick dimension, so the rows land
+        # on the stick-elements device dim (stride_map 1024 at the last position)
+        # and would be interleaved across sticks: not resizable in place.
+        stl = SpyreTensorLayout((630, 1024), (1024, 1), torch.float16, [1, 0])
+        with self.assertRaisesRegex(RuntimeError, "stick-elements"):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
+    def test_device_layout_at_max_accepted(self) -> None:
+        # The derived layout at max, given explicitly: accepted, the tensor
+        # keeps its real shape and carries the declaration.
+        stl = SpyreTensorLayout((630, 1024), torch.float16)
+        y = self.x.to(
+            DEVICE,
+            device_layout=stl,
+            dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+        )
+        self.assertEqual(tuple(y.shape), (560, 1024))
+        self.assertEqual(
+            get_reserved_dims(y), {0: {"min": 70, "max": 630, "granularity": 70}}
+        )
+        self.assertEqual(
+            list(get_spyre_tensor_layout(y).device_size), list(stl.device_size)
+        )
+
+    def test_device_layout_folded_rejected(self) -> None:
+        # A layout that folds the rows into the stick dimension has no device
+        # dim carrying host stride 1024 on its own: "found 0" carriers.
+        stl = SpyreTensorLayout(
+            [1, 630 * 1024 // 64, 64],
+            [0, 1, 0],
+            get_device_dtype(torch.float16),
+            {(0,): 1, (1, 2): 630 * 1024},
+        )
+        with self.assertRaisesRegex(RuntimeError, "found 0"):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
+    def test_device_layout_two_carriers_rejected(self) -> None:
+        # Two device dims walk host stride 1024 with an extent above one, so
+        # the reserved rows have no single device dim to resize along:
+        # "found 2", and the message names the case.
+        stl = SpyreTensorLayout(
+            [630, 2, 16, 64],
+            [1024, 1024, 64, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 630, (1,): 2, (2, 3): 1024},
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, r"found 2[\s\S]*device dimension of its own"
+        ):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
+    def test_device_layout_too_small_elsewhere_rejected(self) -> None:
+        # The rows sit whole at device dim 0 with extent max, but the layout
+        # covers two of the four middle rows per outer row: fewer bytes than
+        # the host shape at max. Refused at allocation, where the layout can
+        # be named, not at the first resize_ past the host bytes.
+        x = torch.rand(560, 4, 1024, dtype=torch.float16)
+        stl = SpyreTensorLayout(
+            [630, 2, 1024 // 64, 64],
+            [4 * 1024, 1024, 64, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 630, (1,): 2, (2, 3): 1024},
+        )
+        with self.assertRaisesRegex(RuntimeError, "fewer than the"):
+            x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
+    def test_reserved_transfer_does_not_warn(self) -> None:
+        # The transfer used to warn that compiled kernels were built for the
+        # first compile's size (#5937). The compiler now builds a declared
+        # dimension's geometry at the declared maximum and binds the size at
+        # launch, so there is nothing to warn about.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             self.x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
-        self.assertIn("compiled", str(cm.warning))
+        self.assertEqual(
+            [str(w.message) for w in caught if "compiled" in str(w.message)], []
+        )
 
     def test_non_dict_spec_rejected(self) -> None:
         # The per-dim declaration must be a dict, not a bare number/list/None.

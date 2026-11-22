@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Per-token decode cost = (latency at 129 output tokens - latency at 1) / 128, per repeat pair, then compared across
+# pinning policies within each node class. A pair of cases from different environments or subjects is refused.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: pinning-effect, owner: example-team}
+spec:
+  select: {benchmarks: [decode-probe]}
+  metric: llm.batch_latency.mean
+  hold: ["case.*", "system.*", "subject.id"]
+  vary: [run.exec.cpu_pinning]
+  derive:
+    name: llm.decode_per_token
+    op: slope
+    cases: {first: decode-probe/out=out129, second: decode-probe/out=out1}
+    x: {first: 129, second: 1}
+  compare:
+    by: run.exec.cpu_pinning
+    across: [env.label.node_class]
+    metric: llm.decode_per_token
+    baseline: none
+  output: {noise: series_floor}

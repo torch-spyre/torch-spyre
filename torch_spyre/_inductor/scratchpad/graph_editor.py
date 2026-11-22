@@ -30,6 +30,7 @@ from torch_spyre._inductor.pass_utils import (
     invalidate_op_read_writes,
     op_read_writes,
     register_operation_after_graph_edit,
+    work_division_transport_indexes,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -46,6 +47,12 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
+from torch_spyre._inductor.loop_node import (
+    all_ops,
+    move_after,
+    move_before,
+    top_level_entry,
+)
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
 # In-place collectives whose codegen reads exactly one tensor operand,
@@ -284,12 +291,21 @@ class GraphEditor:
             )
             if clone_ownership is None:
                 raise ValueError("LX clone is missing its accepted physical ownership")
+            work_division_transport_indexes(
+                new_com_buf,
+                op_read_writes(new_com_buf),
+                clone_space,
+                clone_ownership.work_slices,
+                message_prefix="LX input clone:",
+            )
             commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
             clone_splits = {
                 sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
                 for sym in iteration_space_from_op(new_com_buf)
             }
+            # unallocated_copy preserves device layout and index coefficients,
+            # so the producer's accepted splits stay representable on this clone.
             commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
@@ -320,32 +336,72 @@ class GraphEditor:
                         f"unexpected buffer user type {type(consumer)} ({consumer})"
                     )
 
-        self.lowering.operations.remove(new_com_buf)
+        self._place_clone(
+            new_com_buf,
+            buf_name,
+            input=input,
+            lower_anchor=lower_anchor,
+            lower_before=lower_before,
+            first_user=first_user,
+        )
+        return new_com_buf
+
+    def _place_clone(
+        self,
+        new_com_buf: ComputedBuffer,
+        buf_name: str,
+        *,
+        input: bool,
+        lower_anchor: Operation | None,
+        lower_before: Operation | None,
+        first_user: Operation | None,
+    ) -> None:
+        """Put the freshly lowered clone (appended at the top level) in its place.
+
+        * a drain (``lower_anchor``) runs once, after the whole loop that holds its
+          anchor, so it goes right after the outermost loop entry of the anchor
+          (the anchor itself when it is not in a loop);
+        * a hoisted input clone (``lower_before``) runs once, before the loop its
+          consumers run in, so it goes right before that outermost entry, when
+          ``lower_before`` is the entry's first op. If ops that are not counted
+          loop members (extern kernels keep their ``loop_info``) come first in the
+          loop, ``lower_before`` is not the first op and the clone goes right before
+          it, in the body, as before: the allocator's live-range gate only looked
+          from ``lower_before`` on;
+        * an output clone with no drain plan copies the buffer's final value and
+          carries the buffer's ``loop_info``, so it goes right after its last
+          writer, in that writer's list (a member stays a member);
+        * any other clone goes right before its first consumer, in that
+          consumer's list: it runs every trip when the consumer is in a loop body.
+
+        The anchors are Operation objects, not saved indexes: earlier clones in the
+        same push only insert before or after existing entries, so the identity
+        survives and a stale index cannot.
+        """
+        operations = self.lowering.operations
         if lower_anchor is None and not input:
             # An output clone copies the buffer's final value, so it runs right
             # after the last op that writes it: the producer, or a later
             # in-place mutation. ``buffer_users`` comes from get_buffer_users,
             # which lists writers as well as readers, so "before the first
             # user" would put the clone ahead of the producer it copies.
-            lower_anchor = self._last_writer(buf_name)
-        if lower_anchor is not None:
-            # Post-loop drain: insert after the loop's last member (an
-            # Operation object, not a saved index -- earlier clones in the same
-            # push only insert before/after existing ops, so the identity
-            # survives and a stale index cannot).
-            self.lowering.operations.insert(
-                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            move_after(operations, self._last_writer(buf_name), new_com_buf)
+        elif lower_anchor is not None:
+            move_after(
+                operations, top_level_entry(operations, lower_anchor), new_com_buf
+            )
+        elif lower_before is not None:
+            entry = top_level_entry(operations, lower_before)
+            # Hoist out of the loop only from its first op; see the docstring.
+            first_op = next(all_ops([entry]))
+            move_before(
+                operations,
+                entry if first_op is lower_before else lower_before,
+                new_com_buf,
             )
         else:
-            # A hoisted input clone goes before its consumers' loop entry; any
-            # other clone goes before its first consumer, as before.
-            before = lower_before if lower_before is not None else first_user
-            assert before is not None, "a clone with no consumers needs an anchor"
-            self.lowering.operations.insert(
-                self.lowering.operations.index(before), new_com_buf
-            )
-
-        return new_com_buf
+            assert first_user is not None, "a clone with no consumers needs an anchor"
+            move_before(operations, first_user, new_com_buf)
 
     def _last_writer(self, buf_name: str) -> Operation:
         """The last op in the lowered order that writes ``buf_name``: its
