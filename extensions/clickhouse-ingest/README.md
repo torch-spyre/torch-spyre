@@ -102,7 +102,8 @@ any other tag then fails. The output's `registry` says which happened.
 
 In `results` a tag it cannot file (an unknown `--tag-family`) is dropped with a warning; the
 other tags and the verdicts are recorded regardless. `--strict` makes `results` exit 1 when a
-named artifact's verdicts were not all recorded, or when a tag fell back to `misc`.
+v2 write failed, when a named artifact's verdicts were not all recorded, or when a tag fell back to
+`misc`. `--schema` defaults to `v2` (`INGEST_SCHEMA` overrides); `v1` and `both` are an explicit opt-in.
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
 URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
 digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and

@@ -219,12 +219,9 @@ jobs:
     # than a computed `secrets[...]` lookup. An unset selected secret forwards as
     # empty and the perf ingest step self-skips.
     secrets:
-      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
-      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      CLICKHOUSE_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_HOST_DEV)) }}
+      CLICKHOUSE_PORT: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_PORT_DEV)) }}
+      CLICKHOUSE_DB_V2: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV)) }}
       # toJSON: an unset prod secret must not fall through to the dev one.
       CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV))
         }}
@@ -291,12 +288,9 @@ jobs:
       # Reuse run-tests' wheel on the checkout path instead of building and uploading a second one.
       torch_spyre_wheel_artifact_name: ${{ !inputs.prebaked_image && 'torch-spyre-wheel' || '' }}
     secrets:
-      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
-      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      CLICKHOUSE_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_HOST_DEV)) }}
+      CLICKHOUSE_PORT: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_PORT) || toJSON(secrets.CLICKHOUSE_PORT_DEV)) }}
+      CLICKHOUSE_DB_V2: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV)) }}
       # toJSON: an unset prod secret must not fall through to the dev one.
       CLICKHOUSE_V2_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV))
         }}
