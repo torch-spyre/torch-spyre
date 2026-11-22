@@ -327,6 +327,13 @@ _SCAN_HOP_NAME = "torch.ops.higher_order.scan"
 # every cached graph that has a ``scan`` in it.
 _SCAN_CACHE_SALT = "torch-spyre-scan-v1"
 
+# torch-spyre's ``Tensor.to`` and ``torch.empty`` wrappers as PyTorch's cache checks
+# see them (``_patch_tensor_for_spyre`` publishes them under these names).
+_TENSOR_WRAPPER_NAMES = (
+    "torch_spyre._monkey_patch.spyre_to",
+    "torch_spyre._monkey_patch.spyre_empty",
+)
+
 
 def _allow_scan_graph_caching() -> None:
     """Let the FX graph and AOTAutograd caches keep graphs that use ``scan``.
@@ -350,6 +357,39 @@ def _allow_scan_graph_caching() -> None:
 
     marked = dict(inductor_config.unsafe_marked_cacheable_functions)
     marked.setdefault(_SCAN_HOP_NAME, _SCAN_CACHE_SALT)
+    inductor_config.unsafe_marked_cacheable_functions = marked
+
+
+def _allow_tensor_wrapper_caching() -> None:
+    """Let AOTAutogradCache keep graphs that call torch-spyre's ``Tensor.to`` or
+    ``torch.empty`` wrapper.
+
+    On by default; turn off with ``TORCH_SPYRE_CACHE_TENSOR_WRAPPERS=0``. Dynamo keeps
+    ``.to`` as an allow_in_graph leaf, so the wrapper is itself a node of the graph,
+    and AOTAutogradCache bypasses any graph with a call it does not know is safe.
+    Such a graph is traced by AOTAutograd again in every process before its FX graph
+    cache hit, which a warm start pays for each one.
+
+    The wrappers depend only on their arguments and the target device, and their
+    arguments are graph inputs or constants in the graph, so a cached graph calls them
+    the same way a traced one does. Their code is not in the key: the salt is a hash
+    of ``_monkey_patch.py``, so a change to that file drops the old entries.
+    """
+    if os.environ.get("TORCH_SPYRE_CACHE_TENSOR_WRAPPERS", "1") != "1":
+        return
+    import hashlib
+    import importlib.util
+
+    import torch._inductor.config as inductor_config
+
+    spec = importlib.util.find_spec("torch_spyre._monkey_patch")
+    if spec is None or spec.origin is None:
+        return
+    with open(spec.origin, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()[:16]
+    marked = dict(inductor_config.unsafe_marked_cacheable_functions)
+    for name in _TENSOR_WRAPPER_NAMES:
+        marked.setdefault(name, f"torch-spyre-tensor-wrappers-{digest}")
     inductor_config.unsafe_marked_cacheable_functions = marked
 
 
@@ -392,5 +432,6 @@ def _autoload():
         )
 
         _allow_scan_graph_caching()
+        _allow_tensor_wrapper_caching()
 
         _autoload._ran = True
