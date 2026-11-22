@@ -63,14 +63,14 @@ def gate(action, tmp_path, inputs):
     return "configured=true" in out.read_text()
 
 
-def ingest(action, tmp_path, inputs):
+def ingest(action, tmp_path, inputs, fake_exit=0):
     """Run the ingest step with a fake interpreter; return (exit code, env the library would see, stdout)."""
     bin_ = tmp_path / "bin"
     bin_.mkdir()
     for name in ("python", "python3"):
         fake = bin_ / name
         fake.write_text(
-            '#!/bin/bash\nenv | grep -E "^(CLICKHOUSE_|INGEST_SCHEMA)" | sort > "$ENV_OUT"\n'
+            '#!/bin/bash\nenv | grep -E "^(CLICKHOUSE_|INGEST_SCHEMA)" | sort > "$ENV_OUT"\nprintf "%s\\n" "$@" > "$ENV_OUT.argv"\nexit ${FAKE_EXIT:-0}\n'
         )
         fake.chmod(0o755)
     (tmp_path / "venv/bin").mkdir(parents=True)
@@ -81,7 +81,7 @@ def ingest(action, tmp_path, inputs):
     env = env_of(s, {"xml-dir": "x", "gha-run-id": "1", **inputs})
     env.update(VENV=str(tmp_path / "venv"), PATH=f"{bin_}:/usr/bin:/bin", ENV_OUT=str(tmp_path / "seen"),
                ROOT=str(tmp_path), JSON_FILE="j.json", GITHUB_SERVER_URL="https://x", GITHUB_REPOSITORY="o/r",
-               GITHUB_RUN_ID="1", RUN_ID="1", REPO="o/r")  # fmt: skip
+               GITHUB_RUN_ID="1", RUN_ID="1", REPO="o/r", INGEST_SCHEMA="both", FAKE_EXIT=str(fake_exit))  # fmt: skip
     r = subprocess.run(
         ["bash", "-e", "-c", re.sub(r"\$\{\{.*?\}\}", "", s["run"])],
         env=env,
@@ -216,3 +216,35 @@ def test_v2_artifact_overrides_the_callers_job_env(tmp_path):
         and seen["CLICKHOUSE_V2_PASSWORD"] == "newpw"
     )
     assert "CLICKHOUSE_PORT" not in seen and "CLICKHOUSE_V2_PORT" not in seen
+
+
+def test_the_actions_write_v2_even_when_the_job_sets_ingest_schema_both(tmp_path):
+    (tmp_path / "x").mkdir()
+    rc, seen, _ = ingest(XML, tmp_path / "x", NEW)
+    assert (
+        rc == 0 and seen["INGEST_SCHEMA"] == "v2"
+    )  # the harness injects INGEST_SCHEMA=both
+    argv = (tmp_path / "x" / "seen.argv").read_text().split()
+    assert argv[argv.index("--schema") + 1] == "v2"
+
+
+@pytest.mark.parametrize("action", [XML, HW])
+@pytest.mark.parametrize("strict, code", [("false", 0), ("true", 75), ("", 75)])
+def test_parked_rows_exit_75_unless_strict_is_false(tmp_path, action, strict, code):
+    rc, _, out = ingest(action, tmp_path, {**NEW, "strict": strict}, fake_exit=75)
+    assert rc == code
+    assert ("::warning title=ClickHouse::rows were parked" in out) is (code == 0)
+
+
+@pytest.mark.parametrize("action", [XML, HW])
+def test_strict_false_does_not_hide_other_failures(tmp_path, action):
+    rc, _, _ = ingest(action, tmp_path, {**NEW, "strict": "false"}, fake_exit=1)
+    assert rc == 1
+
+
+def test_the_hw_script_passes_strict_unless_strict_is_false(tmp_path):
+    for strict, want in (("false", False), ("true", True), ("", True)):
+        d = tmp_path / (strict or "default")
+        d.mkdir()
+        ingest(HW, d, {**NEW, "strict": strict})
+        assert ("--strict" in (d / "seen.argv").read_text().split()) is want

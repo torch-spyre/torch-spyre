@@ -214,3 +214,24 @@ def test_the_covered_tier_lookup_refuses_half_a_v2_login(tmp_path):
         capture_output=True, text=True, env=env, cwd=tmp_path,
     )  # fmt: skip
     assert p.returncode == 0 and "set both CLICKHOUSE_V2_USER" in p.stderr
+
+
+def _covered(tmp_path, **extra):
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith(("CLICKHOUSE_", "CH_"))
+    }
+    env.update(extra)
+    return subprocess.run(
+        [sys.executable, str(REPO / ".github/scripts/resolve_covered_tiers.py"),
+         "--commit-sha", "ab12", "--arch", "x86_64"],
+        capture_output=True, text=True, env=env, cwd=tmp_path,
+    )  # fmt: skip
+
+
+def test_the_covered_tier_lookup_never_tries_the_default_user(tmp_path):
+    p = _covered(tmp_path, CLICKHOUSE_HOST="h.example.com", CLICKHOUSE_DB_V2="spyre_v2")
+    assert p.returncode == 0 and "no ClickHouse login" in p.stderr

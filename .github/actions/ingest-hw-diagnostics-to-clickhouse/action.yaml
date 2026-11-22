@@ -120,9 +120,9 @@ inputs:
     default: ''
   strict:
     description: >
-      'true' (default): a failed v2 write, an unrecorded artifact verdict or a tag that fell back
-      to misc fails the step. 'false' downgrades those to warnings. An unset host skips the ingest
-      either way; a set host with a missing login fails.
+      'true' (default): a failed insert fails the step. 'false' downgrades a failed insert and
+      parked rows (exit 75) to warnings. A missing login or an unreachable host still fails
+      (use continue-on-error on the step to tolerate an outage). An unset host skips either way.
     required: false
     default: 'true'
 
@@ -252,10 +252,12 @@ runs:
         export CLICKHOUSE_DB="${CH_DB_V2_IN}" CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         unset CLICKHOUSE_PORT CLICKHOUSE_V2_PORT
         [ -z "${CH_PORT_IN}" ] || export CLICKHOUSE_PORT="${CH_PORT_IN}" CLICKHOUSE_V2_PORT="${CH_PORT_IN}"
+        export INGEST_SCHEMA=v2
         RUN_URL="${RUN_URL_IN:-${{ github.server_url }}/${REPO}/actions/runs/${RUN_ID}}"
         TABLE_ARGS=()
         [ "${STRICT_IN}" = false ] || TABLE_ARGS+=(--strict)
         [ -n "${{ inputs.table }}" ] && TABLE_ARGS+=(--table "${{ inputs.table }}")
+        rc=0
         python3 "${ROOT}/.github/scripts/ingest_hw_diagnostics.py" \
           --json-file      "${JSON_FILE}" \
           --run-id         "${{ inputs.threaded-run-id }}" \
@@ -266,7 +268,13 @@ runs:
           --trigger-type   "${{ inputs.trigger-type || inputs.workflow-name }}" \
           --run-url        "${RUN_URL}" \
           --artifact-id    "${{ inputs.artifact-id }}" \
-          "${TABLE_ARGS[@]}"
+          ${TABLE_ARGS[@]+"${TABLE_ARGS[@]}"} || rc=$?
+        # strict=false: parked rows (exit 75) are a warning, not a failed step.
+        if [ "${rc}" -eq 75 ] && [ "${STRICT_IN}" = false ]; then
+          echo "::warning title=ClickHouse::rows were parked, not stored; strict is false, so the step passes"
+          rc=0
+        fi
+        exit "${rc}"
 
     # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.
     - name: Publish a rows-free manifest of parked ClickHouse rows

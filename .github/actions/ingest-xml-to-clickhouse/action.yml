@@ -231,9 +231,11 @@ inputs:
     default: ''
   strict:
     description: >
-      'true' (default): a failed v2 write, an unrecorded artifact verdict or a tag that fell back
-      to misc fails the step. 'false' downgrades those to warnings. An unset host skips the ingest
-      either way; a set host with a missing login fails.
+      'true' (default) passes --strict: a failed v2 write, an unrecorded artifact verdict, a tag
+      that fell back to misc, or v2 tables the login cannot see fail the step. 'false' downgrades
+      those, and parked rows (exit 75), to warnings. It does not cover a missing login, an
+      unreachable host or a perf report with no records, which still fail (use continue-on-error
+      on the step to tolerate an outage). An unset host skips either way.
     required: false
     default: 'true'
 
@@ -405,8 +407,9 @@ runs:
         export CLICKHOUSE_DB="${CH_DB_V2_IN}" CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         unset CLICKHOUSE_PORT CLICKHOUSE_V2_PORT
         [ -z "${CH_PORT_IN}" ] || export CLICKHOUSE_PORT="${CH_PORT_IN}" CLICKHOUSE_V2_PORT="${CH_PORT_IN}"
+        export INGEST_SCHEMA=v2
         # Optional flags only when set: an empty --arch would override the host-arch default.
-        ARGS=()
+        ARGS=(--schema v2)
         [ "${STRICT_IN}" = false ] || ARGS+=(--strict)
         [ -n "${PLATFORM_IN}" ] && ARGS+=(--arch "${PLATFORM_IN}")
         [ -n "${COMPONENT_IN}" ] && ARGS+=(--component "${COMPONENT_IN}")
@@ -437,6 +440,7 @@ runs:
           kv="${kv//[[:space:]]/}"
           [ -n "${kv}" ] && ARGS+=(--perf "${kv}")
         done <<< "${PERF_IN}"
+        rc=0
         python -m spyre_clickhouse_ingest results \
           --workflow "${WORKFLOW_IN}" \
           --branch "${BRANCH_IN}" \
@@ -446,7 +450,13 @@ runs:
           --triggered-at "${TRIGGERED_AT_IN}" \
           --pr-number "${PR_NUMBER_IN}" \
           --trigger-type "${TRIGGER_TYPE_IN}" \
-          "${ARGS[@]}"
+          "${ARGS[@]}" || rc=$?
+        # strict=false: parked rows (exit 75) are a warning, not a failed step.
+        if [ "${rc}" -eq 75 ] && [ "${STRICT_IN}" = false ]; then
+          echo "::warning title=ClickHouse::rows were parked, not stored; strict is false, so the step passes"
+          rc=0
+        fi
+        exit "${rc}"
 
     # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.
     - name: Publish a rows-free manifest of parked ClickHouse rows
