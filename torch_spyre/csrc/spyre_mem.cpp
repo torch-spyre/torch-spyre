@@ -317,8 +317,8 @@ auto identity_dim_ea(const std::vector<int>& tiles,
  */
 auto get_device_stride_infos(
     int64_t cpu_offset, int64_t device_offset, const SpyreTensorLayout& stl,
-    bool host2device, std::vector<perdim_element_arrangement>& dimwise_ea)
-    -> std::vector<DataConversionStrideInfo> {
+    bool host2device, std::vector<perdim_element_arrangement>& dimwise_ea,
+    EaPairBoundary& boundary) -> std::vector<DataConversionStrideInfo> {
   for (const int64_t size : stl.device_size) {
     TORCH_CHECK(size >= 0, "Invalid device size ", size);
   }
@@ -326,13 +326,16 @@ auto get_device_stride_infos(
   const std::vector<int64_t> device_strides = contiguous_device_strides(stl);
   // Every stride is non-negative after construction. A zero stride is a
   // broadcast or a size-1 dim.
-  const std::vector<int64_t>& host_strides = stl.stride_map;
+  std::vector<int64_t> host_strides = stl.stride_map;
   std::vector<int64_t> sizes = stl.device_size;
+  boundary = EaPairBoundary{};
 
   for (const auto& [dims, count] : stl.valid_elements) {
     if (dims.size() != 1) continue;
     const int64_t j = dims[0];
-    if (stl.stride_map[j] > 0) sizes[j] = std::min(count, stl.device_size[j]);
+    // A stride-0 dim is a broadcast or a size-1/sparse dim. Only the valid
+    // count says how many of its elements exist, so cap it too.
+    sizes[j] = std::min(count, stl.device_size[j]);
   }
 
   // The first stick pair with a partial last row, if any: that row covers one
@@ -397,20 +400,41 @@ auto get_device_stride_infos(
           identity_dim_ea(tiles, stl.device_size, device_strides));
     }
 
+    // The rows the stick pair is repeated over: the valid counts of the other
+    // singleton keys.
     int64_t outer_count = 1;
-    for (int k = 0; k < stick_elem_dim; k++) outer_count *= sizes[k];
+    for (const auto& [dims, count] : stl.valid_elements) {
+      if (dims.size() == 1 && dims[0] != stick_elem_dim &&
+          dims[0] != stick_count_dim) {
+        outer_count *= count;
+      }
+    }
 
-    EaPairBoundary boundary;
     ea_shuffle(stl, device_strides[stick_elem_dim],
                has_stick_count ? device_strides[stick_count_dim] : 0,
                allocated_sticks, valid_width, outer_count,
                dimwise_ea[stick_elem_dim], host2device, boundary);
-    // An odd number of valid sticks makes the last pair straddle padding. The
-    // padded walk for that case is built on the host dims and is not ported to
-    // device dims yet.
-    TORCH_CHECK(!boundary.needed,
-                "Staggered layout with an odd number of valid sticks (",
-                valid_width, " elements) is not supported yet");
+    if (boundary.needed) {
+      // An odd number of valid sticks: walk whole stick pairs of the padded
+      // extent. The caller splices the boundary DCI that slices (D2H) or
+      // zero-pads (H2D) between the padded and the valid widths.
+      TORCH_CHECK(has_stick_count,
+                  "Staggered layout with padding needs a stick count dim");
+      sizes[stick_elem_dim] = stl.device_size[stick_elem_dim];
+      sizes[stick_count_dim] =
+          boundary.padded_width / stl.device_size[stick_elem_dim];
+      partial_pair.reset();
+      // Non-stick dims whose stride steps over a whole valid row move to the
+      // padded row length, so the padded buffer is addressed consistently.
+      for (int k = 0; k < device_rank; k++) {
+        if (k == stick_count_dim || k == stick_elem_dim) continue;
+        const int64_t stride = stl.stride_map[k];
+        if (stride < valid_width) continue;
+        TORCH_CHECK(stride % valid_width == 0, "Cannot rescale stride ", stride,
+                    " to the padded stick width ", boundary.padded_width);
+        host_strides[k] = stride / valid_width * boundary.padded_width;
+      }
+    }
   }
 
   // Builds one descriptor. The descriptors list the innermost device dim
@@ -600,9 +624,15 @@ void cap_valid_elements_to_view(SpyreTensorLayout& stl,
     // single stride would reduce it to the stick's own extent, one row.
     if (dims.size() == 2) {
       const int64_t outer_stride = stl.stride_map[dims[0]];
+      const int64_t inner_stride = stl.stride_map[dims[1]];
       const auto rows = size_at_stride.find(outer_stride);
+      const auto stick = size_at_stride.find(inner_stride);
+      // Rows times the stick only when the view takes whole sticks; a view that
+      // takes part of a stick (or none of it) falls through to the rule below.
       if (outer_stride > 0 && rows != size_at_stride.end() &&
-          rows->second != std::numeric_limits<int64_t>::max()) {
+          rows->second != std::numeric_limits<int64_t>::max() &&
+          stick != size_at_stride.end() &&
+          stick->second == stl.device_size[dims[1]]) {
         count = std::min(count, rows->second * stl.device_size[dims[1]]);
         continue;
       }
@@ -663,7 +693,9 @@ void apply_expands(std::vector<int64_t>& stride_map,
     }
   }
   for (size_t i = 0; i < stride_map.size(); i++) {
-    if (stride_map[i] <= 0) continue;
+    // A stride the rebase already moved to a host stride is a host stride; it
+    // must not be divided by the expand factor a second time.
+    if (stride_map[i] <= 0 || stride_map[i] != stl.stride_map[i]) continue;
     for (const auto& [stride, expand] : expands) {
       if (stl.stride_map[i] > stride) stride_map[i] /= expand;
     }
@@ -882,8 +914,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   } else {
     // EA shuffle: dimwise_ea is filled only for copies of staggered layouts.
     std::vector<perdim_element_arrangement> dimwise_ea;
+    EaPairBoundary boundary;
     dci.dcsi_ = get_device_stride_infos(cpu_offset, device_offset, stl,
-                                        host2device, dimwise_ea);
+                                        host2device, dimwise_ea, boundary);
     if (!dimwise_ea.empty()) {
       // The shapes list the innermost dim first, so the per-dim EA does too.
       std::reverse(dimwise_ea.begin(), dimwise_ea.end());
@@ -900,8 +933,40 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const std::vector<int64_t> cpu_shape(cpu_sizes.rbegin(), cpu_sizes.rend());
     const std::vector<int64_t> device_shape(stl.device_size.rbegin(),
                                             stl.device_size.rend());
-    dci.input_shape_ = host2device ? cpu_shape : device_shape;
-    dci.output_shape_ = host2device ? device_shape : cpu_shape;
+    if (!boundary.needed) {
+      dci.input_shape_ = host2device ? cpu_shape : device_shape;
+      dci.output_shape_ = host2device ? device_shape : cpu_shape;
+    } else {
+      // The stick host dim is the last one; its padded extent replaces the
+      // valid width in the intermediate buffer.
+      TORCH_CHECK(cpu_sizes.back() == boundary.valid_width,
+                  "Padded staggered copy expects the stick to be the last dim");
+      std::vector<int64_t> padded_sizes = cpu_sizes;
+      padded_sizes.back() = boundary.padded_width;
+      const std::vector<int64_t> padded_shape(padded_sizes.rbegin(),
+                                              padded_sizes.rend());
+      if (host2device) {
+        // The walk reads the zero-padded intermediate (offset 0); the host
+        // values are expanded from the real width first.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_src_ -= cpu_offset;
+        boundary.boundary_dcsi.offset_src_ = cpu_offset;
+        dci.pre_expand_dcsi_ = {boundary.boundary_dcsi};
+        dci.pre_input_shape_ = cpu_shape;
+        dci.usePadVal_ = true;
+        dci.inputPadVal_ = 0.0;
+        dci.input_shape_ = padded_shape;
+        dci.output_shape_ = device_shape;
+      } else {
+        // The walk writes the padded intermediate (offset 0); the valid width
+        // is sliced out to the host afterwards.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_dst_ -= cpu_offset;
+        boundary.boundary_dcsi.offset_dst_ = cpu_offset;
+        dci.post_slice_dcsi_ = {boundary.boundary_dcsi};
+        dci.post_output_shape_ = cpu_shape;
+        dci.input_shape_ = device_shape;
+        dci.output_shape_ = padded_shape;
+      }
+    }
   }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
