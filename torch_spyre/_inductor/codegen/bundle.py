@@ -239,9 +239,11 @@ def generate_bundle(
     # Pass 2: emit bundle.mlir.
     # -----------------------------------------------------------------------
 
-    # Collect loop bounds and affine maps needed across the whole tree.
+    # Collect loop bounds, their device-read count sources, and affine maps
+    # needed across the whole tree.
     loop_bounds: list[sympy.Expr] = []
-    _collect_loop_bounds(specs_list, loop_bounds)
+    loop_sources: list[CountSource | None] = []
+    _collect_loop_bounds(specs_list, loop_bounds, loop_sources)
 
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of stride values in outermost-first level order.
@@ -282,13 +284,9 @@ def generate_bundle(
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = any(sk.is_pool for sk in symbol_kinds)
 
-    # Each loop's device-read count source, or None, in the same outer-first
-    # order as loop_bounds. Only a count in the pool is supported for now, so
-    # it is addressed off %pool, which is only defined (in either pool mode
-    # below) when has_pool is set.
-    loop_sources: list[CountSource | None] = [
-        loop.count_from_buffer for loop in walk_loop_specs(specs_list)
-    ]
+    # Only a device-read count in the pool is supported for now, so it is
+    # addressed off %pool, which is only defined (in either pool mode below)
+    # when has_pool is set.
     if not has_pool and any(src is not None for src in loop_sources):
         raise Unsupported(
             "a device-read loop count is only supported from the bundle's pool "
@@ -507,12 +505,7 @@ def generate_bundle(
         # a symbolic one becomes "to <dim> step <G>"; a device-read one reads
         # its bound right before the loop. See _loop_level.
         loop_levels = [
-            _loop_level(
-                lb,
-                lb_idx,
-                loop_dim_ssa,
-                loop_sources[lb_idx] if lb_idx < len(loop_sources) else None,
-            )
+            _loop_level(lb, lb_idx, loop_dim_ssa, loop_sources[lb_idx])
             for lb_idx, lb in enumerate(loop_bounds)
         ]
 
@@ -664,6 +657,11 @@ def generate_bundle(
             sym_canonical=sym_canonical,
             loop_levels=loop_levels,
         )
+        # Every per-loop list above is indexed by the order _emit_specs meets the
+        # loops, so it must have written exactly the loops that were collected.
+        assert loop_bound_idx[0] == len(loop_bounds), (
+            f"emitted {loop_bound_idx[0]} loops but collected {len(loop_bounds)}"
+        )
 
         f.write("\t\treturn\n")
         f.write("\t}\n")
@@ -777,12 +775,15 @@ def _compile_specs(
 # ---------------------------------------------------------------------------
 
 
-def _collect_loop_bounds(specs: list, bounds: list) -> None:
-    """Collect loop trip counts depth-first (same order as loop var naming)."""
+def _collect_loop_bounds(specs: list, bounds: list, sources: list) -> None:
+    """Collect each loop's trip count and device-read count source (or None)
+    depth-first (same order as loop var naming). One walk fills both lists, so
+    entry N of each always belongs to the same loop."""
     for entry in specs:
         if isinstance(entry, LoopSpec):
             bounds.append(entry.count)
-            _collect_loop_bounds(entry.body, bounds)
+            sources.append(entry.count_from_buffer)
+            _collect_loop_bounds(entry.body, bounds, sources)
 
 
 # ---------------------------------------------------------------------------
