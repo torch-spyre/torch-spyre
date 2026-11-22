@@ -14,9 +14,18 @@
 
 # Owner(s): ["module: stream"]
 
+import contextlib
+import ctypes
+import gc
+import os
+import time
+
+import pytest
 import torch
 import torch_spyre
 from torch.testing._internal.common_utils import run_tests, TestCase
+
+from torch_spyre._C import copy_tensor
 
 
 class TestSpyreStream(TestCase):
@@ -327,6 +336,176 @@ class TestStreamCompatibility(TestCase):
         # Both should return valid streams
         self.assertIsNotNone(legacy_current)
         self.assertIsNotNone(modern_current)
+
+
+_RECYCLE_ENV = "TORCH_SPYRE_STREAM_RECYCLE_OPS"
+
+# Retained host bytes per op above which a stream counts as leaking. Flex keeps
+# ~1.4 KB per non-blocking H2D today.
+_MAX_RETAINED_BYTES_PER_OP = 64
+
+_libc = ctypes.CDLL("libc.so.6")
+
+
+def _rss_bytes():
+    gc.collect()
+    _libc.malloc_trim(0)
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def _wait_idle(stream):
+    """Waits for stream without synchronizing it (no recycle point)."""
+    while not stream.query():
+        time.sleep(0.0005)
+
+
+@contextlib.contextmanager
+def _recycle_ops(n):
+    """Sets the recycle threshold; a synchronize refreshes torch-spyre's copy."""
+    saved = os.environ.get(_RECYCLE_ENV)
+    os.environ[_RECYCLE_ENV] = str(n)
+    torch.spyre.synchronize()
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(_RECYCLE_ENV, None)
+        else:
+            os.environ[_RECYCLE_ENV] = saved
+        torch.spyre.synchronize()
+
+
+class TestFlexStreamRecycle(TestCase):
+    """Recycling of the flex stream behind each c10 stream id (#6569).
+
+    Flex keeps per-op host state for a stream until the stream is destroyed,
+    so torch-spyre swaps a fresh flex stream in every
+    TORCH_SPYRE_STREAM_RECYCLE_OPS submitted ops.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("spyre")
+
+    def _copies(self, n):
+        srcs = [torch.arange(64, dtype=torch.int32) + 1000 * i for i in range(n)]
+        dsts = [torch.empty(64, dtype=torch.int32, device=self.device) for _ in srcs]
+        return srcs, dsts
+
+    def _assert_copied(self, srcs, dsts):
+        for src, dst in zip(srcs, dsts):
+            self.assertEqual(src.tolist(), dst.cpu().tolist())
+
+    def _retained_bytes_per_unsynchronized_copy(self, threshold, ops):
+        """Host RSS growth per non-blocking H2D on a never-synchronized stream.
+
+        The stream is only polled until idle every 1024 copies, as a
+        non-driver tensor-parallel rank never synchronizes its streams.
+        """
+        src = torch.arange(64, dtype=torch.int32)
+        dst = src.to(self.device)
+        stream = torch.Stream(self.device)
+
+        def run(n):
+            with stream:
+                for i in range(n):
+                    copy_tensor(src, dst, non_blocking=True)
+                    if i % 1024 == 1023:
+                        _wait_idle(stream)
+            _wait_idle(stream)
+
+        with _recycle_ops(threshold):
+            run(ops // 4)
+            before = _rss_bytes()
+            run(ops)
+            per_op = (_rss_bytes() - before) / ops
+        # Free what an unrecycled stream retained before the next test.
+        with _recycle_ops(1):
+            stream.synchronize()
+        return per_op
+
+    def test_recycle_preserves_ordering(self):
+        """Copies that straddle a recycle observe every earlier copy.
+
+        A broken swap (wrong handle, dropped ops, or a destroyed handle still
+        resolved) shows up as wrong values.
+        """
+        stream = torch.Stream(self.device)
+        with _recycle_ops(4), stream:
+            for i in range(64):
+                expect = torch.arange(128, dtype=torch.int32) + i
+                dst = expect.to(self.device)  # blocking H2D, syncs per copy
+                self.assertTrue(torch.equal(expect, dst.cpu()))
+
+            # Non-blocking bursts: many ops per synchronize, with the
+            # recycle threshold crossed mid-burst.
+            src = torch.arange(64, dtype=torch.int32)
+            dst = src.to(self.device)
+            for burst in range(8):
+                for j in range(12):
+                    copy_tensor(src + burst * 100 + j, dst, non_blocking=True)
+                stream.synchronize()
+                self.assertEqual((src + burst * 100 + 11).tolist(), dst.cpu().tolist())
+
+    def test_idle_pool_recycles_without_synchronize(self):
+        """A stream nobody synchronizes is recycled once the pool goes idle.
+
+        S_prep under SPYRE_HAZARD_TRACKER, and every stream on a non-driver
+        tensor-parallel rank, never reach a synchronization point.
+        """
+        srcs, dsts = self._copies(48)
+        stream = torch.Stream(self.device)
+        with _recycle_ops(8):
+            before = torch_spyre._C._stream_recycle_stats()
+            with stream:
+                for i, (src, dst) in enumerate(zip(srcs, dsts)):
+                    copy_tensor(src, dst, non_blocking=True)
+                    if i % 4 == 3:
+                        _wait_idle(stream)
+                        time.sleep(0.002)  # past the idle-probe interval
+            after = torch_spyre._C._stream_recycle_stats()
+        self.assertGreater(after["when_idle"], before["when_idle"])
+        self.assertEqual(after["at_sync"], before["at_sync"])
+        self._assert_copied(srcs, dsts)
+
+    def test_busy_pool_recycle_is_forced_without_synchronize(self):
+        """Back-to-back submissions hit the forced limit and still all land.
+
+        With threshold 2 a stream reaches the forced limit (twice the
+        threshold) within a few submissions, well inside one idle-probe
+        interval, so the pool is drained and swapped from the submission path.
+        """
+        srcs, dsts = self._copies(64)
+        stream = torch.Stream(self.device)
+        with _recycle_ops(2):
+            before = torch_spyre._C._stream_recycle_stats()
+            with stream:
+                for src, dst in zip(srcs, dsts):
+                    copy_tensor(src, dst, non_blocking=True)
+            after = torch_spyre._C._stream_recycle_stats()
+        self.assertGreater(after["forced"], before["forced"])
+        self._assert_copied(srcs, dsts)
+
+    def test_recycling_bounds_host_memory_of_unsynchronized_stream(self):
+        """A never-synchronized stream stops accumulating flex host state.
+
+        A low threshold keeps the saw-tooth between recycles (at most twice
+        the threshold in retained ops) well under the per-op bound.
+        """
+        per_op = self._retained_bytes_per_unsynchronized_copy(256, 80_000)
+        self.assertLess(per_op, _MAX_RETAINED_BYTES_PER_OP)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="flex keeps per-op host state for every DMA until the stream is "
+        "destroyed (torch-spyre#6569). An XPASS means flex frees it: drop "
+        "TORCH_SPYRE_STREAM_RECYCLE_OPS and this xfail.",
+    )
+    def test_flex_frees_dma_state_without_recycling(self):
+        per_op = self._retained_bytes_per_unsynchronized_copy(0, 80_000)
+        self.assertLess(per_op, _MAX_RETAINED_BYTES_PER_OP)
 
 
 if __name__ == "__main__":

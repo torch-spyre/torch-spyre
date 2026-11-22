@@ -872,6 +872,19 @@ PYBIND11_MODULE(_C, m) {
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
+  m.def(
+      "_stream_recycle_stats",
+      []() {
+        const spyre::StreamRecycleStats stats = spyre::getStreamRecycleStats();
+        py::dict result;
+        result["at_sync"] = stats.at_sync;
+        result["when_idle"] = stats.when_idle;
+        result["forced"] = stats.forced;
+        return result;
+      },
+      "Process-lifetime flex-stream recycle counts by trigger "
+      "(torch-spyre#6569)");
+
   // Expose SpyreStream class to Python
   py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
       .def("synchronize", &spyre::SpyreStream::synchronize,
