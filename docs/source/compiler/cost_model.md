@@ -312,7 +312,7 @@ fix to one is not a fix to the other.
 
 | caller | setting | matmul compute |
 |---|---|---|
-| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term |
+| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term, plus the standalone chooser's split preferences (`_matmul_split_preference_us`) once per invocation, without their batch-split term, which `_matmul_batch_split_ns` charges instead |
 | report (`cost_model_pass`, `SPYRE_DUMP_COST`) | default, `use_bundled_cost_model=True` | `matmul_macs / cores / (mac_peak * pt_eff)` |
 
 Both must count the same work over a loop. The rebuilt axes describe **one pass over the
@@ -328,6 +328,32 @@ count directly. Two loops of 128 experts, each expert a `[64, 128]` output with 
 
 Both cost 128 experts of work on both models. A reduction-tiled loop makes one pass per
 K slice; a loop that tiles an output dimension walks its output once and makes one pass.
+
+The split preferences the allocator adds are not work, so they follow a different
+count: they are fixed amounts per call of the body matmul and are charged once per
+invocation (`loop_trip`). They are also priced on the geometry of **one call**
+(`_matmul_split_preference_us`): the batch rebuilt from the output buffer is divided
+by the number of calls one pass spans, `loop_trip / passes`, and the shared-weight flag
+is re-derived from that batch. In the example above both loops price the preferences of
+a `[64, 128]` call with batch 1, 128 times. Without this the stacked form saw batch 128,
+lost the decode-scope and shared-weight branches, and was priced milliseconds apart
+from the same body writing one buffer. When the buffer batch is not a whole number of
+calls, the buffer-level batch and sharing are kept rather than rounded. When the trip
+count, pass count or batch is symbolic, that test is a SymPy condition, and the batch
+and the shared-weight flag become `Piecewise` expressions over it, which the
+preferences branch on with `piecewise`.
+
+The preferences are ranking regularizers, not measured service times. Each is 10 to
+30 µs per log2 step away from its target (`_M_LANE_UNDERUSE_PENALTY_US`,
+`_M_TILE_UNDERFILL_PENALTY_US`, `_WIDE_N_TILE_PENALTY_US`,
+`_LARGE_M_TILE_SHAPE_PENALTY_US`, `_SHARED_DOWN_N_SPLIT_PENALTY_US`,
+`_CORE_UNDERUSE_PENALTY_US`), tuned on the standalone chooser's device sweeps to order
+candidates of one matmul. On a small matmul they can be far larger than the execution
+estimate: a `[16, 64, 256] @ [16, 256, 128]` BMM split 16 ways on its batch has
+1.37 µs of execution and 170 µs of preferences (without the batch-split term). In the
+CP-SAT objective they can therefore outweigh a small matmul's compute price, and they
+have not been calibrated against the objective's memory, transfer and LX-placement
+terms.
 
 ### Delivering the operand a loop walks
 

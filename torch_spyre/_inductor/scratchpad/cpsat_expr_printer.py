@@ -296,6 +296,10 @@ class _SympyExprToCpSat(Printer):
             result = values[0]
             for value in values[1:]:
                 result = operation(result, value)
+        elif expr.func is sympy.ceiling:
+            result = np.vectorize(math.ceil, otypes=[object])(values[0])
+        elif isinstance(expr, sympy.ITE):
+            result = np.where(values[0], values[1], values[2])
         elif expr.is_Piecewise:
             result = values[-2]
             for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
@@ -946,6 +950,49 @@ class _SympyExprToCpSat(Printer):
     def _print_Or(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
         or_var = self._model.new_bool_var(f"or_{self._count}")
+        self._count += 1
+        self._model.AddBoolOr(lits).OnlyEnforceIf(or_var)
+        self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
+        return or_var
+
+    @memoize_method
+    def _print_ceiling(self, expr):
+        # ``ceiling(num / den)`` for a positive integer ``den``: the integer
+        # ``q`` with ``den * q - den < num <= den * q``. ``_rewrite`` keeps
+        # ceilings (it drops only floors), so whole-number tests survive.
+        num, den = expr.args[0].as_numer_denom()
+        if not (den.is_Integer and den > 0):
+            raise NotImplementedError(f"ceiling not implemented. expr: {expr}")
+        den = int(den)
+        value = self._print(num)
+        if isinstance(value, (int, float)):
+            return math.ceil(value / den)
+        lb, ub = self._affine_bounds(value)
+        var = self._model.new_int_var(
+            math.ceil(lb / den), math.ceil(ub / den), f"ceil_{self._count}"
+        )
+        self._count += 1
+        self._model.add(den * var >= value)
+        self._model.add(den * var <= value + den - 1)
+        return var
+
+    def _print_BooleanTrue(self, expr):
+        return True
+
+    def _print_BooleanFalse(self, expr):
+        return False
+
+    @memoize_method
+    def _print_ITE(self, expr):
+        # SymPy rewrites a Piecewise inside a condition (e.g. ``Eq(B, 1)`` with
+        # ``B`` a Piecewise) to ``ITE(c, t, e)``; lower it as
+        # ``(c & t) | (~c & e)``.
+        cond, then, other = (self._print_condition(arg) for arg in expr.args)
+        lits = [
+            self._conjunction([cond, then]),
+            self._conjunction([cond.Not(), other]),
+        ]
+        or_var = self._model.new_bool_var(f"ite_{self._count}")
         self._count += 1
         self._model.AddBoolOr(lits).OnlyEnforceIf(or_var)
         self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
