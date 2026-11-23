@@ -553,6 +553,187 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
         self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
 
+class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
+    """With an outer_stride, each trip of the directly enclosing loop reads its
+    own count at base + stride * i, as prefill reads one count per expert."""
+
+    EXPERTS = 8
+    STICK = 128
+
+    def _strided_loop(self, **overrides):
+        fields = {"outer_stride": self.STICK}
+        fields.update(overrides)
+        return self._device_read_loop(source=self._source(**fields))
+
+    def _run_ops(self, specs, n_ops, pool_size=None):
+        entries = [self._pool_entry(i) for i in range(n_ops)]
+        bundle, _kinds = self._run(specs, entries, pool_size or self.POOL_SIZE)
+        return bundle
+
+    def _in_experts(self, *body):
+        return LoopSpec(count=sympy.Integer(self.EXPERTS), body=list(body))
+
+    @staticmethod
+    def _depth(bundle, marker):
+        line = next(line for line in bundle.splitlines() if marker in line)
+        return len(line) - len(line.lstrip("\t"))
+
+    def _refuses(self, specs, fragment, n_ops=2, pool_size=None):
+        with self.assertRaises(Unsupported) as caught:
+            self._run_ops(specs, n_ops, pool_size)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_address_is_base_plus_stride_times_the_outer_variable(self):
+        bundle = self._run_ops([_op_spec(), self._in_experts(self._strided_loop())], 2)
+
+        for line in (
+            f"%cnt_off_1 = arith.constant {self.COUNT_OFFSET} : index",
+            "%cnt_base_1 = arith.addi %pool, %cnt_off_1 : index",
+            f"%cnt_step_1 = arith.constant {self.STICK} : index",
+            "%cnt_dx_1 = arith.muli %i_0, %cnt_step_1 : index",
+            "%cnt_addr_1 = arith.addi %cnt_base_1, %cnt_dx_1 : index",
+            "%n_1 = sdscbundle.load_value_at_address %cnt_addr_1 ",
+            "scf.for %i_1 = %c0 to %n_1 step %c1",
+        ):
+            self.assertIn(line, bundle)
+
+    def test_the_constants_sit_at_the_top_and_the_address_in_the_outer_body(self):
+        """The base and the step never change, so they are set up once; the
+        address uses the outer loop's variable, so it is computed inside it."""
+        bundle = self._run_ops([_op_spec(), self._in_experts(self._strided_loop())], 2)
+
+        outer_loop = "scf.for %i_0 = %c0 to %loop_bound_0 step %c1"
+        order = [
+            "%cnt_step_1 = arith.constant",
+            outer_loop,
+            "%cnt_dx_1 = arith.muli",
+            "%cnt_addr_1 = arith.addi",
+            "%n_1 = sdscbundle.load_value_at_address",
+            "scf.for %i_1",
+        ]
+        positions = [bundle.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions), bundle)
+        for marker in order[2:]:
+            self.assertEqual(
+                self._depth(bundle, marker), self._depth(bundle, outer_loop) + 1
+            )
+
+    def test_a_stride_of_zero_keeps_the_fixed_address(self):
+        """Decode: a stride of 0 is the same bundle as no stride at all."""
+        explicit = self._run_ops(
+            [_op_spec(), self._in_experts(self._strided_loop(outer_stride=0))], 2
+        )
+        default = self._run_ops(
+            [_op_spec(), self._in_experts(self._device_read_loop())], 2
+        )
+
+        self.assertEqual(explicit, default)
+        self.assertIn("%cnt_addr_1 = arith.addi %pool, %cnt_off_1 : index", explicit)
+        for absent in ("%cnt_base_", "%cnt_step_", "arith.muli"):
+            self.assertNotIn(absent, explicit)
+
+    def test_a_count_written_inside_the_outer_loop_is_addressed_after_it(self):
+        """The per-trip case: the address and the read follow the write in the
+        same trip, and an op after the outer loop is back at its level."""
+        loop = self._in_experts(_op_spec(), self._strided_loop())
+
+        bundle = self._run_ops([loop, _op_spec()], 3)
+
+        outer_loop = "scf.for %i_0 = %c0 to %loop_bound_0 step %c1"
+        order = [
+            outer_loop,
+            'sdsc_filename="sdsc_0.json"',
+            "%cnt_dx_1 = arith.muli %i_0",
+            "%cnt_addr_1 = arith.addi",
+            "%n_1 = sdscbundle.load_value_at_address",
+            "scf.for %i_1",
+            'sdsc_filename="sdsc_2.json"',
+        ]
+        positions = [bundle.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions), bundle)
+        inside = self._depth(bundle, outer_loop) + 1
+        for marker in order[1:-1]:
+            self.assertEqual(self._depth(bundle, marker), inside, marker)
+        self.assertEqual(self._depth(bundle, order[-1]), inside - 1)
+
+    def test_the_stride_uses_the_directly_enclosing_loop(self):
+        """Under a batch loop and an expert loop, the count moves per expert,
+        so the expert loop's variable is the one multiplied."""
+        batch = LoopSpec(
+            count=sympy.Integer(2), body=[self._in_experts(self._strided_loop())]
+        )
+
+        bundle = self._run_ops([_op_spec(), batch], 2)
+
+        self.assertIn("%cnt_dx_2 = arith.muli %i_1, %cnt_step_2 : index", bundle)
+        self.assertNotIn("arith.muli %i_0", bundle)
+
+    def test_two_moving_counts_keep_their_own_names_and_bases(self):
+        loop = self._in_experts(
+            self._strided_loop(),
+            self._strided_loop(pool_offset=self.COUNT_OFFSET * 2),
+        )
+
+        bundle = self._run_ops([_op_spec(), loop], 3)
+
+        for idx, offset in ((1, self.COUNT_OFFSET), (2, self.COUNT_OFFSET * 2)):
+            self.assertIn(f"%cnt_off_{idx} = arith.constant {offset} : index", bundle)
+            self.assertIn(f"%cnt_dx_{idx} = arith.muli %i_0, %cnt_step_{idx}", bundle)
+            self.assertIn(
+                f"%n_{idx} = sdscbundle.load_value_at_address %cnt_addr_{idx} ", bundle
+            )
+        defined = [
+            line.split("=", 1)[0].strip()
+            for line in bundle.splitlines()
+            if line.strip().startswith("%") and "=" in line
+        ]
+        self.assertEqual(len(defined), len(set(defined)), "a name is defined twice")
+
+    def test_the_last_count_may_end_exactly_at_the_pool_end(self):
+        pool_size = self.STICK * self.EXPERTS
+        loop = self._in_experts(self._strided_loop(pool_offset=0))
+
+        bundle = self._run_ops([_op_spec(), loop], 2, pool_size=pool_size)
+
+        self.assertIn("%cnt_dx_1 = arith.muli %i_0", bundle)
+
+    @expects_raise
+    def test_a_stride_that_is_not_a_whole_stick(self):
+        for stride in (100, -self.STICK):
+            with self.subTest(stride=stride):
+                loop = self._in_experts(self._strided_loop(outer_stride=stride))
+                self._refuses(
+                    [_op_spec(), loop],
+                    f"outer_stride={stride} is not a whole number of",
+                )
+
+    @expects_raise
+    def test_no_enclosing_loop_to_step_over(self):
+        self._refuses(
+            [_op_spec(), self._strided_loop()], "needs an enclosing loop to step over"
+        )
+
+    @expects_raise
+    def test_a_symbolic_enclosing_loop(self):
+        outer = LoopSpec(
+            count=FloorDiv(_sym(), TILE),
+            body=[self._strided_loop()],
+            count_symbol_bounds={SYM: (MAX, TILE)},
+        )
+        self._refuses([_op_spec(), outer], "only a concrete enclosing trip count")
+
+    @expects_raise
+    def test_a_last_count_one_byte_past_the_pool(self):
+        """The last of 8 counts ends at byte 1024; a 1023-byte pool is one short."""
+        end = self.STICK * self.EXPERTS
+        loop = self._in_experts(self._strided_loop(pool_offset=0))
+        self._refuses(
+            [_op_spec(), loop],
+            f"ends at byte {end}, past the {end - 1}-byte pool",
+            pool_size=end - 1,
+        )
+
+
 class TestADeviceReadCountSurvivesTheRealSerializer(unittest.TestCase):
     """The generated wrapper rebuilds the LoopSpecs from source before the
     bundle is written, so a count source the serializer drops never reaches it."""
@@ -594,6 +775,15 @@ class TestADeviceReadCountSurvivesTheRealSerializer(unittest.TestCase):
         self.assertNotIn("count_from_buffer", text)
         self.assertIsNone(reloaded.count_from_buffer)
 
+    def test_the_outer_stride_comes_back_intact(self):
+        source = CountSource(pool_offset=4096, max_value=16, outer_stride=128)
+        spec = LoopSpec(count=sympy.Integer(16), body=[], count_from_buffer=source)
+
+        (reloaded,), text = self._round_trip(spec)
+
+        self.assertIn("outer_stride=128", text)
+        self.assertEqual(reloaded.count_from_buffer, source)
+
 
 class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
     """The read and its address live in the bundle, not in any SDSC JSON, so
@@ -623,6 +813,13 @@ class TestTheCacheKeySeparatesADeviceReadCount(unittest.TestCase):
         self.assertNotEqual(
             self._key(CountSource(pool_offset=0, max_value=16)),
             self._key(CountSource(pool_offset=0, max_value=8)),
+        )
+
+    def test_two_outer_strides_do_not_share_an_entry(self):
+        """A fixed count and one that moves per trip are different bundles."""
+        self.assertNotEqual(
+            self._key(CountSource(pool_offset=0, max_value=16)),
+            self._key(CountSource(pool_offset=0, max_value=16, outer_stride=128)),
         )
 
     def test_the_same_source_does_share_one(self):
