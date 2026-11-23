@@ -89,6 +89,7 @@ from .loop_node import remove_op
 from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
+    compute_size1_restickify_target,
     concretize_expr,
     dense_relocation_serves_read,
     expand_sparse,
@@ -1301,7 +1302,18 @@ def _find_layout_avoiding_var_on_stick(
     2. Else return the first layout that can be restickified to move avoid_var
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
+
+    A layout whose stick is a constant (a padded size-1 stick) trivially
+    excludes avoid_var, but it is only accepted when no host coordinate
+    survives avoid_var. Otherwise the kernel reads such an indices layout
+    wrongly, so a real stick on a surviving coordinate is used instead.
     """
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
     constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
@@ -1311,18 +1323,17 @@ def _find_layout_avoiding_var_on_stick(
         if avoid_var not in stick_vars:
             if stick_vars:
                 return stl
-            constant_stick = stl
+            if not surviving_vars:
+                constant_stick = stl
 
     if constant_stick is not None:
         return constant_stick
 
-    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
-    surviving_vars = set()
-    for coord in arg_host_coords:
-        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
-            surviving_vars.update(coord.free_symbols)
-
     if not surviving_vars:
+        for stl in arg.layouts:
+            result = compute_size1_restickify_target(stl, arg.layout, arg.dep)
+            if result is not None:
+                return result
         raise Unsupported(
             f"{label}: no surviving coordinates after removing {avoid_var}"
         )

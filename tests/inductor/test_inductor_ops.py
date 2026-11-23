@@ -1301,7 +1301,11 @@ def _build_fp32_proxy_cpu_refs(
 # keep_by_index / mask_by_index cases, as (shape, k, dim, fill value). Each runs
 # in fp16 (plain names) and fp32 (names suffixed _fp32) - see _masking_ops_params.
 _MASKING_OPS_CASES = {
-    # Stick-aligned (every dim a multiple of 64).
+    # 1-D
+    "1d_aligned": ((64,), 8, 0, -1.0),
+    "1d_unaligned": ((67,), 8, 0, 0.0),
+    "1d_small": ((32,), 4, 0, -1.0),
+    # Stick-aligned
     "2d_aligned_dim0": ((64, 128), 8, 0, -1.0),
     "3d_aligned_dim0": ((64, 64, 128), 2, 0, 0.0),
     "4d_aligned_dim2": ((2, 4, 64, 64), 16, 2, -1.0),
@@ -1311,7 +1315,7 @@ _MASKING_OPS_CASES = {
     "3d_dim0": ((67, 71, 256), 2, 0, 0.0),
     "4d_dim0": ((6, 17, 7, 64), 2, 0, -1.0),
     "4d_dim2": ((6, 17, 64, 64), 16, 2, 0.0),
-    # Other fill values on one aligned and one unaligned shape.
+    # Other fill values
     "2d_aligned_dim0_fill_neginf": ((64, 128), 8, 0, float("-inf")),
     "2d_dim0_fill_neginf": ((67, 256), 8, 0, float("-inf")),
     "2d_aligned_dim0_fill_pos": ((64, 128), 8, 0, 5.0),
