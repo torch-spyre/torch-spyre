@@ -1499,7 +1499,7 @@ def build_op_split_space(
     return OpSplitSpace(
         op=op,
         context=context,
-        output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
+        output_axes=frozenset(a for a in axes if a in write.index.free_symbols),
         factor_domains={axis: context.factor_domain(axis) for axis in axes},
         tiling=tiling,
     )

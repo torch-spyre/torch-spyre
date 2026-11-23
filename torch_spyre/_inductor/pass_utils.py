@@ -2606,7 +2606,8 @@ def unrepresentable_splits_by_index_coeff(
     :func:`finalize_work_division_for_scheduler` (which must never see a
     non-empty result once those checks hold, and raises if it does).
     """
-    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
+    write_index_syms = write_index.free_symbols
+    reduction_syms = {sym for sym in it_space if sym not in write_index_syms}
     problems: list[str] = []
     for label, index, symbols in (
         ("output", write_index, [s for s in it_space if s not in reduction_syms]),
@@ -5138,11 +5139,11 @@ def completed_reduction_split_on_buf(
     ownership = getattr(op, "iteration_space_ownership", None)
     if prep is None or ownership is None:
         return None
+    write_index_syms = prep.write_index.free_symbols
     reduction_splits = [
         int(ownership.work_slices.get(sym, 1))
         for sym in prep.iter_space
-        if prep.write_index.coeff(sym) == 0
-        and int(ownership.work_slices.get(sym, 1)) > 1
+        if sym not in write_index_syms and int(ownership.work_slices.get(sym, 1)) > 1
     ]
     if len(reduction_splits) != 1 or prep.stick_host_stride is None:
         return None
