@@ -2008,14 +2008,16 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
-def _ref_arg(op_spec):
-    if op_spec.is_reduction:
-        # The reduced tensor, not the index tensor of a gather fused into it
-        # (index tensors lead the args).
-        return next(
-            (a for a in op_spec.args if not is_index_tensor(a, op_spec)),
-            op_spec.args[0],
-        )
+def _reduced_arg_index(op_spec) -> int:
+    """Position of the tensor a reduction reads its data from.
+
+    Index tensors of a gather fused into the reduction lead the args, so
+    ``args[0]`` is not always the reduced tensor.
+    """
+    return next(
+        (i for i, a in enumerate(op_spec.args) if not is_index_tensor(a, op_spec)),
+        0,
+    )
 
 
 def _merged_reduction_dim_order(op_spec, symbol_mapping):
@@ -2029,6 +2031,7 @@ def _merged_reduction_dim_order(op_spec, symbol_mapping):
     the per-operand dim orders instead, keeping the first non-None stick
     symbol seen.
 
+    A value tensor read through a fused gather contributes its index dims.
     Operands are visited in op_spec.args order. A dim shared by two operands
     is assumed to appear in the same relative order in both; if they
     disagree, the order from the first operand to mention it wins.
@@ -2036,7 +2039,9 @@ def _merged_reduction_dim_order(op_spec, symbol_mapping):
     merged_order: list[Symbol] = []
     merged_stick: Symbol | None = None
     for arg in op_spec.args:
-        order, stick = _get_device_dim_order(arg, symbol_mapping)
+        if is_index_tensor(arg, op_spec):
+            continue  # an index tensor's stick is its entry axis, not the data axis
+        order, stick = _get_device_dim_order(arg, symbol_mapping, op_spec)
         if merged_stick is None:
             merged_stick = stick
         for sym in order:
@@ -2468,7 +2473,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if op_spec.is_reduction:
         if (
-            not (is_matmul or is_pool or has_indirect_access)
+            not (is_matmul or is_pool)
             and not is_conv
             and not _is_topk(op_spec.op)
             and not _is_keep_by_index(op_spec.op)
@@ -2716,10 +2721,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [arg.dim_order for arg in args],
         )
     elif op_spec.is_reduction:
+        # The reduced tensor: padding to an index tensor's stick would run the
+        # iteration into its uninitialized padding lanes.
+        reduced = _reduced_arg_index(op_spec)
         pad_args, pad_sdsc_args, dim_order = (
-            [op_spec.args[0]],
-            [args[0]],
-            [args[0].dim_order],
+            [op_spec.args[reduced]],
+            [args[reduced]],
+            [args[reduced].dim_order],
         )
     elif is_restickify:
         # Pad iteration space using all args so both the old stick (input) and
@@ -2792,7 +2800,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
+        constants["samv-maskvalue"] = _get_mask_value(
+            op_spec.op,
+            args[
+                _reduced_arg_index(op_spec) if op_spec.is_reduction else 0
+            ].data_format,
+        )
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output
