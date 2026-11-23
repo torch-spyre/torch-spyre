@@ -1165,6 +1165,17 @@ def _emit_specs(
             )
             bound = level.bound if level is not None else f"%loop_bound_{lb_idx}"
             step = level.step if level is not None else "%c1"
+            if level is not None and level.outer_stride:
+                # base + outer_stride * the directly enclosing loop's variable;
+                # generate_bundle has checked that such a loop exists.
+                f.write(
+                    f"{tab}%cnt_dx_{lb_idx} = arith.muli {loop_vars[-1]}, "
+                    f"%cnt_step_{lb_idx} : index\n"
+                )
+                f.write(
+                    f"{tab}%cnt_addr_{lb_idx} = arith.addi %cnt_base_{lb_idx}, "
+                    f"%cnt_dx_{lb_idx} : index\n"
+                )
             for line in level.pre_loop if level is not None else ():
                 f.write(f"{tab}{line}\n")
             f.write(f"{tab}scf.for {loop_var} = %c0 to {bound} step {step} {{\n")
