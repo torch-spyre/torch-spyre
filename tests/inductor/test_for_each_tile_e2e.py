@@ -2618,6 +2618,40 @@ class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
                 out=dest,
             )
 
+    @expects_raise
+    def test_out_dim_int_is_rejected(self):
+        """``out_dim=int`` with ``out=`` is refused at lowering, not miscompiled.
+
+        Its write position is the step counter, a carry the indirect-access path
+        cannot index by. TODO: lower that write as a tile-advancing write (the
+        counter equals the loop variable); this test then becomes value checks for
+        ``out_dim=0`` and ``out_dim=1``.
+        """
+        from torch._inductor.exc import InductorError
+
+        def split(out_dim):
+            def fn(x, y, dest):
+                def body(_, ops):
+                    a, b = ops
+                    return None, a @ b
+
+                dims = (0, None) if out_dim == 0 else (None, 1)
+                for_each_tile(
+                    body, (x, y), dims=dims, tile_size=64, out_dim=out_dim, out=dest
+                )
+
+            return fn
+
+        x = cached_xavier((128, 256)).to(DEVICE_NAME)
+        y = cached_xavier((256, 128), differentiation=1).to(DEVICE_NAME)
+        for out_dim in (0, 1):
+            with self.subTest(out_dim=out_dim):
+                dest = torch.zeros(128, 128, dtype=torch.float16).to(DEVICE_NAME)
+                with self.assertRaisesRegex(
+                    InductorError, r"out_dim=int\) is not supported on Spyre"
+                ):
+                    self._run(split(out_dim), x, y, dest)
+
     def test_gather_rows_into_caller_pool(self):
         """KV-cache-style write into a pool uploaded with the default layout.
 

@@ -96,7 +96,7 @@ def for_each_tile(
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Tiles may be a tensor or a pytree of
-            tensors. ``None`` means the body emits no tile. With ``out``,
+            tensors. ``None`` means the body emits no tile. With ``out``, also
             ``Gather(axis, index)``: step ``i``'s tile is written at the rows
             ``index[i]`` names along ``axis``.
         out: the caller's destination for the output tiles, written in place and
@@ -234,8 +234,9 @@ strides are not divisible by the tile count.
 ### Writing into a caller-owned output (`out=`)
 
 With `out=`, the caller passes the tensor the output tiles must end up in, and
-every step scatters its tile into it in place. No stacked per-step output is
-materialized. The call returns `out` itself.
+every step writes its tile into it in place. No stacked per-step output is
+materialized, and neither is the full-output fold copy that `out_dim != 0`
+otherwise costs. The call returns `out` itself.
 
 ```python
 with torch.inference_mode():
@@ -243,7 +244,12 @@ with torch.inference_mode():
     for_each_tile(
         body, (values,), dims=0, tile_size=1, out_dim=Gather(0, slots), out=kv_pool
     )
+    # Tile i lands at dest[64*i : 64*(i+1)]; not yet on Spyre, see below.
+    for_each_tile(body, (x, w), dims=(0, None), tile_size=64, out_dim=0, out=dest)
 ```
+
+- `out_dim=d` (an `int`): step `i`'s tile lands at `narrow(d, i*extent, extent)`
+  of every `out` leaf, which must be `trips * extent` long along `d`.
 
 - `out_dim=Gather(axis, index)`: step `i`'s tile lands at the rows `index[i]`
   names along `axis`. `index` is `[trips]` (one row per step) or
@@ -256,8 +262,6 @@ with torch.inference_mode():
   `[trips, rows]` with `rows` a multiple of 32.
 - `out` leaves match the body's output tiles in flattened order, with the same
   dtype and the tile's shape on every other axis.
-- An `int` `out_dim` is not supported with `out=` yet and raises
-  `NotImplementedError`; leave `out=None` to get the output returned.
 
 The destination is written through `scan`'s input mutation: it reaches the loop
 as an additional input that the body updates with `index_copy_`, and the splice
@@ -272,7 +276,14 @@ binds that write to the caller's buffer. Hence:
   A decomposition returns its result, or carries the destination and updates it
   with a functional `index_copy`.
 
-On Spyre, keep the destination in a layout with the indexed dimension
+On Spyre:
+
+- `out_dim=d` (an `int`) is not supported yet, and raises `Unsupported` when the
+  loop is lowered: the write position is the step counter, a carry the
+  indirect-access path cannot index by. Leave `out=None`, or pass a `Gather`
+  index table.
+
+For a `Gather` on Spyre, keep the destination in a layout with the indexed dimension
 outermost, such as the "indirect access" layout `torch_spyre.model_utils` gives
 an embedding table. Otherwise `reorder_nonstick_dims_mutation` copies the whole
 destination in and out around every trip's write (see
