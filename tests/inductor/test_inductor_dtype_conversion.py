@@ -865,14 +865,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the eager .half() of is also wrong though the compiled .half() of "
-            "the same tensor is right, see eager.py spyre__copy_from()."
-        ),
-    )
     def test_float_half_methods_on_spyre_tensor(self):
         """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)

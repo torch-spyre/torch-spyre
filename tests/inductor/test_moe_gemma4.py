@@ -48,7 +48,6 @@ import sys
 import pytest
 import regex as re
 import torch
-from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -267,11 +266,6 @@ INDEX_ADD_DUPLICATES = _xfail(
 )
 # At T=1 the routing flatten succeeds and the grouped path stops at the stable sort.
 SORT_AT_DECODE = dict(decode_eager=STABLE_SORT, decode_compiled=STABLE_SORT)
-BACKEND_ERROR = _xfail(
-    (InductorError, BackendCompilerFailed),
-    "Deeptools #4988: dbo-opt fails compile for some shapes to shuffle op",
-    "Cannot find a valid minimum value for data stage",
-)
 INDIRECT_RESTICKIFY_ARGS = _xfail(
     InductorError,
     "restickify of an indirect store keeps its index arg in op_spec",
@@ -1117,7 +1111,12 @@ def test_G4_GM_003_grouped_mm_expert_ffn(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=BACKEND_ERROR,
+        eager=_xfail(
+            NotImplementedError,
+            "#692: aten::_index_put_impl_ has no Spyre kernel",
+            "aten::_index_put_impl_",
+        ),
+        decode_eager=TOPK_STAGGERED_INPUT,
         compiled=INDIRECT_RESTICKIFY_ARGS,
         decode_compiled=SCATTER_IA_RETILE,
     ),

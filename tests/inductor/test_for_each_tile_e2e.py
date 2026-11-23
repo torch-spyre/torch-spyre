@@ -58,7 +58,6 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
-from torch._dynamo.exc import BackendCompilerFailed
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
@@ -171,8 +170,6 @@ from utils_inductor import (
     expects_raise,
     opspec_summaries,
 )
-
-_BACKEND_ERROR = "Cannot find a valid minimum value for data stage"
 
 
 def _with_dynamo_reset(test_fn):
@@ -842,17 +839,6 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     def test_upcast_add_downcast_in_body(self):
         self._check_upcast_add_tiled(downcast_in_body=True)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=BackendCompilerFailed,
-        reason=(
-            f"Fails with backend compiler error '{_BACKEND_ERROR}'. "
-            "Additionally, for_each_tile fails to preserve input EA tag in "
-            "identity op. The output is incorrectly tagged STANDARD (default) "
-            "when data is staggered it causes EA DCI to incorrectly apply / "
-            "restore EA. See issue #6462."
-        ),
-    )
     def test_upcast_add_in_body_downcast_after_loop(self):
         self._check_upcast_add_tiled(downcast_in_body=False)
 
@@ -1546,7 +1532,6 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     """
 
     def test_substick_indirect_advance_is_refused(self):
-        import pytest
         from torch._inductor.exc import InductorError
 
         ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)

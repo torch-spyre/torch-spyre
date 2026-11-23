@@ -50,7 +50,6 @@ from utils_inductor import (
     cached_randn,
     expects_raise,
     shapes2key,
-    strict_xfail,
 )
 
 EA = ElementArrangement
@@ -1427,7 +1426,6 @@ def test_ea_staggered_device_storage_offset():
 _WHOLE_STICK_PAIRS = "requires whole stick pairs"
 _RESCALE_REJECTION = "cannot rescale device layout"
 _NOT_DIVISIBLE = "cannot be divided safely"
-_BACKEND_ERROR = "Cannot find a valid minimum value for data stage"
 
 
 class TestEAShuffle:
@@ -1462,25 +1460,17 @@ class TestEAShuffle:
     # fp16 -> fp32 (DL16_TO_FP32) also pads an odd number of fp32 sticks to a whole
     # pair. fp32 -> fp16 (FP32_TO_DL16) only accepts an even number of 32-element
     # fp32 sticks (rescale_stl_for_dtype), so these are left out of it.
-    _DL16_TO_FP32_SHAPES = _STICK_ALIGNED_SHAPES + [(68,), (4, 69), (4, 96), (4, 160)]
+    _DL16_TO_FP32_SHAPES = _STICK_ALIGNED_SHAPES + [
+        (68,),
+        (4, 69),
+        (4, 96),
+        (4, 160),
+        (64, 192),
+        (64, 448),
+        (2, 128256),
+        (64, 151936),
+    ]
     _FP32_TO_DL16_SHAPES = _STICK_ALIGNED_SHAPES
-
-    # Shapes that fail due to stick-pair unaligned at the stick level.
-    # PR 5048 added padding support for single-core or small-row cases where
-    # shapes can be padded to an even number of stick pairs (e.g., 1x192, 4x192).
-    # However, multi-stick shapes like 4x160 (5 sticks) remain unsupported.
-    # See deeptools issue #4988.
-    _STICK_PAIR_UNALIGNED_SHAPES = [(4, 160)]
-
-    # Shapes that fail due to LX-HBM memory split planning in the LX planner.
-    # The shuffle kernel's input and output are placed in different memories
-    # (one in LX, one in HBM), causing dbo-opt to fail. With LX_PLANNING=0,
-    # these compile successfully. See deeptools issue #4988.
-    _LX_HBM_SPLIT_SHAPES = [(64, 192), (2, 128256), (64, 151936)]
-
-    _BACKEND_FAILURES = dict.fromkeys(
-        _STICK_PAIR_UNALIGNED_SHAPES + _LX_HBM_SPLIT_SHAPES, _BACKEND_ERROR
-    )
 
     # Shapes the compiler rejects today, with a fragment of the error. They are
     # left out of the shuffle cases on the device and checked by
@@ -1488,7 +1478,6 @@ class TestEAShuffle:
     _DL16_TO_FP32_REJECTED = {
         # fewer than a whole pair of 32-element fp32 sticks
         **dict.fromkeys([(2,), (32,), (4, 16), (4, 32)], _WHOLE_STICK_PAIRS),
-        **dict.fromkeys(_STICK_PAIR_UNALIGNED_SHAPES, _BACKEND_ERROR),
     }
     _FP32_TO_DL16_REJECTED: dict[tuple[int, ...], str] = {}
     _DIRECTIONS = [
@@ -1562,7 +1551,7 @@ class TestEAShuffle:
         (4, 448),
         (64, 448),
     ]
-    _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS, **_BACKEND_FAILURES}
+    _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS}
 
     _FP16 = pytest.mark.parametrize(
         "fp16",
@@ -1625,18 +1614,6 @@ class TestEAShuffle:
     @pytest.mark.parametrize("program", list(MIXED_EA_PROGRAMS))
     def test_mixed_ea_pointwise(self, request, program, shape, fp16):
         """A pointwise op on a staggered and a STANDARD operand matches the CPU."""
-        # flip_then_shuffle_back on 1x192 and 4x192 fails with BackendCompilerFailed.
-        # Although PR 5048 added padding for simple shuffles on these shapes,
-        # flip_then_shuffle_back performs multiple nested/bidirectional shuffles.
-        # This complex shuffle sequence on a narrow padded width fails the backend compiler's
-        # stage validation. See deeptools issue #4988.
-        if program == "flip_then_shuffle_back" and shape in [(1, 192), (4, 192)]:
-            strict_xfail(
-                request,
-                raises=(InductorError, BackendCompilerFailed),
-                reason="flip_then_shuffle_back fails with backend compiler error"
-                " due to complex nested shuffles on narrow stick-padded shapes",
-            )
         self._check(self.MIXED_EA_PROGRAMS[program], shape, fp16, reset_dynamo=True)
 
     @expects_raise
