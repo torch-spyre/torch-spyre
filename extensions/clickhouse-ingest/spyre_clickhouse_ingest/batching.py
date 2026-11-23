@@ -60,6 +60,14 @@ class BatchFailed(RuntimeError):
         self.landed = landed
 
 
+class BatchParked(BatchFailed):
+    """Rows were parked in the spool, not stored: `landed` are stored, `parked` are held."""
+
+    def __init__(self, message: str, landed: int, parked: int):
+        super().__init__(message, landed)
+        self.parked = parked
+
+
 class BatchAmbiguous(BatchFailed):
     """A batch failed but may have been stored; resending could duplicate it."""
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import copy
+from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -37,7 +38,11 @@ from . import config
 from .constants import MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
+from .errors import Unsupported
+from .loop_facts import enclosing_loops, read_advance
+from .loop_info import LoopInfo
+from .pass_utils import copy_op_metadata
+from .loop_node import record_loop_info, remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -48,6 +53,29 @@ from .pass_utils import (
     per_core_views_equal,
     replace_computed_buffer_body,
 )
+
+
+@dataclass(frozen=True)
+class ReadCopyElisionRecord:
+    """Direct-read form saved while a consumer is redirected through a copy.
+
+    Coarse tiling keeps the copy authoritative until layout selection, work
+    division, and LX planning finish.  A later pass may restore
+    ``direct_inner_fn`` only when the final physical plan proves that reading
+    ``source_name`` directly is equivalent.  The record is deliberately not
+    copied by :func:`copy_op_metadata`: rebuilding the consumer body
+    invalidates the saved direct form unless that pass explicitly recreates
+    the record.
+    """
+
+    consumer_name: str
+    copy_name: str
+    source_name: str
+    direct_inner_fn: object
+    # Intermediate copies that become dead only if the deferred proposal is
+    # accepted, ordered from the replacement consumer back toward the source.
+    orphaned_copy_names: tuple[str, ...] = ()
+
 
 logger = get_inductor_logger("read_copy_elision")
 
@@ -123,71 +151,32 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _loop_advance_bound(
-    op: ComputedBuffer,
-    dep: MemoryDep,
-    loop_info: CoarseTileInfo,
-    dep_idx: int,
-) -> tuple[int, int] | None:
-    """Inclusive address change across loop trips, in source elements."""
-    if dep_idx >= len(loop_info.tiled_dims_per_read):
-        return None
-    tiled = loop_info.tiled_dims_per_read[dep_idx]
-    squeezed = (
-        loop_info.squeezed_advance_per_read[dep_idx]
-        if dep_idx < len(loop_info.squeezed_advance_per_read)
-        else []
-    )
-    if not any(tiled) and not any(squeezed):
-        return None
+def _loop_advance_bound(op: ComputedBuffer, dep: MemoryDep) -> tuple[int, int] | None:
+    """Inclusive address change across loop trips, in source elements.
 
-    ranges = list(getattr(op.data, "ranges", None) or [])
-    reduction_ranges = list(getattr(op.data, "reduction_ranges", None) or [])
-    raw_to_symbol: dict[int, sympy.Symbol] = {}
-    squeezed_idx = 0
-    for raw_idx, extent in enumerate(ranges):
-        if _static_int(extent) != 1:
-            if squeezed_idx >= len(dep.var_names):
-                return None
-            raw_to_symbol[raw_idx] = dep.var_names[squeezed_idx]
-            squeezed_idx += 1
-    for red_idx, extent in enumerate(reduction_ranges):
-        if _static_int(extent) != 1:
-            if squeezed_idx >= len(dep.var_names):
-                return None
-            raw_to_symbol[len(ranges) + red_idx] = dep.var_names[squeezed_idx]
-            squeezed_idx += 1
-
+    The step per trip at each level is the loop variable's coefficient in
+    ``dep.index`` (``loop_facts.read_advance``); ``None`` when no level moves, when
+    a step is not a number, or when the index uses the variable in a way that has no
+    single step.
+    """
+    try:
+        steps = read_advance(op, dep)
+    except Unsupported:
+        # No single step (a non-affine use of the loop variable): decline. A
+        # RuntimeError (the loop checker, or an op that lists the wrong number of
+        # loop variables) is a compiler bug and is not swallowed.
+        return None
+    if not any(step != 0 for step in steps):
+        return None
     lo = 0
     hi = 0
-    for level_idx, trip_expr in enumerate(loop_info.loop_count):
-        trip_count = _trip_count_bound(trip_expr)
+    for level_idx, level in enumerate(enclosing_loops(op)):
+        trip_count = _trip_count_bound(level.trip_count)
         if trip_count is None or trip_count < 1:
             return None
-        dim_pairs = tiled[level_idx] if level_idx < len(tiled) else []
-        zero_subs = {symbol: sympy.Integer(0) for symbol in dep.index.free_symbols}
-        step_expr = sympy.Integer(0)
-        for raw_dim, extent_expr in dim_pairs:
-            symbol = raw_to_symbol.get(raw_dim)
-            extent = _static_int(extent_expr)
-            if symbol is None or extent is None:
-                return None
-            level_subs = dict(zero_subs)
-            level_subs[symbol] = sympy.Integer(extent)
-            step_expr += sympy.expand(dep.index.xreplace(level_subs))
-            step_expr -= sympy.expand(dep.index.xreplace(zero_subs))
-        pairs = squeezed[level_idx] if level_idx < len(squeezed) else []
-        step = 0
-        for stride_expr, extent_expr in pairs:
-            stride = _static_int(stride_expr)
-            extent = _static_int(extent_expr)
-            if stride is None or extent is None:
-                return None
-            step += stride * extent
-        tiled_step = _static_int(step_expr)
-        if tiled_step is None:
+        step = _static_int(steps[level_idx]) if level_idx < len(steps) else 0
+        if step is None:
             return None
-        step += tiled_step
         delta = step * (trip_count - 1)
         lo += min(0, delta)
         hi += max(0, delta)
@@ -314,7 +303,6 @@ def _prove_matmul_direct_read(
     if output_dep is None or len(direct_source_deps) != 1:
         return None, "direct source dependency is ambiguous"
     source_dep = direct_source_deps[0]
-    direct_source_idx = direct_reads.index(source_dep)
 
     if is_matmul:
         if len(direct_reads) != 2:
@@ -344,64 +332,18 @@ def _prove_matmul_direct_read(
     copy_source_indices = [
         idx for idx, dep in enumerate(copy_reads) if dep.name == record.source_name
     ]
-    copy_loop_info = getattr(copy_op, "loop_info", None)
     current_loop_info = getattr(consumer, "loop_info", None)
-    if len(copy_source_indices) > 1 or not isinstance(
-        current_loop_info, CoarseTileInfo
-    ):
-        return None, "copy has no complete loop-address record"
-    recorded_tiled = record.direct_tiled_dims_per_level
-    recorded_squeezed = record.direct_squeezed_advance_per_level
-    has_recorded_address = recorded_tiled is not None and recorded_squeezed is not None
-    if not has_recorded_address and (
-        len(copy_source_indices) != 1 or not isinstance(copy_loop_info, CoarseTileInfo)
-    ):
-        return None, "copy has no complete loop-address record"
-    copy_source_idx = copy_source_indices[0] if copy_source_indices else None
+    # A strict LoopInfo (made by the loop-tiling lowering) is declined on purpose: it
+    # has no saved direct form, so its copy stays.
     if (
-        isinstance(copy_loop_info, CoarseTileInfo)
-        and copy_source_idx is not None
-        and copy_source_idx >= len(copy_loop_info.tiled_dims_per_read)
+        len(copy_source_indices) > 1
+        or not isinstance(current_loop_info, LoopInfo)
+        or current_loop_info.strict_loop_vars
     ):
-        return None, "copy has no tiled-dimension record for its source"
-
-    tiled_dims = [
-        [list(level) for level in per_read]
-        for per_read in current_loop_info.tiled_dims_per_read
-    ]
-    squeezed = [
-        [list(level) for level in per_read]
-        for per_read in current_loop_info.squeezed_advance_per_read
-    ]
-    if direct_source_idx >= len(tiled_dims):
-        return None, "direct-read metadata does not match its dependencies"
-    squeezed.extend([] for _ in range(len(direct_reads) - len(squeezed)))
-    if recorded_tiled is None or recorded_squeezed is None:
-        assert isinstance(copy_loop_info, CoarseTileInfo)
-        assert copy_source_idx is not None
-        recorded_tiled = tuple(
-            tuple(tuple(pair) for pair in level)
-            for level in copy_loop_info.tiled_dims_per_read[copy_source_idx]
-        )
-        copy_squeezed = (
-            copy_loop_info.squeezed_advance_per_read[copy_source_idx]
-            if copy_source_idx < len(copy_loop_info.squeezed_advance_per_read)
-            else []
-        )
-        recorded_squeezed = tuple(
-            tuple(tuple(pair) for pair in level) for level in copy_squeezed
-        )
-    tiled_dims[direct_source_idx] = [
-        [tuple(pair) for pair in level] for level in recorded_tiled
-    ]
-    squeezed[direct_source_idx] = [
-        [tuple(pair) for pair in level] for level in recorded_squeezed
-    ]
-    resolved_loop_info = dataclasses.replace(
-        current_loop_info,
-        tiled_dims_per_read=tiled_dims,
-        squeezed_advance_per_read=squeezed,
-    )
+        return None, "copy reads its source more than once, or consumer is not looped"
+    # The direct read keeps the staged copy's loop term in its index (the consumer
+    # lists the loop variable in its dim_hints), so its advance is read from there.
+    resolved_loop_info = dataclasses.replace(current_loop_info)
     direct_op.loop_info = resolved_loop_info  # type: ignore[attr-defined]
 
     source = _unwrap_buffer(V.graph.get_buffer(record.source_name))
@@ -442,47 +384,7 @@ def _prove_matmul_direct_read(
             return None, "source stick dimension is not the matmul output dimension"
 
     local_bounds = _affine_bounds(source_dep)
-    advance_bounds = _loop_advance_bound(
-        direct_op, source_dep, resolved_loop_info, direct_source_idx
-    )
-    if (
-        advance_bounds is None
-        and isinstance(copy_loop_info, CoarseTileInfo)
-        and copy_source_idx is not None
-        and (
-            record.direct_tiled_dims_per_level is not None
-            or record.direct_squeezed_advance_per_level is not None
-        )
-    ):
-        # Rebasing a spliced-loop source removes the induction variable from
-        # its load index.  Usually the recorded pre-rebase metadata still
-        # describes the step.  A size-one tiled dimension can already have
-        # been squeezed out, however, leaving that metadata unable to recover
-        # the source stride (for example, one expert per loop trip).  The
-        # staging copy was built before that information was lost and carries
-        # the authoritative equivalent advance; use it as a proof/codegen
-        # fallback rather than declining an otherwise safe direct read.
-        tiled_dims[direct_source_idx] = [
-            list(level) for level in copy_loop_info.tiled_dims_per_read[copy_source_idx]
-        ]
-        copy_squeezed = (
-            copy_loop_info.squeezed_advance_per_read[copy_source_idx]
-            if copy_source_idx < len(copy_loop_info.squeezed_advance_per_read)
-            else []
-        )
-        squeezed[direct_source_idx] = [list(level) for level in copy_squeezed]
-        fallback_loop_info = dataclasses.replace(
-            current_loop_info,
-            tiled_dims_per_read=tiled_dims,
-            squeezed_advance_per_read=squeezed,
-        )
-        fallback_bounds = _loop_advance_bound(
-            direct_op, source_dep, fallback_loop_info, direct_source_idx
-        )
-        if fallback_bounds is not None:
-            resolved_loop_info = fallback_loop_info
-            direct_op.loop_info = resolved_loop_info  # type: ignore[attr-defined]
-            advance_bounds = fallback_bounds
+    advance_bounds = _loop_advance_bound(direct_op, source_dep)
     # A non-contiguous graph-input view can address a larger backing span than
     # its logical numel (for example, an active KV-cache prefix whose head
     # stride still reflects the maximum cache length).  Bound the generated
@@ -490,13 +392,10 @@ def _prove_matmul_direct_read(
     # rather than rejecting valid addresses in its inter-head gaps.
     source_numel = _static_int(source_layout.storage_size())
     logger.debug(
-        "direct-read bounds for %s <- %s: source_dep=%s tiled=%s "
-        "squeezed=%s local=%s advance=%s numel=%s",
+        "direct-read bounds for %s <- %s: source_dep=%s local=%s advance=%s numel=%s",
         consumer.get_name(),
         record.source_name,
         source_dep,
-        resolved_loop_info.tiled_dims_per_read[direct_source_idx],
-        resolved_loop_info.squeezed_advance_per_read[direct_source_idx],
         local_bounds,
         advance_bounds,
         source_numel,
@@ -658,6 +557,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             reason="read advancing input directly from HBM",
         )
         replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
+        record_loop_info(replacement)
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):
             if hasattr(direct_op, attr):
                 setattr(replacement, attr, getattr(direct_op, attr))
@@ -665,7 +565,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             del replacement._read_copy_elision_record  # type: ignore[attr-defined]
         V.graph.name_to_buffer[replacement.get_name()] = replacement
         graph.removed_buffers.add(copy_op.get_name())
-        operations.remove(copy_op)
+        remove_op(operations, copy_op)
         for orphan_name in record.orphaned_copy_names:
             orphan = next(
                 (
@@ -681,7 +581,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 and not _copy_readers(operations, orphan_name)
             ):
                 graph.removed_buffers.add(orphan_name)
-                operations.remove(orphan)
+                remove_op(operations, orphan)
         logger.info(
             "removed read copy %s; %s reads %s directly",
             copy_op.get_name(),

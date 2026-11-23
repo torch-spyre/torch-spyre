@@ -1,0 +1,38 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/kernel/system-op-library.json",
+ "title": "kernel/op-library",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "library": {
+   "enum": [
+    "torch-spyre",
+    "torch-cpu"
+   ]
+  },
+  "precision": {
+   "enum": [
+    "fp32",
+    "bf16",
+    "fp16",
+    "fp8"
+   ]
+  },
+  "harness": {
+   "enum": [
+    "harness-a",
+    "pytorch-benchmark"
+   ]
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "library",
+  "precision",
+  "harness"
+ ]
+}

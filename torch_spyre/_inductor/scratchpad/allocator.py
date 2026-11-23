@@ -147,12 +147,13 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
-from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
-from torch_spyre._inductor.loop_info import (
-    COUNTED_LOOP_INFO,
-    LoopCarryRecord,
-    ReadCopyElisionRecord,
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
 )
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -345,7 +346,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), COUNTED_LOOP_INFO)
+    return is_looped(op)
 
 
 def _sibling_pinned_divisions(
@@ -373,7 +374,7 @@ def _sibling_pinned_divisions(
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
-    ``CoarseTileInfo.loop_count`` is one entry per nesting level, outermost
+    ``LoopInfo.loop_count`` is one entry per nesting level, outermost
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
@@ -701,7 +702,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     hoisted pre-loop input clone are neither loop members nor carries: a
     surviving ``loop_info`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
-    advance in codegen (``_general_tile_advance``), and the records would
+    advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
     clone keeps today's metadata-copy behavior.
@@ -3228,14 +3229,14 @@ def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> Non
         chosen = getattr(buf, "chosen_division", None)
         cd = divisions[chosen] if chosen is not None and divisions else None
         op = op_by_name.get(buf.name)
-        info = getattr(op, "loop_info", None)
-        group = getattr(info, "loop_group_id", None)
+        loops = enclosing_loops(op) if op is not None else ()
+        group = loops[-1].group_path if loops else None
         logger.debug(
             "solver_out: %s group=%s loop=%s div=%s tiling=%s lx=%s "
             "size=%s committed=%s",
             buf.name,
             group if group is not None else "-",
-            getattr(info, "loop_count", "-"),
+            [level.trip_count for level in loops] if loops else "-",
             cd.label if cd is not None else "-",
             cd.tiling.label if cd is not None else "-",
             buf.address,
@@ -4243,7 +4244,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
-        if getattr(op, "loop_info", None) is not None:
+        if is_looped(op):
             return untiled
         if op.get_operation_name() in getattr(self, "_prescribed_ops", ()):
             return untiled

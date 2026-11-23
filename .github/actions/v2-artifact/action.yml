@@ -4,8 +4,8 @@ description: >
   is one, else the identity registration derives, recorded and tagged
   (`python -m spyre_clickhouse_ingest artifacts ensure`). Specs: image:, rpm:, wheel:,
   generic:, gha:<id>|<base>|<installed>;component=<c>, id:<id> or a bare artifact_id. A failure
-  is reported as an error annotation and leaves the outputs empty; it fails the job only with
-  `strict: true`.
+  is reported as an error annotation and leaves the outputs empty; the job fails unless
+  `strict: 'false'`.
 
 inputs:
   artifact:
@@ -67,27 +67,46 @@ inputs:
     required: false
     default: 'false'
   strict:
-    description: Fail the job when the artifact cannot be resolved or recorded.
+    description: >
+      'true' (default): fail the job when the artifact cannot be resolved or recorded; 'false'
+      keeps an error annotation and empty outputs. An unset host skips either way; a set host
+      with no login fails.
     required: false
-    default: 'false'
+    default: 'true'
   clickhouse-host:
-    description: ClickHouse host; empty = resolve only (dry-run) or skip.
+    description: Deprecated, used when clickhouse-v2-host is empty (host and port resolve together).
     required: false
     default: ''
   clickhouse-port:
-    description: ClickHouse port.
+    description: Deprecated, see clickhouse-host. Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-user:
-    description: ClickHouse user.
+    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together). Never used once clickhouse-v2-host is set.
     required: false
     default: ''
   clickhouse-pass:
-    description: ClickHouse password.
+    description: Deprecated, see clickhouse-user. Never used once clickhouse-v2-host is set.
+    required: false
+    default: ''
+  clickhouse-v2-host:
+    description: ClickHouse endpoint serving spyre_v2. Empty (with clickhouse-host also empty) = resolve only (dry-run) or skip.
+    required: false
+    default: ''
+  clickhouse-v2-port:
+    description: Port of clickhouse-v2-host (default 443 inside the library).
+    required: false
+    default: ''
+  clickhouse-v2-user:
+    description: Scoped v2 writer login; required once a host is set (the deprecated clickhouse-user is never sent to a v2 host).
+    required: false
+    default: ''
+  clickhouse-v2-pass:
+    description: Password for clickhouse-v2-user.
     required: false
     default: ''
   clickhouse-db-v2:
-    description: The spyre_v2 database.
+    description: The v2 database every statement is written to (default spyre_v2).
     required: false
     default: ''
   registry-username:
@@ -171,11 +190,15 @@ runs:
         RUN_URL: ${{ inputs.run-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
         DRY_RUN: ${{ inputs.dry-run }}
         STRICT: ${{ inputs.strict }}
-        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
-        CLICKHOUSE_PORT: ${{ inputs.clickhouse-port }}
-        CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
-        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
-        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}
+        CH_V2_HOST_IN: ${{ inputs.clickhouse-v2-host }}
+        CH_V2_PORT_IN: ${{ inputs.clickhouse-v2-port }}
+        CH_V2_USER_IN: ${{ inputs.clickhouse-v2-user }}
+        CH_V2_PASS_IN: ${{ inputs.clickhouse-v2-pass }}
+        CH_OLD_HOST_IN: ${{ inputs.clickhouse-host }}
+        CH_OLD_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_OLD_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_OLD_PASS_IN: ${{ inputs.clickhouse-pass }}
+        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 || 'spyre_v2' }}
         ICR_USERNAME: ${{ inputs.registry-username }}
         ICR_PASSWORD: ${{ inputs.registry-password }}
         ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
@@ -183,12 +206,29 @@ runs:
       run: |
         set -uo pipefail
         cmd=ensure
+        # Host and login resolve as one unit: a v2 host never receives the deprecated login.
+        if [ -n "${CH_V2_HOST_IN}" ]; then
+          CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}" CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"
+        else
+          CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"
+          if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        fi
+        # Override anything the caller's job env carries: the routing is decided by the inputs alone.
+        export CLICKHOUSE_HOST="${CH_HOST_IN}" CLICKHOUSE_V2_HOST="${CH_HOST_IN}"
+        export CLICKHOUSE_USER="${CH_USER_IN}" CLICKHOUSE_V2_USER="${CH_USER_IN}"
+        export CLICKHOUSE_PASS="${CH_PASS_IN}" CLICKHOUSE_V2_PASSWORD="${CH_PASS_IN}"
+        unset CLICKHOUSE_PORT CLICKHOUSE_V2_PORT
+        [ -z "${CH_PORT_IN}" ] || export CLICKHOUSE_PORT="${CH_PORT_IN}" CLICKHOUSE_V2_PORT="${CH_PORT_IN}"
         if [ -z "${CLICKHOUSE_HOST}" ]; then
           if [ "${DRY_RUN}" != "true" ]; then
             echo "::notice title=v2 artifact::no clickhouse-host; ${ARTIFACT} not recorded."
             exit 0
           fi
           cmd=resolve LOOKUP=off
+        fi
+        if [ "${cmd}" = ensure ] && { [ -z "${CLICKHOUSE_USER}" ] || [ -z "${CLICKHOUSE_PASS}" ]; }; then
+          echo "::error title=v2 artifact::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass (a v2 host never gets the deprecated login)"
+          exit 1
         fi
         export CLICKHOUSE_DB="${CLICKHOUSE_DB_V2}"
         args=(--artifact "${ARTIFACT}" --arch "${ARCH}" --lookup "${LOOKUP}"
@@ -200,8 +240,9 @@ runs:
           local v
           while IFS= read -r v; do
             v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
-            [ -n "${v}" ] && args+=("$1" "${v}")
+            if [ -n "${v}" ]; then args+=("$1" "${v}"); fi
           done <<< "$2"
+          return 0
         }
         repeat --tag "${TAGS}"
         repeat --source "${SOURCE}"
@@ -227,5 +268,40 @@ runs:
         msg="v2 artifact ${ARTIFACT} was not resolved or recorded (see the log above)."
         echo "::error title=v2 artifact::${msg}"
         echo "- :x: ${msg}" >> "$GITHUB_STEP_SUMMARY"
-        [ "${STRICT}" = "true" ] && exit 1
+        [ "${STRICT}" = false ] || exit 1
         exit 0
+
+    # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.
+    - name: Publish a rows-free manifest of parked ClickHouse rows
+      id: ch-spool
+      if: always()
+      shell: bash
+      run: |
+        spool="${CH_WRITE_SPOOL:-${RUNNER_TEMP}/ch-spool}"
+        compgen -G "${spool}/[0-9]*.json" > /dev/null || exit 0
+        py="${RUNNER_TEMP}/v2-artifact-venv/bin/python"
+        if [ ! -x "${py}" ]; then
+          echo "::warning title=ClickHouse::rows are parked in ${spool}, but this action's venv is missing"
+          exit 0
+        fi
+        # One manifest line per batch for the whole job: batches another action already listed are skipped.
+        seen="${RUNNER_TEMP}/ch-spool-listed.jsonl"
+        touch "${seen}"
+        errs="${RUNNER_TEMP}/ch-spool-list.err"
+        CH_WRITE_SPOOL="${spool}" "${py}" -m spyre_clickhouse_ingest spool list 2> "${errs}" \
+          | grep -vxF -f "${seen}" > "${RUNNER_TEMP}/ch-spool-manifest.jsonl" || true
+        if [ -s "${errs}" ]; then
+          echo "::warning title=ClickHouse spool::$(head -c 500 "${errs}" | tr '\n' ' ')"
+        fi
+        [ -s "${RUNNER_TEMP}/ch-spool-manifest.jsonl" ] || exit 0
+        cat "${RUNNER_TEMP}/ch-spool-manifest.jsonl" >> "${seen}"
+        { echo "parked=true"; echo "id=$(date +%s)-${RANDOM}${RANDOM}"; } >> "$GITHUB_OUTPUT"
+        echo "::warning title=ClickHouse::rows were parked, not stored; see the step summary"
+
+    - name: Upload the parked-rows manifest
+      if: always() && steps.ch-spool.outputs.parked == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ch-spool-manifest-artifact-${{ github.job }}-${{ github.run_attempt }}-${{ steps.ch-spool.outputs.id }}
+        path: ${{ runner.temp }}/ch-spool-manifest.jsonl
+        retention-days: 7

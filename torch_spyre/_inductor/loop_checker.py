@@ -73,7 +73,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
-from .loop_facts import counted_loop_path
+from .loop_facts import counted_loop_path, node_levels, stamped_levels
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -99,17 +99,6 @@ class LoopStructureError(RuntimeError):
             "(a compiler bug; set TORCH_SPYRE_CHECK_LOOPS=0 to skip this check):\n  "
             + "\n  ".join(self.problems)
         )
-
-
-class LoopAdvanceMismatch(RuntimeError):
-    """A loop access's advance read from its stored record differs from the one
-    read from its index (stage 7.2).
-
-    Raised while the kernel builds a ``TensorArg``, so ``TORCH_SPYRE_CHECK_LOOPS``
-    does not apply. A compiler bug, not a user error, so not ``Unsupported``
-    (see :class:`LoopStructureError`). Until the stored fields are deleted
-    (stage 7.4) an op can carry both; they must agree.
-    """
 
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -183,7 +172,7 @@ def _index_symbols(op: ir.Operation) -> set[sympy.Symbol]:
 
 def _node_key(node: LoopNode, depth: int) -> tuple[int, ...] | None:
     """The group path prefix of ``node``'s members at ``depth``, from its first
-    member that has one (the same rule as ``loop_node._node_key``)."""
+    member that has one (the rule ``collapse`` uses)."""
     for leaf in all_ops(node.body):
         path = counted_loop_path(leaf)
         if len(path) > depth:
@@ -249,37 +238,76 @@ def _membership_problems(
             )
 
 
-def _interior_non_members(
-    entries: list[ir.Operation], depth: int, problems: list[str]
-) -> None:
-    """Rule 5: an op that is not a member of its node, between two members.
+def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -> None:
+    """Rule 5: an op in a node's body that is not a member of its loop.
 
-    Head and tail non-members are allowed here: an allocator that inserts "before
-    the loop" through the flat view puts the op in the body, and
-    ``peel_non_members`` moves it out at the hand-off. An ``ExternKernel`` is
-    allowed anywhere (a once-op stays in the body until the scheduler hoists it).
+    The scheduler runs a node's whole body every trip, so such an op would run
+    every trip although it carries no loop. It is reported wherever it sits in the
+    body. (Before stage 8.5 an op at the head or tail was allowed, because the
+    flat view put an op inserted "before the loop" there and ``peel_non_members``
+    moved it out at the hand-off; every edit now names its position, and that
+    repair is gone.) An ``ExternKernel`` is allowed anywhere: a once-op stays in
+    the body until the scheduler hoists it.
     """
     for entry in entries:
         if not isinstance(entry, LoopNode):
             continue
         key = _node_key(entry, depth)
         if key is not None:
-            member = [
-                isinstance(op, LoopNode)
-                or bool(counted_loop_path(op))
-                or isinstance(op, ir.ExternKernel)
-                for op in entry.body
-            ]
-            real = [i for i, m in enumerate(member) if m]
-            if real:
-                for i in range(real[0], real[-1] + 1):
-                    if not member[i]:
-                        problems.append(
-                            f"{entry.body[i].get_name()} is in the body of "
-                            f"{entry.get_name()} between two of its members "
-                            "but is not a member of the loop"
-                        )
-        _interior_non_members(entry.body, depth + 1, problems)
+            for op in entry.body:
+                if not (
+                    isinstance(op, LoopNode)
+                    or bool(counted_loop_path(op))
+                    or isinstance(op, ir.ExternKernel)
+                ):
+                    problems.append(
+                        f"{op.get_name()} is in the body of {entry.get_name()} "
+                        "but is not a member of the loop"
+                    )
+        _non_members(entry.body, depth + 1, problems)
+
+
+def _facts(levels) -> list[tuple]:
+    return [
+        (
+            level.group_path,
+            level.trip_count,
+            level.tiled_dims,
+            level.tiled_reduction_dims,
+        )
+        for level in levels
+    ]
+
+
+def _node_fact_problems(
+    op: ir.Operation, enclosing: tuple[LoopNode, ...], problems: list[str]
+) -> None:
+    """Rule 6: the facts the nodes around ``op`` hold (group path, trip count,
+    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_info`` says.
+
+    Until the lowerings stop writing ``loop_info`` (stage 9.4) both exist; a pass
+    that changes the stamp after the node was built, without telling the node,
+    leaves the node answering differently, which this reports. An op with no
+    ``loop_info`` has nothing to compare with and is skipped.
+    """
+    if (
+        not enclosing
+        or getattr(op, "loop_info", None) is None
+        or not all(n.facts_recorded for n in enclosing)
+    ):
+        return
+    if tuple(getattr(op, "_loop_chain", ())) != enclosing:
+        problems.append(
+            f"{op.get_name()}: its recorded node chain "
+            f"{[n.get_name() for n in getattr(op, '_loop_chain', ())]} is not the "
+            f"nodes around it {[n.get_name() for n in enclosing]}"
+        )
+        return
+    stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
+    if stamped != derived:
+        problems.append(
+            f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"
+        )
 
 
 def find_violations(operations: list[ir.Operation]) -> list[str]:
@@ -318,8 +346,10 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             carries(entry.body)
 
     carries(operations)
+    for op, enclosing in _walk(operations):
+        _node_fact_problems(op, enclosing, problems)
     _membership_problems(operations, 0, (), problems, _covered_keys(operations))
-    _interior_non_members(operations, 0, problems)
+    _non_members(operations, 0, problems)
     return problems
 
 

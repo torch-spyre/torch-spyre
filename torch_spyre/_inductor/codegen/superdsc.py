@@ -2596,41 +2596,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow a core-split index-entry iteration to the padded output device_size.
-    # The output's entry-dim device_size was rounded up to the index stick
-    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
-    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors puts each core's output base on a stick boundary
-    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
-    # grown iteration would dereference the index's padding lanes as table rows,
-    # and those hold whatever the index's producer left there.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    # Never iterate past the index's allocated entries: the padding
-                    # lanes past them are uninitialized and read as indices.
-                    idx_pos = next(
-                        i
-                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
-                        if c.free_symbols == {entry_c}
-                    )
-                    idx_eps = idx_arg.device_dtype.elems_per_stick()
-                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
-                    dev = min(int(out_arg.device_size[pos]), idx_extent)
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dim_splits[entry_mb] > 1
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
-
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if reinstated_unit_spatial:
         injected_dims["unit_spatial_dims"] = reinstated_unit_spatial

@@ -15,9 +15,8 @@
 """Loop terms in the index of span-overflow groups (stage 7a.2).
 
 The unit tests cover the step rule and the loop-variable minting. The device tests
-add the term to the legacy lowering's result and check that the kernel reads the
-same advance from the index as the legacy record holds (``LoopAdvanceMismatch``
-otherwise), with the same numerics and the same kernel text.
+check that the lowering puts ``step * u`` in the index and that the kernel agrees
+with the carry records and the loop nodes it builds from it.
 """
 
 import pytest
@@ -709,9 +708,13 @@ def test_declaring_the_carry_does_not_change_the_kernel(case, fn, shapes):
     makes the same choices with and without it, so the generated kernel is the same."""
     limit = CASES["matmul_k_tiled"][2] if case == "k_tiled_matmul" else 2 * 1024 * 1024
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with_record = compile_span_overflow(fn, args, limit)
-    with mock.patch.object(slt, "_apply_carries", lambda edits: None):
-        without = compile_span_overflow(fn, args, limit)
+    # One CP-SAT worker: a parallel search can return a different one of several
+    # equally good plans (another core division, another LX offset) on two compiles
+    # of the same graph, and this compares the whole generated text.
+    with config.patch({"num_cpus": 1}):
+        with_record = compile_span_overflow(fn, args, limit)
+        with mock.patch.object(slt, "_apply_carries", lambda edits: None):
+            without = compile_span_overflow(fn, args, limit)
     assert _normalised(with_record.code) == _normalised(without.code)
 
 

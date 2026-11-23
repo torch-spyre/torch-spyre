@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Shape of the producer's throughput Benchmarks; the model and the test name are substituted.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: throughput-mistral7b-tp1-in64-out64, description: 'offline batch (vllm bench throughput)', owner: spyre-inference}
+spec:
+  type: perf
+  level: model
+  tier: core
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/throughput}
+  run:
+    cache: warm
+    repeats: 1
+    command: [uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --suite, nightly, --bench-types, throughput, --tests, "{case}", --results-dir, "{raw_dir}"]
+  est_hours: 0.25
+  identity:
+    mode: ingest
+    profile: vllm
+    name: throughput_mistral7b_tp1_in64_out64
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: throughput}
+      - {key: tensor_parallel, value: 1}
+      - {key: input_len, value: 64}
+      - {key: output_len, value: 64}
+  variants:
+    - name: throughput_mistral7b_tp1_in64_out64
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: mistral-7b-instruct-v0.3, model: mistral-7b-instruct-v0.3, precision: fp16, tp: 1, flags: {load-format: auto, max-model-len: 128}}
+      workload: {type: llm/throughput, input_len: 64, output_len: 64, prompts: 16, load: {executor: batch, requests: 16}}

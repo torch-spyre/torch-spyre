@@ -964,6 +964,48 @@ class TestUnsupportedGates(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             x.to("spyre")
 
+    def test_kernel_to_dtype_without_src_dtype_raises_unsupported(self):
+        """A kernel cast without src_dtype is rejected with Unsupported (#5783).
+
+        OpsHandler.to_dtype declares src_dtype optional, and some upstream
+        Inductor lowerings omit it. Spyre picks the hardware op from the
+        (src_dtype, dtype) pair, so it must reject the cast with a clear
+        message instead of failing with TypeError.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        for kwargs in ({}, {"use_compute_types": False}, {"src_dtype": None}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(Unsupported, "without a source dtype"):
+                    SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
+
+    @_rejected(r"aten::sort\.values_stable", "#4500")
+    def test_compiled_conversion_of_multi_output_op_does_not_crash(self):
+        """A dtype conversion of a multi-output op's result compiles (#5831).
+
+        argsort lowers through aten.sort, whose FX node carries a (values,
+        indices) tuple as meta["val"]. split_multi_ops called .to() on it and
+        crashed with "'tuple' object has no attribute 'to'". With the fix the
+        graph compiles, and the run stops at aten.sort, which has no Spyre
+        kernel yet (#4500).
+
+        TODO(#4500): once aten.sort is supported, drop @_rejected so the
+        compiled result is compared with the CPU.
+
+        Caches are off: a cached graph would skip split_multi_ops and hide the
+        bug.
+        """
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, dtype=torch.float16)
+
+        def fn(a):
+            return torch.argsort(a, dim=1).to(torch.float16)
+
+        with torch._inductor.config.patch(force_disable_caches=True):
+            out = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+        torch.testing.assert_close(out, fn(x))
+
 
 class TestModelIntegration(unittest.TestCase):
     """Compiled model integration tests: dtype behavior through realistic compute patterns."""

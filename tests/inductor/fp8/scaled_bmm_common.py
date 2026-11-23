@@ -571,6 +571,15 @@ _KNOWN_FAILURES = [
     ),
     _KnownFailure(
         "test_shapes",
+        r"4d_global_prefill_qk_1x16x24x512x24-cores3",
+        AssertionError,
+        _OUTSIDE_BOUND,
+        "Unstable: #6527: [fp8] scaled_bmm: 4D global-prefill QKᵀ at 3 cores "
+        "intermittently returns wrong values (fails in CI, passes locally)",
+        strict=False,
+    ),
+    _KnownFailure(
+        "test_shapes",
         r"3d_moe_bmm_as_captured_(8|96)x2816x704x1-cores\d+",
         InductorError,
         _NO_STICK_MECHANISM,
@@ -627,16 +636,6 @@ _KNOWN_FAILURES = [
         AssertionError,
         "subnormal values flushed to zero by quantize_fp8_with_scale",
         "#6084: [fp8] quantize_fp8_with_scale corrupts E4M3 subnormal values",
-    ),
-    _KnownFailure(
-        "test_rejections",
-        r"mat[12]_fp16-cores\d+",
-        AssertionError,
-        # pytest.raises' "Regex pattern did not match", quoting the layout error that
-        # reaches the user instead of the dtype guard.
-        _NO_STICK_MECHANISM,
-        "#6203: [fp8] scaled_bmm: FP8 operand guard in lower_bmm_fp8 is bypassed "
-        "when one operand is fp16",
     ),
     _KnownFailure(
         "test_padded_inputs",

@@ -1686,7 +1686,14 @@ class _OPWrapper:
         if torch.compiler.is_compiling():
             return self._fn(*args, **kwargs)
         if self._compiled_fn is None:
-            self._compiled_fn = torch.compile(self._fn, dynamic=False)
+            from torch_spyre.ops.eager import _static_compile
+
+            # ``dynamic=False`` does not override ``mark_dynamic`` on a tensor
+            # declared with ``.to("spyre", dynamic=...)``; the kernel gets
+            # unmarked twins instead, as in ``compile_once`` (#6030). No autograd
+            # kernel sits above this wrapper, so a marked tensor that requires
+            # grad is rejected rather than losing its history to the twin.
+            self._compiled_fn = _static_compile(self._fn, autograd_handled=False)
         # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
         # scalar induction variable with ``item()``.  Eager PrivateUse1
         # dispatch reaches that rewrite through this lazy compilation path,
