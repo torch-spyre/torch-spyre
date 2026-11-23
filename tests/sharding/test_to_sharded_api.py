@@ -504,6 +504,7 @@ def test_device_replicated_signature_differs_from_plain_and_sharded():
 
     keys = [_sharding_key(t) for t in (replicated, plain, sharded)]
 
+    assert keys[0] == ("replicate", 1)
     assert keys[1] is None
     assert len({repr(key) for key in keys}) == 3
     # Address-free: a second allocation has the same signature.

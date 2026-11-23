@@ -66,6 +66,13 @@ everything outside it fails at compile time with a specific message:
   | `Shard(d)` with `Replicate()`, a plain tensor, or a scalar | `Shard(d)` |
   | `Replicate()` with `Replicate()`, a plain tensor, or a scalar | an ordinary unified tensor; no sharded kernel is involved |
   | `Shard(d1)` with `Shard(d2)` | rejected, naming both placements: it needs data movement between shards |
+
+  `combine_placements` (`_inductor/sharded_hbm.py`) is the single place this
+  table is implemented; a plain tensor or scalar is `None` there. The compiler
+  records a `Replicate()` tag from the real graph input as a
+  `ReplicatedPlacement(copies=1)`. Only the one-copy read path exists, so a
+  replica with any other copy count fails closed instead of compiling as a
+  unified operand.
 * Each shard must be a whole device dim of whole sticks: the shard keeps
   the global device layout's dim structure, the shard boundary falls on
   whole sticks for a last-dim shard (a stick cannot be split between
@@ -160,7 +167,10 @@ the compile guards and cache key (address-free), so a replicated tensor never
 shares a compiled entry with a plain or sharded one. It takes no
 `num_shards` (that raises `ValueError`), needs no divisible dimension, and
 is not sharded: `is_sharded` is `False` and `sharding_info` raises
-`TypeError`. There is exactly one copy. Per-HBM-group copies for locality are
+`TypeError`. There is exactly one copy; its compile signature is
+`("replicate", 1)`, where the second field is the copy count, so a later
+per-core replica (a different copy count) can never share a compiled entry with
+it. Per-HBM-group copies for locality are
 not provided: they need a receipt that can describe a whole-tensor replica per
 core, and are deferred until broadcasting (#5821) defines how a replica is
 read per core.
@@ -323,8 +333,9 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 2. Every sharded input must agree with the others on placement (shard dim,
    count) — an operand-vs-operand check; each operand's own storage was
    already validated against its receipt when the tensor was created.
-   Unsharded operands of a pointwise op are admitted when they are a scalar
-   constant or a graph input (`_require_replica_source`) of the op's shape
+   Operand placements combine through `combine_placements` (the table
+   above). Unsharded operands of a pointwise op are admitted when they are a
+   scalar constant or a graph input (`_require_replica_source`) of the op's shape
    or broadcast to it (`_require_replica_read`); they keep ordinary unified
    addressing, and only the sharded arguments get per-core shard addresses
    (`verify_mixed_args`).

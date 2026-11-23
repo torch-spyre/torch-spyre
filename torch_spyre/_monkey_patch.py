@@ -296,7 +296,9 @@ def _sharding_key(tensor) -> tuple | None:
     from torch_spyre import _C
 
     if _C._spyre_is_replicated(tensor):
-        return ("replicate",)
+        # (kind, copies): one unified copy today; a per-core replica would be
+        # a different copy count, hence a different key.
+        return ("replicate", 1)
     if not _C._spyre_is_sharded(tensor):
         return None
     info = _C._spyre_sharding_info(tensor)
