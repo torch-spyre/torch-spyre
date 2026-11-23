@@ -1185,6 +1185,11 @@ PYBIND11_MODULE(_C, m) {
       "Allocate an uninitialized sharded Spyre tensor.");
   m.def("_spyre_is_sharded", &spyre::spyre_is_sharded, py::arg("tensor"),
         "Whether a tensor's storage is sharded storage.");
+  m.def("_spyre_mark_replicated", &spyre::spyre_mark_replicated,
+        py::arg("tensor"),
+        "Tag a unified Spyre tensor's storage with the Replicate() placement.");
+  m.def("_spyre_is_replicated", &spyre::spyre_is_replicated, py::arg("tensor"),
+        "Whether a tensor's storage carries the Replicate() placement.");
   m.def(
       "_spyre_sharding_info",
       [](const at::Tensor& tensor) {

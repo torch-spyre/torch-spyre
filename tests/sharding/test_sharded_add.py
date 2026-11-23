@@ -45,7 +45,7 @@ from device_suite import (
     make_device_suite_test,
     requires_emulation,
 )
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate, Shard
 
 from torch_spyre._inductor import config as spyre_config
 
@@ -379,6 +379,86 @@ def test_sharded_and_unified_second_operand_do_not_share_a_kernel(launched):
 
     assert len({code_dir for code_dir, _ in launched}) == 2
     assert torch.equal(both_sharded.cpu(), one_sharded.cpu())
+
+
+@requires_emulation
+@pytest.mark.parametrize("case", ["shard0_bias_row", "shard1_bias_vec"])
+def test_sharded_plus_replicated_bias_matches_unsharded(launched, case):
+    """A Replicate() operand is the same single unified copy a plain one is:
+    the kernel and the result are the ones the unified bias gets."""
+    dim, shape_of, bias_shape_of = _BIAS_CASES[case]
+    n = num_shards()
+    torch.manual_seed(11)
+    a_cpu = torch.randn(*shape_of(n), dtype=torch.float16)
+    bias_cpu = torch.randn(*bias_shape_of(n), dtype=torch.float16)
+    a = _sharded(a_cpu, dim, n)
+    bias = torch.spyre.to_sharded(bias_cpu, Replicate())
+    add = torch.compile(lambda x, b: x + b, dynamic=False)
+
+    c = add(a, bias)
+
+    assert torch.spyre.is_sharded(c)
+    assert torch.spyre.sharding_info(c).placement == Shard(dim)
+    _assert_mixed_kernel(launched, n, sharded_inputs=1, plain_inputs=1)
+    assert torch.equal(c.cpu(), add(a_cpu.to("spyre"), bias_cpu.to("spyre")).cpu())
+
+
+@requires_emulation
+def test_replicated_and_plain_operands_do_not_share_a_compiled_graph(launched):
+    """The placement tag is in the guards: switching a bias between Replicate()
+    and a plain tensor recompiles rather than reusing the other's entry."""
+    n = num_shards()
+    torch.manual_seed(12)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    bias_cpu = torch.randn(64, dtype=torch.float16)
+    a = _sharded(a_cpu, 0, n)
+    add = torch.compile(lambda x, b: x + b, dynamic=False)
+    expected = add(a_cpu.to("spyre"), bias_cpu.to("spyre")).cpu()
+
+    torch._dynamo.utils.counters.clear()
+    plain = add(a, bias_cpu.to("spyre"))
+    replicated = add(a, torch.spyre.to_sharded(bias_cpu, Replicate()))
+    plain_again = add(a, bias_cpu.to("spyre"))
+
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 2
+    for got in (plain, replicated, plain_again):
+        assert torch.equal(got.cpu(), expected)
+
+
+@requires_emulation
+def test_replicated_operand_first_matches_unsharded(launched):
+    """Operand order does not matter for a Replicate() operand either."""
+    n = num_shards()
+    torch.manual_seed(13)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    bias_cpu = torch.randn(64, dtype=torch.float16)
+    a = _sharded(a_cpu, 0, n)
+    bias = torch.spyre.to_sharded(bias_cpu, Replicate())
+    add = torch.compile(lambda b, x: b + x, dynamic=False)
+
+    c = add(bias, a)
+
+    assert torch.spyre.is_sharded(c)
+    assert torch.spyre.sharding_info(c).placement == Shard(0)
+    _assert_mixed_kernel(launched, n, sharded_inputs=1, plain_inputs=1)
+    assert torch.equal(c.cpu(), add(bias_cpu.to("spyre"), a_cpu.to("spyre")).cpu())
+
+
+@requires_emulation
+def test_replicate_with_replicate_is_an_ordinary_unified_op(launched):
+    """No sharded operand, so no sharded kernel: the result is a plain
+    unified tensor, the same as for two plain operands."""
+    torch.manual_seed(14)
+    x_cpu = torch.randn(8, 64, dtype=torch.float16)
+    y_cpu = torch.randn(8, 64, dtype=torch.float16)
+    x = torch.spyre.to_sharded(x_cpu, Replicate())
+    y = torch.spyre.to_sharded(y_cpu, Replicate())
+    add = torch.compile(lambda a, b: a + b, dynamic=False)
+
+    c = add(x, y)
+
+    assert not torch.spyre.is_sharded(c)
+    assert torch.equal(c.cpu(), add(x_cpu.to("spyre"), y_cpu.to("spyre")).cpu())
 
 
 @requires_emulation

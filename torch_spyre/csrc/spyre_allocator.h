@@ -60,6 +60,11 @@ struct SharedOwnerCtx {
   flex::MemoryType memory_type;
   // Set only for sharded storage.
   std::optional<ShardedStorageInfo> sharding;
+  // Declared Replicate() placement: ordinary unified storage (one copy that
+  // every core reads) that the user asked to be treated as replicated. A
+  // placement tag only; it changes neither the layout nor the addressing, and
+  // it is never set together with `sharding`.
+  bool replicated = false;
   // Set only on the SharedOwnerCtx embedded in a ShardViewCtx: points back
   // at the enclosing view so the view's DataPtr deleter can free it.
   ShardViewCtx* shard_view = nullptr;

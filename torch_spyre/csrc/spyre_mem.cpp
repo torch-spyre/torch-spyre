@@ -1882,6 +1882,24 @@ std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
   return start;
 }
 
+void spyre_mark_replicated(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone() && tensor.has_storage(),
+              "expected a Spyre tensor with storage");
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context());
+  TORCH_CHECK(ctx != nullptr, "cannot mark empty Spyre storage as replicated");
+  TORCH_CHECK(!ctx->sharding.has_value() && ctx->shard_view == nullptr,
+              "only unified Spyre storage can be marked as replicated");
+  ctx->replicated = true;
+}
+
+bool spyre_is_replicated(const at::Tensor& tensor) {
+  if (!tensor.is_privateuseone() || !tensor.has_storage()) return false;
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context());
+  return ctx != nullptr && ctx->replicated;
+}
+
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes) {

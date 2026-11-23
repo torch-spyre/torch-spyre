@@ -119,10 +119,48 @@ def test_valid_request_reaches_the_runtime(no_runtime):
     assert no_runtime == ["init"]
 
 
-@pytest.mark.parametrize("placement", [Replicate(), Partial(), object(), None, 0])
-def test_placement_must_be_exact_shard(no_runtime, placement):
+@pytest.mark.parametrize("placement", [Partial(), object(), None, 0])
+def test_placement_must_be_shard_or_replicate(no_runtime, placement):
     with pytest.raises(TypeError, match="Shard"):
         to_sharded(_source(), placement)
+    assert no_runtime == []
+
+
+@pytest.mark.parametrize("placement", [Replicate(), [Replicate()]])
+def test_replicate_reaches_the_runtime(no_runtime, placement):
+    with pytest.raises(_NativeCalled):
+        to_sharded(_source((3, 5)), placement)
+    assert no_runtime == ["init"]
+
+
+def test_replicate_takes_no_shard_count(no_runtime):
+    with pytest.raises(ValueError, match="num_shards"):
+        to_sharded(_source(), Replicate(), num_shards=8)
+    assert no_runtime == []
+
+
+def test_replicate_needs_no_divisible_dimension_or_matching_core_count(
+    no_runtime, active_cores
+):
+    # One unified copy: no shard planning, so an odd shape and an unsupported
+    # core count are fine.
+    active_cores["cores"] = 32
+    with pytest.raises(_NativeCalled):
+        to_sharded(_source((3, 5)), Replicate())
+
+
+@pytest.mark.parametrize(
+    "source,message",
+    [
+        (None, "torch.Tensor"),
+        (_source(dtype=torch.int64), "dtype"),
+        (torch.empty(16, requires_grad=True), "gradients"),
+        (torch.empty(4, 4).t(), "contiguous"),
+    ],
+)
+def test_replicate_validates_the_source_before_runtime(no_runtime, source, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        to_sharded(source, Replicate())
     assert no_runtime == []
 
 
@@ -414,3 +452,59 @@ def test_device_fill_then_copy_runs_in_order(active_cores):
     _C.copy_tensor(replacement, result, non_blocking=False)
 
     assert torch.equal(result.cpu(), replacement)
+
+
+@_requires_spyre
+@pytest.mark.parametrize("shape", [(64,), (3, 5), (8, 64)])
+def test_device_replicate_is_one_tagged_unified_copy(shape):
+    from torch_spyre import _C
+
+    source = _source(shape, torch.float16)
+
+    result = torch.spyre.to_sharded(source, Replicate())
+
+    assert type(result) is torch.Tensor
+    assert result.device.type == "spyre"
+    assert result.shape == source.shape
+    assert _C._spyre_is_replicated(result)
+    assert not torch.spyre.is_sharded(result)
+    with pytest.raises(TypeError, match="sharded"):
+        torch.spyre.sharding_info(result)
+    assert torch.equal(result.cpu(), _expected_round_trip(source))
+
+
+@_requires_spyre
+def test_device_plain_tensor_is_not_replicated():
+    from torch_spyre import _C
+
+    assert not _C._spyre_is_replicated(_source((16,)).to("spyre"))
+    assert not _C._spyre_is_replicated(
+        torch.spyre.to_sharded(_source((16, 64)), Shard(0))
+    )
+
+
+@_requires_spyre
+def test_device_mark_replicated_rejects_sharded_storage():
+    from torch_spyre import _C
+
+    sharded = torch.spyre.to_sharded(_source((16, 64)), Shard(0))
+    with pytest.raises(RuntimeError, match="unified"):
+        _C._spyre_mark_replicated(sharded)
+    assert not _C._spyre_is_replicated(sharded)
+
+
+@_requires_spyre
+def test_device_replicated_signature_differs_from_plain_and_sharded():
+    from torch_spyre._monkey_patch import _sharding_key
+
+    source = _source((16, 64), torch.float16)
+    replicated = torch.spyre.to_sharded(source, Replicate())
+    plain = source.to("spyre")
+    sharded = torch.spyre.to_sharded(source, Shard(0))
+
+    keys = [_sharding_key(t) for t in (replicated, plain, sharded)]
+
+    assert keys[1] is None
+    assert len({repr(key) for key in keys}) == 3
+    # Address-free: a second allocation has the same signature.
+    assert _sharding_key(torch.spyre.to_sharded(source, Replicate())) == keys[0]

@@ -220,6 +220,27 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
     )
 
 
+def _to_replicated(tensor: object, num_shards: object) -> torch.Tensor:
+    """Copy a CPU tensor to one unified Spyre copy tagged ``Replicate()``.
+
+    One copy, read by every core with ordinary unified addressing, so there is
+    no shard table, shard count or receipt. The tag is recorded on the storage
+    and joins the compile guards and cache key.
+    """
+
+    if num_shards is not None:
+        raise ValueError(
+            "num_shards applies to Shard placements; Replicate() keeps one copy"
+        )
+    source = _validate_host_transfer_source(tensor)
+    _ensure_spyre_runtime_initialized()
+    from torch_spyre import _C
+
+    result = source.detach().to("spyre")
+    _C._spyre_mark_replicated(result)
+    return result
+
+
 def to_sharded(
     tensor: object, placement: object, *, num_shards: object = None
 ) -> torch.Tensor:
@@ -229,6 +250,11 @@ def to_sharded(
 
         y = torch.spyre.to_sharded(x, Shard(0))
         x_back = y.cpu()
+
+    ``Replicate()`` (or ``[Replicate()]``) instead keeps one unified copy that
+    every core reads, tagged as replicated. It is not sharded
+    (``is_sharded`` is ``False``), takes no ``num_shards``, and is the operand
+    to pair with a sharded tensor in a pointwise op.
 
     The result is a plain ``torch.Tensor`` on the ``spyre`` device whose
     storage is split across the device's cores — the same relationship
@@ -257,6 +283,10 @@ def to_sharded(
     fails, and nothing falls back to unified storage.
     """
 
+    from torch.distributed.tensor import Replicate
+
+    if type(_normalize_placement(placement)) is Replicate:
+        return _to_replicated(tensor, num_shards)
     if num_shards is None:
         num_shards = _active_core_count()
     request = _validate_sharding_request(tensor, placement, num_shards)

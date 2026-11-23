@@ -279,7 +279,10 @@ def _sharding_key(tensor) -> tuple | None:
 
     Part of guards and the FX graph cache key: a sharded input compiles to a
     non-unified kernel, so it must never reuse an unsharded kernel (or one
-    with another sharding), and vice versa.
+    with another sharding), and vice versa. A ``Replicate()``-tagged tensor
+    has its own signature, so its placement is part of what a kernel was
+    compiled for and a replicated tensor never shares an entry with a plain
+    unified one.
     """
     import torch
 
@@ -292,6 +295,8 @@ def _sharding_key(tensor) -> tuple | None:
         return None
     from torch_spyre import _C
 
+    if _C._spyre_is_replicated(tensor):
+        return ("replicate",)
     if not _C._spyre_is_sharded(tensor):
         return None
     info = _C._spyre_sharding_info(tensor)
