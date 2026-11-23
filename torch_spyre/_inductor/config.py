@@ -341,6 +341,14 @@ read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
     "yes",
 )
 
+# Debug switch for a restickify whose stick variable owns only part of a host
+# dim (the dim is read as, for example, 64*d3 + d4).  1 (default) allows it and
+# sizes the stick variable by its own part of the host dim.  0 refuses such a
+# restickify.
+allow_restickify_split_host_dim: bool = (
+    os.environ.get("SPYRE_ALLOW_RESTICKIFY_SPLIT_HOST_DIM", "1") == "1"
+)
+
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
 # pass function names (e.g., "split_multi_ops,insert_restickify") to log only
