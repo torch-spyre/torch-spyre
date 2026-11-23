@@ -2595,7 +2595,8 @@ def unrepresentable_splits_by_index_coeff(
     :func:`finalize_work_division_for_scheduler` (which must never see a
     non-empty result once those checks hold, and raises if it does).
     """
-    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
+    write_index_syms = write_index.free_symbols
+    reduction_syms = {sym for sym in it_space if sym not in write_index_syms}
     problems: list[str] = []
     for label, index, symbols in (
         ("output", write_index, [s for s in it_space if s not in reduction_syms]),
@@ -2671,9 +2672,10 @@ def splits_by_index_coeff(
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    write_index_syms = write_index.free_symbols
+    # Reduction splits: symbols not in write_index but in read_index
     reduction_only = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in splits.items() if sym not in write_index_syms
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
@@ -5368,8 +5370,9 @@ def _per_core_view_on_buf(
 
     prep = _prepare_per_core_view(op, dep, buf_name)
     write_index = prep.write_index if prep is not None else sympy.S.Zero
+    write_index_syms = write_index.free_symbols
     reduction_splits = {
-        sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
+        sym: split for sym, split in splits.items() if sym not in write_index_syms
     }
     result = _per_core_view_from_prep(
         prep,
@@ -5401,11 +5404,11 @@ def completed_reduction_split_on_buf(
     ownership = getattr(op, "iteration_space_ownership", None)
     if prep is None or ownership is None:
         return None
+    write_index_syms = prep.write_index.free_symbols
     reduction_splits = [
         int(ownership.work_slices.get(sym, 1))
         for sym in prep.iter_space
-        if prep.write_index.coeff(sym) == 0
-        and int(ownership.work_slices.get(sym, 1)) > 1
+        if sym not in write_index_syms and int(ownership.work_slices.get(sym, 1)) > 1
     ]
     if len(reduction_splits) != 1 or prep.stick_host_stride is None:
         return None
