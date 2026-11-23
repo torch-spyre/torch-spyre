@@ -2979,7 +2979,7 @@ def _align_single_source_producer(
     # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
     # the mutation target is always STANDARD; forcing it onto the producer strips
     # the arrangement and causes the codegen to misread the HBM layout.  The
-    # caller then gives the target the same QFP8WT arrangement (see
+    # caller gives an indirect-scatter target the same QFP8WT arrangement (see
     # source_is_qfp8wt there), so producer and target still agree.
     if any(
         getattr(stl, "element_arrangement", ElementArrangement.STANDARD)

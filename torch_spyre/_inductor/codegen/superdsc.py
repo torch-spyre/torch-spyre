@@ -1341,7 +1341,7 @@ def _is_qfp8wt_2d_stick(arg: TensorArg, op_spec: OpSpec) -> bool:
         return False
     # A plain copy between a QFP8WT tensor and one of another arrangement (the
     # clone of a QFP8WT weight into a fresh tensor) cannot move 2D sticks into
-    # 1D ones: both sides keep a 1D stick, as before QFP8WT scatters.
+    # 1D ones: both sides keep a 1D stick, as before this change.
     return not (
         op_spec.op == IDENTITY_OP
         and not any(is_index_tensor(a, op_spec) for a in op_spec.args)
@@ -1889,9 +1889,10 @@ def _create_sdsc_tensors(
         # Special handling for QFP8WT KERNEL tensors: the element arrangement
         # alone selects the 2D stick [2, stick_size/2], whatever the op (matmul
         # weight, quantization, or an identity op such as a scatter or gather
-        # with or without indirect access). The one exception is fp8todl16,
+        # with or without indirect access). There are two exceptions: fp8todl16,
         # which carries a QFP8WT-arranged tensor as input but uses a 1D flat FP8
-        # input.
+        # input, and a plain copy between a QFP8WT tensor and one of another
+        # arrangement (see _is_qfp8wt_2d_stick).
         # Both sides of a scatter (source and destination) must use the 2D
         # stick, so that both treat pairs of K-elements as one 2-element outer
         # stick; otherwise the 1D-stick source wins the OUTPUT-label race in
@@ -2708,7 +2709,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         ]
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
-    # For sub-stick indirect scatter/gather (op_stick_dim is None, has_indirect_access),
+    # For a sub-stick indirect scatter (op_stick_dim is None, has_indirect_access),
     # the stick sym (e.g. "y") was added to sdsc_iteration_space above but is absent from
     # every value/destination tensor's layoutDimOrder_ unless _create_sdsc_tensors step 3
     # is told which sym IS the stick.  Pass it explicitly so step 3 can use it instead of

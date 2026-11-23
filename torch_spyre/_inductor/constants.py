@@ -230,8 +230,9 @@ SPYRE_FP8_OPS = {
 # Used in compute_ops._layout_info_for_tensor to restore 2D-stick metadata
 # that was erased by device-size flattening when an op is compiled individually.
 # Other ops (e.g. identity copies and index_copy_ scatters) are not gated here:
-# superdsc selects the 2D stick from the tensor's element arrangement alone, so
-# their metadata is never flattened away.
+# superdsc selects the 2D stick from the tensor's element arrangement alone
+# (except for a plain copy into a tensor of another arrangement), so their
+# metadata is never flattened away.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
