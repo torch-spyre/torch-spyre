@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: metal-a, description: "reserved pool of identical two-socket hosts"}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: metal-a}}
+  host_profile: {governor: performance, turbo: "on", smt: "on", cstate_policy: fixed, thp: madvise, cpu_quota_min_cores: 8}
+  qualification: {expiry_days: 14, probe: repeat-probe, cv_limit_pct: 2.0, checks: [host_profile, governor]}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: metal-b, description: "shared pool, no qualification policy"}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: metal-b}}
+  host_profile: {governor: performance, smt: "off"}

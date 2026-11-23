@@ -98,6 +98,7 @@ def test_seed_covers_every_base_table_in_schema():
         "artifact_subscription_versions",
         "rbac_role_versions",
         "rbac_binding_versions",
+        "bench_span_values",
     }
     unseeded = declared - {t for t, _, _ in Sandbox.SEED} - filled_by_mv
     assert {t for t in unseeded if not t.startswith("otel_")} == set()

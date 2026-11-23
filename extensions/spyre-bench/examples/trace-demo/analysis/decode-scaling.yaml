@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Scaling: latency on 1, 2 and 4 cards against the 1-card run of the same build. The card count is what differs, so the
+# environment id and its device-count label are relaxed. Relaxing env.id also stops comparing the rest of the environment
+# fingerprint (kernel, driver...); subject, node and the other labels (node class) must still match.
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: decode-scaling, owner: example-team}
+spec:
+  select: {benchmarks: [decode-scaling]}
+  metric: llm.batch_latency.mean
+  hold: ["case.*", "input.*", "subject.id"]
+  relax: [env.id, env.label.device.count]
+  vary: [system.tp]
+  compare:
+    by: env.label.device.count
+    metric: llm.batch_latency.mean
+    baseline: "1"
+  output: {noise: series_floor}

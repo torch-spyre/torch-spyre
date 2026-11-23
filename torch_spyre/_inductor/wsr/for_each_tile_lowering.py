@@ -1537,6 +1537,8 @@ def _consume_tile_dim_markers(
             # `_marker_dim(op) is not None` individually -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
             # matters, on `_marker_resolution(op)`.
             marker_op.tile_marker_resolution = MarkerResolution.INLINE_ERASED
+            # A plain list edit is right here: this runs inside splice_while_loops,
+            # before ``collapse`` builds any LoopNode, so there is no node to tell.
             operations.remove(marker_op)
             if marker_op in group_ops:
                 group_ops.remove(marker_op)
@@ -2761,6 +2763,7 @@ def _contract_cross_scope_input_materializations(
                     None,
                 )
                 if dead_identity is not None:
+                    # Plain list edit: before ``collapse`` (see _consume_tile_dim_markers).
                     operations.remove(dead_identity)
                     graph.removed_buffers.add(name)
             transformed = True

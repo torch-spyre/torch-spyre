@@ -38,6 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .parallel_precompile import report_output_layouts
 from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
@@ -101,6 +102,7 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
 from .loop_checker import check_loops
+from .loop_facts import counted_loop_path
 from .loop_node import (
     OpsView,
     all_ops,
@@ -420,9 +422,9 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     # stamped by splice_while_loops (for_each_tile).
     # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
-        op.loop_info.loop_group_id[0]
+        counted_loop_path(op, include_extern=True)[0]
         for op in graph.operations
-        if hasattr(op, "loop_info") and op.loop_info is not None
+        if counted_loop_path(op, include_extern=True)
     ]
     group_idx_offset = max(used_ids, default=-1) + 1
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
@@ -651,6 +653,9 @@ class CustomPreSchedulingPasses:
             plan_sharded_hbm,
             _distribute_work,
             #
+            # The graph outputs' layouts are final here. A forked precompile child
+            # reports them to its parent before the planning below (parallel_precompile).
+            report_output_layouts,
             # LX Planning
             _maybe_scratchpad_planning,
             # Preserve copies through physical planning, then remove only

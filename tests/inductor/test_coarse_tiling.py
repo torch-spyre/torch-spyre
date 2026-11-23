@@ -1285,7 +1285,12 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
         q1 = sympy.Symbol("q1")
         consumer = _make_consumer_with_ranges([4, 256])
-        consumer.loop_info = object()
+        consumer.loop_info = LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[]],
+        )
 
         result = _retile_load_index("buf", q1, info, consumer)
 
@@ -1446,7 +1451,10 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
         consumer = _make_consumer_with_ranges([1, 8, 4, 32, 128])
         consumer.loop_info = SimpleNamespace(
-            loop_count=[2], loop_tiled_dims=[[3]], loop_tiled_reduction_dims=[[]]
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[[3]],
+            loop_tiled_reduction_dims=[[]],
         )
         kv, group, seq, column = map(sympy_index_symbol, ("d0", "d1", "d2", "d3"))
         full_scale = 32768 * kv + 8192 * group + 128 * seq + column
@@ -5009,7 +5017,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         op, dep, info = self._looped_read(lambda u: 4096 * u, Integer(3))
 
-        self.assertEqual(_loop_advance_bound(op, dep, info), (0, 8192))
+        self.assertEqual(_loop_advance_bound(op, dep), (0, 8192))
 
     def test_loop_bound_takes_the_declared_maximum_for_a_symbolic_count(self):
         # A for_each_tile over a dim declared {min 8, max 64, granularity 8}
@@ -5023,7 +5031,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
         op, dep, info = self._looped_read(lambda u: 4096 * u, sympy.floor(s0 / 8))
 
         with declared_dims({"s0": (8, 64, 8)}):
-            self.assertEqual(_loop_advance_bound(op, dep, info), (0, 4096 * (8 - 1)))
+            self.assertEqual(_loop_advance_bound(op, dep), (0, 4096 * (8 - 1)))
 
     def test_loop_bound_declines_a_symbolic_count_without_a_declaration(self):
         # The same count with no declaration has no finite bound, so the proof
@@ -5040,7 +5048,7 @@ class TestReadCopyElisionProof(unittest.TestCase):
         graph = SimpleNamespace(sizevars=SimpleNamespace(shape_env=shape_env))
 
         with declared_dims({}), V.set_graph_handler(graph):
-            self.assertIsNone(_loop_advance_bound(op, dep, info))
+            self.assertIsNone(_loop_advance_bound(op, dep))
 
     def test_loop_step_is_the_loop_variables_coefficient_in_the_index(self):
         d0, d1 = sympy.symbols("d0 d1", integer=True)
@@ -5053,14 +5061,14 @@ class TestReadCopyElisionProof(unittest.TestCase):
             size=(Integer(64), Integer(128)),
         )
 
-        self.assertEqual(_loop_advance_bound(op, dep, info), (0, 16384))
+        self.assertEqual(_loop_advance_bound(op, dep), (0, 16384))
 
     def test_a_read_that_does_not_move_with_the_loop_has_no_bound(self):
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
         op, dep, info = self._looped_read(lambda u: Integer(0), Integer(3))
 
-        self.assertIsNone(_loop_advance_bound(op, dep, info))
+        self.assertIsNone(_loop_advance_bound(op, dep))
 
     def test_direct_read_storage_encoding_must_match(self):
         from torch_spyre._C import ElementArrangement

@@ -30,6 +30,7 @@ from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
+    is_looped,
     output_advances_anywhere,
     read_advances_anywhere,
 )
@@ -443,7 +444,7 @@ def _is_read_advancing_anywhere(
     whether its index moves with one of the op's loop variables.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
-        if getattr(reader_op, "loop_info", None) is None:
+        if not is_looped(reader_op):
             continue
         # read_advances_anywhere is False when dep is not one of the reader's
         # MemoryDep reads (it is name's write on this op).

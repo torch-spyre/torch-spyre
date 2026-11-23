@@ -124,6 +124,7 @@ jobs:
     # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     # Repo variable GHA_FULL_MERGE_QUEUE_TESTS=true lifts the label and merge-queue skips so GHA runs the full suite;
     # GHA_TESTS_ON_AUTO_MERGE=true lifts the auto-merge skip on PRs.
+    # Fork PR runs read every variable as empty, so these skips apply to them as if the variables were unset, never more tests than a same-repo PR.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
       (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true') &&
@@ -153,10 +154,11 @@ jobs:
     secrets:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
       CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+      CLICKHOUSE_V2_HOST: ${{ secrets.CLICKHOUSE_V2_HOST }}
+      CLICKHOUSE_V2_PORT: ${{ secrets.CLICKHOUSE_V2_PORT }}
+      CLICKHOUSE_V2_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+      CLICKHOUSE_V2_PASSWORD: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (advisory test-result gate)
@@ -182,7 +184,7 @@ jobs:
           RESULT="${{ needs.run-tests.result }}"
           echo "run-tests result: ${RESULT}"
 
-          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
+          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" && "${RESULT}" == "skipped" ]] && ${{ vars.GHA_FULL_MERGE_QUEUE_TESTS != 'true' }}; then
             echo "integration-test label set -- the Jenkins integration run owns this"
             echo "commit's testing and reports its own check. Passing this required"
             echo "gate so the merge queue is not blocked by a missing check."
@@ -222,8 +224,8 @@ jobs:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
-          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
-          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          app-id: ${{ vars.SPYRE_CI_APP_ID }}
+          private-key: ${{ secrets.SPYRE_CI_PRIVATE_KEY }}
           owner: torch-spyre
           repositories: hf-adapters
           permission-actions: write
@@ -257,8 +259,8 @@ jobs:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
-          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
-          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          app-id: ${{ vars.SPYRE_CI_APP_ID }}
+          private-key: ${{ secrets.SPYRE_CI_PRIVATE_KEY }}
           owner: torch-spyre
           repositories: spyre-inference
           permission-actions: write

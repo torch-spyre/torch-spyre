@@ -69,11 +69,13 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
     if loop_info is None:
         return ()
     path = _group_path(loop_info)
-    counts = loop_info.loop_count
-    if not path or len(counts) < len(path):
+    if not path:
         return ()
-    tiled = loop_info.loop_tiled_dims
-    tiled_red = loop_info.loop_tiled_reduction_dims
+    counts = getattr(loop_info, "loop_count", None) or ()
+    if len(counts) < len(path):
+        return ()
+    tiled = getattr(loop_info, "loop_tiled_dims", None) or ()
+    tiled_red = getattr(loop_info, "loop_tiled_reduction_dims", None) or ()
 
     def at(lists, i):
         return tuple(lists[i]) if i < len(lists) else ()
@@ -90,9 +92,70 @@ def _levels(loop_info) -> tuple[LoopLevel, ...]:
     )
 
 
-def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
-    """Loops enclosing ``op``, outermost first; ``()`` if none or malformed."""
+def stamped_levels(op: Operation) -> tuple[LoopLevel, ...]:
+    """The levels ``op.loop_info`` (the per-op stamp) describes; ``()`` if none or
+    malformed. Readers use :func:`enclosing_loops`; this is the stamp itself, for
+    the loop checker's comparison with the nodes and for an op no node holds."""
     return _levels(getattr(op, "loop_info", None))
+
+
+def _in_built_node(op: Operation) -> bool:
+    # An op with no loop_info answers "not looped" as it always did, even when a
+    # helper put it in a body (a once-op extern the scheduler hoists, say): node
+    # membership becomes the truth only when the stamp is gone (stage 9.4).
+    chain = getattr(op, "_loop_chain", ())
+    return (
+        isinstance(chain, tuple)
+        and bool(chain)
+        and getattr(op, "loop_info", None) is not None
+        and all(node.facts_recorded for node in chain)
+    )
+
+
+def enclosing_loops(op: Operation) -> tuple[LoopLevel, ...]:
+    """Loops enclosing ``op``, outermost first; ``()`` if none or malformed.
+
+    Read from the ``LoopNode``s around ``op`` once the pipeline has built them
+    (:func:`node_levels`; the loop checker, rule 6, keeps them equal to the stamp).
+    An op no node holds yet (a loop being lowered, before its nodes are built) or no
+    longer holds (hoisted out of its loop) answers from its ``loop_info``.
+    """
+    if _in_built_node(op):
+        return node_levels(op)
+    return stamped_levels(op)
+
+
+def node_levels(op: Operation) -> tuple[LoopLevel, ...]:
+    """The same levels as :func:`enclosing_loops`, read from the ``LoopNode``s
+    around ``op`` (``op._loop_chain``, set where the node is built and by the
+    ``loop_node`` edit helpers) instead of from ``op.loop_info``.
+
+    ``induction`` is the node's, where ``enclosing_loops`` reports ``None``. ``()``
+    for an op no node holds.
+    """
+    chain = getattr(op, "_loop_chain", ())
+    if not chain:
+        return ()
+    name = op.get_name()
+    levels = []
+    for i, node in enumerate(chain):
+        tiled, tiled_reduction = node.tiling.get(name, ((), ()))
+        levels.append(
+            LoopLevel(
+                group_path=tuple(n.group_id for n in chain[: i + 1]),
+                trip_count=sympy.sympify(node.trip_count),
+                induction=node.induction,
+                tiled_dims=tiled,
+                tiled_reduction_dims=tiled_reduction,
+            )
+        )
+    return tuple(levels)
+
+
+def is_looped(op: Operation) -> bool:
+    """True if a counted loop encloses ``op`` (it runs inside, or is stamped for, a
+    loop). An ``ExternKernel`` that keeps its stamp counts."""
+    return bool(enclosing_loops(op))
 
 
 def loop_depth(op: Operation) -> int:
@@ -112,6 +175,8 @@ def counted_loop_path(
     """
     if isinstance(op, ExternKernel) and not include_extern:
         return ()
+    if _in_built_node(op):
+        return tuple(node.group_id for node in op._loop_chain)  # type: ignore[attr-defined]
     return _group_path(getattr(op, "loop_info", None))
 
 
@@ -123,6 +188,8 @@ def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
     """
     for snode in node.get_nodes():
         if isinstance(snode, SchedulerNode) and snode.node is not None:
+            if _in_built_node(snode.node):
+                return node_levels(snode.node)
             loop_info = getattr(snode.node, "loop_info", None)
             if loop_info is not None:
                 return _levels(loop_info)
@@ -179,10 +246,6 @@ def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
     return step
 
 
-def _depth(loop_info) -> int:
-    return len(_group_path(loop_info))
-
-
 def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     """An op's advance per level: the coefficient of each loop variable in
     ``dep.index``, in host elements. The loop variables are the ``dim_hints``
@@ -202,7 +265,7 @@ def _index_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
         for h in getattr(op, "dim_hints", None) or ()
         if h.loop_var is not None and h.loop_var_range is not None
     ]
-    depth = _depth(op.loop_info)
+    depth = loop_depth(op)
     if not variables:
         if getattr(op.loop_info, "strict_loop_vars", False):
             raise RuntimeError(

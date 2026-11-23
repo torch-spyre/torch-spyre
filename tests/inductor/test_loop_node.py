@@ -43,6 +43,13 @@ from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
 )
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
+    node_levels,
+    stamped_levels,
+)
 from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
@@ -59,6 +66,7 @@ from torch_spyre._inductor.loop_node import (
     move_after,
     move_before,
     owning_list,
+    record_loop_info,
     remove_op,
     replace_op,
     request_loop_nodes,
@@ -754,6 +762,146 @@ class TestTopLevelEntry(unittest.TestCase):
         real, *_ = _nested()
         with self.assertRaises(ValueError):
             top_level_entry(OpsView(real), _Op("stranger"))
+
+
+class TestNodeFacts(unittest.TestCase):
+    """The node holds its group id, trip count and each member's tiled dims, and each
+    leaf op points at its enclosing nodes (stage 9.3a). ``node_levels`` answers from
+    them; ``enclosing_loops`` still answers from the stamp, and they must agree."""
+
+    def _tiled_pair(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_info.loop_tiled_dims = [[1]]
+        b.loop_info.loop_tiled_reduction_dims = [[0]]
+        graph = _graph([_Op("pre"), a, b, _Op("post")])
+        collapse(graph)
+        node = next(o for o in graph.operations if isinstance(o, LoopNode))
+        return graph, node, a, b
+
+    def test_collapse_records_group_id_tiling_and_chain(self):
+        graph, node, a, b = self._tiled_pair()
+        self.assertEqual(node.group_id, 0)
+        self.assertEqual(node.tiling, {"a": ((1,), ()), "b": ((), (0,))})
+        self.assertEqual(a._loop_chain, (node,))
+        self.assertTrue(node.facts_recorded)
+        for op in (a, b):
+            self.assertEqual(
+                [
+                    (
+                        level.group_path,
+                        level.trip_count,
+                        level.tiled_dims,
+                        level.tiled_reduction_dims,
+                    )
+                    for level in node_levels(op)
+                ],
+                [
+                    (
+                        level.group_path,
+                        level.trip_count,
+                        level.tiled_dims,
+                        level.tiled_reduction_dims,
+                    )
+                    for level in stamped_levels(op)
+                ],
+            )
+            self.assertEqual(enclosing_loops(op), node_levels(op))
+        self.assertEqual(counted_loop_path(a), (0,))
+
+    def test_an_op_no_node_holds_answers_from_its_stamp(self):
+        a = _Op("a", (0,), [4])
+        a.loop_info.loop_tiled_dims = [[1]]
+        self.assertEqual(node_levels(a), ())
+        (level,) = enclosing_loops(a)
+        self.assertEqual((level.group_path, level.tiled_dims), ((0,), (1,)))
+        self.assertEqual(counted_loop_path(a), (0,))
+
+    def test_an_op_moved_out_of_its_loop_falls_back_to_its_stamp(self):
+        graph, node, a, b = self._tiled_pair()
+        move_after(graph.operations, node, a)
+        self.assertEqual(node_levels(a), ())
+        self.assertEqual(enclosing_loops(a), stamped_levels(a))
+
+    def test_nested_chain_is_outermost_first(self):
+        b = _Op("b", (0,), [4])
+        c = _Op("c", (0, 0), [4, 2])
+        c.loop_info.loop_tiled_dims = [[], [2]]
+        graph = _graph([b, c])
+        collapse(graph)
+        (outer,) = graph.operations
+        inner = outer.body[1]
+        self.assertEqual(c._loop_chain, (outer, inner))
+        self.assertEqual(b._loop_chain, (outer,))
+        self.assertEqual(inner.tiling["c"], ((2,), ()))
+        self.assertEqual(outer.tiling["c"], ((), ()))
+        self.assertEqual([level.group_path for level in node_levels(c)], [(0,), (0, 0)])
+
+    def test_an_op_placed_in_a_body_joins_its_chain_and_tiling(self):
+        graph, node, a, b = self._tiled_pair()
+        new = _Op("new", (0,), [4])
+        new.loop_info.loop_tiled_dims = [[0]]
+        insert_before(graph.operations, b, new)
+        self.assertEqual(new._loop_chain, (node,))
+        self.assertEqual(node.tiling["new"], ((0,), ()))
+        out = _Op("out")
+        insert_after(graph.operations, node, out)
+        self.assertEqual(out._loop_chain, ())
+
+    def test_moving_an_op_out_of_a_body_clears_its_chain(self):
+        graph, node, a, b = self._tiled_pair()
+        move_after(graph.operations, node, a)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node_levels(a), ())
+
+    def test_a_stamp_written_after_placement_is_recorded_by_record_loop_info(self):
+        graph, node, a, b = self._tiled_pair()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        self.assertNotIn("late", node.tiling)
+        late.loop_info = LoopInfo(
+            loop_group_id=(0,),
+            loop_count=[4],
+            loop_tiled_dims=[[2]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        record_loop_info(late)
+        self.assertEqual(node.tiling["late"], ((2,), ()))
+
+    def test_an_unstamped_op_in_a_body_still_answers_not_looped(self):
+        """Node membership is not yet the truth for an op with no loop_info (stage
+        9.4 makes it so): it answers as it always did, though a helper put it in the
+        body and ``node_levels`` sees the node."""
+        graph, node, a, b = self._tiled_pair()
+        once = _Op("once")
+        insert_before(graph.operations, b, once)
+        self.assertEqual(once._loop_chain, (node,))
+        self.assertEqual(len(node_levels(once)), 1)
+        self.assertEqual(enclosing_loops(once), ())
+        self.assertFalse(is_looped(once))
+        self.assertTrue(is_looped(a))
+
+    def test_replace_op_takes_the_new_ops_tiling(self):
+        graph, node, a, b = self._tiled_pair()
+        new = _Op("a", (0,), [4])
+        new.loop_info.loop_tiled_dims = [[0, 2]]
+        replace_op(graph.operations, a, new)
+        self.assertEqual(new._loop_chain, (node,))
+        self.assertEqual(node.tiling["a"], ((0, 2), ()))
+
+    def test_remove_op_forgets_the_op_but_a_move_keeps_it(self):
+        graph, node, a, b = self._tiled_pair()
+        move_before(graph.operations, a, b)
+        self.assertEqual(node.tiling["b"], ((), (0,)))
+        self.assertEqual(b._loop_chain, (node,))
+        remove_op(graph.operations, a)
+        self.assertNotIn("a", node.tiling)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node.tiling["b"], ((), (0,)))
+
+    def test_hoist_to_front_clears_the_chain(self):
+        graph, node, a, b = self._tiled_pair()
+        OpsView(graph.operations).hoist_to_front([a])
+        self.assertEqual(a._loop_chain, ())
 
 
 class TestDeadcodeOnRealNestedList(unittest.TestCase):
