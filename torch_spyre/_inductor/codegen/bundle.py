@@ -295,7 +295,7 @@ def generate_bundle(
             "a device-read loop count is only supported from the bundle's pool "
             "for now, and this bundle has none"
         )
-    _check_strided_count_sources(loop_bounds, loop_sources, loop_parents, pool_size)
+    _check_count_sources(loop_bounds, loop_sources, loop_parents, pool_size)
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
     # the same logical tensor arg share one function parameter (the first-seen
@@ -779,14 +779,22 @@ def _compile_specs(
 # ---------------------------------------------------------------------------
 
 
-def _check_strided_count_sources(
+def _check_count_sources(
     loop_bounds: list, loop_sources: list, loop_parents: list, pool_size: int
 ) -> None:
-    """Refuse a count whose address moves with an enclosing loop unless that
-    loop exists, has a concrete trip count, and every count it steps over lies
-    inside the pool."""
+    """Refuse a device-read count that lies outside the pool, and one whose
+    address moves with an enclosing loop unless that loop exists, has a concrete
+    trip count, and every count it steps over lies inside the pool."""
     for idx, src in enumerate(loop_sources):
-        if src is None or not src.outer_stride:
+        if src is None:
+            continue
+        first_end = src.pool_offset + _STICK_BYTES
+        if first_end > pool_size:
+            raise Unsupported(
+                f"device-read loop count at byte {src.pool_offset} ends at byte "
+                f"{first_end}, past the {pool_size}-byte pool"
+            )
+        if not src.outer_stride:
             continue
         parent = loop_parents[idx]
         if parent is None:

@@ -563,6 +563,23 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
                     f"pool_offset={offset} is not at the start of a",
                 )
 
+    @expects_raise
+    def test_a_fixed_count_past_the_pool_end(self):
+        """A count that never moves is checked against the pool end too."""
+        self._refuses(
+            self._device_read_loop(source=self._source(pool_offset=self.POOL_SIZE)),
+            f"ends at byte {self.POOL_SIZE + 128}, past the {self.POOL_SIZE}-byte pool",
+        )
+
+    def test_a_fixed_count_in_the_last_stick_of_the_pool(self):
+        """Ending exactly at the pool end is inside it."""
+        last_stick = self.POOL_SIZE - 128
+        bundle = self._run_with_producer(
+            self._device_read_loop(source=self._source(pool_offset=last_stick))
+        )
+
+        self.assertIn(f"%cnt_off_0 = arith.constant {last_stick} : index", bundle)
+
 
 class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
     """With an outer_stride, each trip of the directly enclosing loop reads its
