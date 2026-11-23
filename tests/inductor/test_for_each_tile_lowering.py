@@ -49,7 +49,7 @@ import pytest
 import torch
 from torch._inductor.virtualized import V
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, loop_member_view
 
 from for_each_tile_fixtures import (
     PAGE_HS,
@@ -1522,6 +1522,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor.dependencies import MemoryDep
 
         from torch_spyre._inductor.loop_facts import read_advance
+        from torch_spyre._inductor.loop_node import inherit_loop_membership
         from torch_spyre._inductor.read_copy_elision import _clone_direct_consumer
 
         def read_of(op, name):
@@ -1533,6 +1534,8 @@ class TestSpliceWhileLoops(unittest.TestCase):
             return read_advance(op, dep)
 
         direct = _clone_direct_consumer(reader, record)
+        # As ``_prove_matmul_direct_read`` does: the probe stands in for the consumer.
+        inherit_loop_membership(reader, direct)
         return read_of(reader, copy_name), read_of(direct, source_name)
 
     def _run_graph(self, fn, args):
@@ -1740,14 +1743,12 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertFalse(
                 any(isinstance(op, ir.WhileLoop) for op in graph.operations)
             )
-            tiled_ops = [
-                op for op in graph.operations if getattr(op, "loop_info", None)
-            ]
+            tiled_ops = [op for op in graph.operations if loop_member_view(op)]
             self.assertTrue(
-                tiled_ops, "expected at least one op with loop_info stamped"
+                tiled_ops, "expected at least one op with loop_member stamped"
             )
             for op in tiled_ops:
-                info = op.loop_info
+                info = loop_member_view(op)
                 self.assertEqual(info.loop_group_id, (0,))
 
     def test_private_in_graph_fill_keeps_single_buffer(self):
@@ -1936,14 +1937,12 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertFalse(
                 any(isinstance(op, ir.WhileLoop) for op in graph.operations)
             )
-            tiled_ops = [
-                op for op in graph.operations if getattr(op, "loop_info", None)
-            ]
+            tiled_ops = [op for op in graph.operations if loop_member_view(op)]
             self.assertTrue(
-                tiled_ops, "expected at least one op with loop_info stamped"
+                tiled_ops, "expected at least one op with loop_member stamped"
             )
             for op in tiled_ops:
-                info = op.loop_info
+                info = loop_member_view(op)
                 self.assertEqual(info.loop_group_id, (0,))
 
             records_by_name = {
@@ -1993,7 +1992,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         self.assertTrue(markers, "expected surviving STAR_DEP_KEPT markers")
         self.assertIn(
             (0, 1),
-            {op.loop_info.loop_group_id for op in markers},
+            {loop_member_view(op).loop_group_id for op in markers},
             "an inner marker synthesized during its splice lost the outer level",
         )
 
@@ -2004,7 +2003,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         ]
         self.assertTrue(snapshots, "expected the online-softmax carry snapshot")
         for op in snapshots:
-            self.assertEqual(op.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(loop_member_view(op).loop_group_id, (0, 1))
 
     def test_noncontiguous_input_materialization_streams_one_tile(self):
         """A prefix view is staged one tile at a time after loop splicing."""
@@ -2097,8 +2096,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
             self.assertFalse(
                 any(
-                    getattr(op, "loop_info", None)
-                    and list(op.data.ranges) == [4, 64, 1, 8, 128]
+                    loop_member_view(op) and list(op.data.ranges) == [4, 64, 1, 8, 128]
                     for op, _identity in identities
                 ),
                 "the full-cache exact-stride copy remained inside the loop",
@@ -2184,7 +2182,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertEqual(direct_record.copy_name, input_copy.get_name())
             self.assertEqual(direct_record.source_name, source_name)
 
-            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(loop_member_view(direct_reader).loop_group_id, (0, 1))
             # Per level, outermost first: the consumer reads the staged copy one
             # head tile further each outer trip, and the direct read of the source
             # (what replaces the copy) moves by its own source stride.
@@ -2285,7 +2283,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             direct_record = direct_reader._read_copy_elision_record
             self.assertEqual(direct_record.copy_name, input_copy.get_name())
             self.assertEqual(direct_record.source_name, source_name)
-            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(loop_member_view(direct_reader).loop_group_id, (0, 1))
             # Invariant in the outer loop, one sequence tile per inner trip.
             self.assertEqual(
                 self._advances(
@@ -2307,7 +2305,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
 
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _identity_chain_has_valid_loop_advances,
         )
@@ -2325,7 +2323,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         )
         reader = mock.Mock()
         reader.get_name.return_value = "reader"
-        reader.loop_info = LoopInfo(
+        reader.loop_member = LoopMember(
             loop_group_id=(0, 1),
             loop_count=[2, 4],
             loop_tiled_dims=[[], [0]],
@@ -2558,7 +2556,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             "the shared fill must be copied before an inner loop",
         )
         for op in copies:
-            info = getattr(op, "loop_info", None)
+            info = loop_member_view(op)
             self.assertIsNotNone(
                 info, f"{op.get_name()} is not a member of the enclosing loop"
             )
@@ -2742,8 +2740,8 @@ class TestDrainMaterialization(unittest.TestCase):
         # The anchor is the last operation of the loop's group subtree.
         expected_anchor = None
         for op in graph.operations:
-            loop_info = getattr(op, "loop_info", None)
-            if loop_info is not None and loop_info.loop_group_id[:1] == (0,):
+            loop_member = loop_member_view(op)
+            if loop_member is not None and loop_member.loop_group_id[:1] == (0,):
                 expected_anchor = op
         self.assertIsNotNone(expected_anchor)
         self.assertIs(plan.anchor_op, expected_anchor)
@@ -2787,24 +2785,24 @@ class TestDrainMaterialization(unittest.TestCase):
             with mock.patch.object(storage, "_loop_carry_record", broken):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("nested loop level"):
-            from torch_spyre._inductor.loop_info import LoopInfo
+            from torch_spyre._inductor.loop_facts import counted_loop_path
 
-            nested = LoopInfo(
-                loop_group_id=(0, 0),
-                loop_count=[sympy.Integer(4), sympy.Integer(4)],
-                loop_tiled_dims=[[], []],
-            )
-            with mock.patch.object(update, "loop_info", nested):
+            # The update sits two loops deep. (The nodes own the loop facts, so the
+            # variant is made at the accessor the plan asks, not on the op.)
+            def nested_path(op):
+                return (0, 0) if op is update else counted_loop_path(op)
+
+            with mock.patch.object(allocator_module, "_access_group_path", nested_path):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("storage is itself a loop member"):
-            from torch_spyre._inductor.loop_info import LoopInfo
+            from torch_spyre._inductor.loop_node import LoopMember
 
-            tagged = LoopInfo(
+            tagged = LoopMember(
                 loop_group_id=(0,),
                 loop_count=[sympy.Integer(4)],
                 loop_tiled_dims=[[]],
             )
-            with mock.patch.object(storage, "loop_info", tagged, create=True):
+            with mock.patch.object(storage, "loop_member", tagged, create=True):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("second writer into the storage"):
             other = next(
@@ -2845,7 +2843,7 @@ class TestDrainMaterialization(unittest.TestCase):
                 for op in graph.operations
                 if op is not storage
                 and op is not update
-                and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+                and getattr(loop_member_view(op), "loop_group_id", None)
             )
             real_read_writes = allocator_module.op_read_writes
             injected = MemoryDep(storage.get_name(), sympy.Integer(0), (), ())
@@ -3068,8 +3066,7 @@ class TestDrainMaterialization(unittest.TestCase):
         last_loop_member_index = max(
             i
             for i, n in enumerate(ordered)
-            if isinstance(n, SchedulerNode)
-            and getattr(n.node, "loop_info", None) is not None
+            if isinstance(n, SchedulerNode) and loop_member_view(n.node) is not None
         )
         self.assertLess(last_loop_member_index, drain_index)
 
@@ -5456,7 +5453,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
         own 3-leaf (m, denom, acc) carry over K/V tiles -- previously only
         exercised by test_nested_late_created_ops_inherit_ancestor_loop_info
-        (loop_info/marker propagation on mocked IR, no device compile, no
+        (loop_member/marker propagation on mocked IR, no device compile, no
         numerics). This closes that gap: same dl16-rounded-reference,
         xavier-input methodology as test_carry_mode_online_softmax
         (test_for_each_tile_e2e.py), since the inner loop is exactly that
@@ -5547,7 +5544,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         self.assertTrue(consumers, "no read carries the 32*u0 per-trip advance")
         for op, advance in consumers:
-            info = getattr(op, "loop_info", None)
+            info = loop_member_view(op)
             self.assertIsNotNone(info, "the consumer was not stamped")
             loop_tiled = [pos for level in info.loop_tiled_dims for pos in level]
             self.assertNotIn(
@@ -5714,10 +5711,10 @@ class TestStampDirectLoopInfo(unittest.TestCase):
 
             _stamp_direct_loop_info(group_ops, loop_var, result.trip_count, group_idx=0)
 
-        stamped = [op for op in group_ops if getattr(op, "loop_info", None)]
-        self.assertTrue(stamped, "no op received a loop_info stamp")
+        stamped = [op for op in group_ops if loop_member_view(op)]
+        self.assertTrue(stamped, "no op received a loop_member stamp")
         for op in stamped:
-            info = op.loop_info
+            info = loop_member_view(op)
             self.assertEqual(info.loop_group_id, (0,))
             self.assertEqual(info.loop_count, [result.trip_count])
 
@@ -5778,7 +5775,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         tiled_ops = [
             op
             for op in group_ops
-            if getattr(op, "loop_info", None) and op.loop_info.loop_tiled_dims[-1]
+            if loop_member_view(op) and loop_member_view(op).loop_tiled_dims[-1]
         ]
         self.assertTrue(
             tiled_ops,
@@ -5850,7 +5847,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             # context, same as the stamping call above.
             saw_advancing_read = False
             for op in group_ops:
-                info = getattr(op, "loop_info", None)
+                info = loop_member_view(op)
                 if not info:
                     continue
                 self.assertEqual(info.loop_group_id, (0,))
