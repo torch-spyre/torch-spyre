@@ -500,7 +500,9 @@ class CountSource:
         outer_stride: Bytes the count moves per trip of the directly enclosing
             loop. 0 reads one count for every trip (as in decode); 128 reads
             one stick per trip, ``pool_offset + 128 * i`` (as in prefill, one
-            count per expert).
+            count per expert). Only the directly enclosing loop moves the count,
+            which is what chunked prefill needs (the expert loop over the tile
+            loop).
     """
 
     pool_offset: int
