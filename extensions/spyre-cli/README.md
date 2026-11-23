@@ -161,6 +161,18 @@ print(tensors[2].cpu())
 `tensors_from_spec` allocates only. Nothing writes to the inputs afterwards, so
 what you put there is what the kernel sees.
 
+Each tensor has the host strides the compiled graph used, which are not always
+contiguous (a transposed input, for instance). To fill one of those, copy from
+a host tensor with the same strides: the host-to-device copy does not write a
+non-contiguous tensor from a contiguous source.
+
+```
+t = tensors[0]
+host = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype)
+host.copy_(my_a)
+t.copy_(host)
+```
+
 `spyre_cli.default_tensors(spec, tensors)` fills the inputs with ones instead,
 which is what `spyre launch <folder>` does when given no data of its own. Ones
 tell you a folder loads and runs and nothing about whether it computes -- an add

@@ -118,7 +118,16 @@ def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:
     :func:`default_tensors` is what gives it torch.ones.
 
     Each tensor gets the recorded device layout, which is the part that cannot
-    be reconstructed from shape and dtype.
+    be reconstructed from shape and dtype, and the recorded host strides, since
+    a graph input or output can be non-contiguous. A layout this build cannot
+    rebuild is refused rather than replaced by the default arrangement: a
+    tensor of the right shape and dtype in the wrong arrangement launches and
+    returns wrong data.
+
+    To fill a tensor whose recorded strides are not contiguous, copy from a
+    host tensor with the same strides, ``torch.empty_strided(t.shape,
+    t.stride(), dtype=t.dtype)``: the host to device copy does not write a
+    non-contiguous destination from a contiguous source.
 
        The pool tensor, when the kernel takes one, is prepended exactly as
     inductor's ``call_kernel`` does; it is not one of ``spec.args``, so the
@@ -129,22 +138,34 @@ def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:
         tensors.append(torch.empty(spec.pool_size, dtype=torch.uint8, device="spyre"))
 
     for arg in spec.args:
+        where = f"arg {arg.arg_index}"
         try:
             shape = arg.resolved_shape(bindings)
+            stride = arg.resolved_stride(bindings)
+            offset = arg.resolved_storage_offset(bindings)
         except UnboundSymbol as sym:
             raise ValueError(
-                f"arg {arg.arg_index}: dimension '{sym}' is symbolic. "
-                f"Bind it with --bind {sym}=N"
+                f"{where}: dimension '{sym}' is symbolic. Bind it with --bind {sym}=N"
             ) from None
         except UnresolvedExpression as expr:
             raise ValueError(
-                f"arg {arg.arg_index}: dimension '{expr}' was recorded as an "
-                "expression, so the spec cannot size this tensor. Allocate it "
-                "yourself and launch through the SDK."
+                f"{where}: dimension '{expr}' was recorded as an expression, so "
+                "the spec cannot size this tensor. Allocate it yourself and "
+                "launch through the SDK."
             ) from None
-        tensors.append(
-            _alloc(shape, getattr(torch, arg.dtype), spyre_layout(arg.layout))
-        )
+        if offset != 0:
+            raise ValueError(
+                f"{where}: recorded at storage offset {offset}; a tensor rebuilt "
+                "from the spec cannot be placed at an offset into a larger "
+                "storage. Allocate it yourself and launch through the SDK."
+            )
+        try:
+            layout = spyre_layout(arg.layout)
+        except ValueError as e:
+            raise ValueError(
+                f"{where}: {e}, so the tensor cannot be allocated as the kernel expects"
+            ) from None
+        tensors.append(_alloc(shape, getattr(torch, arg.dtype), layout, stride))
     return tensors
 
 
@@ -156,8 +177,9 @@ def default_tensors(spec, tensors: Sequence) -> None:
     A caller that cares about numerics allocates with
     :func:`tensors_from_spec` and writes its own values instead.
 
-    Outputs are left alone, and so are ``input_output`` arguments, whose
-    starting value is part of what is being tested.
+    Outputs are left alone. ``input_output`` arguments (an in-place op's
+    target) get ones as well: the kernel reads them, so without a value the
+    smoke test would compute on uninitialised memory.
 
     The ones are written by a copy from the host rather than ``fill_``. A
     declared dynamic tensor bound below its maximum is allocated at the
@@ -167,53 +189,73 @@ def default_tensors(spec, tensors: Sequence) -> None:
     arrives.
     """
     for arg in spec.args:
-        if arg.role == "input":
+        if arg.role in ("input", "input_output"):
             tensor = tensors[arg.arg_index + spec.arg_offset]
-            tensor.copy_(torch.ones(tuple(tensor.shape), dtype=tensor.dtype))
+            # From a host tensor with the destination's strides: the host to
+            # device copy does not write a non-contiguous (e.g. transposed)
+            # destination from a contiguous source.
+            ones = torch.empty_strided(
+                tuple(tensor.shape), tuple(tensor.stride()), dtype=tensor.dtype
+            )
+            ones.fill_(1.0)
+            tensor.copy_(ones)
 
 
-def _alloc(shape, dtype, layout):
-    """An uninitialised spyre tensor of ``shape``, in ``layout`` when given."""
-    if layout is None:
-        return torch.empty(shape, dtype=dtype, device="spyre")
+def _alloc(shape, dtype, layout, stride=None):
+    """An uninitialised spyre tensor of ``shape`` in ``layout``.
 
+    ``stride`` is the recorded host stride; None (a spec that predates it)
+    means contiguous.
+    """
     # Unlike the ordinary factories, this goes straight to the allocator and
     # does not bring the runtime up, and it can be our first allocation.
     torch.spyre._impl._lazy_init()
-    strides = torch.empty(shape, dtype=dtype, device="meta").stride()
+    if stride is None:
+        stride = torch.empty(shape, dtype=dtype, device="meta").stride()
     return spyre_empty_with_layout(
-        tuple(shape), tuple(strides), dtype, layout, torch.device("spyre")
+        tuple(shape), tuple(stride), dtype, layout, torch.device("spyre")
     )
 
 
 def spyre_layout(layout):
     """Build a ``SpyreTensorLayout`` from a spec's ``layout`` block.
 
-    Returns None when the block cannot be turned into a layout (an older spec
-    missing a field, or an enum spelling this build does not know), so a caller
-    can fall back to the default arrangement rather than fail.
+    Raises ``ValueError`` when the block cannot be turned into a layout: no
+    layout recorded, an enum spelling this build does not know, or values the
+    constructor rejects. There is no fallback to the default arrangement,
+    because a kernel compiled against a particular packing returns wrong data
+    for a tensor in any other one.
     """
     if layout is None:
-        return None
+        raise ValueError("no device layout is recorded for it")
+    device_dtype = getattr(DataFormats, str(layout.device_dtype), None)
+    if not isinstance(device_dtype, DataFormats):
+        raise ValueError(
+            f"its device dtype {layout.device_dtype!r} is not one this build knows"
+        )
+    arrangement_name = layout.element_arrangement or "STANDARD"
+    arrangement = getattr(ElementArrangement, str(arrangement_name), None)
+    if not isinstance(arrangement, ElementArrangement):
+        raise ValueError(
+            f"its element arrangement {arrangement_name!r} is not one this build knows"
+        )
+    # valid_elements is a required argument of the only constructor that takes
+    # a device_size and stride_map. A spec that predates the field gives {},
+    # which the constructor documents as "unknown".
+    valid_elements = {
+        tuple(int(d) for d in dims): int(count)
+        for dims, count in (layout.valid_elements or [])
+    }
     try:
-        # valid_elements is a required argument of the only constructor that
-        # takes a device_size and stride_map. A spec that predates the field
-        # gives {}, which the constructor documents as "unknown".
-        valid_elements = {
-            tuple(int(d) for d in dims): int(count)
-            for dims, count in (layout.valid_elements or [])
-        }
         return SpyreTensorLayout(
             [int(d) for d in layout.device_size],
             [int(x) for x in layout.stride_map],
-            getattr(DataFormats, layout.device_dtype),
+            device_dtype,
             valid_elements,
-            getattr(ElementArrangement, layout.element_arrangement or "STANDARD"),
+            arrangement,
         )
-    except (AttributeError, TypeError, ValueError):
-        # An enum spelling this build does not know, or a field it predates:
-        # fall back to the default arrangement rather than fail the launch.
-        return None
+    except (TypeError, ValueError, RuntimeError) as e:
+        raise ValueError(f"its recorded layout is not valid here ({e})") from None
 
 
 def device_layout_of(tensor):
@@ -234,13 +276,15 @@ def _enum_name(value) -> str:
     return getattr(value, "name", None) or str(value).rsplit(".", 1)[-1]
 
 
-def _layout_mismatch(arg, tensor) -> Optional[str]:
-    """How ``tensor``'s device layout differs from what ``arg`` records.
+def _layout_mismatch(want, got) -> Optional[str]:
+    """How device layout ``got`` differs from the recorded ``want``, or None.
 
-    None when they agree, or when the comparison cannot be made. A tensor whose
-    layout differs is packed differently along the sticks: the launch will
-    succeed and return wrong data, which is exactly what the spec exists to
-    prevent, so this is reported like any other mismatch.
+    A tensor whose layout differs is packed differently along the sticks: the
+    launch will succeed and return wrong data, which is exactly what the spec
+    exists to prevent, so this is reported like any other mismatch. The element
+    arrangement counts too: an FP8 tensor in ``STANDARD`` and one in
+    ``QFP8CH`` can share device_size and stride_map and still hold different
+    bytes.
 
     Size-1 device dimensions are left out of the comparison. Such a dimension is
     always indexed at 0, so its stride never contributes to an address, and two
@@ -249,12 +293,6 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
     ``torch.empty((512, 1))`` gets ``[1, 512, 64]``, and either launches
     correctly.
     """
-    want = spyre_layout(arg.layout)
-    if want is None:
-        return None
-    got = device_layout_of(tensor)
-    if got is None:
-        return None
 
     def placement(layout) -> list:
         return [
@@ -263,20 +301,49 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
             if int(size) != 1
         ]
 
-    if placement(got) == placement(want):
-        return None
+    if placement(got) != placement(want):
 
-    def describe_layout(layout) -> str:
+        def describe_layout(layout) -> str:
+            return (
+                f"device_size={list(layout.device_size)} "
+                f"stride_map={list(layout.stride_map)}"
+            )
+
         return (
-            f"device_size={list(layout.device_size)} "
-            f"stride_map={list(layout.stride_map)}"
+            f"expected layout {describe_layout(want)}, "
+            f"got {describe_layout(got)} -- the tensor is packed differently "
+            "along the sticks, so the launch would return wrong data"
         )
+    if got.element_arrangement != want.element_arrangement:
+        return (
+            f"expected element arrangement {_enum_name(want.element_arrangement)}, "
+            f"got {_enum_name(got.element_arrangement)} -- the same placement "
+            "holds different bytes, so the launch would return wrong data"
+        )
+    return None
 
-    return (
-        f"expected layout {describe_layout(want)}, "
-        f"got {describe_layout(got)} -- the tensor is packed differently "
-        "along the sticks, so the launch would return wrong data"
-    )
+
+def _stride_mismatch(want_shape, want_stride, want_offset, tensor) -> Optional[str]:
+    """How ``tensor``'s host strides or offset differ from the recorded ones.
+
+    Size-1 dimensions are skipped: torch leaves their strides arbitrary, and
+    they never contribute to an address.
+    """
+    if want_stride is not None:
+
+        def significant(stride) -> list:
+            return [s for s, n in zip(stride, want_shape) if n != 1]
+
+        got_stride = list(tensor.stride())
+        if significant(got_stride) != significant(want_stride):
+            return (
+                f"expected host strides {want_stride}, got {got_stride} -- "
+                "the compiled graph reads and writes this tensor with the "
+                "recorded strides"
+            )
+    if tensor.storage_offset() != want_offset:
+        return f"expected storage offset {want_offset}, got {tensor.storage_offset()}"
+    return None
 
 
 def check_tensors_against_spec(
@@ -286,8 +353,8 @@ def check_tensors_against_spec(
 
     ``spec`` may be a ``LaunchSpec`` or the dict read off disk. Reports every
     problem rather than the first, so one run tells the caller everything to
-    fix. Well-formed is not correct: this checks count, shape, dtype and layout,
-    and says nothing about the values in the tensors.
+    fix. Well-formed is not correct: this checks count, shape, host strides,
+    dtype and device layout, and says nothing about the values in the tensors.
     """
     if not isinstance(spec, LaunchSpec):
         spec = LaunchSpec.from_dict(spec)
@@ -321,6 +388,8 @@ def check_tensors_against_spec(
 
         try:
             want_shape = arg.resolved_shape(bindings)
+            want_stride = arg.resolved_stride(bindings)
+            want_offset = arg.resolved_storage_offset(bindings)
         except UnboundSymbol as e:
             problems.append(
                 f"{where}: dimension '{e}' is symbolic and unbound "
@@ -342,6 +411,18 @@ def check_tensors_against_spec(
             problems.append(
                 f"{where}: expected shape {want_shape}, got {got_shape}{hint}"
             )
+        else:
+            mismatch = _stride_mismatch(want_shape, want_stride, want_offset, tensor)
+            if mismatch:
+                problems.append(f"{where}: {mismatch}")
+
+        got_layout = device_layout_of(tensor)
+        if got_layout is None:
+            problems.append(
+                f"{where}: not a Spyre tensor, so it has no device layout to "
+                "launch with"
+            )
+            continue
 
         # The device format is the contract, not the host dtype: float16,
         # bfloat16 and bool are all SEN169_FP16, and one compiled kernel
@@ -352,13 +433,11 @@ def check_tensors_against_spec(
         # diverge from what the caller expects.
         got_dtype = str(tensor.dtype).removeprefix("torch.")
         want_device = arg.layout.device_dtype if arg.layout else None
-        got_layout = device_layout_of(tensor)
-        got_device = _enum_name(got_layout.device_dtype) if got_layout else None
+        got_device = _enum_name(got_layout.device_dtype)
 
-        if want_device is None or got_device is None:
-            # A CPU tensor has no device layout, and a spec from a newer build
-            # may name a format this one cannot resolve. The host dtype is then
-            # the only thing both sides have.
+        if want_device is None:
+            # No layout recorded: the host dtype is the only thing to compare,
+            # and the missing layout is reported below.
             if got_dtype != arg.dtype:
                 problems.append(f"{where}: expected dtype {arg.dtype}, got {got_dtype}")
         elif got_device != want_device:
@@ -375,7 +454,12 @@ def check_tensors_against_spec(
                 stacklevel=2,
             )
 
-        mismatch = _layout_mismatch(arg, tensor)
+        try:
+            want_layout = spyre_layout(arg.layout)
+        except ValueError as e:
+            problems.append(f"{where}: {e}, so its layout cannot be checked")
+            continue
+        mismatch = _layout_mismatch(want_layout, got_layout)
         if mismatch:
             problems.append(f"{where}: {mismatch}")
 

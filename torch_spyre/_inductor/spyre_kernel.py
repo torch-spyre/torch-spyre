@@ -709,6 +709,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._live_call_arg_names: list[str] | None = None
         # Per-argument HOST shape/dtype for the launch spec, keyed by arg_index.
         self._launch_args: dict[int, LaunchArg] = {}
+        # Arguments _record_launch_spec_arg could not describe. Any entry means
+        # the kernel gets no launch spec at all, rather than one with a hole.
+        self._launch_spec_unrecorded: list[str] = []
         # The op names of the scheduler nodes codegenned into this kernel, set by
         # the scheduler before any spec is built; empty means "unknown", which
         # makes every buffer look non-local.  Read by create_tensor_arg for
@@ -1412,8 +1415,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         }
         return expr.xreplace(exact) if exact else expr
 
+    def _launch_spec_dim(self, dim):
+        """One recorded shape, stride or offset entry: an int, or a symbol's name.
+
+        A free symbol (mark_dynamic/dynamic=True) is named, so the launcher can
+        bind it, rather than baked in as a hint. An entry that is still an
+        expression after folding is recorded as written, and the reader refuses
+        it rather than guess.
+        """
+        if isinstance(dim, (int, sympy.Integer)):
+            return int(dim)
+        return str(self._fold_exact_divisions(dim))
+
     def _record_launch_spec_arg(self, name: str, tensor_arg) -> None:
-        """Record one argument's HOST shape and dtype for the launch spec.
+        """Record one argument's HOST view for the launch spec.
 
         Called from ``codegen_kernel`` as each ``arg_index`` is assigned, which
         is the last point where this is knowable: the host view lives on the
@@ -1421,46 +1436,65 @@ class SpyreKernel(Kernel[CSEVariable]):
         ``FixedLayout`` with the device one), and ``TensorArg`` keeps only the
         device half.
 
+        An argument seen again with the other role is both read and written, so
+        it becomes ``input_output``: keeping the last record would make an
+        in-place input look like a plain output. An argument that cannot be
+        recorded is remembered, and ``launch_args`` then returns nothing.
+
         Symbolic dims are recorded as the symbol's name and kept off
         ``TensorArg`` by design so as not to invalidate every cached kernel.
         """
         try:
             buf = V.graph.try_get_buffer(name)
             if buf is None:
-                return
+                raise ValueError(f"{name} is not a buffer of this graph")
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
-                return
+                raise ValueError(f"{name} has no FixedTiledLayout: {layout}")
 
-            shape: list = []
-            for dim in layout.size:
-                if isinstance(dim, (int, sympy.Integer)):
-                    shape.append(int(dim))
-                else:
-                    # A free symbol (mark_dynamic/dynamic=True): name it and let
-                    # the launcher bind it, rather than baking in a hint. A dim
-                    # that is still an expression after folding is recorded as
-                    # written, and the reader refuses it rather than guess.
-                    shape.append(str(self._fold_exact_divisions(dim)))
+            role = "input" if tensor_arg.is_input else "output"
+            prior = self._launch_args.get(tensor_arg.arg_index)
+            if prior is not None and prior.role != role:
+                role = "input_output"
 
             record = LaunchArg(
                 arg_index=tensor_arg.arg_index,
-                role="input" if tensor_arg.is_input else "output",
-                shape=shape,
+                role=role,
+                shape=[self._launch_spec_dim(d) for d in layout.size],
                 dtype=str(layout.dtype).removeprefix("torch."),
                 layout=LaunchArgLayout.from_device_layout(layout.device_layout),
+                stride=[self._launch_spec_dim(s) for s in layout.stride],
+                storage_offset=self._launch_spec_dim(layout.offset),
             )
         except Exception:  # noqa: BLE001 - no spec is better than a failed compile
             logger.debug("could not record launch arg for %s", name, exc_info=True)
+            self._launch_spec_unrecorded.append(name)
             return
         self._launch_args[tensor_arg.arg_index] = record
 
     def launch_args(self) -> list[LaunchArg]:
         """The recorded per-argument host records, in ``arg_index`` order.
 
-        Populated after ``codegen_kernel`` is run.
+        Populated after ``codegen_kernel`` is run. All or nothing: empty unless
+        every argument the kernel is called with was recorded, because a spec
+        with a hole would give every later tensor the wrong position.
         """
-        return [self._launch_args[i] for i in sorted(self._launch_args)]
+        indices = sorted(self._launch_args)
+        live = self._live_call_arg_names
+        if (
+            self._launch_spec_unrecorded
+            or live is None
+            or indices != list(range(len(live)))
+        ):
+            if self._launch_args or self._launch_spec_unrecorded:
+                logger.debug(
+                    "no launch spec: recorded args %s of %s; could not record %s",
+                    indices,
+                    live,
+                    self._launch_spec_unrecorded,
+                )
+            return []
+        return [self._launch_args[i] for i in indices]
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""

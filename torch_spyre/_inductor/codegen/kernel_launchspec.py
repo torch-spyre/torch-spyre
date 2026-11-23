@@ -78,8 +78,13 @@ class LaunchArg:
     """One positional argument of a compiled kernel.
 
     ``arg_index`` *is* the contract: binding is positional, which is why there
-    is deliberately no per-argument name. ``shape`` holds ints, or a symbol's
-    name for a dimension only known at launch.
+    is deliberately no per-argument name. ``shape`` and ``stride`` hold ints,
+    or a symbol's name for a dimension only known at launch.
+
+    ``stride`` and ``storage_offset`` are the HOST view the compiled graph used.
+    A graph input or output can be non-contiguous (a transposed output, say), and
+    a tensor rebuilt with contiguous strides reads back differently. ``stride``
+    is None in a spec written before it was recorded, which means contiguous.
     """
 
     arg_index: int
@@ -87,21 +92,34 @@ class LaunchArg:
     shape: list[Any]
     dtype: str
     layout: Optional[LaunchArgLayout] = None
+    stride: Optional[list[Any]] = None
+    storage_offset: Any = 0
 
     @classmethod
     def from_dict(cls, raw: dict) -> "LaunchArg":
         layout = raw.get("layout")
+        stride = raw.get("stride")
         return cls(
             arg_index=raw["arg_index"],
             role=raw["role"],
             shape=list(raw["shape"]),
             dtype=raw["dtype"],
             layout=LaunchArgLayout.from_dict(layout) if layout else None,
+            stride=list(stride) if stride is not None else None,
+            storage_offset=raw.get("storage_offset", 0),
         )
 
     def resolved_shape(self, bindings: Optional[dict] = None) -> list[int]:
         """This argument's extents, with symbols bound."""
         return resolve_shape(self.shape, bindings)
+
+    def resolved_stride(self, bindings: Optional[dict] = None) -> Optional[list[int]]:
+        """This argument's host strides, with symbols bound; None if unrecorded."""
+        return None if self.stride is None else resolve_shape(self.stride, bindings)
+
+    def resolved_storage_offset(self, bindings: Optional[dict] = None) -> int:
+        """This argument's host storage offset, with symbols bound."""
+        return resolve_shape([self.storage_offset], bindings)[0]
 
 
 def _enum_name(value) -> str:
@@ -157,7 +175,7 @@ class LaunchSpec:
             symbols={
                 dim: {}
                 for arg in args
-                for dim in arg.shape
+                for dim in [*arg.shape, *(arg.stride or [])]
                 if isinstance(dim, str) and dim.isidentifier()
             },
         )
@@ -168,13 +186,25 @@ class LaunchSpec:
 
         Unknown top-level keys are ignored so a newer minor spec still loads;
         a newer *major* is refused by ``load_launch_spec`` before this runs.
+
+        A spec whose ``arg_index`` values are not exactly 0..n-1 is refused:
+        binding is positional, so a missing or repeated index would put every
+        later tensor in the wrong slot.
         """
+        args = sorted(
+            (LaunchArg.from_dict(a) for a in raw["args"]),
+            key=lambda a: a.arg_index,
+        )
+        indices = [a.arg_index for a in args]
+        if indices != list(range(len(args))):
+            raise ValueError(
+                f"launch spec for {raw.get('kernel_name')!r} does not describe "
+                f"every argument: arg_index values are {indices}, expected "
+                f"0..{len(args) - 1}"
+            )
         return cls(
             kernel_name=raw["kernel_name"],
-            args=sorted(
-                (LaunchArg.from_dict(a) for a in raw["args"]),
-                key=lambda a: a.arg_index,
-            ),
+            args=args,
             pool_size=raw.get("pool_size", 0),
             bundle_symbolic_args=raw.get("bundle_symbolic_args", True),
             emitter=raw.get("emitter"),
