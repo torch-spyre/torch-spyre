@@ -106,18 +106,18 @@ Full reference: [GitHub Actions](github-actions.md). Short version for a
        gha-run-id: ${{ github.run_id }}
        trigger-type: regression
        component: your-repo-name
-       schema: v2
-       clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-       clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-       clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-       clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-       clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+       clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+       clickhouse-v2-port: ${{ secrets.CLICKHOUSE_V2_PORT || secrets.CLICKHOUSE_PORT }}
+       clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+       clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
        clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
    ```
 
-3. **Set the five (or six, with `_V2`) `CLICKHOUSE_*` secrets** at the repo
-   or org level. Leaving `clickhouse-host` empty is a supported, clean no-op
-   — useful for a fork or a repo that isn't ready to write yet.
+3. **Set the `CLICKHOUSE_V2_USER` and `CLICKHOUSE_V2_PASSWORD` secrets** (your repo's
+   scoped login) at the repo or org level; `CLICKHOUSE_V2_HOST` / `CLICKHOUSE_V2_PORT` are
+   optional and default to `CLICKHOUSE_HOST` / `CLICKHOUSE_PORT`. Leaving
+   `clickhouse-v2-host` empty is a supported, clean no-op — useful for a fork or a repo that
+   isn't ready to write yet; a host with no login fails the step.
 
 4. **If you're not calling from `workflow_run`**, you don't need the
    download-artifacts dance every existing `push-*-to-clickhouse.yaml`

@@ -34,7 +34,6 @@ from .cost_features import (
     _tiled_symbols_per_level as _tiled_symbols_per_level,
     _dep_index as _dep_index,
     _level_loop_vars as _level_loop_vars,
-    _stamped_advances as _stamped_advances,
     _loop_var_advances as _loop_var_advances,
     _loop_factor_for_index as _loop_factor_for_index,
     _tiled_flag as _tiled_flag,

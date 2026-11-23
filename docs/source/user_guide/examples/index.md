@@ -26,6 +26,8 @@ common Torch-Spyre use cases.
 | `tensor_layout.py` | Moving a tensor to Spyre with an explicit on-device layout |
 | `custom_op.py` | Registering a custom op with a Spyre lowering |
 | `flash_attention.py` | Block-wise flash attention with online softmax |
+| `linear_attention.py` | Chunkwise causal linear attention with a normalizer and a carried state (`torch.ops.spyre.linear_attention`) |
+| `fft.py` | Discrete Fourier transform (`fft`/`fft2`/`fftn`) as a device matmul |
 | `hf_model.py` | Running a HuggingFace causal LM through hf-adapters |
 
 ## Distributed Examples
@@ -42,6 +44,9 @@ common Torch-Spyre use cases.
 | `distributed/compiled/all_gather_demo_multirank.py` | Multi-rank all-gather walkthrough |
 | `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
 | `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
+| `distributed/compiled/all_reduce_coalesced_demo_multirank.py` | Multi-rank coalesced allreduce, decomposed into per-tensor allreduce plans |
+| `distributed/compiled/all_gather_coalesced_demo_multirank.py` | Multi-rank coalesced all-gather, decomposed into per-tensor all-gather plans |
+| `distributed/compiled/reduce_scatter_demo_multirank.py` | Multi-rank reduce-scatter via `torch.compile`'s plan/run collective ops |
 
 ## Scratchpad Planning Examples
 

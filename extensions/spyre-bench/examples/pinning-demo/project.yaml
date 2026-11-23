@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# pinning-demo: does pinning the process tree to the CPUs local to the accelerators change decode latency, per node class?
+# Synthetic: node classes, counts and values are placeholders. Everything is local, so no --central is needed.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: pinning-demo}
+spec:
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [decode]  # tp2 holds the one-process-per-rank variant: --suite tp2
+  default_environment: node-a-unpinned
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.node_class, env.label.cpu_pinning]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decode}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: node-a}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: node-a}}
+  host_profile: {governor: performance, smt: "on"}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: node-b}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: node-b}}
+  host_profile: {governor: performance, smt: "off"}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: node-a-unpinned, description: "two cards on a node-a host, no CPU pinning requested"}
+spec:
+  devices:
+    requests:
+      - {name: cards, device_class: spyre/pf, count: 2, selectors: [{attribute: spyre.profile, eq: a}]}
+  host: {node_class: node-a, arch: x86_64, exclusive: true}
+  labels: {node_class: node-a, device.count: 2}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: node-a-device-local, description: "same request, process tree pinned to the CPUs local to the cards"}
+spec:
+  base: node-a-unpinned
+  patch: {host: {cpu_pinning: {policy: device_local, require_verified: true}}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: node-b-unpinned}
+spec:
+  base: node-a-unpinned
+  patch: {host: {node_class: node-b}, labels: {node_class: node-b}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: node-b-device-local}
+spec:
+  base: node-b-unpinned
+  patch: {host: {cpu_pinning: {policy: device_local, require_verified: true}}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a}
+spec: {assets: [{role: weights, asset: demo-llm-a-weights}], family: demo, architecture: decoder-only}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: tp2}
+spec: {type: perf}

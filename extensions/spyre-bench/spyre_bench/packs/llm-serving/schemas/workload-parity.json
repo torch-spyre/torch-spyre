@@ -1,0 +1,30 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/workload-parity.json",
+ "title": "llm/parity: greedy outputs against a reference asset",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "sampling": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "temperature": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 0
+    },
+    "max_tokens": {
+     "type": "integer",
+     "minimum": 1
+    }
+   },
+   "required": [
+    "temperature"
+   ]
+  }
+ },
+ "required": [
+  "sampling"
+ ]
+}

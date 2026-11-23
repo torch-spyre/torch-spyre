@@ -1,0 +1,48 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/system-vllm.json",
+ "title": "llm/vllm",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "model": {
+   "type": "string",
+   "minLength": 1,
+   "description": "name of a Model resource"
+  },
+  "precision": {
+   "enum": [
+    "fp32",
+    "bf16",
+    "fp16",
+    "fp8",
+    "fp4",
+    "int8",
+    "int4"
+   ]
+  },
+  "tp": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "pp": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "features": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[a-z_]+=[a-z0-9_.-]+$"
+   }
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "model",
+  "precision"
+ ]
+}

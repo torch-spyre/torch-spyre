@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Measure the effect of CPU pinning on one small model: TP1 and TP2 x policies x repeats, then apply the acceptance rule.
+
+For each tensor-parallel width (a suite of the catalog) and each policy it plans and runs the cases with
+`spyre-bench plan/run --cpu-pinning POLICY`, then reads the Results and judges every non-`none` policy against `none`:
+
+  worth adopting = median per-token decode improvement > max(CV of both cells, --accept-pct)
+                   AND decode improved in at least --pairs-share of the repeat pairs
+                   AND the first-token (prefill) latency is not worse than the noise.
+
+The verdict is advisory and printed per width and policy; nothing gates. Run it once per node class and copy the table
+into the report (see docs/pinning.md). Policies are run in the order given; interleave nights, not policies, to keep a
+slow drift out of the comparison.
+
+  bench-pinning-matrix --catalog benchmarks --out results/pinning \\
+      --suite tp1=sanity-tp1 --suite tp2=sanity-tp2 --decode-cases tp1=m/out=out129,m/out=out1 ... \\
+      --policies none,device_local,per_device --pin-opt per_device:cores_per_device=4 [--dry-run]
+"""
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+
+
+def pairs(arg_list, what):
+    out = {}
+    for item in arg_list:
+        key, sep, value = item.partition("=")
+        if not sep:
+            sys.exit(f"{what} {item!r}: use WIDTH=VALUE")
+        out[key] = value
+    return out
+
+
+def cmd_plan(a, width, suite, policy, plan_path):
+    cmd = [*a.engine, "plan", "--catalog", a.catalog, "--purpose", "on-demand", "--suite", suite, "--arch", a.arch]
+    cmd += ["--devices", a.devices, "--set", f"run.repeats={a.repeats}", "--out", str(plan_path)]
+    cmd += ["--subject-id", a.subject_id, "--cpu-pinning", policy] + (["--require-pinning"] if policy != "none" else [])
+    for item in a.pin_opt:
+        pol, _, opt = item.partition(":")
+        pol, _, only = pol.partition("@")  # POLICY@WIDTH:KEY=VALUE applies to one width
+        if pol == policy and only in ("", width):
+            cmd += ["--pin-opt", opt]
+    for item in a.extra_plan:
+        cmd += item.split()
+    return cmd
+
+
+def cmd_run(a, plan_path, out):
+    cmd = [*a.engine, "run", "--plan", str(plan_path), "--catalog", a.catalog, "--out", str(out)]
+    cmd += ["--workdir", a.workdir] if a.workdir else []
+    cmd += ["--env-file", a.env_file] if a.env_file else []
+    for item in a.extra_run:
+        cmd += item.split()
+    return cmd
+
+
+def repeat_values(result, metric):
+    return {
+        r["run.repeat"]: statistics.median(r["samples"][metric])
+        for r in result["status"]["repeats"]
+        if r.get("status", "ok") == "ok" and r["samples"].get(metric)
+    }
+
+
+def load(out, metric):
+    """{case name: {repeat: value}} for a run directory, plus the run.exec props seen."""
+    cases, props = {}, set()
+    for f in sorted(Path(out).glob("cases/*/result.json")):
+        res = json.loads(f.read_text())
+        cases[(res["metadata"].get("labels") or {}).get("bench.case") or res["metadata"]["name"]] = repeat_values(
+            res, metric
+        )
+        props |= {
+            (r.get("props") or {}).get("run.exec.pinning_verified", "-")
+            for r in res["status"]["repeats"]
+            if r.get("status", "ok") == "ok"
+        }
+    return cases, props
+
+
+def cv(values):
+    return statistics.stdev(values) / abs(statistics.fmean(values)) * 100 if len(values) > 1 else float("nan")
+
+
+def decode_series(cases, first, second, x_first, x_second):
+    a, b = cases.get(first, {}), cases.get(second, {})
+    return {r: (a[r] - b[r]) / (x_first - x_second) for r in sorted(set(a) & set(b))}
+
+
+def judge(base, trial, first_tok_base, first_tok_trial, accept_pct, share):
+    reps = sorted(set(base) & set(trial))
+    if len(reps) < 2:
+        return {"verdict": "insufficient", "reason": f"{len(reps)} repeat pair(s)"}
+    gains = [(base[r] - trial[r]) / base[r] * 100 for r in reps]
+    noise = max(cv(list(base.values())), cv(list(trial.values())), accept_pct)
+    median_gain = statistics.median(gains)
+    better = sum(g > 0 for g in gains)
+    worse_prefill = None
+    if first_tok_base and first_tok_trial:
+        pre = (
+            (statistics.median(first_tok_trial.values()) - statistics.median(first_tok_base.values()))
+            / statistics.median(first_tok_base.values())
+            * 100
+        )
+        worse_prefill = pre > max(cv(list(first_tok_base.values())), cv(list(first_tok_trial.values())), accept_pct)
+    ok = median_gain > noise and better >= share * len(reps) and not worse_prefill
+    return {
+        "verdict": "adopt"
+        if ok
+        else "no_effect"
+        if abs(median_gain) <= noise
+        else "worse"
+        if median_gain < 0
+        else "mixed",
+        "decode_gain_pct": round(median_gain, 2),
+        "noise_pct": round(noise, 2),
+        "pairs_better": f"{better}/{len(reps)}",
+        "prefill_worse": worse_prefill,
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--catalog", required=True)
+    ap.add_argument("--out", required=True, help="directory for plans, run outputs and report.json")
+    ap.add_argument("--suite", action="append", required=True, help="WIDTH=SUITE, e.g. tp1=sanity-tp1 (repeatable)")
+    ap.add_argument(
+        "--decode-cases", action="append", required=True, help="WIDTH=FIRST,SECOND case names (long, short)"
+    )
+    ap.add_argument("--decode-x", default="129,1", help="output lengths of FIRST,SECOND (default 129,1)")
+    ap.add_argument("--metric", default="llm.batch_latency.mean")
+    ap.add_argument("--policies", default="none,device_local,per_device")
+    ap.add_argument(
+        "--pin-opt", action="append", default=[], help="POLICY[@WIDTH]:KEY=VALUE for that policy (repeatable)"
+    )
+    ap.add_argument("--repeats", type=int, default=10)
+    ap.add_argument("--accept-pct", type=float, default=3.0)
+    ap.add_argument("--pairs-share", type=float, default=0.8)
+    ap.add_argument("--arch", default="x86_64")
+    ap.add_argument("--devices", required=True, help="CLASS=COUNT of this leg, e.g. accel/a=2")
+    ap.add_argument("--subject-id", required=True, help="the subject artifact id (Results need one)")
+    ap.add_argument("--workdir")
+    ap.add_argument("--env-file", help="the probe's env.json: its device NUMA nodes feed device_local and per_device")
+    ap.add_argument("--extra-plan", action="append", default=[], help="extra words for `plan`, e.g. '--environment e'")
+    ap.add_argument("--extra-run", action="append", default=[], help="extra words for `run`")
+    ap.add_argument("--engine", default="spyre-bench", help="engine command (default spyre-bench)")
+    ap.add_argument("--skip-run", action="store_true", help="judge existing run outputs under --out")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    a.engine = a.engine.split()
+    suites, cases = pairs(a.suite, "--suite"), pairs(a.decode_cases, "--decode-cases")
+    policies = [p for p in a.policies.split(",") if p]
+    if "none" not in policies:
+        sys.exit("the policies must include none: it is the baseline")
+    out = Path(a.out)
+    x1, x2 = (float(x) for x in a.decode_x.split(","))
+    for width, suite in suites.items():
+        for policy in policies:
+            plan, run_out = out / f"{width}-{policy}.plan.json", out / f"{width}-{policy}"
+            steps = [cmd_plan(a, width, suite, policy, plan), cmd_run(a, plan, run_out)]
+            for cmd in steps:
+                print("+", " ".join(cmd), flush=True)
+                if not (a.dry_run or a.skip_run):
+                    out.mkdir(parents=True, exist_ok=True)
+                    if subprocess.run(cmd).returncode not in (0, 1):  # 1: some repeat failed; judged below
+                        sys.exit(f"{width}/{policy}: {cmd[len(a.engine)]} failed")
+    if a.dry_run:
+        return 0
+    report = {}
+    for width in suites:
+        first, second = cases[width].split(",")
+        loaded = {p: load(out / f"{width}-{p}", a.metric) for p in policies}
+        series = {p: decode_series(c, first, second, x1, x2) for p, (c, _) in loaded.items()}
+        report[width] = {}
+        for p in policies:
+            if p == "none":
+                continue
+            row = judge(
+                series["none"],
+                series[p],
+                loaded["none"][0].get(second),
+                loaded[p][0].get(second),
+                a.accept_pct,
+                a.pairs_share,
+            )
+            row["pinning_verified"] = sorted(loaded[p][1])
+            if row["pinning_verified"] != ["true"]:
+                row["note"] = "placement not verified on every repeat: read the effect as unverified"
+            report[width][p] = row
+    (out / "report.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"{'width':6} {'policy':14} {'verdict':12} {'decode gain %':>13} {'noise %':>8} {'pairs':>6}  verified")
+    for width, rows in report.items():
+        for p, r in rows.items():
+            print(
+                f"{width:6} {p:14} {r['verdict']:12} {r.get('decode_gain_pct', '-'):>13} {r.get('noise_pct', '-'):>8} "
+                f"{r.get('pairs_better', '-'):>6}  {','.join(r['pinning_verified'])}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
