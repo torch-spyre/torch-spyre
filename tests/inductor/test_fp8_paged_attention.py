@@ -55,7 +55,7 @@ The tests cover two approaches for handling K at decode time:
   This requires ``spyre.scaled_bmm`` (``torch.ops.spyre.scaled_bmm``) and the
   QFP8WT 2D-stick scatter fix in the compiler (``index_copy_`` emits 2D-stick
   HBM layout for QFP8WT destinations).  The cache must be allocated as QFP8WT
-  (``spyre_empty_with_layout(..., QFP8WT)``): the caller's tensor keeps the
+  (``torch_spyre.model_utils.zeros_qfp8wt``): the caller's tensor keeps the
   layout it was allocated with, so a STANDARD cache is rejected at compile time.
 
 Test classes
@@ -132,6 +132,7 @@ from torch_spyre._C import (
     spyre_empty_with_layout,
 )
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from torch_spyre.model_utils import zeros_qfp8wt
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared geometry constants matching standard paged-cache shapes.
@@ -168,43 +169,6 @@ def _cpu_quantize_dequantize(x: torch.Tensor, scale: torch.Tensor) -> torch.Tens
 def _cpu_per_token_scale(x: torch.Tensor) -> torch.Tensor:
     """amax-based per-token scale: shape [..., 1] fp16."""
     return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
-
-
-def _qfp8wt_zeros(shape) -> torch.Tensor:
-    """Zero-filled device tensor a compiled graph can write into as QFP8WT.
-
-    A QFP8WT cache that a compiled graph scatters into must already be QFP8WT,
-    with the page dim outermost: ``[pages, ..., K, 1, stick]``.  The caller's
-    tensor keeps the layout it was allocated with, so the graph is compiled
-    against it rather than relabelling it.  A 2D ``[K, N]`` buffer takes the
-    default 2D-stick weight layout.
-    """
-    host = torch.zeros(shape, dtype=torch.float8_e4m3fn)
-    if len(shape) == 2:
-        # A plain [K, N] weight: the default 2D-stick layout.
-        stl = SpyreTensorLayout(
-            list(shape),
-            list(host.stride()),
-            torch.float8_e4m3fn,
-            [0, 1],
-            ElementArrangement.QFP8WT,
-        )
-        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
-        copy_tensor(host, dev, non_blocking=False)
-        return dev
-    lead = list(shape[:-1])
-    lead_strides = list(host.stride()[:-1])
-    n = shape[-1]
-    stl = SpyreTensorLayout(
-        lead + [1, n],
-        lead_strides + [n, 1],
-        SpyreTensorLayout(list(shape), torch.float8_e4m3fn).device_dtype,
-        {**{(d,): shape[d] for d in range(len(lead))}, (len(lead), len(lead) + 1): n},
-        ElementArrangement.QFP8WT,
-    )
-    dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
-    copy_tensor(host, dev, non_blocking=False)
-    return dev
 
 
 def _device_write_read_fp8(
@@ -2091,7 +2055,7 @@ class TestFp8KvCacheWriteQFP8WT:
         sk_d = sk_cpu.to(DEVICE)
         sq_d = sq_cpu.to(DEVICE)
         block_d = block_idx.to(DEVICE)
-        k_cache_d = _qfp8wt_zeros(k_cache.shape)
+        k_cache_d = zeros_qfp8wt(k_cache.shape)
 
         def write_and_score(k, sk, block, k_cache, q, sq):
             # ── Fill ───────────────────────────────────────────────────────────
@@ -2137,6 +2101,27 @@ class TestFp8KvCacheWriteQFP8WT:
         expected = (torch.matmul(q_dq, k_dq) * attn_scale).to(torch.float16)
 
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
+
+    def test_zeros_qfp8wt_layout(self):
+        """The helper's cache is QFP8WT, zero-filled, with the page dim outermost."""
+        shape = (NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE)
+        cache = zeros_qfp8wt(shape)
+        stl = cache.device_tensor_layout()
+        assert stl.element_arrangement == ElementArrangement.QFP8WT
+        assert list(stl.device_size) == [
+            NUM_BLOCKS,
+            NUM_KV_HEADS,
+            HEAD_SIZE,
+            1,
+            BLOCK_SIZE,
+        ]
+        assert tuple(cache.shape) == shape
+        assert not cache.cpu().view(torch.uint8).any()
+
+    @pytest.mark.parametrize("shape", [(128,), (4, 3, 128), (4, 2, 96)])
+    def test_zeros_qfp8wt_rejects_bad_shape(self, shape):
+        with pytest.raises(ValueError, match="QFP8WT"):
+            zeros_qfp8wt(shape)
 
     @expects_raise
     def test_standard_layout_cache_is_rejected(self):
@@ -2192,7 +2177,7 @@ class TestFp8KvCacheWriteQFP8WT:
             [_cpu_per_token_scale(k_perm_cpu).amax().item()], dtype=torch.float16
         )
         block_d = torch.tensor([block], dtype=torch.int32).to(DEVICE)
-        k_cache_d = _qfp8wt_zeros((NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE))
+        k_cache_d = zeros_qfp8wt((NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE))
 
         def fill(k, sk, block, k_cache):
             k_perm = k.permute(1, 2, 0).contiguous()
@@ -2337,7 +2322,7 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
         v_d = v_fp16.to(DEVICE)
         q_d = query_fp16.to(DEVICE)
         block_d = block_idx.to(DEVICE)
-        k_cache_d = _qfp8wt_zeros(k_cache.shape)
+        k_cache_d = zeros_qfp8wt(k_cache.shape)
         k_scale_cache_d = k_scale_cache.to(DEVICE)
         v_cache_d = v_cache.to(DEVICE)
         v_scale_cache_d = v_scale_cache.to(DEVICE)
@@ -2473,7 +2458,7 @@ class TestFp8Qfp8wtSliceCopy:
         expected = torch.compile(
             lambda x, y: torch.ops.aten._scaled_mm(x, y, **self._SCALED_MM)
         )(qa, qb)
-        buf = _qfp8wt_zeros((k, n))
+        buf = zeros_qfp8wt((k, n))
         return qa, qb, buf, expected.cpu().float()
 
     def test_qfp8wt_full_copy(self):

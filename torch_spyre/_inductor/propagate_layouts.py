@@ -3890,7 +3890,7 @@ def propagate_spyre_tensor_layouts(
                     raise Unsupported(
                         f"QFP8WT scatter into graph input {target_name} requires "
                         f"a QFP8WT destination; allocate it with "
-                        f"spyre_empty_with_layout(..., QFP8WT) "
+                        f"torch_spyre.model_utils.zeros_qfp8wt "
                         f"(got {caller_target_stl.element_arrangement})"
                     )
                 if source_is_qfp8wt:
