@@ -107,7 +107,6 @@ def test_a_perf_report_records_the_purpose(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "case, kwargs, extra",
     [
-        ("v1 schema (the default)", {}, []),
         ("explicit v1", {}, ["--schema", "v1"]),
         ("CLICKHOUSE_DB_V2 unset", {"db_v2": ""}, ["--schema", "v2"]),
         (
@@ -188,7 +187,10 @@ def test_a_directory_whose_files_write_no_perf_row_exits_2(
     assert purposes(c) == []
 
 
-def test_a_purpose_is_refused_for_the_bench_input(monkeypatch, tmp_path):
+@pytest.mark.parametrize("flag", ["--bench-dir", "--reference-dir"])
+def test_a_purpose_is_refused_for_the_bench_and_reference_inputs(
+    monkeypatch, tmp_path, flag
+):
     with pytest.raises(SystemExit) as err:
         ingest(
             monkeypatch,
@@ -197,7 +199,13 @@ def test_a_purpose_is_refused_for_the_bench_input(monkeypatch, tmp_path):
             Client(),
             "--purpose",
             "nightly",
-            "--bench-dir",
+            flag,
             str(tmp_path),
         )
     assert "refusing to drop it" in str(err.value)
+
+
+def test_a_reference_dir_is_not_ingested_directly(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit) as err:
+        ingest(monkeypatch, tmp_path, PERF, Client(), "--reference-dir", str(tmp_path))
+    assert "recorded at approval" in str(err.value)

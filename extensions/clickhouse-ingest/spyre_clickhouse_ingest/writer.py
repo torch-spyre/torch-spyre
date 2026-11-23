@@ -208,7 +208,11 @@ class TestResultWriter(RunWriter):
         source_file: str = "",
         attempt: int = 0,
     ) -> bool:
-        """Have this source file's rows for this run, from this attempt or later, landed?"""
+        """Have this source file's rows for this run, from this attempt or later, landed?
+
+        Given an attempt, false while rows of an earlier attempt of the file remain: a run that
+        stopped between its insert and its delete comes back and finishes.
+        """
         if not attempt:
             return cls._seen(
                 client,
@@ -217,20 +221,44 @@ class TestResultWriter(RunWriter):
                 component,
                 (("props['source_file']", "sf", source_file),),
             )
-        return (
-            cls.fact_table.count_rows(
-                client,
-                db,
-                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
-                {
-                    "component": component,
-                    "run_id": run_id,
-                    "sf": source_file,
-                    "attempt": attempt,
-                },
-            )
-            > 0
+        params = {
+            "component": component,
+            "run_id": run_id,
+            "sf": source_file,
+            "attempt": attempt,
+        }
+        if not cls.fact_table.count_rows(
+            client, db, f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}", params
+        ):
+            return False
+        older = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
+        verdicts = older.replace("props['source_file']", "props['shard']")
+        return not (
+            cls.fact_table.count_rows(client, db, older, params)
+            or CapabilityWriter.fact_table.count_rows(client, db, verdicts, params)
         )
+
+    @classmethod
+    def rows_of_file(cls, client, db, run_id, component, source_file) -> int:
+        """How many outcome rows this run holds for one source file, any attempt."""
+        params = {"component": component, "run_id": run_id, "sf": source_file}
+        return cls.fact_table.count_rows(client, db, cls._FILE, params)
+
+    @classmethod
+    def replace_attempt(
+        cls, client, db, component, run_id, cases, source_file, *a, **kw
+    ) -> int:
+        """`insert`, then drop the file's rows from earlier attempts.
+
+        In that order, so an insert that parks or fails keeps the previous attempt whole.
+        """
+        written = cls.insert(
+            client, db, component, run_id, cases, source_file, *a, **kw
+        )
+        cls.drop_older_attempts(
+            client, db, run_id, component, source_file, kw.get("attempt", 0)
+        )
+        return written
 
     @classmethod
     def drop_older_attempts(
@@ -401,7 +429,7 @@ class TestResultWriter(RunWriter):
             t
             for t in {k[0] for k in verdicts}
             if CapabilityWriter.already_ingested(
-                client, db, run_id, component, t, shard=source_file
+                client, db, run_id, component, t, shard=source_file, attempt=attempt
             )
         }
         for (test_type, arch, disc_keys), results in verdicts.items():
@@ -772,15 +800,24 @@ class CapabilityWriter(RunWriter):
         component: str,
         test_type: str = "",
         shard: str = "",
+        attempt: int = 0,
     ) -> bool:
-        """Have this run's verdicts for this analysis and shard already landed?"""
-        return cls._seen(
-            client,
-            db,
-            run_id,
-            component,
-            (("test_type", "tt", test_type), ("props['shard']", "shard", shard)),
-        )
+        """Have this run's verdicts for this analysis and shard already landed?
+
+        Given an attempt, only verdicts from that attempt or later count, so an earlier
+        attempt's verdicts do not block a re-run's.
+        """
+        scopes = (("test_type", "tt", test_type), ("props['shard']", "shard", shard))
+        if not attempt:
+            return cls._seen(client, db, run_id, component, scopes)
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        params: dict = {"component": component, "run_id": run_id, "attempt": attempt}
+        for column, key, value in scopes:
+            if value:
+                where += f" AND {column} = {{{key}:String}}"
+                params[key] = value
+        where += f" AND {TestResultWriter._ATTEMPT} >= {{attempt:UInt32}}"
+        return cls.fact_table.count_rows(client, db, where, params) > 0
 
     @classmethod
     def insert(
@@ -1091,6 +1128,10 @@ class ArtifactWriter:
         if not supersede and cls.result_recorded(
             client, db, aid, rid, kind, test_type, attempt
         ):
+            if attempt:  # a run that stopped between the insert and the delete
+                cls._drop_older_verdicts(
+                    client, db, aid, rid, kind, test_type, attempt, if_any=True
+                )
             if props.get("failure_reason"):
                 cls.insert_reason(
                     client,
@@ -1104,13 +1145,6 @@ class ArtifactWriter:
                     source=props.get("source") or "writer",
                 )
             return True
-        if attempt:
-            where, params = cls._verdict_key(aid, rid, kind, test_type)
-            client.command(
-                f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where} "
-                f"AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}",
-                parameters={**params, "attempt": attempt},
-            )
         result_row: schema.ArtifactResultRow = {
             "artifact_id": aid,
             "run_id": rid,
@@ -1125,7 +1159,25 @@ class ArtifactWriter:
             ),
         }
         cls.result_table.insert(client, [result_row], db=db)
+        if (
+            attempt
+        ):  # after the insert: one that parks or fails keeps the earlier verdict
+            cls._drop_older_verdicts(client, db, aid, rid, kind, test_type, attempt)
         return True
+
+    @classmethod
+    def _drop_older_verdicts(
+        cls, client, db, aid, rid, kind, test_type, attempt, if_any=False
+    ):
+        where, params = cls._verdict_key(aid, rid, kind, test_type)
+        where += f" AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}"
+        params = {**params, "attempt": attempt}
+        if if_any and not cls.result_table.count_rows(client, db, where, params):
+            return
+        client.command(
+            f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where}",
+            parameters=params,
+        )
 
     @classmethod
     def latest_result(cls, client, db: str, artifact_id, run_id, test_type: str):
@@ -1332,6 +1384,7 @@ class ArtifactWriter:
 cases_already_ingested = TestResultWriter.already_ingested
 drop_older_case_attempts = TestResultWriter.drop_older_attempts
 insert_test_results = TestResultWriter.insert
+replace_case_attempt = TestResultWriter.replace_attempt
 benchmarks_already_ingested = BenchmarkWriter.already_ingested
 insert_benchmarks = BenchmarkWriter.insert
 capabilities_already_ingested = CapabilityWriter.already_ingested

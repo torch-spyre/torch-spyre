@@ -108,7 +108,7 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "iteration_space_ownership",
-    "loop_info",
+    "loop_member",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
@@ -171,6 +171,12 @@ def copy_op_metadata(
     for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+    if getattr(src, "_loop_chain", ()):
+        # ``src`` is a member of built loop nodes (they, not an attribute, hold
+        # that). ``dst`` is a copy of it: when a loop_node helper places ``dst``
+        # in those nodes it becomes a member that tiles what ``src`` tiles, unless
+        # the pass clears this (a drain or a hoisted clone is not a member).
+        dst._member_like = src  # type: ignore[attr-defined]
 
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1948,7 +1954,7 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
+    op.loop_member.loop_tiled_dims (stamped by coarse-tiling before layout
     propagation runs, per passes.py's pass ordering) lists, per nesting
     level, the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
@@ -5472,8 +5478,13 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
+            if levels := enclosing_loops(op):
+                # No induction: a node knows it, the flat path's stamp does not,
+                # and the two paths' dumps are compared.
+                buf.write(
+                    "\n  loop_levels="
+                    f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"
+                )
             buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

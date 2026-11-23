@@ -62,6 +62,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
+| `reference.py` | `bench-reference` bundles: file format and validation, identity, approval rules, lifecycle, and the writer that runs at approval (docs/references.md) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
@@ -101,7 +102,8 @@ any other tag then fails. The output's `registry` says which happened.
 
 In `results` a tag it cannot file (an unknown `--tag-family`) is dropped with a warning; the
 other tags and the verdicts are recorded regardless. `--strict` makes `results` exit 1 when a
-named artifact's verdicts were not all recorded, or when a tag fell back to `misc`.
+v2 write failed, when a named artifact's verdicts were not all recorded, or when a tag fell back to
+`misc`. `--schema` defaults to `v2` (`INGEST_SCHEMA` overrides); `v1` and `both` are an explicit opt-in.
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
 URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
 digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and
@@ -538,11 +540,53 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Logins and hosts
+
+`ClickHouse.connect()` returns a **writer** client by default. It refuses `CREATE`, `ALTER`,
+`DROP`, `TRUNCATE`, `RENAME`, `EXCHANGE`, `ATTACH`, `DETACH`, `UNDROP`, `REPLACE`, `RESTORE`,
+`SYSTEM RESTORE`, `GRANT` and `REVOKE`, after any leading comments (nested `/* */` included), before
+they reach the server (`SchemaStatementOnWriter`); reads, inserts, `DELETE FROM` and
+`INSERT ... SELECT` pass. This catches mistakes; the writer login's grants are the real boundary.
+DDL (the applier, the sandbox tools, the ensure-table steps of the dispatch, model-ops and
+hw-diagnostics ingests) uses `ClickHouse.connect(role="schema")`. `tests/test_logins.py` scans the
+ingest code and `.github/scripts` for DDL sent on a writer.
+
+| Variable | Used for |
+|---|---|
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASS` | the writer login (legacy host) |
+| `CLICKHOUSE_SCHEMA_USER` / `CLICKHOUSE_SCHEMA_PASSWORD` | the schema login; unset falls back to the writer login with one warning |
+| `CLICKHOUSE_V2_HOST` (`_PORT`, `_SECURE`) | an optional second endpoint for the v2 databases; port and TLS default to the legacy ones (the legacy `CLICKHOUSE_SECURE` is kept as is: only `0`, `false`, `no`; `CLICKHOUSE_V2_SECURE` accepts `0/false/no/off` in any case) |
+| `CLICKHOUSE_V2_USER` / `CLICKHOUSE_V2_PASSWORD` | the writer login on the v2 host; unset uses the legacy writer pair |
+| `CLICKHOUSE_V2_SCHEMA_USER` / `CLICKHOUSE_V2_SCHEMA_PASSWORD` | the schema login on the v2 host; unset tries the schema pair, then the v2 writer pair |
+| `CH_V2_DATABASES` | comma list of the databases the v2 host serves (default `spyre_v2`); `CLICKHOUSE_DB_V2` is always included |
+| `CH_REQUIRE_V2_HOST` | `1`: connecting with a v2 database configured but no `CLICKHOUSE_V2_HOST` is an error |
+
+Half a user/password pair is an error. Without `CLICKHOUSE_V2_HOST` there is one host, as before.
+With it, a connection whose database is a v2 database goes to the v2 host, and any other is a
+`RoutedClient`: statements stay on the legacy host unless they name a v2 database (`db.table`,
+`FROM db`, `USE db`, `merge(db, ...)`, `database = 'db'` or `LIKE`, a `{db:String}` or
+`{x:Identifier}` parameter, or an insert's `database=`), ignoring comments and string literals.
+Database names are matched case-sensitively, as ClickHouse does. A statement naming qualified
+tables on both hosts raises `CrossHostStatement`, as does one that reads an unqualified table
+beside a v2 one, a view or materialized-view target on the other host, or a v2 parameter in a
+statement on legacy tables. An unqualified statement always goes to the legacy host, so v2 code
+must keep qualifying its tables. Every v2 setting is checked by
+`connect()`, so a bad one stops the process before it writes anything; the v2 client itself
+opens on first use and, if it cannot, raises `V2Unavailable`, which the ingests catch as a v2
+failure while the v1 rows still land. `CH_V2_DATABASES` may not name `CLICKHOUSE_DB` unless that
+is also `CLICKHOUSE_DB_V2` (a v2-only process).
+
+## Replicated clusters
+
+`apply_schema --cluster <name>` (or `CLICKHOUSE_CLUSTER`, `CLICKHOUSE_KEEPER_PATH`) applies the
+schema `ON CLUSTER` onto Replicated tables; see
+[`schema/README.md`](schema/README.md#applying-on-a-replicated-cluster).
+
 ## Write resilience
 
 `resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
-a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet except the `spool` command and there is no
-probe.** It is a building block with deliberately small promises.
+a Keeper blip, an `insert_quorum` that is briefly unmet). It is a building block with deliberately
+small promises; `writes.py` wires it into the ingests (see "In the ingests" below).
 
 What it promises:
 
@@ -594,9 +638,8 @@ What it promises:
 
 What it does not promise:
 
-- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
-  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
-  window has not passed; neither is small enough to ship without a probe.
+- No automatic replay. Parked batches stay until a person acts (`spool replay`, below, is run by
+  hand and refuses a plain table).
 - No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
   on a plain table.
 - `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
@@ -623,20 +666,84 @@ Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 
 ```text
 python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
 python -m spyre_clickhouse_ingest spool list --fail-if-pending   # same; exit 75 if anything is parked
+python -m spyre_clickhouse_ingest spool replay [TOKEN]   # resend under the original token
 python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
 ```
 
-A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
-rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
-to send. `put` and `drop` take a lock file in the directory, so processes sharing it leave one
-file per token and a `held` flag is never cleared (flock on a local filesystem; not guaranteed on
-NFS). `drop` matches by token suffix. `list` prints to stderr any quarantined `.corrupt` file (one
-that would not parse as a batch), any file it could not read (left in place, not renamed), and
-leftover `.tmp` files; all of them count toward the size cap, and the quarantined ones hold row
-data to inspect and delete by hand. Temp files older than an hour are removed when a `Spool` is
-opened. `list` exits 0 whatever it finds; with `--fail-if-pending` it exits 75 (EX_TEMPFAIL) when
-a batch is parked or any of those files exists, for a CI step that must not pass over parked rows.
-The spool refuses a directory that is a symlink or owned by another user. The spool directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+`replay` resends a batch only to a Replicated table with a nonzero dedup window, under the token it
+was first sent with, so a batch that did land is a no-op; it drops the file once the batch is
+stored and keeps it otherwise (one attempt per run). A `held` batch is also refused when it is
+older than `CH_WRITE_REPLAY_MAX_AGE_S` (default 3600 s, the server's
+`replicated_deduplication_window_seconds`), since the server may have evicted its token. A window
+the login cannot read in `system.merge_tree_settings` (prod readers get 497 there) is read through
+`getMergeTreeSetting()`, and only when that fails too is taken as 10000 blocks, the 26.3 server
+default, with one warning. `test_case_runs`, `capability_runs` and `artifact_results`
+are never replayed: their writers also skip repeated cases, replace older attempts and feed the
+counters and the verdict, so re-run the ingest for that file instead.
+
+**Replay first, then re-run; never replay after a re-run.** A re-run sends the same rows again
+under new tokens, so replaying the parked batch afterwards would double them. The same holds for a
+bench-reference write: its retry resumes the write, so drop its parked batches instead.
+
+The JSON file flattens cells to text; replay turns top-level DateTime, Date, UUID and Decimal
+columns (through `Nullable`/`LowCardinality`) back into those types from `system.columns` and
+sends through the normal client. Naive datetimes are parked with the writer's UTC offset, so
+replay stores the same instant on any host. A column that nests one of those types (Array, Map,
+Tuple) or a String value, nested ones included, that the spool wrote from bytes (`b'...'`) is
+refused and the file is kept.
+
+The spool refuses a directory that is a symlink or owned by another user. The spool directory is `CH_WRITE_SPOOL`, else `$RUNNER_TEMP/ch-spool`; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+
+### In the ingests
+
+`CH_WRITE_RESILIENCE=auto` (the default; `off` disables it) sends `Table.insert`, the v2 copy of
+`hw_failure_diagnostics` and `result_invalidations` through `resilient_insert` when the target's
+engine is Replicated (one `system.tables` read per client and table, which also says whether a
+materialized view reads the table). A plain table, a table the login cannot see and a failed
+lookup keep the existing `insert_chunks` path, and the legacy v1 inserts never look: their
+statements are the same as without this module. Every call gets its own token scope, so identical
+rows written by two calls are never merged; the quorum never degrades. The CI workflows read
+`vars.CH_WRITE_RESILIENCE`, `vars.CH_WRITE_STRICT` and `vars.CH_WRITE_DEADLINE_S` (default 120 s
+there; 300 s in the library).
+
+Each call retries up to `CH_WRITE_DEADLINE_S`. Once a call to a table has spent its deadline
+(parked, or failed with no spool), later calls to that table in the process get one attempt each,
+so an outage costs one deadline per table, not one per file; a table that keeps storing is not
+slowed by one that fails. The next call to that table that stores its rows ends it, and so does
+one more deadline passing; the state is shared by a process's threads under a lock. A
+long-lived caller that writes in-process (a web server calling `dispatch.request`) holds the
+request for up to one deadline: set `CH_WRITE_DEADLINE_S` low there (a few seconds) and
+`CH_WRITE_RESILIENCE=off` in its environment to opt out; with no `CH_WRITE_SPOOL` it fails the
+write instead of parking.
+
+Rows that cannot land are parked in the spool and the insert raises `BatchParked`. The results
+ingest then marks the file and withholds the artifact verdict of its run (the first terminal
+verdict wins, and one built from the files that did land could be green); `--strict` fails on a
+withheld verdict. After a clean run that parked rows, the CLI and the hw-diagnostics script
+append a rows-free list of the parked tables to `$GITHUB_STEP_SUMMARY`, then:
+
+- exit 0 with a `::warning` when the run also wrote the v1 rows (`--schema both`), since v1 is
+  authoritative;
+- exit 75 (EX_TEMPFAIL) for a v2-only run, or for any run when `CH_WRITE_STRICT=1`.
+
+`relay` and `bench-verdicts` keep their own status: a park there is a failed write that their own
+retry handles. Commands that do not catch `BatchParked` (`artifacts`, `ci-run-timings`, ...) end
+with it, so the v2-artifact action reports a parked artifact row through its "not recorded" branch
+(`strict` fails the step). The ingest composite actions upload `spool list` output as a
+`ch-spool-manifest-*` artifact, never the spool itself, which holds full rows and dies with an
+ephemeral runner: re-run the job, or set `CH_WRITE_SPOOL` to a persistent directory on a
+self-hosted runner and `spool replay` there. A job's manifests list each parked batch once, and
+an action whose own install failed only warns.
+
+A re-run of a v2 test-results file converges at any attempt: it takes the replace path, whose
+writer skips the cases already stored, so a file that parked or failed part way is finished.
+Without `--run-attempt` a file that already holds as many rows as it has cases keeps its first
+write (as before: nothing tells the runs apart); one with fewer is finished. With `--run-attempt` the new attempt is inserted before the old
+one is deleted, so an insert that parks or fails leaves the previous attempt whole; artifact
+verdicts follow the same order. Benchmark reports are still skipped once any of their rows are
+stored, so a report of more than one batch that parks after its first batch is not finished by a
+re-run. A run that stops between deleting
+old rows and rebuilding `run_case_counters` still leaves the counters stale, as before.
 
 ## What is deliberately NOT here
 

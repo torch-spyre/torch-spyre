@@ -19,7 +19,7 @@ pre-scheduling pipeline leaves its ``LoopNode``s in ``graph.operations`` and
 the scheduler makes ONE ``LoopSchedulerNode`` of each) and with
 ``loop_scheduler.SCHEDULE_LOOP_NODES`` off, the path it replaced (the nodes are
 expanded after the pass loop and ``build_loop_scheduler_nodes`` rebuilds the
-loops from the flat ops' ``loop_info``).
+loops from the flat ops' ``loop_member``).
 
 The IR at the end of pre-scheduling is not comparable (one list holds nodes),
 so what is compared is what the IR is for:

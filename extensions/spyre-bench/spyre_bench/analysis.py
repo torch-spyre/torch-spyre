@@ -14,7 +14,10 @@
 
 """Evaluate the `derive:` and `compare:` blocks of an Analysis over stored Results.
 
-  spyre-bench analyze ANALYSIS --catalog DIR --results FILE.json [--pack DIR]... [--central DIR]... [--json]
+  spyre-bench analyze ANALYSIS --catalog DIR --results PATH... [--pack DIR]... [--central DIR]... [--json]
+
+PATH is a JSON file (a list of Results or one Result) or the output directory of `spyre-bench run`; repeat --results to
+combine runs (for example one run per pinning policy).
 
 derive combines two cases of one subject and environment per repeat pair; compare tabulates a metric (or the derived
 one) by a run/label/observation attribute within each `across` combination. A cell may hold only one Result (add
@@ -28,8 +31,9 @@ import json
 import math
 import statistics
 import sys
+from pathlib import Path
 
-from spyre_bench import engine
+from spyre_bench import engine, quality
 
 PIN_KEY = "run.exec.cpu_pinning"
 
@@ -39,7 +43,9 @@ class AnalysisError(Exception):
 
 
 def _case(result):
-    return result["metadata"]["name"]
+    """The case name an Analysis refers to; a Result built by `run` is named after its run and labels the case."""
+    meta = result["metadata"]
+    return (meta.get("labels") or {}).get("bench.case") or meta["name"]
 
 
 def _props(result, repeat):
@@ -95,7 +101,16 @@ def _labels(result, pinning):
     return labels
 
 
-def incomparable(a, b, pinning=True):
+def _relaxed(relax, key):
+    """key is named by a relax pattern: exact, or a prefix with a trailing `*` (a bare `*` relaxes nothing)."""
+    return any(p == key or (p.endswith("*") and len(p) > 1 and key.startswith(p[:-1])) for p in relax)
+
+
+def _strict(labels, relax):
+    return {k: v for k, v in labels.items() if not _relaxed(relax, k)}
+
+
+def incomparable(a, b, pinning=True, relax=()):
     """Why two Results cannot be combined: empty means same subject, environment, node and pinning.
 
     pinning=False leaves the pinning policy out (the compared dimension itself); a Result whose own repeats disagree
@@ -103,15 +118,15 @@ def incomparable(a, b, pinning=True):
     """
     sa, sb = a["status"], b["status"]
     why = [f"mixed cpu pinning within {_case(r)}" for r in (a, b) if len(_pinnings(r)) > 1]
-    if sa["subject"]["artifact_id"] != sb["subject"]["artifact_id"]:
+    if sa["subject"]["artifact_id"] != sb["subject"]["artifact_id"] and not _relaxed(relax, "subject.id"):
         why.append("different subject")
-    if sa["environment"]["env_id"] != sb["environment"]["env_id"]:
+    if sa["environment"]["env_id"] != sb["environment"]["env_id"] and not _relaxed(relax, "env.id"):
         why.append("different env_id")
-    if _labels(a, pinning) != _labels(b, pinning):
+    if _strict(_labels(a, pinning), relax) != _strict(_labels(b, pinning), relax):
         why.append("different environment labels")
     if sa["environment"].get("observations", {}).get("env.node") != sb["environment"].get("observations", {}).get(
         "env.node"
-    ):
+    ) and not _relaxed(relax, "env.node"):
         why.append("different node")
     if pinning and _pinnings(a) != _pinnings(b):
         why.append("different cpu pinning")
@@ -273,8 +288,13 @@ def _reading(effect, direction):
     return "better" if (effect < 0) == (direction == "lower_is_better") else "worse"
 
 
-def compare(cmp_, rows, unit="1", direction=None):
-    """Per (across, by) cell: n, mean, median, cv_pct, effect_pct vs the baseline cell, within_noise, reading."""
+def compare(cmp_, rows, unit="1", direction=None, relax=()):
+    """Per (across, by) cell: n, mean, median, cv_pct, effect_pct vs the baseline cell, within_noise, reading.
+
+    relax: attributes (subject.id, env.id, env.node, env.label.<k>, trailing * allowed) that may differ between cells,
+    for a comparison whose point is that difference (card count, build); a cell itself still holds one Result.
+    Relaxing env.id drops the whole environment fingerprint from the check, not only the attribute being compared;
+    derive pairs stay strict."""
     across = cmp_.get("across", [])
     cells = {}
     for row in rows:
@@ -284,7 +304,7 @@ def compare(cmp_, rows, unit="1", direction=None):
         _check_cell(key, group)
     for (ctx, by), group in cells.items():
         for other in [k[1] for k in cells if k[0] == ctx and k[1] != by]:
-            why = incomparable(cells[(ctx, other)][0]["results"][0], group[0]["results"][0], pinning=False)
+            why = incomparable(cells[(ctx, other)][0]["results"][0], group[0]["results"][0], pinning=False, relax=relax)
             if why:
                 raise AnalysisError(
                     f"compare: cells {other!r} and {by!r} are not comparable: {', '.join(why)}; "
@@ -357,7 +377,7 @@ def analyze(spec, results, metrics=None):
     """
     metrics = metrics or {}
     sel = set(spec["select"]["benchmarks"])
-    results = select_results(results, sel)
+    everything, results = results, select_results(results, sel)
     if not results:
         raise AnalysisError(f"no Result of {sorted(sel)}")
     derive, cmp_ = spec.get("derive"), spec.get("compare")
@@ -380,16 +400,33 @@ def analyze(spec, results, metrics=None):
             rows, unit, base_metric = _plain_rows(results, m, warn), _unit(results, m), m
         if not rows:
             raise AnalysisError(f"compare: no values of {m}")
-        report["compare"] = compare(cmp_, rows, unit, metrics.get(base_metric, {}).get("direction"))
+        report["compare"] = compare(
+            cmp_, rows, unit, metrics.get(base_metric, {}).get("direction"), spec.get("relax", [])
+        )
+    if spec.get("reference"):
+        report["reference"] = quality.reference_report(spec, everything, results, metrics)
     report["warnings"] = warn
     return report
+
+
+def load_results(paths):
+    """Result documents from JSON files and `run` output directories (cases/*/result.json)."""
+    out = []
+    for p in paths:
+        p = Path(p)
+        docs = [json.loads(f.read_text()) for f in sorted(p.glob("cases/*/result.json"))] if p.is_dir() else None
+        if docs is None:
+            doc = json.loads(p.read_text())
+            docs = doc if isinstance(doc, list) else [doc]
+        out += docs
+    return out
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
     ap.add_argument("--catalog", required=True)
-    ap.add_argument("--results", required=True)
+    ap.add_argument("--results", required=True, action="append", help="Results JSON or a run output directory")
     ap.add_argument("--pack", action="append", default=[])
     ap.add_argument("--central", action="append", default=[])
     ap.add_argument("--json", action="store_true")
@@ -403,8 +440,7 @@ def main(argv=None):
         print(f"error: no Analysis named {a.name!r}", file=sys.stderr)
         return 2
     try:
-        with open(a.results) as f:
-            report = analyze(doc.spec, json.load(f), cat.reg.metrics)
+        report = analyze(doc.spec, load_results(a.results), cat.reg.metrics)
     except (AnalysisError, OSError, ValueError, KeyError) as x:
         print(f"error: {x}", file=sys.stderr)
         return 2

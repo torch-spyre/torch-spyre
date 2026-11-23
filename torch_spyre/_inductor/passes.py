@@ -38,6 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .parallel_precompile import report_output_layouts
 from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
@@ -618,15 +619,15 @@ class CustomPreSchedulingPasses:
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
             # docstring) branches on whether old_name already has
-            # `loop_info` stamped, to decide whether the per-trip advance
+            # `loop_member` stamped, to decide whether the per-trip advance
             # belongs on the restickify stage or stays on the consumer.
             # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's LoopInfo in one deferred final
+            # for_each_tile level's LoopMember in one deferred final
             # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_info is already in place. If this pass ever
+            # stage's loop_member is already in place. If this pass ever
             # moved ahead of splice_while_loops' stamping, that check would
             # silently take the "not yet tiled" branch and emit an empty
-            # loop_info for a stage that is actually tiled -- a
+            # loop_member for a stage that is actually tiled -- a
             # wrong-answer, not a crash.
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
@@ -652,6 +653,9 @@ class CustomPreSchedulingPasses:
             plan_sharded_hbm,
             _distribute_work,
             #
+            # The graph outputs' layouts are final here. A forked precompile child
+            # reports them to its parent before the planning below (parallel_precompile).
+            report_output_layouts,
             # LX Planning
             _maybe_scratchpad_planning,
             # Preserve copies through physical planning, then remove only

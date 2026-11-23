@@ -414,3 +414,6 @@ tools/frontend_timing/records/
 # OpSpec lab outputs
 captured/
 op_spec_out/
+
+# spyre-bench output of `make bench-*`
+/bench-results/

@@ -124,7 +124,7 @@ def explain(cat, name, a):
             doc["reuse_key"] = {
                 "benchmark_id": doc["benchmark_id"],
                 "subject_id": a.subject or "<artifact id at plan time>",
-                "environment": "env_id (exact, known after placement); label-key relaxation by Selection",
+                "environment": "env_id (exact, known after placement); label-key relaxation by Selection; an Analysis may relax env.id for compare",
             }
         if sets:
             doc["identity_diff"] = diff

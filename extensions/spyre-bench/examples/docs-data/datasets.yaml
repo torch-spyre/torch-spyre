@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: sample-trace}
+spec:
+  asset: sample-trace-files
+  role: trace
+  schema: {record: {prompt: text, output_len: int}, id: {field: seq_id}}
+  subsets:
+    head-200: {limit: 200, order: sequential}
+    stratified: {sample: {n: 1000, seed: 0, stratify_by: bucket}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: random-lengths, description: "seeded random prompts; lengths come from the workload"}
+spec: {asset: random-prompts, role: trace}

@@ -49,7 +49,7 @@ from torch_spyre._inductor import loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import propagate_layouts
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.loop_node import LoopNode, all_ops, expand
 from torch_spyre._inductor.loop_scheduler import (
     LoopSchedulerNode,
@@ -125,7 +125,7 @@ class _Graph(unittest.TestCase):
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
         if gid is not None:
-            buf.loop_info = LoopInfo(
+            buf.loop_member = LoopMember(
                 loop_group_id=gid,
                 loop_count=[4] * len(gid),
                 loop_tiled_dims=[[] for _ in gid],
@@ -203,7 +203,7 @@ class TestFormatOperations(_Graph):
         text = format_operations(ops)
         self.assertEqual(text, "".join(format_operations([op]) for op in ops))
         self.assertTrue(text.startswith("a: ComputedBuffer\n  buffer=a\n  layout="))
-        self.assertIn("\n  loop_info=LoopInfo(loop_group_id=(0,)", text)
+        self.assertIn("\n  loop_levels=[((0,),", text)
         self.assertTrue(text.endswith("\n\n"))
         self.assertNotIn("LoopNode", text)
 
@@ -372,7 +372,7 @@ class TestSchedulerPassThrough(_Graph):
 
     def test_regroup_keeps_a_loop_node_in_place_among_flat_loop_ops(self):
         # A mixed list: a structured loop and a FLAT loop (its ops carry
-        # loop_info group 1 and still need regrouping, as span-overflow and
+        # loop_member group 1 and still need regrouping, as span-overflow and
         # allocator tiling produce today).
         pre = self._buf("pre")
         b = self._buf("b", reads="pre", gid=(0,))
@@ -404,7 +404,7 @@ class TestSchedulerPassThrough(_Graph):
         self.assertEqual([n.get_name() for n in flat_loops[0].snodes], ["f1", "f2"])
 
     def test_a_flat_member_left_outside_its_loop_node_is_caught(self):
-        # A flat op whose loop_info says it belongs to the loop the node
+        # A flat op whose loop_member says it belongs to the loop the node
         # already is (group 0) would become a second, separate group-0 loop.
         b = self._buf("b", gid=(0,))
         mid = self._buf("mid", reads="b")

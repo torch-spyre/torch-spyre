@@ -489,3 +489,20 @@ def test_a_big_scope_confirms_with_the_server_side_token(world):
     assert (
         t1 and t1 == bi.preview(c, ev(), limit=1, with_verdicts=False)["confirm_token"]
     )
+
+
+def test_a_replicated_target_takes_the_resilient_path_and_nothing_else(
+    world, monkeypatch
+):
+    from spyre_clickhouse_ingest import writes
+
+    f, c = world
+    poison(f)
+    sent = []
+    monkeypatch.setattr(
+        writes,
+        "insert",
+        lambda client, table, rows, cols, *a, **k: sent.append(table) or 1,
+    )
+    bi.apply(c, [ev()], actor="amy@example.com")
+    assert sent == ["result_invalidations"] and stored(c) == []

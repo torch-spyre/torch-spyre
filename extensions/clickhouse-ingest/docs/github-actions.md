@@ -15,7 +15,7 @@ uses: torch-spyre/torch-spyre/.github/actions/<name>@main
 
 Because a composite action cannot receive secrets implicitly, every one of
 them takes the ClickHouse connection as **plain inputs**, and every one gates
-itself to a clean no-op when `clickhouse-host` is empty — a caller with no
+itself to a clean no-op when `clickhouse-v2-host` is empty — a caller with no
 ClickHouse secrets configured (or a fork, or a dev sandbox) simply skips the
 ingest rather than failing the run.
 
@@ -64,8 +64,9 @@ XML pipeline ends here.
 | `artifact` / `tag-family` / `tag` / `tag-date` | Name the artifact the run tested by any spec (`image:`, `id:`, `gha:`, ...), and how to tag it; the same options as [`v2-artifact`](#v2-artifact). |
 | `component` / `platform` / `trigger-type` | Hash inputs and tier label stamped on v2 rows — `component` is the value that keeps hf-adapters' and torch-spyre's `test_cases` from colliding on an identically-named test. |
 | `purpose` | `run.purpose` of the perf rows (`nightly`, `weekly`, `merge`, `on-demand`, ...); only the first three join verdict baselines. Empty records none. |
-| `schema` | `v1` (default) / `v2` / `both` — the migration-window switch. |
-| `clickhouse-*` | Connection; empty `clickhouse-host` is a clean no-op. |
+| `strict` | `true` (default) passes `--strict`: a failed v2 write, an unrecorded artifact verdict or a misc-tag fallback fails the step. `false` makes those warnings. |
+| `clickhouse-v2-*`, `clickhouse-db-v2` | The scoped v2 login and its endpoint (database default `spyre_v2`); empty `clickhouse-v2-host` is a clean no-op. Everything is written to the v2 database only. |
+| `clickhouse-host` / `-port` / `-user` / `-pass` | Deprecated: used only when `clickhouse-v2-host` is empty; once it is set, the deprecated port, user and pass are never used. `clickhouse-db` and `schema` are ignored (a non-v2 `schema` warns); the action always writes v2. A host from either name with no login fails the step; a `clickhouse-v2-host` is always paired with `clickhouse-v2-user`/`-pass`. |
 
 ### `ingest-hw-diagnostics-to-clickhouse`
 
@@ -79,7 +80,8 @@ reaches the hardware-health view.
 |---|---|
 | `gha-run-id` (required) | Run whose job logs are analysed. |
 | `arch` | Arch of the analysed legs — never `$(uname -m)` of the ingest runner itself. A wrong value derives a `run_id` that joins nothing, silently. |
-| `clickhouse-db-v2` / `schema` | `hw_failure_diagnostics` has the same shape in both generations, so v2 reinserts the same rows qualified with this database instead of diverging into a new table model. |
+| `clickhouse-v2-*`, `clickhouse-db-v2` | The scoped v2 login and its endpoint; rows go to `<db>.hw_failure_diagnostics` only. |
+| `strict` | `true` (default): a failed insert fails the step; `false` makes it a warning. |
 
 Output: `json-file` — the parsed JSON, for the caller to upload as its own
 artifact.
@@ -130,8 +132,10 @@ there is one, else the derived identity, recorded and tagged.
     artifact: image:icr.io/<repo>@sha256:<list digest>
     arch: s390x
     tag-family: nightly-supply-chain
-    clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-    # clickhouse-port / -user / -pass / -db-v2, registry-* for image specs
+    clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST }}
+    clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+    clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+    # clickhouse-v2-port / -db-v2, registry-* for image specs
 - run: echo "${{ steps.art.outputs.artifact-id }}"
 ```
 
@@ -141,7 +145,7 @@ there is one, else the derived identity, recorded and tagged.
 | `tag-family`, `tag`, `tag-date` | How it is tagged; see the top-level README's tag families. |
 | `lookup`, `registry` | `auto` / `off` / `only` (must already be recorded); `auto` / `off`. |
 | `origin`, `source`, `identity-dep`, `context-dep`, `prop`, `tag-prop`, `run-url` | Recorded fields of a new record (multi-valued inputs one per line). |
-| `dry-run`, `strict` | Print what would be written; fail the job on an error (by default an error annotation and empty outputs). |
+| `dry-run`, `strict` | Print what would be written; `strict` (default `true`) fails the job on an error, `strict: 'false'` keeps an error annotation and empty outputs. |
 
 Outputs: `artifact-id`, `tag`, `tag-family`, `source` (`given`, `existing`,
 `label` or `derived`) and `json` (the full `artifacts ensure` result).
@@ -251,7 +255,7 @@ with more jobs than that silently lost XML with no error.
 ### `push-hw-diagnostics-to-clickhouse.yaml`
 
 A single-step job: calls `ingest-hw-diagnostics-to-clickhouse` with
-`schema: both` (dual-write during the v1-to-v2 migration window) and a
+the scoped v2 login and a
 hardcoded `arch: x86_64` — literal, not `$(uname -m)`, because the HW test
 matrix this workflow follows only runs on the x86 Spyre pool today.
 
