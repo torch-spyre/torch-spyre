@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The table lowering of a CP-SAT cost objective: the base mechanics, one table per
-node, printed by a sympy Printer, each node's list computed from its operands' lists. No device and no compile:
-each test builds its inputs by hand and solves the lowered model with CP-SAT.
+node, printed by a sympy Printer, each node's list computed from its operands' lists.
+No device and no compile: each test builds its inputs by hand and solves the lowered
+model with CP-SAT.
 
 *Exact* means: every assignment of the inputs has exactly one solution, so each
 position and the cost are determined by the inputs, and that solution's cost is
@@ -25,6 +26,7 @@ the expression's value, not to the bits of another evaluator.
 import inspect
 import itertools
 import math
+from collections.abc import Iterable
 
 import numpy as np
 import pytest
@@ -164,13 +166,14 @@ def _printed(
     printer = Recording(case.inputs, cap)
     printer.print(expr)
     return {
-        node: realization.table(CAP) for node, realization in printer.printed.items()
+        node: realization.table(cap) for node, realization in printer.printed.items()
     }
 
 
-def _operations(printed: dict[sympy.Basic, TableRealization]) -> list[sympy.Basic]:
-    """The nodes whose lists the printer computes: neither a symbol nor a constant."""
-    return [e for e in printed if e.free_symbols and not isinstance(e, sympy.Symbol)]
+def _operations(printed: Iterable[sympy.Basic]) -> list[sympy.Basic]:
+    """The nodes whose lists the printer computes: those with operands, an operation on
+    numbers among them, and neither a symbol nor a number."""
+    return [e for e in printed if e.args]
 
 
 # -------------------------------------------------------------------- the printer
@@ -587,7 +590,7 @@ def test_a_node_is_evaluated_once_its_operands_before_it(monkeypatch):
     expr = shared * a + sympy.log(shared)
     printer = Recording(case.inputs)
     root = printer.print(expr)
-    computed = [e for e in printer.printed if e.free_symbols and not e.is_Symbol]
+    computed = _operations(printer.printed)
     # lowering the root evaluates every node under it, each once, the root last
     assert len(calls) == len(computed) and set(calls) == set(computed)
     assert calls[-1] == expr
@@ -793,7 +796,7 @@ def test_a_node_is_lambdified_once_and_nothing_keeps_its_function(monkeypatch):
     calls = _count_lambdify(monkeypatch)
     printer = Recording(case.inputs)
     root = printer.print(expr)
-    computed = [e for e in printer.printed if e.free_symbols and not e.is_Symbol]
+    computed = _operations(printer.printed)
     assert len(calls) == len(computed) > 300
     assert len({str(c) for c in calls}) <= 12
     printer.print(expr)
@@ -988,10 +991,11 @@ def _refused(reason):
 # One example per optimization of a later stage: an objective whose one table is past
 # its cap, which no stage before that one can lower and that stage's optimization can.
 # Each is refused today, for the reason its mark gives; the stage that lowers it drops
-# its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's numpy steps change no lowering,
-# so they have none, and the fold's example comes with Stage 10, since whether it fits
-# where the switch and Stage 9's rungs do not depends on the fold's own counts. The
-# first example lowers today, so the check below runs end to end on every stage.
+# its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's
+# numpy steps change no lowering, so they have none, and the fold's example comes with
+# Stage 10, since whether it fits where the switch and Stage 9's rungs do not depends
+# on the fold's own counts. The first example lowers today, so the check below runs end
+# to end on every stage.
 EXAMPLES = [
     pytest.param(
         lambda: _with(

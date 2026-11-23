@@ -364,12 +364,12 @@ class TableLowering(Printer):
         other operation: sqrt(a) and sqrt(19) are then equal at a = 19, where sympy's
         float(sqrt(19)) is the double below numpy's.
 
-        A table past the cap is refused before anything under expr is printed, so it
-        is never evaluated. Then the operands are printed, each refusing a value of its
-        own that is not finite, and expr's list is its function applied to their
-        tables, each read at expr's entries (Index.on_grid). A condition is read as
-        one, and a Mul reads the base of a factor it divides by in the factor's
-        place."""
+        A table past the cap is refused once its symbols' columns are read, before any
+        operand is printed, so nothing under expr is evaluated. Then the operands are
+        printed, each refusing a value of its own that is not finite, and expr's list
+        is its function applied to their tables, each read at expr's entries
+        (Index.on_grid). A condition is read as one, and a Mul reads the base of a
+        factor it divides by in the factor's place."""
         if not operands:
             value = TableRealization(values=[_constant(expr)], index=UNIT)
             return self._finite(expr, value)
@@ -395,7 +395,8 @@ class TableLowering(Printer):
             table = self.print(operand).table(self.cap)
             form: Form = CONDITION if _is_condition(operand) else None
             if _divides(expr, operand):
-                table, form = self.print(operand.base).table(self.cap), operand.exp  # type: ignore[attr-defined]
+                base, form = operand.base, operand.exp  # type: ignore[attr-defined]
+                table = self.print(base).table(self.cap)
             # A constant operand is a broadcast of its one entry, under an operation on
             # numbers too: numpy computes x**0.5 as sqrt(x) for a broadcast exponent
             # only, and both sides of a tie must take one path.
