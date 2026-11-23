@@ -30,7 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch._inductor.ir import ComputedBuffer, Pointwise
+from torch._inductor.ir import ComputedBuffer, Pointwise, Operation
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -57,6 +57,7 @@ from .constants import (
 )
 from . import config as _spyre_config
 from .core_mapping import (
+    PerCoreView,
     derive_operation_mapping,
     finalize_tensor_work_divisions,
     matmul_reduction_dim,
@@ -691,6 +692,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
         self._tile_advance_seen: dict[str, int] = {}
+        self._pending_lx_ownership: list[tuple[TensorArg, PerCoreView]] = []
         # (node, its read/writes): the tile-advance builders run once per
         # argument of a node, so trace the node once. Keyed by identity,
         # holding the node.
@@ -940,6 +942,42 @@ class SpyreKernel(Kernel[CSEVariable]):
         # "No advance" is None, not a zero: consumers test ``is not None``.
         return None if from_index == 0 else from_index
 
+    @staticmethod
+    def _is_partial_lx_read(
+        name: str, is_input: bool, in_lx: bool, operation: Operation
+    ) -> bool:
+        """Return whether ``operation`` reads only part of LX input ``name``.
+
+        Such an input is rebased onto its compact local subrange by
+        ``normalize_local_lx_subrange``, which checks the rebased ownership
+        against the arg's ``work_division``. ``create_tensor_arg`` therefore
+        computes that ownership at once, from the unpadded iteration space,
+        instead of deferring it to ``create_op_spec``. The unpadded space gives
+        the right answer: a compact coordinate is never a bare identity onto a
+        larger ``device_size``, so padding never grows a var it uses.
+
+        Only Pointwise ops have local read contracts, and only with
+        ``lx_planner_relayout`` on and the KTIR emitter off.
+
+        Args:
+            name: The buffer the arg reads.
+            is_input: Whether the arg is an input of ``operation``.
+            in_lx: Whether the buffer is allocated in LX.
+            operation: The op being emitted.
+        """
+        if not (
+            _spyre_config.lx_planner_relayout
+            and not _spyre_config.ktir_emitter
+            and is_input
+            and in_lx
+            and isinstance(operation, ComputedBuffer)
+            and isinstance(operation.data, Pointwise)
+        ):
+            return False
+
+        reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
+        return has_partial_read(V.graph.get_buffer(name).layout.size, reads)
+
     def create_tensor_arg(
         self,
         is_input: bool,
@@ -997,9 +1035,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Restore it here because the tensor data was uploaded as orig_stl.
         if is_input:
             tensor.layout = input_layout_for_operation(operation, name, tensor.layout)
+        in_lx = "lx" in tensor.layout.allocation
 
-        if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
+        if in_lx and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
+
+        is_partial_lx_read = self._is_partial_lx_read(name, is_input, in_lx, operation)
+        defer_ownership = in_lx and not is_partial_lx_read
 
         # A loop variable describes the address advance from one counted-loop trip to
         # the next, not an in-tile iteration axis. The advance is the variable's
@@ -1016,13 +1058,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
-        work_division = work_division_from_view(
-            tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
-            tensor.layout.device_layout.device_size,
-            device_coords,
-            it_space,
-            allow_extended=_spyre_config.lx_extended_ownership,
-        )
+        if defer_ownership:
+            work_division = None
+        else:
+            work_division = work_division_from_view(
+                tensor.layout.lx_view if in_lx else None,
+                tensor.layout.device_layout.device_size,
+                device_coords,
+                it_space,
+                allow_extended=_spyre_config.lx_extended_ownership,
+            )
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -1042,26 +1087,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             ),
             stride_map=list(tensor.layout.device_layout.stride_map),
         )
-        if (
-            _spyre_config.lx_planner_relayout
-            and not _spyre_config.ktir_emitter
-            and tensor_arg.is_input
-            and "lx" in tensor_arg.allocation
-            and isinstance(operation, ComputedBuffer)
-            and isinstance(operation.data, Pointwise)
-        ):
-            reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
-            if has_partial_read(V.graph.get_buffer(name).layout.size, reads):
-                if self.local_read_contract_factory is None:
-                    raise ValueError(f"{name}: local LX contract provider is missing")
-                contract = self.local_read_contract_factory(name, operation)
-                tensor_arg = normalize_local_lx_subrange(
-                    contract,
-                    name,
-                    tensor_arg,
-                    it_space,
-                    allow_extended=_spyre_config.lx_extended_ownership,
-                )
+        if is_partial_lx_read:
+            if self.local_read_contract_factory is None:
+                raise ValueError(f"{name}: local LX contract provider is missing")
+            contract = self.local_read_contract_factory(name, operation)
+            tensor_arg = normalize_local_lx_subrange(
+                contract,
+                name,
+                tensor_arg,
+                it_space,
+                allow_extended=_spyre_config.lx_extended_ownership,
+            )
+        elif defer_ownership:
+            lx_view = tensor.layout.lx_view
+            assert lx_view is not None  # an LX buffer without a view raised above
+            self._pending_lx_ownership.append((tensor_arg, lx_view))
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation
@@ -1187,6 +1227,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                 output_args[0].device_coordinates,
                 [(arg.device_coordinates, arg.device_size) for arg in args],
             )
+
+        for arg, view in self._pending_lx_ownership:
+            assert any(a is arg for a in args), (
+                f"deferred LX arg {arg.name} is not an argument of {op}"
+            )
+            arg.work_division = work_division_from_view(
+                view,
+                arg.device_size,
+                arg.device_coordinates,
+                it_space,
+                allow_extended=_spyre_config.lx_extended_ownership,
+            )
+        self._pending_lx_ownership = []
 
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
@@ -1430,6 +1483,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._tile_advance_seen = {}
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
+        self._pending_lx_ownership = []
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -1565,6 +1619,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._tile_advance_seen = {}
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
+        self._pending_lx_ownership = []
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):

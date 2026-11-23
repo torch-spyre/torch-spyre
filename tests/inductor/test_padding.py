@@ -1736,12 +1736,22 @@ class _BufferRecord:
     Attributes:
         is_output: Whether the buffer is a graph output.
         device_size: The buffer's device size.
-        allocation: The buffer's allocation, e.g. ``{"lx": 0}``; empty for HBM.
+        allocation: The buffer's allocation as LX planning left it, e.g.
+            ``{"lx": 0}``; empty for HBM.
+        layout: The live layout, not a copy. Kernel preparation demotes a buffer
+            by clearing this layout's allocation in place, so after the compile
+            :attr:`final_allocation` shows where the buffer ended up.
     """
 
     is_output: bool
     device_size: list[int]
     allocation: dict[str, int]
+    layout: FixedTiledLayout = dataclasses.field(compare=False, repr=False)
+
+    @property
+    def final_allocation(self) -> dict[str, int]:
+        """The buffer's allocation after the compile, demotions included."""
+        return dict(self.layout.allocation)
 
 
 class _RecordLayouts(CustomPreSchedulingPasses):
@@ -1778,6 +1788,7 @@ class _RecordLayouts(CustomPreSchedulingPasses):
                 is_output=op.name in outputs,
                 device_size=list(layout.device_layout.device_size),
                 allocation=dict(layout.allocation),
+                layout=layout,
             )
 
 
@@ -1841,16 +1852,6 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         )
 
     @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "LX planning places the row-padded intermediate in LX, but "
-            "prepare_spyre_kernels demotes it to HBM: create_tensor_arg's "
-            "work_division_from_view sees the unpadded loop extent (e.g. 61 "
-            "rows) and raises 'loop c0 not divisible by 4' (#741)"
-        ),
-    )
     def test_pointwise_intermediates_land_in_lx(
         self, rows, padded_rows, sencores
     ) -> None:
@@ -1895,7 +1896,59 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         )
         intermediate = non_outputs[0]
         self.assertEqual(intermediate.device_size, ds)
-        self.assertIn("lx", intermediate.allocation)
+        self.assertIn("lx", intermediate.allocation)  # LX planning chose LX...
+        self.assertIn("lx", intermediate.final_allocation)  # ... and it stayed there
+
+    @parametrize(
+        "rows,padded_rows,sencores,in_lx", [(61, 64, 4, False), (64, 64, 4, True)]
+    )
+    def test_row_reduction_reader_keeps_padded_intermediate_out_of_lx(
+        self, rows, padded_rows, sencores, in_lx
+    ) -> None:
+        """A padded intermediate is in LX only if every reader iterates the padding.
+
+        ``y = 2 * t`` is read by ``y + 1``, which iterates the padded rows, and
+        by ``y.amax(0)``, which reduces over them. The reduction's row var is
+        not a coordinate of its output, so it is not grown and the reduction
+        reads only the real rows. That leaves a ``backGap`` in ``y``, which
+        keeps it out of LX. On an unpadded input the same graph puts ``y`` in
+        LX, which shows that the reduction itself does not keep it out.
+
+        The inputs are those of ``test_pointwise_intermediates_land_in_lx``, and
+        ``amax`` is exact, so the comparison with CPU uses ``atol=rtol=0``.
+        """
+        _RecordLayouts.drain()
+        with (
+            patch.object(passes, "CustomPreSchedulingPasses", _RecordLayouts),
+            patch.object(allocator, "clone_at_graph_boundaries", lambda: False),
+            patch.object(scratchpad_utils, "clone_at_graph_boundaries", lambda: False),
+            ts_inductor_config.patch(sencores=sencores, lx_planning=True),
+        ):
+            gen = torch.Generator().manual_seed(0)
+            k = torch.randint(-120, 121, (rows, 64), generator=gen)
+            x_cpu = (k / 4).half()
+            x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows, x_cpu)
+
+            def f(t):
+                y = 2 * t
+                return y + 1, y.amax(0)
+
+            with self.assertNoLogs(lx_relayout.logger.name, "INFO"):
+                out, _ = self._compile_and_run(x_spyre, f)
+
+            out_y1, out_max = out
+            out_y1_cpu, out_max_cpu = f(x_cpu)
+            torch.testing.assert_close(out_y1.cpu(), out_y1_cpu, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(out_max.cpu(), out_max_cpu, atol=0.0, rtol=0.0)
+
+        non_outputs = [r for r in _RecordLayouts.drain().values() if not r.is_output]
+        self.assertEqual(len(non_outputs), 1, "expected one intermediate buffer")
+        intermediate = non_outputs[0]
+        self.assertEqual(intermediate.device_size, ds)
+        self.assertEqual("lx" in intermediate.allocation, in_lx, "LX planning")
+        self.assertEqual(
+            "lx" in intermediate.final_allocation, in_lx, "after the compile"
+        )
 
     @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
     def test_padded_input_read_twice_is_cloned_into_lx(
@@ -1935,6 +1988,7 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         for record in non_outputs:
             self.assertEqual(record.device_size, ds)
             self.assertIn("lx", record.allocation)
+            self.assertIn("lx", record.final_allocation)
 
     @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
     def test_pointwise_splits_padded_rows(self, rows, padded_rows, sencores) -> None:
