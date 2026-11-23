@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: hf-adapters, owner: hf-adapters}
+spec:
+  component: hf-adapters
+  packs: [{name: kernel, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [hf-models]
+  default_environment: one-device
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.device.count]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: hf-models}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: one-device, description: "one accelerator device; the placer decides where"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke, description: "one case of the sanity model"}
+spec:
+  cases: ["gpt2/config=one-block/mode=prefill-only"]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: models-nightly, description: "the larger models: full model and one block, all three modes"}
+spec:
+  selector: {types: [perf], groupings: {tier: {eq: core}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: models-weekly, description: "every declared model"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: extended}}}

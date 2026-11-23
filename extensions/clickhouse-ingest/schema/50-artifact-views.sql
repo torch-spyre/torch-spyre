@@ -44,6 +44,8 @@ SELECT
     uniqExact(t.artifact_id) > 1       AS is_rolling  -- within this (component, arch, artifact_name) slot
 FROM artifact_tags AS t
 INNER JOIN v_artifacts AS a ON a.artifact_id = t.artifact_id
+-- Comparison-target artifacts are not builds; the tag and result views below inherit this.
+WHERE t.tag_family != 'reference' AND a.component != 'reference'
 GROUP BY tag, component, arch, artifact_name;
 
 -- The tag picker: one row per tag, so the UI lists channels without resolving each. arch_list
@@ -82,6 +84,7 @@ FROM
                AS slot_artifacts
     FROM artifact_tags AS at
     LEFT JOIN v_artifacts AS a ON a.artifact_id = at.artifact_id
+    WHERE at.tag_family != 'reference' AND ifNull(a.component, '') != 'reference'
 ) AS t
 GROUP BY tag;
 
@@ -173,6 +176,9 @@ FROM
                 props['runner_died'] IN ('1', 'true'), 'infra_capacity',
                 -- the pre-taxonomy spelling of ingest_error/result_lost
                 dg_cat = 'infra_result_lost', 'ingest_error',
+                -- A child that only "completed with status ABORTED" was aborted, whatever its log shows.
+                position(JSONExtractString(props['diagnosis'], 'evidence'), 'status ABORTED') > 0
+                    AND dg_cat IN ('', 'unknown'), 'aborted',
                 dg_cat NOT IN ('', 'unknown'), dg_cat,
                 '') AS own_reason,
         multiIf(props['failure_reason'] != '', props['failure_subreason'],
@@ -238,20 +244,53 @@ LEFT JOIN (
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
     -- run_case_counters, not test_case_runs: pre-aggregated, one row per run; sum() is still
-    -- required since SummingMergeTree collapses on merge, not on read.
+    -- required since SummingMergeTree collapses on merge, not on read. A retracted appended
+    -- round's cases are taken back out (d), as the counters were summed on insert.
     SELECT
-        run_id,
-        sum(total_tests) AS total_tests,
-        sum(passed)      AS passed,
-        sum(failed)      AS failed,
-        sum(errors)      AS errors,
-        sum(skipped)     AS skipped,
-        sum(xfail)       AS xfail,
-        sum(xpass)       AS xpass,
-        sum(recovered)   AS recovered
-    FROM run_case_counters
-    GROUP BY run_id
-) AS c ON c.run_id = r.run_id;
+        rc.run_id                                  AS run_id,
+        rc.total_tests - coalesce(d.total_tests, 0) AS total_tests,
+        rc.passed      - coalesce(d.passed, 0)      AS passed,
+        rc.failed      - coalesce(d.failed, 0)      AS failed,
+        rc.errors      - coalesce(d.errors, 0)      AS errors,
+        rc.skipped     - coalesce(d.skipped, 0)     AS skipped,
+        rc.xfail       - coalesce(d.xfail, 0)       AS xfail,
+        rc.xpass       - coalesce(d.xpass, 0)       AS xpass,
+        rc.recovered   - coalesce(d.recovered, 0)   AS recovered
+    FROM
+    (
+        SELECT
+            run_id,
+            sum(total_tests) AS total_tests,
+            sum(passed)      AS passed,
+            sum(failed)      AS failed,
+            sum(errors)      AS errors,
+            sum(skipped)     AS skipped,
+            sum(xfail)       AS xfail,
+            sum(xpass)       AS xpass,
+            sum(recovered)   AS recovered
+        FROM run_case_counters
+        GROUP BY run_id
+    ) AS rc
+    LEFT JOIN
+    (
+        SELECT
+            run_id,
+            count()                        AS total_tests,
+            countIf(status = 'passed')     AS passed,
+            countIf(status = 'failed')     AS failed,
+            countIf(status = 'error')      AS errors,
+            countIf(status = 'skipped')    AS skipped,
+            countIf(status = 'xfail')      AS xfail,
+            countIf(status = 'xpass')      AS xpass,
+            countIf(status = 'passed' AND (props['result.prior_status'] IN ('failed', 'error')
+                    OR toUInt32OrZero(props['result.reruns']) > 0)) AS recovered
+        FROM test_case_runs
+        WHERE run_id IN (SELECT run_id FROM v_retracted_rounds)
+          AND props['upload_id'] IN (SELECT toString(upload_id) FROM v_retracted_rounds)
+        GROUP BY run_id
+    ) AS d ON d.run_id = rc.run_id
+) AS c ON c.run_id = r.run_id
+WHERE ifNull(a.component, '') != 'reference';
 
 -- Combined functional + performance results for every artifact in one tag. INNER JOIN on the
 -- tag-resolved artifact_id, not tag directly, is what makes this safe (see v_tag_resolution).

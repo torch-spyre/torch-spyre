@@ -52,11 +52,9 @@ from spyre_clickhouse_ingest import (
     get_client,
     insert_artifact_result,
     insert_benchmarks,
-    insert_test_results,
     promote_xpass,
     capability_declaration,
-    cases_already_ingested,
-    drop_older_case_attempts,
+    replace_case_attempt,
     benchmarks_already_ingested,
     component_of,
     target_database,
@@ -64,6 +62,9 @@ from spyre_clickhouse_ingest import (
     source_and_external_run_id,
     tables_present,
 )
+from spyre_clickhouse_ingest.batching import BatchParked, insert_chunks
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.writer import TestResultWriter
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
 from spyre_clickhouse_ingest.offline import main as offline_main
@@ -125,6 +126,32 @@ _PERF_NAME_RE = re.compile(
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
+
+
+def _is_model_record(op_name: str, tags: dict) -> bool:
+    # The explicit model tag wins; the granite_ prefix covers reports that predate it.
+    return bool(tags.get("model")) or op_name.startswith("granite_")
+
+
+def _model_operation_name(op_name: str, tags: dict) -> str:
+    # granite_ ops keep the single "granite" series so existing history stays continuous.
+    return "granite" if op_name.startswith("granite_") else tags["model"]
+
+
+def _model_shape(op_name: str, tags: dict):
+    """batch_size, prompt_length: explicit tags first, else parsed from the granite_ op name."""
+    batch = _opt_float(tags, "batch_size")
+    prompt = _opt_float(tags, "prompt_length")
+    if batch is None and prompt is None:
+        m = _GRANITE_CONFIG_RE.search(op_name)
+        if m:
+            batch = float(m.group("batch_size"))
+            pl_raw = m.group("prompt_length")
+            prompt = float(pl_raw) if pl_raw and pl_raw.isdigit() else None
+    return (
+        int(batch) if batch is not None else None,
+        int(prompt) if prompt is not None else None,
+    )
 
 
 KERNEL_CLASSNAME = "kernel_benchmark"
@@ -285,12 +312,9 @@ def parse_benchmark_xml(
             if regression_status == "N/A":
                 regression_status = None
 
-        is_granite = op_name.startswith("granite_")
+        is_granite = _is_model_record(op_name, tags)
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(op_name)
-            batch_size = int(config_m.group("batch_size")) if config_m else None
-            pl_raw = config_m.group("prompt_length") if config_m else None
-            prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(op_name, tags)
             config_name = tags.get("config")
             run_mode = tags.get("mode")
             pt_util = _opt_float(tags, "pt_util")
@@ -309,7 +333,9 @@ def parse_benchmark_xml(
             {
                 "benchmark_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else op_name,
+                "operation_name": _model_operation_name(op_name, tags)
+                if is_granite
+                else op_name,
                 "config_name": config_name,
                 "input_shapes": None if is_granite else (shapes_str or None),
                 "batch_size": batch_size,
@@ -392,24 +418,22 @@ def parse_kernel_xml(
             continue
 
         operation_name = tags.get("op", "")
-        is_granite = operation_name.startswith("granite_")
+        is_granite = _is_model_record(operation_name, tags)
         num_runs = _opt_float(tags, "num_runs")
 
         # config__/mode__ carry only full_model|one_block and prefill|decode, so
         # without bs/pl two Granite configs would be indistinguishable here.
         batch_size = prompt_length = None
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(operation_name)
-            if config_m:
-                batch_size = int(config_m.group("batch_size"))
-                pl_raw = config_m.group("prompt_length")
-                prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(operation_name, tags)
 
         kernels.append(
             {
                 "kernel_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else (operation_name or None),
+                "operation_name": _model_operation_name(operation_name, tags)
+                if is_granite
+                else (operation_name or None),
                 "kernel_name": kernel_name,
                 # A section's Total is the sum of its siblings; flagged so
                 # queries can aggregate without double-counting.
@@ -571,6 +595,32 @@ _V2_BENCH_ID_KEYS = (
 _BENCH_TABLES = (schema_model.BENCHMARKS, schema_model.BENCHMARK_RUNS)
 
 
+def _v2_unavailable(
+    failed: list, name: str, db: str, tables: str = "benchmark"
+) -> None:
+    failed.append(name)
+    print(
+        f"  [error] {name} not written: the {db} {tables} tables are absent, incomplete "
+        "or not readable by this login",
+        file=sys.stderr,
+    )
+
+
+def _already_ingested_v2(
+    client, db, run_id, component, kind, source_file, failed, incomplete, name
+):
+    """True when the report is already in v2; None when the read itself failed (recorded as a v2 failure)."""
+    try:
+        return benchmarks_already_ingested(
+            client, db, run_id, component, kind, source_file
+        )
+    except Exception as err:
+        failed.append(name)
+        incomplete.add(str(run_id))
+        print(f"  [warn] v2 dedup read failed: {err!r}", file=sys.stderr)
+        return None
+
+
 def benchmark_tables_present(client, db: str) -> bool:
     """Both benchmark tables exist in `db` AND carry every column the writer inserts.
 
@@ -626,12 +676,54 @@ def _bench_backend(rec: dict) -> str:
     return "spyre"
 
 
-def _bench_entries(records: list) -> list:
+def _purpose_value(raw: str) -> str:
+    """The validated, lower-cased run purpose, or '' when none was given."""
+    value = (raw or "").strip().lower()
+    if value and not (
+        len(value) <= 32
+        and value[0].isalpha()
+        and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
+    ):
+        raise SystemExit(
+            f"--purpose {raw!r}: use lower-case letters, digits, '-' or '_' (at most 32)"
+        )
+    return value
+
+
+def _purpose_props(args) -> dict:
+    """run.purpose as a run-level prop; baseline eligibility reads it (schema 62/85)."""
+    value = _purpose_value(getattr(args, "purpose", ""))
+    return {"run.purpose": value} if value else {}
+
+
+def _refuse_purpose(why: str) -> None:
+    """--purpose that cannot reach benchmark_runs.props is an error, not a silent drop."""
+    print(f"  [error] --purpose cannot be recorded: {why}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _purpose_state(args) -> dict:
+    return args.__dict__.setdefault("_purpose_state", {"rows": 0, "skips": 0})
+
+
+def _purpose_skipped(args, why: str) -> None:
+    if getattr(args, "purpose", ""):
+        _purpose_state(args)["skips"] += 1
+        print(
+            f"  [warn] --purpose {args.purpose} not recorded for this file: {why}",
+            file=sys.stderr,
+        )
+
+
+def _bench_entries(records: list, run_props: dict | None = None) -> list:
     """This producer's perf records in the shared writer's entry shape.
 
     Measurements become single-element ARRAYS: benchmark_runs stores a metric's samples, and
     this harness reports one pre-averaged value per metric, so `iterations` carries the n
     behind it.
+
+    `run_props` (e.g. run.purpose) is merged into every entry's run-level props; it never
+    reaches the benchmark identity.
 
     Dropped from v2 deliberately: regression_status and ratio (verdicts with no recorded
     baseline -- derived in v_benchmark_metric_verdicts / v_benchmark_backend_compare instead), and
@@ -663,6 +755,7 @@ def _bench_entries(records: list) -> list:
                 "iterations": int(num_runs) if num_runs is not None else 0,
                 "disc": rec,
                 "disc_keys": _V2_BENCH_ID_KEYS,
+                **({"run_props": dict(run_props)} if run_props else {}),
             }
         )
     return entries
@@ -1241,10 +1334,18 @@ def insert_run(client, run_id: str, run: dict, args):
     )
 
 
+def _count_rows(client, sql: str, params: dict) -> int:
+    """Row count for a v1 insert's scope. Another writer sharing the scope makes a failed
+    batch look kept, which fails safe as BatchAmbiguous; case ids cannot narrow it (fresh
+    uuids, and a 35k-id list exceeds http_max_field_value_size)."""
+    return int(client.query(sql, parameters=params).result_rows[0][0])
+
+
 def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
     if not cases:
         return
-    client.insert(
+    insert_chunks(
+        client,
         "test_cases",
         [
             [
@@ -1275,6 +1376,11 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
             "triggered_at",
             "workflow",
         ],
+        already_landed=lambda: _count_rows(
+            client,
+            "SELECT count() FROM test_cases WHERE run_id = {r:String} AND workflow = {w:String}",
+            {"r": run_id, "w": workflow},
+        ),
     )
 
 
@@ -1291,7 +1397,8 @@ def insert_properties(client, run_id: str, cases: list[dict]):
         for pname, pvalue in c["properties"]
     ]
     if rows:
-        client.insert(
+        insert_chunks(
+            client,
             "run_properties",
             [
                 [
@@ -1310,6 +1417,11 @@ def insert_properties(client, run_id: str, cases: list[dict]):
                 "prop_value",
                 "triggered_at",
             ],
+            already_landed=lambda: _count_rows(
+                client,
+                "SELECT count() FROM run_properties WHERE run_id = {r:String}",
+                {"r": run_id},
+            ),
         )
 
 
@@ -1514,13 +1626,28 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
         acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
-def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
+def _write_artifact_verdicts(
+    client, v2db: str, args, legs: dict, incomplete=frozenset()
+) -> bool:
     """Write the artifact and one artifact_results row per (run_id, tier) of this leg; False
-    when a named artifact's verdicts were not all recorded."""
+    when a named artifact's verdicts were not all recorded.
+
+    A run in `incomplete` (a file of it parked or failed in v2; "" stands for any run) gets no
+    verdict: the first terminal verdict wins, and one built from the files that landed could be
+    green for a run that is not.
+    """
     if not legs or not v2db or not (artifact_spec(args)):
         return True
+    withheld = {k for k in legs if "" in incomplete or str(k[0]) in incomplete}
+    if withheld:
+        print(
+            f"  [warn] v2: verdict withheld for {len(withheld)} leg(s): a file of the run was "
+            "parked or failed. Re-run this ingest over the whole leg to record it",
+            file=sys.stderr,
+        )
+        legs = {k: v for k, v in legs.items() if k not in withheld}
     try:
-        return _write_named_artifact_verdicts(client, v2db, args, legs)
+        return _write_named_artifact_verdicts(client, v2db, args, legs) and not withheld
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
@@ -1548,8 +1675,14 @@ def _admitted_legs(legs: dict):
 
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
-    run_url = _opt(args, "run_url") or _gha_run_url(args)
     result_props = dict(_opt(args, "result_props") or [])
+    if "run.trust" in result_props:
+        raise SystemExit(
+            "run.trust is assigned by the receiving channel, not passed in"
+        )
+    run_url = _opt(args, "run_url") or _gha_run_url(args)
+    if _opt(args, "assigned_trust"):
+        result_props["run.trust"] = args.assigned_trust
     source = result_props.pop("source", "") or (
         "jenkins" if _opt(args, "jenkins_run_key") else "gha"
     )
@@ -1706,6 +1839,13 @@ def build_parser() -> argparse.ArgumentParser:
         "tags it as options.ci_tags() spells, beside any --tag.",
     )
     parser.add_argument(
+        "--purpose",
+        default="",
+        help="Why this run happened (nightly | weekly | merge | on-demand | pr-check | ...); "
+        "recorded as the run prop run.purpose on benchmark_runs. Only nightly, weekly and "
+        "merge runs join verdict baselines (benchmark_baseline_purposes); empty records none.",
+    )
+    parser.add_argument(
         "--jenkins-run-key",
         default="",
         help="This leg's own Jenkins externalizable id, e.g. 'Spyre/component-build#417'. "
@@ -1735,10 +1875,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
     )
     parser.add_argument(
+        "--case-prop",
+        dest="case_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="test_case_runs prop k=v added to every case row, repeatable (not part of any id)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
-        help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
-        "all recorded; by default that is a warning and the cases still land",
+        help="exit 1 when a v2 write failed, or when --artifact/--artifact-id named an artifact "
+        "but its verdicts were not all recorded; by default those are warnings and the cases "
+        "still land",
     )
     # Backfill/replay — deliberate replays only. Forward nightlies leave these unset so
     # Run Evidence shows Unavailable. Never rewrite created_at.
@@ -1760,21 +1909,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Must include a time (e.g. 2026-10-07T15:30:00Z); date-only is rejected. "
         "Omit on forward nightlies; blank/whitespace is rejected.",
     )
-    # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
-    # behaving exactly as before -- this script runs from inside a BAKED image, so old images
-    # and new ones coexist for as long as it takes every product image to be rebuilt.
-    #
-    # v1 is not a permanent home: test_runs, run_properties, perf_benchmarks and perf_kernels
-    # have NO v2 equivalent because v2 replaces them outright -- run_properties becomes
-    # test_cases.tags, test_runs is derivable from test_case_runs, and the two perf tables
-    # collapse into benchmarks + benchmark_runs. The v2 DDL in spyre-frameworks deliberately
-    # does not define them. Both is the migration window; v2 is the destination.
+    # Which schema generation to write; v2 unless asked otherwise. v1 and both stay as an explicit
+    # opt-in for a caller that still needs the legacy tables (test_runs, run_properties,
+    # perf_benchmarks, perf_kernels), which v2 replaces with test_case_runs and benchmark_runs.
     parser.add_argument(
         "--schema",
         choices=["v1", "v2", "both"],
-        default=os.environ.get("INGEST_SCHEMA", "v1"),
-        help="Which schema generation to write: v1 (default, the legacy tables), v2 (the "
-        "replacement tables only), or both (the migration window). Also settable via "
+        default=os.environ.get("INGEST_SCHEMA", "v2"),
+        help="Which schema generation to write: v2 (default, the replacement tables only), v1 (the "
+        "legacy tables) or both (the migration window). Also settable via "
         "INGEST_SCHEMA so a workflow can set it once for every leg.",
     )
     add_offline_options(parser)
@@ -1790,28 +1933,61 @@ def _ingest_kind(argv, args) -> int:
     with tempfile.TemporaryDirectory(prefix="results-") as tmp:
         off.out = str(Path(tmp) / "bundle")
         try:
-            args.from_bundle = str(offline.write(off))
+            off.seal_trust = ""
+            off.ended_at = off.ended_at or offline._now()
+            args.from_bundle = str(offline.write(off, validate_times=False))
         except offline.BundleError as err:
             print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
             return err.code
         return bundle.ingest(args)
 
 
-def main(argv=None):
+def main(argv=None, assigned_trust=""):
+    """`assigned_trust` is for bundle.write_junit only: no command-line flag can set it."""
     args = build_parser().parse_args(argv)
-    if args.offline or args.validate_only or args.upload:
+    args.assigned_trust = assigned_trust
+    args.purpose = _purpose_value(args.purpose)
+    if args.purpose and (
+        args.offline
+        or args.validate_only
+        or args.upload
+        or args.check is not None
+        or args.from_bundle
+        or args.kind != "junit"
+        or args.vllm_results_dir
+        or args.sendnn_report
+        or args.benchmarks_dir
+        or args.tables_dir
+        or getattr(args, "bench_dir", "")
+        or getattr(args, "reference_dir", "")
+    ):
+        sys.exit(
+            "--purpose is recorded for the perf report.xml ingest only (--xml-dir/--xml-file); "
+            "refusing to drop it for this input kind"
+        )
+    if args.offline or args.validate_only or args.upload or args.check is not None:
         return offline_main(argv)
     if args.from_bundle:
         from spyre_clickhouse_ingest.bundle import ingest
 
         return ingest(args)
+    if getattr(args, "reference_dir", ""):
+        sys.exit(
+            "--reference-dir seals a reference bundle (--offline); a reference is recorded at approval, not by a direct ingest"
+        )
     if (
         args.kind != "junit"
         or args.vllm_results_dir
         or args.sendnn_report
         or args.benchmarks_dir
+        or args.tables_dir
+        or getattr(args, "bench_dir", "")
     ):
         return _ingest_kind(argv, args)
+    if args.channel_trust:
+        raise SystemExit(
+            "--channel-trust applies to --from-bundle and the vllm/sendnn/benchmarks/tables direct ingests"
+        )
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot
@@ -1819,6 +1995,10 @@ def main(argv=None):
     args.write_v1 = args.schema in ("v1", "both")
     args.write_v2 = args.schema in ("v2", "both")
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+    if args.write_v1:
+        writes.note_v1_written()
+    if args.purpose and not args.write_v2:
+        _refuse_purpose("--schema must include v2 (v1 rows carry no run props)")
 
     # Validate backfill CLI once before any connect / XML write. Invalid values must
     # fail even when the dir has only test-result XML, and must not let a preceding
@@ -1864,8 +2044,16 @@ def main(argv=None):
             "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
             file=sys.stderr,
         )
+        if args.strict and not args.write_v1:
+            print(
+                "  [error] v2: --strict, and no v2 database is configured",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     client.command("SELECT 1")
     print("Connected.\n")
+    if args.purpose and not v2db:
+        _refuse_purpose("CLICKHOUSE_DB_V2 is unset, so no v2 row would be written")
 
     # No schema mutation here, deliberately. This used to ALTER benchmark_runs on EVERY run to
     # add workflow/platform -- a migration in the wrong place: it demanded DDL rights on every
@@ -1889,6 +2077,9 @@ def main(argv=None):
     parsed_benchmarks = 0
     total_kernels = 0
     v2_failed_files = []
+    v2_parked_files: list = []
+    # v2 run_ids with a parked or failed file; "" = unknown.
+    incomplete_runs: set = set()
 
     # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
     # files under one run_id, so a per-file write would report only the first shard's verdict.
@@ -1896,7 +2087,16 @@ def main(argv=None):
     run_started = None
 
     # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
-    bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
+    try:
+        bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
+    except Exception as err:  # a v2 host that is down must not cost the v1 rows
+        print(
+            f"  [warn] v2 benchmark gate failed, v1 unaffected: {err!r}",
+            file=sys.stderr,
+        )
+        bench_ready = False
+    if args.purpose and not bench_ready:
+        _refuse_purpose("the v2 benchmark tables are absent or incomplete")
 
     for xml_path in xml_files:
         print(f"Processing: {xml_path.name}")
@@ -1908,18 +2108,14 @@ def main(argv=None):
         # Kernel first: is_benchmark_xml() also matches these.
         if is_kernel_benchmark_xml(root):
             print("  Detected: per-kernel breakdown XML")
-            # Both halves of the migration are required, and it can land partially.
-            # Without perf_kernels there is nowhere to put the kernels; without
-            # run_type the run row cannot be marked as a kernel run. Either way the
-            # result would be a benchmark_runs row with nothing behind it and no
-            # marker — the "run that measured nothing" this branch exists to stop.
-            # Checked before anything is written, so the skip stays retryable: no
-            # source_file is recorded, and a later run re-ingests the file.
+            # The v1 kernel tables are a precondition only for the v1 write; checked before
+            # anything is written, so the skip stays retryable (no source_file is recorded).
             missing = []
-            if not _table_exists(client, "perf_kernels"):
-                missing.append("no perf_kernels table")
-            if _absent_columns(client, "benchmark_runs", ("run_type",)):
-                missing.append("no benchmark_runs.run_type column")
+            if args.write_v1:
+                if not _table_exists(client, "perf_kernels"):
+                    missing.append("no perf_kernels table")
+                if _absent_columns(client, "benchmark_runs", ("run_type",)):
+                    missing.append("no benchmark_runs.run_type column")
             if missing:
                 print(
                     f"  [warn] {' and '.join(missing)} — skipping this kernel XML. "
@@ -1945,10 +2141,12 @@ def main(argv=None):
                     print(
                         f"  Already ingested kernels — skipping {run_meta['source_file']}"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                     continue
 
             run_id = uuid.uuid4().int >> 64
             print(f"  run_id={run_id}  kernels={len(kernels)}")
+            _stored = args.write_v1
 
             if args.write_v1:
                 insert_benchmark_run(client, run_id, run_meta)
@@ -1966,34 +2164,72 @@ def main(argv=None):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "kernel",
-                    run_meta["source_file"],
-                ):
+                    if not args.write_v1:
+                        v2_failed_files.append(xml_path.name)
+                    _purpose_skipped(args, "no v2 run id could be derived")
+                elif (
+                    _dedup := _already_ingested_v2(
+                        client,
+                        v2db,
+                        _v2_run_id,
+                        component_of(args, COMPONENT_DEFAULT),
+                        "kernel",
+                        run_meta["source_file"],
+                        v2_failed_files,
+                        incomplete_runs,
+                        xml_path.name,
+                    )
+                ) is None:
+                    _purpose_skipped(args, "its v2 dedup read failed")
+                elif _dedup:
                     print(
                         f"  v2: already ingested kernel report for "
                         f"run_id={_v2_run_id} — skipping"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                 else:
-                    _n = insert_benchmarks(
-                        client,
-                        v2db,
-                        component_of(args, COMPONENT_DEFAULT),
-                        _v2_run_id,
-                        _bench_entries(kernels),
-                        report_kind="kernel",
-                        source_file=run_meta["source_file"],
-                    )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                    try:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(kernels, _purpose_props(args)),
+                            report_kind="kernel",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                        _stored = True
+                    except BatchParked as _v2_parked:
+                        v2_parked_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 rows were parked")
+                    except Exception as _v2_err:
+                        v2_failed_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 write failed: {_v2_err!r}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 write failed")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
-            total_kernels += len(kernels)
-            print(f"  Inserted {len(kernels)} kernel rows")
+            if not bench_ready and v2db and not args.write_v1:
+                _v2_unavailable(v2_failed_files, xml_path.name, v2db)
+
+            if _stored:
+                total_kernels += len(kernels)
+                print(f"  Inserted {len(kernels)} kernel rows")
+            else:
+                print(
+                    f"  No kernel rows stored from {xml_path.name} (see the v2 lines above)"
+                )
 
         elif is_benchmark_xml(root, xml_path):
             print("  Detected: performance benchmark XML")
@@ -2028,11 +2264,13 @@ def main(argv=None):
                     print(
                         f"  Already ingested benchmark — skipping {run_meta['source_file']}"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                     continue
 
             # benchmark_runs.run_id is UInt64 — use a random 64-bit int
             run_id = uuid.uuid4().int >> 64  # positive 64-bit int
             print(f"  run_id={run_id}  benchmarks={len(benchmarks)}")
+            _stored = args.write_v1
 
             if args.write_v1:
                 insert_benchmark_run(client, run_id, run_meta)
@@ -2050,37 +2288,76 @@ def main(argv=None):
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif benchmarks_already_ingested(
-                    client,
-                    v2db,
-                    _v2_run_id,
-                    component_of(args, COMPONENT_DEFAULT),
-                    "benchmark",
-                    run_meta["source_file"],
-                ):
+                    if not args.write_v1:
+                        v2_failed_files.append(xml_path.name)
+                    _purpose_skipped(args, "no v2 run id could be derived")
+                elif (
+                    _dedup := _already_ingested_v2(
+                        client,
+                        v2db,
+                        _v2_run_id,
+                        component_of(args, COMPONENT_DEFAULT),
+                        "benchmark",
+                        run_meta["source_file"],
+                        v2_failed_files,
+                        incomplete_runs,
+                        xml_path.name,
+                    )
+                ) is None:
+                    _purpose_skipped(args, "its v2 dedup read failed")
+                elif _dedup:
                     print(
                         f"  v2: already ingested benchmark report for "
                         f"run_id={_v2_run_id} — skipping"
                     )
+                    _purpose_skipped(args, "the report was already ingested")
                 else:
-                    _n = insert_benchmarks(
-                        client,
-                        v2db,
-                        component_of(args, COMPONENT_DEFAULT),
-                        _v2_run_id,
-                        _bench_entries(benchmarks),
-                        report_kind="benchmark",
-                        source_file=run_meta["source_file"],
-                    )
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                    try:
+                        _n = insert_benchmarks(
+                            client,
+                            v2db,
+                            component_of(args, COMPONENT_DEFAULT),
+                            _v2_run_id,
+                            _bench_entries(benchmarks, _purpose_props(args)),
+                            report_kind="benchmark",
+                            source_file=run_meta["source_file"],
+                        )
+                        print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                        _purpose_state(args)["rows"] += _n if args.purpose else 0
+                        _stored = True
+                    except BatchParked as _v2_parked:
+                        v2_parked_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 rows were parked")
+                    except Exception as _v2_err:
+                        v2_failed_files.append(xml_path.name)
+                        incomplete_runs.add(str(_v2_run_id))
+                        print(
+                            f"  [warn] v2 write failed: {_v2_err!r}",
+                            file=sys.stderr,
+                        )
+                        _purpose_skipped(args, "its v2 write failed")
                 if _v2_run_id:
                     _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
-            total_benchmarks += len(benchmarks)
-            print(f"  Inserted {len(benchmarks)} benchmark rows")
+            if not bench_ready and v2db and not args.write_v1:
+                _v2_unavailable(v2_failed_files, xml_path.name, v2db)
+
+            if _stored:
+                total_benchmarks += len(benchmarks)
+                print(f"  Inserted {len(benchmarks)} benchmark rows")
+            else:
+                print(
+                    f"  No benchmark rows stored from {xml_path.name} (see the v2 lines above)"
+                )
 
         else:
             print("  Detected: test-result XML")
+            _purpose_skipped(args, "it is a test-result report, not a perf report")
             run, cases = parse_test_xml(xml_path)
             if run is None:
                 continue
@@ -2152,8 +2429,17 @@ def main(argv=None):
             # v2 tables, alongside v1. Failure here must never cost a v1 row: v1 is still
             # authoritative, so the experimental write is contained rather than allowed to
             # abort the loop and drop every remaining file's v1 insert.
+            _v2_run_id = ""
             try:
-                if v2db and tables_present(client, v2db):
+                if v2db and not tables_present(client, v2db):
+                    if not args.write_v1:
+                        _v2_unavailable(
+                            v2_failed_files,
+                            xml_path.name,
+                            v2db,
+                            "functional-test (test_cases, test_case_runs)",
+                        )
+                elif v2db:
                     _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
                     _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
                     _v2_run_id = run_id_for(
@@ -2169,27 +2455,22 @@ def main(argv=None):
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
-                    elif cases_already_ingested(
+                        if not args.write_v1:
+                            v2_failed_files.append(xml_path.name)
+                    elif not args.run_attempt and TestResultWriter.rows_of_file(
                         client,
                         v2db,
                         _v2_run_id,
                         component_of(args, COMPONENT_DEFAULT),
                         xml_path.name,
-                        attempt=args.run_attempt,
-                    ):
+                    ) >= len(cases):
+                        # No attempt to tell runs apart: a complete file keeps its first write.
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        # Before the insert, so a failed delete aborts this file (caught
-                        # below) rather than leaving two attempts' rows under one run_id.
-                        drop_older_case_attempts(
-                            client,
-                            v2db,
-                            _v2_run_id,
-                            component_of(args, COMPONENT_DEFAULT),
-                            xml_path.name,
-                            args.run_attempt,
-                        )
-                        _n = insert_test_results(
+                        # The replace path: the writer skips cases already stored, so a re-run
+                        # finishes a file that parked or failed part way. Insert, then drop the
+                        # earlier attempts: one that parks or fails keeps the previous attempt.
+                        _n = replace_case_attempt(
                             client,
                             v2db,
                             component_of(args, COMPONENT_DEFAULT),
@@ -2197,6 +2478,8 @@ def main(argv=None):
                             cases,
                             xml_path.name,
                             attempt=args.run_attempt,
+                            arch=args.platform or run["platform"],
+                            row_props=dict(_opt(args, "case_props") or []),
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
@@ -2212,8 +2495,16 @@ def main(argv=None):
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
                         _first_failure(_acc, cases)
                         _capability_legs(artifact_legs, _v2_run_id, cases)
+            except BatchParked as _v2_parked:
+                v2_parked_files.append(xml_path.name)
+                incomplete_runs.add(str(_v2_run_id))
+                print(
+                    f"  [warn] v2 rows parked, not stored: {_v2_parked}",
+                    file=sys.stderr,
+                )
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
+                incomplete_runs.add(str(_v2_run_id))
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
                     file=sys.stderr,
@@ -2229,8 +2520,14 @@ def main(argv=None):
     if not _opt(args, "tag_date"):
         # The run's own day, not the ingest's: a run past midnight keeps its start date.
         args.tag_date = (run_started or datetime.now(UTC)).date()
-    verdicts_recorded = _write_artifact_verdicts(client, v2db, args, artifact_legs)
+    verdicts_recorded = _write_artifact_verdicts(
+        client, v2db, args, artifact_legs, incomplete_runs
+    )
 
+    state = _purpose_state(args)
+    if args.purpose and not state["rows"] and not state["skips"]:
+        # Every file took a path that wrote no perf row and said nothing about the purpose.
+        _refuse_purpose("no perf row was written, so run.purpose is recorded nowhere")
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
     print(f"  Benchmarks ingested:  {total_benchmarks}")
@@ -2242,8 +2539,26 @@ def main(argv=None):
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
         )
+    if v2_parked_files:
+        print(
+            f"  [warn] v2 rows PARKED for {len(v2_parked_files)} file(s): "
+            + ", ".join(v2_parked_files)
+        )
     if args.dry_run:
         print("  dry run -- nothing written; would write:\n" + client.report())
+    if args.strict and v2_failed_files:
+        print("  [error] v2: --strict, and a v2 write failed", file=sys.stderr)
+        sys.exit(1)
+    if not args.strict:
+        for failed, what in (
+            (v2_failed_files, f"v2 write failed for {len(v2_failed_files)} file(s)"),
+            (not verdicts_recorded, "the artifact's verdicts were not all recorded"),
+            (getattr(args, "misc_tags", None), "a tag fell back to misc"),
+        ):
+            if failed:
+                print(
+                    f"::warning title=ClickHouse::{what}; strict is false, so the step passes"
+                )
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"

@@ -25,7 +25,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
+import pytest
 import sympy
+import torch
 from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
@@ -35,7 +37,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import LoopInfo
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -49,6 +51,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
+from utils_inductor import cached_randn, compare_with_cpu
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -227,8 +230,9 @@ class TestAllocatorSpillReasons(TestCase):
     def test_placement_allocator(self):
         # "late" is live while "first" fills the scratchpad.
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        graph = types.SimpleNamespace(operations=[])
         reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            allocation
+            graph, allocation
         )
         self.assertEqual(set(reasons), {"barred", "late"})
         self.assertEqual(reasons["barred"], "op not allowed")
@@ -236,8 +240,9 @@ class TestAllocatorSpillReasons(TestCase):
 
     def test_joint_allocator_reports_only_what_the_solver_said(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        graph = types.SimpleNamespace(operations=[])
         reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            allocation
+            graph, allocation
         )
         self.assertEqual(reasons, {"barred": "op not allowed"})
 
@@ -272,7 +277,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     @staticmethod
     def _tiled(loop_count):
-        return CoarseTileInfo(
+        return LoopInfo(
             loop_group_id=(0,) * len(loop_count),
             loop_count=loop_count,
             loop_tiled_dims=[[] for _ in loop_count],
@@ -291,21 +296,91 @@ class TestCoarseTileLoopTripCount(TestCase):
         op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
 
+    _UNRESOLVED = mock.patch(
+        "torch_spyre._inductor.pass_utils.concretize_expr",
+        side_effect=RuntimeError("unresolvable"),
+    )
+
     def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
-        """A dynamic-shape loop bound (for_each_tile_lowering.py's
-        _extract_trip_count) can stamp an unresolved sympy.Symbol into
-        loop_count instead of a concrete int. int() on that raises TypeError;
-        the multiplier must fall back to 1 for that level rather than
-        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
-        float, consumed by min()/round() elsewhere in the solver)."""
+        """A symbolic count that concretize_expr cannot resolve is priced as
+        one trip, not propagated as a symbol into RelayoutCandidate.cost_ns
+        (a float consumed by min()/round() in the solver)."""
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_unresolved_trip_count_warns_once(self):
+        """Falling back to one trip logs a warning, once per exception type."""
+        from torch_spyre._inductor import logging_utils, pass_utils
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        with (
+            self._UNRESOLVED,
+            mock.patch.object(logging_utils, "_warned_once", set()),
+            mock.patch.object(pass_utils.logger, "warning") as warning,
+        ):
+            self.assertEqual(pass_utils.trip_count_estimate(n), 1)
+            self.assertEqual(pass_utils.trip_count_estimate(n // 8), 1)
+        warning.assert_called_once()
+        self.assertIn("priced as 1 trip", warning.call_args.args[0])
 
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
         op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
-        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        with self._UNRESOLVED:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_unbacked_trip_count_is_one_trip(self):
+        """An unbacked count is one trip, not the unbacked-symint fallback hint
+        that concretize_expr would return."""
+        u = sympy.Symbol("u0", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([u // 8, 4]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=1024
+        ) as concretize:
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+        concretize.assert_not_called()
+
+    def test_symbolic_trip_count_resolves_through_concretize_expr(self):
+        """A symbolic count that concretize_expr resolves (the declared maximum
+        or the hint) is priced at that value, not as one trip."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8, 2]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 64)
+
+    def test_cost_features_loop_trip_resolves_a_symbolic_count(self):
+        """cost_features prices a symbolic loop with the same resolved count."""
+        from torch_spyre._inductor.cost_features import _loop_features
+
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n // 8]))
+        with mock.patch(
+            "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
+        ):
+            self.assertEqual(_loop_features(op)[0], 32)
+
+
+class TestTripCountEstimate(TestCase):
+    """A concrete trip count converts with ``int()`` and is at least 1."""
+
+    def test_concrete_counts(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count, expected in [(5, 5), (5.0, 5), (sympy.Integer(5), 5)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), expected)
+                self.assertIs(type(trip_count_estimate(count)), int)
+
+    def test_zero_and_negative_counts_are_one_trip(self):
+        from torch_spyre._inductor.pass_utils import trip_count_estimate
+
+        for count in [0, -3, 0.0, sympy.Integer(0), sympy.Integer(-3)]:
+            with self.subTest(count=count):
+                self.assertEqual(trip_count_estimate(count), 1)
 
 
 class TestDrainLifetimeBoundary(TestCase):
@@ -1397,7 +1472,34 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         ).plan_layout_and_core_divisions(cost)
 
         self.assertEqual(result.chosen_division, 1)
-        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+        self.assertEqual(float(cost.xreplace(solved_bindings([result]))), 1000.0)
+
+    def test_solve_runs_without_the_variable_shaving_subsolvers(self):
+        from ortools.sat.python import cp_model
+
+        ignored = []
+        solve = cp_model.CpSolver.Solve
+
+        def record_and_solve(solver, model, *args, **kwargs):
+            ignored.append(list(solver.parameters.ignore_subsolvers))
+            return solve(solver, model, *args, **kwargs)
+
+        buf = CoreDivisionBuffer("out", 100, [0, 1], core_divisions=_whole())
+        with mock.patch.object(cp_model.CpSolver, "Solve", record_and_solve):
+            self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+
+        self.assertTrue(ignored)
+        for names in ignored:
+            self.assertEqual(
+                set(names),
+                {
+                    "variables_shaving",
+                    "variables_shaving_no_lp",
+                    "variables_shaving_max_lp",
+                },
+            )
 
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
@@ -1742,6 +1844,228 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         )
         self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
 
+    def _plan(self, buffers, size):
+        return {
+            buf.name: buf
+            for buf in self.solver_class(
+                buffers, size=size, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+
+    @staticmethod
+    def _sink(parent):
+        return CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [99],
+            core_divisions=_whole(),
+            parents=[parent],
+            cd_parent_matches={parent: [(0, 0)]},
+        )
+
+    def test_a_cut_tile_resides_though_its_reader_is_outside_the_nest(self):
+        # p can only be tiled and its reader c only untiled, so c reads p's
+        # copied-out full buffer from HBM and asks nothing of the tile. The
+        # table has no pair for the edge, which once held p out of LX; the
+        # tile is read by its copy op and resides.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p", 128, [0, 1], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+
+    def test_a_cut_tile_takes_the_space_it_resides_in(self):
+        # q is alive across p's write. p's tile (64) and q (64) do not both fit
+        # in 100, and keeping the tile saves more traffic than keeping q: a
+        # spilled tile is written to HBM and read back by its copy. With p
+        # held out of LX, as it once was at a cut, q would have resided.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        q = CoreDivisionBuffer("q", 64, [0, 2], core_divisions=_whole())
+        p = CoreDivisionBuffer(
+            "p", 128, [1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        r = CoreDivisionBuffer(
+            "r",
+            1,
+            [2, 3],
+            core_divisions=_whole(),
+            parents=["q", "p"],
+            cd_parent_matches={"q": [(0, 0)]},
+        )
+        res = self._plan([q, p, r, self._sink("r")], size=100)
+        self.assertIsNotNone(res["p"].address)
+        self.assertIsNone(res["q"].address)
+
+    def test_a_cut_tile_resides_only_as_its_copy_can_read_it(self):
+        # p is a cut, so its copy op is the tile's reader. The copy walks p's
+        # output and has no reduction axis: it reads the tile from LX only
+        # where each core holds a slice of that output. Splitting the
+        # reduction axis as well uses twice the cores, and the solve once took
+        # that division for a tile it had placed in LX, which the tiled graph
+        # then spilled, as no division of the copy could read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out, red = sympy.Symbol("d0"), sympy.Symbol("d1")
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={out: 2}, tiling=spec),
+                CoreDivision(
+                    splits={out: 2, red: 2},
+                    reduction_syms=frozenset({red}),
+                    tiling=spec,
+                ),
+            ],
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+        self.assertEqual(res["p"].chosen_division, 0)
+
+    def test_a_buffer_read_by_a_nest_lives_until_the_nest_ends(self):
+        # w is untiled and read by b, the first op of the nest b, c. Every
+        # iteration of the nest reads w again, so it stays alive through c and
+        # c's copy. Untiled lifetimes end w at b, and then w + b (80) and
+        # b + c (80) both fit in 100; held to the end of the nest, w + b + c
+        # (120) do not, and w is the cheapest of the three to spill.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled = [CoreDivision(tiling=spec)]
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=tiled,
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            80,
+            [2, 3],
+            core_divisions=tiled,
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0)]},
+        )
+        res = self._plan([w, b, c, self._sink("c")], size=100)
+        self.assertIsNone(res["w"].address)
+        self.assertIsNotNone(res["b"].address)
+        self.assertIsNotNone(res["c"].address)
+
+    def test_a_tiled_graph_output_resides_as_a_tile(self):
+        # Nothing reads a graph output from LX while it is untiled. Tiled, its
+        # copy op does, so the bar holds only for the untiled candidate.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        reason = "no consumer reads it from LX"
+        tiled_out = CoreDivisionBuffer(
+            "tiled_out",
+            128,
+            [0],
+            core_divisions=[CoreDivision(tiling=spec)],
+            boundary=BufferType.Output,
+            untiled_bar=reason,
+        )
+        untiled_out = CoreDivisionBuffer(
+            "untiled_out",
+            128,
+            [1],
+            core_divisions=_whole(),
+            boundary=BufferType.Output,
+            untiled_bar=reason,
+        )
+        res = self._plan([tiled_out, untiled_out], size=1 << 20)
+        self.assertIsNotNone(res["tiled_out"].address)
+        self.assertIsNone(res["untiled_out"].address)
+        self.assertEqual(res["untiled_out"].spill_reason, reason)
+
+    def test_an_untiled_bar_is_absolute_for_a_solver_without_tilings(self):
+        buf = CoreDivisionBuffer(
+            "out", 128, [0], untiled_bar="no consumer reads it from LX"
+        )
+        solver = GreedyLayoutSolver([buf], size=1 << 20)
+        self.assertEqual(solver.excluded(buf), "no consumer reads it from LX")
+
+    def test_a_cut_is_charged_the_traffic_of_its_copy(self):
+        # Untiled, p (128) does not fit in 100 and spills: one write and c's
+        # read. Tiled, its tile fits -- but c is outside the nest, so the copy
+        # still writes p to HBM and c still reads it from there. Tiling saves
+        # nothing, and with no charge for the copy it would look free.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(), CoreDivision(tiling=spec)],
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            1,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0)]},
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        chosen = res["p"].core_divisions[res["p"].chosen_division]
+        self.assertTrue(chosen.tiling.is_untiled)
+
+    def test_tiling_is_chosen_when_it_keeps_a_chain_resident(self):
+        # Untiled, neither p nor c (128 each) fits in 100. Tiled into one nest,
+        # p's tile hands its slot to c's in place and both reside; only c's
+        # copy and the sink's read reach HBM.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        either = [CoreDivision(), CoreDivision(tiling=spec)]
+        p = CoreDivisionBuffer("p", 128, [0, 1], core_divisions=list(either))
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [1, 2],
+            core_divisions=list(either),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0), (1, 1)]},
+            in_place_parents=["p"],
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        for name in ("p", "c"):
+            chosen = res[name].core_divisions[res[name].chosen_division]
+            self.assertEqual(chosen.tiling, spec, name)
+            self.assertIsNotNone(res[name].address, name)
+        self.assertEqual(res["p"].address, res["c"].address)
+
+    def test_a_skip_connection_is_cut_where_an_untiled_op_splits_the_run(self):
+        # Op order a, b, c: b reads a, and c reads a and b. a and c can only be
+        # tiled and b only untiled, so b splits the run although a feeds c
+        # directly. a is then a cut: b and c both read its full copy from HBM,
+        # and its tile is free once the copy has drained it. LX holds one tile
+        # (64), so a's and c's both reside only because a's does not wait for
+        # c, its last reader in op order.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        a = CoreDivisionBuffer(
+            "a", 128, [0, 1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["a"],
+            residency_reason="keep b out of the choice",
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)]},
+        )
+        res = self._plan([a, b, c, self._sink("c")], size=64)
+        self.assertIsNotNone(res["a"].address)
+        self.assertIsNotNone(res["c"].address)
+
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the
         # divisor cannot contain 0"): a reciprocal-of-cores cost term (as the
@@ -1878,7 +2202,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 self.assertIsInstance(approx, sympy.Piecewise)
                 for v in (1, 2, 5, 8, 16, 32):
                     self.assertAlmostEqual(
-                        float(approx.subs(split, v)), v**0.25, delta=0.045 * v**0.25
+                        float(approx.xreplace({split: v})),
+                        v**0.25,
+                        delta=0.045 * v**0.25,
                     )
         n = sympy.Symbol("n")
         self.assertEqual(printer._inv_log_sym(split**n), split**n)
@@ -1975,7 +2301,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver = cp_model.CpSolver()
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
-                expected = sum(expr.subs({x: a, y: b}) for expr in expressions)
+                expected = sum(expr.xreplace({x: a, y: b}) for expr in expressions)
                 self.assertAlmostEqual(solver.objective_value, float(expected))
 
     def test_repeated_constant_conditions_do_not_create_decisions(self):
@@ -1992,7 +2318,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver.parameters.num_search_workers = 1
         self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
         expected = min(
-            sum(expr.subs({x: 2, y: value}) for expr in expressions)
+            sum(expr.xreplace({x: 2, y: value}) for expr in expressions)
             for value in range(-2, 3)
         )
         self.assertAlmostEqual(solver.objective_value, float(expected))
@@ -2093,7 +2419,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
                 self.assertAlmostEqual(
-                    solver.objective_value, float(expression.subs({x: a, y: b}))
+                    solver.objective_value, float(expression.xreplace({x: a, y: b}))
                 )
 
     def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
@@ -2283,7 +2609,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 )
                 self.assertAlmostEqual(
                     solver.ObjectiveValue(),
-                    float(expression.subs({x: 4, enabled: flag})),
+                    float(expression.xreplace({x: 4, enabled: flag})),
                     places=6,
                 )
 
@@ -2472,7 +2798,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
             solver = cp_model.CpSolver()
             self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
             values = [
-                int(expr.subs(dict(zip(lits, bits))))
+                int(expr.xreplace(dict(zip(lits, bits))))
                 for bits in itertools.product((0, 1), repeat=len(lits))
             ]
             best = max(values) if maximize else min(values)
@@ -2634,6 +2960,64 @@ class SolveStatsTest(TestCase):
         self.assertFalse(solver.last_solve_stats["objective_used"])
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class UniquenessCheckTest(TestCase):
+    """The tie probe that follows a priced solve: a second plan at the optimum's
+    cost is reported with a warning, and the probe never replaces the plan.
+    """
+
+    _LOGGER = "torch_spyre._inductor.scratchpad.ilp_solver_ortools"
+
+    def setUp(self):
+        # The probe is off by default (SPYRE_ENABLE_UNIQUENESS_CHECK).
+        self.enterContext(config.patch({"enable_uniqueness_check": True}))
+
+    @staticmethod
+    def _solver(size=1 << 20):
+        return CpSatLayoutSolver(
+            [
+                CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+                CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+            ],
+            size,
+        )
+
+    @staticmethod
+    def _spill_cost(buffers):
+        return sum(4000 * (1 - b.sym_is_lx) for b in buffers)
+
+    def test_an_unpriced_residency_is_reported_as_a_tie(self):
+        """Only ``b0`` is priced, so ``b1`` resident or spilled costs the same."""
+        solver = self._solver()
+        with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+            solver.plan_layout_and_core_divisions(self._spill_cost(solver.buffers[:1]))
+        self.assertTrue(
+            any("cannot prove uniqueness" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_fully_priced_plan_is_not_reported(self):
+        """Every other plan spills a priced buffer, so the runner-up is dearer.
+
+        The probe solves for that runner-up, and a plan extracted from
+        it would spill a buffer here despite the probe returning OPTIMAL."""
+        solver = self._solver()
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is not None for b in plan))
+
+    def test_a_plan_with_no_alternative_is_not_reported(self):
+        """Neither buffer fits, force the probe the report INFEASIBLE."""
+        solver = self._solver(size=64)
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is None for b in plan))
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.
@@ -2784,6 +3168,138 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+@pytest.mark.skipif(
+    not _HAS_ORTOOLS, reason="default cpsat layout_solver needs ortools"
+)
+class TestPerCoreViewFrameMismatch:
+    """Regression coverage for #3084's per-core view frame-consistency fix
+    in pass_utils.py (writer/reader of the same buffer compared in
+    inconsistent logical-vs-tiled frames). Exercises current behavior."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    def test_matmul_k_split_output_feeds_second_op_multicore(self):
+        m, k, n = 64, 128, 64
+
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    def test_batched_matmul_k_split_feeds_reduction(self):
+        b, m, k, n = 2, 32, 64, 32
+
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+
+@pytest.mark.skipif(
+    not _HAS_ORTOOLS, reason="default cpsat layout_solver needs ortools"
+)
+class TestPerCoreViewFrameMismatchExtended:
+    """Extends TestPerCoreViewFrameMismatch with a wider sencores sweep,
+    including sencores=1 to cover _per_core_view_on_buf's single-core
+    path."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [
+            (64, 128, 64, 1),
+            (64, 128, 64, 4),
+            (64, 128, 64, 8),
+            (128, 256, 128, 8),
+            (32, 64, 32, 4),
+            (128, 128, 128, 16),
+        ],
+    )
+    def test_matmul_k_split_feeds_pointwise_consumer(self, m, k, n, sencores):
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    @pytest.mark.parametrize(
+        "b,m,k,n,sencores",
+        [
+            (2, 32, 64, 32, 1),
+            (2, 32, 64, 32, 4),
+            (2, 32, 64, 32, 8),
+            (4, 16, 32, 16, 4),
+        ],
+    )
+    def test_batched_matmul_k_split_feeds_reduction(self, b, m, k, n, sencores):
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [(64, 64, 64, 1), (64, 64, 64, 4), (64, 64, 64, 8)],
+    )
+    def test_matmul_output_feeds_second_matmul(self, m, k, n, sencores):
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        c = cached_randn((n, m), differentiation=2)
+
+        def chained_matmul(x, y, z):
+            mid = torch.matmul(x, y)
+            return torch.matmul(mid, z) + mid.sum()
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(chained_matmul, a, b, c)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat inv-scale tests need ortools")

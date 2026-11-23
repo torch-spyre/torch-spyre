@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Why a verdict did not pass, written after the verdict itself; one row per source.",
+  "properties": {
+    "artifact_id": {},
+    "confidence": {},
+    "failure_detail": {},
+    "failure_log_url": {},
+    "failure_reason": {
+      "enum": [
+        "aborted",
+        "build_error",
+        "dependency_failed",
+        "infra_auth",
+        "infra_capacity",
+        "infra_disk",
+        "infra_env",
+        "infra_hardware",
+        "infra_network",
+        "infra_timeout",
+        "ingest_error",
+        "pipeline_error",
+        "superseded",
+        "test_failure",
+        "unknown"
+      ]
+    },
+    "failure_subreason": {},
+    "failure_wait_s": {},
+    "props": {},
+    "result_kind": {
+      "enum": [
+        "capability",
+        "functional",
+        "performance"
+      ]
+    },
+    "run_id": {},
+    "source": {
+      "minLength": 1
+    },
+    "test_type": {
+      "enum": [
+        "fvt",
+        "fvt-dynamic",
+        "fvt-static",
+        "integration",
+        "model_modules",
+        "model_ops",
+        "model_serving",
+        "model_support",
+        "perf",
+        "quality",
+        "regression",
+        "smoke",
+        "svt",
+        "svt-dynamic",
+        "svt-static",
+        "trunk",
+        "unit"
+      ]
+    }
+  },
+  "required": [
+    "artifact_id",
+    "run_id",
+    "result_kind",
+    "test_type",
+    "failure_reason",
+    "failure_subreason",
+    "failure_detail",
+    "failure_log_url",
+    "failure_wait_s",
+    "confidence",
+    "source",
+    "props"
+  ],
+  "title": "artifact_result_reasons: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

@@ -23,6 +23,12 @@ from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 session = pytest.importorskip("chdb.session")
 
 AID = "2b397099-6200-52fb-98c4-b603961a0582"
+ABORTED = json.dumps(
+    {
+        "category": "unknown",
+        "evidence": "example-job #851 completed with status ABORTED",
+    }
+)
 DIAG = json.dumps(
     {"category": "infra_network", "evidence": "checkout retries", "is_infra": True}
 )
@@ -48,6 +54,7 @@ VERDICTS = {
     ),
     "12": ("error", {}),
     "13": ("error", {"runner_died": "true"}),
+    "14": ("failed", {"diagnosis": ABORTED}),
 }
 
 
@@ -75,7 +82,8 @@ def db():
             + "\n".join(map(json.dumps, rows)))  # fmt: skip
     s.query(
         "INSERT INTO run_case_counters (run_id, component, total_tests, passed, failed) "
-        f"VALUES ('{_rid('03')}', 'torch-spyre', 5, 3, 2), ('{_rid('10')}', 'torch-spyre', 12, 1, 11)"
+        f"VALUES ('{_rid('03')}', 'torch-spyre', 5, 3, 2), ('{_rid('10')}', 'torch-spyre', 12, 1, 11), "
+        f"('{_rid('14')}', 'torch-spyre', 4, 2, 2)"
     )
     reasons = [
         (_rid("06"), "infra_timeout", "card_lock", 2, "backfill-console", "10:00"),
@@ -166,3 +174,7 @@ def test_a_sources_latest_row_is_its_answer_whatever_its_confidence(db):
 
 def test_groovys_runner_died_true_reads_as_infra(db):
     assert _why(db, "13") == ("infra_capacity", "runner_died", "writer")
+
+
+def test_an_aborted_childs_diagnosis_reads_aborted_over_its_partial_cases(db):
+    assert _why(db, "14") == ("aborted", "", "writer")

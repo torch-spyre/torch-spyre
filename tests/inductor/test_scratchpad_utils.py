@@ -16,8 +16,10 @@
 
 ``_would_produce_lx_back_gap`` asks whether a device dimension is *fully
 covered* by the iteration symbols that walk it: a backGap fires when
-``device_size[d]`` exceeds the extent the coordinate actually reaches, and the
-backend supports that for HBM but not for LX.
+``device_size[d]`` exceeds the extent the coordinate actually reaches, a bare
+coordinate iterates beyond its physical extent, or normalization splits an
+overlapping coordinate into a negative-gap inner axis.
+The backend supports these gaps for HBM but not for LX.
 
 The covered extent is a property of the whole coordinate expression, not of any
 one symbol in it. These tests pin that, because the two obvious cheaper
@@ -38,8 +40,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
+import pytest
 import sympy
 import torch
+import torch._dynamo
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -47,17 +51,22 @@ from torch._inductor.ir import (
     FallbackKernel,
     FixedLayout,
     MutationLayoutSHOULDREMOVE,
+    NonOwningLayout,
+    OperationBuffer,
     Pointwise,
 )
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V, ops
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     get_ncores_for_buffers,
     ops_in_offset_mutation_component,
+    storage_has_single_writer,
 )
+from utils_inductor import HAS_ORTOOLS, cached_randn, compare_with_cpu
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
 
@@ -71,6 +80,76 @@ d0, d1, d2, d3 = sympy.symbols("d0 d1 d2 d3", integer=True, nonnegative=True)
 # one non-stick device dim, so ``device_size[0]`` is the dim under test.
 _STICK_COORD = sympy.Mod(d0, 64)
 _STICK_SIZE = 64
+
+
+class SingleWriterTest(TestCase):
+    """Exercise the shared proof with real IR and dependency extraction."""
+
+    @staticmethod
+    def _producer(name=_BUF, layout=None, input_name="input"):
+        return ComputedBuffer(
+            name=name,
+            layout=layout
+            if layout is not None
+            else FixedLayout(torch.device("cpu"), torch.float16, [4, 64], [64, 1]),
+            data=Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(input_name, 64 * index[0] + index[1]),
+                ranges=[4, 64],
+            ),
+        )
+
+    def setUp(self):
+        self.graph = SimpleNamespace(
+            operations=[],
+            sizevars=SizeVarAllocator(),
+            mark_buffer_mutated=lambda name: None,
+        )
+
+    def test_fresh_storage_and_read_only_consumer(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            reader = self._producer("reader", input_name=_BUF)
+            self.graph.operations = [producer, reader]
+            self.assertTrue(storage_has_single_writer(self.graph, producer))
+
+    def test_second_writer_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer, second_writer = self._producer(), self._producer()
+            self.assertIsNot(producer, second_writer)
+            self.assertEqual(
+                {dep.name for dep in second_writer.get_read_writes().writes}, {_BUF}
+            )
+            self.graph.operations = [producer, second_writer]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_mutation_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            mutation = self._producer("mutation", MutationLayoutSHOULDREMOVE(producer))
+            self.assertIn(_BUF, mutation.get_mutation_names())
+            self.graph.operations = [producer, mutation]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_output_alias_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            alias = OperationBuffer(name="alias", layout=NonOwningLayout(producer))
+            self.assertIn(_BUF, alias.get_inputs_that_alias_output())
+            self.graph.operations = [producer, alias]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_unimplemented_dependency_proof_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            # OperationBuffer cannot describe its writes. Unknown operations must
+            # fail closed rather than be treated as read-only.
+            unknown = OperationBuffer(name="unknown", layout=producer.get_layout())
+            with self.assertRaises(NotImplementedError):
+                unknown.get_read_writes()
+            self.graph.operations = [producer, unknown]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
 
 
 class PointwiseInPlaceInputsTest(TestCase):
@@ -163,6 +242,14 @@ def _back_gap(coord, extent, ranges):
 
 
 class BackGapTest(TestCase):
+    def test_negative_gap_bars_lx(self):
+        self.assertTrue(_back_gap(d0, 2, {d0: 4}))
+
+    def test_overlapping_affine_coordinate_bars_lx(self):
+        # The original row axis is fully covered, but normalization gives d1
+        # a two-row physical extent while it iterates over four rows.
+        self.assertTrue(_back_gap(2 * d0 + d1, 16, {d0: 7, d1: 4}))
+
     def test_multi_symbol_coordinate_that_covers_its_dim_has_no_gap(self):
         """``2*d1 + d3`` over ``d1 in [0,40)``, ``d3 in [0,2)`` reaches 0..79.
 
@@ -249,7 +336,7 @@ class ExternalOperandTest(TestCase):
         write = mock.sentinel.write
         view = SimpleNamespace(work_slice_dims=[], same_partition=lambda _: True)
         utils = "torch_spyre._inductor.scratchpad.utils"
-        for drained, cores in ((None, -1), ({_BUF: "all_reduce"}, 1)):
+        for drained, cores in ((None, -1), ({_BUF: {"all_reduce"}}, 1)):
             with (
                 self.subTest(drained=drained),
                 mock.patch(
@@ -261,7 +348,7 @@ class ExternalOperandTest(TestCase):
                 ),
                 mock.patch(
                     f"{utils}.op_read_writes",
-                    return_value=SimpleNamespace(writes={write}),
+                    return_value=SimpleNamespace(reads=set(), writes={write}),
                 ),
             ):
                 counts, _reasons, views = get_ncores_for_buffers(
@@ -406,6 +493,186 @@ class OffsetMutationPinTest(TestCase):
             _pinned(ops),
             {"clone", "slice_write", "copy_back", "add_one", "amax", "add"},
         )
+
+
+@unittest.skipUnless(HAS_ORTOOLS, "default cpsat layout_solver needs ortools")
+class TestBackGapProducingBufferExclusion(TestCase):
+    """A cat whose internal seam is not stick-aligned (an 8-wide piece next
+    to a 120-wide one, seam at column 8 of a 64-element stick) must be
+    excluded from LX for a real residency reason, not silently placed.
+
+    The buffers that would leave the gap are the restickify and clone pieces
+    the unaligned seam is lowered into; they must get "lx back gap". The cat
+    buffer itself cannot show this: it has a mutation layout, so it is "op not
+    allowed" whatever the seam. An aligned seam (64 + 64) is the control: it
+    produces no such pieces and no back-gap exclusion.
+    """
+
+    def _residency_reasons(self, c1, c2):
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        def cat_then_use_twice(a, b):
+            cat = torch.cat([a, b], dim=-1)
+            return cat * 2 + cat
+
+        a = cached_randn((32, c1))
+        b = cached_randn((32, c2), differentiation=1)
+
+        captured: dict[str, "str | None"] = {}
+        orig = ScratchpadAllocator._buffer_residency_reason
+
+        def wrapper(self, graph, name, uses, op, **kwargs):
+            reason = orig(self, graph, name, uses, op, **kwargs)
+            captured[name] = reason
+            return reason
+
+        with (
+            config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}),
+            mock.patch.object(ScratchpadAllocator, "_buffer_residency_reason", wrapper),
+        ):
+            torch._dynamo.reset()
+            compare_with_cpu(cat_then_use_twice, a, b)
+        self.assertTrue(captured, "the allocator never evaluated a buffer")
+        return captured
+
+    def test_gap_producing_buffer_is_excluded_from_lx(self):
+        captured = self._residency_reasons(8, 120)
+        back_gap = {
+            name for name, reason in captured.items() if reason == "lx back gap"
+        }
+        self.assertTrue(
+            back_gap,
+            "no buffer of the unaligned-seam cat was excluded for 'lx back gap'; "
+            f"reasons: {captured}",
+        )
+
+    def test_aligned_seam_produces_no_back_gap(self):
+        captured = self._residency_reasons(64, 64)
+        back_gap = {
+            name for name, reason in captured.items() if reason == "lx back gap"
+        }
+        self.assertEqual(
+            back_gap,
+            set(),
+            "a stick-aligned seam must not produce an LX back gap; "
+            f"reasons: {captured}",
+        )
+
+
+def _layernorm_chain(x, weight, bias, normalized_shape):
+    # A second op after layer_norm so the normalized output is a real LX
+    # candidate, not just an unread graph output.
+    y = torch.nn.functional.layer_norm(x, normalized_shape, weight, bias, eps=1e-5)
+    return y * 2 + y
+
+
+def _layernorm_output_lx_placements(fn, *args, **kwargs) -> list[bool]:
+    """Run compare_with_cpu(fn, *args, **kwargs); return, for each buffer
+    lowered from spyre.layernormnorm (the normalized output) that another op
+    in the same graph reads, whether the Spyre pre-scheduling passes placed it
+    in LX. Unread copies are skipped: eager runs LayerNorm as a graph of its
+    own, where the output is an unread graph output and rightly stays in HBM."""
+    placements: list[bool] = []
+    orig = CustomPreSchedulingPasses.__call__
+
+    def spy(self, graph):
+        orig(self, graph)
+        for op in graph.operations:
+            targets = {str(node.target) for node in getattr(op, "origins", ())}
+            read_by_others = any(
+                dep.name == op.get_name()
+                for other in graph.operations
+                if other is not op
+                for dep in other.get_read_writes().reads
+            )
+            if read_by_others and any("layernormnorm" in t for t in targets):
+                layout = graph.get_buffer(op.get_name()).get_layout()
+                placements.append("lx" in (getattr(layout, "allocation", None) or {}))
+
+    torch._dynamo.reset()
+    torch._inductor.codecache.FxGraphCache.clear()
+    with mock.patch.object(CustomPreSchedulingPasses, "__call__", spy):
+        compare_with_cpu(fn, *args, **kwargs)
+    assert placements, "no graph had a spyre.layernormnorm output that an op reads"
+    return placements
+
+
+@pytest.mark.skipif(not HAS_ORTOOLS, reason="default cpsat layout_solver needs ortools")
+class TestLayerNormAddressing:
+    """LayerNorm correctness and LX residency under default lx_planning,
+    including across core counts (#2533).
+
+    The LX residency check is applied only where the normalized output can
+    reside: its per-core slice, ceil(rows / cores) * hidden * itemsize, must
+    fit the frontend's LX share (about 1.55 MiB, see _lx_planning_size).
+    Elsewhere the test is a correctness check only. The check reads the
+    normalized output's own placement: a search of the generated code cannot
+    tell, because the small LayerNorm statistics buffers are in LX in every
+    case (and `{lx:` matches nothing; the code writes `'lx': N`, see #6097).
+    """
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    @pytest.mark.parametrize(
+        "rows,hidden,dtype,expect_lx",
+        [
+            # expect_lx: the per-core slice at the default 32 cores fits LX.
+            (2048, 4096, torch.float16, True),  # Granite/Llama prefill: 512 KiB
+            (1, 4096, torch.float16, True),  # decode (M=1) -- boundary shape
+            (49152, 768, torch.bfloat16, False),  # BERT-style, bf16: 2.25 MiB
+            (2048, 12800, torch.float16, False),  # Granite intermediate: 1.56 MiB
+            (2049, 4096, torch.float16, True),  # non-power-of-2 rows: 520 KiB
+            (32, 256, torch.bfloat16, True),  # small shape, bf16
+        ],
+    )
+    def test_layernorm_matches_cpu_under_default_lx_planning(
+        self, rows, hidden, dtype, expect_lx
+    ):
+        x = cached_randn((rows, hidden), dtype=dtype)
+        weight = cached_randn((hidden,), differentiation=1, dtype=dtype)
+        bias = cached_randn((hidden,), differentiation=2, dtype=dtype)
+
+        with config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}):
+            placements = _layernorm_output_lx_placements(
+                lambda x, w, b: _layernorm_chain(x, w, b, (hidden,)),
+                x,
+                weight,
+                bias,
+                atol=0.15,
+                rtol=0.15,
+            )
+        if expect_lx:
+            assert all(placements), f"normalized output not in LX: {placements}"
+
+    @pytest.mark.parametrize("sencores", [1, 4, 8, 32])
+    def test_layernorm_matches_cpu_across_sencores(self, sencores):
+        """LayerNorm's split dim is the outer (row) dim; sweep core counts
+        to exercise the per-core LX addressing path. The 2048 x 4096 fp16
+        output is 16 MiB, so only the 32-core slice (512 KiB) can reside in
+        LX; the smaller core counts are correctness-only."""
+        rows, hidden = 2048, 4096
+        x = cached_randn((rows, hidden))
+        weight = cached_randn((hidden,), differentiation=1)
+        bias = cached_randn((hidden,), differentiation=2)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            placements = _layernorm_output_lx_placements(
+                lambda x, w, b: _layernorm_chain(x, w, b, (hidden,)),
+                x,
+                weight,
+                bias,
+                atol=0.15,
+                rtol=0.15,
+            )
+        if sencores == 32:
+            assert all(placements), f"normalized output not in LX: {placements}"
 
 
 if __name__ == "__main__":

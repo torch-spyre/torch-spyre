@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 import sympy
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._inductor import cost_model, logging_utils
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
@@ -63,7 +63,7 @@ def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_spl
     assert _matmul_execution_cost(*axes, 32, **options) == pytest.approx(estimate)
     split = sympy.Symbol("k_split", integer=True, positive=True)
     symbolic = _matmul_execution_cost(*axes[:3], (256, split), 32, **options)
-    assert float(symbolic.subs(split, k_split)) == pytest.approx(estimate)
+    assert float(symbolic.xreplace({split: k_split})) == pytest.approx(estimate)
     assert _matmul_split_cost(*axes, 32, **options) > _matmul_split_cost(
         *axes, used, **options
     )
@@ -84,7 +84,7 @@ def test_split_sum_matmul_prices_one_corelet(shared_weight):
     for k in (1, 2, 4):
         compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
         expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
-        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert float(price.xreplace({split: k})) == pytest.approx(expected)
         assert wd._matmul_execution_cost(
             *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
         ) == pytest.approx(expected)
@@ -156,7 +156,7 @@ def test_fused_reduction_compute_keeps_core_count_symbolic():
     compute = cost_model._fused_reduction_compute_ns([op], CostParams())
 
     assert compute.free_symbols == {heads, rows}
-    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+    assert float(compute.xreplace({heads: 4, rows: 8})) == pytest.approx(256)
 
 
 def test_fused_reduction_compute_skips_independent_boundary_reductions():
@@ -233,7 +233,7 @@ def test_matmul_split_cost_over_symbolic_splits_matches_concrete_in_budget():
         )
         assert not wd.isinf(concrete)
         point = {m: m_split, n: n_split, k: k_split}
-        assert float(symbolic.subs(point)) == pytest.approx(concrete)
+        assert float(symbolic.xreplace(point)) == pytest.approx(concrete)
 
 
 def _issue_4387_matmul(cores, m_split, n_split, k_split):
@@ -257,8 +257,8 @@ def _issue_4387_matmul(cores, m_split, n_split, k_split):
     )
 
 
-def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
-    monkeypatch.setattr(cost_model.config, "sencores", 32)
+@cost_model.config.patch(sencores=32)
+def test_upstream_matmul_price_rejects_an_over_budget_split():
     params = cost_model.CostParams(use_bundled_cost_model=False)
     priced = cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
     assert priced > 0
@@ -267,8 +267,8 @@ def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
 
 
 @pytest.mark.parametrize("infinity", [float("inf"), sympy.oo, sympy.zoo])
+@cost_model.config.patch(sencores=32)
 def test_upstream_matmul_price_rejects_a_symbolic_infinity(monkeypatch, infinity):
-    monkeypatch.setattr(cost_model.config, "sencores", 32)
     monkeypatch.setattr(
         cost_model, "_matmul_execution_cost", lambda *args, **kwargs: infinity
     )
@@ -665,6 +665,80 @@ def _extractable_op(name, reads):
     )
 
 
+@pytest.mark.parametrize("execution_cores", [16, 32])
+def test_relayout_price_does_not_replace_execution_cores(monkeypatch, execution_cores):
+    from dataclasses import replace
+
+    import torch
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import Pointwise
+    from torch._inductor.virtualized import V, ops
+
+    price = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=64,
+        cores=16,
+        dtype_bytes=2,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=16,
+        relayout_run_elems=8,
+        relayout_split=8,
+    )
+    monkeypatch.setattr(dcm, "_relayout_features", lambda *_: price)
+    op = _extractable_op("buf1", ["buf0"])
+    row = sympy.Symbol("row", integer=True)
+    op.data = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: ops.load("buf0", index[0]),
+        ranges=[64],
+    )
+    op.get_read_writes = lambda: SimpleNamespace(
+        reads=[MemoryDep("buf0", row, (row,), (64,))],
+        writes=[MemoryDep("buf1", row, (row,), (64,))],
+    )
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(
+            op, {row: execution_cores}, is_lx={"buf0": True, "buf1": True}
+        )
+
+    assert feature.cores == execution_cores
+    assert feature.relayout_cores == 16
+    assert feature.read_bytes() == feature.write_bytes() == 0
+    params = CostParams()
+    legacy = replace(feature, cores=16, relayout_cores=0)
+    assert cost_model.relayout_ns(feature, params) == cost_model.relayout_ns(
+        legacy, params
+    )
+    assert cost_model.predict_ops([feature], params) == cost_model.predict_ops(
+        [legacy], params
+    )
+
+
+@pytest.mark.parametrize(
+    "source_cores,destination_cores", [(16, 32), (32, 16), (32, 32)]
+)
+def test_relayout_features_keep_the_smaller_price_domain(
+    monkeypatch, source_cores, destination_cores
+):
+    monkeypatch.setattr(dcm, "governing_run_split", lambda *_: (64, 8))
+    feature = dcm.relayout_cost_features(
+        object(),
+        object(),
+        source_cores,
+        [512, 4096],
+        512 * 4096,
+        2,
+        destination_num_cores=destination_cores,
+    )
+    assert feature.cores == source_cores
+    assert feature.relayout_cores == min(source_cores, destination_cores)
+
+
 def _stamps(op, graph):
     """{(role, name): is_boundary} as the real extractor stamps them under ``graph``."""
     from torch._inductor.virtualized import V
@@ -809,11 +883,13 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     """``LAST_IO`` feeds ``profile_ops.py``, whose printed lines ``parse_sweep_logs.py``
     reads back. Its per-arg ``hbm_counted`` must use the same accounting as the total it
     is printed beside -- a resident boundary arg is the case where the two can diverge."""
+    from torch_spyre._inductor import dump_cost_model as reports
+
     feats = [_reader("C", "buf1", resident={"arg0_1"})]
-    dcm._record_last_io(feats)
-    counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
+    reports._record_last_io(feats)
+    counted = sum(a["hbm_counted"] for o in reports.LAST_IO["ops"] for a in o["args"])
     # The clone-in load of the resident input, plus the write of the HBM output.
-    assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
+    assert counted == reports.LAST_IO["hbm_bytes"] == 2 * BYTES
 
 
 def _indirect_store(cores=1, is_lx=False, **kwargs):
@@ -868,7 +944,9 @@ def test_store_symbolic_cost_matches_concrete():
     expression = cost_model._store_core_excess_ns([feature], params)
     for cores in (1, 2, 4, 5, 8, 16, 32):
         expected = cost_model._store_core_excess_ns([_indirect_store(cores)], params)
-        assert float(expression.subs(cores_symbol, cores)) == pytest.approx(expected)
+        assert float(expression.xreplace({cores_symbol: cores})) == pytest.approx(
+            expected
+        )
 
 
 def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):

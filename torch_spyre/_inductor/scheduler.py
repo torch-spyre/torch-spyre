@@ -38,11 +38,12 @@ from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
+from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
-from .op_spec import LoopSpec
 from . import config as _spyre_config
 from .errors import Unsupported
 
@@ -54,7 +55,7 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
     Produced by build_loop_scheduler_nodes from SchedulerNodes whose
     underlying ir.Operation has been stamped with a ``loop_info``
-    (``CoarseTileInfo``) attribute by the coarse-tiling IR pass.
+    (``LoopInfo``) attribute by the coarse-tiling IR pass.
 
     loop_count is the trip count of the loop that directly contains this
     group's operations.  For nested loops, the snodes may themselves
@@ -96,13 +97,20 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
 
 def _loop_group_id(node: BaseSchedulerNode):
-    """Return the loop_group_id of the ir.Operation inside node, or None."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                return loop_info.loop_group_id
-    return None
+    """The normalized ``loop_group_id`` tuple of the loop ``node`` is a member
+    of, or None.
+
+    A ``CountedLoopSchedulerNode`` (which includes the ``LoopSchedulerNode``
+    that a ``LoopNode`` becomes) is already a loop group, not a member of
+    another loop, so it gives None. Its first leaf carries the loop's own
+    ``loop_info``; reading that would make ``build_loop_scheduler_nodes``
+    wrap the structured node a second time, a nested ``LoopSpec`` that runs
+    the body ``trip_count`` squared times.
+    """
+    if isinstance(node, CountedLoopSchedulerNode):
+        return None
+    levels = scheduler_enclosing_loops(node)
+    return levels[-1].group_path if levels else None
 
 
 def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
@@ -110,26 +118,16 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
     nesting level from outermost to innermost (stamped by
-    coarse_tile_post_stickify() or the for_each_tile lowering).
+    tile_groups() or the for_each_tile lowering).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
     For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
     and depth 0 → K1, depth 1 → K2.
     """
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                counts: list = loop_info.loop_count
-                gid = loop_info.loop_group_id
-                # coarse_tile stamps one count per nesting level, so
-                # len(counts) == len(gid) always holds.
-                assert len(counts) == len(gid), (
-                    f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
-                )
-                if 0 <= depth < len(counts):
-                    return counts[depth]
+    levels = scheduler_enclosing_loops(node)
+    if 0 <= depth < len(levels):
+        return levels[depth].trip_count
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
@@ -280,7 +278,7 @@ def build_loop_scheduler_nodes(
 ) -> list[BaseSchedulerNode]:
     """Pre-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
 
-    Reads the ``loop_info`` (``CoarseTileInfo``) attribute stamped on
+    Reads the ``loop_info`` (``LoopInfo``) attribute stamped on
     ir.Operation objects by the coarse-tiling IR pass.  Nodes without these attributes
     are passed through unchanged.
 
@@ -307,7 +305,12 @@ def build_loop_scheduler_nodes(
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
-            gid = _loop_group_id(node.get_nodes()[0])
+            # The member's own levels, not _loop_group_id: that is None for a
+            # nested loop node, which can be the first member.  A structured
+            # LoopSchedulerNode passed through is checked the same way, so a
+            # flat op of the same loop left outside it is caught here.
+            levels = scheduler_enclosing_loops(node.get_nodes()[0])
+            gid = levels[-1].group_path if levels else None
             if gid is not None:
                 key = gid[0:1]
                 name = node.get_name()
@@ -547,6 +550,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
@@ -627,7 +633,7 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+        kernel.op_specs.append(SpyreKernel.counted_loop(node.loop_count, body))
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel
@@ -661,8 +667,22 @@ class SuperDSCScheduling(BaseScheduling):
             buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
-            if method == "sdsc" and kernel._kernel_uses_hbm_pool():
-                buf.writeline(f", pool_size={kernel.pool_size})")
+            if method == "sdsc":
+                from torch_spyre.execution.kernel_cache import precompute_kernel_key
+
+                # pool_size is passed only for a pooled kernel (sdsc's default
+                # 0 otherwise); the precomputed key hashes the value passed.
+                tail = ""
+                pool_size = 0
+                if kernel._kernel_uses_hbm_pool():
+                    pool_size = kernel.pool_size
+                    tail = f", pool_size={pool_size}"
+                # Emitted whatever config.precomputed_kernel_key says: the
+                # switch is read by sdsc() at call time, not here.
+                precomputed_key = precompute_kernel_key(
+                    src_code, kernel_name, pool_size
+                )
+                buf.writeline(f"{tail}, precomputed_key={precomputed_key!r})")
             else:
                 buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)

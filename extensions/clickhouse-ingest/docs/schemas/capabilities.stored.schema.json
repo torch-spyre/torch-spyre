@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Capability identity: one row per (subject, capability), mirroring test_cases.",
+  "properties": {
+    "capability_id": {},
+    "component": {
+      "minLength": 1
+    },
+    "name": {
+      "minLength": 1
+    },
+    "props": {},
+    "subject": {},
+    "tags": {},
+    "test_type": {
+      "minLength": 1
+    }
+  },
+  "required": [
+    "capability_id",
+    "component",
+    "test_type",
+    "subject",
+    "name",
+    "tags",
+    "props"
+  ],
+  "title": "capabilities: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

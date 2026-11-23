@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import decimal
+import math
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING
+import warnings
 
 from torch.utils._config_module import install_config_module
 
@@ -54,6 +57,20 @@ hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
 enable_lx_context_switching: bool = os.getenv(
     "ENABLE_LX_CONTEXT_SWITCHING", "1"
 ).lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Move each collective's wait as late as its consumers allow, before
+# spyre_fuse_nodes bundles contiguous compute. Independent compute then sits
+# between the *_run call and wait_work in its own bundle, instead of being
+# fused with the code that reads the collective's result. Off by default:
+# collectives and compute share one in-order flex stream, so the hoisted
+# kernel still runs after the collective and the split only adds a kernel
+# launch. Set SPYRE_SINK_COLLECTIVE_WAITS=1 once collectives have their own
+# stream.
+sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lower() in (
     "1",
     "true",
     "yes",
@@ -126,11 +143,60 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
+
+# Wall-clock ceiling, in seconds, on ONE backend-compiler (dbo-opt) invocation,
+# on both the bundle and the KTIR path. It bounds a wedged compiler -- which
+# would otherwise block torch.compile forever with no diagnostic -- rather than
+# policing slowness: a small kernel finishes in well under a second. Raise it if
+# a large bundle legitimately needs longer; non-positive values disable the
+# limit. The parent reads it and passes it to each compile, so a runtime
+# ``config.patch`` also reaches compiles in Inductor's subprocess pool.
+def _backend_compile_timeout_from_env() -> float:
+    value = os.environ.get("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", "60")
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds, "
+            f"got {value!r}"
+        ) from exc
+    if not math.isfinite(timeout) or (timeout == 0 and decimal.Decimal(value) != 0):
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a finite number "
+            f"of seconds representable as a float, got {value!r}"
+        )
+    return timeout
+
+
+backend_compile_timeout_seconds: float = _backend_compile_timeout_from_env()
+
 # Enable certified LX ownership changes: movement, exact fused-axis views,
 # consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
 # ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Enable optional ownership proofs and local reads added after prefix support.
+# Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
+lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Let a co-optimizing solver that decides LX relayouts (one whose
+# decides_lx_relayouts() is true) choose them. Set SPYRE_LX_SOLVER_RELAYOUT=0 to
+# offer it no relayout candidates, so an edge whose views differ spills to HBM, and
+# nothing else about the plan changes; unlike SPYRE_LX_PLANNER_RELAYOUT=0, which
+# also turns off restickify residency and fused-axis views. It does not gate the
+# greedy fallback after a failed solve, which plans relayouts under
+# SPYRE_LX_PLANNER_RELAYOUT. For measuring what a relayout is worth (the cost-model
+# sweep's `relayout` op) and for tests that need the spill side of an edge.
+lx_solver_relayout: bool = os.getenv("SPYRE_LX_SOLVER_RELAYOUT", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -165,19 +231,102 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Compiling for Spyre 1p5 (the backend compiler reads the same SENARCH). Its
+# matmul takes BFLOAT16 inputs only, so a matmul input must already be BFLOAT16
+# on the device: see spyre_kernel._check_sen1p5_matmul_inputs.
+sen1p5: bool = os.environ.get("SENARCH", "").lower() == "sen1p5"
+
 # Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
 # The pointwise work-division PR (#2499) wires that helper into the
 # compilation pipeline; until then these knobs are read only by the
 # helper and its unit tests. See #2284, #2287 for the design.
 
-# Cap on bucket count (= max_size / granularity).
-# TODO: confirm the default with the Deeptools team.
-max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+# Cap on bucket count (= max_size / granularity): the number of candidate
+# iterations of a loop over a declared dimension, one correction slot each.
+# 256 covers a 32K context at 128 tokens per page with granularity 1. Nothing
+# in the kernel, launch or correction path reads this knob; the measurements
+# behind the default are on #6432. A consumer may set it per process, by this
+# env variable or on this module before the first declaration.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "256"))
+
+# Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
+# plugin's linear wrapper branches on a row count below this, which would
+# become a branch on a symbol once that dim is dynamic. Real minima are far
+# above it today, so this holds by luck rather than by construction --
+# enforcing it at the reservation means a future caller can't quietly drop
+# below it.
+min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 
 # Soft floor on the auto-derived granularity when mark_dynamic(min=...)
 # is not provided. Keeps the picked granularity from collapsing to a
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
+
+
+def reservation_violations(
+    dim_min: int,
+    dim_max: int,
+    granularity: int,
+    *,
+    enforce_min_floor: bool = True,
+) -> list[str]:
+    """Problems with ``(dim_min, dim_max, granularity)`` as a reservation contract.
+
+    Shared by the two places such a triple is created: a user's own
+    ``tensor.to("spyre", dynamic=...)`` declaration (``_monkey_patch.py``) and
+    a derived output contract handed from one compiled kernel to the next
+    (``reserved_dims_contract.py``'s ``output_reserved_dims``). A derived
+    contract is held to the same structural bar as a typed one, instead of
+    silently carrying a triple the declare-time path would have rejected.
+
+    ``enforce_min_floor`` defaults on for a user-typed declaration, where
+    ``min_reserved_dim_size`` matters (the serving plugin's eager row-count
+    branching, see that constant's own docstring). A derived output contract
+    is purely an internal compiler value with no such caller, and a real
+    kernel-to-kernel contract routinely has a ``min`` under that floor (a
+    reduction's output row count, say) -- so ``output_reserved_dims`` passes
+    ``False``. The two divisibility rules hold on a derived contract by
+    construction, given a valid input; the bucket cap does not (a derived
+    granularity can be finer than any input's), so it is the one rule that
+    genuinely needs checking there too.
+
+    Empty when the triple is valid. Callers decide how to report a
+    violation: a user-typed declaration raises ``ValueError``; a
+    compiler-derived contract that fails the cap raises ``Unsupported``
+    rather than silently stamping it or silently loosening the cap.
+    """
+    # install_config_module (below) moves every config value off this
+    # module's plain globals and onto its own accessor, so a bare reference
+    # to max_buckets/min_reserved_dim_size from here -- a function living in
+    # this same file -- would raise NameError once the module is installed.
+    # Re-importing it by name resolves through that accessor instead, the
+    # same way every external caller (e.g. pass_utils.py) already reads it.
+    from torch_spyre._inductor import config as _config
+
+    violations = []
+    if dim_min > dim_max:
+        violations.append(f"min={dim_min} exceeds max={dim_max}")
+    if dim_max % granularity != 0:
+        violations.append(
+            f"max={dim_max} is not a multiple of granularity={granularity}"
+        )
+    if dim_min % granularity != 0:
+        violations.append(
+            f"min={dim_min} is not a multiple of granularity={granularity}"
+        )
+    if enforce_min_floor and dim_min < _config.min_reserved_dim_size:
+        violations.append(
+            f"min={dim_min} is below the minimum supported reservation floor "
+            f"({_config.min_reserved_dim_size})"
+        )
+    num_buckets = dim_max // granularity
+    if num_buckets > _config.max_buckets:
+        violations.append(
+            f"max={dim_max} / granularity={granularity} = {num_buckets} buckets, "
+            f"exceeding the cap of {_config.max_buckets} (config.max_buckets)"
+        )
+    return violations
+
 
 # Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
@@ -262,6 +411,7 @@ dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
+
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
@@ -388,6 +538,13 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
+# Check that graph.operations is topologically ordered after every
+# pre-scheduling pass, not only after the last one. The check after the last
+# pass always runs and catches any pass that breaks the order; this one names
+# the pass that did. Off by default because it re-extracts the read set of
+# every operation after every pass. Set SPYRE_VALIDATE_EVERY_PASS=1 to enable.
+validate_every_pass: bool = os.environ.get("SPYRE_VALIDATE_EVERY_PASS", "0") == "1"
+
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
 # selects. Off by default, and inert unless a joint co-opt path is active
@@ -412,13 +569,21 @@ _cpsat_warn_on_cost_expr: bool = True
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
+# Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
+# if an optimal solution is fully priced. The check is a second solve with no
+# time limit, so it can run well past ``cpsat_time_limit_seconds`` on a hard model;
+# not for production compiles.
+enable_uniqueness_check: bool = (
+    os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
+)
+
 # solver_relayout_edge_context's same-tile-group exception (#5057): without it,
 # a coarse-tiled producer or consumer can never host a relayout candidate at
 # all, even when the pair shares one loop_group_id (same iteration, same tile,
 # direct read, no staging op between them). With it, every such edge is priced,
 # which can enumerate and cost a large number of candidate divisions on a graph
 # with many eligible same-group edges -- see #5609's compile-time report.
-# This is not for_each_tile-specific: loop_group_id/CoarseTileInfo is stamped
+# This is not for_each_tile-specific: loop_group_id/LoopInfo is stamped
 # by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
 # path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
 # any graph with coarse-tiled ops sharing a loop_group_id with their consumer,
@@ -430,6 +595,12 @@ lx_same_tile_group_relayout: bool = (
     os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
 )
 
+# Allow post-solve matmul output staging before an all-reduce's HBM copy.
+# Set SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0 to disable this step alone.
+lx_collective_output_staging: bool = (
+    os.environ.get("SPYRE_LX_COLLECTIVE_OUTPUT_STAGING", "1") == "1"
+)
+
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every
 # other setting's value in the key. A setting belongs here when it describes the
@@ -439,6 +610,61 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # A limit on compiler execution time, not an input to generated code.
+    "backend_compile_timeout_seconds",
+    # Where logs go and whether kernels are kept on disk: these do not change
+    # the compiled code (spyre_kernel_cache only picks between the kernel disk
+    # cache and a fresh backend compile). Without them, a run that only writes
+    # its timing log to a new file cannot reuse any cached graph and compiles
+    # everything again. These are prefixes: "timing" covers both timing and
+    # timing_out. A test in test_solver_relayout_decision.py pins what each
+    # prefix matches.
+    "timing",
+    "dump_cost_expr_file",
+    "spyre_kernel_cache",
+    # Read at call time; the generated code is the same for every value.
+    "precomputed_kernel_key",
 ]
+
+
+def _precomputed_kernel_key_from_env() -> str:
+    value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return "1"
+    if normalized == "verify":
+        return "verify"
+    if normalized not in ("", "0", "false", "no"):
+        warnings.warn(
+            "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY must be 1/true/yes, verify or "
+            f"0/false/no, got {value!r}; leaving it off",
+            stacklevel=2,
+        )
+    return "0"
+
+
+# Trust the kernel-cache key that codegen stored in the generated wrapper.
+# Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
+# (None when it could not be computed): <key> is compute_specs_hash() of the
+# call's specs and pool_size, <fp> a fingerprint of everything else that key
+# depends on (see kernel_key_fingerprint in torch_spyre.execution.kernel_cache
+# for the list). With the kernel cache on and this set to "1",
+# sdsc() uses <key> when <fp> matches the running process instead of
+# regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
+# mismatch falls back to compute_specs_hash(). "verify" computes both and
+# raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
+# time; the generated code is the same for every value, so it is left out of
+# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
+# (true and yes work too). Any other value warns and leaves it off.
+precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
+
+if TYPE_CHECKING:
+    # install_config_module below adds ``patch`` (and the rest of the config
+    # API) at runtime. Declare it for mypy, which pre-commit runs without torch
+    # installed, so torch.utils._config_typing cannot supply it.
+    def patch(
+        arg1: str | dict[str, Any] | None = None, arg2: Any = None, **kwargs: Any
+    ) -> Any: ...
+
 
 install_config_module(sys.modules[__name__])

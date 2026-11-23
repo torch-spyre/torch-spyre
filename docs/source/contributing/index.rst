@@ -14,3 +14,5 @@ For compiler-specific patterns such as adding new operation support, see
    op_enablement
    profiling
    is_power_z_dev_label_guide
+   benchmark_node_qualification
+   bench_on_demand

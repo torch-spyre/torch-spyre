@@ -118,6 +118,15 @@ class DryRunClient:
         return "\n".join(lines) or "    nothing"
 
 
+# Per-upload tags a dashboard upload puts on every row it adds; never part of a row's identity.
+UPLOAD_ROW_PROPS = ("upload_id", "round")
+
+
+def upload_row_props(props) -> dict:
+    """The upload tags among `props`, for the fact rows of one upload."""
+    return {k: str(props[k]) for k in UPLOAD_ROW_PROPS if (props or {}).get(k)}
+
+
 class _Rows:
     def __init__(self, rows):
         self.result_rows = rows
@@ -143,10 +152,24 @@ class RunWriter:
         return cls.fact_table.count_rows(client, db, where, params) > 0
 
     @classmethod
-    def _flush(cls, client, db: str, ident_rows: dict, fact_rows: list) -> int:
-        """Write the unknown identities and every fact row; returns the row count."""
+    def _flush(
+        cls, client, db: str, ident_rows: dict, fact_rows: list, scope=None
+    ) -> int:
+        """Write the unknown identities and every fact row; returns the row count.
+
+        `scope` is (where, params) naming this call's rows, so a batch that errors is only
+        resent when none of it was stored (the fact tables are plain MergeTree). Without a
+        scope a failed batch is not resent.
+        """
         cls.identity_table.insert_identities(client, ident_rows, db=db)
-        cls.fact_table.insert(client, fact_rows, db=db)
+        landed = None
+        if scope:
+            where, params = scope
+
+            def landed() -> int:
+                return cls.fact_table.count_rows(client, db, where, params)
+
+        cls.fact_table.insert(client, fact_rows, db=db, landed=landed)
         return len(fact_rows)
 
     @staticmethod
@@ -185,7 +208,11 @@ class TestResultWriter(RunWriter):
         source_file: str = "",
         attempt: int = 0,
     ) -> bool:
-        """Have this source file's rows for this run, from this attempt or later, landed?"""
+        """Have this source file's rows for this run, from this attempt or later, landed?
+
+        Given an attempt, false while rows of an earlier attempt of the file remain: a run that
+        stopped between its insert and its delete comes back and finishes.
+        """
         if not attempt:
             return cls._seen(
                 client,
@@ -194,20 +221,44 @@ class TestResultWriter(RunWriter):
                 component,
                 (("props['source_file']", "sf", source_file),),
             )
-        return (
-            cls.fact_table.count_rows(
-                client,
-                db,
-                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
-                {
-                    "component": component,
-                    "run_id": run_id,
-                    "sf": source_file,
-                    "attempt": attempt,
-                },
-            )
-            > 0
+        params = {
+            "component": component,
+            "run_id": run_id,
+            "sf": source_file,
+            "attempt": attempt,
+        }
+        if not cls.fact_table.count_rows(
+            client, db, f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}", params
+        ):
+            return False
+        older = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
+        verdicts = older.replace("props['source_file']", "props['shard']")
+        return not (
+            cls.fact_table.count_rows(client, db, older, params)
+            or CapabilityWriter.fact_table.count_rows(client, db, verdicts, params)
         )
+
+    @classmethod
+    def rows_of_file(cls, client, db, run_id, component, source_file) -> int:
+        """How many outcome rows this run holds for one source file, any attempt."""
+        params = {"component": component, "run_id": run_id, "sf": source_file}
+        return cls.fact_table.count_rows(client, db, cls._FILE, params)
+
+    @classmethod
+    def replace_attempt(
+        cls, client, db, component, run_id, cases, source_file, *a, **kw
+    ) -> int:
+        """`insert`, then drop the file's rows from earlier attempts.
+
+        In that order, so an insert that parks or fails keeps the previous attempt whole.
+        """
+        written = cls.insert(
+            client, db, component, run_id, cases, source_file, *a, **kw
+        )
+        cls.drop_older_attempts(
+            client, db, run_id, component, source_file, kw.get("attempt", 0)
+        )
+        return written
 
     @classmethod
     def drop_older_attempts(
@@ -296,8 +347,14 @@ class TestResultWriter(RunWriter):
         cases: list,
         source_file: str = "",
         attempt: int = 0,
+        arch: str = "",
+        row_props: dict | None = None,
     ) -> int:
-        """Write one leg's cases; returns the number of outcome rows written."""
+        """Write one leg's cases; returns the number of outcome rows written.
+
+        `arch` is the leg's arch, used for capability verdicts whose case carries no platform tag.
+        `row_props` are tags added to every outcome row (an upload's id); not hashed into any id.
+        """
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
@@ -307,7 +364,7 @@ class TestResultWriter(RunWriter):
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
-            cls._capability(c, run_tags, attempt, verdicts, problems)
+            cls._capability(c, run_tags, attempt, verdicts, problems, arch)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -336,6 +393,7 @@ class TestResultWriter(RunWriter):
                 # carries the original executor's), the filter for "how much did we
                 # execute"; source_file is the shard discriminator the dedup reads.
                 "props": {
+                    **(row_props or {}),
                     **results,
                     **recorded,
                     "ran_in": run_id,
@@ -349,13 +407,29 @@ class TestResultWriter(RunWriter):
         run_rows, superseded = cls._one_per_case(
             client, db, component, run_id, run_rows
         )
-        written = cls._flush(client, db, ident_rows, run_rows)
+        written = cls._flush(
+            client,
+            db,
+            ident_rows,
+            run_rows,
+            scope=(
+                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
+                {
+                    "component": component,
+                    "run_id": run_id,
+                    "sf": source_file,
+                    "attempt": attempt,
+                },
+            )
+            if source_file
+            else None,
+        )
         # Checked before any batch is written, so a type's second batch is not refused.
         landed = {
             t
             for t in {k[0] for k in verdicts}
             if CapabilityWriter.already_ingested(
-                client, db, run_id, component, t, shard=source_file
+                client, db, run_id, component, t, shard=source_file, attempt=attempt
             )
         }
         for (test_type, arch, disc_keys), results in verdicts.items():
@@ -370,6 +444,7 @@ class TestResultWriter(RunWriter):
                     arch=arch,
                     disc_keys=disc_keys,
                     shard=source_file,
+                    row_props=row_props,
                 )
         if superseded:
             # After the insert, so a failed insert never loses the outcome it would replace.
@@ -405,7 +480,13 @@ class TestResultWriter(RunWriter):
 
     @classmethod
     def _capability(
-        cls, case: dict, run_tags, attempt: int, verdicts: dict, problems: Counter
+        cls,
+        case: dict,
+        run_tags,
+        attempt: int,
+        verdicts: dict,
+        problems: Counter,
+        default_arch: str = "",
     ) -> None:
         """Add the case's `capability.*` verdict, if it declares a valid one, to `verdicts`.
 
@@ -427,7 +508,7 @@ class TestResultWriter(RunWriter):
                 for t in run_tags
                 if CaseId.namespace(t) == "platform"
             ),
-            "",
+            default_arch,
         )
         key = (decl["test_type"], arch, tuple(sorted(decl["sig"])))
         verdicts.setdefault(key, []).append(
@@ -611,8 +692,12 @@ class BenchmarkWriter(RunWriter):
         benchmarks: list,
         report_kind: str = "",
         source_file: str = "",
+        row_props: dict | None = None,
     ) -> int:
-        """Write one leg's benchmarks, one row per (benchmark, backend)."""
+        """Write one leg's benchmarks, one row per (benchmark, backend).
+
+        `row_props` are tags added to every run row (an upload's id); not hashed into any id.
+        """
         if not benchmarks:
             return 0
         ident_rows: dict[str, schema.BenchmarkRow] = {}
@@ -647,6 +732,8 @@ class BenchmarkWriter(RunWriter):
         # The DDL's CHECK refuses an empty map, so one unmeasured benchmark would fail
         # the whole insert; dropped with a warning rather than losing a long perf leg.
         run_rows = [f for f in facts.values() if f["measurements"]]
+        for f in run_rows:
+            f["props"].update(row_props or {})
         dropped = len(facts) - len(run_rows)
         kept = {f["benchmark_id"] for f in run_rows}
         written = cls._flush(
@@ -713,15 +800,24 @@ class CapabilityWriter(RunWriter):
         component: str,
         test_type: str = "",
         shard: str = "",
+        attempt: int = 0,
     ) -> bool:
-        """Have this run's verdicts for this analysis and shard already landed?"""
-        return cls._seen(
-            client,
-            db,
-            run_id,
-            component,
-            (("test_type", "tt", test_type), ("props['shard']", "shard", shard)),
-        )
+        """Have this run's verdicts for this analysis and shard already landed?
+
+        Given an attempt, only verdicts from that attempt or later count, so an earlier
+        attempt's verdicts do not block a re-run's.
+        """
+        scopes = (("test_type", "tt", test_type), ("props['shard']", "shard", shard))
+        if not attempt:
+            return cls._seen(client, db, run_id, component, scopes)
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        params: dict = {"component": component, "run_id": run_id, "attempt": attempt}
+        for column, key, value in scopes:
+            if value:
+                where += f" AND {column} = {{{key}:String}}"
+                params[key] = value
+        where += f" AND {TestResultWriter._ATTEMPT} >= {{attempt:UInt32}}"
+        return cls.fact_table.count_rows(client, db, where, params) > 0
 
     @classmethod
     def insert(
@@ -735,6 +831,7 @@ class CapabilityWriter(RunWriter):
         arch: str = "",
         disc_keys=(),
         shard: str = "",
+        row_props: dict | None = None,
     ) -> int:
         """Write one analysis's verdicts; `backend` is a column, not part of the id."""
         if not results:
@@ -774,6 +871,7 @@ class CapabilityWriter(RunWriter):
                 # shard is applied LAST: it is the dedup scope, so a producer prop
                 # of the same name must not redefine it and let a re-ingest through.
                 "props": {
+                    **(row_props or {}),
                     **{k: str(v) for k, v in (r.get("props") or {}).items()},
                     **({"shard": shard} if shard else {}),
                 },
@@ -1003,8 +1101,12 @@ class ArtifactWriter:
         duration_s: float = 0.0,
         props=None,
         attempt: int = 0,
+        supersede: bool = False,
     ) -> bool:
         """One verdict of one leg on one artifact; refuses a partial key, skips a repeat.
+
+        `supersede` writes a new row even when the key holds a verdict: an appended round's
+        verdict over the whole run, which every view reads as the latest.
 
         Given an attempt, the verdict replaces any from an earlier attempt of the same run. A
         repeat that explains a failure lands its reason in artifact_result_reasons instead.
@@ -1023,7 +1125,13 @@ class ArtifactWriter:
                 file=sys.stderr,
             )
             return False
-        if cls.result_recorded(client, db, aid, rid, kind, test_type, attempt):
+        if not supersede and cls.result_recorded(
+            client, db, aid, rid, kind, test_type, attempt
+        ):
+            if attempt:  # a run that stopped between the insert and the delete
+                cls._drop_older_verdicts(
+                    client, db, aid, rid, kind, test_type, attempt, if_any=True
+                )
             if props.get("failure_reason"):
                 cls.insert_reason(
                     client,
@@ -1037,13 +1145,6 @@ class ArtifactWriter:
                     source=props.get("source") or "writer",
                 )
             return True
-        if attempt:
-            where, params = cls._verdict_key(aid, rid, kind, test_type)
-            client.command(
-                f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where} "
-                f"AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}",
-                parameters={**params, "attempt": attempt},
-            )
         result_row: schema.ArtifactResultRow = {
             "artifact_id": aid,
             "run_id": rid,
@@ -1058,7 +1159,47 @@ class ArtifactWriter:
             ),
         }
         cls.result_table.insert(client, [result_row], db=db)
+        if (
+            attempt
+        ):  # after the insert: one that parks or fails keeps the earlier verdict
+            cls._drop_older_verdicts(client, db, aid, rid, kind, test_type, attempt)
         return True
+
+    @classmethod
+    def _drop_older_verdicts(
+        cls, client, db, aid, rid, kind, test_type, attempt, if_any=False
+    ):
+        where, params = cls._verdict_key(aid, rid, kind, test_type)
+        where += f" AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}"
+        params = {**params, "attempt": attempt}
+        if if_any and not cls.result_table.count_rows(client, db, where, params):
+            return
+        client.command(
+            f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where}",
+            parameters=params,
+        )
+
+    @classmethod
+    def latest_result(cls, client, db: str, artifact_id, run_id, test_type: str):
+        """(state, duration_s) of the run's latest published verdict at this key, else None."""
+        kind = cls._result_kind(test_type)
+        where, params = cls._verdict_key(artifact_id, run_id, kind, test_type)
+        rows = client.query(
+            f"SELECT state, duration_s FROM {db}.v_artifact_results_published WHERE {where} "
+            "ORDER BY ts DESC, audit_timestamp DESC LIMIT 1",
+            parameters=params,
+        ).result_rows
+        return (rows[0][0], float(rows[0][1] or 0)) if rows else None
+
+    @classmethod
+    def over_prior(cls, client, db, artifact_id, run_id, test_type, state, duration_s):
+        """(state, duration_s) of a round's verdict over the whole run: durations add, and a
+        failed or error round before it is not undone by a passing one."""
+        prior = cls.latest_result(client, db, artifact_id, run_id, test_type)
+        if not prior:
+            return state, duration_s
+        worst = next((s for s in ("error", "failed") if s in (state, prior[0])), state)
+        return worst, duration_s + prior[1]
 
     @staticmethod
     def _result_kind(test_type: str, result_kind: str = "") -> str:
@@ -1243,6 +1384,7 @@ class ArtifactWriter:
 cases_already_ingested = TestResultWriter.already_ingested
 drop_older_case_attempts = TestResultWriter.drop_older_attempts
 insert_test_results = TestResultWriter.insert
+replace_case_attempt = TestResultWriter.replace_attempt
 benchmarks_already_ingested = BenchmarkWriter.already_ingested
 insert_benchmarks = BenchmarkWriter.insert
 capabilities_already_ingested = CapabilityWriter.already_ingested

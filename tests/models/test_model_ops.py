@@ -24,7 +24,7 @@ from .model_cases_loader import LoadedCase, case_key, load_all_cases
 from .runner import run_test, parse_dtype, make_SampleInput
 from .op_registry import OP_REGISTRY, OpAdapter
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from torch.testing._internal.opinfo.core import (
     OpInfo,
@@ -66,6 +66,14 @@ class ModelOpInfo(OpInfo):
 
 
 model_ops_db: list[ModelOpInfo] = []
+
+
+def dtype_precision(dtypes: List[Dict[str, Any]], dtype: torch.dtype) -> Dict[str, Any]:
+    """Return the "precision" mapping of the top-level "dtypes" entry for dtype."""
+    for entry in dtypes:
+        if parse_dtype(entry["name"]) == dtype:
+            return dict(entry.get("precision") or {})
+    return {}
 
 
 def add_model_ops_db(loadedCases: List[LoadedCase]):
@@ -193,8 +201,23 @@ class TestSpyreModelOps(TestCase):
 
         # load parameters
         seed = case.get("seed", defaults.get("seed", None))
-        rtol = float(case.get("rtol", defaults.get("rtol", 5e-3)))
-        atol = float(case.get("atol", defaults.get("atol", 5e-3)))
+
+        def tolerance(out_dtype: Optional[torch.dtype]) -> Tuple[float, float]:
+            # Precedence: case > top-level "dtypes" entry > defaults. The
+            # "dtypes" entry is looked up by the case dtype when the case sets
+            # one, otherwise by the dtype of the output tensor.
+            precision_dtype = (
+                dtype if "dtype" in case or out_dtype is None else out_dtype
+            )
+            precision = dtype_precision(loadedCase.dtypes, precision_dtype)
+            rtol = float(
+                case.get("rtol", precision.get("rtol", defaults.get("rtol", 5e-3)))
+            )
+            atol = float(
+                case.get("atol", precision.get("atol", defaults.get("atol", 5e-3)))
+            )
+            return rtol, atol
+
         description = case.get("description")
 
         # Build CPU args ONCE, then copy to Spyre (identical values)
@@ -221,8 +244,7 @@ class TestSpyreModelOps(TestCase):
                 test_sample,
                 test_device,
                 compile_backend,
-                rtol,
-                atol,
+                tolerance,
                 description,
             )
         finally:

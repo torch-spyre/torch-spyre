@@ -232,10 +232,7 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.cumsum,
-        aten.repeat.out,
         aten.arange,
-        aten.ne.Scalar_out,
         aten.isin,
         aten.tril,
         aten.triu.out,
@@ -246,7 +243,6 @@ register_fallback_default(
         aten.argmax.default,
         aten.argmin.default,
         aten.where.default,
-        aten.index_copy.out,
     ]
 )
 

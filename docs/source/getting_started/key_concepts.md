@@ -217,7 +217,7 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
    plus a Taylor polynomial).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `cumsum`, `tril`, ...). Transparent, but
+   `arange`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
@@ -232,8 +232,8 @@ to enable a new one.
 
 The compiled path runs the standard PyTorch pipeline (FX capture,
 AOTAutograd, Inductor scheduler) and inserts three Spyre-specific
-passes: layout propagation, work division (`span_reduction` followed
-by `work_distribution`), and scratchpad / LX planning. The output is
+passes: layout propagation, work division (`cost_model_matmul_division`
+and `work_distribution`), and scratchpad / LX planning. The output is
 a SuperDSC JSON artifact that the Deeptools backend (a proprietary
 compiler) turns into a device binary.
 

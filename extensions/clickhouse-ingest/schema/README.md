@@ -16,23 +16,94 @@ Applying them in filename order works from an empty database.
 | `26-dispatch-targets.sql` | `dispatch_targets` | — |
 | `30-benchmarks.sql` | `benchmarks`, `benchmark_runs` | — |
 | `40-jenkins-agents.sql` | `jenkins_agents` | — |
+| `41-ops-requests.sql` | `ops_requests` | — |
+| `42-ci-requests.sql` | `ci_requests` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
-| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_artifact_results_published` | 20 |
+| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_retracted_rounds`, `v_artifact_results_published` | 20 |
 | `50-artifact-views.sql` | 8 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
 | `53-pipeline-views.sql` | `v_pipeline_runs`, `v_pipeline_run_outcomes`, `v_pipeline_gate_daily` | 47 |
 | `54-ci-run-timing-views.sql` | `v_ci_run_timings`, `v_ci_runs`, `v_ci_runs_spyre_test`, `v_ci_runs_merge_queue`, `v_ci_runs_main_push`, `v_ci_lane_daily` | 48 |
 | `55-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers`, `v_feed_events` (parameterized), `v_dispatch_targets` | 20, 25, 26, 49, 50 |
-| `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
-| `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
+| `56-pipeline-run-lineage.sql` | `pipeline_run_links`, `v_pipeline_run_links`, `v_pipeline_run_links_pending`, `v_pipeline_run_edges`, `v_pipeline_run_lineage`, `v_pipeline_run_lineage_gaps` | 47, 53 |
+| `57-failure-forensics-views.sql` | `v_result_run_context`, `v_failure_fingerprint`, `v_case_run_history`, `v_failure_recurrence`, `v_failure_first_seen`, `v_failure_groups` | 10, 20, 45, 47, 53 |
+| `58-ci-event-records.sql` | `poller_decisions`, `ci_write_failures`, `merge_queue_events` | — |
+| `59-ci-request-views.sql` | `v_ci_requests`, `v_ci_cell_durations` | 20, 42, 50 |
+| `60-benchmark-views.sql` | `benchmark_excluded_record_types`, `v_benchmark_runs_measured`, 5 `v_benchmark_*` views | 20, 30, 50 |
+| `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `benchmark_baseline_purposes`, `benchmark_metric_verdicts` + its refreshable MV | 60, 85 (the MV reads `v_benchmark_metric_verdicts`; refreshable MVs are created last) |
+| `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
+| `65-insight-reports.sql` | `insight_reports`, `v_insight_reports` | — |
+| `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
+| `67-effect-status.sql` | `effect_status` (append-only triage events), `v_effect_status` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
+| `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
+| `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
+| `81-bench-environments.sql` | `environments`, `node_classes`, `environment_fingerprints`, `environment_nodes`, `environment_qualifications`, `v_environments`, `v_node_classes`, `v_environment_fingerprints`, `v_environment_nodes`, `v_environment_qualified` | — |
+| `82-run-placements.sql` | `run_placements`, `v_run_placements_effective`, `v_run_devices` | — |
+| `83-result-invalidations.sql` | `result_invalidations`, `v_invalidation_state`, `v_invalidated_runs` | 49, 82 |
+| `84-bench-views.sql` | `v_bench_attrs`, `v_bench_results` | 20, 30, 49, 60, 81, 82, 83 |
+| `85-benchmark-verdict-views.sql` | `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `v_perf_regression_gate` (they skip invalidated runs and keep suspect or non-baseline-purpose runs out of baselines) | 20, 49, 60, 62, 83 |
+| `86-bench-references.sql` | `v_bench_references`, `v_bench_reference_values` | 20, 30, 49, 50 |
+| `87-bench-trace-views.sql` | `v_bench_step_records`, `v_bench_step_rank_agg`, `v_bench_step_lag`, `v_bench_step_headline`, `v_bench_step_outliers`, `v_bench_rank_coverage`, `v_bench_spans` (step and span values unnested from `benchmark_runs` arrays; see `docs/trace-views.md`) | 30, 83 |
+| `88-bench-anchored-verdicts.sql` | `v_benchmark_series_runs`, `v_benchmark_anchor`, `v_benchmark_anchored_verdicts` (a fixed accepted baseline per series beside the rolling verdict; changes no existing view) | 20, 30, 49, 50, 60, 62, 83, 85, 86 |
+| `89-bench-invalidation-preview.sql` | `v_bench_repeat_scope`, `v_bench_invalidation_impact`, `v_bench_invalidation_summary`, `v_bench_scope_hits` (parameterized) | 60, 82, 83 |
+| `90-bench-span-values.sql` | OPTIONAL: `bench_span_values`, `mv_bench_span_values`, `v_bench_spans_fast` (an insert-triggered copy of the unnested spans) | 30, 83, 87 |
+
+### Benchmark schema stack (81-90)
+
+Numbers 81-86 come first, in this order: environments, placements and invalidations (81-84), reader
+exclusion (edits to 50/52/55/60/62/70 plus migrations 025 and 029), verdict views (85), references view
+(86). The views that follow extend the stack without renumbering it:
+
+| number | for |
+|---|---|
+| `87` | trace views |
+| `88` | anchor (baseline) views |
+| `89` | invalidation preview |
+| `90` | optional span-values table and its materialized view (the trace views' speed path) |
+
+Migration numbers: `025` is the reader exclusion; `028` (`ci_requests` accepts the `comment` channel) and `029`
+(the HUD projection skips bench rows) are rerunnable. `026` (the `reference` and `bench` upload formats) belongs
+to the bundle kinds and `027` is not used. The ledger is per file, so a gap in the numbers is harmless.
+
+Behaviour notes for consumers of the stack:
+
+- A run with no eligible samples (all invalidated, or only excluded record types) has no row in
+  `v_benchmark_gate` / `v_perf_regression_gate`; treat a missing row as "no verdict", not a pass.
+- Record types in `benchmark_excluded_record_types` no longer get verdicts; history already in
+  `benchmark_metric_verdicts` is kept, new refreshes skip them.
+- `benchmark_baseline_purposes` is a view: editing it changes baseline eligibility for all history.
+
+The new tables are append-only and the rest are views, so rolling back is dropping the new views
+and reverting the edited ones.
+
+Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
+
+| column | values |
+|---|---|
+| `ts` | DateTime64(3, 'UTC') |
+| `session_id` | the conversation |
+| `role` | what the call was for |
+| `actor`, `actor_kind` | `human`, `anonymous`, `agent`, `service` |
+| `model_alias`, `served_model` | display name, model id |
+| `prompt_version` | first 12 hex of the system prompt sha256 |
+| `tokens_in`, `tokens_out`, `latency_ms`, `cost_usd` | numbers, 0 when unknown |
+| `outcome` | `ok`, `rejected_schema`, `error`, `timeout`, `budget` |
+| `props` | Map(String, String), error detail |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between
 them (`artifact_results` to `test_case_runs`). The `51` tier views read `artifact_results` only
 to learn which tier a run's leg was dispatched for.
+
+Comparison targets are not measurements: a `benchmark_runs` row with `run.ref_only = '1'` (or
+`run.record_type = 'reference'`) is dropped by `v_benchmark_runs_measured`, which the benchmark views
+read, and by the HUD projection (an MV cannot read a view), which also skips `report_kind = 'bench'` rows (migration 029). The trend, backend-compare and verdict
+views also skip the record types in `benchmark_excluded_record_types`; the artifact, tag, coverage and
+dispatch views skip `component = 'reference'` artifacts and `tag_family = 'reference'` tags.
 
 `70-` is named for what it is — a projection of `benchmark_runs` into the shape the PyTorch HUD
 reads — rather than for a table, because the tables it declares carry upstream's names
@@ -96,6 +167,123 @@ Mechanical constraints behind those rules:
 - `MODIFY COLUMN` cannot convert `Float64` to `Array(Float64)` (Code 53) — also a rebuild.
 - The server rejects `CREATE OR REPLACE VIEW` (`renameat2() is not supported`), and dropping a
   base table silently drops its views.
+
+## Applying on a Replicated cluster
+
+Off by default: with no cluster set the applier sends exactly the SQL it always did. Set
+`--cluster <name>` or `CLICKHOUSE_CLUSTER=<name>` (a plain identifier) and it instead:
+
+- adds `ON CLUSTER <name>` to every `CREATE`, to migration DDL (`ALTER`, `DROP`, `TRUNCATE`,
+  `RENAME`, `EXCHANGE TABLES`) and to migration `DELETE`;
+- creates tables on the matching `Replicated*MergeTree` engine (`MergeTree`, `ReplacingMergeTree`,
+  `SummingMergeTree`, `AggregatingMergeTree`; any other engine raises), including the
+  `schema_migrations` ledger and tables a migration creates;
+- keeps the table in Keeper at `/clickhouse/<cluster>/tables/{shard}/<db>/<table>`, or at
+  `CLICKHOUSE_KEEPER_PATH` if set: an absolute path of letters, digits and `_ . / -` with the
+  placeholders `{table}` (or `{uuid}`; required), `{db}`, `{cluster}` and `{shard}` only, anything
+  else raises. The default has no generation suffix, unlike a converted table's path (`.../g<N>`):
+  dropping and recreating a table at the same path collides in Keeper if a replica missed its
+  `DROP ... SYNC`. Set `CLICKHOUSE_KEEPER_PATH=/clickhouse/<cluster>/tables/{shard}/{db}/{table}/g2`
+  (or the next generation) to keep paths distinct; `--check` and `apply` print a note while the
+  default is in use;
+- treats a Replicated table as equal to its plain file, so a converted table is never drift. Only
+  the engine's path and replica, and a conversion comment `ha-twin` (or `ha-twin | <original>`),
+  are ignored; a `COMMENT` written in the file still counts;
+- reports a table of a Replicated family that is still on a plain engine as `not-replicated`:
+  `--check` exits 2 (like drift) and `apply` stops before any write, because its `ON CLUSTER`
+  DDL would otherwise change each server alone. Without a cluster this is not checked.
+
+Data statements in a migration (`INSERT`) run once on the connected server and reach the others by
+replication; before a later statement reads a table the migration inserted into, the applier runs
+`SYSTEM SYNC REPLICA ON CLUSTER` on it. The ledger is synced on the connected replica before it is
+read.
+
+A refreshable MV appends on a schedule, so it exists on **one** replica only, never `ON CLUSTER`.
+Before creating one, the applier reads `system.tables` on every replica through
+`clusterAllReplicas` and skips creating it if any replica already has it, so it does not matter
+which replica a later run connects to. That read needs `SELECT` on `system.tables` on every replica
+as the cluster's inter-server user; if any replica cannot show `schema_migrations` the run stops
+before creating anything, because a replica that cannot see tables would hide its MV. Rerun after
+fixing the grant. A migration that creates a refreshable MV also creates it on the connected server
+only.
+
+Refused with an error, not run on one server: `CREATE OR REPLACE`, `CREATE DICTIONARY`,
+`CREATE TABLE ... AS SELECT` or `AS <table>`, an MV with its own `ENGINE` (use `TO <table>`),
+`DROP TABLE a, b`, `RENAME`/`EXCHANGE` with `SETTINGS`, `OPTIMIZE`, `ATTACH`/`DETACH`/`UNDROP`,
+`SYSTEM`, `GRANT`/`REVOKE`, and an explicit `ON CLUSTER` on a non-Replicated table. Errors in new
+tables or pending migrations surface from `--check` and before the first `CREATE` of an apply.
+
+Prerequisite: every table, and the ledger, must already be Replicated. `SYSTEM SYNC REPLICA`
+refuses a plain table, and `CREATE ... IF NOT EXISTS ON CLUSTER` does not convert an existing one.
+Convert the existing tables to Replicated engines first, for example with a table-conversion tool
+for your deployment. The applier checks the ledger, and every existing table a pending migration
+inserts into, on the connected server before any write, and raises naming the ones that are not
+Replicated. It sees only what the login's `system.tables` shows: a pending migration that inserts
+into a table the login cannot see, or into another database, is refused rather than skipped.
+`--check` also runs `SYSTEM SYNC REPLICA` on the ledger, so a read-only login needs that grant too.
+
+Rows a migration inserted are synced before any later statement, in the same or a later migration,
+reads that table by name. Known view gap: a view over a table is not seen, so a migration that
+inserts into a table and then reads it only through a view is not synced in between, and rows still
+unsynced when the last migration finishes (for example `010` into `run_case_counters`, `019` into
+`artifact_subscription_versions`) reach the other replicas by ordinary replication, so a view read
+on another replica right after an apply can lag.
+
+Every cluster statement waits up to an hour (`distributed_ddl_task_timeout`, and the client's read
+timeout is raised to match unless `CLICKHOUSE_SEND_RECEIVE_TIMEOUT` is set). If an `ON CLUSTER`
+statement still raises, the applier reads its task in `system.distributed_ddl_queue`: it goes on only
+when the task has finished without error on every host, and otherwise stops with the task id and the
+per-host state. It does not wait further, and it never writes the ledger row for a statement it
+could not confirm. A rerun is safe only for statements that tolerate repetition: `CREATE ... IF NOT
+EXISTS` and `ADD ... IF NOT EXISTS`/`DROP ... IF EXISTS` are idempotent; an `INSERT` migration is not
+(a timed-out insert may have landed), and the applier cannot tell, so check the rows first.
+
+If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
+keep running on the other replicas, and its ledger row is not written. Migrations marked
+`-- RERUNNABLE` (`grep -l RERUNNABLE schema/migrations/*.sql`: today `007`, `009`, `010`, `012`, `023`,
+`025`, `028` and `029`) can be run again with `--cluster <c> --rerun <migration.sql>`, which first re-checks that the
+tables it inserts into are Replicated. Any other migration must not be rerun, in particular the
+unmarked ones that insert rows (`002`, `003`, `006`, `013`, `019`): look at what ran
+(`system.query_log`), run its remaining statements by hand on the connected replica, and record it.
+To print the statements exactly as the applier would send them, including the
+`SYSTEM SYNC REPLICA` steps and with `ON CLUSTER` and `SYNC` in place, run this and take the ones
+after the last statement that already ran. Statements under `-- IF TABLE EXISTS: <t>` are printed
+with a note and must be skipped when `<t>` does not exist. Syncs for tables written by an earlier
+migration depend on that migration, so list every earlier migration that was still pending in
+`earlier` (in order), or the sync before the first read of such a table is missing:
+
+```bash
+python - <<'EOF'
+from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S
+earlier = []  # paths of the earlier pending migrations, in order
+text = open("<path>").read()
+guard = lambda t: print(f"-- only if {t} exists") or True
+pending = {}
+for p in earlier:
+    for _ in S.migration_commands(open(p).read(), "<cluster>", "<db>", pending, lambda t: True):
+        pass
+for cmd, _ in S.migration_commands(text, "<cluster>", "<db>", pending, guard):
+    print(cmd + ";")
+EOF
+```
+
+The migration's ledger row uses the checksum from this one-liner (`<path>` is the file's path):
+
+```bash
+python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; print(S.checksum(open('<path>').read()))"
+```
+
+```sql
+INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<migration-stem>.sql', '<checksum>')
+```
+
+`<migration-stem>` is the file name without `.sql` (for example `006_case_id_without_run_context`);
+`--rerun` takes the full name `<migration.sql>`.
+
+What it does not do: convert an existing plain table to Replicated, lock against two appliers
+running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on
+single-node chdb, which proves the SQL rewriting only; `ON CLUSTER` and Replicated behaviour are
+not exercised there.
 
 ## Sandboxes
 

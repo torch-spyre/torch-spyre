@@ -64,6 +64,20 @@ class TestExpectFailReason(unittest.TestCase):
         self.assertTrue(mark.kwargs["strict"])
         self.assertEqual(mark.kwargs["reason"], "Expected fail for c")
 
+    def test_float_case_name_keeps_its_reason_after_normalization(self):
+        cls = _make(
+            {
+                "param_sets": {"alpha_0.5": ("x",)},
+                "expect_fail": {"alpha_0.5": "wrong values for fractional alpha"},
+            }
+        )
+        self.assertEqual(
+            unittest.TestLoader().getTestCaseNames(cls), ["test_f_alpha_0p5"]
+        )
+        mark = _xfail_mark(cls.test_f_alpha_0p5)
+        self.assertTrue(mark.kwargs["strict"])
+        self.assertIn("wrong values for fractional alpha", mark.kwargs["reason"])
+
     def test_ops_dict_entry_can_target_one_op_with_a_reason(self):
         def base(self, op, mode):
             pass

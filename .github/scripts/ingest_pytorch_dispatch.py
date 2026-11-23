@@ -321,19 +321,20 @@ def main() -> None:
     client.command("SELECT 1")
     print("[info] Connected.")
 
-    client.command(_CREATE_TABLE_SQL)
+    schema_client = get_client(role="schema")
+    schema_client.command(_CREATE_TABLE_SQL)
     # CREATE TABLE IF NOT EXISTS above won't add columns to a table that
     # already exists (e.g. from before `stage` was introduced) — upgrade it
     # in place, idempotently.
-    client.command(
+    schema_client.command(
         "ALTER TABLE pytorch_ci_dispatches "
         "ADD COLUMN IF NOT EXISTS stage LowCardinality(String) DEFAULT ''"
     )
-    client.command(
+    schema_client.command(
         "ALTER TABLE pytorch_ci_dispatches "
         "ADD COLUMN IF NOT EXISTS pytorch_sha String DEFAULT ''"
     )
-    client.command(
+    schema_client.command(
         "ALTER TABLE pytorch_ci_dispatches "
         "ADD COLUMN IF NOT EXISTS torch_spyre_sha String DEFAULT ''"
     )

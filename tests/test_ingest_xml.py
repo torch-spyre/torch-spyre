@@ -204,8 +204,9 @@ def test_benchmarks_are_stamped_with_the_callers_component(
     monkeypatch.setattr(
         ingest,
         "insert_benchmarks",
-        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
-        or len(entries),
+        lambda client, db, comp, run_id, entries, **kw: (
+            written.append(comp) or len(entries)
+        ),
     )
     _run_main(
         ingest,
@@ -290,12 +291,19 @@ class FakeClient:
             return _Result([[self.already_ingested]])
         if "FROM test_runs" in sql:
             return _Result([[0]])
+        if "SELECT count() FROM test_cases" in sql or "FROM run_properties" in sql:
+            return _Result([[self._stored(sql)]])
         raise AssertionError(f"unexpected query: {sql}")
+
+    def _stored(self, sql):
+        """Rows a batch-failure probe would count: what this fake has inserted so far."""
+        table = "test_cases" if "FROM test_cases" in sql else "run_properties"
+        return sum(len(rows) for t, rows, _ in self.inserts if t == table)
 
     def command(self, sql):
         self.commands.append(sql)
 
-    def insert(self, table, rows, column_names=None):
+    def insert(self, table, rows, column_names=None, **kw):
         self.inserts.append((table, rows, column_names))
 
 
@@ -365,6 +373,7 @@ FULL_RUN_SCHEMA = {
 
 def _run_main(ingest, monkeypatch, xml_path, client, extra_argv=None):
     monkeypatch.setenv("CLICKHOUSE_HOST", "stub")
+    monkeypatch.setenv("INGEST_SCHEMA", "v1")  # these tests cover the legacy v1 writer
     monkeypatch.setattr(ingest, "get_client", lambda: client)
     argv = ["ingest_xml.py", "--xml-file", str(xml_path)]
     if extra_argv:
@@ -857,8 +866,7 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
     for name in (
         "component_of",
         "run_id_for",
-        "cases_already_ingested",
-        "insert_test_results",
+        "replace_case_attempt",
         "extract_properties",
         "promote_xpass",
         "source_and_external_run_id",
@@ -1134,7 +1142,7 @@ def test_strict_fails_on_a_misc_fallback(ingest, monkeypatch, tmp_path, strict, 
     xml.write_text("<testsuites><testsuite name='pytest'><testcase classname='tests.test_ops' "
                    "name='test_a' time='1'/></testsuite></testsuites>", encoding="utf-8")  # fmt: skip
 
-    def verdicts(c, db, args, legs):
+    def verdicts(c, db, args, legs, incomplete=frozenset()):
         args.misc_tags = ["v1.2"]
         return True
 
@@ -1287,7 +1295,9 @@ def test_the_tag_date_defaults_to_the_runs_start_day(ingest, monkeypatch, tmp_pa
     )
     seen = []
     monkeypatch.setattr(
-        ingest, "_write_artifact_verdicts", lambda c, db, args, legs: seen.append(args)
+        ingest,
+        "_write_artifact_verdicts",
+        lambda c, db, args, legs, incomplete=frozenset(): seen.append(args),
     )
     _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)))
     _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)),

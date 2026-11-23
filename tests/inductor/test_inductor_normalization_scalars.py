@@ -45,8 +45,8 @@ def _xfail_var_unsupported(request, execution_mode):
 def _xfail_round_unsupported(request, execution_mode):
     """Strict xfail for a body that calls ``torch.round`` (#1723).
 
-    Eager has no ``aten::round.out`` kernel; compiled generates a kernel module
-    that is not valid Python, because round has no lowering.
+    Eager has no ``aten::round.out`` kernel; compiled emits round as an
+    unimplemented op, so the kernel raises when it is invoked.
     """
     if execution_mode == "eager":
         strict_xfail(
@@ -57,9 +57,9 @@ def _xfail_round_unsupported(request, execution_mode):
     else:
         strict_xfail(
             request,
-            torch._inductor.exc.InductorError,
-            "the generated kernel is not valid Python, because round has no "
-            "lowering (#1723)",
+            RuntimeError,
+            "the compiled kernel raises 'unimplemented operation', because round "
+            "has no lowering (#1723)",
         )
 
 

@@ -29,6 +29,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
+    Layout,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     ReinterpretView,
@@ -101,6 +102,74 @@ def test_change_graph_output_skips_unrelated_view_and_preserves_matching_view():
     assert output.data.data is view
     assert view.layout is view_layout
     assert view.data.data is new
+
+
+def test_output_clone_precedes_consumers_in_lowered_order():
+    """Name-sorted users must not place a drain after an earlier reader."""
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+    from torch_spyre._inductor.scratchpad import graph_editor as ge
+
+    fx_graph = torch.fx.Graph()
+    source_fx = fx_graph.placeholder("source")
+    early_fx = fx_graph.call_function(torch.neg, (source_fx,))
+    late_fx = fx_graph.call_function(torch.relu, (source_fx,))
+    fx_graph.output((early_fx, late_fx))
+    gm = torch.fx.GraphModule(torch.nn.Module(), fx_graph)
+
+    def buffer(name, origin):
+        result = _graph_editor_test_buffer(name)
+        result.origins.add(origin)
+        result.origin_node = origin
+        return result
+
+    source = buffer("source", source_fx)
+    source.layout = FixedTiledLayout(
+        torch.device("spyre"),
+        torch.float16,
+        [2, 3],
+        [3, 1],
+        SpyreTensorLayout([2, 3], [3, 1], torch.float16, [0, 1]),
+    )
+    source.layout.allocation["lx"] = 128
+    early = buffer("buf59", early_fx)
+    late = buffer("buf121", late_fx)
+    operations = [source, early, late]
+    lowering = SimpleNamespace(
+        operations=operations,
+        orig_gm=gm,
+        register_buffer=lambda _buf: "drain",
+    )
+    editor = object.__new__(GraphEditor)
+    editor.lowering = lowering
+    editor.fx_graph = fx_graph
+    editor.clone_aten_op = torch.clone
+    clone_data = _graph_editor_test_buffer("clone_data").data
+
+    with (
+        patch.object(
+            ge,
+            "clone_lowering",
+            return_value=TensorBox(StorageBox(clone_data)),
+        ),
+        patch.object(
+            ge,
+            "register_operation_after_graph_edit",
+            side_effect=lambda graph, op: graph.operations.append(op),
+        ),
+        patch.object(ge, "copy_op_metadata"),
+        patch.object(ge, "iteration_space_from_op", return_value={}),
+        patch.object(ge, "commit_iteration_space_ownership"),
+    ):
+        drain = editor.push_allocation_with_clone(
+            source, [late, early], input=False, private=True
+        )
+
+    assert operations == [source, drain, early, late]
+    assert early_fx.args == late_fx.args == (drain.origin_node,)
+    assert drain.layout.allocation == {}
+    assert source.layout.allocation == {"lx": 128}
+    fx_graph.lint()
 
 
 def test_nested_spyre_context_runs_pre_scheduling_once():
@@ -182,6 +251,8 @@ class BaseTestScratchpadUsage(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
+        # Per test, so a pass added by one test cannot reach another.
+        self.our_pre_scheduling_passes = []
 
         self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
         self.patchers.append(
@@ -223,8 +294,12 @@ class BaseTestScratchpadUsage(unittest.TestCase):
             f(graph)
 
         self.our_pre_scheduling_passes.append(new_pass)
-        yield
-        self.our_pre_scheduling_passes.remove(new_pass)
+        try:
+            yield
+        finally:
+            # Without this, a compile that raises leaves the pass installed and
+            # it runs inside every later test's compile.
+            self.our_pre_scheduling_passes.remove(new_pass)
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
@@ -237,6 +312,12 @@ class BaseTestScratchpadUsage(unittest.TestCase):
             for op in operations:
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
+                # Multi-output ops (e.g. fused attention) expose a
+                # MultiOutputLayout placeholder here instead of a real
+                # Layout; get_layout() raises for it, so skip until a
+                # concrete Layout is available.
+                if not isinstance(getattr(buffer, "layout", None), Layout):
+                    continue
                 layout = buffer.get_layout()
                 if isinstance(layout, MutationLayoutSHOULDREMOVE):
                     layout = layout.real_layout()
@@ -520,6 +601,93 @@ class ParameterizedScratchpadUsage(
         )
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "default cpsat layout_solver needs ortools")
+class TestMLPWhitelistedOpsLXPinning(BaseTestScratchpadUsage):
+    """LX-pinning coverage for the ops #2765 whitelisted: neg, div, bmm,
+    expand, and a small gated-MLP combination of all of them."""
+
+    def _run_case(self, fn, args, atol=0.1, rtol=0.1):
+        cpu_result = fn(*(a.to("cpu") for a in args))
+        with ts_inductor_config.patch(
+            lx_planning=True, allow_all_ops_in_lx_planning=True
+        ):
+            torch.compiler.reset()
+            result, mem_usages = self.compile_and_collect_mem_usage(fn, args)
+        self.assert_uses_lx(mem_usages)
+        self.assertTrue(
+            torch.allclose(result.float(), cpu_result.float(), atol=atol, rtol=rtol),
+            "Result differs from CPU under default lx_planning=True",
+        )
+
+    def test_neg_reaches_lx(self):
+        x = self.rand_device((64, 256))
+
+        def fn(x):
+            return torch.neg(x) + x
+
+        self._run_case(fn, (x,))
+
+    def test_div_reaches_lx(self):
+        x = self.rand_device((64, 256))
+        y = self.rand_device((64, 256))
+
+        def fn(x, y):
+            return (x / 2.0) + y
+
+        self._run_case(fn, (x, y))
+
+    def test_bmm_reaches_lx(self):
+        b, m, k, n = 2, 32, 64, 32
+        x = self.rand_device((b, m, k))
+        y = self.rand_device((b, k, n))
+
+        def fn(x, y):
+            mm = torch.bmm(x, y)
+            return mm + mm
+
+        self._run_case(fn, (x, y))
+
+    def test_expand_fused_into_its_consumer_matches_cpu(self):
+        """expand() is a pure view op that Inductor fuses into its consumer
+        rather than materializing its own buffer, so there is no expand
+        buffer whose LX residency could be asserted; this checks that the
+        compiled result is correct under default lx_planning with
+        allow_all_ops_in_lx_planning."""
+        x = self.rand_device((64, 1))
+        y = self.rand_device((64, 256))
+
+        def fn(x, y):
+            return x.expand(64, 256) + y
+
+        cpu_result = fn(*(t.to("cpu") for t in (x, y)))
+        with ts_inductor_config.patch(
+            lx_planning=True, allow_all_ops_in_lx_planning=True
+        ):
+            torch.compiler.reset()
+            result, _ = self.compile_and_collect_mem_usage(fn, (x, y))
+        self.assertTrue(
+            torch.allclose(result.float(), cpu_result.float(), atol=0.1, rtol=0.1),
+            "Result differs from CPU under default lx_planning=True",
+        )
+
+    def test_gated_mlp_op_combination_small_shape(self):
+        """All non-matmul whitelisted ops together (silu, neg via double
+        negation, div) plus two matmuls, at a small shape."""
+        rows, d_model, d_ff = 8, 32, 64
+        x = self.rand_device((rows, d_model))
+        w_gate = self.rand_device((d_model, d_ff))
+        w_up = self.rand_device((d_model, d_ff))
+        w_down = self.rand_device((d_ff, d_model))
+
+        def fn(x, w_gate, w_up, w_down):
+            gate = torch.nn.functional.silu(x @ w_gate)
+            up = -(-(x @ w_up))  # exercises neg via double negation
+            hidden = (gate * up) / 2.0
+            return hidden @ w_down
+
+        self._run_case(fn, (x, w_gate, w_up, w_down), atol=0.2, rtol=0.2)
+
+
 class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     """Compares HBM transfers with co-optimization off vs on.
 
@@ -778,7 +946,13 @@ class TestCloneAtGraphBoundaries(
         return fn, (x,), {"assertion_fn": assertion_fn}
 
     parameter_axes = {
-        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
+        "solver_method": (
+            "greedy",
+            "bestfit",
+            "firstfit",
+            "cpsat",
+            "simulated_annealing",
+        ),
         "sencores": (1, 32),
         "co_optimization": (False, True),
     }
@@ -812,6 +986,8 @@ class TestCloneAtGraphBoundaries(
             for op in graph.operations:
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
+                if not isinstance(getattr(buffer, "layout", None), Layout):
+                    continue
                 layout = buffer.get_layout()
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
@@ -866,6 +1042,68 @@ class TestCloneAtGraphBoundaries(
                 result_no_lx,
                 n_ops_no_lx,
                 mem_usages_no_lx,
+            )
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "default cpsat layout_solver needs ortools")
+class TestClonedOutputReinterpretViewExclusion(BaseTestScratchpadUsage):
+    """Coverage for #3154: a graph output that is a ReinterpretView (e.g. a
+    transpose of a computed intermediate) must be excluded from LX via
+    ScratchpadAllocator._buffer_residency_reason's "graph output is a
+    ReinterpretView" reason.
+    """
+
+    def _compile_and_capture_reasons(self, fn, args):
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        captured: dict[str, "str | None"] = {}
+        orig = ScratchpadAllocator._buffer_residency_reason
+
+        def wrapper(self, graph, name, uses, op, **kwargs):
+            reason = orig(self, graph, name, uses, op, **kwargs)
+            captured[name] = reason
+            return reason
+
+        with patch.object(ScratchpadAllocator, "_buffer_residency_reason", wrapper):
+            compiled = torch.compile(fn, fullgraph=True)
+            raw = compiled(*args)
+        result = (
+            tuple(r.to("cpu") for r in raw) if isinstance(raw, tuple) else raw.to("cpu")
+        )
+        return result, captured
+
+    def test_reinterpret_view_output_excluded_from_lx(self):
+        """A transpose of a computed intermediate returned as a graph
+        output lowers to a ReinterpretView; verify the allocator excludes
+        it from LX and the result stays numerically correct."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # Not ``x + 0``: adding zero is folded away, which would leave y a
+            # view of the graph input instead of a computed intermediate.
+            a = x * 2
+            y = a.transpose(-1, -2)
+            z = y + 1
+            return y, z
+
+        with ts_inductor_config.patch(
+            lx_planning=True, allow_all_ops_in_lx_planning=True
+        ):
+            torch.compiler.reset()
+            result, captured = self._compile_and_capture_reasons(fn, (x,))
+
+        cpu_result = fn(x.to("cpu"))
+
+        self.assertIn(
+            "graph output is a ReinterpretView",
+            set(captured.values()),
+            "Expected #3154's ReinterpretView output-exclusion reason to fire "
+            f"for this scenario; captured reasons: {captured}",
+        )
+        for dev, cpu in zip(result, cpu_result):
+            self.assertTrue(
+                torch.allclose(cpu.float(), dev.float(), atol=0.05, rtol=0.05),
+                "ReinterpretView output-clone exclusion changed the numerical result",
             )
 
 
@@ -1786,7 +2024,6 @@ class TestSolverCapabilities(unittest.TestCase):
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "replans_after_tiling",
         "linear_cost_only",
     )
 
@@ -1821,6 +2058,7 @@ class TestSolverCapabilities(unittest.TestCase):
             SimulatedAnnealingLayoutSolver: none,
             SaCoOptimizingSolver: {
                 **joint,
+                "decides_lx_relayouts": True,
                 "generates_divisions": True,
                 "chooses_tilings": True,
             },
@@ -1829,7 +2067,6 @@ class TestSolverCapabilities(unittest.TestCase):
                 "decides_lx_relayouts": True,
                 "chooses_tilings": True,
                 "tilings_from_menu": True,
-                "replans_after_tiling": True,
                 "linear_cost_only": True,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
@@ -1897,18 +2134,14 @@ class TestSolverCapabilities(unittest.TestCase):
 
         joint = placement(**all_false)
         joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
-        for implied in ("tilings_from_menu", "replans_after_tiling"):
-            with (
-                self.subTest(implied=implied),
-                self.assertRaisesRegex(
-                    TypeError, f"{implied}\\(\\) requires chooses_tilings"
-                ),
-            ):
-                type(
-                    "WithoutTilings",
-                    (CoreDivisionLayoutSolver,),
-                    {**joint, implied: classmethod(lambda cls: True)},
-                )
+        with self.assertRaisesRegex(
+            TypeError, "tilings_from_menu\\(\\) requires chooses_tilings"
+        ):
+            type(
+                "WithoutTilings",
+                (CoreDivisionLayoutSolver,),
+                {**joint, "tilings_from_menu": classmethod(lambda cls: True)},
+            )
         with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
             type(
                 "JointThatDenies",
@@ -2750,6 +2983,80 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
             "input clone slot sharing changed the numerical result",
+        )
+
+    def test_single_use_clone_not_named_as_in_place_parent(self):
+        """The negative of test_input_clone_reused_in_place_by_last_consumer:
+        in ``torch.abs(x) + x`` the input clone is bound and may reside (x is
+        read by two ops, the abs and the add), but x's last reader is the graph
+        output itself, which has no LX consumer and so may not reside. No buffer
+        that may reside may name the clone as an in-place parent. Values must be
+        unchanged.
+
+        The barred output can still list the clone in ``in_place_parents``:
+        the input-clone edge in ``_build_bound_buffers`` checks that the clone
+        may reside, not the consumer. That entry is inert, since a barred buffer
+        is never placed and so never takes the clone's slot, hence the check on
+        buffers whose ``residency_reason`` is None."""
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            return torch.abs(x) + x
+
+        captured: list[list] = []
+        orig = ScratchpadAllocator._build_bound_buffers
+
+        def spy(self, *a, **k):
+            bufs = orig(self, *a, **k)
+            captured.append(list(bufs))
+            return bufs
+
+        with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
+            # As in the positive sibling: this targets the base placement
+            # allocator's ``_build_bound_buffers``, so pin the co-optimizing
+            # path off; otherwise ``select_allocator`` routes to
+            # ``CoOptimizingAllocator`` (builder ``_build_cd_bound_buffers``)
+            # and nothing is captured.
+            with ts_inductor_config.patch(
+                lx_planning=True, co_optimizing_lx_planning=False
+            ):
+                compiled = torch.compile(fn, fullgraph=True)
+                result = compiled(x).to("cpu")
+
+        self.assertTrue(captured, "allocator._build_bound_buffers was not called")
+        bound = [b for bufs in captured for b in bufs]
+        # Input clones are exactly the buffers whose first access is a read.
+        input_clones = [b for b in bound if b.first_use_is_read]
+        self.assertTrue(
+            input_clones,
+            "the input clone was never bound, so there is no candidate whose "
+            "in-place edges this test could check",
+        )
+        self.assertTrue(
+            all(b.residency_reason is None for b in input_clones),
+            "the input clone may not reside, so no in-place edge could be offered "
+            "and this test would check nothing; "
+            f"{[(b.name, b.residency_reason) for b in input_clones]}",
+        )
+        input_clone_names = {b.name for b in input_clones}
+        resident_children = {
+            b.name
+            for b in bound
+            if b.residency_reason is None
+            and set(b.in_place_parents) & input_clone_names
+        }
+        self.assertEqual(
+            resident_children,
+            set(),
+            "x's last reader is the graph output, which may not reside, so no "
+            "buffer that may reside should name the input clone as an in-place "
+            f"parent; offenders: {resident_children}",
+        )
+        self.assertTrue(
+            torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
+            "unexpected numerical change in the negative-case scenario",
         )
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")

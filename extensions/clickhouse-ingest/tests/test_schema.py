@@ -307,7 +307,7 @@ def test_identity_lookup_is_chunked_under_the_http_field_limit():
         for i in ids
     }
     assert insert_identities(c, TEST_CASES, rows) == len(ids) - 2
-    assert [len(p["ids"]) for p in c.params] == [
+    assert [len(p["ids"]) for p in c.params if "ids" in p] == [
         IDENTITY_LOOKUP_CHUNK,
         IDENTITY_LOOKUP_CHUNK,
         1,
@@ -328,7 +328,7 @@ def test_fact_tables_declare_no_identity_and_dimensions_do():
 
 def test_registry_covers_exactly_the_v2_tables():
     # The functional/benchmark four, the artifact four, the capability two, pipeline_runs,
-    # ci_run_timings and the dispatch four. Pinned as an exact set so adding a table to the DDL
+    # ci_run_timings, the rbac pair and the dispatch four. Pinned as an exact set so adding a table to the DDL
     # without modelling it here (or vice versa) fails rather than drifting.
     assert set(TABLES) == {
         "test_cases",
@@ -343,8 +343,11 @@ def test_registry_covers_exactly_the_v2_tables():
         "capabilities",
         "capability_runs",
         "pipeline_runs",
+        "pipeline_run_links",
         "ci_run_timings",
         "artifact_subscriptions",
+        "rbac_roles",
+        "rbac_bindings",
         "dispatch_requests",
         "artifact_dispatches",
         "dispatch_targets",

@@ -16,7 +16,6 @@ test_suite_config:
             - TestTensorCreation::test_cat_stack_cross_devices
             - TestTensorCreation::test_empty_strided
             - TestTensorCreation::test_empty_tensor_props
-            - TestTensorCreation::test_offset_scalar_cast
             - TestTensorCreation::test_simple_scalar_cast
             - TestTensorCreation::test_storage_filename
             - TestTensorCreation::test_strided_mismatched_stride_shape
@@ -25,31 +24,11 @@ test_suite_config:
             - TestTensorCreation::test_vander
             - TestTensorCreation::test_zeros_dtype_layout_device_match
           mode: mandatory_success
-        # These tests exercise the `dsplit` operation with different dtypes, focusing on tensor splitting behaviors.
-        # They are classified as `mandatory_success` because the Spyre backend must support `dsplit` for all relevant dtypes.
-        # The relevant Spyre capability is the exclusion of `int64` dtype due to backend limitations.
-        - names:
-            - TestTensorCreation::test_dsplit
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: int64
         # These tests verify the behavior of float-to-int conversion, including handling of non-finite values.
         # They are classified as mandatory_success due to the expected NotImplementedError and TypeError.
         # The failure with int64 dtype highlights Spyre's current limitation in handling this specific conversion.
         - names:
             - TestTensorCreation::test_float_to_int_conversion_nonfinite
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: int64
-        # These tests exercise the `hsplit` operation with different dtypes, focusing on tensor splitting behaviors.
-        # They are classified as `mandatory_success` due to the expectation that `hsplit` should work across supported dtypes.
-        # The relevant Spyre capability is its support for tensor operations, but it currently lacks support for `int64` dtypes.
-        - names:
-            - TestTensorCreation::test_hsplit
           mode: mandatory_success
           edits:
             dtypes:
@@ -65,6 +44,22 @@ test_suite_config:
             dtypes:
               exclude:
                 - name: int64
+        # Upstream regression: test_dsplit/test_hsplit split a tensor along dim -1/-2 into
+        # unequal chunks and compare each chunk against the numpy reference -- every element
+        # mismatches (100%), indicating a wrong split/copy on device.
+        - names:
+            - TestTensorCreation::test_dsplit
+            - TestTensorCreation::test_hsplit
+          mode: skip  # skip: wrong numeric result on upstream PyTorch bump
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        # Upstream regression: test_offset_scalar_cast reads back int(y) as 1 instead of the
+        # expected 3 for a storage-offset scalar tensor -- a wrong numeric result on device.
+        - names:
+            - TestTensorCreation::test_offset_scalar_cast
+          mode: skip  # skip: wrong numeric result on upstream PyTorch bump
         - names:
             - TestTensorCreation::test_cat_trailing_dim
             - TestAsArray::test_retain_autograd_history

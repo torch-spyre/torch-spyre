@@ -426,6 +426,9 @@ class OpFeatures:
     # ``cores / owners`` via a future ``relayout_owners`` feature, not by a bytes
     # field).
     is_lx_relayout: bool = False
+    # Pricing domain for an LX copy. Zero uses the operation's core count.
+    # Keep this separate from cores, which also feeds other cost terms.
+    relayout_cores: int = 0
     # Stores with a known contiguous, indirect row write.
     is_indirect_store: bool = False
     # Per-core contiguous run, in ELEMENTS, of the finer (governing) of the two
@@ -1325,11 +1328,12 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     """
     if not o.is_lx_relayout or o.out_elems <= 0:
         return 0.0
-    if o.relayout_run_elems <= 0 or o.cores <= 0:
+    cores = o.relayout_cores or o.cores
+    if o.relayout_run_elems <= 0 or cores <= 0:
         return 0.0
     p = params or CostParams()
     # Bytes moved == the copy's device bytes: a relayout is an identity clone.
-    per_core = o.out_elems * o.dtype_bytes / o.cores
+    per_core = o.out_elems * o.dtype_bytes / cores
     run_bytes = o.relayout_run_elems * o.dtype_bytes
     split = min(p.relayout_split_max, max(p.relayout_split_min, o.relayout_split))
     runs = per_core / run_bytes
@@ -2611,7 +2615,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             # a candidate-tiled arg keeps its full extent: drop the per-tile LX
             # size (`dump_cost_model._per_tile_elems`) so the count is concrete.
             if _is_sym(arg.is_lx):
-                payload = sympy.sympify(payload).subs(arg.is_lx, 0)
+                payload = sympy.sympify(payload).xreplace({arg.is_lx: 0})
             if payload <= 0:
                 continue
             requests = sympy.piecewise_fold(payload / sympy.sympify(run))

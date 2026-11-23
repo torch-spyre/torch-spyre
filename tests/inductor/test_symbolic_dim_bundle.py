@@ -18,6 +18,8 @@ compile_op_spec is mocked throughout so no Spyre hardware is required.
 """
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,12 +40,30 @@ class TestFrontendPoolAllocationConfig(unittest.TestCase):
     """Standalone sanity checks for the frontend_pool_allocation config flag."""
 
     def test_default_is_false(self):
-        self.assertFalse(config.frontend_pool_allocation)
+        # The flag is read from FRONTEND_POOL_ALLOCATION at import time, so check
+        # the code default in a fresh interpreter with that variable removed --
+        # otherwise a CI job that exports it would make this test fail.
+        env = {k: v for k, v in os.environ.items() if k != "FRONTEND_POOL_ALLOCATION"}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import torch; "
+                "from torch_spyre._inductor import config; "
+                "print(config.frontend_pool_allocation)",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "False")
 
     def test_patchable(self):
-        with config.patch({"frontend_pool_allocation": True}):
-            self.assertTrue(config.frontend_pool_allocation)
-        self.assertFalse(config.frontend_pool_allocation)
+        original = config.frontend_pool_allocation
+        with config.patch({"frontend_pool_allocation": not original}):
+            self.assertEqual(config.frontend_pool_allocation, not original)
+        self.assertEqual(config.frontend_pool_allocation, original)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +341,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %arg_0)", bundle)
         self.assertIn('"symbol_ids"=[-1, -2]', bundle)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_pool_device_mem_allocate_emitted(self):
         """A pool symbol triggers device_mem_allocate with the right byte
         count, and no %pool_base_addr parameter."""
@@ -405,6 +426,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         self.assertNotIn("device_mem_allocate", bundle)
         self.assertNotIn("%pool", bundle)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_pool_and_kernel_address_combination(self):
         """A pool symbol and a kernel-address symbol coexist: device_mem_allocate
         appears in the body, %arg_0_base_addr is still the only signature param."""
@@ -455,6 +477,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         with self.assertRaises(AssertionError):
             self._run_bundle([entry], pool_size=MAX_POOL_SIZE_BYTES + 1)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_pool_size_at_max_succeeds(self):
         """A pool symbol with pool_size == MAX_POOL_SIZE_BYTES (the exact budget
         boundary) must be accepted, not rejected -- MAX_POOL_SIZE_BYTES is itself

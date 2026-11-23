@@ -79,6 +79,11 @@ _HINT_RE = re.compile(r"^_hint_(\d+)$")
 # hint scope annotation.
 _SCAN_SNAPSHOT_SEQ_KEY = "spyre_scan_snapshot_seq"
 
+# One snapshot entry per call_function node: (target, custom meta, node name).
+# The name is None when the snapshotted graph is replaced by a retrace rather
+# than edited in place, since no node of the replacement is the snapshotted one.
+_SnapshotEntry = tuple[Any, dict | None, str | None]
+
 
 @torch.compiler.allow_in_graph
 def get_id():
@@ -236,9 +241,11 @@ def _scan_combine_subgraphs(graph: torch.fx.Graph) -> list[torch.fx.GraphModule]
     return subgraphs
 
 
-def _snapshot_subgraph(sub_gm: torch.fx.GraphModule) -> list[tuple[Any, dict | None]]:
+def _snapshot_subgraph(sub_gm: torch.fx.GraphModule) -> list[_SnapshotEntry]:
+    # decompose_scan_to_while_loop retraces the combine-fn into a new body graph,
+    # whose node names say nothing about these nodes, so none are recorded.
     return [
-        (n.target, n.meta.get("custom"))
+        (n.target, n.meta.get("custom"), None)
         for n in sub_gm.graph.nodes
         if n.op == "call_function"
     ]
@@ -246,14 +253,25 @@ def _snapshot_subgraph(sub_gm: torch.fx.GraphModule) -> list[tuple[Any, dict | N
 
 def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
-    Snapshot call_function nodes' (target, custom-meta) by topological position.
-    Pairs with recover_spyre_hints to survive AOT re-tracing.
+    Snapshot call_function nodes' (target, custom-meta, name) by topological
+    position. Pairs with recover_spyre_hints to survive AOT re-tracing.
 
     Targets are stored alongside the meta so recovery can re-align even when the
     node sequence changes between the two passes (e.g. ``x + x`` materializes the
-    shared producer as two identical nodes -> ``add(mm, mm_default)``). The node
-    *name* is renamed by AOT re-tracing (mm -> mm_default) and so is unstable, but
-    the ``target`` OpOverload is preserved and is what we align on.
+    shared producer as two identical nodes -> ``add(mm, mm_default)``). A node
+    created after this snapshot gets a fresh name (mm_default), so its name says
+    nothing, but its ``target`` OpOverload does. A node that survives until
+    recovery keeps its name, so recovery anchors on it.
+
+    Names identify nodes only within this ``Graph`` object, where FX never
+    reissues one, even after its node is erased. The passes up to
+    recover_spyre_hints edit this graph in place (decompose_auto_functionalized
+    splices its make_fx trace in through replace_by_example, so those nodes get
+    fresh names here). A pass that replaced ``gm.graph`` with a retrace would
+    restart the name counters. Where no name matches, recovery falls back to
+    the unbounded target scan, but a retraced node that happens to share a
+    snapshotted node's name and target anchors on that entry and can take a
+    hint the target scan would not have given it.
 
     Also snapshots every scan-combine-fn subgraph in encounter order (see
     ``_scan_combine_subgraphs``): for_each_tile's body traces into its own
@@ -284,7 +302,7 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
         # it for recover_spyre_hints at scheduler time.
         _recover_orphaned_hints(graph.owning_module)
         snapshot = [
-            (node.target, node.meta.get("custom"))
+            (node.target, node.meta.get("custom"), node.name)
             for node in graph.nodes
             if node.op == "call_function"
         ]
@@ -325,7 +343,7 @@ def _split_on_markers(items, target_of) -> list[list]:
 
 
 def _apply_snapshot(
-    nodes: list[torch.fx.Node], snapshot: list[tuple[Any, dict | None]]
+    nodes: list[torch.fx.Node], snapshot: list[_SnapshotEntry]
 ) -> tuple[int, int]:
     """Align ``snapshot`` (from ``_snapshot_subgraph``/collect_spyre_hints's
     top-level scan) against ``nodes`` by ``target``, writing back recovered
@@ -355,7 +373,7 @@ def _apply_snapshot(
 
 
 def _apply_snapshot_flat(
-    nodes: list[torch.fx.Node], snapshot: list[tuple[Any, dict | None]]
+    nodes: list[torch.fx.Node], snapshot: list[_SnapshotEntry]
 ) -> tuple[int, int]:
     """Forward-scan alignment over one already-synchronized segment.
 
@@ -363,23 +381,52 @@ def _apply_snapshot_flat(
     deleted ones (in ``snapshot``, not in ``nodes``) are skipped past. A node
     whose target repeats the last consumed entry is a duplicate (e.g. the
     second mm in add(mm, mm)) and inherits the same hint.
+
+    A node that still carries a snapshotted name and target is that entry, so
+    it anchors the alignment: the target scan for any other node stops at the
+    next anchor's entry. Without that bound, an inserted node whose target
+    recurs later in the snapshot (mm_to_bmm's unsqueeze/expand) would jump the
+    cursor past every entry in between and take the hint of an unrelated,
+    distant scope.
+
+    The bound includes the anchor's own entry, so a same-target node inserted
+    directly before a surviving hinted node still takes that node's hint. This
+    is deliberate: it is how a copy of a hinted node placed just before the
+    original keeps the hint, and target alone cannot tell the two apart. Anchors
+    stop a hint from travelling past a surviving node; they do not make an
+    insertion next to one safe.
     """
+    position = {name: i for i, (_, _, name) in enumerate(snapshot) if name}
+
+    def anchor_of(node: torch.fx.Node) -> int | None:
+        i = position.get(node.name)
+        return i if i is not None and snapshot[i][0] == node.target else None
+
+    anchors = sorted(i for n in nodes if (i := anchor_of(n)) is not None)
+    next_anchor = 0
     cursor = 0
     last_target = None
     last_custom = None
     matched = 0
     for node in nodes:
         custom = None
-        # Scan snapshot forward to find a matching entry for this node.
-        found_at = None
-        for i in range(cursor, len(snapshot)):
-            if snapshot[i][0] == node.target:
-                found_at = i
-                break
+        found_at = anchor_of(node)
+        if found_at is None:
+            while next_anchor < len(anchors) and anchors[next_anchor] < cursor:
+                next_anchor += 1
+            stop = (
+                anchors[next_anchor] + 1
+                if next_anchor < len(anchors)
+                else len(snapshot)
+            )
+            for i in range(cursor, stop):
+                if snapshot[i][0] == node.target:
+                    found_at = i
+                    break
         if found_at is not None:
             # Advance cursor past all skipped (deleted) entries and this one.
-            cursor = found_at + 1
-            last_target, last_custom = snapshot[found_at]
+            cursor = max(cursor, found_at + 1)
+            last_target, last_custom, _ = snapshot[found_at]
             custom = last_custom
             matched += 1
         elif node.target == last_target:
@@ -393,12 +440,12 @@ def _apply_snapshot_flat(
             node.meta["custom"] = {}
         node.meta["custom"].update(custom)
 
-    hinted = sum(1 for _, c in snapshot if c)
+    hinted = sum(1 for _, c, _ in snapshot if c)
     return matched, hinted
 
 
 def _recover_hop_subgraph_hints(
-    graph: torch.fx.Graph, subgraph_snapshots: list[list[tuple[Any, dict | None]]]
+    graph: torch.fx.Graph, subgraph_snapshots: list[list[_SnapshotEntry]]
 ) -> None:
     """Recover collect_spyre_hints's per-scan-combine-fn snapshots into the
     while_loop bodies decompose_scan_to_while_loop replaced them with.
@@ -489,7 +536,7 @@ def _recover_hop_subgraph_hints(
 
     for seq, body_node in stamped_bodies:
         snapshot = subgraph_snapshots[seq]
-        if not any(custom for _, custom in snapshot):
+        if not any(custom for _, custom, _ in snapshot):
             continue
         sub_gm = getattr(graph.owning_module, body_node.target, None)
         if not isinstance(sub_gm, torch.fx.GraphModule):
@@ -525,6 +572,13 @@ def _recover_collected_hints(gm: torch.fx.GraphModule) -> bool:
     subgraph_snapshots = gm.meta.pop("__spyre_dim_hints_subgraphs", [])
     nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
     matched, hinted = _apply_snapshot(nodes, _dim_hints)
+    target_of = {n.name: n.target for n in nodes}
+    if hinted and not any(target_of.get(name) == t for t, _, name in _dim_hints):
+        logger.debug(
+            "_recover_collected_hints: on %s, no snapshot entry kept its node "
+            "name and target; hints were aligned on target alone, unbounded.",
+            gm._get_name(),
+        )
     if matched < hinted:
         logger.debug(
             "_recover_collected_hints: on %s, matched %d/%d hinted snapshot "
@@ -592,12 +646,13 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     - Deleted nodes (in snapshot, not in graph): skip past the snapshot entry
       to stay aligned with the graph.
 
-    We implement this as a forward scan: for each graph node, scan forward in
-    the snapshot (from the current cursor) looking for a matching target. If
-    found, consume all snapshot entries up to and including it. If not found,
-    the node was inserted after the snapshot — leave it untouched. A node
-    whose target repeats the last consumed entry is a duplicate (e.g. the
-    second mm in add(mm, mm)) and inherits the same hint.
+    We implement this as a forward scan: a graph node that kept its snapshotted
+    name is matched to its own entry. Any other node scans forward in the
+    snapshot (from the current cursor, up to the next surviving node's entry)
+    looking for a matching target. If found, consume all snapshot entries up to
+    and including it. If not found, the node was inserted after the snapshot —
+    leave it untouched. A node whose target repeats the last consumed entry is a
+    duplicate (e.g. the second mm in add(mm, mm)) and inherits the same hint.
 
     Also recovers the per-scan-combine-fn snapshots into their corresponding
     while_loop bodies -- see _recover_hop_subgraph_hints.

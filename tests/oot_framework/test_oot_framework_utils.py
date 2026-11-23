@@ -16,6 +16,7 @@
 
 Covers:
   - _filter_entries_by_platform  (platform-tag override logic, #3902)
+  - _platform_excluded           (exclude__plat_<arch> entry-level gate)
   - _extract_op_name_from_method (OpDTypes.none / no-dtype-suffix path, #3444)
 """
 
@@ -28,6 +29,7 @@ from unittest.mock import patch
 from oot_framework.oot_test_utilities import (
     _extract_op_name_from_method,
     _filter_entries_by_platform,
+    _platform_excluded,
 )
 
 
@@ -72,6 +74,33 @@ class TestFilterEntriesByPlatform:
         with patch("oot_framework.oot_test_utilities._OOT_PLATFORM_ARCH", "x86_64"):
             result = _filter_entries_by_platform([tagged])
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _platform_excluded
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformExcluded:
+    def test_tagged_entry_excluded_on_matching_arch(self):
+        """An exclude__plat_ppc64le entry is excluded on ppc64le."""
+        entry = _entry(["model__Qwen2.5-7B-Instruct", "exclude__plat_ppc64le"])
+        with patch("oot_framework.oot_test_utilities._OOT_PLATFORM_ARCH", "ppc64le"):
+            assert _platform_excluded(entry) is True
+
+    def test_tagged_entry_runs_on_other_arch(self):
+        """The same entry is not excluded on x86_64 or s390x."""
+        entry = _entry(["model__Qwen2.5-7B-Instruct", "exclude__plat_ppc64le"])
+        with patch("oot_framework.oot_test_utilities._OOT_PLATFORM_ARCH", "x86_64"):
+            assert _platform_excluded(entry) is False
+        with patch("oot_framework.oot_test_utilities._OOT_PLATFORM_ARCH", "s390x"):
+            assert _platform_excluded(entry) is False
+
+    def test_untagged_entry_never_excluded(self):
+        """An entry sharing the same file but without the tag is unaffected."""
+        entry = _entry(["model__Meta-Llama-3.1-8B-Instruct"])
+        with patch("oot_framework.oot_test_utilities._OOT_PLATFORM_ARCH", "ppc64le"):
+            assert _platform_excluded(entry) is False
 
 
 # ---------------------------------------------------------------------------
