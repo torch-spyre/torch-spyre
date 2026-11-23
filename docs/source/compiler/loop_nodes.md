@@ -519,9 +519,8 @@ leaves `node` unset where `compute_dependencies` expects one. It carries the
   body). `PATCHED_SURFACE` lists the private Inductor names to re-verify on an
   upgrade.
 
-`CustomPreFusionPasses` runs `propagate_mutation_layouts` and then
-`build_loop_scheduler_nodes`, which passes the `LoopSchedulerNode`s through
-unchanged. `CustomPostFusionPasses` runs `sink_collective_waits`,
+`CustomPreFusionPasses` runs `propagate_mutation_layouts`; nothing regroups the
+`LoopSchedulerNode`s. `CustomPostFusionPasses` runs `sink_collective_waits`,
 `spyre_fuse_nodes`, `prepare_spyre_kernels` and `hbm_pool_planning`. A counted loop
 may share a bundle with adjacent ops (`spyre_fuse_nodes` accepts a
 `CountedLoopSchedulerNode` as well as a `SchedulerNode`); `hbm_pool_planning`
@@ -662,8 +661,10 @@ induction variables and bounds in order (`%i_0`, `%i_1`, ...).
   loop-tiling lowering, `apply_loop_carries`, the carry bridge in
   `wsr/while_loop_bridge.py`, the restickify and non-stick-order relayouts,
   `copy_forced`, and LX context switching) each give an op one target.
-  `propagate_mutation_layouts` (the first pre-fusion pass) unwraps the layout into a
-  real `FixedTiledLayout` once the scheduler has consumed the mutation state.
+  `propagate_mutation_layouts` (the pre-fusion pass) gives each such op a real
+  `FixedTiledLayout` once the scheduler has consumed the mutation state: the
+  target's own layout when it fits the op, a computed one otherwise. It descends
+  into a `LoopSchedulerNode`'s body like any other group.
 - **The cache key.** `_uuid` in `passes.py` hashes each pass's own source file, so
   editing a pass invalidates the Inductor FX cache. A change to a helper in a file
   that is not a pass (for example `wsr/loop_tiling_common.py`) is not seen by it;
