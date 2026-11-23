@@ -1034,7 +1034,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   if (host2device) {
     // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-    // sliced and/or expanded.
+    // sliced, expanded and/or permuted.
     if (cpu_strides != dev_strides) {
       // In these cases we update the stride_map of the SpyreTensorLayout to
       // reflect the cpu_strides instead of the dma_strides.
@@ -1084,42 +1084,23 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
       stl.stride_map = dst_stride_map;
 
-      // Adjust the dst_stride_map for all sliced dimension by multiplying all
-      // other stride values greater than or equal to the sliced stride value
-      // by the amount sliced.
-      std::vector<int64_t> cpu_order(host_rank);
-      std::iota(cpu_order.begin(), cpu_order.end(), 0);
-      std::sort(cpu_order.begin(), cpu_order.end(),
-                [&cpu_strides, &cpu_sizes](int64_t i1, int64_t i2) {
-                  if (cpu_strides[i1] == cpu_strides[i2]) {
-                    if (cpu_sizes[i1] == 1 && cpu_sizes[i2] == 1) {
-                      return i1 < i2;
-                    }
-                    return cpu_sizes[i1] == 1;
-                  }
-                  return cpu_strides[i1] < cpu_strides[i2];
-                });
-
-      std::multimap<int64_t, int64_t> slices;
-      int64_t current_slices = 1;
-      for (const auto& i : cpu_order) {
+      // Re-express each stride_map value through the host dimension it tiles:
+      // a multiple of that dimension's dst_stride becomes the same multiple of
+      // its cpu_stride. Scaling per dimension covers a sliced host tensor and
+      // a permuted one (e.g. a transpose). One factor applied to every larger
+      // value, as before, is right only when the host keeps the device's
+      // dimension order: a transpose wrote one column or read past the host
+      // buffer.
+      for (int i = 0; i < host_rank; i++) {
         const int64_t cpu_stride = cpu_strides[i];
         const int64_t dev_stride = dst_strides[i];
         TORCH_CHECK(
             dev_stride > 0,
             "Invalid destination stride. Expected > 0, got: ", dev_stride);
-        const int64_t slice = cpu_stride / dev_stride / current_slices;
-        if (slice > 1) {
-          slices.insert({dev_stride, slice});
-          current_slices *= slice;
-        }
-      }
-
-      for (int i = 0; i < device_rank; i++) {
-        if (dst_stride_map[i] <= 0) continue;
-        for (const auto& [stride, slice] : slices) {
-          if (stl.stride_map[i] < stride) continue;
-          dst_stride_map[i] *= slice;
+        if (cpu_stride == 0) continue;  // expanded: zeroed above
+        for (const int& j : tile_map[i]) {
+          if (dst_stride_map[j] <= 0) continue;
+          dst_stride_map[j] = dst_stride_map[j] / dev_stride * cpu_stride;
         }
       }
 

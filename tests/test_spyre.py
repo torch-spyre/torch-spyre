@@ -1657,6 +1657,34 @@ class TestSpyre(TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
             torch.compile(lambda t: t.to(torch.float64))(source)
 
+    @parametrize("case", ["transposed_view_dst", "strided_dst", "transposed_src"])
+    def test_h2d_copy_between_transposed_strides(self, case):
+        """H2D copy_ where host and device strides are a transpose of each other.
+
+        The copy scaled every stride_map value by one slice factor, which is
+        right for a slice but not for a transpose. A contiguous source into a
+        transposed view got only column 0 written, with no error; into an
+        empty_strided tensor it raised "Invalid device sizes and stride map";
+        and a transposed source into a contiguous tensor read past the host
+        buffer, which killed the process (SIGSEGV).
+        """
+        # Integers below 512 are exact on device, so the comparison is exact.
+        values = (torch.arange(256 * 128) % 509).reshape(256, 128).half()
+        src = values
+        if case == "transposed_view_dst":
+            dst = torch.empty(128, 256, dtype=torch.float16, device="spyre").t()
+        elif case == "strided_dst":
+            dst = torch.empty_strided(
+                (256, 128), (1, 256), dtype=torch.float16, device="spyre"
+            )
+        else:
+            dst = torch.empty(256, 128, dtype=torch.float16, device="spyre")
+            src = values.t().contiguous().t()
+        self.assertNotEqual(src.stride(), dst.stride())
+        dst.fill_(777.0)  # not a value of `values`: marks an unwritten element
+        dst.copy_(src)
+        self.assertEqual(dst.cpu(), values, atol=0, rtol=0)
+
     @parametrize(
         "sizes",
         [
