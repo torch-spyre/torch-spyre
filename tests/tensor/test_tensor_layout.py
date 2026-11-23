@@ -436,9 +436,10 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map,valid_elements",
         [
-            # Dim 1 is expanded (stride 0), so it has no valid key of its own:
-            # its full extent of 512 is a singleton key. The 60 valid elements
-            # are the stick pair (dim 0 = outer size-1 row, dim 2 = stick).
+            # Dim 1 is a broadcast (stride 0) and the host is not expanded, so
+            # one copy is valid: singleton key (1,) holds 1, not its extent of
+            # 512 (the expanded test below uses 512 to move every copy). Dim 2
+            # is the stick, with 60 valid elements; dim 0 is a size-1 row.
             ([60], [1], [1, 512, 64], [60, 0, 1], {(1,): 1, (2,): 60}),
         ],
     )
@@ -1222,6 +1223,40 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(scalar_out.device_size), [1, 32])
         self.assertEqual(list(scalar_out.stride_map), [0, 0])
+
+    def test_rescale_for_dtype_caps_a_singleton_stick_valid_count(self):
+        """A stick dim that holds a singleton valid count keeps at most one new
+        stick's worth of elements when the elements per stick shrink: widening
+        fp16 to fp32 halves 64 to 32, so a count of 64 would claim elements the
+        narrower stick does not have. A count already within the new stick is
+        kept. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+
+        def rescaled(stick_valid):
+            stl = SpyreTensorLayout(
+                [1, 64],
+                [0, 0],
+                fp16,
+                {(0,): 1, (1,): stick_valid},
+                ElementArrangement.STANDARD,
+            )
+            return rescale_stl_for_dtype(
+                stl,
+                torch.float32,
+                ElementArrangement.STANDARD,
+                _host_layout(torch.float16, [1]),
+                _dep("buf", [1]),
+            )
+
+        out = rescaled(64)
+        self.assertEqual(list(out.device_size), [1, 32])
+        self.assertEqual(out.valid_elements[(1,)], 32)
+        self.assertEqual(out.valid_elements[(0,)], 1)
+        self.assertEqual(rescaled(1).valid_elements[(1,)], 1)
 
     def test_rescale_for_dtype_rejects_a_stick_with_no_dim_counting_its_sticks(self):
         """A layout with no device dim to count its sticks has none to resize. 16

@@ -292,12 +292,14 @@ auto identity_dim_ea(const std::vector<int>& tiles,
  *
  * The number of elements moved along each device dim comes from
  * stl.valid_elements:
- *   - singleton {j}: min(count, device_size[j]) when stride_map[j] > 0;
+ *   - singleton {j}: min(count, device_size[j]);
  *   - stick pair {outer, inner} holding V elements: inner moves
  *     min(V, inner_size) and outer moves V / inner_size full rows. When
  *     V % inner_size != 0 the last, partial row is a second descriptor.
- * A dim with stride_map == 0 (a broadcast) is not capped by its key and moves
- * its full device extent.
+ * A dim with stride_map == 0 (a broadcast or a size-1/sparse dim) is capped by
+ * its key like any other: its count says how many of its elements exist. A
+ * layout that needs the whole broadcast extent moved must say so with a count
+ * equal to that extent.
  *
  * A staggered element arrangement (DL16_TO_FP32, FP32_TO_DL16) does not change
  * these descriptors. It is described by dimwise_ea, with one entry per device
@@ -333,8 +335,8 @@ auto get_device_stride_infos(
   for (const auto& [dims, count] : stl.valid_elements) {
     if (dims.size() != 1) continue;
     const int64_t j = dims[0];
-    // A stride-0 dim is a broadcast or a size-1/sparse dim. Only the valid
-    // count says how many of its elements exist, so cap it too.
+    // This includes stride-0 dims (a broadcast or a size-1/sparse dim): only
+    // the valid count says how many of their elements exist.
     sizes[j] = std::min(count, stl.device_size[j]);
   }
 
@@ -493,7 +495,7 @@ int64_t device_offset_for_storage_offset(const SpyreTensorLayout& stl,
       TORCH_CHECK(i == (device_rank - 1),
                   "Invalid device sizes and stride map. Expected only 1 non-1 ",
                   "device_size value for stride_map value ", stl.stride_map[i],
-                  "got: ", stl.device_size[i], " and ",
+                  ", got: ", stl.device_size[i], " and ",
                   stl.device_size[stride_map_to_j[stl.stride_map[i]]]);
       continue;
     }
@@ -546,10 +548,8 @@ std::map<int64_t, int64_t> view_size_at_stride(
     // layout dim at that stride.
     if (view_sizes[i] == 1) continue;
     if (stride <= 0 || !layout_extent.contains(stride)) continue;
-    // A size-1 view dim indexes nothing, so its stride says nothing about the
-    // layout and does not count as a foreign dim.
-    // A size-1 view dim indexes nothing, so its stride says nothing about the
-    // layout and does not count as a foreign dim.
+    // A view dim above this stride that the layout lacks is foreign; size-1
+    // view dims index nothing and never count as foreign.
     bool foreign_dim_above = false;
     for (size_t j = 0; j < view_strides.size(); j++) {
       if (view_sizes[j] != 1 && view_strides[j] > stride &&
@@ -672,8 +672,8 @@ void rebase_view_strides(std::vector<int64_t>& stride_map,
 // tensor that is an expanded view of the device tensor. Expanded host dims
 // (cpu stride 0) are broadcast: each device dim with that view stride becomes
 // stride 0, and the device strides above it shrink by the expand factor.
-// valid_elements is not adjusted here; get_device_stride_infos moves the full
-// extent of the zeroed (broadcast) dims.
+// valid_elements is not adjusted here; get_device_stride_infos caps each zeroed
+// (broadcast) dim by its own valid count.
 void apply_expands(std::vector<int64_t>& stride_map,
                    std::vector<int64_t>& dst_strides,
                    const SpyreTensorLayout& stl,
@@ -1834,7 +1834,9 @@ bool needs_host_staging(const at::Tensor& self, const SpyreTensorLayout& stl) {
 
 // D2H copy of `self` through a host copy of its whole allocation, with the view
 // applied on the host. Always blocking: the host buffer is local, and the view
-// is read from it before it is freed.
+// is read from it before it is freed. This stages the whole layout span, not
+// just the view, so it is a fallback for views the descriptors cannot express;
+// do not route views that DMA directly through it.
 void copy_view_via_host_allocation(const at::Tensor& self,
                                    const at::Tensor& dst,
                                    const SpyreTensorLayout& stl,

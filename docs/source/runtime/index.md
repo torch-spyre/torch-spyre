@@ -107,8 +107,9 @@ The `SpyreTensorLayout` holds:
 - `stride_map`: the host stride for each device dim. A `0` here means the dim is synthetic, fully padded, or broadcast.
 - `device_dtype`: the on-device data format, for example `SEN169_FP16`.
 - `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
+- `valid_elements`: the count of valid (non-padded) elements for each group of device dims, either a single dim or a stick pair (outer, inner). It is excluded from layout equality and hashing.
 
-Alongside the layout, `SpyreTensorImpl` has no separate DMA fields. When a view is copied to or from the host, `generate_dci()` in `spyre_mem.cpp` derives the transfer descriptors from the layout's `valid_elements` and `stride_map`. They drive `copyAsync()` in `spyre_stream.cpp`.
+`SpyreTensorImpl` keeps no separate DMA descriptor. When a tensor or view is copied to or from the host, `generate_dci()` in `spyre_mem.cpp` derives the transfer descriptors from the layout's `valid_elements` and `stride_map`, capped to the extent the view covers. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -401,8 +402,8 @@ compiled broadcast, allgather, and allreduce materialize view inputs automatical
 Materialize other unsupported views before submission.
 
 Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
-A scalar has one logical element (its shape is empty, whose product is
-one), while its DL16 allocation occupies a full 64-element stick. Collective
+A scalar has one logical element (an empty shape has a product of
+one, and its layout's valid count is one), while its DL16 allocation occupies a full 64-element stick. Collective
 plans communicate that physical allocation, just as they do for padded
 multidimensional tensors; the host result remains a single scalar.
 

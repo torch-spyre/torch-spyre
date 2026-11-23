@@ -304,13 +304,14 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
-    if (this->device_size != other.device_size ||
-        this->stride_map != other.stride_map ||
-        this->device_dtype != other.device_dtype ||
-        this->element_arrangement != other.element_arrangement) {
-      return false;
-    }
-    return this->valid_elements == other.valid_elements;
+    // valid_elements is deliberately excluded (and from std::hash): layouts
+    // for different concrete sizes that pad to the same device geometry must
+    // compare equal so guards and caches keyed on a layout do not split per
+    // size. Compare valid_elements explicitly where it matters.
+    return this->device_size == other.device_size &&
+           this->stride_map == other.stride_map &&
+           this->device_dtype == other.device_dtype &&
+           this->element_arrangement == other.element_arrangement;
   }
 };
 
@@ -436,12 +437,6 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
-    for (const auto& [dims, count] : layout.valid_elements) {
-      for (int64_t d : dims) {
-        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
-      }
-      seed = c10::hash_combine(seed, std::hash<int64_t>{}(count));
-    }
     return seed;
   }
 };
