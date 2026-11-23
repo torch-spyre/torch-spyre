@@ -45,6 +45,17 @@
    "type": "object",
    "additionalProperties": false,
    "properties": {
+    "applies_to": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "perf",
+       "quality"
+      ]
+     },
+     "minItems": 1,
+     "description": "test types the policy judges; default [perf]. A quality policy replaces the clean, qualification, cv and warm-up requirements with the gates listed per row; mixed lists are rejected"
+    },
     "purposes": {
      "type": "object",
      "additionalProperties": {
@@ -95,6 +106,13 @@
            "required",
            "optional"
           ]
+         },
+         "gates": {
+          "type": "array",
+          "items": {
+           "$ref": "#/$defs/metric"
+          },
+          "description": "quality policies: pack gate ids evaluated for the row, e.g. llm.records_complete"
          }
         },
         "description": "gates a result must pass to earn `valid`; failing one caps the validity (qualification: unqualified_env, clean: shared_env, the rest: suspect)"

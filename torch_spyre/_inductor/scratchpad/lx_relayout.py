@@ -58,8 +58,7 @@ from ..lx_read_contracts import (
     local_read_certificate,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback
-from ..loop_facts import counted_loop_path
-from ..loop_info import LoopInfo
+from ..loop_facts import counted_loop_path, is_looped
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
@@ -693,7 +692,7 @@ def _is_activation_source(
         if (
             isinstance(previous, ComputedBuffer)
             and isinstance(previous.layout, MutationLayoutSHOULDREMOVE)
-            and getattr(previous, "loop_info", None) is None
+            and not is_looped(previous)
             and previous.layout.get_buffer().get_name() == reads[0].name
         ):
             updated = True
@@ -785,8 +784,8 @@ def _persistent_scatter_consumer(
             or _pointwise_scatter_materializer(graph, producer, consumer, source_name)
         )
         or not isinstance(consumer.data, Pointwise)
-        or getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
+        or is_looped(producer)
+        or is_looped(consumer)
     ):
         return False
     return _persistent_scatter_storage_safe(graph, producer, consumer, source_name)
@@ -941,12 +940,10 @@ def solver_relayout_edge_context(
     # the parent's own loop trip count before handing a same-group candidate
     # to the solver, so a repeated shuffle is priced at its real total cost,
     # not once.
-    producer_loop_info = getattr(producer, "loop_info", None)
-    consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (
         config.lx_same_tile_group_relayout
-        and isinstance(producer_loop_info, LoopInfo)
-        and isinstance(consumer_loop_info, LoopInfo)
+        and is_looped(producer)
+        and is_looped(consumer)
         and counted_loop_path(producer, include_extern=True)
         == counted_loop_path(consumer, include_extern=True)
         and not (
@@ -954,9 +951,7 @@ def solver_relayout_edge_context(
             and is_restickify_op(consumer, graph)
         )
     )
-    if (
-        producer_loop_info is not None or consumer_loop_info is not None
-    ) and not same_tile_group:
+    if (is_looped(producer) or is_looped(consumer)) and not same_tile_group:
         return None
     if (
         not isinstance(producer, ComputedBuffer)
@@ -1047,8 +1042,8 @@ def prefix_lx_contraction_axis(producer: Operation, consumer: Operation) -> int 
         or len(layout.size) < 2
         or any(not sympy.sympify(x).is_Integer for x in layout.size)
         or any(x != 1 for x in layout.size[:-2])
-        or getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
+        or is_looped(producer)
+        or is_looped(consumer)
         or getattr(producer, "_input_layout_overrides", None)
         or getattr(consumer, "_input_layout_overrides", None)
     ):
@@ -1186,7 +1181,7 @@ def _local_lx_parent_read(graph, producer, consumer):
             or len(constant.constant_args) != 1
             or type(constant.constant_args[0]) not in (bool, int, float)
             or op_read_writes(constant).reads
-            or getattr(constant, "loop_info", None) is not None
+            or is_looped(constant)
             or not storage_has_single_writer(graph, constant)
         ):
             return None
@@ -1219,7 +1214,7 @@ def _local_lx_pointwise_read(graph, producer, consumer):
         or sibling.layout.offset != 0
         or sibling.get_device() != consumer.get_device()
         or sibling.get_dtype() != consumer.get_dtype()
-        or getattr(sibling, "loop_info", None) is not None
+        or is_looped(sibling)
         or getattr(sibling, "_input_layout_overrides", None)
         or not storage_has_single_writer(graph, sibling)
         or is_partial_lx_read(sibling, dep)
@@ -1273,8 +1268,7 @@ def _local_lx_scatter_geometry(graph, producer, consumer):
         or producer.get_dtype() != consumer.get_dtype()
         or producer.layout.offset != 0
         or any(
-            getattr(op, "loop_info", None) is not None
-            or getattr(op, "_input_layout_overrides", None)
+            is_looped(op) or getattr(op, "_input_layout_overrides", None)
             for op in (producer, consumer)
         )
         or not storage_has_single_writer(graph, producer)
@@ -1351,7 +1345,7 @@ def local_lx_subrange_geometry(graph, producer, consumer):
         or producer.get_device() != consumer.get_device()
         or producer.get_dtype() != consumer.get_dtype()
         or any(
-            getattr(op, "loop_info", None) is not None
+            is_looped(op)
             or getattr(op, "_input_layout_overrides", None)
             or op.layout.offset != 0
             for op in (producer, consumer)

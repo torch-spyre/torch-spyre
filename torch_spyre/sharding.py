@@ -243,6 +243,50 @@ def compute_shard_range(
     )
 
 
+def _require_divisible_shard_dim(
+    shape: tuple[int, ...], dim: int, shard_count: int
+) -> None:
+    """Reject a shard dim that cannot split into equal, non-empty shards.
+
+    Every core must get the same, non-empty amount of work, so the sharded
+    dim's size must be a multiple of the shard count. The shard count is never
+    reduced to fit: a tensor always has exactly the shards that were asked for.
+    The error names the dims that would divide, so the caller can pick one.
+    """
+
+    extent = shape[dim]
+    if extent % shard_count == 0:
+        return
+    reason = (
+        f"it has only {extent} element{'s' if extent != 1 else ''}, fewer than "
+        f"{shard_count}"
+        if extent < shard_count
+        else f"its size {extent} is not a multiple of {shard_count}"
+    )
+    candidates = [
+        f"{d} (size {size})"
+        for d, size in enumerate(shape)
+        if d != dim and size % shard_count == 0
+    ]
+    if candidates:
+        hint = (
+            f"Dims whose size is a multiple of {shard_count}: "
+            f"{', '.join(candidates)}. Shard one of them, or pad dim {dim} to a "
+            f"multiple of {shard_count}."
+        )
+    else:
+        hint = (
+            f"No dim of this shape is a multiple of {shard_count}; pad dim {dim} "
+            f"to a multiple of {shard_count}."
+        )
+    raise ValueError(
+        f"shards must be equal: cannot shard dim {dim} of shape {list(shape)} "
+        f"into {shard_count} equal, non-empty shards ({reason}). {hint} "
+        "Compiled ops also need the shard dim to be the outermost device dim "
+        "(docs/source/compiler/sharded_tensors.md)."
+    )
+
+
 def _require_shard_count(shard_count: object) -> int:
     shard_count = _require_exact_int("num_shards", shard_count)
     if shard_count not in SUPPORTED_SHARD_COUNTS:
@@ -280,6 +324,9 @@ def plan_equal_shards(
         raise TypeError("Shard.dim must be a concrete int")
     normalized_dim = dim % len(shape)
     shard_count = _require_shard_count(shard_count)
+    if -len(shape) <= dim < len(shape):
+        # An out-of-range dim is reported by compute_shard_range below.
+        _require_divisible_shard_dim(shape, normalized_dim, shard_count)
 
     ranges = tuple(
         compute_shard_range(
