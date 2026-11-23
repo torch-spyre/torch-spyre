@@ -381,7 +381,7 @@ def _sibling_pinned_divisions(
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
-    ``LoopInfo.loop_count`` is one entry per nesting level, outermost
+    ``LoopMember.loop_count`` is one entry per nesting level, outermost
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
@@ -427,7 +427,7 @@ class DrainPlan:
     update_name:
         Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
     loop_group:
-        The update's ``loop_info.loop_group_id`` -- exactly one level.
+        The update's ``loop_member.loop_group_id`` -- exactly one level.
     anchor_op:
         The last operation of the loop's group subtree, as an ``Operation``
         object (identity survives other clones; a saved index would not).
@@ -707,7 +707,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
     (input clone) attributes onto the clone, but a post-loop drain and a
     hoisted pre-loop input clone are neither loop members nor carries: a
-    surviving ``loop_info`` would re-group the clone into the counted loop at
+    surviving ``loop_member`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
     advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
@@ -715,9 +715,26 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     clone keeps today's metadata-copy behavior.
     """
 
-    for attr in ("loop_info", "_loop_carry_record"):
+    for attr in ("loop_member", "_loop_carry_record", "_member_like"):
         if hasattr(op, attr):
             delattr(op, attr)
+
+
+def _read_after_mutation(graph: GraphLowering, name: str, uses: list[int]) -> bool:
+    """Whether an op reads graph input ``name`` after another op mutates it.
+
+    An input clone is made once, before the first consumer, and every consumer is
+    pointed at it. A read that follows an in-place write to the input would then
+    see the value from before that write.
+    """
+    mutators = []
+    for i, op in enumerate(graph.operations):
+        try:
+            if name in op.get_mutation_names():
+                mutators.append(i)
+        except (AttributeError, NotImplementedError):
+            continue
+    return bool(mutators) and any(u > mutators[0] and u not in mutators for u in uses)
 
 
 def _hoisted_input_clone_entry(
@@ -1504,6 +1521,8 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
+        if _read_after_mutation(graph, name, uses):
+            return "read after in-place mutation"
         if division_is_fixed:
             # See the matching comment in _buffer_residency_reason: on the
             # joint path this is redundant with (and less accurate than) the
@@ -3610,7 +3629,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Candidate coarse tilings enter the same way: each tiled axis's
         symbolic count (``sym_tile_counts``) is keyed on the op's own loop
         variable for that axis. With no tiled candidate there are none, and the
-        extractor reads the op's committed tiling (``loop_info``) as before.
+        extractor reads the op's committed tiling (``loop_member``) as before.
         """
         from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -4243,7 +4262,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         differently-shaped consumer -- a separate mechanism, still xfailed, not
         reached by the ordinary M-axis output tiling offered here.)
 
-        An op already tiled (``loop_info`` set -- by the ``spyre_hint`` pass
+        An op already tiled (``loop_member`` set -- by the ``spyre_hint`` pass
         pre-stickification, a ``for_each_tile`` loop, or a prior apply) is left
         untouched, so the solve never re-tiles or un-tiles it, and so is every
         other op inside a ``for_each_tile`` region (``_prescribed_ops``): the
@@ -5478,7 +5497,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             # A coarse-tiled CANDIDATE can never host a relayout, for the same
             # reasons a coarse-tiled op cannot in general (a tiled candidate's
-            # buffer is per-tile scratch). The loop_info edge gate covers
+            # buffer is per-tile scratch). The loop_member edge gate covers
             # hint-materialized tiling decided before the solve; once the
             # unified-tiling work (#3923) makes tiling a per-candidate solver
             # choice, cd.tiling is the only marker. Written via getattr so it

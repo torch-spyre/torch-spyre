@@ -322,6 +322,63 @@ def _dma_to_spyre_fp8_kernel(
     return dst
 
 
+def zeros_qfp8wt(
+    shape: tuple[int, ...] | list[int] | torch.Size,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor:
+    """Allocate a zero-filled ``torch.float8_e4m3fn`` tensor in QFP8WT layout.
+
+    Use this for a persistent cache (such as a paged-attention K cache) that a
+    compiled graph writes into with ``index_copy_`` or ``index_put_`` and that
+    ``spyre.scaled_bmm`` reads.  A graph input keeps the device layout it was
+    allocated with, so a cache that receives QFP8WT data must be allocated as
+    QFP8WT; scattering into a STANDARD cache is rejected at compile time.
+
+    The last two dims are the weight's ``[K, N]`` matrix (``K`` divisible by 2,
+    ``N`` by 64).  Any leading dims (pages, heads, ...) stay outermost on the
+    device, giving ``[..., K, 1, N]`` for rank 3 and above.  A rank-2 ``[K, N]``
+    tensor takes the default 2D-stick weight layout, as
+    ``_dma_to_spyre_fp8_kernel`` does.
+    """
+    shape = tuple(shape)
+    if len(shape) < 2:
+        raise ValueError(f"QFP8WT needs at least 2 dims [K, N], got shape {shape}")
+    k, n = shape[-2], shape[-1]
+    if k % 2 != 0:
+        raise ValueError(f"QFP8WT K={k} must be divisible by 2 (shape {shape})")
+    if n % 64 != 0:
+        raise ValueError(f"QFP8WT N={n} must be divisible by 64 (shape {shape})")
+
+    target = _normalize_spyre_device(device)
+    host = torch.zeros(shape, dtype=torch.float8_e4m3fn)
+    if len(shape) == 2:
+        layout = SpyreTensorLayout(
+            list(shape),
+            list(host.stride()),
+            torch.float8_e4m3fn,
+            [0, 1],
+            ElementArrangement.QFP8WT,
+        )
+    else:
+        lead = list(shape[:-1])
+        valid_elements: dict[tuple[int, ...], int] = {
+            (d,): shape[d] for d in range(len(lead))
+        }
+        valid_elements[(len(lead), len(lead) + 1)] = n
+        layout = SpyreTensorLayout(
+            lead + [1, n],
+            list(host.stride()[:-1]) + [n, 1],
+            SpyreTensorLayout(list(shape), torch.float8_e4m3fn).device_dtype,
+            valid_elements,
+            ElementArrangement.QFP8WT,
+        )
+    dst = spyre_empty_with_layout(
+        host.size(), host.stride(), torch.float8_e4m3fn, layout, device=target
+    )
+    copy_tensor(host, dst, non_blocking=False)
+    return dst
+
+
 def dma_moe_expert_weight_to_spyre(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,

@@ -14,7 +14,7 @@
 
 """A reader that takes its facts from a shim op's index: the cost features.
 
-A strict ``LoopInfo`` carries no per-read lists, so ``cost_features.extract_op_features`` reads
+A strict ``LoopMember`` carries no per-read lists, so ``cost_features.extract_op_features`` reads
 whether an operand advances at a level from the access's index. The device-free
 accessor tests are in ``test_loop_shim.py``; this file runs the reader on the shim ops
 of real compiled graphs and checks the loop facts it reports against what the plan
@@ -43,7 +43,7 @@ def _features_of_the_looped_ops(case):
     def spy(graph, groups, group_idx_offset=0):
         result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
         for op in all_ops(graph.operations):
-            info = getattr(op, "loop_info", None)
+            info = getattr(op, "loop_member", None)
             if isinstance(op, ComputedBuffer) and getattr(
                 info, "strict_loop_vars", False
             ):
