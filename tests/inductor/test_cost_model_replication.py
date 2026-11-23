@@ -970,6 +970,31 @@ def test_in_scope_the_cohort_excess_steps_aside():
     assert _shared_operand_read_excess([op], _COST_PARAMS) == 0
 
 
+@pytest.mark.parametrize("symbolic", [False, True])
+@pytest.mark.parametrize("weight_lx", [False, True])
+def test_decode_weight_delivery_and_stream_prices_are_disjoint(symbolic, weight_lx):
+    from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
+
+    op = (
+        _decode_symbolic(8, weight_lx=weight_lx)
+        if symbolic
+        else _gate_up(8, 8, 1, 1, weight_lx=weight_lx)
+    )
+    # The activation is below the stream threshold, but the 2D shared weight
+    # qualifies. Eight rows on few cores used to pay both delivery terms.
+    assert op.args[0].elems * 2 < _COST_PARAMS.mm_stream_min_bytes
+    assert op.args[1].elems * 2 > _COST_PARAMS.mm_stream_min_bytes
+    stream = _reused_operand_stream_excess_ns([op], _COST_PARAMS)
+    delivery = _decode_weight_delivery_excess([op], _COST_PARAMS)
+    for m, n, k in [(1, 1, 1), (8, 1, 1), (4, 8, 1)] if symbolic else [(8, 1, 1)]:
+        at = _at(m, n, k)
+        assert float(sympy.sympify(stream).xreplace(at)) == 0
+        expected = 0 if weight_lx else _decode_expected(m, k, m * n * k)
+        assert float(sympy.sympify(delivery).xreplace(at)) == pytest.approx(expected)
+        if not weight_lx and m == 8:
+            assert expected > 0
+
+
 DECODE_MENU = [
     (4, 8, 1),
     (8, 4, 1),
