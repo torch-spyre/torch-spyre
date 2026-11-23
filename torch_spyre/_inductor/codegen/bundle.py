@@ -41,6 +41,8 @@ from torch_spyre._inductor.pass_utils import decompose_tiled_count
 logger = get_inductor_logger("sdsc_compile")
 sdsc_log = get_inductor_logger("sdsc")
 
+_STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -876,6 +878,10 @@ class LoopLevel:
     ``setup`` lines are written once at the top of the bundle. ``pre_loop``
     lines are written right before this level's ``scf.for``, for a value that
     only exists once the ops before the loop have run.
+
+    ``outer_stride``, when set, makes a device-read count's address move with
+    the directly enclosing loop. _emit_specs writes that address right before
+    ``pre_loop``, since only it knows the enclosing loop's variable.
     """
 
     setup: "tuple[str, ...]"
@@ -883,6 +889,7 @@ class LoopLevel:
     step: str
     stride_scale: int
     pre_loop: "tuple[str, ...]" = ()
+    outer_stride: int = 0
 
 
 def _count_scale(count: sympy.Expr) -> int:
@@ -1022,11 +1029,28 @@ def _device_read_loop_level(
             f"device-read loop count max_value={source.max_value} is not a "
             f"multiple of granularity={source.granularity}"
         )
-    return LoopLevel(
-        setup=(
-            f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index",
+    if source.outer_stride < 0 or source.outer_stride % _STICK_BYTES:
+        raise Unsupported(
+            f"device-read loop count outer_stride={source.outer_stride} is not a "
+            f"whole number of {_STICK_BYTES}-byte sticks"
+        )
+    offset = f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index"
+    if source.outer_stride:
+        # The address moves with the enclosing loop, so only its base and step
+        # are constants here; _emit_specs writes the address inside that loop.
+        setup = (
+            offset,
+            f"%cnt_base_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
+            f"%cnt_step_{lb_idx} = arith.constant {source.outer_stride} : index",
+        )
+    else:
+        setup = (
+            offset,
             f"%cnt_addr_{lb_idx} = arith.addi %pool, %cnt_off_{lb_idx} : index",
-        ),
+        )
+    return LoopLevel(
+        setup=setup,
+        outer_stride=source.outer_stride,
         pre_loop=(
             f"%n_{lb_idx} = sdscbundle.load_value_at_address %cnt_addr_{lb_idx} "
             f"{{granularity = {source.granularity}, "
