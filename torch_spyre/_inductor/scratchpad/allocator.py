@@ -699,8 +699,8 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
     (input clone) attributes onto the clone, but a post-loop drain and a
     hoisted pre-loop input clone are neither loop members nor carries: a
-    surviving ``loop_member`` would re-group the clone into the counted loop at
-    scheduling time (``_loop_group_id``) and give it another op's per-read tile
+    surviving loop membership would keep the clone in the counted loop at
+    scheduling time and give it another op's per-read tile
     advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
@@ -2271,9 +2271,9 @@ class ScratchpadAllocator:
                     )
                     # Drain-only metadata hygiene: the clone copied the
                     # storage's attributes, but it is neither a loop member nor
-                    # a carry.  The scheduler-level
-                    # ``_loop_group_id(drain_node) is None`` is asserted by the
-                    # captured-order test; here the op-level absence is exact.
+                    # a carry.  That the drain's scheduler node is in no loop is
+                    # asserted by the captured-order test; here the op-level
+                    # absence is exact.
                     _clear_loop_membership_metadata(new_buffer)
                     if drain_plan.collective is not None:
                         # An in-place collective's result is the output: it and
