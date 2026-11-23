@@ -88,8 +88,9 @@ def reuse_log(monkeypatch):
 
 
 def _inputs(rows=4):
-    torch.manual_seed(0)
-    return torch.randn(rows, 8), torch.randn(rows, 8)
+    # A CPU generator: torch.manual_seed would also seed, and so open, a Spyre card.
+    g = torch.Generator().manual_seed(0)
+    return torch.randn(rows, 8, generator=g), torch.randn(rows, 8, generator=g)
 
 
 def _precompile_in_pool(fn, dynamic):
@@ -128,8 +129,9 @@ def _load_in_new_process(path, tmp_path, dynamic):
                 fn = torch.compiler.load_compiled_function(f)
             ok = True
             for rows in ((4, 6) if {dynamic!r} else (4,)):
-                torch.manual_seed(0)
-                a, b = torch.randn(rows, 8), torch.randn(rows, 8)
+                g = torch.Generator().manual_seed(0)
+                a = torch.randn(rows, 8, generator=g)
+                b = torch.randn(rows, 8, generator=g)
                 ok = ok and torch.allclose(fn(a, b), kern(a, b))
             print("RESULT", ok, len(calls))
             """
