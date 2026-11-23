@@ -1685,6 +1685,34 @@ class TestSpyre(TestCase):
         dst.copy_(src)
         self.assertEqual(dst.cpu(), values, atol=0, rtol=0)
 
+    # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/6404
+    # A missing feature: the plan pairs device dims with host dims from the
+    # source's strides, which fails for this layout with a transposed source.
+    # When the pairing comes from the destination this must copy correctly.
+    @_expect_raise(r"Invalid copy plan: it reaches host element")
+    def test_h2d_copy_transposed_source_into_head_major_layout(self):
+        """H2D copy_ of a sliced, transposed host view into a head-major tensor.
+
+        The head-major layout (the paged KV cache's, and issue #6404's) keeps a
+        host dim between the stick count and the stick. A plan built from a
+        transposed source's strides cannot pair that dim and reaches past the
+        host buffer; the copy is refused instead of reading out of bounds.
+        """
+        E, H, M = 2, 128, 128
+        # Integers below 512 are exact on device, so the comparison is exact.
+        host = (torch.arange(E * 2 * M * H) % 509).reshape(E, 2 * M, H).half()
+        view = host[:, :M, :].transpose(1, 2)  # [E, H, M], sliced and transposed
+        layout = self._head_major_kv_layout(E, H, M, torch.float16)
+        dst = torch.empty(
+            (E, H, M),
+            dtype=torch.float16,
+            device=torch.device("spyre"),
+            device_layout=layout,
+        )
+        dst.fill_(777.0)  # not a value of `host`: marks an unwritten element
+        dst.copy_(view)
+        self.assertEqual(dst.cpu(), view, atol=0, rtol=0)
+
     @parametrize(
         "sizes",
         [
