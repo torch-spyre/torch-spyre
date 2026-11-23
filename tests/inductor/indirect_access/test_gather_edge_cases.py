@@ -53,11 +53,6 @@ _NUMERICAL_MISMATCH = (
     "Eager gather followed by a sum accumulate mismatches CPU.",
     r"spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_FP16_TO_FP32_EAGER = (
-    5856,
-    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
-    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _CLAMP_MIN_EAGER = rejection(
     6340,
     "aten::clamp_min.out is not registered on Spyre.",
@@ -530,8 +525,6 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_api_gather_then_softmax(self, execution_mode):
         """Gather logits for target tokens → softmax over vocab."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
-        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         logits = cached_randn((32, 512), differentiation="api22", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(

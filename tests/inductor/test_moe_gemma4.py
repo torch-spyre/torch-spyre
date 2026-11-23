@@ -224,6 +224,22 @@ TILE_OFFSET_CUMSUM = _xfail(
     "#4754: no offset-free alternative stick dim for mutation target",
     "no offset-free alternative stick dim for mutation target",
 )
+# Eager: the fp16/bf16 -> fp32 cast now keeps its DL16_TO_FP32 layout, and topk over
+# that staggered input stops at the compiler: buf0 (Reduction) has no way to resolve
+# the stick incompatibility between the staggered input and the topk output.
+EAGER_TOPK_STAGGERED_STICK = _xfail(
+    InductorError,
+    "#3193: eager topk of a DL16_TO_FP32 input raises no mechanism to resolve "
+    "stick incompatibility",
+    "no mechanism to resolve stick incompatibility",
+)
+# At T=1 eager topk over the tied candidates runs, but its values or tied-pool count
+# differ from CPU (1 of 1 element wrong, max abs difference 4.0).
+EAGER_TOPK_TIED_MISMATCH = _xfail(
+    AssertionError,
+    "#4639: eager tied topk returns a different tied-pool count than CPU",
+    r"eager spyre <-> cpu\[1\] mismatch",
+)
 TOPK_FLOAT_IDS = _xfail(
     AssertionError,
     "#5847: topk returns float32 indices",
@@ -237,14 +253,6 @@ TOPK_STAGGERED_INPUT = _xfail(
     AssertionError,
     "#5856: topk of a DL16_TO_FP32 input returns rows in staggered order",
     "Tensor-likes are not close",
-)
-# An FP32 softmax of a BF16 [12, 128] input, or a .float() of its [12, 8] top-k
-# mask, stages a DL16_TO_FP32 operand whose stick pair is on no single dim. This
-# fails before #4639 (wrong compiled / tied topk values) can be observed.
-STAGGERED_UPCAST = _xfail(
-    InductorError,
-    "#6486: staggered read with no unique num-sticks dim on an FP32 upcast",
-    "staggered read with no unique num-sticks dim",
 )
 INDEX_2D = _xfail(
     NotImplementedError,
@@ -305,12 +313,6 @@ REPEAT_INTERLEAVE = _xfail(
 GROUPED_MM_SORT = dict(eager=STABLE_SORT, compiled=SORT_RESTICKIFY)
 GROUPED_MM_SORT_CASES = dict(
     GROUPED_MM_SORT, decode_compiled=SORT_STICK_INCOMPATIBILITY
-)
-UPCAST_RMS_NORM = _xfail(
-    AssertionError,
-    "#5893: FP32 RMSNorm of an upcast BF16 input returns wrong values, so eager "
-    "attention outputs NaN",
-    "Greatest absolute difference: nan",
 )
 
 
@@ -831,7 +833,7 @@ def _f32(tensors):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=TOPK_FLOAT_IDS,
+        eager=EAGER_TOPK_STAGGERED_STICK,
         compiled=TOPK_STAGGERED_INPUT,
         decode_compiled=TOPK_FLOAT_IDS,
     ),
@@ -979,7 +981,7 @@ def test_G4_RT_003_per_expert_scale(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+    _cases(eager=EAGER_TOPK_STAGGERED_STICK, compiled=FLOAT_IDS_AS_INDEX),
 )
 def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
     """Gemma4TextRouter: RMS norm, scale, proj, softmax, top-8, renorm, rescale."""
@@ -1125,7 +1127,7 @@ def test_G4_GM_004_inverse_permute_fp32_combine(execution_mode, T):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+    _cases(eager=EAGER_TOPK_STAGGERED_STICK, compiled=FLOAT_IDS_AS_INDEX),
 )
 def test_G4_GM_005_router_and_grouped_mm_moe(execution_mode, T):
     """Gemma4TextRouter followed by grouped_mm_experts_forward."""
@@ -1243,14 +1245,10 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=STAGGERED_UPCAST,
+        eager=EAGER_TOPK_STAGGERED_STICK,
         compiled=TOPK_STAGGERED_INPUT,
         decode_compiled=TIED_TOPK_COMPILED,
-        decode_eager=_xfail(
-            InductorError,
-            "#4404: restickify restore expects a padding-prepended gap dim",
-            "restickify restore: expected padding-prepended",
-        ),
+        decode_eager=EAGER_TOPK_TIED_MISMATCH,
     ),
 )
 def test_G4_EC_003_topk_tied_candidates(execution_mode, T):
@@ -1418,14 +1416,14 @@ def _attention_case(kind, execution_mode, T):
     return cos, sin, weights
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
 def test_G4_AT_001_sliding_window_attention(execution_mode, T):
     """Sliding layer: 16 Q / 8 KV heads of 256, RoPE theta 1e4 over the full head."""
     _, _, weights = _attention_case("sliding", execution_mode, T)
     assert weights[2] is not None
 
 
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
 def test_G4_AT_002_full_attention_k_eq_v(execution_mode, T):
     """Full layer: 2 KV heads of 512, V from k_proj, proportional RoPE theta 1e6."""
     cos, sin, weights = _attention_case("full", execution_mode, T)
@@ -1496,8 +1494,9 @@ def _decoder_case(kind, execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=FLOAT_IDS_AS_INDEX_EAGER,
+        eager=EAGER_TOPK_STAGGERED_STICK,
         compiled=FLOAT_IDS_AS_INDEX,
+        decode_eager=FLOAT_IDS_AS_INDEX_EAGER,
         sentinel="eager-decode1",
     ),
 )
@@ -1509,8 +1508,9 @@ def test_G4_E2E_002_decoder_layer_sliding(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=FLOAT_IDS_AS_INDEX_EAGER,
+        eager=EAGER_TOPK_STAGGERED_STICK,
         compiled=FLOAT_IDS_AS_INDEX,
+        decode_eager=FLOAT_IDS_AS_INDEX_EAGER,
         sentinel="eager-decode1",
     ),
 )
