@@ -235,15 +235,6 @@ class SpyreTensorLayout:
         device_size: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
-        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
-        valid_elements: dict[tuple[int, ...], int] = {},
-    ) -> None: ...
-    @typing.overload
-    def __init__(
-        self,
-        device_size: collections.abc.Sequence[typing.SupportsInt],
-        stride_map: collections.abc.Sequence[typing.SupportsInt],
-        device_dtype: DataFormats,
         valid_elements: dict[tuple[int, ...], int],
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
@@ -512,6 +503,8 @@ class SymbolicArg:
     tensor_id: int
     dim_index: int
     num_shards: int
+    granularity: int
+    max_value: int
     def __init__(
         self,
         kind: SymbolicArgKind,
@@ -519,6 +512,8 @@ class SymbolicArg:
         dim_index: int = -1,
         value: int = -1,
         num_shards: int = -1,
+        granularity: int = -1,
+        max_value: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 
@@ -606,6 +601,24 @@ def spyre_empty_reserved(
     size/stride stay at `size`/`stride`. `min_size`/`granularity` are
     stored on the tensor for the runtime resize_ guard to check. Backs
     tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
+    """
+
+def spyre_empty_reserved_with_layout(
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    device_layout: SpyreTensorLayout,
+    dim: int,
+    min_size: int,
+    max_size: int,
+    granularity: int,
+) -> torch.Tensor:
+    """
+    spyre_empty_reserved with an explicit device layout. The layout
+    describes the buffer at `max_size`: the reserved host dimension must
+    occupy one whole device dimension, not the stick-elements one, with
+    extent `max_size`. Backs tensor.to("spyre", dynamic={...},
+    device_layout=...).
     """
 
 def spyre_empty_with_layout(

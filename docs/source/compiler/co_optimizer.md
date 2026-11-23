@@ -326,7 +326,8 @@ and for what happens with a non-core-division-capable `layout_solver` and the
 `ExhaustiveSearchSolver` fallback. Those two are all (a) needs; (b) adds one more on top,
 `config.auto_coarse_tiling` (env `AUTO_COARSE_TILING`, off by default) — the dedicated switch
 for adding coarse tiling to the pair in (a), inert unless `layout_solver` is `"cpsat"` or
-`"simulated_annealing"`.
+`"simulated_annealing"`. The search offers one loop level only (a nested tiling is refused when
+applied, #6088), so an op whose best tiling needs two levels is tiled once or not at all.
 
 ### a) LX placement and work division
 

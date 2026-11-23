@@ -13,6 +13,13 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 [embedding example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/embedding.py), and the
 [FP8 quantization example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fp8.py).
 
+The discrete Fourier transform
+([FFT example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fft.py))
+is a host library function (`torch_spyre.ops.fft` / `ifft` / `fft2` / `ifft2` /
+`fftn` / `ifftn`), not a `torch.compile` lowering: it runs the DFT as a real
+matmul on device, while the complex packing and the fp16 casts stay on the
+host. `torch.fft.*` itself is not supported on the device (it is complex).
+
 ## Operations Table
 
 | Operation | Eager | Compiled | Execution | Notes |
@@ -24,13 +31,16 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.bmm` | Y | Y | Spyre | |
 | `torch._grouped_mm` | Y | Y | Spyre | All four upstream shape variants; the ragged ones pack/`bmm`/unpack with host-computed routing tables. BF16 only; `offs` must be a Spyre tensor; raises if routing is too skewed for the static per-expert capacity. |
 | `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
-| `torch.ops.spyre.quantscalepertokenfp8` | | Y | Spyre | Compiled only; no eager fallback. Fused per-token amax + scale computation for FP8 activation quantization |
+| `torch.ops.spyre.quantscalepertokenfp8` | Y | Y | Spyre | Fused per-token amax + scale computation for FP8 activation quantization |
 | `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 activation to FP8 using a pre-computed scale (`qfp8ch` layout) |
 | `torch.ops.spyre.quantize_weight_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 weight to FP8 using a pre-computed scale (`qfp8wt` layout) |
 | `torch.ops.spyre.dequantize_fp8_with_scale` | Y | Y | Spyre | Dequantize FP8 tensor to FP16 using a pre-computed scale |
+| `torch.ops.spyre.scaled_bmm` | | Y | Spyre | Compiled-only FP8 batched matmul (3D@2D, 3D@3D, 4D@4D); batched counterpart to `spyre.scaled_mm`. `spyre.bmm_fp8` is the unscaled variant |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
-| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
+| `torch.conv1d` | Y | Y | Spyre | Lowers through the `conv2d` path (`conv2d_via_bmm_decomp` or the native conv SDSC) |
+| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm_decomp`) running entirely on device; a native conv2d SDSC path (`lower_convolution`) is also available |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
+| `torch.nn.functional.max_pool2d` | | Y | Spyre | Compiled only; native maxpool SDSC (`lower_max_pool2d_with_indices`) |
 | `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
@@ -44,6 +54,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
 | `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax) with native grouped-query attention: K/V keep their head count and gain a unit broadcast axis rather than materializing `Hq` copies; auto-registers a PrivateUse1 kernel for eager dispatch |
 | `torch.ops.spyre.sliding_window_attention` | | Y | Spyre | Compiled-only custom op; runtime additive mask, causal and non-causal paths, native GQA |
+| `torch.ops.spyre.linear_attention` | | Y | Spyre | Compiled-only custom op; chunkwise causal and non-causal linear attention with a carried `[B, H, Dk, Dv]` state. Phase 1: no GQA, no gating or decay (see [Linear attention custom op](#linear-attention-custom-op)) |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -65,15 +76,16 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
-| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32 runs natively via `addi32toi32` |
+| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32/int64 run natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
-| `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
+| `torch.mul` | Y | Y | Spyre | int32/int64 run natively via `muli32toi32` |
 | `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` not yet implemented (#3610). |
 | `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
-| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
+| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU. A host bool mask with fp32 or int32 values is refused as mixed EA (#5495) |
+| `torch.masked_fill` | Y | Y | Spyre | Lowers to `where`, so the same limitation applies: a host bool mask with fp32 or int32 values is refused as mixed EA (#5495) |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | Y | Y | Spyre | |
@@ -126,7 +138,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.pad` / `torch.constant_pad_nd` | Y | Y | Spyre | Custom lowering |
 | **In-place / Initialization** | | | | |
-| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable |
+| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable. Eager `fill_`/`zero_` raise on a partial, broadcast or overlapping view; sharded tensors are filled one shard at a time |
 | `torch.Tensor.normal_` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.Tensor.uniform_` | Y | | CPU fallback | Eager only; random values generated on CPU, copied back |
 | `torch.Tensor.random_` | Y | | CPU fallback | Eager only; `from` overload |
@@ -212,6 +224,86 @@ are still computed before the additive mask is applied.
 The cache capacity must be positive and a multiple of 64, and `Lq` must be in
 `[1, Lk]`. The op has no eager implementation and must be called on Spyre under
 `torch.compile(backend="inductor")`.
+
+## Linear attention custom op
+
+`torch.ops.spyre.linear_attention` has the schema:
+
+```python
+linear_attention(
+    query, key, value, initial_state=None, chunk_size=64, is_causal=True, scale=None
+) -> tuple[Tensor, Tensor]  # (output, final_state)
+```
+
+Linear attention drops the softmax. With the feature map already applied by
+the caller, the causal form is the recurrence `S_t = S_{t-1} + k_tᵀ v_t`,
+`o_t = scale · q_t S_t`, where the current token is included. The state `S` has
+a fixed `[Dk, Dv]` size per head, so decode costs the same at any context
+length, unlike a KV cache.
+
+The query and key shape is `[B, H, L, Dk]` and the value shape is
+`[B, H, L, Dv]`. The result is `output` with shape `[B, H, L, Dv]` and
+`final_state` with shape `[B, H, Dk, Dv]`. Pass one call's `final_state` as the
+next call's `initial_state` (same dtype as the query) to continue a sequence,
+which is how chunked prefill and token-by-token decode work. `scale` defaults
+to `Dk ** -0.5`. With `is_causal=False` every row reads the state summed over
+the whole sequence.
+
+`chunk_size` is static configuration: a multiple of 64, at most 512. The
+sequence is padded at the end to a whole number of chunks and processed one
+chunk per step with plain matmuls plus a `[chunk_size, chunk_size]` lower
+triangular mask. Padding at the end leaves the output and final state exact.
+
+The caller owns the feature map (for example `elu(x) + 1`) and any
+normalization. [`linear_attention.py`](examples/linear_attention.py) shows how
+to get the normalizer from the same call by appending a block of ones to the
+value.
+
+Spyre has no kernel for `expm1`, and Inductor decomposes `F.elu` through it, so
+compiling `F.elu(x) + 1` on device fails with `unimplemented operation expm1`.
+For the default `alpha=1` feature map use operations Spyre already supports:
+
+```python
+def feature_map(x):
+    return torch.exp(torch.minimum(x, torch.zeros_like(x))) + torch.relu(x)
+```
+
+This equals `exp(x)` for negative inputs and `x + 1` for nonnegative ones. The
+argument of `exp` never exceeds zero, so a large positive input cannot
+overflow in the branch that is not selected. It computes `elu(x) + 1` directly,
+so it does not need the numerical care that replacing a general `expm1(x)` with
+`exp(x) - 1` would near zero.
+
+Phase 1 limits, each rejected with an `Unsupported` error that names the
+problem:
+
+- Query, key and value must share a dtype, device, batch, heads and length;
+  there is no grouped-query form and no cross-length form.
+- No gating or decay (so not GLA, RetNet, Mamba-2, or the delta-rule family).
+- The chunk loop is a `for_each_tile` loop with the state as its carry, so the
+  traced graph does not grow with `ceil(L / chunk_size)` and the number of
+  chunks is not capped. The backend compiler unrolls counted loops by default
+  (`SPYRE_BACKEND_LOOP_UNROLL`). On 1p0, compile time did not grow noticeably
+  between 64 and 512 chunks (about 14-20 s either way, with unrolling on or
+  off).
+- Precision: each chunk's matmuls accumulate in FP32, but the carried state is
+  stored in the 16-bit device format between chunks, so its relative error
+  grows slowly with the number of chunks. The IEEE fp16 overflow limit of 65504
+  does not apply on device; it matters only when `final_state` is read back to
+  the host as IEEE fp16. The 16-bit format has fewer mantissa bits on newer
+  hardware generations (BF16 on 1p5), where the drift is larger. This path has
+  been validated on 1p0 only; an FP32 carry is a possible follow-up.
+- Dtypes: on a Spyre device only `torch.float16` is accepted; other dtypes are
+  rejected with an `Unsupported` error. CPU calls accept any floating dtype.
+
+The op has no eager implementation on Spyre and must be called under
+`torch.compile(backend="inductor")`; an eager call on a Spyre device raises
+`Unsupported`. A single-token call (`L == 1`) is one state update plus one
+matmul, with no chunk loop, mask or score matmul. The update pads the token axis
+to one stick (a contraction-1 matmul does not lower yet), so decode costs a
+stick of rows per token, a constant factor above the ideal `O(Dk * Dv)`. On CPU
+it runs the fp32 token-by-token reference, which is the accuracy yardstick for
+the device path.
 
 ## Unsupported Operations
 

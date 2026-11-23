@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: gemma-4-26b-a4b-it-weights}
+spec:
+  type: fileset
+  format: safetensors
+  visibility: public
+  source: {uri: 'hf://models/google/gemma-4-26B-A4B-it', revision: '4d7ae4984b7db7de8f8457170b3f1a419ee76d52'}
+  integrity: {revision_pinned: true}
+---
+# unpinned: runner resolves the hub default
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: mistral-7b-instruct-v0.3-weights, annotations: {revision.state: unpinned}}
+spec:
+  type: fileset
+  format: safetensors
+  visibility: public
+  source: {uri: 'hf://models/mistralai/Mistral-7B-Instruct-v0.3', revision: '0000000000000000000000000000000000000000'}
+  integrity: {revision_pinned: true}
+---
+# unpinned: runner resolves the hub default
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: qwen2.5-0.5b-instruct-weights, annotations: {revision.state: unpinned}}
+spec:
+  type: fileset
+  format: safetensors
+  visibility: public
+  source: {uri: 'hf://models/Qwen/Qwen2.5-0.5B-Instruct', revision: '0000000000000000000000000000000000000000'}
+  integrity: {revision_pinned: true}

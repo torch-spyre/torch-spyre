@@ -27,27 +27,35 @@ import getpass
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import sendnn, vllm
+from . import bench_invalidation, sendnn, vllm
 from .identity import DerivedId, RunId
 from .offline import (
+    ADMIN_KINDS,
     FAILED,
     MANUAL_PREFIX,
+    REJECTED,
     STATUS,
+    CHANNEL_TRUST,
     BundleError,
     benchmark_entries,
     check,
+    current_user,
     digest,
+    effective_trust,
     inbox_keys,
     is_manual,
     opened,
+    receipt_id,
     run_key,
     specs,
 )
 
 SOURCE = "bundle"
+TRUST_PROP = "run.trust"
 
 
 def run_id(meta: dict) -> str:
@@ -184,6 +192,20 @@ def check_append(
         )
 
 
+def prior_trust(client, db: str, aid: str, rid: str, test_type: str) -> str:
+    """The lowest run.trust the run's earlier verdicts carry; '' when none is recorded."""
+    rows = client.query(
+        f"SELECT DISTINCT props['{TRUST_PROP}'] FROM {db}.v_artifact_results_published "
+        "WHERE artifact_id = {aid:UUID} AND run_id = {rid:UUID} AND test_type = {t:String}",
+        parameters={"aid": aid, "rid": rid, "t": test_type},
+    ).result_rows
+    return min(
+        (r[0] for r in rows if r[0] in CHANNEL_TRUST),
+        key=CHANNEL_TRUST.index,
+        default="",
+    )
+
+
 def verdict_recorded(client, db: str, aid: str, rid: str, test_type: str) -> bool:
     return (
         client.query(
@@ -218,7 +240,7 @@ def results_argv(meta: dict, root: Path, aid: str, rid: str, props: dict, strict
     for tag in meta.get("tags", []):
         argv += ["--tag", tag]
     for k, v in props.items():
-        if v:
+        if v and k != TRUST_PROP:
             argv += ["--result-prop", f"{k}={v}"]
     from .writer import upload_row_props
 
@@ -245,12 +267,130 @@ def ingest(args) -> int:
     except BundleError as err:
         print(json.dumps({"status": STATUS[err.code], "reason": str(err)}))
         return err.code
+    if report.get("status") != "ingested":
+        report.pop("receipt", None)
     print(json.dumps(report, sort_keys=True))
+    if report.get("receipt"):
+        print(receipt_text(report), file=sys.stderr)
     return 0
 
 
-def _ingest(root: Path, args) -> dict:
+def receipt_text(report: dict) -> str:
+    """The printable receipt: what was recorded and the id to quote when asking about it."""
+    rows = [("receipt", report["receipt"]), ("status", report.get("status", "")),
+            ("bundle sha256", report.get("bundle_sha256", "")), ("run id", report.get("run_id", "")),
+            ("artifact", report.get("artifact_id", "")), ("trust", report.get("trust", ""))]  # fmt: skip
+    return "\n".join(f"{k:<14} {v}" for k, v in rows if v)
+
+
+def _ingest_reference(root: Path, meta: dict, args) -> dict:
+    """A bench-reference bundle at approval: the one writer of component `reference`.
+
+    An authorised-caller-only entry point: the approval route (or the reference credential's job) has
+    already checked who may approve and passes the outcome as --bundle-prop approved_by / upload_id /
+    submitted_by [/ approval_reason, approval_override, terms_ack_by, approved_at, promote=0,
+    register_missing=1]; none of it is verified here beyond the self-approval backstop. Without
+    approved_by only a dry run is allowed. The submitter comes from the stored upload (submitted_by),
+    never from the bundle.
+    """
+    import uuid
+
+    from . import reference as ref
+    from .client import ClickHouse, ClickHouseEnv
+
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    sha = digest(root)
+    submitter = extra.get("submitted_by", "")
+    approver = extra.get("approved_by", "")
+    if not args.dry_run:
+        if not (approver and extra.get("upload_id") and submitter):
+            raise BundleError(
+                "a reference is written at approval: pass --bundle-prop approved_by=<login>, "
+                "submitted_by=<login> and upload_id=<id>"
+            )
+        if (
+            ref.norm_login(approver) == ref.norm_login(submitter)
+            and extra.get("approval_override") != "1"
+        ):
+            raise BundleError(
+                "the submitter cannot approve their own reference; an admin approval is flagged approval_override=1"
+            )
+        if extra.get("approved_at"):
+            try:
+                datetime.fromisoformat(extra["approved_at"].replace("Z", "+00:00"))
+            except ValueError:
+                raise BundleError("approved_at is not an ISO-8601 time") from None
+    submitter = submitter or args.uploader or getpass.getuser()
+    upload_id = extra.get("upload_id") or str(uuid.uuid5(uuid.NAMESPACE_URL, sha))
+    try:
+        upload_id = str(uuid.UUID(upload_id))
+    except ValueError:
+        raise BundleError(f"upload_id {upload_id!r} is not a UUID") from None
+    db = ClickHouseEnv.target_database()
+    if not db:
+        raise BundleError("no database: set CLICKHOUSE_DB_V2", FAILED)
+    try:
+        client = ClickHouse.connect(database=db)
+        if args.dry_run:
+            client.set_client_setting("readonly", "2")
+    except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
+        raise BundleError(f"spyre_v2 unreachable: {err!r}", FAILED) from None
+    selfie = ref.norm_login(approver) == ref.norm_login(submitter)
+    # The override flag is an audit record the caller asserts; only a self-approval is forced to carry it.
+    approval = {"ref.approved_by": ref.norm_login(approver), "ref.approval_reason": extra.get("approval_reason", ""),
+                "ref.approval_override": "1" if selfie else extra.get("approval_override", ""),
+                "ref.approval_self": "1" if selfie else extra.get("approval_self", ""),
+                "ref.terms_ack_by": extra.get("terms_ack_by", "")}  # fmt: skip
+    ctx = ref.WriteContext(submitter=submitter, upload_id=upload_id, approval=approval, bundle_sha256=sha,
+                           bundle_url=args.bundle_url, promote=extra.get("promote", "1") != "0",
+                           register_missing=extra.get("register_missing") == "1", approved_at=extra.get("approved_at", ""))  # fmt: skip
+    try:
+        out = ref.write(
+            client, db, ref.load(root / "results" / ref.FILE), ctx, args.dry_run
+        )
+    except ref.ReferenceError as err:
+        raise BundleError(str(err), FAILED if err.retry else REJECTED) from None
+    except Exception as err:  # noqa: BLE001 -- never a traceback after a partial write: the same upload resumes
+        raise BundleError(f"reference write crashed: {err!r}", FAILED) from None
+    return {
+        **out,
+        "bundle_sha256": sha,
+        "test_type": meta["test_type"],
+        "run_key": f"manual:{ref.norm_login(submitter)}:{upload_id}",
+    }
+
+
+def _ingest_invalidation(root: Path, args) -> dict:
+    """The invalidation writer owns the kind; the channel rules of the other admin kinds still apply."""
+    if args.expect_key:
+        raise BundleError(
+            "a bench-invalidation bundle is not an inbox bundle: only a CI job or an operator ingests it directly"
+        )
     meta = check(root)
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    if trust not in ("ci", "lab"):
+        raise BundleError(
+            f"a bench-invalidation bundle needs a channel of trust ci or lab, not {trust or 'none'}"
+        )
+    report = bench_invalidation.ingest(root, args)
+    upload_id = dict(getattr(args, "bundle_prop", None) or []).get("upload_id", "")
+    return {
+        **report,
+        "trust": trust,
+        "receipt": receipt_id(report["bundle_sha256"], upload_id),
+    }
+
+
+def _ingest(root: Path, args) -> dict:
+    if bench_invalidation.is_bundle(root):
+        return _ingest_invalidation(root, args)
+    meta = check(root)
+    if meta.get("kind") == "bench-reference":
+        if getattr(args, "append_to_run", False):
+            raise BundleError(
+                "--append-to-run does not apply to a bench-reference bundle"
+            )
+        return _ingest_reference(root, meta, args)
     key = run_key(meta)
     if not is_manual(key) and args.trusted_job_prefix:
         if not any(key.startswith(p) for p in args.trusted_job_prefix):
@@ -263,6 +403,11 @@ def _ingest(root: Path, args) -> dict:
             f"its folder {args.expect_key!r} is not its artifact_id or sha256-<image digest> "
             f"({sorted(inbox_keys(meta))})"
         )
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    if TRUST_PROP in extra:
+        raise BundleError(
+            f"{TRUST_PROP} is assigned by the receiving channel, not passed in"
+        )
     from .client import ClickHouse, ClickHouseEnv
 
     db = ClickHouseEnv.target_database()
@@ -274,6 +419,8 @@ def _ingest(root: Path, args) -> dict:
             client.set_client_setting("readonly", "2")
     except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
         raise BundleError(f"spyre_v2 unreachable: {err}", FAILED) from None
+    if meta.get("kind") in ADMIN_KINDS:
+        return _ingest_admin(client, db, root, meta, args, extra)
     try:
         r, via = resolve_artifact(client, db, meta)
     except BundleError:
@@ -281,7 +428,7 @@ def _ingest(root: Path, args) -> dict:
             raise
         r, via = create_artifact(client, db, meta, args.dry_run), "create_artifact"
     sha = digest(root)
-    uploader = args.uploader or meta.get("uploader") or getpass.getuser()
+    uploader = args.uploader or meta.get("uploader") or current_user()
     meta.setdefault("arch", DerivedId.arch(r.arch))
     meta.setdefault("component", r.component)
     meta["run_key"] = key or f"{MANUAL_PREFIX}{uploader}:{sha}"
@@ -292,9 +439,16 @@ def _ingest(root: Path, args) -> dict:
     aid, rid = r.artifact_id, run_id(meta)
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
               "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    if trust:
+        report["trust"] = trust
+    report["receipt"] = receipt_id(sha, extra.get("upload_id", ""))
+    if meta.get("kind") == "bench":
+        return _ingest_bench(
+            client, db, root, meta, args, report, aid, rid, extra, uploader, sha
+        )
     seen, files = existing_run(client, db, rid, meta["component"])
     names = {Path(p).name for p in (root / "results").iterdir()}
-    extra = dict(getattr(args, "bundle_prop", None) or [])
     append = getattr(args, "append_to_run", False)
     if append:
         if sha in seen:
@@ -307,6 +461,10 @@ def _ingest(root: Path, args) -> dict:
             client, db, rid, meta["component"], extra["upload_id"]
         )
         check_append(target, names, taken, meta, aid, rid)
+        earlier = prior_trust(client, db, aid, rid, meta["test_type"])
+        if earlier:
+            trust = effective_trust(trust, earlier)
+            report["trust"] = trust
         report["append"] = True
     elif seen == {sha}:
         return {**report, "status": "duplicate"}
@@ -321,7 +479,7 @@ def _ingest(root: Path, args) -> dict:
     props = {**extra, "source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
              "bundle_url": args.bundle_url, "bundle_kind": meta.get("kind", "junit"),
              "bundle_files": "\n".join(sorted(names)),
-             **({"round": "1"} if append else {})}  # fmt: skip
+             **({"round": "1"} if append else {}), **({TRUST_PROP: trust} if trust else {})}  # fmt: skip
     if meta.get("kind") == "vllm":
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
     elif meta.get("kind") == "sendnn":
@@ -343,6 +501,59 @@ def _ingest(root: Path, args) -> dict:
     return {**report, "status": "ingested"}
 
 
+def _ingest_bench(
+    client, db, root, meta, args, report, aid, rid, extra, uploader, sha
+) -> dict:
+    from . import bench_bundle
+
+    if getattr(args, "append_to_run", False):
+        raise BundleError(
+            "--append-to-run is for the other kinds: a bench bundle's repeats are idempotent, "
+            "so re-send the bundle with more repeats"
+        )
+    props = {**extra, "source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
+             "bundle_url": args.bundle_url}  # fmt: skip
+    try:
+        out = bench_bundle.ingest(
+            client, db, root, meta, aid, rid, props, report, args.dry_run
+        )
+    except BundleError:
+        raise
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes are keyed by content
+        raise BundleError(f"bench write failed: {err!r}", FAILED) from None
+    if out["status"] == "ingested" and not verdict_recorded(
+        client, db, aid, rid, meta["test_type"]
+    ):
+        raise BundleError(
+            f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
+        )
+    return out
+
+
+def _ingest_admin(client, db, root, meta, args, extra) -> dict:
+    from . import bench_bundle
+
+    if args.expect_key:
+        raise BundleError(
+            f"a {meta['kind']} bundle is not an inbox bundle: only a CI job ingests it directly"
+        )
+
+    sha = digest(root)
+    uploader = (
+        args.uploader or current_user()
+    )  # the verified login, never a name the bundle gives
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    try:
+        out = bench_bundle.ingest_admin(
+            client, db, root, meta, args, trust, uploader, sha, args.dry_run
+        )
+    except BundleError:
+        raise
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the records are keyed
+        raise BundleError(f"{meta['kind']} write failed: {err!r}", FAILED) from None
+    return {**out, "receipt": receipt_id(sha, extra.get("upload_id", ""))}
+
+
 def write_junit(db, root, meta, aid, rid, props, strict) -> None:
     from .results import main as results
 
@@ -350,7 +561,10 @@ def write_junit(db, root, meta, aid, rid, props, strict) -> None:
     # stdout carries only this command's one-line JSON report.
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            results(results_argv(meta, root, aid, rid, props, strict))
+            results(
+                results_argv(meta, root, aid, rid, props, strict),
+                assigned_trust=props.get(TRUST_PROP, ""),
+            )
     except SystemExit as exit_:
         if exit_.code not in (0, None):
             raise BundleError(f"results exited {exit_.code}", FAILED) from None

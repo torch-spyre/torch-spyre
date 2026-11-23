@@ -25,6 +25,23 @@ What it checks:
 2. Every loop variable in an op's read and write indices is the induction
    variable of a loop that encloses the op.
 3. Every carry's update is an op in its node's body.
+4. An op that runs in a counted loop that a node covers (its ``loop_info``
+   names that loop) sits inside that node: not outside it, and not in the body
+   of another loop's node.
+5. A node's body holds no op that is not a member of the loop BETWEEN two of
+   its members.
+
+A loop no node covers is not checked: span-overflow tiling still stamps flat
+loop ops (stage 7a replaces it), and ``build_loop_scheduler_nodes`` groups them
+later. So rule 4 fires only when a node already claims the op's loop, which is
+how a copy-back placed after its loop by a flat index (#6101) is told from a
+flat loop.
+
+Rules 4 and 5 compare each op's ``loop_info`` with the node it sits in, using
+the same group path that builds the nodes (:func:`counted_loop_path`, which
+gives an ``ExternKernel`` the empty path). They see only the leaf ops, so a node
+built by hand from ops with no ``loop_info`` (the unit tests do) is not checked
+by them.
 
 What it cannot check: that a read which SHOULD advance carries the induction
 variable. That was the padding bug (#5573); only a comparison against the
@@ -56,6 +73,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
+from .loop_facts import counted_loop_path, node_levels, stamped_levels
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -152,6 +170,146 @@ def _index_symbols(op: ir.Operation) -> set[sympy.Symbol]:
     return used
 
 
+def _node_key(node: LoopNode, depth: int) -> tuple[int, ...] | None:
+    """The group path prefix of ``node``'s members at ``depth``, from its first
+    member that has one (the rule ``collapse`` uses)."""
+    for leaf in all_ops(node.body):
+        path = counted_loop_path(leaf)
+        if len(path) > depth:
+            return path[: depth + 1]
+    return None
+
+
+def _covered_keys(
+    entries: list[ir.Operation], depth: int = 0, out: set[tuple[int, ...]] | None = None
+) -> set[tuple[int, ...]]:
+    """The group path key of every node in ``entries``, at every depth."""
+    out = set() if out is None else out
+    for entry in entries:
+        if isinstance(entry, LoopNode):
+            key = _node_key(entry, depth)
+            if key is not None:
+                out.add(key)
+            _covered_keys(entry.body, depth + 1, out)
+    return out
+
+
+def _claimed(path: tuple[int, ...], covered: set[tuple[int, ...]]) -> bool:
+    """Whether some node covers ``path`` or a prefix of it."""
+    return any(path[: len(key)] == key for key in covered)
+
+
+def _membership_problems(
+    entries: list[ir.Operation],
+    depth: int,
+    enclosing: tuple[int, ...],
+    problems: list[str],
+    covered: set[tuple[int, ...]],
+) -> None:
+    """Rule 4 for ``entries``, which sit directly in a node whose key is
+    ``enclosing`` (``()`` at the top level). ``covered`` holds every node's key."""
+    for entry in entries:
+        if isinstance(entry, LoopNode):
+            key = _node_key(entry, depth)
+            if key is not None:
+                if key[: len(enclosing)] != enclosing:
+                    problems.append(
+                        f"{entry.get_name()} is a loop of group path {key} "
+                        f"nested in a loop of group path {enclosing}"
+                    )
+                _membership_problems(entry.body, depth + 1, key, problems, covered)
+            else:
+                _membership_problems(
+                    entry.body, depth + 1, enclosing, problems, covered
+                )
+            continue
+        path = counted_loop_path(entry)
+        if path and not enclosing:
+            if not _claimed(path, covered):
+                continue  # a flat loop no node covers
+            problems.append(
+                f"{entry.get_name()} runs in the counted loop {path} but sits "
+                "outside every loop node"
+            )
+        elif path and path[: len(enclosing)] != enclosing:
+            problems.append(
+                f"{entry.get_name()} runs in the counted loop {path} but sits "
+                f"in the body of the loop {enclosing}"
+            )
+
+
+def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -> None:
+    """Rule 5: an op in a node's body that is not a member of its loop.
+
+    The scheduler runs a node's whole body every trip, so such an op would run
+    every trip although it carries no loop. It is reported wherever it sits in the
+    body. (Before stage 8.5 an op at the head or tail was allowed, because the
+    flat view put an op inserted "before the loop" there and ``peel_non_members``
+    moved it out at the hand-off; every edit now names its position, and that
+    repair is gone.) An ``ExternKernel`` is allowed anywhere: a once-op stays in
+    the body until the scheduler hoists it.
+    """
+    for entry in entries:
+        if not isinstance(entry, LoopNode):
+            continue
+        key = _node_key(entry, depth)
+        if key is not None:
+            for op in entry.body:
+                if not (
+                    isinstance(op, LoopNode)
+                    or bool(counted_loop_path(op))
+                    or isinstance(op, ir.ExternKernel)
+                ):
+                    problems.append(
+                        f"{op.get_name()} is in the body of {entry.get_name()} "
+                        "but is not a member of the loop"
+                    )
+        _non_members(entry.body, depth + 1, problems)
+
+
+def _facts(levels) -> list[tuple]:
+    return [
+        (
+            level.group_path,
+            level.trip_count,
+            level.tiled_dims,
+            level.tiled_reduction_dims,
+        )
+        for level in levels
+    ]
+
+
+def _node_fact_problems(
+    op: ir.Operation, enclosing: tuple[LoopNode, ...], problems: list[str]
+) -> None:
+    """Rule 6: the facts the nodes around ``op`` hold (group path, trip count,
+    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_info`` says.
+
+    Until the lowerings stop writing ``loop_info`` (stage 9.4) both exist; a pass
+    that changes the stamp after the node was built, without telling the node,
+    leaves the node answering differently, which this reports. An op with no
+    ``loop_info`` has nothing to compare with and is skipped.
+    """
+    if (
+        not enclosing
+        or getattr(op, "loop_info", None) is None
+        or not all(n.facts_recorded for n in enclosing)
+    ):
+        return
+    if tuple(getattr(op, "_loop_chain", ())) != enclosing:
+        problems.append(
+            f"{op.get_name()}: its recorded node chain "
+            f"{[n.get_name() for n in getattr(op, '_loop_chain', ())]} is not the "
+            f"nodes around it {[n.get_name() for n in enclosing]}"
+        )
+        return
+    stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
+    if stamped != derived:
+        problems.append(
+            f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"
+        )
+
+
 def find_violations(operations: list[ir.Operation]) -> list[str]:
     """Every structural violation in ``operations``, as messages."""
     problems: list[str] = []
@@ -188,6 +346,10 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             carries(entry.body)
 
     carries(operations)
+    for op, enclosing in _walk(operations):
+        _node_fact_problems(op, enclosing, problems)
+    _membership_problems(operations, 0, (), problems, _covered_keys(operations))
+    _non_members(operations, 0, problems)
     return problems
 
 

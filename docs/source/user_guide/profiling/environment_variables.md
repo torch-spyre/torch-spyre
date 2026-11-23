@@ -66,6 +66,16 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## Declared-range checks
+
+Report when a size range declared with `tensor.to("spyre", dynamic=...)` is not
+served by one compiled program. An unknown value falls back to `warn`.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_NARROWING_CHECK` | After each compile, report guards that reject some declared sizes. `warn` (default), `error` (stop the compile), `off` |
+| `TORCH_SPYRE_RECOMPILE_CHECK` | Report a recompile while a declared input has a declared size. `warn` (default), `error` (stop the recompile), `all` (every recompile of user code), `off` |
+
 ## Compile-time timing
 
 Measures how long the compiler frontend takes, per pass pipeline and per
@@ -98,9 +108,11 @@ The `stage:` regions are:
 |---|---|
 | `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region in this table nests inside it |
 | `stage:CustomPreSchedulingPasses:pass_loop` | The pre-scheduling pass list |
+| `stage:CustomPreSchedulingPasses:validate` | The operation-order check after the last pass |
 | `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
 | `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
 | `stage:CustomPreSchedulingPasses:log_before` / `:log_after` | The IR dumps, only when INFO logging is on |
+| `validate:CustomPreSchedulingPasses:<pass>` | The operation-order check after one pass, only with `SPYRE_VALIDATE_EVERY_PASS=1` |
 | `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |
 | `stage:SpyreAsyncCompile:generate_bundle` / `:generate_ktir` | Backend-input generation, per kernel |
 | `stage:SpyreAsyncCompile:kernel_provenance` | Kernel provenance descriptor, per kernel |

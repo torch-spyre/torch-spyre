@@ -97,6 +97,7 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
+| `SPYRE_VALIDATE_EVERY_PASS=1` | Check that `graph.operations` is topologically ordered after every pre-scheduling pass, and name the pass that broke the order. The check after the last pass always runs; when it fails, its error asks for this. Off by default because it re-extracts every operation's read set after every pass |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 To find an operation that silently ran on the host, promote its warning to an
