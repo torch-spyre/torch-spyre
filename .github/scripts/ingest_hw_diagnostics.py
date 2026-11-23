@@ -17,12 +17,14 @@ product repos share one definition; this file is the CLI around it.
 """
 
 import argparse
-import os
 import platform as _platform
 import sys
 from collections import Counter
 from pathlib import Path
 
+import regex as re
+from spyre_clickhouse_ingest import writes
+from spyre_clickhouse_ingest.batching import BatchParked
 from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
 from spyre_clickhouse_ingest.hw_diagnostics import (
     NIL_UUID,
@@ -41,7 +43,6 @@ from spyre_clickhouse_ingest.identity import (
 from spyre_clickhouse_ingest.hw_schema import (
     DEFAULT_TABLE,
     already_ingested,
-    ensure_extra_columns,
 )
 
 
@@ -102,22 +103,19 @@ def main() -> None:
         default="",
         help="artifact_id of the image this leg ran, read from its OCI label / in-image file",
     )
-    # hw_failure_diagnostics has the SAME shape in both generations (unlike test_cases /
-    # benchmark_runs, which v2 replaces outright with a different model): v2 is reached by
-    # qualifying this run's --table name with CLICKHOUSE_DB_V2, not by writing a second shape.
     parser.add_argument(
-        "--schema",
-        choices=["v1", "v2", "both"],
-        default=os.environ.get("INGEST_SCHEMA", "v1"),
-        help="Which schema generation to write: v1 (default, the legacy self-migrating "
-        "table), v2 (the CLICKHOUSE_DB_V2-qualified table only), or both (the migration "
-        "window). Also settable via INGEST_SCHEMA so a workflow can set it once for every "
-        "leg.",
+        "--strict",
+        action="store_true",
+        help="exit 1 when the insert fails; otherwise a failure is a warning",
     )
     args = parser.parse_args()
-    args.write_v1 = args.schema in ("v1", "both")
-    args.write_v2 = args.schema in ("v2", "both")
-    print(f"[info] schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.table):
+        print(
+            f"[error] --table must be a plain SQL identifier: {args.table!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     json_path = Path(args.json_file)
     if not json_path.exists():
@@ -194,58 +192,36 @@ def main() -> None:
         print("[error] No valid rows to insert.", file=sys.stderr)
         sys.exit(1)
 
-    # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
-    if args.write_v1:
-        ensure_extra_columns(client, table=args.table)
-        if already_ingested(client, run_id, component, table=args.table):
+    v2db = target_database()
+    if not v2db:
+        print(
+            "[error] CLICKHOUSE_DB_V2 is unset: no v2 database to write to",
+            file=sys.stderr,
+        )
+        sys.exit(1)  # misconfiguration, whatever --strict says
+    table = f"{v2db}.{args.table}"
+    try:
+        if not client.command(f"EXISTS TABLE {table}"):
+            raise RuntimeError(f"{table} does not exist")
+        if already_ingested(client, run_id, component, table=table):
             print(
-                f"[info] v1: run_id={run_id} component={component!r} already ingested "
-                f"in {args.table} — skipping."
+                f"[info] run_id={run_id} component={component!r} already ingested "
+                f"in {table} — skipping."
             )
         else:
-            print(f"[info] v1: inserting {len(rows)} row(s) into {args.table} ...")
-            try:
-                insert_rows(client, rows, table=args.table)
-            except Exception as exc:
-                print(f"[error] v1 insert failed: {exc}", file=sys.stderr)
-                sys.exit(1)
-            print(f"[info] v1: inserted {len(rows)} row(s) into {args.table}")
-
-    # ── v2: {CLICKHOUSE_DB_V2}.hw_failure_diagnostics (same shape, DDL-managed) ─
-    # Wrapped so a v2 failure never costs the v1 rows already inserted above -- v1 stays
-    # authoritative during the migration window (--schema both), same as every other writer.
-    if args.write_v2:
-        v2db = target_database()
-        if not v2db:
+            print(f"[info] inserting {len(rows)} row(s) into {table} ...")
+            insert_rows(client, rows, table=table, resilient=True)
+            print(f"[info] inserted {len(rows)} row(s) into {table}")
+    except BatchParked as exc:
+        print(f"[warn] rows parked, not stored: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[error] insert into {table} failed: {exc}", file=sys.stderr)
+        if not args.strict:
+            one_line = " ".join(str(exc).split())[:300]
             print(
-                "[warn] --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — "
-                "v2 rows skipped",
-                file=sys.stderr,
+                f"::warning title=ClickHouse::insert into {table} failed, strict is false: {one_line}"
             )
-        else:
-            v2_table = f"{v2db}.{args.table}"
-            try:
-                if not client.command(f"EXISTS TABLE {v2_table}"):
-                    print(
-                        f"[warn] v2 table {v2_table} does not exist — skipping v2 write",
-                        file=sys.stderr,
-                    )
-                elif already_ingested(client, run_id, component, table=v2_table):
-                    print(
-                        f"[info] v2: run_id={run_id} component={component!r} already "
-                        f"ingested in {v2_table} — skipping."
-                    )
-                else:
-                    print(
-                        f"[info] v2: inserting {len(rows)} row(s) into {v2_table} ..."
-                    )
-                    insert_rows(client, rows, table=v2_table)
-                    print(f"[info] v2: inserted {len(rows)} row(s) into {v2_table}")
-            except Exception as exc:
-                print(
-                    f"[warn] v2 write failed (v1 rows unaffected): {exc}",
-                    file=sys.stderr,
-                )
+        sys.exit(1 if args.strict else 0)
 
     reasons: Counter = Counter(_str(r.get("failure_reason"), "none") for r in records)
     outcomes: Counter = Counter(_str(r.get("outcome"), "unknown") for r in records)
@@ -265,4 +241,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(writes.run_cli(main))

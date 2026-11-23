@@ -264,6 +264,51 @@ class TestMembership(unittest.TestCase):
         self.assertEqual(find_violations(tree), [])
 
 
+class TestNodeFactsRule(unittest.TestCase):
+    """Rule 6: the facts the nodes hold equal the stamp, for nodes the pipeline built."""
+
+    def _built(self):
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.loop_node import collapse
+
+        from torch_spyre._inductor.loop_info import LoopInfo
+
+        a, b = _LoopOp("a", (0,)), _LoopOp("b", (0,))
+        for op in (a, b):
+            op.loop_info = LoopInfo(
+                loop_group_id=(0,),
+                loop_count=[4],
+                loop_tiled_dims=[[]],
+                loop_tiled_reduction_dims=[[]],
+            )
+        graph = SimpleNamespace(operations=[a, b])
+        collapse(graph)
+        return graph, a, b
+
+    def test_agreeing_node_and_stamp_are_clean(self):
+        graph, *_ = self._built()
+        self.assertEqual(find_violations(graph.operations), [])
+
+    def test_a_stamp_changed_after_the_node_was_built_is_reported(self):
+        graph, a, b = self._built()
+        a.loop_info.loop_tiled_dims = [[1]]
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("a: loop_info says", problem)
+        self.assertIn("but its nodes say", problem)
+
+    def test_an_op_with_no_recorded_chain_is_reported(self):
+        graph, a, b = self._built()
+        del a._loop_chain
+        (problem,) = find_violations(graph.operations)
+        self.assertIn("a: its recorded node chain", problem)
+
+    def test_a_hand_built_node_is_not_compared(self):
+        tree = [_node("n0", [_LoopOp("a", (0,))])]
+        tree[0].body[0].loop_info.loop_tiled_dims = [[1]]
+        self.assertEqual(find_violations(tree), [])
+
+
 class TestCheckLoops(unittest.TestCase):
     def setUp(self):
         self.enabled_patch = unittest.mock.patch.object(

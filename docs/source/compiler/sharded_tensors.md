@@ -30,9 +30,10 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   works across compiled calls, but a multi-op graph with a sharded
   intermediate is rejected. Everything else that would touch sharded
   storage is rejected at compile time with a message saying why.
-* **Host copies only.** Sharded tensors copy to and from the CPU
-  (whole-tensor, no dtype change). Device-to-device copies and fills are
-  rejected because they take a single device address.
+* **Host copies and fills.** Sharded tensors copy to and from the CPU
+  (whole-tensor, no dtype change), and eager `fill_`/`zero_` fill each
+  shard's own allocation. Device-to-device copies are rejected because they
+  take a single device address.
 
 Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
@@ -105,7 +106,11 @@ Copies a CPU tensor into a sharded Spyre tensor. Arguments:
   dimension to split, or the single-element list `[Shard(dim)]`. Exactly one
   placement is admitted (there is no multi-dimensional mesh); `dim` may be
   negative. The named dimension must divide into `num_shards` equal,
-  non-empty shards.
+  non-empty shards: its size must be a multiple of `num_shards`. The shard
+  count is never reduced to fit; an unshardable dimension is rejected before
+  any allocation, and the error lists the dimensions that would divide.
+  For example, `Shard(0)` on a `[3, 32, 64]` tensor with 8 shards is rejected
+  (3 elements cannot split into 8 shards) and suggests dims 1 and 2.
 * **`num_shards`** — keyword-only. Must be 8 or 16 and must equal the active
   core count (`SENCORES`), so storage and the kernels that consume it agree
   on how many cores participate. Omitted, it defaults to the active core
@@ -222,13 +227,15 @@ implements:
 * `copy_sharded` — host↔device copy, one shard at a time through
   `spyre_shard_view`, a single-chunk view of one shard's allocation that
   keeps the parent storage alive. Copies are blocking by contract.
+* `fill_sharded` — eager `fill_`/`zero_`, one shard at a time through
+  `spyre_shard_view`, with the same whole-tensor checks as `copy_sharded`.
 * `shard_device_address` — the launch-time resolver: given a sharded
   tensor and a shard index, returns the device address of that shard's
   allocation. It cross-checks the tensor's actual shard count and
   per-shard bytes against what the kernel was compiled for, so a stale
   kernel or a differently-sharded tensor fails at launch, not silently.
-* Fail-closed guards: `set_`, `resize_`, and fills reject sharded storage
-  (they would reinterpret or partially write it); the view constructors and
+* Fail-closed guards: `set_` and `resize_` reject sharded storage (they
+  would reinterpret it); the view constructors and
   in-place `as_strided_` reject any view of sharded storage that does not
   reproduce the base tensor exactly — same sizes, strides, and storage
   offset — because a view's shape no longer matches the shard mapping

@@ -53,7 +53,13 @@ from torch_spyre._inductor import config, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import work_division
 from torch_spyre._inductor.ir import SpyreConstantFallback
-from torch_spyre._inductor.loop_node import LoopNode, all_ops
+from torch_spyre._inductor.loop_node import (
+    LoopNode,
+    all_ops,
+    insert_after,
+    insert_at_start,
+    remove_op,
+)
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import lx_relayout
@@ -399,7 +405,7 @@ def _inject_dead_body_copy(record: dict):
         buf.loop_info = copy.deepcopy(src.loop_info)
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
-        loop.body.insert(loop.body.index(src) + 1, buf)
+        insert_after(real, src, buf)
         record["name"] = name
 
     return dce
@@ -548,8 +554,8 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
             if isinstance(op, SpyreConstantFallback)
             and getattr(op, "loop_info", None) is not None
         )
-        graph.operations.remove(constant)
-        node.body.insert(0, constant)
+        remove_op(graph.operations, constant)
+        insert_at_start(node, constant)
         seen["body_externs"] = [constant.get_name()]
         real(graph)
 

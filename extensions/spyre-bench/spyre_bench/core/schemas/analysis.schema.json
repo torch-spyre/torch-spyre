@@ -236,6 +236,54 @@
       "metric"
      ],
      "description": "a table of per-cell statistics over `by` within each `across` combination; metric may be derive.name"
+    },
+    "reference": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "case": {
+       "$ref": "#/$defs/case_name"
+      },
+      "value": {
+       "type": "number"
+      },
+      "stderr": {
+       "type": "number",
+       "minimum": 0
+      },
+      "n": {
+       "type": "integer",
+       "minimum": 1
+      },
+      "label": {
+       "type": "string",
+       "description": "abstract name of an inline reference, e.g. cpu-fp32-ref"
+      },
+      "stderr_metric": {
+       "$ref": "#/$defs/metric"
+      },
+      "tolerance": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "stderr": {
+         "type": "number",
+         "minimum": 0,
+         "description": "allowed shortfall in combined standard errors; a single run is `regressed` only from 4 combined standard errors, a smaller shortfall past the allowance is `suspected`"
+        },
+        "abs": {
+         "type": "number",
+         "minimum": 0,
+         "description": "practical floor: a shortfall below it is never worse"
+        }
+       },
+       "description": "at least one of stderr, abs; both set = the larger allowance"
+      }
+     },
+     "required": [
+      "tolerance"
+     ],
+     "description": "quality: compare the score of each selected Result with a reference (the Result of `case`, or an inline value with its stderr or n); `metric` is the score. Advisory: never gates, and a Result whose validity is suspect or invalid is reported as such, never as regressed"
     }
    },
    "required": [

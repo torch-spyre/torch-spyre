@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: scale-time-no-regression, owner: example-team}
+spec:
+  selector: {benchmarks: [op-scale]}
+  metric: kernel.time.mean
+  baseline: {kind: rolling, window: 20, min_n: 10, purposes: [nightly], match: {environment: id}}
+  tolerance: {pct: 5}
+  noise: {sigmas: 2, source: baseline_mad}
+  severity: advisory
+---
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: scale-time-vs-target, owner: example-team, description: "a fixed target in base units, for a number someone signed off"}
+spec:
+  selector: {cases: [op_scale_n4096]}
+  metric: kernel.time.mean
+  baseline: {kind: fixed, value: 0.005}
+  tolerance: {pct: 10}
+  severity: informational

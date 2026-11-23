@@ -31,6 +31,7 @@ from .cost_model import (
     _select,
     max,
 )
+from .loop_facts import enclosing_loops, is_looped
 from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
@@ -264,18 +265,16 @@ def _loop_features(op):
     (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_info
     but tile NEITHER (both lists empty), so their accumulators stay fixed (factor L); a
     genuinely tiled op's args advance (factor 1)."""
-    li = getattr(op, "loop_info", None)
-    if li is None:
+    levels = enclosing_loops(op)
+    if not levels:
         return 1, False, False
     trip = 1
-    for c in getattr(li, "loop_count", None) or []:
-        trip *= trip_count_estimate(c)
-    red_dims = getattr(li, "loop_tiled_reduction_dims", None) or []
-    out_dims = getattr(li, "loop_tiled_dims", None) or []
+    for level in levels:
+        trip *= trip_count_estimate(level.trip_count)
     return (
         max(1, trip),
-        any(bool(level) for level in red_dims),
-        any(bool(level) for level in out_dims),
+        any(bool(level.tiled_reduction_dims) for level in levels),
+        any(bool(level.tiled_dims) for level in levels),
     )
 
 
@@ -298,13 +297,11 @@ def _tiled_symbols_per_level(op):
         loop_tiled_dims          = [[0], []]      # level 0 tiles output dim 0 -> i0
         loop_tiled_reduction_dims= [[],  [0]]     # level 1 tiles reduction dim 0 -> r0_0
     """
-    li = getattr(op, "loop_info", None)
-    if li is None:
-        return []
-    counts = list(getattr(li, "loop_count", None) or [])
-    out_lv = list(getattr(li, "loop_tiled_dims", None) or [])
-    red_lv = list(getattr(li, "loop_tiled_reduction_dims", None) or [])
-    n_levels = max(len(out_lv), len(red_lv))
+    loops = enclosing_loops(op)
+    counts = [level.trip_count for level in loops]
+    out_lv = [list(level.tiled_dims) for level in loops]
+    red_lv = [list(level.tiled_reduction_dims) for level in loops]
+    n_levels = len(loops)
     if not n_levels:
         return []
     try:
@@ -485,7 +482,7 @@ def _candidate_tiling(op, tiling: Mapping):
     The op must not already be coarse-tiled: its ``loop_info`` would describe a
     second loop nest this cannot compose with.
     """
-    if getattr(op, "loop_info", None) is not None:
+    if is_looped(op):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )

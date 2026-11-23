@@ -5,7 +5,7 @@ derives their identity, and plans runs with reuse, invalidation and qualificatio
 CLI: `plan` marks each case run, reuse or skip, `run` executes a plan's declared commands and hands the raw outputs to
 the ingest, and `verdict` prints the stored verdict of a run. It writes no database rows itself.
 
-> **Concepts, kinds and naming:** [`docs/README.md`](docs/README.md).
+> **Concepts, kinds and naming:** [`docs/README.md`](docs/README.md). **Developer guides:** [`docs/dev/`](docs/dev/README.md).
 
 ## Why identity is derived
 
@@ -14,6 +14,12 @@ agree on the namespace without coordinating. A test cross-checks `engine.benchma
 `spyre_clickhouse_ingest.identity.BenchmarkId`. To reproduce the ids the ingest already stores, a Benchmark declares
 `identity: {mode: ingest, ...}` and the engine calls the ingest derivation through one adapter (`spyre-bench[ingest]`);
 see [`docs/README.md`](docs/README.md#ingest-identity).
+
+## First consumer
+
+`benchmarks/` at the repository root is the torch-spyre catalog. Its Benchmarks use `identity: {mode: ingest,
+profile: perf-kernel}` and a conformance check recomputes their ids with the ingest's own `report.xml` parser
+(`make bench-check-ids`); the advisory `bench-nightly` workflow runs it. See [`benchmarks/README.md`](../../benchmarks/README.md).
 
 ## Install
 
@@ -35,12 +41,18 @@ spyre-bench validate examples/llm-demo --central examples/central
 spyre-bench validate examples/postgres-demo --pack examples/packs/postgres-example
 spyre-bench explain serve_demoa_tp4_c5_all --catalog examples/llm-demo --central examples/central
 spyre-bench ids --catalog examples/ingest-demo --central examples/central --inputs
+spyre-bench dataset add ./data.jsonl --display-name "Name" --license internal   # dry run; --apply writes
+spyre-bench dataset list --benchmarks-dir examples/llm-demo --central examples/central
 spyre-bench gen-schemas --check
 spyre-bench analyze --help
 spyre-bench plan --catalog examples/run-demo --central examples/central --purpose nightly --arch x86_64 \
     --reference-node --subject-id 9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2 --out plan.json
 spyre-bench run --plan plan.json --catalog examples/run-demo --central examples/central --workdir examples/run-demo
 spyre-bench verdict --run-id <uuid> --store clickhouse --json
+spyre-bench upload results/bench                 # seal and check a lab run; --apply sends it to the inbox
+spyre-bench accept --run-dir results/bench --reason "new driver"   # propose a stored run as the new anchor
+spyre-bench reference create --from-request <file>              # also: validate, seal, submit, compare
+spyre-bench invalidate --run <uuid> --reason-code C --reason T  # preview; --apply records it
 ```
 
 The `runners` declared by the kernel and comms packs name entry points supplied by the producer packages, not shipped here; `run` executes each Benchmark's own `run.command`.
@@ -66,13 +78,14 @@ plan = engine.plan(cat, {"purpose": "pr", "selection": {"tier": "sanity"}}, leg)
 |---|---|
 | `spyre_bench/engine.py` | registry, catalog validation, case expansion, identity, plan, reuse, invalidation, qualification, validity |
 | `spyre_bench/validate.py`, `explain.py`, `analysis.py`, `gen_schemas.py`, `cli.py` | the CLI verbs (`analysis.py` also evaluates `derive` and `compare`) |
+| `spyre_bench/reference.py`, `reference_client.py` | the `reference` verb (create, validate, seal, submit, compare) and its dashboard client |
 | `spyre_bench/plan.py`, `run.py`, `verdict.py`, `store.py`, `planfile.py`, `cliutil.py` | the `plan`, `run` and `verdict` verbs, the stores behind them (none, ClickHouse, in-memory), the `plan.json` constants and token templates, shared CLI plumbing |
 | `spyre_bench/ingest_adapter.py`, `ids.py` | the only import of the ingest derivation; the `ids` verb |
 | `spyre_bench/placement.py` | observed CPU placement (`run.exec.*`) from `/proc` and `/sys` |
 | `spyre_bench/core/` | the core pack and the generated JSON Schemas (one per authored kind, plus tool-output shapes) |
 | `spyre_bench/packs/` | built-in packs: `llm-serving`, `spyre`, `kernel`, `comms` |
 | `spyre_bench/demo.py` | builds `examples/results/` from synthetic samples (`python -m spyre_bench.demo --check`) |
-| `examples/` | synthetic catalogs, a third-party pack, requests and tool-output samples |
+| `examples/` | synthetic catalogs, a third-party pack, requests and tool-output samples; `examples/docs-*` back the developer guides |
 | `tests/` | the engine test suite; `tests/golden/` pins the engine ids and the ingest conformance table |
 
 ## Tests

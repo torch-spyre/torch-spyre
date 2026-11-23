@@ -1,0 +1,78 @@
+{
+ "_note": "The one place the on-demand limits and switches live (device-hours, counts, seconds). `enabled` false = the feature is dark: nothing is admitted. `enforce_budgets` false = the device-hour limits, the per-PR window and supersede counting only REPORT 'would have been refused' and proceed; tier limits, head pinning, fork sha=, writer-only trigger and the start-of-run PR re-check always apply. The internal poller keeps a byte copy; both repos pin its sha-256 in a test.",
+ "enabled": false,
+ "enforce_budgets": false,
+ "github.com": {
+  "tiers": [
+   "sanity"
+  ],
+  "reuse_modes": [
+   "if_valid",
+   "prefer",
+   "only"
+  ],
+  "force_all": false,
+  "profiles": [
+   "off"
+  ],
+  "custom_env": false,
+  "budget_device_hours": {
+   "sanity": 4.0
+  },
+  "pr_window_device_hours": 8.0,
+  "per_user_per_hour": 6,
+  "max_wait_default_s": 1800,
+  "max_wait_cap_s": 3600,
+  "clean_per_user": 1,
+  "clean_per_user_per_day": 3,
+  "clean_cluster": 2,
+  "types": [
+   "perf"
+  ],
+  "vs_kinds": [
+   "main"
+  ],
+  "vs_relax": false
+ },
+ "ghe": {
+  "tiers": [
+   "sanity",
+   "core"
+  ],
+  "reuse_modes": [
+   "if_valid",
+   "never",
+   "prefer",
+   "only"
+  ],
+  "force_all": true,
+  "profiles": [
+   "off",
+   "light"
+  ],
+  "custom_env": true,
+  "budget_device_hours": {
+   "sanity": 12.0,
+   "core": 48.0
+  },
+  "pr_window_device_hours": 96.0,
+  "per_user_per_hour": 6,
+  "max_wait_default_s": 1800,
+  "max_wait_cap_s": 3600,
+  "clean_per_user": 1,
+  "clean_per_user_per_day": 3,
+  "clean_cluster": 2,
+  "types": [
+   "perf",
+   "quality"
+  ],
+  "vs_kinds": [
+   "main",
+   "tag",
+   "build",
+   "artifact",
+   "ref"
+  ],
+  "vs_relax": true
+ }
+}

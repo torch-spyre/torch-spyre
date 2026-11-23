@@ -35,16 +35,18 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
-from xml.etree import ElementTree
 
 import pytest
 import torch
+from device_env import num_shards
+from device_suite import (
+    SMALL_DMA_SLICE_BYTES,
+    make_device_suite_test,
+    requires_emulation,
+)
+from torch.distributed.tensor import Shard
 
 from torch_spyre._inductor import config as spyre_config
-from device_env import device_available, emulation_ready, mode_usable
-from torch.distributed.tensor import Shard
 
 from torch_spyre.execution import kernel_runner
 
@@ -57,127 +59,11 @@ def expects_raise(test):
     return test
 
 
-def _num_shards() -> int:
-    return int(os.environ.get("SENCORES", "0") or 0)
-
-
-_requires_emulation = pytest.mark.skipif(
-    not emulation_ready(),
-    reason="needs SENCORES in (8, 16) and a sharded-admitting Flex device mode "
-    "(FLEX_DEVICE=EMUL1p5) at "
-    "process start; test_device_suite_in_emulation_shape runs these in that shape",
-)
-
-
-# The Flex device mode that admits sharded allocations (the scheduler
-# factory routes it to the multi-chunk scheduler): the EMUL1p5 device
-# always admits. "EMUL1p5-small-dma" also lowers the DMA slice size, which
-# Flex reads once at runtime start, so each shard's copy becomes several
-# DMA slices (256 MiB by default: a test shard would take one).
-#
-# The small-dma mode reruns the whole file on purpose, not only the
-# multi-slice test: every other test whose shards are larger than one slice
-# is then also checked with its copies split into several DMA slices.
-_SMALL_DMA_SLICE_BYTES = 4096
-_DEVICE_MODES = {
-    "EMUL1p5": {"FLEX_DEVICE": "EMUL1p5"},
-    "EMUL1p5-small-dma": {
-        "FLEX_DEVICE": "EMUL1p5",
-        "FLEX_DATA_TRANSFER_BUFFER_SIZE": str(_SMALL_DMA_SLICE_BYTES),
-    },
-}
-# Extra child pytest arguments per mode. With the default slice size the
-# multi-slice test would only skip, and the wrapper allows no skips in a child
-# besides its own tests, so it is deselected there instead.
-_MODE_PYTEST_ARGS = {
-    "EMUL1p5": ("-k", "not test_shards_larger_than_one_dma_slice_round_trip"),
-}
-
-
-@pytest.mark.skipif(
-    emulation_ready() or not device_available(),
-    reason="needs a Spyre device; in an emulation shape the tests below run directly",
-)
-@pytest.mark.parametrize(
-    ("mode", "shards"),
-    [(m, s) for m in sorted(_DEVICE_MODES) for s in (8, 16)],
-)
-def test_device_suite_in_emulation_shape(mode, shards, tmp_path):
-    # The child opens the card itself, so this process must not hold it yet.
-    if torch.spyre.is_initialized():
-        pytest.skip(
-            "the Spyre runtime is already open in this process; run "
-            "tests/sharding/test_sharded_add.py on its own"
-        )
-    env = dict(os.environ)
-    env["SENCORES"] = str(shards)
-    env.update(_DEVICE_MODES[mode])
-    env.pop("PYTEST_ADDOPTS", None)
-    # A device being present is not enough: the mode must be able to open it
-    # (a PF-only host has no VFs, so EMUL1p5 children die opening the PCI
-    # path). Probe in a throwaway process and skip rather than fail there.
-    usable, reason = mode_usable(_DEVICE_MODES[mode], shards)
-    if not usable:
-        pytest.skip(
-            f"Flex device mode {mode} cannot open the card on this machine "
-            f"({reason}); needs bound VFs"
-        )
-    junit = tmp_path / "child.xml"
-    # Output is streamed (not captured) so CI's no-output watchdog sees
-    # progress; results are read from the JUnit report.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-v",
-            "-p",
-            "no:cacheprovider",
-            f"--junit-xml={junit}",
-            *_MODE_PYTEST_ARGS.get(mode, ()),
-            __file__,
-        ],
-        env=env,
-        timeout=1200,
-    )
-    # Parse the report before judging the exit code, so a nonzero exit can
-    # name the failing child cases (with their messages) instead of showing
-    # only "assert 1 == 0". Child stdout was streamed to this process's
-    # output and is in the log above.
-    outcomes = {}
-    failures = []
-    if junit.exists():
-        for case in ElementTree.parse(junit).getroot().iter("testcase"):
-            children = [c.tag for c in case]
-            outcome = next(
-                (t for t in ("failure", "error", "skipped") if t in children), "passed"
-            )
-            outcomes[case.get("name")] = outcome
-            for tag in ("failure", "error"):
-                node = case.find(tag)
-                if node is not None:
-                    message = (node.get("message") or "").splitlines()
-                    failures.append(
-                        f"{case.get('name')}: {message[0] if message else tag}"
-                    )
-    if result.returncode != 0:
-        detail = (
-            "; ".join(failures)
-            if failures
-            else "no failing case in the JUnit report (collection or setup error)"
-        )
-        raise AssertionError(
-            f"child pytest failed for {shards} shards in {mode} mode "
-            f"(exit {result.returncode}). {detail}"
-        )
-    wrappers = {
-        f"test_device_suite_in_emulation_shape[{m}-{s}]"
-        for m in sorted(_DEVICE_MODES)
-        for s in (8, 16)
-    }
-    assert {k for k, v in outcomes.items() if v == "skipped"} == wrappers, outcomes
-    ran = {k for k, v in outcomes.items() if v == "passed"}
-    assert ran and ran | wrappers == set(outcomes), outcomes
+# The subprocess wrapper that re-runs this file per (mode, shards)
+# shape on a VF-mode host, and the gating of the device tests below,
+# live in device_suite.py (shared with the other sharding device
+# files); conftest.py guards that they actually executed.
+test_device_suite_in_emulation_shape = make_device_suite_test(__file__)
 
 
 @pytest.fixture(autouse=True)
@@ -256,7 +142,7 @@ def _sharded(cpu: torch.Tensor, dim: int, n: int) -> torch.Tensor:
     return torch.spyre.to_sharded(cpu, Shard(dim), num_shards=n)
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize(
     "shape_per_shard, dim, dtype",
     [
@@ -268,7 +154,7 @@ def _sharded(cpu: torch.Tensor, dim: int, n: int) -> torch.Tensor:
     ],
 )
 def test_compiled_add_runs_one_shard_per_core(launched, shape_per_shard, dim, dtype):
-    n = _num_shards()
+    n = num_shards()
     shape = list(shape_per_shard)
     shape[dim] *= n
     torch.manual_seed(0)
@@ -286,7 +172,7 @@ def test_compiled_add_runs_one_shard_per_core(launched, shape_per_shard, dim, dt
     assert torch.equal(c.cpu(), expected)
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize(
     "op,num_args",
     [(lambda x, y: x * y, 2), (lambda x: torch.abs(x), 1)],
@@ -298,7 +184,7 @@ def test_compiled_pointwise_ops_run_one_shard_per_core(launched, op, num_args):
     same-shape pointwise op.
     """
 
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
     b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
@@ -318,11 +204,11 @@ def test_compiled_pointwise_ops_run_one_shard_per_core(launched, op, num_args):
     assert torch.equal(c.cpu(), expected)
 
 
-@_requires_emulation
+@requires_emulation
 def test_eager_add_on_sharded_inputs():
     """The eager path also computes sharded add correctly (no torch.compile)."""
 
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(3)
     a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
     b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
@@ -335,7 +221,7 @@ def test_eager_add_on_sharded_inputs():
     assert torch.equal(c.cpu(), expected)
 
 
-@_requires_emulation
+@requires_emulation
 def test_chained_compiled_adds(launched):
     """A compiled sharded output feeds a second compiled call.
 
@@ -344,7 +230,7 @@ def test_chained_compiled_adds(launched):
     anything the planner or launch binding keys on, the second call is where
     it would show.
     """
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(2)
     a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
     b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
@@ -363,10 +249,10 @@ def test_chained_compiled_adds(launched):
     assert torch.equal(d.cpu(), expected_d)
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize("dim", [0, 1])
 def test_each_core_writes_only_its_own_shard(launched, dim):
-    n = _num_shards()
+    n = num_shards()
     # Every shard of a and of b gets distinct values (integers < 512, so the
     # sums are exact in the device fp16 format): a core reading or writing
     # another shard's chunk, of any operand, puts values in the wrong place.
@@ -390,7 +276,7 @@ def test_each_core_writes_only_its_own_shard(launched, dim):
         assert torch.equal(b.cpu(), b_cpu)
 
 
-@_requires_emulation
+@requires_emulation
 def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
     """Sharding is part of the guards and the FX cache key (L11).
 
@@ -399,7 +285,7 @@ def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
     sharding tells the two calls apart. Without the sharding key the second
     call reuses the unified kernel on sharded storage.
     """
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(1)
     a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
     b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
@@ -433,7 +319,7 @@ def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
     assert _kernel_summary(launched[0][0])[1][0].get("nonUnifiedAllocInHBM_") is None
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize(
     "shape_per_shard, dim",
     [
@@ -452,7 +338,7 @@ def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
 )
 @expects_raise
 def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
-    n = _num_shards()
+    n = num_shards()
     shape = list(shape_per_shard)
     shape[dim] *= n
     torch.manual_seed(0)
@@ -462,7 +348,7 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
         torch.compile(lambda x, y: x + y, dynamic=False)(a, a)
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize(
     "fn, other, match",
     [
@@ -470,8 +356,14 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
         # redistribution; positive once that exists.
         (lambda x, y: x + y, "unsharded", "every operand sharded with the same"),
         (lambda x, y: x + y, "shard1", "every operand sharded with the same"),
-        # Non-unified reductions are not implemented.
-        (lambda x, y: x.sum(0) + y.sum(0), "shard0", "pointwise ops only"),
+        # TODO: a full reduction reduces more than the shard dim, which needs
+        # more than one split reduced dim. Reductions that are supported are
+        # covered in test_sharded_reduction.py.
+        (
+            lambda x, y: x.sum() + y.sum(),
+            "shard0",
+            "must reduce the shard dim only",
+        ),
         # TODO: in-place writes into sharded storage.
         (lambda x, y: x.add_(y), "shard0", "in-place writes into sharded"),
         # TODO: sharded intermediates.
@@ -484,7 +376,7 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
 )
 @expects_raise
 def test_unsupported_ops_fail_at_compile(fn, other, match):
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     src = torch.randn(8 * n, 64, dtype=torch.float16)
     a = _sharded(src, 0, n)
@@ -501,7 +393,7 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
         torch.compile(fn, dynamic=False)(a, b)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 @pytest.mark.parametrize(
     "view",
@@ -519,7 +411,7 @@ def test_views_of_sharded_inputs_fail(view):
     # view's shape; chunk addressing would read permuted data. The native
     # view constructors reject it before the tensor can reach a kernel.
     # TODO: positive once views of sharded tensors have a shard mapping.
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     for cpu in (
         torch.randn(2 * n, 128, dtype=torch.float16),
@@ -532,13 +424,13 @@ def test_views_of_sharded_inputs_fail(view):
             view(x)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_as_strided_in_place_of_sharded_fails():
     # as_strided_ changes metadata in place, bypassing the view
     # constructors; an unguarded call leaves the shard table describing the
     # old shape and the next copy reads the wrong elements.
-    n = _num_shards()
+    n = num_shards()
     x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
 
     with pytest.raises(
@@ -547,7 +439,7 @@ def test_as_strided_in_place_of_sharded_fails():
         x.as_strided_((2 * n,), (1,), 0)
 
 
-@_requires_emulation
+@requires_emulation
 def test_compiled_add_over_detached_views(launched):
     """Detached views of sharded inputs reach the compiled path unchanged.
 
@@ -559,7 +451,7 @@ def test_compiled_add_over_detached_views(launched):
     base-tensor check in sharded_hbm.py, which cannot see that the view is
     an identity one.)
     """
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
     b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
@@ -573,7 +465,7 @@ def test_compiled_add_over_detached_views(launched):
     assert torch.equal(c.cpu(), expected)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_contiguous_prefix_view_of_sharded_fails():
     # The hole the copy-path guards could not see: a contiguous view from
@@ -581,7 +473,7 @@ def test_contiguous_prefix_view_of_sharded_fails():
     # check, yet maps view elements onto the wrong shards (element N comes
     # from the start of a later shard instead of the shards that back the
     # first N elements). It must be rejected at construction, not copied.
-    n = _num_shards()
+    n = num_shards()
     x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
 
     with pytest.raises(
@@ -590,12 +482,12 @@ def test_contiguous_prefix_view_of_sharded_fails():
         x.narrow(0, 0, 2 * n)
 
 
-@_requires_emulation
+@requires_emulation
 def test_identity_views_of_sharded_keep_round_trip():
     # Identity views (detach, as_strided of the base tensor) reproduce the
     # base tensor exactly, so the element-to-shard mapping still holds and
     # the whole-tensor copy path must keep working through them.
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     cpu = torch.randn(2 * n, 128, dtype=torch.float16)
     x = _sharded(cpu, 0, n)
@@ -614,10 +506,10 @@ def test_identity_views_of_sharded_keep_round_trip():
     assert torch.equal(x.to("cpu"), expected)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_mixed_dtypes_fail_at_compile():
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     x = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
@@ -625,13 +517,13 @@ def test_mixed_dtypes_fail_at_compile():
         torch.compile(lambda a, b: (a + b).float(), dynamic=False)(x, x)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_multi_output_op_with_conversion_fails_at_compile():
     """argsort (through aten.sort, a multi-output op) feeding a dtype-converting
     consumer is rejected by the sharding checks, not by a crash in
     split_multi_ops ("'tuple' object has no attribute 'to'", #5831)."""
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
@@ -640,12 +532,12 @@ def test_multi_output_op_with_conversion_fails_at_compile():
         torch.compile(lambda x, y: torch.argsort(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_dynamic_shapes_fail_at_compile():
     """torch.compile(dynamic=True) is refused before lowering, so a sharded
     operand never reaches the non-unified static-shape check."""
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
@@ -655,38 +547,63 @@ def test_dynamic_shapes_fail_at_compile():
         torch.compile(lambda x, y: x + y, dynamic=True)(a, a)
 
 
-@_requires_emulation
+@requires_emulation
+@expects_raise
+def test_mixed_placement_consumer_fails_at_compile():
+    """A consumer that mixes sharded and unsharded storage is rejected at
+    compile, not at launch with an error that names neither the op nor the
+    sharding. cumsum decomposes to a matmul whose triu_mask operand is
+    unsharded, so the add over its result and a sharded tensor fails the
+    same-placement check."""
+    n = num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+    b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="need every operand sharded with the same placement"
+    ):
+        torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
+
+
+@requires_emulation
 @expects_raise
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
     from torch_spyre.ops.fallbacks import fallback_ops
 
-    # The op must still be a Spyre fallback. An op that gets a lowering becomes
-    # a ComputedBuffer, which the op-kind check rejects first, so this test
-    # would no longer reach the fallback-consumer check (torch.cumsum, used
-    # here before, got a lowering in #3389).
+    # The op must still be a Spyre fallback. An op that gets a lowering
+    # becomes a ComputedBuffer, which the op-kind check rejects first, so
+    # this test would no longer reach the fallback-consumer check
+    # (torch.cumsum, used in the mixed-placement test above, decomposes to
+    # a matmul with an unsharded triu_mask operand).
     assert torch.ops.aten.tril.default in fallback_ops, (
         "aten.tril is no longer a Spyre fallback; pick another op from "
         "torch_spyre/ops/fallbacks.py"
     )
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    # The fallback's result is the graph output: an op that combined it with
-    # a sharded operand would be rejected first, as mixed sharded/unsharded.
-    with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
+    # The fallback's result is the graph output: an op that combined it
+    # with a sharded operand would be rejected first, as mixed
+    # sharded/unsharded. The message names the ops non-unified kernels
+    # support since the cross-shard-reduction work: pointwise and
+    # shard-local reductions.
+    with pytest.raises(
+        RuntimeError, match="shard-local reductions on sharded operands only"
+    ):
         torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 @spyre_config.patch(bundle_symbolic_args=False)
 def test_bundle_symbolic_args_disabled_fails_at_compile():
     """Every core's start address is a bundle input_arg, so a sharded kernel
     cannot be compiled onto the launch-time-bound path."""
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
@@ -701,7 +618,7 @@ def _exact_source(shape, dtype) -> torch.Tensor:
     return (torch.arange(torch.Size(shape).numel()) % 1024).reshape(shape).to(dtype)
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.parametrize(
     "shape_per_shard, dim, dtype",
     [
@@ -717,7 +634,7 @@ def _exact_source(shape, dtype) -> torch.Tensor:
 )
 def test_padded_shards_round_trip(shape_per_shard, dim, dtype):
     """Shards that end partway through a stick copy to and from the CPU."""
-    n = _num_shards()
+    n = num_shards()
     shape = list(shape_per_shard)
     shape[dim] *= n
     cpu = _exact_source(shape, dtype)
@@ -741,11 +658,11 @@ _DMA_SLICE_BYTES = int(
 )
 
 
-@_requires_emulation
+@requires_emulation
 @pytest.mark.skipif(
-    _DMA_SLICE_BYTES > _SMALL_DMA_SLICE_BYTES,
+    _DMA_SLICE_BYTES > SMALL_DMA_SLICE_BYTES,
     reason="needs FLEX_DATA_TRANSFER_BUFFER_SIZE <= "
-    f"{_SMALL_DMA_SLICE_BYTES} at process start; "
+    f"{SMALL_DMA_SLICE_BYTES} at process start; "
     "test_device_suite_in_emulation_shape runs it in the EMUL1p5-small-dma mode",
 )
 @pytest.mark.parametrize(
@@ -759,7 +676,7 @@ _DMA_SLICE_BYTES = int(
 )
 def test_shards_larger_than_one_dma_slice_round_trip(shape_per_shard, dim, dtype):
     """A shard whose copy is split into several DMA slices round-trips exactly."""
-    n = _num_shards()
+    n = num_shards()
     shape = list(shape_per_shard)
     shape[dim] *= n
     cpu = _exact_source(shape, dtype)
@@ -771,7 +688,7 @@ def test_shards_larger_than_one_dma_slice_round_trip(shape_per_shard, dim, dtype
     assert torch.equal(x.cpu(), cpu)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_dtype_casting_copy_fails_closed():
     """Dtype-converting copies of sharded tensors are rejected, not truncated.
@@ -779,7 +696,7 @@ def test_dtype_casting_copy_fails_closed():
     Converting shard copies are untested against the D2H conversion path,
     which bounds its host output by the host_capacity the DMA factories set.
     """
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
@@ -787,7 +704,7 @@ def test_dtype_casting_copy_fails_closed():
         a.to("cpu", torch.float32)
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_dtype_view_of_sharded_fails_closed():
     """A same-size view(dtype) must not reach the copy path.
@@ -799,7 +716,7 @@ def test_dtype_view_of_sharded_fails_closed():
     of at copy time.
     """
 
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
@@ -809,7 +726,7 @@ def test_dtype_view_of_sharded_fails_closed():
         a.view(torch.bfloat16).cpu()
 
 
-@_requires_emulation
+@requires_emulation
 @expects_raise
 def test_resize_and_set_of_sharded_tensor_fail_closed():
     """resize_/set_ must not silently corrupt or un-shard sharded storage.
@@ -818,7 +735,7 @@ def test_resize_and_set_of_sharded_tensor_fail_closed():
     old shape (wrong rows gathered by .cpu()); a reallocating resize would
     silently convert the tensor to unified storage.
     """
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
@@ -831,17 +748,17 @@ def test_resize_and_set_of_sharded_tensor_fail_closed():
     assert torch.spyre.is_sharded(a)
 
 
-@_requires_emulation
+@requires_emulation
 def test_inputs_usable_after_compile_rejection():
     """A rejected compile leaves the sharded inputs intact and usable."""
-    n = _num_shards()
+    n = num_shards()
     torch.manual_seed(0)
     src = torch.randn(8 * n, 64, dtype=torch.float16)
     a = _sharded(src, 0, n)
     b = _sharded(src.clone(), 0, n)
 
-    with pytest.raises(RuntimeError, match="pointwise ops only"):
-        torch.compile(lambda x, y: x.sum(0) + y.sum(0), dynamic=False)(a, b)
+    with pytest.raises(RuntimeError, match="must reduce the shard dim only"):
+        torch.compile(lambda x, y: x.sum() + y.sum(), dynamic=False)(a, b)
 
     # Same tensors still work in a supported compile afterwards.
     c = torch.compile(lambda x, y: x + y, dynamic=False)(a, b)

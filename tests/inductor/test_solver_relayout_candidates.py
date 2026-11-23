@@ -301,6 +301,17 @@ def test_split_product_must_equal_core_count():
     )
 
 
+def _loop_info(group):
+    """A real one-record loop stamp for the loop group path ``group``."""
+    from torch_spyre._inductor.loop_info import LoopInfo
+
+    return LoopInfo(
+        loop_group_id=group,
+        loop_count=[4] * len(group),
+        loop_tiled_dims=[[0]] * len(group),
+    )
+
+
 @config.patch({"lx_same_tile_group_relayout": True})
 def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     """Cross-group endpoints must stop before any layout inspection.
@@ -335,11 +346,7 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
         obj.loop_info = loop_info
         return obj
 
-    unknown = object()
     rejected = [
-        (unknown, None),
-        (None, unknown),
-        (unknown, unknown),
         (tiled((0,)), None),
         (None, tiled((0,))),
         (tiled((0,)), tiled((1,))),
@@ -908,9 +915,9 @@ def test_persistent_scatter_requires_independent_immutable_source(
     elif violation == "producer_alias":
         source.get_inputs_that_alias_output = lambda: ("external",)
     elif violation == "tiled_producer":
-        source.loop_info = object()
+        source.loop_info = _loop_info((0,))
     elif violation == "tiled_consumer":
-        update.loop_info = object()
+        update.loop_info = _loop_info((0,))
     elif violation == "opaque_aliases":
 
         def unknown():
