@@ -455,6 +455,65 @@ inline void addDmaSectionMetadata(trace_activity_type& trace_activity,
   }
 }
 
+// Protocol event class (RFC 2973 Section 3.4) the producer tagged a
+// collective's CB or copy with, as coll_event (e.g. "SIGNAL_ACK"), and on
+// copies the peer it named, as coll_peer. Omitted when unset. Newer than the
+// coll_* fields, so detected rather than assumed.
+template <class T, class = void>
+struct HasCollEventField : std::false_type {};
+template <class T>
+struct HasCollEventField<T,
+                         std::void_t<decltype(std::declval<T&>().coll_event)>>
+    : std::true_type {};
+template <class T, class = void>
+struct HasCollPeerField : std::false_type {};
+template <class T>
+struct HasCollPeerField<T, std::void_t<decltype(std::declval<T&>().coll_peer)>>
+    : std::true_type {};
+
+inline const char* collEventName(uint8_t cls) {
+  switch (cls) {
+    case AIUPTI_COLL_EVENT_SEND_DATA:
+      return "SEND_DATA";
+    case AIUPTI_COLL_EVENT_RECV_DATA:
+      return "RECV_DATA";
+    case AIUPTI_COLL_EVENT_SIGNAL_DATA:
+      return "SIGNAL_DATA";
+    case AIUPTI_COLL_EVENT_SIGNAL_ACK:
+      return "SIGNAL_ACK";
+    case AIUPTI_COLL_EVENT_WAIT_DATA:
+      return "WAIT_DATA";
+    case AIUPTI_COLL_EVENT_WAIT_ACK:
+      return "WAIT_ACK";
+    case AIUPTI_COLL_EVENT_MONITOR_NOTICE:
+      return "MONITOR_NOTICE";
+    case AIUPTI_COLL_EVENT_COMPUTE:
+      return "COMPUTE";
+    case AIUPTI_COLL_EVENT_RESET_SEND:
+      return "RESET_SEND";
+    case AIUPTI_COLL_EVENT_RESET_WAIT:
+      return "RESET_WAIT";
+    default:
+      return nullptr;  // NONE, or a class newer than this build
+  }
+}
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCollEventMetadata(trace_activity_type& trace_activity,
+                                 const aiupti_activity_type* activity) {
+  if constexpr (HasCollEventField<aiupti_activity_type>::value) {
+    if (const char* name = collEventName(activity->coll_event)) {
+      trace_activity->addMetadataQuoted("coll_event", name);
+    }
+  }
+  if constexpr (HasCollPeerField<aiupti_activity_type>::value) {
+    // Collective records only: a zero-initialized record would read as peer 0.
+    if (activity->coll_group[0] != '\0' && activity->coll_peer != UINT32_MAX) {
+      trace_activity->addMetadata("coll_peer", activity->coll_peer);
+    }
+  }
+}
+
 // Collective a host span did work for (e.g. the artifact load an allreduce
 // triggered). Not a correlation ID, so it never links host and device records.
 // Newer than the other runtime fields, so detected rather than assumed.
@@ -694,6 +753,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   // all-zero array here signals a counter failure rather than absence.
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   addDmaSectionMetadata(kernel_activity, activity);
+  addCollEventMetadata(kernel_activity, activity);
 
   recordStream(kernel_activity->device, kernel_activity->resource);
   kernel_activity->log(*logger);
@@ -816,6 +876,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   }
   addCollMetadata(memcpy_activity, activity);
   addDmaSectionMetadata(memcpy_activity, activity);
+  addCollEventMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
