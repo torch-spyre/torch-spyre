@@ -1680,8 +1680,8 @@ def embedding_restickify_table_fn(
     operand (dims=(None, 0)): the indirect-access layout the embedding op
     needs forces insert_restickify.py to materialize a full, untiled
     relayout copy of `table` inside the loop body. Building that copy calls
-    _transfer_loop_info's `elif hasattr(op, "loop_info")` branch, which deep-
-    copies the embedding consumer's LoopInfo onto the copy buffer.
+    _transfer_loop_info's `elif hasattr(op, "loop_member")` branch, which deep-
+    copies the embedding consumer's LoopMember onto the copy buffer.
     Before the fix, the consumer's own `loop_tiled_dims` (its per-tile token
     axis) survived that copy onto the table buffer's unrelated row dim;
     work_division_constraints.py's coarse_tile_local_dim_split_domains then
