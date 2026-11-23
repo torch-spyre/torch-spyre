@@ -1476,7 +1476,7 @@ class TestEAShuffle:
     # The shuffle kernel's input and output are placed in different memories
     # (one in LX, one in HBM), causing dbo-opt to fail. With LX_PLANNING=0,
     # these compile successfully. See deeptools issue #4988.
-    _LX_HBM_SPLIT_SHAPES = [(64, 192), (64, 448), (2, 128256), (64, 151936)]
+    _LX_HBM_SPLIT_SHAPES = [(64, 192), (2, 128256), (64, 151936)]
 
     _BACKEND_FAILURES = dict.fromkeys(
         _STICK_PAIR_UNALIGNED_SHAPES + _LX_HBM_SPLIT_SHAPES, _BACKEND_ERROR
@@ -1560,6 +1560,7 @@ class TestEAShuffle:
         (4, 192),
         (4, 320),
         (4, 448),
+        (64, 448),
     ]
     _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS, **_BACKEND_FAILURES}
 

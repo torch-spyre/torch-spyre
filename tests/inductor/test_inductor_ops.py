@@ -8596,10 +8596,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_ea_reduction_dl16tofp32_then_standard_add",
             "test_ea_reduction_dl16tofp32_then_standard_add_cpu",
         ): {
-            "expect_fail": {
-                "sum_dim0": "sum(0) is tagged DL16_TO_FP32, but nothing shuffles it to "
-                "STANDARD before the add, so the add returns permuted values, pending #5495",
-            },
             "param_sets": {
                 "sum_dim0": (
                     cached_randn((64, 128), dtype=torch.float16),
