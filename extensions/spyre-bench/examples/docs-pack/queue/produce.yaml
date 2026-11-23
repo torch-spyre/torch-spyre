@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: broker-1p}
+spec: {type: mq/broker, backend: broker-a, token: p1, partitions: 1, settings: {replication: 1}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: produce, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: sanity
+  system: broker-1p
+  workload:
+    type: mq/produce
+    message_bytes: 128
+    acks: leader
+    progress_s: 10
+    load: {executor: closed, concurrency: 4, duration: 2m, warmup: 20s}
+  metrics: {required: [mq.throughput, mq.latency.p99, mq.errors.ratio], headline: [mq.throughput]}
+  run:
+    repeats: 3
+    timeout: 10m
+    command: ["{python}", "tools/emit_queue.py", "--bytes", "{case.message_bytes}", "--repeat", "{repeat}", "--raw", "{raw_dir}", "--out", "{repeat_dir}"]
+  matrix:
+    name_template: produce_{size}_{parts}
+    axes:
+      size:
+        - {token: small, patch: {workload: {message_bytes: 128}}}
+        - {token: large, patch: {tier: core, workload: {message_bytes: 65536}}}
+      parts:
+        - {token: p1, patch: {}}

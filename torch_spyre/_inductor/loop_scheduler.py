@@ -32,7 +32,7 @@ preparation, HBM-pool planning, codegen) sees the counted loop it always saw.
 Once the scheduler nodes exist, ``graph.operations`` is the flat leaf list
 again (the structure lives in the scheduler nodes): kernel preparation's LX
 read contracts read it and expect leaf ops.  A kernel op inside a node that
-is not a member of that loop (no matching ``loop_info``) is refused, since it
+is not a member of that loop (no matching ``loop_member``) is refused, since it
 would run every trip here and once on the flat path.
 
 The patch reaches into private Inductor code.  It is supported only on the
@@ -75,7 +75,7 @@ SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 # Set to False only by the equivalence test, to compare the flow-through path
 # with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
 # ``LoopNode`` after the pass loop, as before, and ``build_loop_scheduler_nodes``
-# rebuilds the loops from the flat ops' ``loop_info``.
+# rebuilds the loops from the flat ops' ``loop_member``.
 SCHEDULE_LOOP_NODES = True
 
 # The Inductor surface this module depends on.  "patched": replaced for the
@@ -315,11 +315,11 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     member of that loop.
 
     A ``LoopSchedulerNode`` runs every kernel child ``trip_count`` times.  The
-    path it replaced decided membership op by op, from ``loop_info``
+    path it replaced decided membership op by op, from ``loop_member``
     (``build_loop_scheduler_nodes``): an op without this loop's group path ran
     outside the loop, once.  ``collapse`` keeps an op that sits between two
     members inside the span, so such an op (an op a pass placed there without
-    ``loop_info``) would silently run every trip on this path -- an
+    ``loop_member``) would silently run every trip on this path -- an
     accumulator's zero-fill re-run each trip, a wrong answer.  Every direct
     kernel child must therefore share one group path, and so be in the loop
     on both paths; a nested loop's members are checked at their own level.
@@ -327,14 +327,14 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     No pass produces such an op today: across the seven graphs of
     ``test_loop_scheduler_equivalence.py`` this check never fires.  It guards a
     future pass that places an op between two members without stamping its
-    ``loop_info``.  Ops at the head or tail of a body are not refused: they
-    are moved out at the hand-off (``loop_node.peel_non_members``).
+    ``loop_member``.  An op at the head or tail of a body is refused the same way
+    (before stage 8.5 the hand-off moved such an op out of the node).
     """
     paths = {op.get_name(): counted_loop_path(op) for op in kernels}
     # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on
     # longer paths, so the direct kernel children of a node built from
-    # ``loop_info`` all have the SAME full path, and a node always starts at
-    # a member.  (A node built by hand from ops without ``loop_info``, as the
+    # ``loop_member`` all have the SAME full path, and a node always starts at
+    # a member.  (A node built by hand from ops without ``loop_member``, as the
     # unit tests do, has only empty paths and is not checked.)
     if len(set(paths.values())) <= 1:
         return

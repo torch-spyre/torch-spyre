@@ -1,0 +1,6 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Design parameters travel as flags (identity by default). Synthetic shapes.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: moe-demo-fp16}
+spec: {type: kernel/op-library, backend: spyre, library: torch-spyre, precision: fp16, harness: harness-a, extensions: {spyre: {mode: a}}}

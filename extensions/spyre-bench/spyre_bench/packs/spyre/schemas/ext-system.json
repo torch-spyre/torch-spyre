@@ -1,0 +1,19 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/spyre/ext-system.json",
+ "title": "spyre System extension (not identity: the backend is the comparison axis)",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "tag": {
+   "type": "string",
+   "pattern": "^[a-z0-9=.;_-]+$"
+  },
+  "mode": {
+   "enum": [
+    "a",
+    "b"
+   ]
+  }
+ }
+}

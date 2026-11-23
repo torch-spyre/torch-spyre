@@ -64,14 +64,6 @@ _SCALAR_ADD_XFAIL_UINT8_TO_DTYPE = pytest.mark.xfail(
 )
 
 
-# A float16-format bool's float32 or integer result is staggered on device.
-_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a staggered result is read back without restoring its order (#4393)",
-)
-
-
 def _expect_raise(match):
     """Decorator: the test passes only if it raises with a message matching ``match``."""
 
@@ -148,6 +140,11 @@ class TestSpyre(TestCase):
             # element count is what catches it.
             subtest(lambda t: t[8:16].detach(), name="detached_rows_middle"),
             subtest(lambda t: t[:8].detach(), name="detached_rows_leading"),
+            # A tracked view of an untracked partial tensor: its base is the
+            # detached slice, so the base itself must be checked too.
+            subtest(lambda t: t[8:16].detach().view(-1), name="detached_rows_flat"),
+            subtest(lambda t: t[8:16].detach()[:], name="detached_rows_full_slice"),
+            subtest(lambda t: t[8:16].detach().t(), name="detached_rows_transposed"),
             # Broadcast: the base's offset and element count, but only row 0.
             subtest(lambda t: t[:1].expand(64, 64), name="broadcast_row"),
         ],
@@ -169,6 +166,31 @@ class TestSpyre(TestCase):
         self.assertTrue(torch.equal(d.cpu(), expected))
 
     @parametrize(
+        "mode",
+        [
+            subtest(torch.no_grad, name="no_grad"),
+            subtest(torch.inference_mode, name="inference_mode"),
+        ],
+    )
+    def test_fill_views_without_autograd(self, mode):
+        # Under no_grad, views are still tracked (the base check applies); under
+        # inference_mode they are not (the layout check applies). Either way a
+        # partial view must be rejected and a whole-tensor view must fill.
+        expected = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+        with mode():
+            d = expected.to("spyre")
+            for view in (lambda t: t[8:16], lambda t: t[8:16].detach().view(-1)):
+                with self.assertRaisesRegex(
+                    RuntimeError, "partial view of a Spyre tensor"
+                ):
+                    view(d).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), expected))
+            d.view(-1).fill_(3.0)
+            self.assertTrue(torch.equal(d.cpu(), torch.full((64, 64), 3.0)))
+            d.t().zero_()
+            self.assertTrue(torch.equal(d.cpu(), torch.zeros(64, 64)))
+
+    @parametrize(
         "view",
         [
             subtest(lambda t: t, name="base"),
@@ -176,12 +198,18 @@ class TestSpyre(TestCase):
             subtest(lambda t: t.view(-1), name="flat"),
             subtest(lambda t: t.t(), name="transposed"),
             subtest(lambda t: t.unsqueeze(0), name="unsqueezed"),
+            # A detached whole tensor is not a view, but its views are: the
+            # root check must accept them.
+            subtest(lambda t: t.detach().view(-1), name="detached_flat"),
+            subtest(lambda t: t.detach().t(), name="detached_transposed"),
         ],
     )
     def test_fill_whole_tensor_view(self, view):
         d = torch.zeros(64, 64).to("spyre")
         view(d).fill_(3.0)
         self.assertTrue(d.cpu().eq(3.0).all())
+        view(d).zero_()
+        self.assertTrue(d.cpu().eq(0.0).all())
 
     @parametrize(
         "shape, dtype",
@@ -195,6 +223,120 @@ class TestSpyre(TestCase):
         d = torch.zeros(shape, dtype=dtype).to("spyre")
         d.fill_(3.0)
         self.assertTrue(d.cpu().eq(3.0).all())
+
+    @parametrize(
+        "shape",
+        [
+            subtest((64, 64), name="aligned"),
+            subtest((3, 7), name="padded"),
+            subtest((2, 4, 16, 128), name="kv_page_shape"),
+        ],
+    )
+    def test_zero_float8(self, shape):
+        # The device fill has no fp8 value->pattern conversion; zero_ must still
+        # work (all-zero bytes) and must zero every element of a nonzero tensor.
+        ones = torch.ones(shape).to(torch.float8_e4m3fn)
+        d = ones.to("spyre")
+        d.zero_()
+        out = d.cpu()
+        self.assertEqual(out.dtype, torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(out.view(torch.uint8), torch.zeros(shape).to(torch.uint8))
+        )
+
+    @staticmethod
+    def _head_major_kv_layout(
+        num_rows, block_size, head_size, dtype, valid_elements=None
+    ):
+        # The layout spyre-inference uses for its paged KV cache
+        # (head_major_kv_layout): the folded (block, kv_head) row stays whole at
+        # device dim 0, and head_size is split into sticks.
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            get_device_dtype,
+            get_elem_in_stick,
+        )
+
+        eps = get_elem_in_stick(dtype)
+        sticks = (head_size + eps - 1) // eps
+        return SpyreTensorLayout(
+            device_size=[num_rows, block_size, sticks, eps],
+            stride_map=[block_size * head_size, head_size, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements=valid_elements or {},
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.float16, name="fp16"),
+            subtest(torch.float8_e4m3fn, name="fp8"),
+        ],
+    )
+    @parametrize(
+        "head_size", [subtest(64, name="head64"), subtest(128, name="head128")]
+    )
+    @parametrize(
+        "with_valid_elements",
+        [subtest(False, name="unknown_valid"), subtest(True, name="valid_elements")],
+    )
+    def test_zero_kv_cache_device_layout(self, dtype, head_size, with_valid_elements):
+        # spyre-inference allocates its KV cache pages with
+        # torch.empty(..., device_layout=...) and zeroes them with zero_(). The
+        # cache is then read back whole, so every element must be zero.
+        num_blocks, kv_heads, block_size = 3, 2, 16
+        shape = (num_blocks, kv_heads, block_size, head_size)
+        rows = num_blocks * kv_heads
+        # Per device dim group, the unpadded extent: rows, block, and head_size
+        # across the (stick, element-in-stick) pair, which pads head_size up to
+        # whole sticks. The fill guard compares the product with numel().
+        valid = (
+            {(0,): rows, (1,): block_size, (2, 3): head_size}
+            if with_valid_elements
+            else None
+        )
+        layout = self._head_major_kv_layout(rows, block_size, head_size, dtype, valid)
+
+        # Allocation path used by allocate_pages: uninitialised, then zeroed.
+        page = torch.empty(
+            shape, dtype=dtype, device=torch.device("spyre"), device_layout=layout
+        )
+        self.assertIs(page.zero_(), page)
+        out = page.cpu()
+        self.assertEqual(out.shape, shape)
+        self.assertTrue(out.float().eq(0).all())
+
+        # Same layout, starting from nonzero data so the fill is observable
+        # (an empty tensor may already read as zero).
+        host = torch.ones(shape).to(dtype)
+        page = host.to("spyre", device_layout=layout)
+        self.assertTrue(page.cpu().float().eq(1).all())
+        page.zero_()
+        self.assertTrue(page.cpu().float().eq(0).all())
+
+    def test_zero_kv_cache_valid_elements_partial_rejected(self):
+        # Complement of the above: with valid_elements set, zero_ of a page
+        # slice of the cache is still a partial view and must be rejected.
+        shape = (3, 2, 16, 128)
+        layout = self._head_major_kv_layout(
+            6, 16, 128, torch.float8_e4m3fn, {(0,): 6, (1,): 16, (2, 3): 128}
+        )
+        page = (
+            torch.ones(shape).to(torch.float8_e4m3fn).to("spyre", device_layout=layout)
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "view of a Spyre tensor is not supported yet"
+        ):
+            page[1].zero_()
+        self.assertTrue(page.cpu().float().eq(1).all())
+
+    def test_fill_float8_nonzero_rejected(self):
+        # Only zero is supported (no fp8 fill pattern); it must fail cleanly and
+        # leave the tensor untouched.
+        d = torch.ones(64, 64).to(torch.float8_e4m3fn).to("spyre")
+        with self.assertRaisesRegex(RuntimeError, "only supported with the value 0"):
+            d.fill_(1.0)
+        self.assertTrue(d.cpu().float().eq(1.0).all())
 
     @parametrize(
         "view",
@@ -221,9 +363,7 @@ class TestSpyre(TestCase):
         reserve = {0: {"min": 70, "max": 630, "granularity": 70}}
         expected = torch.arange(70 * 64, dtype=torch.float32).reshape(70, 64)
         d = expected.to("spyre", dynamic=reserve)
-        with self.assertRaisesRegex(
-            RuntimeError, "view of a Spyre tensor is not supported yet"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "partial view of a Spyre tensor"):
             d[10:20].fill_(3.0)
         self.assertTrue(torch.equal(d.cpu(), expected))
 
@@ -837,7 +977,6 @@ class TestSpyre(TestCase):
             subtest(
                 dtype,
                 name=str(dtype).removeprefix("torch."),
-                decorators=[_EAGER_BOOL_READBACK_XFAIL],
             )
             for dtype in (torch.float32, torch.int32, torch.int64)
         ],
@@ -1163,6 +1302,17 @@ class TestSpyre(TestCase):
             sliced_expanded.cpu(),
             torch.tensor([data[1]] * 4, dtype=torch.float16),
         )
+
+    def test_eager_expand_broadcast_reduction(self):
+        """Eager dispatch compiles a standalone kernel over the already-
+        materialised expand() output, a distinct trigger from the compiled
+        path's fused expand+sum kernel, so it needs its own check."""
+        x_cpu = torch.randint(-3, 4, (70,), dtype=torch.int32).to(torch.float16)
+        x = x_cpu.to("spyre")
+        actual = x.expand(2, 32, 70).sum(dim=-1).cpu().float()
+        expected = x_cpu.float().expand(2, 32, 70).sum(dim=-1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
