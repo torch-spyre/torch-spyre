@@ -56,7 +56,7 @@ SVG label:
   device strides, plus dtype info) that drives one of these transfers;
   in code it is the `DataConversionInfo` struct built by
   `generate_dci()` in `spyre_mem.cpp` and consumed by `copyAsync`. The
-  `dma_sizes` and `dma_strides` fields on `SpyreTensorLayout` feed the
+  `valid_elements` and `stride_map` fields on `SpyreTensorLayout` feed the
   DCI.
 - **Do not** call LPDDR5 ↔ LX scratchpad transfers DMA. Those are
   driven by load/store instructions emitted by the compiler for the

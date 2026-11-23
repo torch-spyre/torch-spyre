@@ -96,8 +96,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->set_storage_offset(self.storage_offset());
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides);
   spyre_tensor_impl_->spyre_layout = stl;
-  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   // Same as shallow_copy_and_detach_core. A view that changed the geometry
   // carries the map too; has_intact_reservation() is what then rejects it:
   // get_reserved_dims() returns nullopt and resize_ raises (spyre_resize_
@@ -128,8 +126,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides,
                                             self.sym_storage_offset());
   spyre_tensor_impl_->spyre_layout = stl;
-  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
   return self_;
 }
@@ -184,7 +180,6 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   c10::IntArrayRef stride,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout) {
-  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   auto storage_offset = storage_offset_.value_or(self.storage_offset());
   check_sharded_view(self, size, stride, storage_offset);
   auto result = at::detail::make_tensor<SpyreTensorImpl>(
@@ -193,16 +188,9 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   at::native::setStrided(result, size, stride, storage_offset);
   auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
   spyre_impl->spyre_layout = device_layout;
+  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   if (device_layout == orig_impl->spyre_layout) {
-    spyre_impl->dma_sizes = orig_impl->dma_sizes;
-    spyre_impl->dma_strides = orig_impl->dma_strides;
-    // Only here: dma_sizes/dma_strides still describe the original allocation,
-    // so has_intact_reservation() stays meaningful. In the else branch they
-    // are reset to this view's own shape and the check would pass trivially.
     spyre_impl->reserved_dims = orig_impl->reserved_dims;
-  } else {
-    spyre_impl->dma_sizes = size.vec();
-    spyre_impl->dma_strides = stride.vec();
   }
 
   return result;
@@ -237,8 +225,6 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
     return torch::inductor::_reinterpret_tensor(self, size, stride,
                                                 offset_increment);
   }
-  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
   check_sharded_view(self, size, stride,
                      self.sym_storage_offset() + offset_increment);
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
@@ -249,15 +235,9 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                          offset_increment);
   spyre_tensor_impl_->set_sizes_and_strides(size, stride);
   spyre_tensor_impl_->spyre_layout = stl;
-  if (stl == orig_stl) {
-    spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-    spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
-    // As in as_strided_with_layout: only here do dma_sizes/dma_strides still
-    // describe the original allocation, so the intact check stays meaningful.
+  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  if (stl == orig_impl->spyre_layout) {
     spyre_tensor_impl_->reserved_dims = orig_impl->reserved_dims;
-  } else {
-    spyre_tensor_impl_->dma_sizes = size.vec();
-    spyre_tensor_impl_->dma_strides = stride.vec();
   }
   return self_;
 }
@@ -304,8 +284,6 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
   auto* result_impl =
       static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
   result_impl->spyre_layout = orig_impl->spyre_layout;
-  result_impl->dma_sizes = orig_impl->dma_sizes;
-  result_impl->dma_strides = orig_impl->dma_strides;
 
   return result;
 }

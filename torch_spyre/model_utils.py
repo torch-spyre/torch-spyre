@@ -391,7 +391,7 @@ def dma_moe_per_expert_scale_to_spyre(
         [experts, 1, eps],
         [eps, eps, 1],
         get_device_dtype(dev_dtype),
-        {(0,): experts, (1, 2): 1},
+        {(0,): experts, (1, 2): eps},  # widened on the host: eps real values
     )
     dst = spyre_empty_with_layout(
         widened.size(), widened.stride(), dev_dtype, layout, device=device

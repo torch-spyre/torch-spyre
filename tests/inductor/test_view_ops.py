@@ -2125,18 +2125,8 @@ class TestCatSize1:
     """Size-1 dimension interactions."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_3d_size1_seq_expand(self, request, execution_mode, dtype, consumer):
+    def test_cat_3d_size1_seq_expand(self, execution_mode, dtype, consumer):
         """[1,1,256] + [1,32,256] → cat(dim=1) → [1,33,256]. Size-1 seq prepended. Both consumers."""
-        if (
-            execution_mode == "eager"
-            and consumer == "sum_last"
-            and dtype in (torch.float16, torch.bfloat16)
-        ):
-            strict_xfail(
-                request,
-                AssertionError,
-                "AssertionError: Tensor-likes are not close (eager spyre <-> cpu mismatch beyond tolerance), #6443",
-            )
         a = cached_randn(
             (1, 1, 256), dtype=dtype, differentiation=f"cat_3d_size1_seq_a_{dtype}"
         )

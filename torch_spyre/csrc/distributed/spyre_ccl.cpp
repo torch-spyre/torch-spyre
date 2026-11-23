@@ -516,7 +516,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   auto input = inputTensors[0];
   spyre::check_collective_device(input);
   const auto descriptor_numel =
-      c10::multiply_integers(spyre::get_spyre_tensor_sizes(input));
+      spyre::valid_element_count(spyre::get_spyre_tensor_layout(input));
   TORCH_INTERNAL_ASSERT(
       descriptor_numel >= input.numel(),
       "Collective input exceeds its device descriptor extent");
