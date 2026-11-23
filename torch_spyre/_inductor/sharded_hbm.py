@@ -175,7 +175,7 @@ def _shard_symbol(write: MemoryDep, size: list[int], shard_dim: int) -> sympy.Sy
     return matches[0]
 
 
-def _check_local_strides(
+def _check_shard_layout(
     name: str, size: list[int], dtype: torch.dtype, placement: ShardedPlacement
 ) -> None:
     """Reject shardings whose shards are not whole device dims of whole sticks.
@@ -184,12 +184,19 @@ def _check_local_strides(
     gives each core its own start address and walks the core's tile with the
     shard-local layout (verified end-to-end for pointwise ops and for
     shard-local and cross-shard reductions, bit-exact on integer data). An
-    earlier version of this check also required equal strides -- the backend
-    was believed to derive in-tile HBM strides from the global shape (N_) --
-    but the then-measured counterexamples do not reproduce on the current
-    backend, and the real blocker was the codegen guard's unified-model
-    stride arithmetic, replaced by the shard-dim identity check in
-    ``verify_non_unified_split``. What must still hold:
+    earlier version of this check also required equal strides. That rule
+    guarded against a DeepTools import bug, not against stride handling:
+    before DeepTools e1733ab8ad ("Read all SDSC contract flags through one
+    shared bool importer"), ``nonUnifiedAllocInHBM_`` emitted as a JSON
+    bool was silently parsed as disabled (json11's int_value() of ``true``
+    is 0), so non-unified HBM allocations were sized and addressed as
+    unified -- the then-measured counterexamples (a second stick left
+    unwritten) came from that. With the flag honored, and af3e583a4d
+    sizing non-unified allocations from the per-core datastage, the
+    counterexamples do not reproduce; the codegen guard's unified-model
+    stride arithmetic (the other half of the old rule) was replaced by
+    the shard-dim identity check in ``verify_non_unified_split``. What
+    must still hold:
 
     - the shard keeps the global device layout's dim structure (a restickified
       or otherwise relaid shard is not chunk-addressable);
@@ -306,6 +313,15 @@ def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
     # tensor divided n ways on its shard dim, which the planner already
     # checked divides evenly.
     for tensor in shard_kernel_args:
+        # Defence in depth: the arg must actually index
+        # the split dim in the emitted SDSC, so a later tiling pass that
+        # splits the shard dim into sub-dims fails closed here even if
+        # the dim label survives the symbol comparison below.
+        if tensor.scales.get(dim, 0) <= 0:
+            raise Unsupported(
+                f"non-unified kernel splits {dim}, which tensor arg "
+                f"{tensor.arg_index} does not index"
+            )
         shard_dim = tensor.non_unified_shard_dim
         if shard_dim is None:
             raise Unsupported(
@@ -400,7 +416,7 @@ def _plan_cross_shard_reduction(
         raise Unsupported(
             f"{name}: cross-shard reductions over the stick dim are not supported"
         )
-    _check_local_strides(name, in_size, op.get_dtype(), placement)
+    _check_shard_layout(name, in_size, op.get_dtype(), placement)
     op.shard_pinned_splits = {dim_symbol[s]: placement.num_shards}
     op.shard_ring_reduction = True
 
@@ -484,8 +500,8 @@ def _plan_shard_local_reduction(
             out_size, op.get_dtype(), out_shard_dim, placement.num_shards
         ),
     )
-    _check_local_strides(name, in_size, op.get_dtype(), placement)
-    _check_local_strides(name, out_size, op.get_dtype(), out_placement)
+    _check_shard_layout(name, in_size, op.get_dtype(), placement)
+    _check_shard_layout(name, out_size, op.get_dtype(), out_placement)
     op.shard_pinned_splits = {shard_sym: placement.num_shards}
     return out_placement
 
@@ -597,7 +613,7 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
                 f"{name}: non-unified kernels need operands and result of one "
                 f"dtype; got {sorted(map(str, dtypes))} -> {op.get_dtype()}"
             )
-        _check_local_strides(name, size, op.get_dtype(), placement)
+        _check_shard_layout(name, size, op.get_dtype(), placement)
         sym = _shard_symbol(write, size, placement.shard_dim)
         op.shard_pinned_splits = {sym: placement.num_shards}
         placements[name] = placement

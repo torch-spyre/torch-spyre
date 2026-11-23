@@ -52,7 +52,7 @@ everything outside it fails at compile time with a specific message:
   the shard-local layout, and the codegen guard
   (`verify_non_unified_split` in `sharded_hbm.py`) checks that the
   committed work split lands on the shard dim, so core *c* works exactly
-  on shard *c* (`_check_local_strides` in `sharded_hbm.py`).
+  on shard *c* (`_check_shard_layout` in `sharded_hbm.py`).
 * Static shapes only (`dynamic=False`), one dtype across operands and
   output, and `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a
   bundle `input_arg`).

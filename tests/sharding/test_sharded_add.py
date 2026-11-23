@@ -388,14 +388,19 @@ def _split_spec(num_cores=8):
     )
 
 
-def _shard_arg(shard_dim, arg_index=0):
+def _shard_arg(shard_dim, arg_index=0, indexed=("mb",)):
+    import sympy
+
     from torch_spyre._inductor.codegen.superdsc import SDSCArgs
 
+    # ``scales`` says which dims the arg indexes in the emitted SDSC; a
+    # tiling pass that split the shard dim into sub-dims would leave the
+    # split dim out and the guard must fail closed (defence in depth).
     return SDSCArgs(
         layout="OUTPUT",
         dim_order=[],
         data_format=None,
-        scales={},
+        scales={sympy.Symbol(d): 1 for d in indexed},
         strides={},
         offsets={},
         max_dim_sizes={},
@@ -431,7 +436,9 @@ def test_verify_non_unified_split_rejects_a_split_on_another_dim():
         sympy.Symbol("out"): sympy.Mod(sympy.Symbol("core_id"), 8),
     }
     with pytest.raises(Unsupported, match="sharded on"):
-        verify_non_unified_split(spec, [_shard_arg(sympy.Symbol("mb"))])
+        verify_non_unified_split(
+            spec, [_shard_arg(sympy.Symbol("mb"), indexed=("mb", "out"))]
+        )
 
 
 def test_verify_non_unified_split_rejects_an_arg_without_a_shard_dim():
@@ -442,6 +449,81 @@ def test_verify_non_unified_split_rejects_an_arg_without_a_shard_dim():
     # planner carries no shard dim; the guard must fail closed.
     with pytest.raises(Unsupported, match="records no shard dim"):
         verify_non_unified_split(_split_spec(), [_shard_arg(None)])
+
+
+def test_verify_non_unified_split_rejects_an_arg_that_does_not_index_the_split():
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # Defence in depth: the symbol comparison alone would pass (the arg
+    # records the shard dim), but the arg does not index the split dim in
+    # the emitted SDSC -- e.g. a later tiling pass split the shard dim
+    # into sub-dims. The guard must fail closed.
+    import sympy
+
+    with pytest.raises(Unsupported, match="does not index"):
+        verify_non_unified_split(
+            _split_spec(), [_shard_arg(sympy.Symbol("mb"), indexed=())]
+        )
+
+
+def test_non_unified_shard_dim_rejects_an_unmatched_shard_dim():
+    """The derivation fails closed when no iteration symbol matches the
+    shard dim's stride and extent -- the Unsupported
+    branches were reached only end-to-end before)."""
+    import sympy
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor import spyre_kernel
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.sharded_hbm import ShardedPlacement
+
+    saved = spyre_kernel.placement_of
+    spyre_kernel.placement_of = lambda name: ShardedPlacement(
+        shard_dim=1, num_shards=8, shard_device_bytes=128
+    )
+    try:
+        # layout [4, 64]: shard dim 1 has stride 1 and extent 64, but no
+        # iteration symbol has that coefficient and extent.
+        with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+            spyre_kernel._non_unified_shard_dim(
+                "arg0",
+                # Any layout object carrying the tensor's logical size.
+                SimpleNamespace(size=[4, 64]),
+                {sympy.Symbol("mb"): 4},
+                sympy.Symbol("mb") * 64 + sympy.Symbol("out"),
+            )
+    finally:
+        spyre_kernel.placement_of = saved
+
+
+def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim():
+    """Two symbols matching the shard dim's stride and extent means the
+    identification is not unique; the derivation must fail closed."""
+    import sympy
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor import spyre_kernel
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.sharded_hbm import ShardedPlacement
+
+    saved = spyre_kernel.placement_of
+    spyre_kernel.placement_of = lambda name: ShardedPlacement(
+        shard_dim=1, num_shards=8, shard_device_bytes=128
+    )
+    try:
+        # Both s0 and s1 have coefficient 1 and extent 64 in the iteration
+        # space, so the shard dim (stride 1, extent 64) matches twice.
+        with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+            spyre_kernel._non_unified_shard_dim(
+                "arg0",
+                # Any layout object carrying the tensor's logical size.
+                SimpleNamespace(size=[4, 64]),
+                {sympy.Symbol("s0"): 64, sympy.Symbol("s1"): 64},
+                sympy.Symbol("s0") + sympy.Symbol("s1"),
+            )
+    finally:
+        spyre_kernel.placement_of = saved
 
 
 @requires_emulation
