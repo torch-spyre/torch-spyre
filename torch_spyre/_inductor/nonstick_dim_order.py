@@ -88,7 +88,8 @@ from torch_spyre._C import (
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
-from .loop_node import move_after, move_before
+from .loop_facts import enclosing_loops
+from .loop_node import move_after, move_before, record_member
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -1231,18 +1232,10 @@ def _insert_mutation_relayout_copy(
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's
     # loop so other carry readers observe the preceding iteration's updates.
-    loop_info = getattr(mutation_op, "loop_info", None)
-    if loop_info is not None:
-        from .loop_info import LoopInfo
-
+    levels = enclosing_loops(mutation_op)
+    if levels:
         for copy_op in (buf_tmp, buf_copyback):
-            depth = len(loop_info.loop_count)
-            copy_op.loop_info = LoopInfo(
-                loop_group_id=loop_info.loop_group_id,
-                loop_count=list(loop_info.loop_count),
-                loop_tiled_dims=[[] for _ in range(depth)],
-                loop_tiled_reduction_dims=[[] for _ in range(depth)],
-            )
+            record_member(copy_op, [((), ()) for _ in levels], like=mutation_op)
 
     logger.info(
         "nonstick_dim_order: inserted mutation relayout copy for %s "

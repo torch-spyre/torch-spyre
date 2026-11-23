@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: datasets}
+spec:
+  type: core/artifactory
+  endpoint: {env: STORE_BASE_URL}
+  root: {env: STORE_DATASETS_PATH}
+  auth: {mode: token, refs: [{env: STORE_TOKEN}, {secret: store-token}]}
+  visibility: internal
+  mirrors: [node-cache]
+  resolve: [node-cache, mirrors, primary]
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: node-cache}
+spec: {type: core/filesystem, path: /data/bench-cache, auth: {mode: none}, visibility: internal}
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: hub}
+spec:
+  type: core/hf
+  endpoint: {value: hub.example.org}
+  auth: {mode: token, optional: true, refs: [{env: HUB_TOKEN}]}
+  visibility: public
+  resolve: [node-cache, primary]

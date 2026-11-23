@@ -34,7 +34,6 @@ Each compiles on the device with the flow-through on and off.
 """
 
 import contextlib
-import copy
 import unittest
 
 import regex as re
@@ -53,7 +52,19 @@ from torch_spyre._inductor import config, loop_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import work_division
 from torch_spyre._inductor.ir import SpyreConstantFallback
-from torch_spyre._inductor.loop_node import LoopNode, all_ops
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
+)
+from torch_spyre._inductor.loop_node import (
+    LoopNode,
+    all_ops,
+    insert_after,
+    insert_at_start,
+    record_member,
+    remove_op,
+)
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import lx_relayout
@@ -120,9 +131,7 @@ def _recording_deferral(record: dict):
         real(graph)
         record["deferred"] = set(work_division.deferred_work_division(graph))
         record["body_ops"] = {
-            op.get_name()
-            for op in all_ops(graph.operations)
-            if hasattr(op, "loop_info")
+            op.get_name() for op in all_ops(graph.operations) if is_looped(op)
         }
 
     with mock.patch.object(ts_passes, "defer_work_division", defer):
@@ -284,8 +293,8 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
     """The LX allocator hoists an input clone "before its consumers' loop
     entry" (``push_allocation_with_clone``). It used to insert it at the flat
     position of the loop's first member, which through ``OpsView`` is inside
-    the LoopNode's body with no ``loop_info``; the flat path rebuilt loops from
-    ``loop_info`` and ran it once, before the loop, while the flow-through ran it
+    the LoopNode's body with no ``loop_member``; the flat path rebuilt loops from
+    ``loop_member`` and ran it once, before the loop, while the flow-through ran it
     every trip. Stage 8.2 places it before the loop's node, so no hoisted clone is
     ever at the edge of a body, and the two paths agree. The graph
     of ``test_for_each_tile_lowering.test_one_unhinted_scan_does_not_block_the_other``
@@ -308,7 +317,7 @@ def test_lx_input_clone_hoisted_before_a_loop_runs_once():
             for node in graph.operations
             if isinstance(node, LoopNode) and node.body
             for op in (node.body[0], node.body[-1])
-            if isinstance(op, ComputedBuffer) and getattr(op, "loop_info", None) is None
+            if isinstance(op, ComputedBuffer) and not is_looped(op)
         ]
         # The clones hoisted in this compile, each in the unbroken run of hoisted
         # clones that ends right before a node (several are hoisted to one loop).
@@ -396,10 +405,13 @@ def _inject_dead_body_copy(record: dict):
         )
         buf.origins = src.origins
         buf.operation_name = name
-        buf.loop_info = copy.deepcopy(src.loop_info)
         V.graph.name_to_buffer[name] = buf
         V.graph.name_to_op[name] = buf
-        loop.body.insert(loop.body.index(src) + 1, buf)
+        insert_after(real, src, buf)
+        record_member(
+            buf,
+            [(x.tiled_dims, x.tiled_reduction_dims) for x in enclosing_loops(src)],
+        )
         record["name"] = name
 
     return dce
@@ -536,20 +548,21 @@ def test_extern_inside_a_loop_node_is_hoisted_on_a_real_compile():
     real = ts_passes._hand_off_loop_nodes
 
     def hand_off(graph):
-        # Put the body's constant (it keeps the body's loop_info) at the head
+        # Put the body's constant (dedup hoisted it out of the body) at the head
         # of the LoopNode's body, after the pass loop and before the hand-off.
         # Production keeps it outside (see the test above; the passes'
         # re-collapse moves it out again), so this is what reaches the
         # scheduler's own hoisting rule on a real compile.
         node = next(op for op in graph.operations if isinstance(op, LoopNode))
+        # The body's ``torch.full((M, N), 0.5)`` (``_scaled_split_k_fn``); the graph's
+        # other constants are not from the loop body.
         constant = next(
             op
             for op in graph.operations
-            if isinstance(op, SpyreConstantFallback)
-            and getattr(op, "loop_info", None) is not None
+            if isinstance(op, SpyreConstantFallback) and op.constant_args[0] == 0.5
         )
-        graph.operations.remove(constant)
-        node.body.insert(0, constant)
+        remove_op(graph.operations, constant)
+        insert_at_start(node, constant)
         seen["body_externs"] = [constant.get_name()]
         real(graph)
 
@@ -575,7 +588,7 @@ class _Stub:
     def __init__(self, name, group=None):
         self._name = name
         if group is not None:
-            self.loop_info = SimpleNamespace(loop_group_id=group)
+            self.loop_member = SimpleNamespace(loop_group_id=group)
 
     def get_name(self):
         return self._name
@@ -583,7 +596,7 @@ class _Stub:
 
 def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     """``collapse`` keeps an op that sits between two members of a loop in
-    the node's span.  A kernel op there that is not a member (no loop_info)
+    the node's span.  A kernel op there that is not a member (no loop_member)
     would run every trip on the flow-through and once on the flat path: the
     accumulator's zero-fill, re-run each trip, returned only the last tile's
     product (max error 0.146 against the reference, 0.0007 on the flat path).
@@ -595,7 +608,7 @@ def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     ``dedup_and_promote_constants`` now hoists the constant out of the body before
     the nodes are built (the graph compiles and is right, error 0.00073), so no
     compiled graph reaches this check any more. The check guards a future pass
-    that places an op between two members without stamping its ``loop_info``."""
+    that places an op between two members without stamping its ``loop_member``."""
     from torch_spyre._inductor.loop_scheduler import _check_members
 
     node = _Stub("loopnode0")
@@ -679,9 +692,9 @@ def test_structured_and_span_overflow_loops_in_one_graph():
                     type(n).__name__,
                     sorted(
                         {
-                            leaf.node.loop_info.loop_group_id
+                            counted_loop_path(leaf.node)
                             for leaf in n.get_nodes()
-                            if getattr(leaf.node, "loop_info", None) is not None
+                            if counted_loop_path(leaf.node)
                         }
                     ),
                 )

@@ -430,6 +430,32 @@
          }
         }
        },
+       "class": {
+        "type": "string",
+        "pattern": "^(x-)?[a-z][a-z0-9_-]*$",
+        "description": "metric class of the metric-context vocabulary; default: matched by name"
+       },
+       "context": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+         "required": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "pattern": "^[a-z0-9_|-]+$"
+          }
+         },
+         "optional": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "pattern": "^[a-z0-9_-]+$"
+          }
+         }
+        },
+        "description": "facets numbers of this metric must carry; `required` replaces the class default"
+       },
        "otel": {
         "type": "string"
        },

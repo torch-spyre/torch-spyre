@@ -43,7 +43,14 @@ from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
 )
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
+    node_levels,
+    pending_levels,
+)
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.loop_node import (
     LoopNode,
@@ -59,6 +66,8 @@ from torch_spyre._inductor.loop_node import (
     move_after,
     move_before,
     owning_list,
+    inherit_loop_membership,
+    record_member,
     remove_op,
     replace_op,
     request_loop_nodes,
@@ -71,12 +80,12 @@ def _dep(name):
 
 
 class _Op:
-    """A stub op: a name, reads/writes, optional loop_info and layout."""
+    """A stub op: a name, reads/writes, optional loop_member and layout."""
 
     def __init__(self, name, gid=None, counts=None, reads=(), writes=None):
         self._name = name
         if gid is not None:
-            self.loop_info = LoopInfo(
+            self.loop_member = LoopMember(
                 loop_group_id=tuple(gid),
                 loop_count=list(counts),
                 loop_tiled_dims=[[] for _ in gid],
@@ -327,16 +336,17 @@ class TestCollapse(unittest.TestCase):
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
         ext = MagicMock(spec=ExternKernel)
-        ext.loop_info = LoopInfo((0,), [4], [[]], [[]])
+        ext.loop_member = LoopMember((0,), [4], [[]], [[]])
         ext.get_name.return_value = "ext"
         a = _Op("a", (0,), [4])
         out = _round_trip(self, [ext, a])
         self.assertIs(out[0], ext)
         self.assertEqual(out[1].body, [a])
-        # Between members, it stays in the span like any other non-member.
-        b = _Op("b", (0,), [4])
-        (node,) = _round_trip(self, [a, ext, b])
-        self.assertEqual(node.body, [a, ext, b])
+        # Between members, it stays in the span like any other non-member. (Fresh
+        # ops: the first collapse spent the lowering's record on ``a``.)
+        a2, b2 = _Op("a2", (0,), [4]), _Op("b2", (0,), [4])
+        (node,) = _round_trip(self, [a2, ext, b2])
+        self.assertEqual(node.body, [a2, ext, b2])
 
     def test_induction_and_carries(self):
         u0, u1 = sympy.Symbol("u0"), sympy.Symbol("u1")
@@ -425,6 +435,40 @@ class TestPendingLoopNodes(unittest.TestCase):
             [o.get_name() for o in graph.operations], ["loopnode0", "loopnode1"]
         )
         self.assertEqual(graph.operations[1].body, [c, d])
+
+    def test_a_later_build_keeps_an_earlier_nodes_strict_flag(self):
+        """Two passes that tile build their nodes at different times (span-overflow
+        tiling, then the allocator's). The second build must not read the first
+        node's leaves, whose records were spent, as "not strict"."""
+        a, b = _Op("a", (0,), [2]), _Op("b", (0,), [2])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        c.loop_member.strict_loop_vars = d.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        request_loop_nodes(graph, {0: sympy.Symbol("u0")})
+        build_pending_loop_nodes(graph)
+        first = graph.operations[0]
+        self.assertTrue(first.strict_loop_vars)
+        graph.operations.extend([c, d])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        second = graph.operations[1]
+        self.assertIsNot(first, second)
+        self.assertTrue(first.strict_loop_vars)
+        self.assertTrue(second.strict_loop_vars)
+        self.assertFalse(hasattr(a, "loop_member"))
+
+    def test_a_nested_strict_loop_gives_the_inner_node_its_flag_too(self):
+        """The outer node's records are not deleted before the inner node reads
+        its own flag."""
+        a, b = _Op("a", (0, 0), [2, 3]), _Op("b", (0, 0), [2, 3])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        collapse(graph)
+        (outer,) = graph.operations
+        (inner,) = outer.body
+        self.assertTrue(outer.strict_loop_vars)
+        self.assertTrue(inner.strict_loop_vars)
 
     def test_building_twice_changes_nothing(self):
         c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
@@ -754,6 +798,221 @@ class TestTopLevelEntry(unittest.TestCase):
         real, *_ = _nested()
         with self.assertRaises(ValueError):
             top_level_entry(OpsView(real), _Op("stranger"))
+
+
+class TestNodeFacts(unittest.TestCase):
+    """Once the nodes are built they hold the loop facts: the group id, trip count and
+    each member's tiled dims, and each leaf op points at its enclosing nodes. The
+    lowering's ``loop_member`` record is spent and removed from the ops they hold."""
+
+    def _tiled_pair(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_member.loop_tiled_dims = [[1]]
+        b.loop_member.loop_tiled_reduction_dims = [[0]]
+        graph = _graph([_Op("pre"), a, b, _Op("post")])
+        collapse(graph)
+        node = next(o for o in graph.operations if isinstance(o, LoopNode))
+        return graph, node, a, b
+
+    @staticmethod
+    def _facts(levels):
+        return [
+            (x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims)
+            for x in levels
+        ]
+
+    def test_collapse_records_group_id_tiling_and_chain_and_spends_the_record(self):
+        graph, node, a, b = self._tiled_pair()
+        self.assertEqual(node.group_id, 0)
+        self.assertEqual(node.tiling, {"a": ((1,), ()), "b": ((), (0,))})
+        self.assertEqual(a._loop_chain, (node,))
+        self.assertTrue(node.facts_recorded)
+        self.assertEqual(self._facts(enclosing_loops(a)), [((0,), 4, (1,), ())])
+        self.assertEqual(self._facts(enclosing_loops(b)), [((0,), 4, (), (0,))])
+        self.assertEqual(enclosing_loops(a), node_levels(a))
+        self.assertEqual(counted_loop_path(a), (0,))
+        for op in (a, b):
+            self.assertFalse(hasattr(op, "loop_member"))
+            self.assertEqual(pending_levels(op), ())
+
+    def test_an_op_no_node_holds_answers_from_its_pending_record(self):
+        a = _Op("a", (0,), [4])
+        a.loop_member.loop_tiled_dims = [[1]]
+        self.assertEqual(node_levels(a), ())
+        (level,) = enclosing_loops(a)
+        self.assertEqual((level.group_path, level.tiled_dims), ((0,), (1,)))
+        self.assertEqual(counted_loop_path(a), (0,))
+
+    def test_an_op_moved_out_of_its_loop_is_no_longer_looped(self):
+        graph, node, a, b = self._tiled_pair()
+        move_after(graph.operations, node, a)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node_levels(a), ())
+        self.assertEqual(enclosing_loops(a), ())
+        self.assertFalse(is_looped(a))
+
+    def test_nested_chain_is_outermost_first(self):
+        b = _Op("b", (0,), [4])
+        c = _Op("c", (0, 0), [4, 2])
+        c.loop_member.loop_tiled_dims = [[], [2]]
+        graph = _graph([b, c])
+        collapse(graph)
+        (outer,) = graph.operations
+        inner = outer.body[1]
+        self.assertEqual(c._loop_chain, (outer, inner))
+        self.assertEqual(b._loop_chain, (outer,))
+        self.assertEqual(inner.tiling["c"], ((2,), ()))
+        self.assertEqual(outer.tiling["c"], ((), ()))
+        self.assertEqual([level.group_path for level in node_levels(c)], [(0,), (0, 0)])
+
+    def test_an_op_placed_in_a_body_joins_its_chain_and_a_stale_record_is_dropped(
+        self,
+    ):
+        graph, node, a, b = self._tiled_pair()
+        new = _Op("new", (0,), [4])
+        new.loop_member.loop_tiled_dims = [[0]]
+        insert_before(graph.operations, b, new)
+        self.assertEqual(new._loop_chain, (node,))
+        self.assertEqual(node.tiling["new"], ((0,), ()))
+        self.assertFalse(hasattr(new, "loop_member"))
+        out = _Op("out")
+        insert_after(graph.operations, node, out)
+        self.assertEqual(out._loop_chain, ())
+
+    def test_moving_an_op_out_of_a_body_clears_its_chain(self):
+        graph, node, a, b = self._tiled_pair()
+        move_after(graph.operations, node, a)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node_levels(a), ())
+
+    def test_record_member_makes_a_placed_op_a_member(self):
+        graph, node, a, b = self._tiled_pair()
+        late = _Op("late")
+        insert_before(graph.operations, b, late)
+        self.assertNotIn("late", node.tiling)
+        self.assertFalse(is_looped(late))
+        record_member(late, [([2], [])])
+        self.assertEqual(node.tiling["late"], ((2,), ()))
+        self.assertTrue(is_looped(late))
+        self.assertEqual(self._facts(enclosing_loops(late)), [((0,), 4, (2,), ())])
+
+    def test_record_member_needs_one_entry_per_node(self):
+        graph, node, a, b = self._tiled_pair()
+        with self.assertRaises(ValueError):
+            record_member(a, [([], []), ([], [])])
+        with self.assertRaises(ValueError):
+            record_member(graph.operations[0], [([], [])])  # "pre": in no node
+
+    def test_an_unplaced_member_op_inherits_its_stand_in_s_nodes(self):
+        graph, node, a, b = self._tiled_pair()
+        probe = _Op("a")
+        inherit_loop_membership(a, probe)
+        self.assertEqual(probe._loop_chain, (node,))
+        self.assertTrue(is_looped(probe))
+
+    def test_a_copy_of_a_member_placed_in_its_nodes_tiles_what_it_tiles(self):
+        """``copy_op_metadata`` marks a copy with its donor; placing the copy in the
+        donor's nodes makes it a member (an allocator clone beside its consumer)."""
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+
+        graph, node, a, b = self._tiled_pair()
+        clone = _Op("clone")
+        copy_op_metadata(a, clone)
+        insert_before(graph.operations, b, clone)
+        self.assertEqual(node.tiling["clone"], node.tiling["a"])
+        self.assertTrue(is_looped(clone))
+        self.assertFalse(hasattr(clone, "_member_like"))
+
+    def test_a_copy_of_a_non_member_stays_a_non_member(self):
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+
+        graph, node, a, b = self._tiled_pair()
+        pre = graph.operations[0]
+        clone = _Op("clone")
+        copy_op_metadata(pre, clone)
+        insert_before(graph.operations, b, clone)
+        self.assertNotIn("clone", node.tiling)
+        self.assertFalse(is_looped(clone))
+
+    def test_an_allocator_drain_or_hoisted_clone_is_not_a_member(self):
+        """The allocator clears the donor marker for a clone that is neither a member
+        nor a carry (``_clear_loop_membership_metadata``), so a copy of a member placed
+        in the body still reads as not looped."""
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _clear_loop_membership_metadata,
+        )
+
+        graph, node, a, b = self._tiled_pair()
+        clone = _Op("clone")
+        copy_op_metadata(a, clone)
+        _clear_loop_membership_metadata(clone)
+        insert_before(graph.operations, b, clone)
+        self.assertNotIn("clone", node.tiling)
+        self.assertFalse(is_looped(clone))
+
+    def test_a_probe_that_inherits_membership_drops_its_donor_marker(self):
+        from torch_spyre._inductor.pass_utils import copy_op_metadata
+
+        graph, node, a, b = self._tiled_pair()
+        probe = _Op("a")
+        copy_op_metadata(a, probe)
+        self.assertTrue(hasattr(probe, "_member_like"))
+        inherit_loop_membership(a, probe)
+        self.assertFalse(hasattr(probe, "_member_like"))
+        self.assertTrue(is_looped(probe))
+
+    def test_a_loop_that_mixes_the_tiling_lowering_with_another_is_refused(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_member.strict_loop_vars = True
+        with self.assertRaisesRegex(RuntimeError, "holds ops of the loop-tiling"):
+            collapse(_graph([a, b]))
+
+    def test_a_loop_the_tiling_lowering_made_is_strict_as_a_whole(self):
+        a, b = _Op("a", (0,), [4]), _Op("b", (0,), [4])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        collapse(graph)
+        (node,) = graph.operations
+        self.assertTrue(node.strict_loop_vars)
+
+    def test_an_unstamped_op_in_a_body_is_not_a_member(self):
+        """Being placed in a body is not being a member of the loop: an LX clone
+        beside a body consumer runs every trip but tiles nothing and has no entry, so
+        it answers "not looped" (counting it as looped made the same-tile-group
+        relayout offer a wrong candidate for it)."""
+        graph, node, a, b = self._tiled_pair()
+        once = _Op("once")
+        insert_before(graph.operations, b, once)
+        self.assertEqual(once._loop_chain, (node,))
+        self.assertEqual(len(node_levels(once)), 1)
+        self.assertEqual(enclosing_loops(once), ())
+        self.assertFalse(is_looped(once))
+        self.assertTrue(is_looped(a))
+
+    def test_replace_op_takes_the_new_ops_tiling(self):
+        graph, node, a, b = self._tiled_pair()
+        new = _Op("a", (0,), [4])
+        new.loop_member.loop_tiled_dims = [[0, 2]]
+        replace_op(graph.operations, a, new)
+        self.assertEqual(new._loop_chain, (node,))
+        self.assertEqual(node.tiling["a"], ((0, 2), ()))
+        self.assertFalse(hasattr(new, "loop_member"))
+
+    def test_remove_op_forgets_the_op_but_a_move_keeps_it(self):
+        graph, node, a, b = self._tiled_pair()
+        move_before(graph.operations, a, b)
+        self.assertEqual(node.tiling["b"], ((), (0,)))
+        self.assertEqual(b._loop_chain, (node,))
+        remove_op(graph.operations, a)
+        self.assertNotIn("a", node.tiling)
+        self.assertEqual(a._loop_chain, ())
+        self.assertEqual(node.tiling["b"], ((), (0,)))
+
+    def test_hoist_to_front_clears_the_chain(self):
+        graph, node, a, b = self._tiled_pair()
+        OpsView(graph.operations).hoist_to_front([a])
+        self.assertEqual(a._loop_chain, ())
 
 
 class TestDeadcodeOnRealNestedList(unittest.TestCase):

@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Rank attributes of a multi-card trace, for Analyses over per-rank rows stored by the ingest (schema 87).
+# Not in packs/index.yaml: register it at run time with --pack examples/packs/trace-example.
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: trace-example, owner: example-team}
+spec:
+  prefix: trace
+  version: 0.2.0
+  requires: {core: "0.2"}
+  attributes:
+    - {key: run.rank, class: run, role: root, type: int, order: numeric, stored_in: benchmark_runs.props, description: "card (rank) of a per-rank row"}
+    - {key: run.world_size, class: run, role: root, type: int, order: numeric, stored_in: benchmark_runs.props, description: "ranks the launch observed"}

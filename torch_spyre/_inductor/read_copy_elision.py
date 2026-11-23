@@ -39,10 +39,9 @@ from .constants import MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
-from .loop_facts import read_advance
-from .loop_info import LoopInfo
+from .loop_facts import enclosing_loops, read_advance, strict_loop_vars
 from .pass_utils import copy_op_metadata
-from .loop_node import remove_op
+from .loop_node import inherit_loop_membership, remove_op
 from .pass_utils import (
     _per_core_view_on_buf,
     commit_iteration_space_ownership,
@@ -151,9 +150,7 @@ def _affine_bounds(dep: MemoryDep) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _loop_advance_bound(
-    op: ComputedBuffer, dep: MemoryDep, loop_info: LoopInfo
-) -> tuple[int, int] | None:
+def _loop_advance_bound(op: ComputedBuffer, dep: MemoryDep) -> tuple[int, int] | None:
     """Inclusive address change across loop trips, in source elements.
 
     The step per trip at each level is the loop variable's coefficient in
@@ -172,8 +169,8 @@ def _loop_advance_bound(
         return None
     lo = 0
     hi = 0
-    for level_idx, trip_expr in enumerate(loop_info.loop_count):
-        trip_count = _trip_count_bound(trip_expr)
+    for level_idx, level in enumerate(enclosing_loops(op)):
+        trip_count = _trip_count_bound(level.trip_count)
         if trip_count is None or trip_count < 1:
             return None
         step = _static_int(steps[level_idx]) if level_idx < len(steps) else 0
@@ -334,19 +331,18 @@ def _prove_matmul_direct_read(
     copy_source_indices = [
         idx for idx, dep in enumerate(copy_reads) if dep.name == record.source_name
     ]
-    current_loop_info = getattr(consumer, "loop_info", None)
-    # A strict LoopInfo (made by the loop-tiling lowering) is declined on purpose: it
-    # has no saved direct form, so its copy stays.
+    # A consumer the loop-tiling lowering made (strict_loop_vars) is declined on
+    # purpose: it has no saved direct form, so its copy stays.
     if (
         len(copy_source_indices) > 1
-        or not isinstance(current_loop_info, LoopInfo)
-        or current_loop_info.strict_loop_vars
+        or not enclosing_loops(consumer)
+        or strict_loop_vars(consumer)
     ):
         return None, "copy reads its source more than once, or consumer is not looped"
     # The direct read keeps the staged copy's loop term in its index (the consumer
     # lists the loop variable in its dim_hints), so its advance is read from there.
-    resolved_loop_info = dataclasses.replace(current_loop_info)
-    direct_op.loop_info = resolved_loop_info  # type: ignore[attr-defined]
+    # It stands in for the consumer, so it is in the consumer's loops.
+    inherit_loop_membership(consumer, direct_op)
 
     source = _unwrap_buffer(V.graph.get_buffer(record.source_name))
     if not isinstance(source, InputBuffer):
@@ -386,7 +382,7 @@ def _prove_matmul_direct_read(
             return None, "source stick dimension is not the matmul output dimension"
 
     local_bounds = _affine_bounds(source_dep)
-    advance_bounds = _loop_advance_bound(direct_op, source_dep, resolved_loop_info)
+    advance_bounds = _loop_advance_bound(direct_op, source_dep)
     # A non-contiguous graph-input view can address a larger backing span than
     # its logical numel (for example, an active KV-cache prefix whose head
     # stride still reflects the maximum cache length).  Bound the generated
@@ -558,7 +554,6 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             pass_name="read_copy_elision",
             reason="read advancing input directly from HBM",
         )
-        replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):
             if hasattr(direct_op, attr):
                 setattr(replacement, attr, getattr(direct_op, attr))

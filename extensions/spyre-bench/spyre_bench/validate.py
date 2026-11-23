@@ -14,7 +14,7 @@
 
 """Validate spyre-bench catalogs: envelope + core schema, pack-typed blocks, cross-resource rules.
 
-  spyre-bench validate CATALOG_DIR... [--pack DIR]... [--central DIR]... [--base-dir DIR] [--json]
+  spyre-bench validate CATALOG_DIR... [--pack DIR]... [--central DIR]... [--base-dir DIR] [--lint-context] [--json]
 --pack registers a pack at run time (packs not in packs/index.yaml). --central adds shared NodeClass/Environment
 catalogs. --base-dir is the same tree at the merge base: a case whose benchmark_id changed under an unchanged case name
 starts a new series, and a renamed Benchmark needs previous_names. Exit 0 valid, 2 invalid.
@@ -25,7 +25,7 @@ import json
 import sys
 from pathlib import Path
 
-from spyre_bench import engine
+from spyre_bench import engine, metric_context
 
 
 def identity_changes(base, cur):
@@ -71,6 +71,7 @@ def main(argv=None):
     ap.add_argument("--central", action="append", default=[])
     ap.add_argument("--base-dir")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--lint-context", action="store_true", help="list every undeclared metric-context facet")
     a = ap.parse_args(argv)
     if engine.Draft202012Validator is None:
         print("note: jsonschema not importable; using the stdlib schema-subset validator", file=sys.stderr)
@@ -82,6 +83,8 @@ def main(argv=None):
             base = engine.Catalog([Path(a.base_dir) / Path(d).name], a.pack, a.central)
             changed, notes = identity_changes(base, cat)
             warns += changed + notes
+        if not cat.errors:
+            warns += metric_context.lint_catalog(cat, detail=a.lint_context)
         kinds = {}
         for doc in cat.docs:
             kinds[doc.kind] = kinds.get(doc.kind, 0) + 1

@@ -84,6 +84,15 @@ setup: ## Reinstall torch-spyre into the active venv (uv sync --all-extras --rei
 precommit: ## Run all pre-commit hooks against every file
 	pre-commit run --all-files
 
+# Advisory benchmark wrappers (bench-validate, bench-run, ...); see benchmarks/README.md.
+# SENPERFORMANCE=2 is what TEST_TYPE=perf sets for pt_util; here it prefixes `bench-run` only.
+BENCH_PREFIX = SENPERFORMANCE="$${SENPERFORMANCE:-2}"
+include mk/bench.mk
+
+.PHONY: bench-check-ids
+bench-check-ids: ## Check the benchmarks/ identity blocks against the ingest derivation (needs spyre-bench, pyyaml, regex, lxml, clickhouse-connect)
+	@python3 benchmarks/tools/check_identity_ids.py
+
 # ---------------------------------------------------------------------------
 # Test suites
 # ---------------------------------------------------------------------------

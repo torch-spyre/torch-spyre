@@ -81,6 +81,7 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
+    REDUCTIONS_NON_STICK_DIM_ONLY,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
 )
@@ -107,7 +108,7 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "iteration_space_ownership",
-    "loop_info",
+    "loop_member",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
@@ -170,6 +171,12 @@ def copy_op_metadata(
     for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+    if getattr(src, "_loop_chain", ()):
+        # ``src`` is a member of built loop nodes (they, not an attribute, hold
+        # that). ``dst`` is a copy of it: when a loop_node helper places ``dst``
+        # in those nodes it becomes a member that tiles what ``src`` tiles, unless
+        # the pass clears this (a drain or a hoisted clone is not a member).
+        dst._member_like = src  # type: ignore[attr-defined]
 
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1910,23 +1917,28 @@ def get_matmul_m_size(op: "Operation") -> int:
     return 1
 
 
-def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the single input iteration symbol reduced from the output.
+def reduced_loop_vars(
+    inputs: Sequence[MemoryDep], out_dep: MemoryDep
+) -> set[sympy.Symbol]:
+    """The input iteration symbols reduced from the output.
 
     Symbols must have a range on the input dependency that uses them. Indirect
     gather/scatter address symbols are not iteration dimensions.
     """
-    reduction_vars = {
+    return {
         sym
         for inp in inputs
         for sym in inp.index.free_symbols
         if sym in inp.ranges and not is_indirect(sym.name)
     } - out_dep.index.free_symbols
-    if len(reduction_vars) != 1:
-        raise Unsupported(
-            f"expected exactly 1 reduction variable, got {reduction_vars}"
-        )
-    return next(iter(reduction_vars))
+
+
+def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
+    """Return the single input iteration symbol reduced from the output."""
+    reduced = reduced_loop_vars(inputs, out_dep)
+    if len(reduced) != 1:
+        raise Unsupported(f"expected exactly 1 reduction variable, got {reduced}")
+    return next(iter(reduced))
 
 
 def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) -> set:
@@ -1942,7 +1954,7 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
+    op.loop_member.loop_tiled_dims (stamped by coarse-tiling before layout
     propagation runs, per passes.py's pass ordering) lists, per nesting
     level, the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
@@ -3371,6 +3383,249 @@ def restickify_dense_stl_to_sparse(
     return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
 
 
+def reduction_type_of(op: "Operation | None") -> "str | None":
+    """``op``'s reduction type, or ``None`` when it is not a reduction."""
+    data = getattr(op, "data", None)
+    return data.reduction_type if isinstance(data, Reduction) else None
+
+
+def non_stick_reduction_vars(
+    reduction_type: "str | None", in_dep: MemoryDep, out_dep: MemoryDep
+) -> "set[sympy.Symbol] | None":
+    """The reduced loop variables, when the reduction cannot reduce along the
+    stick dim (``REDUCTIONS_NON_STICK_DIM_ONLY``, backend #4409); else ``None``.
+
+    The one source of truth for both places that pick a relocation target --
+    ``compute_restickify_needed`` and ``_reduction_layout_from_stl``. They pick
+    independently, and a disagreement between them is exactly the bug this
+    guards: one declining to preserve the layout while the other restickified
+    the input onto the reduced dim is what raised ``UnalignedStickSplit``.
+
+    Every reduced variable is forbidden, not an arbitrary one of them. Only
+    ``prod`` is in the set today and it reduces a single dim, so the two are the
+    same today; picking one would stop guarding the moment that is not true.
+    """
+    if reduction_type not in REDUCTIONS_NON_STICK_DIM_ONLY:
+        return None
+    return reduced_loop_vars((in_dep,), out_dep)
+
+
+def output_is_indirectly_mutated(op: "Operation | None") -> bool:
+    """Whether another op scatters into ``op``'s output with an indirect index.
+
+    ``index_put_`` on a view of ``op``'s output is lowered as a second op whose
+    ``MutationLayoutSHOULDREMOVE`` targets that output and whose write index
+    carries an indirect symbol (``d1 + 1024*tmp0``). The dim that index selects
+    has to stay off the stick. When it is the stick, ``nonstick_dim_order``
+    re-tiles the destination so each entry sits on a stick of its own, and
+    ``compute_size1_restickify_target`` cannot build that re-tile out of a
+    relocated layout: ``(8, 32, 32)`` written as ``(8, 1024)`` raised "cannot
+    re-tile buf1: no size-1 stick target", where main compiles through the
+    sparse layout and reaches the backend. Relocating onto the dim the scatter
+    indexes is the one choice the relocation must not make here, and the reshape
+    leaves no other dim alone, so these reads are left to the sparse layout
+    exactly as main leaves them.
+
+    The mutating op is already in the graph when its target's layout is decided,
+    so this looks forward without needing a second pass.
+
+    TODO(#5872): forbid only the dim the scatter indexes and relocate onto
+    another, instead of declining whenever the output is scattered into.
+    """
+    get_name = getattr(op, "get_name", None)
+    if get_name is None:
+        return False
+    out_name = get_name()
+    try:
+        operations = list(V.graph.operations)
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+    for other in operations:
+        layout = getattr(other, "layout", None)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        # The target is the buffer, or any depth of MutableBox/BaseView around
+        # it; both wrapper families expose the next layer as ``.data``.
+        target, target_name = layout.target, None
+        while target is not None and target_name is None:
+            getter = getattr(target, "get_name", None)
+            target_name = getter() if getter is not None else None
+            target = getattr(target, "data", None)
+        if target_name != out_name:
+            continue
+        # Dep.is_indirect() is torch's own test and is False for a StarDep,
+        # which carries no index at all.
+        if any(write.is_indirect() for write in other.get_read_writes().writes):
+            return True
+    return False
+
+
+def dense_relocation_serves_read(
+    stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    *,
+    op: "Operation | None" = None,
+    forbidden_stick_syms: "set[sympy.Symbol] | None" = None,
+) -> "SpyreTensorLayout | None":
+    """A dense layout of ``in_host`` with the stick moved to another real dim, when
+    it can serve the read of ``dep`` that ``stl`` cannot, else ``None``.
+
+    ``forbidden_stick_syms`` are loop variables that must not land on the stick: a
+    ``prod`` cannot reduce along the stick dim (backend #4409), and the widest dim
+    a reshape leaves alone is often the reduced one. A candidate whose stick would
+    carry one of them is skipped and the next one tried
+    (``non_stick_reduction_vars`` builds the set).
+
+    A reshape that cuts the stick dim (``[4, 512, 20, 20]`` read as
+    ``[4, 4, 128, 400]``) is legal once a dim the reshape leaves alone carries the
+    stick: the cut dims are then off the stick, where cutting a row is plain
+    indexing. This is the stick relocation layout propagation already does for
+    most ops, and it keeps the tensor dense, so it is tried before the sparse layout
+    (``sparse_target_for_unservable_read``), which costs ``elems_per_stick`` times the
+    memory. Larger dims are tried first; the first that serves the read wins.
+
+    The restickify into the layout this returns is a dense one whose new stick dim
+    is one stick wide, so it carries the per-core span limit of #6132, as the
+    sparse layout carries #6113.
+
+    Candidates are tried widest first, but a dim narrower than a stick is still
+    padded up to one, so "dense" is not free: relocating onto a size-4 dim costs
+    4x the elements it holds, 16x at fp16. That stays well under the sparse
+    layout's elems_per_stick (64x at fp16), which is why it is still preferred,
+    but EdgeCostMap prices every restickify by its input size and cannot see the
+    difference, so it cannot choose between two relocations on cost.
+    """
+    if (
+        stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        or stl.element_arrangement != ElementArrangement.STANDARD
+        or is_sparse_stl(stl)
+        or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
+        or output_is_indirectly_mutated(op)
+    ):
+        return None
+    # A read at an offset (a slice, `x[1:].reshape(4, 28, 16)`) is left to the
+    # sparse layout.  The relocated coordinates are right -- the stick carries the
+    # offset, `d0 + 1` -- but the restickify copies the whole buffer and the
+    # consumer then reads the copy at `Mod(c0, 64)`, dropping the offset, so every
+    # element comes out one stick position off.  Returning the target anyway
+    # silently produced wrong values on (5, 448)[1:].reshape(4, 28, 16), which main
+    # gets right through the sparse layout.
+    #
+    # Only the loop variables and the indirect addresses are zeroed, not every
+    # free symbol: a dynamic slice start (`x[k:]`, index `448*d0 + 448*s1 + ...`)
+    # is just as much an offset, and zeroing `s1` too would read it as no offset
+    # at all and relocate it into the same wrong values.  What survives the
+    # substitution is the offset, constant or symbolic.
+    # TODO(#5872): carry the offset into the restickified buffer's read instead,
+    # and the relocation serves these too.
+    zeroed = dict.fromkeys(
+        (s for s in dep.index.free_symbols if s in dep.ranges or is_indirect(s.name)),
+        0,
+    )
+    if dep.index.xreplace(zeroed) != 0:
+        return None
+    sizes = [int(concretize_expr(v)) for v in in_host.size]
+    strides = [int(concretize_expr(v)) for v in in_host.stride]
+    by_stride = sorted(range(len(sizes)), key=lambda d: -strides[d])
+    # Which host dim the stick is on is a property of stl, not of the host strides:
+    # an input whose stick was already moved does not have it on its smallest-stride
+    # dim.  Match it by stride as restickify_dense_stl_to_sparse does, skipping
+    # size-1 dims, whose stride ties with the real stick dim's and would otherwise
+    # win a sort by stride alone.  Handing _former_stick_dim_outermost the wrong
+    # dim leaves the padding inside another dim, which is what it exists to prevent.
+    stick_stride = stl.stride_map[-1]
+    current_stick = next(
+        (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == stick_stride),
+        None,
+    )
+    if current_stick is None:
+        current_stick = next(
+            (d for d in reversed(by_stride) if sizes[d] > 1), by_stride[-1]
+        )
+    candidates = [d for d in range(len(sizes)) if d != current_stick and sizes[d] > 1]
+    for stick in sorted(candidates, key=lambda d: -sizes[d]):
+        order = [d for d in by_stride if d != stick] + [stick]
+        target = _former_stick_dim_outermost(
+            SpyreTensorLayout(sizes, strides, in_host.dtype, order),
+            sizes[current_stick],
+            strides[current_stick],
+        )
+        if target is None:
+            continue
+        coords = try_device_coordinates(target, dep, indirect_sizes, op=op)
+        if coords is None:
+            continue
+        if forbidden_stick_syms and forbidden_stick_syms & coords[-1].free_symbols:
+            continue
+        if _is_factorized_stick(coords, op):
+            # The stick variable would also sit on an outer axis, so a matmul
+            # backend sees two contraction dims and produces wrong output -- the
+            # same rejection compute_restickify_needed makes for an input layout
+            # it can read (factorized_layout_mismatch).  That check runs off the
+            # input's own coordinates, which do not exist here (this path is only
+            # reached when the input cannot serve the read at all), so the
+            # relocated target is checked instead.
+            continue
+        return target
+    return None
+
+
+def _is_factorized_stick(coords: "list[sympy.Expr]", op: "Operation | None") -> bool:
+    """Whether ``coords`` puts a matmul's stick variable on an outer axis as well.
+
+    See ``is_factorized`` in ``compute_restickify_needed``: the backend reads that
+    as two contraction dims. Only matmuls care, so a non-matmul op is never
+    factorized by this test.
+    """
+    if op is None or not _is_matmul_op(op):
+        return False
+    stick_syms = coords[-1].free_symbols
+    if not stick_syms:
+        return False
+    return sum(bool(c.free_symbols & stick_syms) for c in coords[:-1]) > 1
+
+
+def _former_stick_dim_outermost(
+    stl: SpyreTensorLayout, host_size: int, host_stride: int
+) -> "SpyreTensorLayout | None":
+    """``stl`` with the device dim of the former stick host dim moved outermost,
+    or ``None`` when that dim is not in ``stl``.
+
+    The restickify into ``stl`` pads that dim to whole sticks
+    (``_pad_restickify_output``). Outermost, the padding sits at the end of the
+    buffer; inside another dim it falls between that dim's slices, where a read
+    that walks the two dims as one (a merge) picks it up as data.
+
+    Not finding the dim fails closed. Returning ``stl`` unchanged would leave the
+    padding wherever it happens to sit, which is the wrong-values case this
+    helper exists to prevent, and it would do so silently; the caller skips the
+    candidate instead and the read falls back to the sparse layout.
+    """
+    size, smap = list(stl.device_size), list(stl.stride_map)
+    j = next(
+        (
+            k
+            for k in range(len(size) - 1)
+            if smap[k] == host_stride and size[k] == host_size
+        ),
+        None,
+    )
+    if j is None:
+        return None
+    if j == 0:
+        return stl
+    perm = [j] + [k for k in range(len(size)) if k != j]
+    return SpyreTensorLayout(
+        [size[k] for k in perm],
+        [smap[k] for k in perm],
+        stl.device_dtype,
+        reorder_valid_elements(stl, perm),
+        stl.element_arrangement,
+    )
+
+
 def sparse_target_for_unservable_read(
     stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3438,19 +3693,54 @@ def compute_restickify_needed(
     if idc is None:
         # A read the input cannot serve (flattening [8, 65] into [520] splits a
         # stick) may be served by the input's host shape in a sparse layout.
-        # TODO(#5872): this returns the sparse target for any output, without
-        # checking that it is stick_compatible with the output. That is safe only
-        # because _default_pointwise_layout and _reduction_layout return a sparse
-        # output early. Return the target only for an output it can feed.
-        # TODO(#5966): before the sparse layout, try a dense relocation of the
-        # stick: the first layout with the stick on another real dim (larger
-        # dims first, the former stick dim outermost) on which
-        # try_device_coordinates serves this read. Keep the sparse layout below
-        # as the fallback for a read with no such dim, such as a flatten to 1-D.
+        # Both targets below are returned only for an output they can feed.
+        # TODO(#5872): the end state is to offer them as candidates next to the
+        # normal ones rather than deciding here, so a rule that wants a dense
+        # output for this read can have one.  Today a pair this function rejects
+        # is reported infeasible and the beam search drops that candidate.
+        # Before the sparse layout, which costs elems_per_stick times the memory,
+        # try a dense layout with the stick on a dim the read leaves alone.
+        dense = dense_relocation_serves_read(
+            in_stl,
+            in_host,
+            in_dep,
+            ind_sizes,
+            op=op,
+            forbidden_stick_syms=non_stick_reduction_vars(
+                reduction_type_of(op), in_dep, out_dep
+            ),
+        )
+        if dense is not None:
+            # Both layout rules carry on to _candidate_output_stls after a
+            # relocation, so the output paired with this target need not have the
+            # relocated stick.  A rule that relocated differently (it probes
+            # without the indirect context this function has) also lands here,
+            # and is rejected the same way.
+            dense_idc = try_device_coordinates(dense, in_dep, ind_sizes, op=op)
+            out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
+            if (
+                dense_idc is not None
+                and out_idc is not None
+                and stick_compatible([dense_idc, out_idc])
+            ):
+                return True, dense
         sparse = sparse_target_for_unservable_read(
             in_stl, in_host, in_dep, ind_sizes, op=op
         )
         if sparse is not None:
+            # Returned unchecked, unlike the relocation above.  Running the same
+            # stick_compatible check here was tried and reverted: it rejects the
+            # sparse target for the yolo26 Detect head cat, which then fails with
+            # a bare "Unexpected stick expression Mod(Mod(d1, 80), 64)" from
+            # codegen instead of the padding pass's own message.  stick_compatible
+            # does not model the pairing a sparse target is for.
+            #
+            # The gap this leaves, which #5872's end state closes rather than a
+            # local fix: a rule that relocated reaches _candidate_output_stls and
+            # can hand back a dense output, so when the relocation above is
+            # rejected for that output the sparse target returned here is not the
+            # sparse-output pairing the rules' early return produces.  Codegen
+            # reports such a pair rather than the beam search discarding it.
             return True, sparse
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
@@ -5188,8 +5478,13 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
+            if levels := enclosing_loops(op):
+                # No induction: a node knows it, the flat path's stamp does not,
+                # and the two paths' dumps are compared.
+                buf.write(
+                    "\n  loop_levels="
+                    f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"
+                )
             buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

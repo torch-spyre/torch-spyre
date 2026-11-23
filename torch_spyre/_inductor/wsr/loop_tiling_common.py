@@ -46,6 +46,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from ..errors import Unsupported
 from ..logging_utils import get_logger
+from ..loop_facts import counted_loop_path, enclosing_loops, is_looped
 from ..propagate_hints import DimHint
 from ..pass_utils import (
     op_out_coords,
@@ -1170,7 +1171,7 @@ def _is_dense_full_buffer_view(
     ranges = tuple(consumer.data.ranges)
     reduction_ranges = tuple(getattr(consumer.data, "reduction_ranges", None) or ())
     extent_sets = [(ranges, reduction_ranges)]
-    if getattr(consumer, "loop_info", None) is not None:
+    if is_looped(consumer):
         extent_sets.append(_undivided_ranges(consumer))
 
     # Symbols number the live (possibly divided) ranges; extents come from
@@ -1224,18 +1225,16 @@ def _undivided_ranges(
     Exact because ``_divide_ranges`` refuses a trip count that does not divide
     its range; a non-exact tiling would have to record the original extent.
     """
-    info = consumer.loop_info  # type: ignore[attr-defined]
     ranges = list(consumer.data.ranges)
     reduction_ranges = list(getattr(consumer.data, "reduction_ranges", None) or ())
     hinted = _loop_var_hinted_ranges(consumer)
     hinted_reduction = _loop_var_hinted_reduction_ranges(consumer)
-    for count, dims, reduction_dims in zip(
-        info.loop_count, info.loop_tiled_dims, info.loop_tiled_reduction_dims
-    ):
-        for d in dims:
+    for level in enclosing_loops(consumer):
+        count = level.trip_count
+        for d in level.tiled_dims:
             if d not in hinted:
                 ranges[d] = ranges[d] * count
-        for d in reduction_dims:
+        for d in level.tiled_reduction_dims:
             if d not in hinted_reduction:
                 reduction_ranges[d] = reduction_ranges[d] * count
     return tuple(ranges), tuple(reduction_ranges)
@@ -1372,13 +1371,13 @@ def _retile_load_index(
     tile-local coefficients retain the general decomposition supported by that
     helper.
 
-    When ``consumer`` is given AND has no loop_info of its own (i.e. it is an
+    When ``consumer`` is given AND has no loop_member of its own (i.e. it is an
     "outside" consumer with no enclosing coarse-tile loop nest), any dim
     squeezed out of the old (tile-local) buffer but real in the new (full)
     buffer -- see _squeezed_retile_dims -- is added back as an explicit
     ``consumer``-own-symbol * new_stride term, since compute_tile_index
     cannot rescale a coefficient that isn't in the incoming index at all.
-    Inside consumers (those with their own loop_info) are never patched this
+    Inside consumers (those with their own loop_member) are never patched this
     way: their incoming index is already derived from a real, enclosing loop
     nest via normal codegen and already carries a correct term for every
     real dimension -- adding another would double-count it. Only meaningful
@@ -1475,10 +1474,10 @@ def _retile_load_index(
         new_index += preserved_index
 
     # The squeezed-dim term injection is only meaningful for a consumer with
-    # no loop_info of its own -- an "outside" consumer whose incoming index
+    # no loop_member of its own -- an "outside" consumer whose incoming index
     # was traced against buf_name's tile-local (squeezed) layout with no
     # enclosing coarse-tile loop nest to supply a term for a dim that layout
-    # squeezed away. An "inside" consumer (has loop_info) already derives its
+    # squeezed away. An "inside" consumer (has loop_member) already derives its
     # index from a real, enclosing loop nest that supplies a correct term for
     # every one of *its own* real dimensions; injecting anyway adds a bogus
     # term for any dim this consumer tiles as an output dim but that the new
@@ -1487,11 +1486,7 @@ def _retile_load_index(
     # consumer still reaches the dense-full-view check above: one in another
     # loop group can read the whole buffer every iteration, its index traced
     # at full scale.
-    if (
-        consumer is not None
-        and not hasattr(consumer, "loop_info")
-        and not dense_full_view
-    ):
+    if consumer is not None and not is_looped(consumer) and not dense_full_view:
         for d in _squeezed_retile_dims(info, consumer):
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a
@@ -1559,8 +1554,7 @@ def _should_patch_retiled_load_indexes(
         return False
     if not isinstance(op.data, (Pointwise, Reduction)):
         return False
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or loop_info.loop_group_id != group_id:
+    if counted_loop_path(op, include_extern=True) != group_id:
         return False
     # Fetch op's own read names once (memoized via _op_reads -- safe here
     # because _patch_retiled_load_indexes tests/mutates each op in

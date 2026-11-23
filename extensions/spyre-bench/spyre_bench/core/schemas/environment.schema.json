@@ -147,13 +147,82 @@
           "none",
           "device_local",
           "per_device",
-          "explicit"
+          "explicit",
+          "platform"
          ]
         },
         "cpus": {
          "type": "string",
          "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$",
          "description": "CPU list such as 0-7,16; only for policy explicit"
+        },
+        "cpus_by_device": {
+         "type": "array",
+         "items": {
+          "type": "string",
+          "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$"
+         },
+         "minItems": 1,
+         "description": "one CPU list per device, in device order; per_device only"
+        },
+        "assign": {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "cores_per_device": {
+           "type": "integer",
+           "minimum": 1
+          },
+          "spread": {
+           "enum": [
+            "pack",
+            "spread",
+            "round_robin"
+           ]
+          },
+          "smt": {
+           "enum": [
+            "primary_only",
+            "siblings",
+            "both"
+           ]
+          },
+          "reserve": {
+           "type": "integer",
+           "minimum": 0
+          },
+          "reserve_cpus": {
+           "type": "string",
+           "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$"
+          },
+          "spread_scope": {
+           "enum": [
+            "all",
+            "socket"
+           ]
+          },
+          "llc_align": {
+           "type": "boolean"
+          }
+         },
+         "required": [
+          "cores_per_device"
+         ],
+         "description": "per_device only: generate the lists at run time from the host topology"
+        },
+        "layout": {
+         "enum": [
+          "tree",
+          "ranks"
+         ],
+         "description": "tree: pin the command's process tree; ranks: also pin each rank by LOCAL_RANK behind {pin_wrapper} (per_device only)"
+        },
+        "launcher": {
+         "enum": [
+          "taskset",
+          "numactl"
+         ],
+         "description": "tool that applies the CPUs"
         },
         "require_verified": {
          "type": "boolean",

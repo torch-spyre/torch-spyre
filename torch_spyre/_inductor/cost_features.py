@@ -31,6 +31,7 @@ from .cost_model import (
     _select,
     max,
 )
+from .loop_facts import enclosing_loops, is_looped
 from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
@@ -258,31 +259,29 @@ def _input_traffic(name: str):
 
 def _loop_features(op):
     """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the coarse-tiling
-    ``loop_info`` (loop_info.py / coarse_tile.py). ``loop_trip`` = product of
+    ``loop_member`` (loop_node.LoopMember). ``loop_trip`` = product of
     loop_count (1 if not tiled). tiles_reduction_dim = loop_tiled_reduction_dims is
     non-empty (reduction-dim tiling); tiles_output_dim = loop_tiled_dims is non-empty
-    (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_info
+    (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_member
     but tile NEITHER (both lists empty), so their accumulators stay fixed (factor L); a
     genuinely tiled op's args advance (factor 1)."""
-    li = getattr(op, "loop_info", None)
-    if li is None:
+    levels = enclosing_loops(op)
+    if not levels:
         return 1, False, False
     trip = 1
-    for c in getattr(li, "loop_count", None) or []:
-        trip *= trip_count_estimate(c)
-    red_dims = getattr(li, "loop_tiled_reduction_dims", None) or []
-    out_dims = getattr(li, "loop_tiled_dims", None) or []
+    for level in levels:
+        trip *= trip_count_estimate(level.trip_count)
     return (
         max(1, trip),
-        any(bool(level) for level in red_dims),
-        any(bool(level) for level in out_dims),
+        any(bool(level.tiled_reduction_dims) for level in levels),
+        any(bool(level.tiled_dims) for level in levels),
     )
 
 
 def _tiled_symbols_per_level(op):
     """Per NESTING LEVEL, the set of loop symbols that level tiles.
 
-    ``LoopInfo`` stores the tiled dims as HOST-RANGE indices, one list per level
+    ``LoopMember`` stores the tiled dims as HOST-RANGE indices, one list per level
     (``loop_tiled_dims`` for output dims, ``loop_tiled_reduction_dims`` for reduction
     dims), while the index expressions are written in iteration-space symbols. The
     iteration space SKIPS unit-size ranges, so a host index must be mapped through the
@@ -298,13 +297,11 @@ def _tiled_symbols_per_level(op):
         loop_tiled_dims          = [[0], []]      # level 0 tiles output dim 0 -> i0
         loop_tiled_reduction_dims= [[],  [0]]     # level 1 tiles reduction dim 0 -> r0_0
     """
-    li = getattr(op, "loop_info", None)
-    if li is None:
-        return []
-    counts = list(getattr(li, "loop_count", None) or [])
-    out_lv = list(getattr(li, "loop_tiled_dims", None) or [])
-    red_lv = list(getattr(li, "loop_tiled_reduction_dims", None) or [])
-    n_levels = max(len(out_lv), len(red_lv))
+    loops = enclosing_loops(op)
+    counts = [level.trip_count for level in loops]
+    out_lv = [list(level.tiled_dims) for level in loops]
+    red_lv = [list(level.tiled_reduction_dims) for level in loops]
+    n_levels = len(loops)
     if not n_levels:
         return []
     try:
@@ -363,7 +360,7 @@ def _dep_index(dep):
 def _level_loop_vars(op, levels) -> list:
     """The ``for_each_tile`` loop variable of each level of ``levels``, or ``None``.
 
-    The ``for_each_tile`` lowering stamps one ``LoopInfo`` level per nesting
+    The ``for_each_tile`` lowering stamps one ``LoopMember`` level per nesting
     level, outermost first, and appends one ``DimHint(loop_var, loop_var_range=trip)``
     per level in the same order, so the i-th hint carrying a ``loop_var_range`` (read
     through ``loop_var_ranges_from_dim_hints``) is the loop variable of level i.  Each
@@ -445,7 +442,7 @@ def _loop_factor_for_index(index, levels, advances=None) -> int:
         # An arg REPEATS at a level whenever that level's tiled symbols are absent from
         # its index -- for EITHER reason:
         # * the level tiles nothing this op has (`coarse_tile_fill` / `_combine`, whose
-        # loop_info names a dim they do not iterate), or * the level tiles a dim this
+        # loop_member names a dim they do not iterate), or * the level tiles a dim this
         # arg's address does not depend on (matmul B under M-tiling). Both mean the same
         # physical thing: the op re-enters the same address each iteration of that
         # level. An earlier version guarded this with `if syms`, which silently dropped
@@ -482,10 +479,10 @@ def _candidate_tiling(op, tiling: Mapping):
     flags are conditions rather than bools when a count is symbolic, since the
     candidate the solver picks may leave that axis untiled (count 1).
 
-    The op must not already be coarse-tiled: its ``loop_info`` would describe a
+    The op must not already be coarse-tiled: its ``loop_member`` would describe a
     second loop nest this cannot compose with.
     """
-    if getattr(op, "loop_info", None) is not None:
+    if is_looped(op):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )
@@ -1384,7 +1381,7 @@ def extract_op_features(
     ``sym_tiling`` is a candidate coarse tiling of the (untiled) op during LX
     planning: loop variable -> trip count, concrete or the solver's symbols, as
     ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
-    Otherwise the op's committed ``loop_info`` supplies the tiling. The op's
+    Otherwise the op's committed ``loop_member`` supplies the tiling. The op's
     sizes are then the whole loop's, not one tile's, so each LX arg is cut to
     its per-tile size, as a committed tiling allocates it; an HBM arg keeps
     its full extent either way.
@@ -1444,7 +1441,7 @@ def extract_op_features(
 
     # Per-level loop structure, shared by the output's loop factor (which also scales a
     # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
-    # set above, from the committed loop_info or the candidate tiling.
+    # set above, from the committed loop_member or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
     _rw = None
     try:
@@ -1455,7 +1452,7 @@ def extract_op_features(
     if _levels and _write_index is not None:
         _write_advances = _loop_var_advances(_write_index, _loop_vars)
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
-    else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
+    else:  # no loop_member (or unreadable index) -> the pre-existing behaviour
         out_factor = _select(tiles_out_dim, 1, loop_trip)
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull

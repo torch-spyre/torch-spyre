@@ -50,8 +50,6 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-import dataclasses
-
 import sympy
 import torch
 from sympy import Expr
@@ -75,8 +73,8 @@ from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .loop_facts import read_advances_anywhere
-from .loop_node import move_before
+from .loop_facts import enclosing_loops, is_looped, read_advances_anywhere
+from .loop_node import move_before, record_member
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -94,6 +92,7 @@ from .pass_utils import (
     prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
+    try_device_coordinates,
 )
 from .views import compute_coordinates, matching_dim
 from torch_spyre._C import (
@@ -565,9 +564,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         _move_ops_before(operations, y_new_ops, op)
 
         # When coarse-tiling runs pre-stickification, the consuming matmul
-        # already carries loop_info.  The padding ops must inherit it so they
+        # already carries loop_member.  The padding ops must inherit it so they
         # remain contiguous in the loop group for build_loop_scheduler_nodes.
-        if hasattr(op, "loop_info"):
+        if is_looped(op):
+            levels = enclosing_loops(op)
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
                     # The padding op re-runs identical work every trip and reads y
@@ -576,7 +576,14 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                     # loop-invariant copy inherits the matmul's loop_tiled_dims, which
                     # are indexed against the matmul's dims, not the copy's; clear them
                     # (or place the copy before the node) when padding is node-aware.
-                    new_op.loop_info = dataclasses.replace(op.loop_info)  # type: ignore[attr-defined]
+                    record_member(
+                        new_op,
+                        [
+                            (level.tiled_dims, level.tiled_reduction_dims)
+                            for level in levels
+                        ],
+                        like=op,
+                    )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
@@ -693,11 +700,21 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
     which it never did.
 
-    Only a restickify with exactly one elided operand counts: that is the case the
-    codegen assert covers (one operand's within-stick coordinate has no loop
-    symbol).  When both operands carry one, the restore is a no-op and the slice
-    write compiles correctly (``torch.cat([a, b], -1).sum(-1)`` on
-    ``(32, 8, 16, 1)``, or the copy-back into a mutated graph input).
+    Two shapes of restickify reach the raise.  One operand elided (exactly one
+    within-stick coordinate is symbol-free) is the case the codegen assert covers,
+    and it raises wherever it appears, as on main.  The two coordinates on
+    different dims is what a dense stick relocation produces, and it raises only
+    when the write really is into a sub-range of the target: a cat operand covers
+    ``[1, 80, 6400]`` of a ``[1, 80, 8400]`` buffer, where the old-stick dim
+    cannot be padded in place.
+
+    A write that covers the whole target is not a slice and compiles, even with
+    the two coordinates on different dims -- a copy-back into a mutated graph
+    input whose target layout is transposed covers ``[64, 64]`` of ``[64, 64]``.
+    Raising unconditionally instead broke exactly that
+    (``test_infeasible_target_layout_preserves_copy_back``), while narrowing it to
+    the elided case let a relocated write into a cat slice through, where codegen
+    emitted wrong addresses rather than raising.
 
     TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
     copy it into the slice (see the TODO in ``_pad_restickify_output``); then
@@ -713,16 +730,80 @@ def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
     if in_dep is None or not isinstance(real, FixedTiledLayout):
         return
     write_dep = _write_dep(op)
-    in_coords = device_coordinates(in_layout.device_layout, in_dep)
-    out_coords = device_coordinates(real.device_layout, write_dep)
+    # This runs on every pointwise op with a mutation-layout output, which the
+    # padding pass never computed coordinates for before.  Probe rather than
+    # compute, so an unrepresentable coordinate leaves the op to fail with its
+    # own error instead of the generic one from here.  The trade-off: a sliced
+    # restickify whose coordinates cannot be represented on either side now
+    # skips this guard, and codegen reports it instead.  Layout selection
+    # rejects such a read before codegen, so nothing reaches here that way
+    # today; if that changes, the error moves rather than the behaviour.
+    in_coords = try_device_coordinates(in_layout.device_layout, in_dep, None)
+    out_coords = try_device_coordinates(real.device_layout, write_dep, None)
     if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
         return
-    if bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols):
-        raise Unsupported(
-            f"insert_restickify_padding: restickify written into a slice of "
-            f"another buffer on {op.get_name()} (for example torch.cat of "
-            f"tensors that need a restickify) cannot be padded in place"
+    elided = bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols)
+    if not elided and _covers_whole_target(layout, real):
+        return
+    raise Unsupported(
+        f"insert_restickify_padding: restickify written into a slice of "
+        f"another buffer on {op.get_name()} (for example torch.cat of "
+        f"tensors that need a restickify) cannot be padded in place"
+    )
+
+
+def _covers_whole_target(
+    layout: MutationLayoutSHOULDREMOVE, real: FixedTiledLayout
+) -> bool:
+    """Whether the mutating write spans all of the buffer it writes into.
+
+    A cat operand writes a sub-range of the cat buffer and is a slice; a
+    copy-back into a mutated graph input writes the whole target and is not.
+
+    Element count, not the size list: a copy-back through a reshaped view of the
+    same storage (a ``(4096,)`` input mutated as ``x.view(64, 64)``) covers the
+    whole buffer with a different shape, and comparing size lists would call it a
+    slice and raise where main does not.
+
+    The offset comes from the view being mutated, not from ``layout``, whose own
+    offset ``MutationLayoutSHOULDREMOVE`` never sets: a same-sized write partway
+    into the target is still a slice. Anything that does not concretize is treated
+    as a slice, which keeps the raise rather than letting an unpadded write
+    through.
+    """
+
+    def numel(sizes) -> int:
+        n = 1
+        for s in sizes:
+            n *= int(concretize_expr(s))
+        return n
+
+    try:
+        if numel(layout.size) != numel(real.size):
+            return False
+        return int(concretize_expr(_mutated_view_offset(layout))) == int(
+            concretize_expr(real.offset)
         )
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _mutated_view_offset(layout: MutationLayoutSHOULDREMOVE) -> Expr:
+    """The storage offset of the view ``layout`` mutates.
+
+    ``layout.target`` is the mutated node: a ``StorageBox`` for a whole buffer, a
+    ``ReinterpretView`` for a slice of one, and the view's own layout carries the
+    offset that tells them apart.
+    """
+    target = getattr(layout, "target", None)
+    target_layout = (
+        target.get_layout()
+        if target is not None and hasattr(target, "get_layout")
+        else None
+    )
+    if target_layout is not None and hasattr(target_layout, "offset"):
+        return target_layout.offset
+    return getattr(layout, "offset", sympy.Integer(0))
 
 
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:

@@ -145,6 +145,16 @@ on:
         type: boolean
         default: false
 
+      bench_mode:
+        description: >-
+          Perf job only: off (default, nothing changes) | side-by-side (also feed the same report.xml through the
+          benchmarks/ catalog and file the engine's results as a connected CI run in the bench-<workflow> series) | replace (skip the
+          legacy ingest and store the catalog's rows in v2 only, keeping the legacy workflow name and run id; fails on a report
+          row no case declares).
+        required: false
+        type: string
+        default: off
+
       # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
       # override the pinned pytorch-cpu wheel with the exact PyTorch build
       # torch-spyre's _C.so is compiled against. Empty (default) = every
@@ -179,19 +189,20 @@ on:
       # path the way the matrix suites do. Instead the perf job pushes it inline.
       # All optional: a caller that omits them (or a non-perf run) simply skips
       # the inline push, leaving every existing caller byte-for-byte unchanged.
+      # CLICKHOUSE_HOST/PORT only back up the v2 endpoint; the scoped v2 login is the credential.
       CLICKHOUSE_HOST:
         required: false
       CLICKHOUSE_PORT:
         required: false
-      CLICKHOUSE_USER:
-        required: false
-      CLICKHOUSE_PASS:
-        required: false
-      CLICKHOUSE_DB:
-        required: false
-      # The v2 database for the covered-tier lookup. The other four CLICKHOUSE_* secrets
-      # above already serve it -- one instance, one naming scheme.
       CLICKHOUSE_DB_V2:
+        required: false
+      CLICKHOUSE_V2_HOST:
+        required: false
+      CLICKHOUSE_V2_PORT:
+        required: false
+      CLICKHOUSE_V2_USER:
+        required: false
+      CLICKHOUSE_V2_PASSWORD:
         required: false
 
 defaults:
@@ -199,6 +210,13 @@ defaults:
     shell: bash
 
 env:
+  # Read by the ingest library: fail when a v2 database has no v2 host; the v2 database list.
+  CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+  CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+  # Kill switch, red-on-park and the per-call retry deadline of the v2 write path.
+  CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+  CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+  CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
   # The baked torch-spyre source dir in the dev image (runner is FROM
   # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
   PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
@@ -271,15 +289,14 @@ jobs:
           ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
           DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           DELTA_ARCH: ${{ inputs.runner_label }}
-          # Same secrets the ingest path uses. Previously these read a SPYRE_CH_* set of
-          # vars/secrets that was never configured in any repo or org, so the lookup always
-          # took its unset branch and every run silently ran the FULL tier -- the delta could
-          # not fire at all. Absent secrets still fail open, by design.
+          # Absent secrets fail open: the lookup is skipped and the full tier runs.
           CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
           CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
           CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          CLICKHOUSE_V2_HOST: ${{ secrets.CLICKHOUSE_V2_HOST }}
+          CLICKHOUSE_V2_PORT: ${{ secrets.CLICKHOUSE_V2_PORT }}
+          CLICKHOUSE_V2_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+          CLICKHOUSE_V2_PASSWORD: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -336,7 +353,7 @@ jobs:
           COVERED_RUNS="[]"
           # Guard on the HOST, which is what the resolver needs; SPYRE_CH_URL was never set
           # by anything, so this condition could never be true and the delta never ran.
-          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_HOST:-}" ]; then
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_V2_HOST:-${CLICKHOUSE_HOST:-}}" ]; then
             _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
               --commit-sha "${DELTA_SHA}" \
               --arch "${DELTA_ARCH}" \
@@ -755,7 +772,7 @@ jobs:
           retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
-      # Records this leg's suite as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
+      # Records this leg's suite as a uniquely-named artifact so the retry collectors can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion. Uploaded before the leg finishes, which is what lets the early collector start a retry while the rest of the matrix is still running.
       - name: Save suite descriptor for pod-level retry
         if: failure()
         shell: bash
@@ -769,7 +786,7 @@ jobs:
       # run-scoped, not attempt-scoped (there is no /attempts/N/artifacts
       # endpoint and no attempt field on the artifact object), and a re-run
       # keeps the earlier attempt's descriptors until they expire. Without the
-      # attempt in the name, collect_failed_suites on a later attempt reads a
+      # attempt in the name, a retry collector on a later attempt reads a
       # stale descriptor from a prior attempt and retries a suite that already
       # passed. See retention-days:1 below -- it does not help within 24h.
       # The name also carries generate_matrix's call_id, because the same run
@@ -823,7 +840,7 @@ jobs:
       # Mapped to env so the inline-ingest step can gate on it: secrets cannot be
       # used in a step `if:`. Empty (caller passed no ClickHouse secrets) => the
       # ingest step is skipped and the perf run still succeeds.
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_INGEST_HOST: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
     steps:
       # ALWAYS sparse-checkout .github from the workflow ref, in BOTH prebaked
       # and normal mode. `uses: ./.github/actions/*` resolves the action
@@ -850,7 +867,11 @@ jobs:
           # and .github alone yields the script without it.
           sparse-checkout: |
             .github
+            Makefile
+            mk
+            benchmarks
             extensions/clickhouse-ingest
+            extensions/spyre-bench
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
@@ -926,14 +947,16 @@ jobs:
       # cannot ride the push-to-clickhouse.yaml artifact-download path the
       # matrix suites use. The composite action is the SAME ingest
       # implementation that workflow reuses, so there is one code path, not two.
-      # Gated on CLICKHOUSE_HOST: a caller that passes no ClickHouse secrets
+      # Gated on the ClickHouse host: a caller that passes no ClickHouse secrets
       # skips the push and the perf run still succeeds. Nightly has secrets, so
       # --trigger-type perf + 0 parsed records fails the ingest step.
       - name: Ingest perf report into ClickHouse (inline, no artifact)
         id: ingest
-        if: ${{ env.CLICKHOUSE_HOST != '' }}
+        if: ${{ env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode != 'replace' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
+          # strict (the default) on purpose: this step is the only writer and the report is never uploaded,
+          # so a failed or parked write is lost data and must show red.
           xml-dir: ${{ env.RESULTS_DIR }}
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
@@ -954,15 +977,110 @@ jobs:
           # Workspace sparse-checkout of this ref's .github — not the baked
           # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
           torch-spyre-dir: ${{ github.workspace }}
-          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
-          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
-          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
-          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
-          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          # Without these two the v2 write is a no-op, so benchmark_runs stays empty and the
-          # benchmark path is unreachable -- the perf job is its only producer.
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
           clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
-          schema: both
+
+      # bench_mode != off: the report just produced, split into the benchmarks/ catalog's cases (no second suite run).
+      - name: Install uv (bench mirror)
+        if: ${{ !cancelled() && contains(fromJSON('["side-by-side","replace"]'), inputs.bench_mode) }}
+        continue-on-error: ${{ inputs.bench_mode != 'replace' }}
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Mirror the perf report through the bench catalog
+        id: bench-mirror
+        if: ${{ !cancelled() && contains(fromJSON('["side-by-side","replace"]'), inputs.bench_mode) && steps.confirm-report.outcome == 'success' }}
+        continue-on-error: ${{ inputs.bench_mode != 'replace' }}
+        env:
+          BENCH_MODE: ${{ inputs.bench_mode }}
+          ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+          BENCH_PURPOSE: on-demand
+          BENCH_ENVIRONMENT: one-device
+          BENCH_REUSE: never
+          BENCH_INVOKER: gha
+          BENCH_QUIET: '1'
+          BENCH_INGEST: '0'
+          BENCH_REQUIRED: '1'
+          BENCH_SUITE_FROM: ${{ env.RESULTS_DIR }}
+          BENCH_PASS_ENV: BENCH_SUITE_FROM
+        run: |
+          set -eu
+          uv venv --clear .bench-venv
+          uv pip install --python .bench-venv/bin/python ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          make bench-validate bench-check-ids
+          strict=""
+          if [ "${BENCH_MODE}" = "replace" ]; then strict="--strict"; fi
+          python3 benchmarks/tools/check_report_coverage.py "${RESULTS_DIR}" ${strict} \
+            --cases-file "${GITHUB_WORKSPACE}/bench-cases.txt"
+          # Only the cases whose rows this report holds: a declared series the suite no longer emits is not a failure.
+          BENCH_CASES="$(paste -sd, "${GITHUB_WORKSPACE}/bench-cases.txt")"
+          export BENCH_CASES
+          [ -n "${BENCH_CASES}" ] || { echo "::error::the report holds no declared case"; exit 1; }
+          make bench-run BENCH_RESULTS_DIR="${GITHUB_WORKSPACE}/bench-results"
+          python3 benchmarks/tools/collect_ingest_xml.py "${GITHUB_WORKSPACE}/bench-results" \
+            "${GITHUB_WORKSPACE}/bench-results/ingest-xml" --github-output
+
+      # side-by-side: the engine's own results as a connected CI run, filed in the bench-<workflow> series.
+      # Per-case rows only; kernel rows stay with the legacy ingest. channel-trust ci is refused by the action
+      # on pull_request / workflow_run events (this job never runs on pull_request).
+      - name: Ingest the engine results into ClickHouse (side-by-side)
+        id: bench-ingest-dir
+        if: ${{ !cancelled() && env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode == 'side-by-side' && steps.bench-mirror.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          bench-dir: ${{ github.workspace }}/bench-results
+          channel-trust: ci
+          workflow: ${{ format('bench-{0}', github.workflow) }}
+          branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
+          sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
+          trigger-type: perf
+          platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
+          torch-spyre-dir: ${{ github.workspace }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+
+      # replace: the per-case XMLs under the legacy workflow name and run id (a bench-dir run derives its own
+      # run id from the engine run, so it cannot carry the orchestrator's), kernel rows included.
+      - name: Ingest the mirrored rows into ClickHouse (replace)
+        id: bench-ingest
+        if: ${{ !cancelled() && env.CLICKHOUSE_INGEST_HOST != '' && inputs.bench_mode == 'replace' && steps.bench-mirror.outcome == 'success' }}
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          # strict (the default) on purpose: in replace mode this is the only writer of the perf rows.
+          xml-dir: ${{ github.workspace }}/bench-results/ingest-xml
+          workflow: ${{ github.workflow }}
+          branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
+          sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
+          run-id: ${{ inputs.run_id }}
+          triggered-at: ''
+          pr-number: ''
+          trigger-type: perf
+          platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
+          torch-spyre-dir: ${{ github.workspace }}
+          clickhouse-v2-host: ${{ secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST }}
+          clickhouse-v2-port: ${{ (secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_PORT)
+            || '' }}
+          clickhouse-v2-user: ${{ secrets.CLICKHOUSE_V2_USER }}
+          clickhouse-v2-pass: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       # Four honesty lines. Echo only — never upload report.xml (public
       # artifacts would leak benchmark numbers).
@@ -971,7 +1089,10 @@ jobs:
         env:
           EXEC_OUTCOME: ${{ steps.run-perf.outcome }}
           REPORT_OUTCOME: ${{ steps.confirm-report.outcome }}
-          INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+          INGEST_OUTCOME: ${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.ingest.outcome }}
+          BENCH_MODE: ${{ inputs.bench_mode }}
+          BENCH_MIRROR_OUTCOME: ${{ steps.bench-mirror.outcome }}
+          BENCH_INGEST_OUTCOME: ${{ inputs.bench_mode == 'replace' && steps.bench-ingest.outcome || steps.bench-ingest-dir.outcome }}
         run: |
           if [ "${EXEC_OUTCOME}" = "success" ]; then
             EXEC=PASS
@@ -1003,6 +1124,7 @@ jobs:
           echo "report validation: ${VALIDATION}"
           echo "ClickHouse ingest: ${INGEST}"
           echo "reason: ${REASON}"
+          echo "bench mode: ${BENCH_MODE:-off}; mirror: ${BENCH_MIRROR_OUTCOME:-n/a}; bench ingest: ${BENCH_INGEST_OUTCOME:-n/a}"
 
   # v1 model-ops: delete once the dashboard reads v2 capabilities
   # ---------------------------------------------------------------------------
@@ -1350,7 +1472,7 @@ jobs:
           retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
-      # See the `test` job's identical step: lets collect_failed_suites rebuild a retry matrix without relying on this job's (continue-on-error-muddied) own conclusion.
+      # See the `test` job's identical step: lets the retry collectors rebuild a retry matrix without relying on this job's (continue-on-error-muddied) own conclusion.
       - name: Save suite descriptor for pod-level retry
         if: failure()
         shell: bash
@@ -1371,118 +1493,301 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Job 2b: collect suites that need a pod-level retry -- reads the failed-suite-* / failed-suite-multi-* artifacts and rebuilds two retry matrices (generate_matrix's {"suite": [...]} shape) for test_retry / test_multi_spyre_retry below to consume via fromJSON.
+  # Job 2a: test-matrix fan-in -- this job's own completion is the signal
+  # collect_failed_suites_early polls for to learn that every leg has finished. It does no
+  # work and uploads nothing: an artifact would be one more thing that can fail to appear,
+  # and a poller that misses the end of the matrix holds up the final wave behind it.
+  # ---------------------------------------------------------------------------
+  legs_complete:
+    # call_id in the display name is what the poller matches on, so a run holding two calls
+    # of this workflow (runtests_nightly.yaml) matches only its own. Keep it in step with
+    # FANIN_JOB_NAME in collect_retry_suites.py.
+    name: Test matrix fan-in (${{ needs.generate_matrix.outputs.call_id }})
+    needs: [generate_matrix, test, test_multi_spyre]
+    # always(): the fan-in must happen even when every leg was skipped (perf mode, a failed
+    # build) or some leg failed, or the early collector polls on to its deadline.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record that every test leg has finished
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          TEST_MULTI_RESULT: ${{ needs.test_multi_spyre.result }}
+        run: echo "test=${TEST_RESULT} test_multi_spyre=${TEST_MULTI_RESULT}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2b: EARLY retry-wave collector -- starts with the test matrix and returns at the
+  # first failed-suite descriptor, so test_retry below claims a fresh pod while the rest of
+  # the matrix is still running. The single collector this replaces waited for every leg,
+  # which put the runtime of the slowest suite in the matrix between a two-minute flake and
+  # its retry. Suites that fail after this snapshot are collect_failed_suites' job.
+  # ---------------------------------------------------------------------------
+  collect_failed_suites_early:
+    name: Collect suites for pod-level retry (early)
+    needs: [generate_matrix, build_torch_spyre]
+    # The `test` job's own guard: where no leg runs there is nothing to collect.
+    if: >-
+      !cancelled() &&
+      needs.generate_matrix.outputs.resolved_test_type != 'perf' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    # This wave is only ever a head start, and collect_failed_suites must not inherit its
+    # failures: without this a 502 here would fail the caller's gate on a green run. The
+    # final wave retries every failed suite on its own, and test_result says so.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    # Holds a cardless runner while the matrix runs -- the cost of polling. Normally it
+    # returns at the first failure or at the fan-in; --deadline-secs bounds the case where
+    # it sees neither, because collect_failed_suites waits on this job.
+    timeout-minutes: 95
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      has_failed: ${{ steps.collect.outputs.has_failed }}
+    steps:
+      # Only the collector script, and deliberately from the default checkout (this
+      # workflow's own commit) rather than inputs.ref/inputs.repository: those name the
+      # PRODUCT under test, while this is CI harness that must match the workflow running
+      # it. Same as the "Checkout composite actions" steps, which also pass neither.
+      - name: Checkout the collector script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # The flags travel through env, not interpolated into the command line, so a caller
+      # value like "--cpu-compile -vvv -s" reaches the script as one argument. --opt=value
+      # is required for those two, not style: argparse reads a bare "-v" as another option.
+      - name: Wait for the first failure, then build the retry matrix
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALL_ID: ${{ needs.generate_matrix.outputs.call_id }}
+          CONFIG_ROOT: ${{ needs.generate_matrix.outputs.config_root }}
+          TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+          EXTRA_TEST_FLAGS: ${{ inputs.extra_test_flags }}
+          EXTRA_TEST_FLAGS_MULTI: ${{ inputs.extra_test_flags_multi_spyre }}
+        run: |
+          python3 .github/scripts/collect_retry_suites.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --call-id "${CALL_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --config-root "${CONFIG_ROOT}" \
+            --test-type "${TEST_TYPE}" \
+            --extra-test-flags="${EXTRA_TEST_FLAGS}" \
+            --extra-test-flags-multi="${EXTRA_TEST_FLAGS_MULTI}" \
+            --fanin-job-name="Test matrix fan-in ({call_id})" \
+            --deadline-secs=5400 \
+            --wait-for-failure
+
+  # ---------------------------------------------------------------------------
+  # Job 2c: FINAL retry-wave collector -- after the matrix fans in, collects every failed
+  # suite the early wave did not already claim. Both waves are needed: `test` and
+  # `test_multi_spyre` are continue-on-error, so a failure no retry job ever re-runs would
+  # leave test_result green.
   # ---------------------------------------------------------------------------
   collect_failed_suites:
     name: Collect suites for pod-level retry
-    needs: [generate_matrix, test, test_multi_spyre]
+    needs: [generate_matrix, test, test_multi_spyre, collect_failed_suites_early]
     if: always()
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.collect.outputs.matrix }}
-      matrix_multi: ${{ steps.collect.outputs.matrix_multi }}
-      has_failed_single: ${{ steps.collect.outputs.has_failed_single }}
-      has_failed_multi: ${{ steps.collect.outputs.has_failed_multi }}
+      has_failed: ${{ steps.collect.outputs.has_failed }}
     steps:
-      - name: Download failed-suite descriptors and build retry matrices
+      - name: Checkout the collector script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # --opt=value for the flag options: see the early collector above.
+      - name: Build the retry matrix for whatever the early wave left
         id: collect
         env:
           GH_TOKEN: ${{ github.token }}
+          CALL_ID: ${{ needs.generate_matrix.outputs.call_id }}
+          CONFIG_ROOT: ${{ needs.generate_matrix.outputs.config_root }}
+          TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+          EXTRA_TEST_FLAGS: ${{ inputs.extra_test_flags }}
+          EXTRA_TEST_FLAGS_MULTI: ${{ inputs.extra_test_flags_multi_spyre }}
+          # Empty when the early wave was skipped or claimed nothing, which excludes
+          # nothing -- a wave that did not run can never cost a suite its retry.
+          EARLY_MATRIX: ${{ needs.collect_failed_suites_early.outputs.matrix }}
         run: |
-          mkdir -p failed_suites
-          # --paginate: the artifacts endpoint defaults to 30 per page. A
-          # regression run uploads one XML per suite plus the wheel, well over
-          # one page, and an un-paginated query silently drops every descriptor
-          # past page 1: a suite whose failed-suite-<jobid> descriptor lands
-          # later is never retried and the gate reports green. --paginate
-          # applies --jq per page and concatenates the results (gh rejects
-          # --slurp combined with --jq), so emit a per-object JSON stream, not
-          # a wrapped array, and let python3 slurp the stream into one array.
-          # Same idiom as push-to-clickhouse.yaml.
-          #
-          # startswith("failed-suite-<call_id>-<attempt>-"): the artifacts
-          # endpoint is run-scoped, not call- or attempt-scoped. It returns
-          # descriptors from every call of this reusable workflow in the run
-          # (runtests_nightly.yaml calls it twice) and from every attempt (a
-          # re-run keeps the prior attempt's artifacts until they expire).
-          # Selecting only this call's, current attempt's descriptors stops a
-          # call from retrying another call's suites (with its own, wrong
-          # config_root and flags) and a re-run from retrying a suite that
-          # failed on an earlier attempt but passed on this one. The upload
-          # steps stamp both into the name for exactly this filter.
-          PREFIX="${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-"
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"failed-suite-${PREFIX}\") or startswith(\"failed-suite-multi-${PREFIX}\")) | {id: .id, name: .name}" \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
-
-          ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
-          import json, os, subprocess
-          artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo = "${{ github.repository }}"
-          for a in artifacts:
-              result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
-                  capture_output=True, check=True,
-              )
-              out_dir = f"failed_suites/{a['name']}"
-              os.makedirs(out_dir, exist_ok=True)
-              zip_path = f"{out_dir}.zip"
-              with open(zip_path, "wb") as f:
-                  f.write(result.stdout)
-              subprocess.run(["unzip", "-q", "-o", zip_path, "-d", out_dir], check=True)
-          print(f"Downloaded {len(artifacts)} failed-suite descriptor(s).")
-          PYEOF
-
-          python3 <<'PYEOF'
-          import glob, json, os
-
-          def load(pattern):
-              suites = []
-              for path in sorted(glob.glob(pattern)):
-                  with open(path) as f:
-                      suites.append(json.load(f))
-              return suites
-
-          # Names are failed-suite-<call_id>-<attempt>-<idx> (single) and
-          # failed-suite-multi-<call_id>-<attempt>-<idx> (multi); the --jq
-          # select above already scoped the download to this call and attempt.
-          # The single glob spells out the call_id, so it never matches the
-          # "failed-suite-multi-*" descriptors.
-          prefix = "${{ needs.generate_matrix.outputs.call_id }}-" + os.environ["GITHUB_RUN_ATTEMPT"]
-          multi = load(f"failed_suites/failed-suite-multi-{prefix}-*/suite.json")
-          single = load(f"failed_suites/failed-suite-{prefix}-*/suite.json")
-
-          print(f"Single-card suites to retry: {[s.get('name') for s in single]}")
-          print(f"Multi-card suites to retry : {[s.get('name') for s in multi]}")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"matrix={json.dumps({'suite': single})}\n")
-              f.write(f"matrix_multi={json.dumps({'suite': multi})}\n")
-              f.write(f"has_failed_single={'true' if single else 'false'}\n")
-              f.write(f"has_failed_multi={'true' if multi else 'false'}\n")
-          PYEOF
+          python3 .github/scripts/collect_retry_suites.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --call-id "${CALL_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --config-root "${CONFIG_ROOT}" \
+            --test-type "${TEST_TYPE}" \
+            --extra-test-flags="${EXTRA_TEST_FLAGS}" \
+            --extra-test-flags-multi="${EXTRA_TEST_FLAGS_MULTI}" \
+            --exclude-matrix "${EARLY_MATRIX}"
 
   # ---------------------------------------------------------------------------
-  # Job 2c: single-card pod-level retry -- re-runs, on brand-new ARC pods, exactly the suites collect_failed_suites found failed; mirrors `test`'s steps. No further looping: a suite that fails again here is a genuine failure.
+  # Job 2d: pod-level retry, EARLY wave -- re-runs, on brand-new ARC pods, the suites
+  # collect_failed_suites_early saw fail, while the rest of the matrix is still running.
+  # No further looping: a suite that fails again here is a genuine failure.
+  #
+  # One job serves both card classes: every per-suite knob (runner label, config paths,
+  # report name, flags, --parallel) comes from the matrix entry the collector built, so
+  # collect_retry_suites.py holds what `test`/`test_multi_spyre` hold in YAML.
   # ---------------------------------------------------------------------------
   test_retry:
+    # The "(pod-level retry)" suffix is load-bearing, not decoration: hw_parse.py derives
+    # pod_level_retry from it when ingesting these jobs' logs. Keep it on every wave.
     name: ${{ matrix.suite.name }} (pod-level retry)
-    needs: [generate_matrix, build_torch_spyre, collect_failed_suites]
+    needs: [generate_matrix, build_torch_spyre, collect_failed_suites_early]
     if: >-
       !cancelled() &&
-      needs.collect_failed_suites.outputs.has_failed_single == 'true' &&
+      needs.collect_failed_suites_early.outputs.has_failed == 'true' &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
     runs-on:
       - x86_64
-      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
+      - ${{ matrix.suite.runner }}
       - ${{ inputs.runner_label }}
       - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       CI: ''
-      TORCH_SPYRE_TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+      # '' for the multi-card suites, whose first attempt sets none either.
+      TORCH_SPYRE_TEST_TYPE: ${{ matrix.suite.test_type }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.collect_failed_suites_early.outputs.matrix) }}
+
+    steps:
+      - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Check out pre-built PyTorch
+        if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner, inputs.runner_label, inputs.image_label) }}
+
+      - name: Install prebuilt torch-spyre
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
+
+      # The collector derived report_name and config_paths from the failed leg's own
+      # descriptor, so this is only the workspace-qualified path plus, for a bucket, the
+      # member list the job name is too narrow to show.
+      - name: Derive the report path
+        env:
+          REPORT_NAME: ${{ matrix.suite.report_name }}
+          CONFIG_PATHS: ${{ matrix.suite.config_paths }}
+          SUITE_NAME: ${{ matrix.suite.name }}
+        run: |
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          {
+            echo "### ${SUITE_NAME} (pod-level retry)"
+            for c in ${CONFIG_PATHS}; do echo "- \`${c}\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
+      - name: Download the first attempt's JUnit XML report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ matrix.suite.report_name }}
+          path: ${{ runner.temp }}/replaced-report
+
+      - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
+        id: run_tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          retried: pod
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ matrix.suite.report_name }}
+          suite_name: ${{ matrix.suite.name }}
+          config: ${{ matrix.suite.config_paths }}
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags }}
+          # 'false' for the distributed suites, which drive torchrun themselves.
+          parallel: ${{ matrix.suite.parallel }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ matrix.suite.report_name }}
+          pre_run: |
+            set +u
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
+
+      # overwrite: true replaces the failed first attempt's report (same report_name) so downstream consumers see only the corrected result, not a name conflict.
+      - name: Upload JUnit XML report
+        if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.suite.report_name }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: ${{ inputs.report_retention_days }}
+          overwrite: true
+
+  # ---------------------------------------------------------------------------
+  # Job 2e: pod-level retry, FINAL wave -- test_retry's steps for the suites that failed
+  # after the early wave's snapshot. Kept a separate job because a matrix is fixed when its
+  # job starts: test_retry cannot pick up a suite that fails after it began.
+  # ---------------------------------------------------------------------------
+  test_retry_final:
+    # Same display name as the early wave: a suite is retried by exactly one of them, and
+    # hw_parse.py reads pod_level_retry off this suffix.
+    name: ${{ matrix.suite.name }} (pod-level retry)
+    needs: [generate_matrix, build_torch_spyre, collect_failed_suites]
+    if: >-
+      !cancelled() &&
+      needs.collect_failed_suites.outputs.has_failed == 'true' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - ${{ matrix.suite.runner }}
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      CI: ''
+      TORCH_SPYRE_TEST_TYPE: ${{ matrix.suite.test_type }}
 
     strategy:
       fail-fast: false
@@ -1515,7 +1820,7 @@ jobs:
         with:
           verbose: 'true'
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
-          runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner || 'spyre_pf_x1', inputs.runner_label, inputs.image_label) }}
+          runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner, inputs.runner_label, inputs.image_label) }}
 
       - name: Install prebuilt torch-spyre
         if: >-
@@ -1525,45 +1830,31 @@ jobs:
         with:
           artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
 
-      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
-      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
-      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
-      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
-      # it wins. No-op (skipped) for every existing caller.
+      # See the early wave: pytorch/pytorch dispatch path only, no-op for every other caller.
       - name: Install prebuilt PyTorch
         if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
         uses: ./.github/actions/install-prebuilt-pytorch
         with:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
-      - name: Derive report paths
+      - name: Derive the report path
+        env:
+          REPORT_NAME: ${{ matrix.suite.report_name }}
+          CONFIG_PATHS: ${{ matrix.suite.config_paths }}
+          SUITE_NAME: ${{ matrix.suite.name }}
         run: |
-          CONFIG="${{ matrix.suite.config }}"
-          # A bucket (several short configs in one job) names its report after the bucket.
-          REPORT_STEM="${{ matrix.suite.report }}"
-          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-          # Every member of a bucket, root-qualified; one path for anything else.
-          MEMBERS="${{ matrix.suite.configs }}"
-          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
-          CONFIG_PATHS=""
-          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
-          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
-          # The job name lists only the first few members; the summary lists them all.
-          if [ -n "${MEMBERS}" ]; then
-            {
-              echo "### ${REPORT_STEM}: $(wc -w <<< "${MEMBERS}") configs in this job"
-              for m in ${MEMBERS}; do echo "- \`${m}\`"; done
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "### ${SUITE_NAME} (pod-level retry)"
+            for c in ${CONFIG_PATHS}; do echo "- \`${c}\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ${{ env.REPORT_NAME }}
+          name: ${{ matrix.suite.report_name }}
           path: ${{ runner.temp }}/replaced-report
 
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
@@ -1571,132 +1862,15 @@ jobs:
         uses: ./.github/actions/run-test-suite
         with:
           retried: pod
-          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ matrix.suite.report_name }}
           suite_name: ${{ matrix.suite.name }}
-          config: ${{ env.CONFIG_PATHS }}
+          config: ${{ matrix.suite.config_paths }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags }}
+          parallel: ${{ matrix.suite.parallel }}
           junit_xml_path: ${{ env.REPORT_PATH }}
-          report_name: ${{ env.REPORT_NAME }}
-          pre_run: |
-            set +u
-            unset _IBM_AIU_SETUP
-            rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
-
-      # overwrite: true replaces the failed first attempt's report (same REPORT_NAME) so downstream consumers see only the corrected result, not a name conflict.
-      - name: Upload JUnit XML report
-        if: always()
-        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ env.REPORT_NAME }}
-          path: ${{ env.REPORT_PATH }}
-          if-no-files-found: warn
-          retention-days: ${{ inputs.report_retention_days }}
-          overwrite: true
-
-  # ---------------------------------------------------------------------------
-  # Job 2d: multi-card pod-level retry -- mirrors test_multi_spyre.
-  # ---------------------------------------------------------------------------
-  test_multi_spyre_retry:
-    name: ${{ matrix.suite.name }} (pod-level retry)
-    needs: [generate_matrix, build_torch_spyre, collect_failed_suites]
-    if: >-
-      !cancelled() &&
-      needs.collect_failed_suites.outputs.has_failed_multi == 'true' &&
-      (needs.build_torch_spyre.result == 'success' ||
-       needs.build_torch_spyre.result == 'skipped')
-    runs-on:
-      - x86_64
-      - spyre_pf_x2
-      - ${{ inputs.runner_label }}
-      - ${{ inputs.image_label }}
-    timeout-minutes: 60
-    env:
-      CI: ''
-
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.collect_failed_suites.outputs.matrix_multi) }}
-
-    steps:
-      - name: Checkout composite actions
-        if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
-
-      - name: Expose baked composite actions in the workspace
-        if: ${{ inputs.prebaked_image }}
-        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
-
-      - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          path: torch-spyre
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
-          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-
-      - name: Check out pre-built PyTorch
-        if: ${{ inputs.checkout_pytorch }}
-        uses: ./.github/actions/checkout-pytorch
-
-      - uses: ./.github/actions/gather-runner-info
-        with:
-          verbose: 'true'
-          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
-          runner_labels: ${{ format('["x86_64","spyre_pf_x2","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
-
-      - name: Install prebuilt torch-spyre
-        if: >-
-          ${{ !inputs.prebaked_image &&
-          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
-        uses: ./.github/actions/install-prebuilt-torch-spyre
-        with:
-          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
-
-      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
-      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
-      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
-      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
-      # it wins. No-op (skipped) for every existing caller.
-      - name: Install prebuilt PyTorch
-        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
-        uses: ./.github/actions/install-prebuilt-pytorch
-        with:
-          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
-
-      - name: Derive report paths
-        run: |
-          CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-
-      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
-      - name: Download the first attempt's JUnit XML report
-        continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ${{ env.REPORT_NAME }}
-          path: ${{ runner.temp }}/replaced-report
-
-      - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
-        uses: ./.github/actions/run-test-suite
-        with:
-          retried: pod
-          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
-          suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/${{ matrix.suite.config }}
-          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
-          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
-          parallel: 'false'
-          junit_xml_path: ${{ env.REPORT_PATH }}
-          report_name: ${{ env.REPORT_NAME }}
+          report_name: ${{ matrix.suite.report_name }}
           pre_run: |
             set +u
             unset _IBM_AIU_SETUP
@@ -1708,37 +1882,64 @@ jobs:
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ env.REPORT_NAME }}
+          name: ${{ matrix.suite.report_name }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
   # ---------------------------------------------------------------------------
-  # Job 2e: test matrix result -- the job that actually decides pass/fail for the reusable workflow (test/test_multi_spyre are continue-on-error, so this job's own conclusion is what needs.run-tests.result sees in tests.yml / tests-nightly.yml).
+  # Job 2f: test matrix result -- the job that actually decides pass/fail for the reusable workflow (test/test_multi_spyre are continue-on-error, so this job's own conclusion is what needs.run-tests.result sees in tests.yml / tests-nightly.yml).
   # ---------------------------------------------------------------------------
   test_result:
     name: Test matrix result
-    needs: [collect_failed_suites, test_retry, test_multi_spyre_retry]
+    needs: [collect_failed_suites_early, collect_failed_suites, test_retry, test_retry_final]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate combined result
         run: |
-          echo "Single-card suites retried : ${{ needs.collect_failed_suites.outputs.has_failed_single }}"
-          echo "Multi-card suites retried  : ${{ needs.collect_failed_suites.outputs.has_failed_multi }}"
+          echo "Early wave retried suites  : ${{ needs.collect_failed_suites_early.outputs.has_failed }}"
+          echo "Final wave retried suites  : ${{ needs.collect_failed_suites.outputs.has_failed }}"
           echo "test_retry result          : ${{ needs.test_retry.result }}"
-          echo "test_multi_spyre_retry result : ${{ needs.test_multi_spyre_retry.result }}"
+          echo "test_retry_final result    : ${{ needs.test_retry_final.result }}"
 
           FAIL=0
           if [[ "${{ needs.test_retry.result }}" == "failure" ]]; then
-            echo "::error::One or more single-card suites still failed after pod-level retry."
+            echo "::error::One or more suites still failed after the early pod-level retry."
             FAIL=1
           fi
-          if [[ "${{ needs.test_multi_spyre_retry.result }}" == "failure" ]]; then
-            echo "::error::One or more multi-card suites still failed after pod-level retry."
+          if [[ "${{ needs.test_retry_final.result }}" == "failure" ]]; then
+            echo "::error::One or more suites still failed after the final pod-level retry."
             FAIL=1
           fi
+          # The final collector is the only thing that reads EVERY descriptor, and `test` is
+          # continue-on-error: if it dies, test_retry_final skips and the run would report
+          # green having never re-run -- or even listed -- the suites that failed.
+          if [[ "${{ needs.collect_failed_suites.result }}" == "failure" ]]; then
+            echo "::error::The pod-level-retry collector failed; failed suites may not have been retried."
+            FAIL=1
+          fi
+          # An early collector that died costs only the head start: it claims nothing, so
+          # the final wave retries every failed suite itself.
+          if [[ "${{ needs.collect_failed_suites_early.result }}" == "failure" ]]; then
+            echo "::warning::The early retry collector failed; the final wave covered its suites."
+          fi
+          # A wave whose collector found failures but whose retry job never ran. The final
+          # wave excludes what the early wave CLAIMED, not what it re-ran, so a skipped
+          # test_retry would otherwise strand those suites: nothing re-runs them and
+          # nothing reports them, because their first attempt was continue-on-error.
+          # Belt and braces -- the retry jobs' `if:` is the collectors' own guard plus a
+          # non-empty matrix, so this should be unreachable.
+          for wave in \
+            "early:${{ needs.collect_failed_suites_early.outputs.has_failed }}:${{ needs.test_retry.result }}" \
+            "final:${{ needs.collect_failed_suites.outputs.has_failed }}:${{ needs.test_retry_final.result }}"; do
+            IFS=: read -r name had_failures retry_result <<< "$wave"
+            if [[ "$had_failures" == "true" && "$retry_result" == "skipped" ]]; then
+              echo "::error::The ${name} wave found failed suites but its retry job never ran; they were neither re-run nor reported."
+              FAIL=1
+            fi
+          done
           exit "$FAIL"
 
   # ---------------------------------------------------------------------------
@@ -1751,8 +1952,8 @@ jobs:
   report_empty_suites:
     name: Report empty test suites
     runs-on: ubuntu-latest
-    # Waits for the pod-level retries too, so a suite fixed by retry (overwrite: true replaces its report) is read post-correction.
-    needs: [generate_matrix, test, test_multi_spyre, test_retry, test_multi_spyre_retry]
+    # Waits for both pod-level retry waves too, so a suite fixed by retry (overwrite: true replaces its report) is read post-correction.
+    needs: [generate_matrix, test, test_multi_spyre, test_retry, test_retry_final]
     if: always()
 
     steps:
@@ -1761,7 +1962,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p xml_artifacts
-          # --paginate: same page-cap trap as collect_failed_suites; an
+          # --paginate: same page-cap trap as collect_retry_suites.py; an
           # un-paginated query would miss XML reports past the first page and
           # under-report the empty-suite check. Emit a per-object JSON stream
           # (gh rejects --slurp with --jq) and slurp it into one array.

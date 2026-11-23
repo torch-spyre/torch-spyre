@@ -146,8 +146,11 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
-from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
+    enclosing_loops,
+    is_looped,
+)
 from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
 from torch_spyre._inductor.padding import is_restickify_op
@@ -342,7 +345,7 @@ def _collective_stage_storage_is_private(
 
 
 def _is_coarse_tiled(op: Any) -> bool:
-    return isinstance(getattr(op, "loop_info", None), LoopInfo)
+    return is_looped(op)
 
 
 def _sibling_pinned_divisions(
@@ -370,7 +373,7 @@ def _sibling_pinned_divisions(
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
-    ``LoopInfo.loop_count`` is one entry per nesting level, outermost
+    ``LoopMember.loop_count`` is one entry per nesting level, outermost
     first; the real total is their product. An entry can be a symbolic
     ``sympy.Expr`` under dynamic shapes
     (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
@@ -416,7 +419,7 @@ class DrainPlan:
     update_name:
         Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
     loop_group:
-        The update's ``loop_info.loop_group_id`` -- exactly one level.
+        The update's ``loop_member.loop_group_id`` -- exactly one level.
     anchor_op:
         The last operation of the loop's group subtree, as an ``Operation``
         object (identity survives other clones; a saved index would not).
@@ -696,7 +699,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
     (input clone) attributes onto the clone, but a post-loop drain and a
     hoisted pre-loop input clone are neither loop members nor carries: a
-    surviving ``loop_info`` would re-group the clone into the counted loop at
+    surviving ``loop_member`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
     advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
@@ -704,7 +707,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     clone keeps today's metadata-copy behavior.
     """
 
-    for attr in ("loop_info", "_loop_carry_record"):
+    for attr in ("loop_member", "_loop_carry_record", "_member_like"):
         if hasattr(op, attr):
             delattr(op, attr)
 
@@ -3224,14 +3227,14 @@ def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> Non
         chosen = getattr(buf, "chosen_division", None)
         cd = divisions[chosen] if chosen is not None and divisions else None
         op = op_by_name.get(buf.name)
-        info = getattr(op, "loop_info", None)
-        group = getattr(info, "loop_group_id", None)
+        loops = enclosing_loops(op) if op is not None else ()
+        group = loops[-1].group_path if loops else None
         logger.debug(
             "solver_out: %s group=%s loop=%s div=%s tiling=%s lx=%s "
             "size=%s committed=%s",
             buf.name,
             group if group is not None else "-",
-            getattr(info, "loop_count", "-"),
+            [level.trip_count for level in loops] if loops else "-",
             cd.label if cd is not None else "-",
             cd.tiling.label if cd is not None else "-",
             buf.address,
@@ -3595,7 +3598,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Candidate coarse tilings enter the same way: each tiled axis's
         symbolic count (``sym_tile_counts``) is keyed on the op's own loop
         variable for that axis. With no tiled candidate there are none, and the
-        extractor reads the op's committed tiling (``loop_info``) as before.
+        extractor reads the op's committed tiling (``loop_member``) as before.
         """
         from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -4228,7 +4231,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         differently-shaped consumer -- a separate mechanism, still xfailed, not
         reached by the ordinary M-axis output tiling offered here.)
 
-        An op already tiled (``loop_info`` set -- by the ``spyre_hint`` pass
+        An op already tiled (``loop_member`` set -- by the ``spyre_hint`` pass
         pre-stickification, a ``for_each_tile`` loop, or a prior apply) is left
         untouched, so the solve never re-tiles or un-tiles it, and so is every
         other op inside a ``for_each_tile`` region (``_prescribed_ops``): the
@@ -4238,7 +4241,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
-        if getattr(op, "loop_info", None) is not None:
+        if is_looped(op):
             return untiled
         if op.get_operation_name() in getattr(self, "_prescribed_ops", ()):
             return untiled
@@ -5458,7 +5461,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             # A coarse-tiled CANDIDATE can never host a relayout, for the same
             # reasons a coarse-tiled op cannot in general (a tiled candidate's
-            # buffer is per-tile scratch). The loop_info edge gate covers
+            # buffer is per-tile scratch). The loop_member edge gate covers
             # hint-materialized tiling decided before the solve; once the
             # unified-tiling work (#3923) makes tiling a per-candidate solver
             # choice, cd.tiling is the only marker. Written via getattr so it
