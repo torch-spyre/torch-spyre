@@ -25,6 +25,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_OP,
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
@@ -329,13 +330,71 @@ def _get_mask_value(
     return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
+def _get_matmul_coordinate_mask(
+    iteration_space: dict,
+    arg: SDSCArgs,
+    dim_padding: dict,
+    inputs: list[SDSCArgs],
+    symbolic_dim_names: Iterable[str],
+) -> dict:
+    """Mask the pure-padding lanes of a matmul's padded dim with 0.
+
+    Either of two dims can be masked:
+
+    - the output column dim N (``out``): iterated by the output and the kernel
+      (second operand) but not by the activation. The backend masks every LXLU
+      load whose stick holds it -- the kernel and the output read back for
+      accumulation -- so the padding lanes are 0 rather than allocator garbage.
+    - the reduction dim K: iterated by both inputs but not the output. The
+      kernel's K rows are zero-padded by explicit copies ahead of the matmul,
+      but the activation's K padding lanes hold whatever its producer left
+      there (e.g. ``reciprocal`` of garbage = inf), and inf * 0 = NaN. Masking
+      K zeroes those lanes. K is rounded up by ``_extend_matmul_k_to_padded``,
+      which reports the padding it added.
+
+    The backend masks one dim at a time, so when both qualify only N is
+    masked and K's activation padding is left as it is. A symbolic dim is never masked (the iteration space
+    holds its maximum, so a mask computed from it would not match the runtime
+    extent).
+    """
+    if len(inputs) < 2:
+        return {}
+    activation, kernel = inputs[0], inputs[1]
+    symbolic = set(symbolic_dim_names)
+    mask = {
+        dim: [[iteration_space[dim] - padding, padding]]
+        for dim, padding in dim_padding.items()
+        if padding > 0
+        and kernel.scales.get(dim) == 1
+        and (
+            # N: output column dim, not iterated by the activation.
+            (arg.scales.get(dim) == 1 and dim not in activation.scales)
+            # K: reduction dim, iterated by both inputs but not the output.
+            or (activation.scales.get(dim) == 1 and dim not in arg.scales)
+        )
+        and str(dim) not in symbolic
+    }
+    if len(mask) > 1:
+        # The backend masks one dim at a time: keep N, whose padding lanes
+        # are uninitialized in both the kernel and the accumulated output.
+        mask = {dim: m for dim, m in mask.items() if dim in arg.scales}
+    return mask if len(mask) == 1 else {}
+
+
 def _get_coordinate_mask(
     iteration_space: dict,
     arg: SDSCArgs,
     dim_padding: dict,
     op: str = "",
     inputs: list[SDSCArgs] | None = None,
+    symbolic_dim_names: Iterable[str] = (),
 ) -> dict:
+    # Matmul path: mask the kernel's pure-padding columns (N) with 0, see
+    # _get_matmul_coordinate_mask.
+    if op == BATCH_MATMUL_OP:
+        return _get_matmul_coordinate_mask(
+            iteration_space, arg, dim_padding, inputs or [], symbolic_dim_names
+        )
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
@@ -2103,21 +2162,28 @@ def _round_up_to_stick(
     sym,
     stick_size: int,
     caller: str,
-) -> None:
-    """Round ``sdsc_iteration_space[sym]`` up to the next stick boundary."""
+) -> int:
+    """Round ``sdsc_iteration_space[sym]`` up to the next stick boundary.
+
+    Returns the number of padding elements added.
+    """
     cur = sdsc_iteration_space[sym]
     padded = ((cur + stick_size - 1) // stick_size) * stick_size
     if padded > cur:
         logger.debug("%s: extending %s %d -> %d", caller, sym, cur, padded)
         sdsc_iteration_space[sym] = padded
+    return padded - cur
 
 
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
-) -> None:
+) -> dict:
     """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
+
+    Returns ``{K_sym: K_padded - K}`` (empty if K is not extended), since the
+    later ``_get_padded_iteration_space`` no longer sees K as padded.
 
     The IR-level padding pass pads y's K dimension to K_padded rows but keeps
     the host iteration space (and op_spec.iteration_space) at K.  This function
@@ -2145,7 +2211,7 @@ def _extend_matmul_k_to_padded(
             k_sym,
             y_non_stick_syms,
         )
-        return
+        return {}
 
     if k_sym not in sdsc_iteration_space:
         logger.warning(
@@ -2153,7 +2219,7 @@ def _extend_matmul_k_to_padded(
             k_sym,
             list(sdsc_iteration_space.keys()),
         )
-        return
+        return {}
 
     # Compute K_padded by rounding K up to the next stick boundary.
     # Reading K_padded from y_arg.device_size would be wrong when y is a view
@@ -2161,9 +2227,10 @@ def _extend_matmul_k_to_padded(
     # allocation's K extent, not the slice's logical K, so it can be larger
     # than the matmul's actual K and would over-extend the iteration space.
     stick_size = y_arg.device_dtype.elems_per_stick()
-    _round_up_to_stick(
+    added = _round_up_to_stick(
         sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
     )
+    return {k_sym: added} if added > 0 else {}
 
 
 def _matmul_reuse_dims(
@@ -2686,8 +2753,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         dim_splits[stick_sym] = 1
         op_stick_fallback_sym = stick_sym
 
+    matmul_k_padding: dict = {}
     if is_matmul:
-        _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+        matmul_k_padding = _extend_matmul_k_to_padded(
+            op_spec, sdsc_iteration_space, symbol_mapping
+        )
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
@@ -2796,6 +2866,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
     )
+    # K was rounded up before _get_padded_iteration_space ran, so it reports
+    # no padding for K; restore it so the coordinate mask can cover K.
+    for dim, amount in matmul_k_padding.items():
+        padding[dim] = padding.get(dim, 0) + amount
 
     # For restickify, update backGaps based on the padded iteration space,
     # since non-stick dimensions may now have it_dim_size > dev_dim_size.
@@ -2843,7 +2917,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
+        sdsc_iteration_space,
+        args[-1],
+        padding,
+        op_spec.op,
+        args[:-1],
+        symbolic_dim_names=symbolic_dims,
     )
     masking_const_id = -1
     if coordinate_masking:
