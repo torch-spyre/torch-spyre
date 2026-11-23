@@ -1239,8 +1239,6 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->reserved_dims = {
       {dim, ReservedDimInfo{min_size, max_size, granularity}}};
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (reserved dim=" << dim
                         << " min=" << min_size << " max=" << max_size
                         << " granularity=" << granularity
@@ -1343,8 +1341,6 @@ at::Tensor spyre_empty_reserved_with_layout(
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->reserved_dims = {
       {dim, ReservedDimInfo{min_size, max_size, granularity}}};
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (explicit, reserved dim=" << dim
                         << " min=" << min_size << " max=" << max_size
                         << " granularity=" << granularity
@@ -1394,8 +1390,6 @@ at::Tensor spyre_empty_with_layout(
                   " must be <= max=", info.max, " at dim ", rdim);
     }
     spyre_tensor_impl->reserved_dims = std::move(*reserved_dims);
-    spyre_tensor_impl->dma_sizes = size.vec();
-    spyre_tensor_impl->dma_strides = stride.vec();
   }
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
@@ -1981,8 +1975,7 @@ std::vector<int64_t> pinned_reserved_layout_size(
                 "happens after an in-place change (t_(), transpose_(), "
                 "squeeze_(), as_strided_()) and on a view that changed the "
                 "geometry (a slice, a reshape). current shape=",
-                self.sizes(), ", shape at allocation=",
-                c10::IntArrayRef(self_impl.dma_sizes));
+                self.sizes());
   }
   {
     // Scope today: at most one entry, so this loop runs once; the guard is
@@ -2104,8 +2097,6 @@ const at::Tensor& spyre_resize_(
       (new_numel <= self.numel() || reserved_and_growing) && last_dim_ok) {
     self_impl->set_sizes_contiguous(size_int);
     self_impl->spyre_layout = new_layout;
-    self_impl->dma_sizes = size_int.vec();
-    self_impl->dma_strides = self_impl->strides().vec();
     SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
                           << " layout=" << self_impl->spyre_layout.toString();
     return self;
@@ -2130,8 +2121,6 @@ const at::Tensor& spyre_resize_(
   self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
   self_impl->set_sizes_contiguous(size_int);
   self_impl->spyre_layout = new_layout;
-  self_impl->dma_sizes = size_int.vec();
-  self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();

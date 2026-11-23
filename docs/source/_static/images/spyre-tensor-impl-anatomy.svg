@@ -44,13 +44,7 @@
     <text x="135" y="463" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">device_dtype</text>
     <text x="245" y="463" fill="#475569">the on-device data format, for example SEN169_FP16</text>
 
-    <rect x="120" y="472" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
-    <text x="135" y="489" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">dma_sizes</text>
-    <text x="245" y="489" fill="#475569">host-shape DMA descriptor that D2H copies of views read from</text>
 
-    <rect x="120" y="498" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
-    <text x="135" y="515" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">dma_strides</text>
-    <text x="245" y="515" fill="#475569">paired with dma_sizes — together they drive copyAsync()</text>
   </g>
 
   <text x="450" y="600" text-anchor="middle" font-size="12" font-style="italic" fill="#64748b">Each layer adds a little more metadata. Nothing on this stack hands Python a raw device pointer.</text>

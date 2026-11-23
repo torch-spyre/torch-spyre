@@ -292,7 +292,7 @@ class TestReservationWithExplicitLayout(TestCase):
 
     def test_write_after_resize_reads_back(self) -> None:
         # The other half of #6027: a host-to-device write through the pinned
-        # layout with dma_sizes below max, after a shrink, then a read back.
+        # layout with the real size below max, after a shrink, then a read back.
         d = self._declare(C_MAX)
         d.resize_((9, E, 1))
         new_ids = self.ids[:9] + 1000

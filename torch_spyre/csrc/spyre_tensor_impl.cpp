@@ -266,8 +266,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
   impl->reserved_dims = this->reserved_dims;
-  impl->dma_sizes = this->dma_sizes;
-  impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
       /*src_impl=*/this,
       /*dest_impl=*/impl.get(),
@@ -299,8 +297,6 @@ void SpyreTensorImpl::shallow_copy_from(
   at::TensorImpl::shallow_copy_from(impl);
   this->spyre_layout = spyre_impl->spyre_layout;
   this->reserved_dims = spyre_impl->reserved_dims;
-  this->dma_sizes = spyre_impl->dma_sizes;
-  this->dma_strides = spyre_impl->dma_strides;
 }
 
 uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl) {
@@ -374,9 +370,35 @@ std::vector<StickPair> stick_pairs(const SpyreTensorLayout& stl) {
 }
 
 bool SpyreTensorImpl::has_intact_reservation() const {
-  return !reserved_dims.empty() && storage_offset() == 0 &&
-         sizes() == c10::IntArrayRef(dma_sizes) &&
-         strides() == c10::IntArrayRef(dma_strides);
+  if (reserved_dims.empty() || storage_offset() != 0) return false;
+  // Dense: the strides are the contiguous strides of sizes().
+  int64_t expected = 1;
+  for (int64_t d = dim() - 1; d >= 0; d--) {
+    if (sizes()[d] != 1 && strides()[d] != expected) return false;
+    expected *= std::max<int64_t>(sizes()[d], 1);
+  }
+  for (const auto& [rdim, info] : reserved_dims) {
+    if (rdim < 0 || rdim >= dim()) return false;
+    const int64_t size = sizes()[rdim];
+    if (size < info.min || size > info.max) return false;
+    // The device dim that walks this host stride must have max extent, and
+    // when its valid count is a singleton key that count must be max too.
+    const int64_t host_stride = strides()[rdim];
+    if (host_stride <= 0) return false;
+    bool carried = false;
+    for (size_t d = 0; d < spyre_layout.stride_map.size() && !carried; d++) {
+      if (spyre_layout.stride_map[d] != host_stride ||
+          spyre_layout.device_size[d] != info.max) {
+        continue;
+      }
+      const auto valid =
+          spyre_layout.valid_elements.find({static_cast<int64_t>(d)});
+      carried = valid == spyre_layout.valid_elements.end() ||
+                valid->second == info.max;
+    }
+    if (!carried) return false;
+  }
+  return true;
 }
 
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(

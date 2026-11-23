@@ -346,18 +346,11 @@ class SpyreTensorImpl : public at::TensorImpl {
   std::map<int64_t, ReservedDimInfo> reserved_dims;
 
   /**
-   * Sizes and strides this tensor's reservation was made with: set at
-   * allocation and on each resize_ of a reserved tensor, copied by views with
-   * the reservation. Used only by has_intact_reservation(). Temporary: these
-   * fields are to be removed once the reservation no longer needs them.
-   */
-  std::vector<int64_t> dma_sizes;
-  std::vector<int64_t> dma_strides;
-
-  /**
-   * True if this tensor has a reservation AND its offset, sizes and strides
-   * still match the allocation. reserved_dims keys are absolute dim indices,
-   * so they only mean something while the axes are unchanged.
+   * True if reserved_dims still refers to the axes they name. reserved_dims
+   * keys are absolute dim indices, so this holds only while the tensor is
+   * dense with no storage offset, each reserved dim's host stride is carried
+   * by a device dim of max extent, and that dim's valid count is max. Derived
+   * from the layout, so it needs no record of the allocation.
    */
   bool has_intact_reservation() const;
 
