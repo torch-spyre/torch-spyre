@@ -24,8 +24,9 @@ It runs as a **pre-scheduling pass**: `V.graph` is live but
 know about the kernels its decisions will land in has to be *estimated* from the ordered
 operation list (see [Bundles](#bundles-are-estimates)).
 
-The engine takes no options. The buffers, the capacity and the alignment are its whole interface;
-the search parameters are module constants in `sa_cooptimizer.py`.
+The buffers, the capacity and the alignment are the engine's whole interface. Two search
+parameters are config knobs, `sa_coopt_restarts` and `sa_coopt_steps_per_buffer` (see
+[The search](#the-search)); the rest are module constants in `sa_cooptimizer.py`.
 
 ## The search
 
@@ -34,8 +35,22 @@ The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
 identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
-`min(200n, 50000)` steps at fixed proposal weights, and the best state seen is what gets
-written back — so the result is never worse than the seed.
+`min(sn, 50000)` steps at fixed proposal weights, where `n` counts the buffers that carry a division
+decision and `s` is `config.sa_coopt_steps_per_buffer` (default 200, env
+`SPYRE_SA_COOPT_STEPS_PER_BUFFER`).
+
+A solve runs `config.sa_coopt_restarts` such cools (default 1, env `SPYRE_SA_COOPT_RESTARTS`), in
+sequence. Restart `k` draws from seed `_SEED + k` and starts from its own copy of the same seed
+state, which is built once. Each restart keeps the best state it saw, and the solve writes back
+the restart with the lowest `(score, seed)`, so a tie goes to the lowest seed. The result is never
+worse than the seed state.
+
+The restarts share only the per-buffer memo caches, and those return the same value whichever
+restart fills them. So restart `k` is exactly the one-restart solve with `_SEED` set to `_SEED + k`,
+and adding restarts never makes the result worse. Each restart costs the whole step budget, so the
+solve takes about `sa_coopt_restarts` times as long. The solver records every restart's seed, score
+and step count, and the winner, in `last_solve_stats`, and logs the best score and its spread over
+the restarts at info level.
 
 ### Where the candidates come from
 
@@ -124,13 +139,15 @@ Once no move applies at all (every eligible buffer resident and neither structur
 available), nothing can change the state again, so the cool ends there rather than spending its
 remaining budget.
 
-A run is **bit-for-bit reproducible**: the RNG is seeded, every domain it draws from is
-index-ordered, and the score is an integer fixed-point quantity, so there is no float
-accumulation to reorder.
+A solve is **bit-for-bit reproducible**. Each restart's RNG is seeded, every domain it draws from
+is index-ordered, and the score is an integer fixed-point quantity, so there is no float
+accumulation to reorder. The seed set is fixed by `_SEED` and `sa_coopt_restarts`, and the winner
+is chosen by `(score, seed)`, so the best of them is reproducible too.
 
 :::{warning}
-Reproducible is not stable: the trajectory is chaotic, so compare two revisions over several seeds,
-never one.
+Reproducible is not stable: the trajectory is chaotic, so compare two revisions over several base
+seeds (`_SEED`), never one. A multi-restart solve is itself a best-of over seeds, but it compares
+two revisions only once each.
 :::
 
 ### What the tiling costs, as an objective symbol

@@ -126,6 +126,8 @@ them with `PARAMS`, and `pr-review` checks them.
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
 | `LAYOUT_SOLVER` | LX layout solver: `greedy`, `firstfit`, `bestfit`, `cpsat` (default), `simulated_annealing` |
+| `SPYRE_SA_COOPT_RESTARTS` | SA co-optimizer restarts per solve, run in sequence; the best wins (default 1) |
+| `SPYRE_SA_COOPT_STEPS_PER_BUFFER` | SA co-optimizer anneal steps per division decision, per restart, capped at 50000 in total (default 200) |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
