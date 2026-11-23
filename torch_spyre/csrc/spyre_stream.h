@@ -68,6 +68,14 @@ class SpyreStream {
   void launchCopyRaw(flex::CopyRawParams* params) const;
   // Host-side compute for deeptools host compute calls.
   flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
+  // Reserves correction buffers from this stream's correction arena. The whole
+  // group is admitted together, waiting on the caller if the arena is full.
+  std::shared_ptr<flex::CorrectionReservation> reserveCorrections(
+      const std::vector<size_t>& sizes) const;
+  // Largest group reserveCorrections can admit at once.
+  size_t correctionArenaCapacity() const;
+  void validateCorrectionSizes(const std::vector<size_t>& sizes) const;
+  flex::PerStreamCorrectionArena::Usage correctionArenaUsage() const;
 
   // Conversions
   c10::Stream unwrap() const;

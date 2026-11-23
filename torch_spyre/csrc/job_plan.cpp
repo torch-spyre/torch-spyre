@@ -167,8 +167,26 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
   return resolved;
 }
 
+std::pair<uint64_t, uint64_t> JobPlanStepHostCompute::destinationKey() const {
+  TORCH_CHECK(!device_address_.chunks().empty(),
+              "HostCompute destination allocation has no chunks");
+  const auto& chunk = device_address_.chunks().front();
+  return {chunk.addr.region_id, chunk.addr.offset};
+}
+
+void JobPlanStepHostCompute::validateDestination() const {
+  TORCH_CHECK(
+      correction_size_ == device_address_.total_size(),
+      "HostCompute correction size ", correction_size_,
+      " does not match its destination allocation size ",
+      device_address_.total_size());
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
+  // Check the destination before reserving or producing anything.
+  validateDestination();
+
   std::vector<flex::HostComputeArg> args;
 
   // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
@@ -185,29 +203,35 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   }
 
-  auto* params = flex::createHostComputeParams(handle_.get(), correction_size_,
-                                               input_buffer_, std::move(args));
-
-  struct Guard {
-    flex::HostComputeParams* p;
-    ~Guard() {
-      flex::destroyHostComputeParams(p);
+  // Take the buffer admitted for the whole batch, or reserve one for this step.
+  // Reserving here may wait for an earlier correction upload to finish, which
+  // is safe because that upload was already submitted.
+  std::shared_ptr<flex::ArenaLease> lease;
+  if (ctx.correction_reservation) {
+    lease = ctx.correction_reservation->claim(ctx.next_correction++);
+    if (ctx.next_correction == ctx.correction_reservation->count()) {
+      ctx.correction_reservation.reset();
     }
-  } guard{params};
+  } else {
+    lease = stream.reserveCorrections({correction_size_})->claim(0);
+  }
+
+  std::unique_ptr<flex::HostComputeParams,
+                  decltype(&flex::destroyHostComputeParams)>
+      params(flex::createHostComputeParams(handle_.get(), correction_size_,
+                                           input_buffer_, std::move(args)),
+             flex::destroyHostComputeParams);
+  params->reserved_lease = std::move(lease);
 
   // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
   // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
-  // before returning this fully written buffer (Flex #1990,
-  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
-  // caller ordering makes the bytes ready before S_dev receives the consuming
-  // ComputeParams, regardless of whether hazard tracking is enabled.
-  // Shared ownership then keeps the bytes alive through upload completion.
+  // before returning this fully written buffer. This is not queued work on
+  // S_prep: caller ordering makes the bytes ready before S_dev receives the
+  // consuming ComputeParams, regardless of whether hazard tracking is enabled.
+  // The buffer owns its lease, so the storage stays valid until the upload or
+  // compute that reads it has finished.
   std::shared_ptr<flex::HostComputeBuffer> host_buffer(
-      stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
-
-  // Enforce that the host buffer correction size matches the expected device
-  // allocation size.
-  TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+      stream.launchHostCompute(params.get()), flex::destroyHostComputeBuffer);
 
   if (ctx.batch_program_corrections) {
     ctx.program_corrections.push_back(
@@ -216,28 +240,14 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     return;
   }
 
-  // Create DmaParams to transfer the host buffer.
-  auto* dma_params =
-      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
-                            /*to_device=*/true, &device_address_);
-  dma_params->pipeline_barrier = pipeline_barrier_;
-  // The managed buffer is freed when the callback is destroyed, which happens
-  // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*,
-                                       const flex::FlexCallbackMetadata*) {};
-
-  try {
-    stream.launchH2D(dma_params);
-  }
-  catch (...) {
-    flex::destroyDmaParams(dma_params);
-    throw;
-  }
-  flex::destroyDmaParams(dma_params);
-
-  // managed goes out of scope here, leaving the callback with the only
-  // remaining reference to the host buffer. The buffer will be freed when the
-  // callback is destroyed.
+  // The upload is separate from the HostCompute. It carries the buffer as its
+  // owner and transfers exactly correction_size_ bytes.
+  std::unique_ptr<flex::DmaParams, decltype(&flex::destroyDmaParams)>
+      dma_params(flex::createDmaParamsForCorrection(
+                     std::move(host_buffer), &device_address_,
+                     /*use_compute_pipeline=*/false, pipeline_barrier_),
+                 flex::destroyDmaParams);
+  stream.launchH2D(dma_params.get());
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {

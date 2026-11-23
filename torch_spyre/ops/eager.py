@@ -905,11 +905,18 @@ def spyre__copy_from(self, dst, non_blocking=False):
         # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
         # Dynamo's private predicate covers the separate tracing flag added in
         # 2.14; the Python dispatch key can remain enabled in that region.
-        from torch._dynamo.eval_frame import _is_eager_on_nested_compile
+        from torch._dynamo import eval_frame
+
+        is_eager_on_nested_compile = getattr(
+            eval_frame, "_is_eager_on_nested_compile", None
+        )
 
         if (
             torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
-            or _is_eager_on_nested_compile()
+            or (
+                is_eager_on_nested_compile is not None
+                and is_eager_on_nested_compile()
+            )
         ):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)

@@ -14,10 +14,15 @@
 
 """Tests for launching simple compiled ops through JobPlan execution."""
 
+import faulthandler
 import json
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from typing import Tuple
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,6 +31,16 @@ from test_prepare_kernel import TestPrepareKernel as tpk
 from torch.testing._internal.common_utils import TestCase
 
 import torch_spyre
+
+
+@contextmanager
+def _deadlock_deadline(seconds=120):
+    """Bound C++ waits too: Python thread joins cannot time out a held GIL."""
+    faulthandler.dump_traceback_later(seconds, exit=True)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 def _run_compiled_op(op_name: str) -> None:
@@ -113,8 +128,106 @@ class TestLaunchJobPlan(TestCase):
         elif os.environ.get("FLEX_DEVICE") == "PF":
             self.assertIn("launch::H2D", names)
 
-    def test_invalid_hcm_metadata_surfaces_on_synchronize(self):
-        """Host callback failures should surface as RuntimeError on stream synchronize."""
+    def test_concurrent_launches_share_correction_arena(self):
+        """Use explicit streams and a simultaneous start for cached launches.
+
+        Run in separate processes with SPYRE_HAZARD_TRACKER=0 and =1: the
+        setting is latched at runtime initialization. The former shares one
+        stream; the latter uses different device streams on the same device.
+        Flex's controlled-completion tests separately guarantee lease overlap.
+        """
+        with _deadlock_deadline(600):
+            self._run_concurrent_launches()
+
+    @pytest.mark.skipif(
+        os.environ.get("SPYRE_CORRECTION_ARENA_DEPTH") != "1",
+        reason="requires SPYRE_CORRECTION_ARENA_DEPTH=1 at process startup",
+    )
+    def test_concurrent_launches_with_depth_one_arena(self):
+        """Exercise cached launches with a depth-1 arena configured at startup."""
+        with _deadlock_deadline(600):
+            self._run_concurrent_launches(require_depth_one=True)
+
+    def _run_concurrent_launches(self, require_depth_one=False):
+        torch._dynamo.reset()
+        torch.manual_seed(42)
+
+        def fn(x, y):
+            return torch.softmax(x * y + x, dim=-1)
+
+        compiled = torch.compile(fn, backend="inductor")
+        inputs = [
+            (
+                torch.randn(64, 128, dtype=torch.float16),
+                torch.randn(64, 128, dtype=torch.float16),
+            )
+            for _ in range(8)
+        ]
+        device_inputs = [tuple(t.to("spyre") for t in pair) for pair in inputs]
+        compiled(*device_inputs[0])  # compile on the main thread
+        torch.spyre.synchronize()
+        if require_depth_one and torch_spyre._C._correction_arena_usage()[2] != 1:
+            self.skipTest("requires an effective pooled correction arena depth of 1")
+
+        results = [None] * len(device_inputs)
+        errors = []
+        tracking = torch_spyre._C.get_hazard_tracker_enabled()
+        shared_stream = torch.Stream("spyre")
+        streams = [
+            torch.Stream("spyre") if tracking else shared_stream
+            for _ in device_inputs
+        ]
+        start = threading.Barrier(len(device_inputs) + 1, timeout=30)
+
+        def run(index):
+            try:
+                with streams[index]:
+                    start.wait()
+                    results[index] = compiled(*device_inputs[index])
+            except Exception as e:  # noqa: BLE001 - surfaced by the assertion below
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=run, args=(i,)) for i in range(len(device_inputs))
+        ]
+        for t in threads:
+            t.daemon = True
+
+        # Intercept the exact alias used by KernelRunner, while still calling
+        # the real C++ binding. Every worker must use the warmed cached plans.
+        from torch_spyre.execution import kernel_runner
+
+        original_launch = kernel_runner.launch_jobplan
+        callers = {}
+
+        def record_launch(plan, *args):
+            callers.setdefault(id(plan), set()).add(threading.get_ident())
+            return original_launch(plan, *args)
+
+        with patch.object(kernel_runner, "launch_jobplan", side_effect=record_launch):
+            compiled(*device_inputs[0])
+            torch.spyre.synchronize()
+            warmed_plans = set(callers)
+            self.assertTrue(warmed_plans, "compiled workload did not launch a JobPlan")
+            callers.clear()
+            for t in threads:
+                t.start()
+            start.wait()
+            deadline = time.monotonic() + 120
+            for t in threads:
+                t.join(max(0, deadline - time.monotonic()))
+            self.assertFalse(any(t.is_alive() for t in threads), "launch threads hung")
+        self.assertEqual(set(callers), warmed_plans)
+        for thread_ids in callers.values():
+            self.assertEqual(len(thread_ids), len(threads))
+        torch.spyre.synchronize()
+
+        self.assertEqual(errors, [])
+        for output, pair in zip(results, inputs):
+            torch.testing.assert_close(output.cpu(), fn(*pair), atol=0.01, rtol=0.1)
+
+    def test_invalid_hcm_metadata_raises_during_launch(self):
+        """Synchronous HostCompute failures propagate from launch_jobplan."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_exec_plan = [
                 {
@@ -235,6 +348,57 @@ class TestLaunchJobPlan(TestCase):
             torch_spyre._C._host_compute_bytes(
                 json.dumps({"vdci": {}, "senConstants": []}), 128
             )
+
+    @pytest.mark.skipif(
+        os.environ.get("SPYRE_CORRECTION_ARENA_DEPTH") != "1",
+        reason="requires SPYRE_CORRECTION_ARENA_DEPTH=1 at process startup",
+    )
+    def test_host_reader_releases_gil_while_waiting_for_arena(self):
+        """Python can release the slot that a C++ host reader is waiting for."""
+        payload = b"\x53" * 16
+        hcm = json.dumps(self._payload_hcm(payload))
+        # Initialize the runtime with the process's configured arena depth.
+        torch_spyre._C._host_compute_bytes(hcm, 128)
+        torch.spyre.synchronize()
+        reader_stream = torch.Stream("spyre")
+        with reader_stream, _deadlock_deadline(30):
+            held = None
+            reader = None
+            result = []
+            errors = []
+            try:
+                _, _, capacity = torch_spyre._C._correction_arena_usage()
+                if capacity != 1:
+                    self.skipTest("requires an effective pooled correction arena depth of 1")
+                held = torch_spyre._C._reserve_corrections_for_test([1024])
+
+                def read():
+                    try:
+                        with reader_stream:
+                            result.append(torch_spyre._C._host_compute_bytes(hcm, 128))
+                    except Exception as error:  # noqa: BLE001
+                        errors.append(error)
+
+                reader = threading.Thread(target=read)
+                reader.start()
+                deadline = time.monotonic() + 5
+                while torch_spyre._C._correction_arena_usage()[1] != 1:
+                    self.assertLess(time.monotonic(), deadline, "reader never waited")
+                    time.sleep(0.001)
+                self.assertTrue(reader.is_alive())
+                self.assertEqual(result, [])
+                # Reaching here while the reader is blocked proves GIL progress.
+                held = None
+                reader.join(timeout=5)
+                self.assertFalse(reader.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(result, [payload + b"\x00" * 112])
+                self.assertEqual(torch_spyre._C._correction_arena_usage()[:2], (0, 0))
+            finally:
+                held = None
+                if reader is not None:
+                    reader.join(timeout=5)
+                torch.spyre.synchronize()
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):

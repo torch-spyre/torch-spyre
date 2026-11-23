@@ -282,6 +282,16 @@ struct LaunchContext {
   std::vector<SymbolicArg> symbolic_args;
   bool batch_program_corrections = false;
   std::vector<flex::ProgramCorrection> program_corrections;
+
+  /**
+   * @brief Correction buffers admitted for the current run of HostCompute steps.
+   *
+   * Set by SpyreStream::launch when the whole run is batched, so every step
+   * claims its buffer without waiting. Null means each step reserves its own
+   * buffer. Unclaimed buffers are returned if the launch fails.
+   */
+  std::shared_ptr<flex::CorrectionReservation> correction_reservation;
+  size_t next_correction = 0;  ///< Next buffer to claim from the reservation
 };
 
 /**
@@ -388,11 +398,9 @@ inline std::ostream& operator<<(std::ostream& os, const JobPlanStep& step) {
  * All fields resolved during PrepareKernel. construct() produces a
  * RuntimeOperationH2D.
  *
- * When used for correction tensor DMA, the host_address points into a pinned
- * host buffer allocated during PrepareKernel and shared with the
- * JobPlanStepHostCompute that writes into it. The buffer is allocated once and
- * reused across launches — FIFO ordering within a stream guarantees the
- * HostCompute callback writes the buffer before the H2D reads it.
+ * This step transfers plan-owned static host data. Dynamic corrections are
+ * produced by JobPlanStepHostCompute into a fresh per-launch arena lease;
+ * that step creates an owned H2D or attaches the buffer to a compound Compute.
  */
 class JobPlanStepH2D final : public JobPlanStep {
  public:
@@ -518,13 +526,10 @@ class JobPlanStepCompute final : public JobPlanStep {
  * @brief Host-side computation step (e.g., program correction)
  *
  * Stores compiler metadata (Hcm) and the destination device address for the
- * correction blob.  construct() builds a producer lambda (one of four cases
- * depending on input source), calls it to allocate + fill a RaiiBuffer, then
- * launches the correction H2D — both produce and transfer happen in one step,
- * retiring the shared output_buffer_ pin.
- *
- * The RaiiBuffer produced at launch time carries the correction bytes; the
- * adjacent DataTransfer H2D is collapsed into this step by the builder.
+ * correction blob. construct() consumes a reserved arena lease, produces the
+ * bytes synchronously, and either submits an owned H2D or retains the buffer
+ * for the following compound Compute. Every launch has independent ownership.
+ * The adjacent DataTransfer H2D is collapsed into this step by the builder.
  */
 class JobPlanStepHostCompute final : public JobPlanStep {
  public:
@@ -572,6 +577,22 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       const std::vector<at::Tensor>& tensors,
       const std::vector<SymbolicArg>& symbolic_args);
 
+  /// Exact number of correction bytes this step produces.
+  size_t correctionSize() const {
+    return correction_size_;
+  }
+
+  /**
+   * @brief Stable identity of the destination allocation: (region id, offset).
+   *
+   * Launches of the same plan share this device storage, so SpyreStream uses
+   * it to serialize their upload and consumer admission.
+   */
+  std::pair<uint64_t, uint64_t> destinationKey() const;
+
+  /// Throws if the correction size does not match the destination allocation.
+  void validateDestination() const;
+
  private:
   size_t correction_size_;  ///< byte count of the correction blob
   flex::CompositeAddress device_address_;  ///< device destination for H2D
@@ -590,9 +611,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
  * translates each step into flex operation params and submits them via its
  * typed launchXXX() methods.
  *
- * A JobPlan is self-contained: if a compute requires program correction, the
- * correction callback, the correction tensor DMA, and the device compute are
- * all separate steps in the same JobPlan. For pure data movement (e.g., tensor
+ * A JobPlan is self-contained: HostCompute steps produce corrections using
+ * per-launch leases and submit separate uploads or attach the owners to the
+ * consuming Compute. For pure data movement (e.g., tensor
  * .to(device) or binary loading), a JobPlan with only DMA steps is used.
  *
  * Producers:

@@ -840,6 +840,28 @@ PYBIND11_MODULE(_C, m) {
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
+  // Test seams for a deterministic blocked-reader/GIL test. The capsule owns
+  // only C++ state; destroying it releases capacity without a Python callback.
+  m.def("_reserve_corrections_for_test", [](const std::vector<size_t>& sizes) {
+    auto holder =
+        std::make_unique<std::shared_ptr<flex::CorrectionReservation>>();
+    {
+      py::gil_scoped_release release;
+      *holder = spyre::getCurrentStream().reserveCorrections(sizes);
+    }
+    py::capsule result(holder.get(), [](void* pointer) {
+      delete static_cast<std::shared_ptr<flex::CorrectionReservation>*>(pointer);
+    });
+    holder.release();
+    return result;
+  });
+  m.def("_correction_arena_usage", []() {
+    auto stream = spyre::getCurrentStream();
+    const auto usage = stream.correctionArenaUsage();
+    return py::make_tuple(usage.busy_slots, usage.waiting_groups,
+                          stream.correctionArenaCapacity());
+  });
+
   // Expose SpyreStream class to Python
   py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
       .def("synchronize", &spyre::SpyreStream::synchronize,
@@ -995,6 +1017,11 @@ PYBIND11_MODULE(_C, m) {
           std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
       py::arg("job_plan"), py::arg("args"),
       py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+      // Launching may wait for a correction buffer to be released by an earlier
+      // upload, so do not hold the GIL. Correction buffers are owned by their
+      // lease and launches that share a destination are serialized in
+      // SpyreStream::launch, so this is safe without the GIL.
+      py::call_guard<py::gil_scoped_release>(),
       "Launch a prepared JobPlan with the given tensor arguments.\n\n"
       "Args:\n"
       "    job_plan: The JobPlan to execute\n"
@@ -1027,8 +1054,12 @@ PYBIND11_MODULE(_C, m) {
         } guard{params};
         std::unique_ptr<flex::HostComputeBuffer,
                         decltype(&flex::destroyHostComputeBuffer)>
-            buffer(spyre::getCurrentStream().launchHostCompute(params),
-                   flex::destroyHostComputeBuffer);
+            buffer(nullptr, flex::destroyHostComputeBuffer);
+        {
+          py::gil_scoped_release release;
+          buffer.reset(spyre::getCurrentStream().launchHostCompute(params));
+          buffer->correction()->waitReady();
+        }
         return py::bytes(static_cast<const char*>(buffer->data()),
                          buffer->size());
       },
