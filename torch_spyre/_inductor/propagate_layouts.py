@@ -3871,7 +3871,9 @@ def propagate_spyre_tensor_layouts(
                 # the layout it was allocated with, so relabelling a STANDARD
                 # input here would leave its device_tensor_layout() wrong for
                 # every later reader.  Internal buffers are promoted.
-                source_is_qfp8wt = any(
+                # Only an indirect scatter is a QFP8WT scatter.  A plain copy
+                # (e.g. the clone of a QFP8WT weight) keeps its own layouts.
+                source_is_qfp8wt = output_dep.is_indirect() and any(
                     any(
                         stl.element_arrangement == ElementArrangement.QFP8WT
                         for stl in a.layouts

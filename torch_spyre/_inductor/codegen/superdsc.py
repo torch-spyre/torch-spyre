@@ -1333,9 +1333,22 @@ def _collect_index_tensor_layouts(
 _QFP8WT_ROWS_PER_STICK = 2
 
 
-def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
-    """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
-    return arg.element_arrangement == ElementArrangement.QFP8WT and op != FP8TODL16_OP
+def _is_qfp8wt_2d_stick(arg: TensorArg, op_spec: OpSpec) -> bool:
+    """True if op_spec reads or writes arg as QFP8WT [2, 64] sticks."""
+    if arg.element_arrangement != ElementArrangement.QFP8WT:
+        return False
+    if op_spec.op == FP8TODL16_OP:
+        return False
+    # A plain copy between a QFP8WT tensor and one of another arrangement (the
+    # clone of a QFP8WT weight into a fresh tensor) cannot move 2D sticks into
+    # 1D ones: both sides keep a 1D stick, as before QFP8WT scatters.
+    return not (
+        op_spec.op == IDENTITY_OP
+        and not any(is_index_tensor(a, op_spec) for a in op_spec.args)
+        and any(
+            a.element_arrangement != ElementArrangement.QFP8WT for a in op_spec.args
+        )
+    )
 
 
 def _check_qfp8wt_offset(arg: TensorArg, reject_column_offset: bool) -> None:
@@ -1426,7 +1439,7 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
-        is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
+        is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec)
         if is_qfp8wt_2d_stick:
             _check_qfp8wt_offset(arg, op_spec.op != IDENTITY_OP)
         # Step 1: Determine dimension order and stick dimension.
@@ -1521,56 +1534,18 @@ def _create_sdsc_tensors(
                 if _usd not in dim_order:
                     dim_order = [_usd] + dim_order
 
-        # Step 2: Handle reduced dimensions.
-        # Normally skip for index tensors.  Exception: in a sub-stick indirect
-        # scatter (op_stick_dim is None, has_indirect_access), the KERNEL_IDX
-        # tensor may have fewer dims than N_.  For example, a (T, KV, 1) scatter
-        # with a 1D slot_mapping has N_ = {mb:T, out:KV, y:64}, but the
-        # KERNEL_IDX device coordinates only carry "mb" (the scatter iteration)
-        # while "out" (KV_heads) is a regular loop variable the index broadcasts
-        # over.  Every HBM-pinned tensor's layoutDimOrder_ must cover all dims in
-        # N_ where it is referenced; omitting "out" from the KERNEL_IDX layout causes
-        # a dimension mismatch.
-        # Adding "out" as a reduced (scale=-1 broadcast) dim to the KERNEL_IDX
-        # layout fixes this — the index tensor is broadcast across KV heads.
+        # Step 2: Handle reduced dimensions — skip for index tensors.
         if (
             use_op_dims
             and dim_order != dims
             and not _is_topk(op_spec.op)
             and not _is_keep_by_index(op_spec.op)
         ):
-            # Whether this arg is the KERNEL_IDX of a sub-stick indirect scatter.
-            # For sub-stick scatter (op_stick_dim is None), the KERNEL_IDX broadcasts
-            # over middle dims (e.g. KV_heads) that are in op_dim_order but not in
-            # the index tensor's own coordinates.  Those must be added as reduced
-            # (scale=-1, broadcast) dims so the SDSC knows the index repeats for
-            # each head.
-            #
-            # This must NOT fire for GATHER (index_select): adding extra dims to
-            # KERNEL_IDX for gather causes wrong address computations.
-            # Distinction: scatter writes to the LAST arg (IndirectAccess on args[-1]);
-            # gather writes to a fresh output (args[-1] has no IndirectAccess).
-            is_substick_scatter_index = (
-                has_indirect_access
-                and i in index_tensor_indices
-                and op_stick_dim is None
-                and is_indirect_value_tensor(op_spec.args[-1])
-            )
-            if (
-                not (has_indirect_access and i in index_tensor_indices)
-                or is_substick_scatter_index
-            ):
+            if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d != mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
-                if is_substick_scatter_index:
-                    logger.debug(
-                        "_create_sdsc_tensors: added broadcast dims %s to KERNEL_IDX "
-                        "arg %d for sub-stick indirect scatter",
-                        reduced_dims,
-                        i,
-                    )
 
         if is_matmul and i == 0 and matmul_x_reuse_dims:
             # Two cases for reuse dims on x:
@@ -1923,10 +1898,7 @@ def _create_sdsc_tensors(
         # get_indirect_layout_label and the destination records the wrong size.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if (
-            arg.element_arrangement == ElementArrangement.QFP8WT
-            and op_spec.op != FP8TODL16_OP
-        ):
+        if _is_qfp8wt_2d_stick(arg, op_spec):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # The 2D stick packs 2 values of the weight's K dim against 64 of
