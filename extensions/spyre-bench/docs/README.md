@@ -1,5 +1,10 @@
 # spyre-bench concepts
 
+> **Writing definitions?** The end-to-end developer guides (benchmarks, environments, data, metrics, analyses, packs,
+> safe commands, debugging, contributing) are in [`dev/`](dev/README.md). This page is the reference they link to.
+
+> **Using the platform** (reading verdicts, running, launching, comparing, uploading): [`user/README.md`](user/README.md).
+
 ## The model in one page
 
 A **catalog** is a folder of YAML documents. Each document has an envelope (`apiVersion: bench/v1alpha1`, `kind`,
@@ -305,7 +310,7 @@ A Benchmark states how to run its cases with `run.command`, an argv array (never
 | Phase | Tokens |
 |---|---|
 | `plan` (case values) | `{case}`, `{benchmark}`, `{component}`, `{environment}`, and every identity value by dotted name (`{case.op}`, `{case.shape}`, `{case.load.iterations}`, `{system.precision}`); a list joins with `,`. An unknown token is a plan error |
-| `run` | `{run_id}`, `{subject_id}`, `{arch}`, `{repeat}` (from 1), `{repeats}` (the case's total repeats, cold plus warm for `cache: both`), `{cache}`, `{profile_level}`, `{raw_dir}`, `{repeat_dir}`, `{out_dir}`, `{python}` |
+| `run` | `{run_id}`, `{subject_id}`, `{arch}`, `{repeat}` (from 1), `{repeats}` (the case's total repeats, cold plus warm for `cache: both`), `{cache}`, `{profile_level}`, `{raw_dir}`, `{repeat_dir}`, `{out_dir}`, `{python}`, `{pin_wrapper}` (the generated rank-pinning script; see [pinning.md](pinning.md)) |
 
 A command's environment is an allowlist, matched case-insensitively: `PATH HOME USER LOGNAME SHELL TMPDIR TMP TEMP TERM TZ VIRTUAL_ENV CI LD_LIBRARY_PATH LANG LANGUAGE PWD HOSTNAME NODE_NAME`; proxies (`HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY`, either case); certificates (`SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE`); build (`MAKEFLAGS MAKELEVEL MFLAGS CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LIBRARY_PATH CPATH`); caches (`HF_HOME HF_HUB_CACHE HF_HUB_OFFLINE TRANSFORMERS_OFFLINE TRANSFORMERS_CACHE`); and the prefixes `LC_ PYTHON SPYRE_ OMP_ MKL_ OPENBLAS_ NUMEXPR_ XDG_ CUDA_ TORCH_ VLLM_ KMP_ GOMP_ HF_DATASETS_ CMAKE_ CCACHE_`, plus any `--pass-env-prefix PREFIX` (repeatable; `BENCH_PASS_ENV_PREFIXES`, comma list; matched case-insensitively on both sides). Two filters apply to every name inherited this way, prefixes included. (1) A name with a WHOLE segment (split on `_ - .`) in `TOKEN PASS PASSWD PW SECRET KEY CRED CREDENTIAL AUTH COOKIE BEARER DSN PAT SESSION PRIVATE CERTKEY APIKEY SECRETKEY PRIVKEY PRIVATEKEY ACCESSKEY AUTHKEY PASSPHRASE` is withheld (`SPYRE_BYPASS`, `SPYRE_KEYBOARD`, `PWD` pass; `SPYRE_KEY` does not). (2) A value that embeds URL credentials (`scheme://user:pw@host`, empty user included) or is token-shaped is withheld: a JWT, a `Bearer`/`Basic` credential, a vendor prefix (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `hf_`, `xox?-`, `AKIA`, `glpat-`, `npm_`, `AIza`, `ya29.`, `pypi-`), base64 with `=` padding, or a 32+ character alphanumeric run (no `_`, `-`, `.` or `/`) that mixes letters and digits. UUIDs, dashed host names, paths and pure hex runs (a commit sha, a digest) are not token-shaped. Every withheld name is listed in `status.json` notes with its reason (`secret-looking name` or `credential-looking value`), never the value. The engine's own `BENCH_RUN_ID`, `BENCH_CASE`, `BENCH_REPEAT`, `BENCH_REPEATS`, `BENCH_CACHE`, `BENCH_PROFILE_LEVEL`, `BENCH_RAW_DIR`, `BENCH_REPEAT_DIR`, `BENCH_SUBJECT_ID` and `BENCH_QUIET` are added. Nothing else (inherited `BENCH_*`, `CLICKHOUSE_*`, tokens, ...) reaches a command unless named with `--pass-env NAME` (repeatable; `BENCH_PASS_ENV`, comma list), which passes the variable as it is, secret-looking name or value included (a name matching a passed prefix but secret-looking still needs `--pass-env`). `run.allow_empty: true` declares that a command that exits 0 with no raw output
 and no `metrics.json` is fine. `examples/run-demo` is a runnable catalog with a stub command.
@@ -401,7 +406,7 @@ results/bench/
   `--force-new-run`. A run that ingests refuses a `--run-id` an earlier run in the same `--out` may have ingested
   under; a run that does not ingest repeats ids freely; two runs in different directories that share `RUN_ID` are not
   detected. Tokens: `{python} {run_id} {run_key} {subject_id} {arch} {component} {raw_dir} {out_dir} {case}
-  {profile}`. Tests drive the real bundle-ingest code with 2 and 3 cases per profile and a mixed plan (warehouse
+  {profile} {test_type}` (`perf` or `quality`). Tests drive the real bundle-ingest code with 2 and 3 cases per profile and a mixed plan (warehouse
   faked), build real offline bundles from the defaults and parse all four with the ingest's own argument parser when
   it is importable. The engine's tests do not run the ingest against a live ClickHouse.
 - **Rows landed.** With `--ingest` and `--store clickhouse`, the engine polls `benchmark_runs` for each stored run id (up
@@ -639,6 +644,184 @@ Ingest: a quality case that uses the `generic` identity profile is handed to the
 
 Per-architecture differences (which cases run, card limits, models to skip) belong in data next to the product repo's
 definitions, selected by an architecture name that only names a file. Nothing in a command, Makefile or workflow branches on it.
+
+## On-demand benchmarks for a PR
+
+`spyre-bench ondemand` is the trusted half of a PR-comment run: it turns a comment into an engine request, decides
+whether the commenter and the request are allowed, and renders the plan as a preview. It is pure data in, data out:
+the caller (a workflow or a comment bot) fetches the facts (permissions, head sha, earlier requests) and acts on the
+answer. Run it from the engine installed from the base repository's default branch, never from the PR head.
+
+```bash
+spyre-bench ondemand parse     --comment-file comment.txt --host github.com   # request + policy violations
+spyre-bench ondemand authorize --facts facts.json                              # decision; exit 2 when denied
+spyre-bench ondemand preview   --plan plan.json --request request.json --format md|json
+```
+
+### Command, switches and modes
+
+The command is `/spyre-bench` on both hosts (`/bench` is accepted as a deprecated spelling on github.com). On the internal
+host it is an alias that the comment bot rewrites to `/spyre-test preset=perf-only TEST_TYPE=perf <everything else as written>`, so
+there is one execution path and a perf request is the existing forced perf-only run (the comment-bot to Jenkins route
+covers amd64, ppc64le and s390x, following `arch=`; only the github.com workflow route is x86). An explicit `preset=` wins.
+`type=quality` gives `TEST_TYPE=quality` with no preset: there is no quality-only preset yet (a gap), so the default preset
+and the implied `<product>:quality` tests apply. `/spyre-test TEST_TYPE=perf` also works directly. Triggerers are
+those of `/spyre-test`; no separate allow-list.
+
+Two switches sit at the top of `spyre_bench/ondemand_policy.json` and ship off:
+
+| Switch | Off (shipped) | On |
+|---|---|---|
+| `enabled` | the feature is dark: nothing is admitted, the bots say so | requests are processed |
+| `enforce_budgets` | the device-hour limits, the unknown-cost rule, the per-PR window and the supersede counting only REPORT "would have been refused" (in the preview, in `Decision.would_refuse` and in the `ci_requests` row, `bench.would_refuse`) and the request proceeds | the same findings refuse the request, and a plan above half the limit needs a confirm |
+
+Always enforced in either mode: tier limits (`core` and `extended`), head pinning, the fork `sha=` approval, who may
+trigger, the start-of-run PR re-check, the per-user rate limit and the clean quotas. Both hosts are switched on
+together: flip `enabled` in the engine file and in the internal copy (and the GitHub repository variable
+`BENCH_ONDEMAND_ENABLED`), updating the pinned digest.
+
+### Grammar
+
+```text
+/spyre-bench <selection> [key=value ...]    /spyre-bench confirm    /spyre-bench cancel
+selection := [product ":"] pick (";" [product ":"] pick)*
+pick      := tier | suite ("+" suite)* ["@" tier] | case ("," case)* | "#" selection-name
+tier      := sanity | core | extended
+```
+
+A bare word that is not a tier is a case or Selection name (a single suite is written `suite@tier`). A suite pick
+without `@tier` is made explicit as `sanity`, and the preview says so. Cases and Selections carry their own tier, so the
+host's tier limit is checked on the plan (`authorize` with `stage: planned` and the plan), not on the words. Products: `torch-spyre`, `hf-adapters`, `spyre-inference` (default), `spyre-comms`. The command must
+start a line; lines inside code fences, quotes or indented are ignored.
+
+| Flag (`bench-` prefix optional) | Values | Default |
+|---|---|---|
+| `purpose` | `pr` only | `pr` |
+| `reuse` | `if_valid`, `never`, `prefer`, `only` | `if_valid` |
+| `force` | case names, or `all` | none (needs a reuse mode other than `never`) |
+| `profile` | `off`, `light`, `full` | `off` |
+| `vs` | `main` (alias `nightly`), `tag:<t>`, `build:<job>#<n>`, `artifact:<uuid>`, `ref:<key>`; see "Comparing with `vs=`" | `main` (spelled `nightly`) |
+| `clean` | `true`, `false` | `false` (needs write access) |
+| `max-wait` | `45m`, `1h`, ... (with `clean=true`) | the placer's default; capped at 60m |
+| `env` | an Environment name | the preset's |
+| `budget` | device-hours; lowers the cap, never raises it | the cap |
+| `type` | `perf` (default), `quality` (internal only); also spelled `TEST_TYPE` | `perf` |
+| `sha` | 7 to 40 hex characters of the head commit you reviewed; a fork head needs at least 12 | none |
+
+### Policy
+
+| | github.com | internal host |
+|---|---|---|
+| tiers | `sanity` | `sanity`, `core` |
+| `reuse=never`, `force=all`, `profile=light`, `env=` | refused | allowed |
+| `vs=` kinds | `main` | `main`, `tag`, `build`, `artifact`, `ref` |
+| `extended`, `profile=full` | refused (ops request only) | refused |
+| who may ask | write permission, checked by API | write permission or org membership |
+| `clean=true` | write permission | write permission |
+| budget per request (device-hours) | 4 | 12 (`sanity`), 48 (`core`) |
+| budget per PR per 24 h | 8 | 96 |
+
+The limits live in one file, `spyre_bench/ondemand_policy.json` (starting values 4 / 12 / 48 device-hours accepted by the owner; change them there, nothing else holds a number; the internal poller keeps a byte copy; both repos pin the file's sha-256 in a test, so changing a limit means updating the file, the digest and the copy together). An estimate above half the limit needs `/spyre-bench confirm`;
+above the limit nothing runs. One live request per PR: a new one cancels the requester's own older one (a user with write
+access may cancel anyone's, others are refused while another user's request runs). History rows are normalised
+(pull request numbers compared as text, states case-insensitively). A state that is not dead or finished is live
+(`active`, `previewed`, `launched`, `admit`, `needs_confirm` and anything unknown); `done`, `completed` and `finished`
+are never cancelled but count against the window; `cancelled`, `denied`, `rejected` and `deny` count for nothing
+except the hourly rate and the daily clean quota, so a submit-and-cancel loop still costs. The rate limit counts only
+what the caller records in the history, so the caller must record refused requests too. A row with a non-finite or
+negative estimate fails closed. There is no per-user device-hour cap across pull requests. Other limits: 6 requests per user per hour; clean runs 1 concurrent and 3 per day per user, 2
+at once overall.
+
+### Comparing with `vs=`
+
+`vs=` says what the run is compared with. Resolution is read-only against the store and follows the verdict trust
+rules: only a valid, non-external, non-invalidated stored result counts as the other side. The subject is still a PR
+run, so its verdict is capped at `suspected` and `purpose_not_baseline` holds whatever `vs=` says.
+
+| Form | Resolves to | The other side, when it has no usable result |
+|---|---|---|
+| `vs=main` (also `nightly`) | the newest artifact of the same product and arch with a stored result of a main purpose (`nightly`, `weekly`) | cannot compare; never measured here |
+| `vs=tag:<t>` | the artifact the tag points at now (same product and arch) | measured here, for the missing cases only |
+| `vs=build:<job>#<n>` | the artifact that Jenkins build produced | measured here, for the missing cases only |
+| `vs=artifact:<uuid>` | that artifact | measured here, for the missing cases only |
+| `vs=ref:<key>` | the current approved version of that reference | cannot compare; a reference is never measured |
+
+Rules, in the order they are applied:
+
+1. The host decides which kinds it offers (`vs_kinds` in the policy file): github.com only `main`; the internal host
+   all five. An artifact, build or tag names internal material, so it is never offered on the public host.
+2. A reference is reachable only through `ref:`. `main`, `tag:`, `build:` and `artifact:` refuse a target that is a
+   reference (`reference_only_via_ref`), and `ref:` takes only the version that is `current` (retired, superseded or
+   not yet approved ones are refused). A reference is a comparison target and never a baseline
+   (`target.baseline_eligible` is `false`).
+3. The target must be of the same product and arch as the subject (an unknown arch on either side is refused), and must not be the subject. `vs=main` takes the newest such artifact that has a usable stored result for at least one planned case, and falls back to older ones; if none has, the newest is shown with its reasons.
+4. Per case, the newest stored result of that benchmark is the candidate. It must be `valid`, not `external` trust, and
+   not invalidated (`run` or `run_benchmark` scope, unless restored). `vs=main` additionally needs a main purpose. A reference value (purpose `reference`) is refused by every kind but `ref:`, and `ref:` accepts only reference values. A stored PR-purpose result may be the other side of `tag:`, `build:` and `artifact:` (it is advisory like the subject).
+5. Environment is strict by default: the stored `env_id` must equal the plan's, with the same pinning policy. A
+   result from another environment is never used. `main` and `ref:` then say `cannot compare: different_environment`;
+   a named artifact is measured here instead, because a result in this environment is what is missing. A plan with
+   no environment id compares nothing (`environment_unknown`). A reference carries no environment id of its own: its product and arch are matched, and its comparability caveats apply. A reference has no run, so a reference comparison offers no run-to-run compare link. `spyre-bench ondemand compare --relax-labels` matches
+   labels instead of the id, and only where the host allows it (`vs_relax`; the internal host). It cannot be asked
+   for in a comment.
+6. The other side is measured only when the reason is that nothing usable is stored (`no_stored_result`) or the
+   environment differs, and only for `tag:`, `build:` and `artifact:`. A stored result that is invalid, suspect,
+   external or invalidated is refused, not silently re-measured.
+
+```bash
+spyre-bench ondemand compare --plan plan.json --request request.json --product spyre-inference --host ghe --store clickhouse
+spyre-bench ondemand preview --plan plan.json --request request.json --compare compare.json
+```
+
+`compare` prints a `bench.compare/1` document: the resolved target, the cap, and per case one of `ready` (the other side is stored; this run's side is reused or will run), `will_run_other` (the other side will be measured; `other_requests` holds the engine request for those
+cases) or `cannot_compare` with the reason; counts; the device-hours of both sides (`estimate.known` is false when a case has
+no usable estimate, and the preview then treats the estimate as unknown); and a `digest`. The preview adds
+the other side's device-hours to the estimate the budget is judged on and shows a compare section (ids only on the
+internal host). Pass `--expect-digest` (and `--expect-artifact`) at run time to refuse a comparison that moved since
+the preview: `vs=main` follows the newest nightly, so the target is pinned by the artifact id the preview showed.
+
+The request record (`ci_requests`) carries `bench.vs`, `bench.vs.kind`, `bench.vs.status`, `bench.vs.artifact`,
+`bench.vs.role`, `bench.vs.subject_artifact` and `bench.vs.digest`, so a reader can open the Perf Lab compare layer
+with both sides: `/perf-lab/drill/compare/<run a>/<run b>/<benchmark id>`, one per case with both runs known (the
+subject's run id is the plan's `reused_from`, or the run once it ran).
+
+Examples (synthetic names): `/spyre-bench sanity vs=main`; `/spyre-bench ladder@sanity vs=tag:release-1`;
+`/spyre-bench a_1,b_2 vs=ref:ref-a`.
+
+### Fork pull requests and the pinned sha
+
+- A request is made for one full head sha, recorded with it. If the PR head moves, the request is refused; a new
+  comment is a new request and a new permission check.
+- A fork head runs only if the comment names the commit (`sha=`, at least 12 characters, a prefix of the current head) and the commenter has
+  write access; this is what makes the approval about the commit that was reviewed rather than the one that was
+  force-pushed a moment before the comment. The comment is the approval, recorded as
+  `{sha, approver, permission, request_digest, granted_at}`. It is valid for that sha, that request (by digest) and 72 h.
+  An approval by someone without write access, for another sha or for a changed request is rejected.
+- The measuring job gets `sandbox_profile`: no secrets, no registry or store credentials, checkout of the pinned sha,
+  results leave through a trusted post step, provenance `fork`, never baseline-eligible.
+
+### Request log
+
+`ondemand record` builds the `ci_requests` row for one event of a request (`channel` is `comment`, `target_kind` `pr`;
+states `previewed`, `launched`, `denied`, `rejected`, `failed`, `cancelled`; migration 028 widens the channel check).
+`ondemand history` turns `v_ci_requests` rows (`spyre_bench.ondemand.HISTORY_SQL`, read straight from `ci_requests`; keyed by host, repository and PR; a launched request counts as done after 6 hours because the log has no completion event) into the history `authorize` reads, so the
+per-PR window, the supersede rule and the clean quotas count from the log where it exists. A row that cannot be read
+raises: admission stops until the log is fixed. The GitHub route has no store credentials and so records nothing;
+it counts the user's runs from its own run list instead. A same-repository head needs no `sha=`; a confirm refuses a
+moved head, and a fork head needs `sha=`.
+
+### Preview
+
+`preview --format json` (`bench.preview/1`) carries `counts` (run, reuse, skip), `estimate` (device-hours, wall
+minutes), `reasons`, `queue`, `budget` (limit, needs_confirm, over), `asked`, `diff` (what you asked versus what will
+run, with the reason), `cases` (sorted: run, reuse, skip, then name) and a `digest`. `--format md` renders the same
+data as a PR comment that starts with a marker so it is edited in place. Text that came from a plan or a comment is
+stripped of control and bidirectional characters, backticks, tags, pipes, link and image syntax, and issue references,
+`@` is neutralised and URL schemes are broken, before it is put in a table; `RequestError` messages get the lighter
+form (`neutral`). The JSON preview carries the raw plan strings: a dashboard must escape them. A confirm
+(`/spyre-bench confirm`) runs `authorize` as the original requester with `confirmed`, the recorded `pinned_sha`,
+`requested_at` (no older than 24 hours) and, for a fork, the recorded approval; the confirmer must have write access.
+`authorize` re-validates the request it is given (shape, enums, names, sha) and at `stage: planned` refuses to admit
+without a plan that has cases, because the tier limit of case and Selection picks can only be judged there.
 
 ## Running the tests
 

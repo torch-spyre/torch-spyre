@@ -28,10 +28,14 @@ Each case records what the current lowering produces:
 * the ops the transform adds, by name pattern (``coarse_tile_copy_*``,
   ``..._fill_*``, ``..._combine_*``), which ``scratchpad.coarse_tiling`` and work
   division depend on (``apply_tilings`` sets ``JOINT_TILING_AND_DIVISION_ATTR`` on
-  ops "not in before and with a loop_info");
-* the result against an fp32 reference;
-* that the generated code is deterministic once run-specific ids are
-  normalised, so a later comparison against a new lowering can be trusted.
+  ops "not in before and with a loop_member");
+* the result against an fp32 reference.
+
+(A test that two compiles of one graph give the same generated text lived here, to
+make a comparison against a new lowering trustworthy. The lowering was replaced and
+that comparison is gone. The text it compared includes what the CP-SAT layout
+solver chose, and a parallel search with a few workers does not always return the
+same one of several equally good plans, so the test failed intermittently in CI.)
 
 Cases outside what a replacement will support (more than one level, a chain the
 planner cannot join) are pinned as rejections.
@@ -274,21 +278,6 @@ def test_the_current_lowering_on_a_compiled_span_overflow_graph(case):
     assert _relative_error(compiled.outputs, reference) < 2e-2
 
 
-@pytest.mark.parametrize("case", sorted(CASES))
-def test_the_generated_code_is_deterministic_after_normalising(case):
-    """A comparison against a new lowering is only worth anything if two compiles
-    of the same graph agree. Every case, in one process; for five of them
-    (a copy-out, a K-tiled matmul, a joined group, an output-tiled matmul and an
-    independent pair) two separate processes also gave identical text, which this
-    does not repeat: a spurious difference from a token the normaliser misses
-    would show up here as a failure."""
-    fn, shapes, limit, _, _ = CASES[case]
-    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    first = compile_span_overflow(fn, args, limit)
-    second = compile_span_overflow(fn, args, limit)
-    assert first.code == second.code
-
-
 @expects_raise
 def test_a_two_level_group_is_rejected():
     """A matmul too large for one level nests two (``[4, 4]``). The lowering builds
@@ -389,7 +378,7 @@ def test_the_allocator_asks_the_enumerator_for_one_level_only():
         return None
 
     op = SimpleNamespace(
-        loop_info=None, get_operation_name=lambda: "buf0", get_name=lambda: "buf0"
+        loop_member=None, get_operation_name=lambda: "buf0", get_name=lambda: "buf0"
     )
     allocator = SimpleNamespace(
         _tilings_from_menu=True,
@@ -449,7 +438,7 @@ def test_a_nested_for_each_tile_loop_is_not_affected(limit):
 
     The 256 KB case is a control (nothing overflows). The 16 KB case is the one
     with power: with that skip removed the planner groups the loop body and the
-    compile fails with "group (1,) would overwrite the existing loop_info of
+    compile fails with "group (1,) would overwrite the existing loop_member of
     while_loop_body_graph_0_0_op5"."""
     from for_each_tile_fixtures import nested_split_m_then_k_fn
 

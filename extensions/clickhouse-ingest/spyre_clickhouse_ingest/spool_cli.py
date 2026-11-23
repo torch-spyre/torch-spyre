@@ -12,30 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`spool [list [--fail-if-pending] | drop TOKEN]`: look at and clear batches parked in CH_WRITE_SPOOL.
+"""`spool [list [--fail-if-pending] | replay [TOKEN] | drop TOKEN]`: look at, resend and clear
+batches parked in CH_WRITE_SPOOL (else $RUNNER_TEMP/ch-spool).
 
-A parked batch is one a write could not land. Nothing sends it again: check the table, send the
-rows yourself if they are missing (the file is plain JSON), then `drop` it.
+A parked batch is one a write could not land; nothing sends it again by itself. `replay` sends a
+batch to a Replicated table under its original dedup token and removes the file once stored; it
+refuses one that a resend could double (see `writes.replay`). For those, check the table, send
+the rows yourself if they are missing (the file is plain JSON), then `drop` it.
 
 `list` exits 0 whatever the spool holds, unless `--fail-if-pending` is given: then it exits 75
 (EX_TEMPFAIL) when any batch is parked or any quarantined, unreadable or leftover temp file exists.
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
-from .resilience import Spool
+from . import writes
+from .resilience import Spool, safe
 
 PENDING_EXIT = 75
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    where = (os.environ.get("CH_WRITE_SPOOL") or "").strip()
+    where = writes.spool_dir()
     if not where or not Path(where).is_dir():
-        print("CH_WRITE_SPOOL is not set to an existing directory", file=sys.stderr)
+        print(
+            "no spool: CH_WRITE_SPOOL (or RUNNER_TEMP) is not a directory",
+            file=sys.stderr,
+        )
         return 2
     spool = Spool(where)
     cmd, rest = (argv[0] if argv else "list"), argv[1:]
@@ -58,8 +64,41 @@ def main(argv=None) -> int:
             return 2
         print(f"drop: {n} item(s)")
         return 0 if n else 1
-    print("usage: spool [list [--fail-if-pending] | drop TOKEN]", file=sys.stderr)
+    if cmd == "replay" and len(rest) <= 1:
+        return replay(spool, rest[0] if rest else None)
+    print(
+        "usage: spool [list [--fail-if-pending] | replay [TOKEN] | drop TOKEN]",
+        file=sys.stderr,
+    )
     return 2
+
+
+def replay(spool: Spool, token=None, connect=None) -> int:
+    """0 when every selected batch was stored and dropped, 1 otherwise."""
+    if connect is None:
+        from .client import ClickHouse
+
+        connect = ClickHouse.connect
+    todo = [i for i in spool.pending() if token is None or i.token == token]
+    if not todo:
+        print("replay: nothing to replay", file=sys.stderr)
+        return 1 if token else 0
+    clients: dict = {}
+    failed = 0
+    for item in todo:
+        try:
+            db = item.database or ""
+            if db not in clients:
+                clients[db] = connect(database=db)
+            result = writes.replay(clients[db], item)
+        except Exception as err:  # noqa: BLE001 -- reported per batch; the rest still run
+            result = f"failed: {safe(err)}"
+        if result == "sent":
+            spool.drop(item.token)
+        else:
+            failed += 1
+        print(json.dumps({"token": item.token, "table": item.table, "result": result}))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A concurrency sweep point: the name carries c<N>_n<N>_len<N>_seqs<N>, which is what the ingest's vllm-sweep key list reads.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serving-qwen05b-tp1-c1, description: 'closed-loop serving at concurrency 1 (vllm bench serve)', owner: spyre-inference}
+spec:
+  type: perf
+  level: service
+  tier: core
+  env: {DTLOG_LEVEL: error}
+  system: {type: llm/vllm, backend: spyre}
+  workload: {type: llm/serve}
+  metrics:
+    required: [llm.ttft.mean, llm.ttft.p99, llm.tpot.p99, llm.itl.median, llm.itl.p99, llm.e2el.mean, llm.e2el.p99, llm.output_throughput, llm.request_throughput]
+    headline: [llm.ttft.p99, llm.output_throughput]
+  run:
+    cache: warm
+    repeats: 1
+    command: [uv, run, --active, --no-sync, python3, .github/scripts/run_vllm_benchmarks.py, --configs-dir, vllm-benchmarks/benchmarks/spyre, --suite, nightly, --bench-types, serve, --tests, "{case}", --results-dir, "{raw_dir}"]
+  est_hours: 0.5
+  identity:
+    mode: ingest
+    profile: vllm-sweep
+    name: serving_qwen05b_tp1_c1_n100_len4096_seqs4
+    discriminators:
+      - {key: record_type, value: model}
+      - {key: run_mode, value: serving}
+      - {key: tensor_parallel, value: 1}
+      - {key: input_len, value: ""}
+      - {key: output_len, value: ""}
+      - {key: concurrency, value: 1}
+      - {key: num_prompts, value: 100}
+      - {key: max_model_len, value: 4096}
+      - {key: max_num_seqs, value: 4}
+  variants:
+    - name: serving_qwen05b_tp1_c1_n100_len4096_seqs4
+      environment: spyre-1card
+      system: {type: llm/vllm, backend: spyre, token: qwen2.5-0.5b-instruct, model: qwen2.5-0.5b-instruct, precision: fp16, tp: 1, flags: {load-format: auto, max-num-seqs: 4, max-num-batched-tokens: 512, max-model-len: 4096}}
+      workload:
+        type: llm/serve
+        endpoint: /v1/completions
+        input_len: 64
+        output_len: 64
+        load: {executor: closed, concurrency: 1, requests: 100}
+        inputs: [{name: prompts, dataset: random-lengths}]
+        sampling: {ignore_eos: true}
+        flags: {dataset-name: random, percentile-metrics: 'ttft,tpot,itl,e2el', metric-percentiles: '99,100'}

@@ -307,7 +307,7 @@ def test_identity_lookup_is_chunked_under_the_http_field_limit():
         for i in ids
     }
     assert insert_identities(c, TEST_CASES, rows) == len(ids) - 2
-    assert [len(p["ids"]) for p in c.params] == [
+    assert [len(p["ids"]) for p in c.params if "ids" in p] == [
         IDENTITY_LOOKUP_CHUNK,
         IDENTITY_LOOKUP_CHUNK,
         1,

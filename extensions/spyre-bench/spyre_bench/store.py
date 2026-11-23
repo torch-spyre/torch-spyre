@@ -28,6 +28,7 @@ from spyre_bench import engine
 
 LABEL_PREFIX = "env.label."
 ID_BATCH = 1000
+VS_CANDIDATES = 8
 DB_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 STATUS_OF_VIEW = {"unchanged": "pass"}  # the SQL view's word for the engine's `pass`
 MISSING_PHRASES = ("does not exist", "doesn't exist")
@@ -66,6 +67,14 @@ class Store:
     def invalidated_runs(self, run_ids):
         """The subset of run_ids with an active run-scope invalidation; raises StoreError when this store cannot tell."""
         raise StoreError(f"store {self.name!r} cannot report invalidations")
+
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
+        """Candidate artifacts for a `vs=` target, newest first: artifact_id, component, arch, ts, source, ref_key, ref_state."""
+        return []
+
+    def target_results(self, kind, value, target, benchmark_ids):
+        """Stored results of the resolved target, shaped like stored_results rows (plus purpose, trust)."""
+        return self.stored_results(benchmark_ids, target["artifact_id"])
 
     def check(self):
         """Raise StoreError if the store cannot possibly work (missing settings); never connects."""
@@ -139,6 +148,8 @@ class MemoryStore(Store):
         known=None,
         references=(),
         invalidated=None,
+        targets=(),
+        events=(),
     ):
         self.cases = cases if cases is not None else []
         self.windows = windows if windows is not None else []
@@ -149,6 +160,8 @@ class MemoryStore(Store):
         self.known = known
         self.invalidated = invalidated
         self.references = list(references)
+        self.targets = list(targets)
+        self.events = list(events)
         self.landed_ids = landed if landed is not None else {}
         self.verdicts = verdicts if verdicts is not None else {}
         self.runs = runs if runs is not None else {}
@@ -163,6 +176,29 @@ class MemoryStore(Store):
     def stored_results(self, benchmark_ids, subject_id):
         self._check("stored_results")
         return [r for r in self.results if r["benchmark_id"] in set(benchmark_ids) and r["subject_id"] == subject_id]
+
+    def invalidations(self, run_ids):
+        return [e for e in self.events if e.get("run_id") in set(run_ids)]
+
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
+        self._check("resolve_vs")
+        want = {"build": "build", "artifact": "artifact_id", "tag": "tags", "ref": "ref_key"}.get(kind)
+        out = []
+        for t in self.targets:
+            if kind == "main":
+                hit = t.get("source") in ("nightly", "main")
+            elif kind == "tag":
+                hit = value in t.get("tags", ())
+            else:
+                hit = t.get(want) == value
+            if hit:
+                out.append({"source": kind, "ref_key": "", "ref_state": "", **t})
+        return sorted(out, key=lambda t: str(t.get("ts")), reverse=True)
+
+    def target_results(self, kind, value, target, benchmark_ids):
+        self._check("target_results")
+        ids = set(benchmark_ids)
+        return [r for r in self.results if r["benchmark_id"] in ids and r["subject_id"] == target["artifact_id"]]
 
     def landed(self, run_id):
         self._check("landed")
@@ -342,6 +378,8 @@ class ClickHouseStore(Store):
                 {
                     "run_id": r["run_key"],
                     "benchmark_id": r["benchmark_key"],
+                    "purpose": props.get("run.purpose", ""),
+                    "trust": "external" if any(p.get("run.trust") == "external" for p in props_all) else "internal",
                     "subject_id": subject,
                     "env_id": (env_ids.pop() or None) if len(env_ids) == 1 else None,
                     "labels": {k: v for k, v in props.items() if k.startswith(LABEL_PREFIX)},
@@ -351,6 +389,83 @@ class ClickHouseStore(Store):
                 }
             )
         return out
+
+    def resolve_vs(self, kind, value, product, purposes=(), arch=""):
+        n = {"n": VS_CANDIDATES, "arch": arch}
+        if kind == "artifact":
+            sql = (
+                "SELECT toString(artifact_id) AS artifact_id, component, arch, ts, 'artifact' AS source, '' AS ref_key, "
+                "'' AS ref_state FROM {db}.v_artifacts WHERE artifact_id = {v:UUID}"
+            )
+            params = {"v": _uuid_or_none(value) or str(uuid.UUID(int=0))}
+        elif kind == "tag":
+            sql = (
+                "SELECT toString(artifact_id) AS artifact_id, component, arch, resolved_ts AS ts, 'tag' AS source, "
+                "'' AS ref_key, '' AS ref_state FROM {db}.v_tag_resolution WHERE tag = {v:String} AND component = {c:String} "
+                "ORDER BY resolved_ts DESC LIMIT {n:UInt32}"
+            )
+            params = {"v": value, "c": product, **n}
+        elif kind == "build":
+            sql = (
+                "SELECT toString(a.artifact_id) AS artifact_id, a.component AS component, a.arch AS arch, a.ts AS ts, "
+                "'build' AS source, '' AS ref_key, '' AS ref_state FROM {db}.v_artifacts AS a "
+                "WHERE a.component = {c:String} AND if(a.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', a.arch) = {arch:String} "
+                "AND a.artifact_id IN (SELECT artifact_id FROM {db}.v_artifact_results_published WHERE props['orch_run_key'] = {v:String}) "
+                "ORDER BY a.ts DESC LIMIT {n:UInt32}"
+            )
+            params = {"v": value, "c": product, **n}
+        elif kind == "ref":
+            sql = (
+                "SELECT toString(v.artifact_id) AS artifact_id, 'reference' AS component, v.arch AS arch, "
+                "v.registered_at AS ts, 'reference' AS source, v.ref_key AS ref_key, v.state AS ref_state, x.product AS product "
+                "FROM {db}.v_bench_references AS v LEFT JOIN "
+                "(SELECT artifact_id, any(component) AS product FROM {db}.v_bench_reference_values GROUP BY artifact_id) AS x "
+                "ON x.artifact_id = v.artifact_id WHERE v.ref_key = {v:String} "
+                "ORDER BY v.registered_at DESC LIMIT {n:UInt32}"
+            )
+            params = {"v": value, **n}
+        else:
+            sql = (
+                "SELECT toString(e.artifact_id) AS artifact_id, any(a.component) AS component, any(a.arch) AS arch, "
+                "max(e.run_ts) AS ts, 'main' AS source, '' AS ref_key, '' AS ref_state "
+                "FROM {db}.v_benchmark_results_enriched AS e INNER JOIN {db}.v_artifacts AS a ON a.artifact_id = e.artifact_id "
+                "WHERE a.component = {c:String} AND if(a.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', a.arch) = {arch:String} "
+                "AND e.run_props['run.purpose'] IN {p:Array(String)} "
+                "AND e.run_props['run.validity'] = 'valid' AND e.run_props['run.trust'] != 'external' "
+                "GROUP BY e.artifact_id ORDER BY ts DESC LIMIT {n:UInt32}"
+            )
+            params = {"c": product, "p": list(purposes) or ["nightly"], **n}
+        return self._rows(sql, params)
+
+    def target_results(self, kind, value, target, benchmark_ids):
+        if kind != "ref":
+            return self.stored_results(benchmark_ids, target["artifact_id"])
+        ids = sorted({i for i in (_uuid_or_none(b) for b in benchmark_ids) if i})
+        if not ids:
+            return []
+        rows = self._rows(
+            "SELECT toString(artifact_id) AS run_key, toString(benchmark_id) AS benchmark_key, "
+            "count() AS n "
+            "FROM {db}.v_bench_reference_values WHERE ref_key = {k:String} AND state = 'current' "
+            "AND benchmark_id IN {ids:Array(UUID)} GROUP BY artifact_id, benchmark_id",
+            {"k": value, "ids": ids},
+        )
+        return [
+            {
+                "run_id": r["run_key"],
+                "benchmark_id": r["benchmark_key"],
+                "subject_id": target["artifact_id"],
+                "env_id": None,
+                "labels": {},
+                "validity": "valid",
+                "trust": "internal",
+                "purpose": "reference",
+                "reference": True,
+                "n": int(r["n"] or 0),
+                "ts": target.get("ts") if isinstance(target.get("ts"), datetime) else datetime.now(timezone.utc),
+            }
+            for r in rows
+        ]
 
     def landed(self, run_id):
         run = _uuid_or_none(run_id)

@@ -1,3 +1,6 @@
+# REMAINING V1 WRITER, kept on purpose: pytorch_ci_dispatches has no v2 table yet.
+# Depends on the legacy *_DEV secrets (CLICKHOUSE_HOST_DEV/PORT_DEV/USER_DEV/PASS_DEV/DB_DEV);
+# its steps are non-fatal, so removing them would fail silently.
 name: push-pytorch-dispatch-to-clickhouse
 
 # Entry point for repository_dispatch events sent by pytorch/pytorch's CI
@@ -124,6 +127,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
 
       - name: Summary
         if: always()
@@ -307,6 +312,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER_DEV }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD_DEV }}
 
   build_and_test:
     needs: gate_and_build
