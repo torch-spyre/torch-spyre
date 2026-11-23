@@ -245,7 +245,8 @@ def generate_bundle(
     # needed across the whole tree.
     loop_bounds: list[sympy.Expr] = []
     loop_sources: list[CountSource | None] = []
-    _collect_loop_bounds(specs_list, loop_bounds, loop_sources)
+    loop_parents: list[int | None] = []
+    _collect_loop_bounds(specs_list, loop_bounds, loop_sources, loop_parents)
 
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of stride values in outermost-first level order.
@@ -294,6 +295,7 @@ def generate_bundle(
             "a device-read loop count is only supported from the bundle's pool "
             "for now, and this bundle has none"
         )
+    _check_strided_count_sources(loop_bounds, loop_sources, loop_parents, pool_size)
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
     # the same logical tensor arg share one function parameter (the first-seen
@@ -777,15 +779,50 @@ def _compile_specs(
 # ---------------------------------------------------------------------------
 
 
-def _collect_loop_bounds(specs: list, bounds: list, sources: list) -> None:
-    """Collect each loop's trip count and device-read count source (or None)
-    depth-first (same order as loop var naming). One walk fills both lists, so
-    entry N of each always belongs to the same loop."""
+def _check_strided_count_sources(
+    loop_bounds: list, loop_sources: list, loop_parents: list, pool_size: int
+) -> None:
+    """Refuse a count whose address moves with an enclosing loop unless that
+    loop exists, has a concrete trip count, and every count it steps over lies
+    inside the pool."""
+    for idx, src in enumerate(loop_sources):
+        if src is None or not src.outer_stride:
+            continue
+        parent = loop_parents[idx]
+        if parent is None:
+            raise Unsupported(
+                f"device-read loop count with outer_stride={src.outer_stride} "
+                "needs an enclosing loop to step over"
+            )
+        outer = loop_bounds[parent]
+        if not isinstance(outer, (sympy.Integer, int)):
+            raise Unsupported(
+                f"device-read loop count steps over a loop of {outer} trips; "
+                "only a concrete enclosing trip count is supported"
+            )
+        last_end = src.pool_offset + src.outer_stride * (int(outer) - 1)
+        last_end += _STICK_BYTES
+        if last_end > pool_size:
+            raise Unsupported(
+                f"device-read loop count for the last of {int(outer)} trips ends at "
+                f"byte {last_end}, past the {pool_size}-byte pool"
+            )
+
+
+def _collect_loop_bounds(
+    specs: list, bounds: list, sources: list, parents: list, parent=None
+) -> None:
+    """Collect each loop's trip count, device-read count source (or None) and
+    directly enclosing loop index (or None) depth-first (same order as loop var
+    naming). One walk fills all three lists, so entry N of each always belongs
+    to the same loop."""
     for entry in specs:
         if isinstance(entry, LoopSpec):
+            idx = len(bounds)
             bounds.append(entry.count)
             sources.append(entry.count_from_buffer)
-            _collect_loop_bounds(entry.body, bounds, sources)
+            parents.append(parent)
+            _collect_loop_bounds(entry.body, bounds, sources, parents, idx)
 
 
 # ---------------------------------------------------------------------------
