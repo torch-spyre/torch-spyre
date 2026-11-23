@@ -1812,8 +1812,6 @@ bool needs_host_staging(const at::Tensor& self, const SpyreTensorLayout& stl) {
     return true;  // expanded or broadcast
   }
   if (view_overlaps_itself(self.sizes(), self.strides())) return true;
-  // A view covering every stored element is a plain DMA.
-  if (valid_element_count(stl) == self.numel()) return false;
   // A view dim below the layout's largest stride that is not a layout stride
   // (a step inside a stick, as in x[::2]) selects elements the descriptors
   // cannot express. Dims above every layout stride are outer offsets and stay.
@@ -1832,6 +1830,10 @@ bool needs_host_staging(const at::Tensor& self, const SpyreTensorLayout& stl) {
       return true;
     }
   }
+  // A view covering every stored element is a plain DMA, but only if its
+  // strides are expressible (checked above): a full-size view whose inner dim
+  // spans two sticks, such as a reshape to a wider stick, is not.
+  if (valid_element_count(stl) == self.numel()) return false;
   return view_crosses_stick(stl, self.sizes(), self.strides(),
                             self.storage_offset());
 }
