@@ -463,7 +463,7 @@ class TestD2HFromTensorSegment(TestCase):
                 os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_val
 
     def test_tensor_segment_d2h_out_of_range(self):
-        """D2H from a tensor segment at offset 0 resolves and launches."""
+        """Reject a D2H tensor segment with no corresponding launch argument."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_plan = _build_d2h_jobplan(tmpdir, 34359738368, 128)
             assert job_plan.get_step_type(0) == "D2H"
@@ -476,19 +476,22 @@ class TestD2HFromTensorSegment(TestCase):
                 torch_spyre._C.launch_jobplan(job_plan, [inp, out])
 
     def test_tensor_segment_d2h(self):
-        """D2H from a tensor segment at a non-zero offset
-        exercises the offset arithmetic in JobPlanStepD2H::construct."""
+        """D2H from tensor segment zero completes before its buffers are freed."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_plan = _build_d2h_jobplan(tmpdir, 0, 128)
             assert job_plan.get_step_type(0) == "D2H"
 
             inp = torch.zeros(128, dtype=torch.float16, device="spyre")
             out = torch.zeros(128, dtype=torch.float16, device="spyre")
-            torch_spyre._C.launch_jobplan(job_plan, [inp, out])
+            try:
+                torch_spyre._C.launch_jobplan(job_plan, [inp, out])
+            finally:
+                # The plan owns the host destination; launch_jobplan is asynchronous.
+                # Drain while the plan and tensors are still alive, even on failure.
+                torch.spyre.synchronize()
 
     def test_tensor_segment_d2h_out_of_bounds(self):
-        """D2H from a tensor segment at a non-zero offset
-        exercises the offset arithmetic in JobPlanStepD2H::construct."""
+        """Reject a D2H range extending beyond the tensor allocation."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_plan = _build_d2h_jobplan(tmpdir, 256, 128)
             assert job_plan.get_step_type(0) == "D2H"
