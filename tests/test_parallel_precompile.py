@@ -379,7 +379,12 @@ def test_a_child_solver_gets_its_share_of_the_cpus(monkeypatch):
         monkeypatch.setattr(dist, "get_world_size", lambda: 8)
         assert pp._solver_cpu_share(7) == 8  # no local count: the process group's size
         monkeypatch.setattr(dist, "is_initialized", lambda: False)
-        assert pp._solver_cpu_share(7) == 64  # one rank keeps the host
+        assert pp._solver_cpu_share(7) == 16  # one rank: capped per child
+        monkeypatch.setattr(pp, "_host_cpus", lambda: 9)
+        assert pp._solver_cpu_share(7) == 9  # a small host stays whole
+        monkeypatch.setattr(pp, "_host_cpus", lambda: 384)
+        assert pp._solver_cpu_share(8) == 48  # a big host split across the workers
+        assert pp._solver_cpu_share(64) == 16
         monkeypatch.setattr(pp, "_host_cpus", lambda: 1)
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
         assert pp._solver_cpu_share(7) == 2  # never below two
