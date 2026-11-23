@@ -1351,6 +1351,44 @@ class TestNormalizeCoordinatesFusion(TestCase):
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
 
+    def test_constant_stick_coordinate_keeps_hbm_base_offset(self):
+        """A constant coordinate on the stick dim is an HBM base address, not an error.
+
+        A sub-stick indirect scatter (``index_copy_`` of ``[T, KV, 1]`` rows) has
+        no loop variable on its last device dim; the layout engine bakes the
+        base offset into that coordinate.  It must survive as the ``offset`` of a
+        variable-free term instead of tripping ``assert offset == 0``.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 4},
+            [4, 64],
+            [k, sympy.Integer(5)],
+        )
+        self.assertEqual(len(terms), 2)
+        stick = terms[-1]
+        self.assertIsNone(stick.var)
+        self.assertEqual(stick.dim_size, 64)
+        self.assertEqual(stick.offset, 5)
+        # The base offset is part of the flat device address.
+        addr = self._addr(terms)
+        for val in range(4):
+            self.assertEqual(int(addr.subs({k: val})), val * 64 + 5)
+
+    def test_constant_offset_on_non_stick_size_one_dim_is_rejected(self):
+        """Only the stick dim may carry a constant offset.
+
+        A size-1 non-stick dim without variables is dropped when terms are
+        fused, so a nonzero offset on it would silently be lost.
+        """
+        k = sympy.Symbol("c1")
+        with self.assertRaises(AssertionError):
+            self._normalize(
+                {k: 4},
+                [4, 1, 64],
+                [k, sympy.Integer(3), sympy.Mod(k, 64)],
+            )
+
 
 class TestAlignScatterIndirectSymbol(TestCase):
     """align_tensors_pure with a scatter's indirect symbol in a destination coord.

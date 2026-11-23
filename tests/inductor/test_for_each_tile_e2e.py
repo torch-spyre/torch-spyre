@@ -64,6 +64,7 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
@@ -515,7 +516,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         to scatter elements from one stick to multiple sticks").
 
         Now passes: confirmed via isolated stash/pop bisection that this is
-        fixed by the splice-var/``loop_info`` symbol-consistency work in
+        fixed by the splice-var/``loop_member`` symbol-consistency work in
         ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same issue
         #4706 OS-5/``_synthesize_dim_hints_for_group`` fixes described in
         ``test_nested_for_each_tile_value_correct``'s docstring, which
@@ -1237,14 +1238,15 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
 
 def _record_loop_membership(result: dict):
     """A pre-scheduling pipeline that records, once it is done, where the ops that
-    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+    claim a loop (``enclosing_loops``) sit in the node tree.
 
     An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
-    constant to the head of the graph and it keeps its ``loop_info`` (see
+    constant to the head of the graph and it keeps its ``loop_member`` (see
     ``counted_loop_path``), so it claims a loop from the top level by design.
     ``result`` is filled in rather than kept on the class, so tests share no state.
     """
     from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_facts import enclosing_loops
     from torch_spyre._inductor.loop_node import LoopNode
 
     class _Record(CustomPreSchedulingPasses):
@@ -1252,10 +1254,8 @@ def _record_loop_membership(result: dict):
             super().__call__(graph)
 
             def claims_a_loop(op):
-                return (
-                    not isinstance(op, SpyreConstantFallback)
-                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-                    is not None
+                return not isinstance(op, SpyreConstantFallback) and bool(
+                    enclosing_loops(op)
                 )
 
             result["top_level"] = [
@@ -1321,7 +1321,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
             if name in region.unstamped:
                 continue
             self.assertEqual(
-                op.loop_info.loop_group_id[0],
+                counted_loop_path(op, include_extern=True)[0],
                 region.loop_group_id,
                 f"{name} is stamped by another loop than its region's",
             )
@@ -1329,8 +1329,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         strays = [
             op.get_operation_name()
             for op in outside
-            if getattr(op, "loop_info", None) is not None
-            and op.loop_info.loop_group_id[0] == region.loop_group_id
+            if counted_loop_path(op, include_extern=True)[:1] == (region.loop_group_id,)
         ]
         self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
 
@@ -1370,7 +1369,7 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         (region,) = regions
         self._assert_region_is_whole(operations, region)
         depths = {
-            len(op.loop_info.loop_count)
+            len(counted_loop_path(op, include_extern=True))
             for op in operations[region.start : region.stop]
             if op.get_operation_name() not in region.unstamped
         }
@@ -1683,12 +1682,12 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         hardware limit if the work-division planner is free to split its row
         dim across cores. Before the fix, _transfer_loop_info left the
         embedding consumer's own loop_tiled_dims on that copy's deep-copied
-        LoopInfo, which coarse_tile_local_dim_split_domains misread as
+        LoopMember, which coarse_tile_local_dim_split_domains misread as
         "the copy's row dim is loop-tiled" and pinned its core split to 1,
         making every split attempt fail with "per-core tensor span 384.500
         MB ... exceeds hardware limit of 256.00 MB" -- reproduced by
         temporarily reverting the two-line fix in insert_restickify.py's
-        `elif hasattr(op, "loop_info")` branch. The sibling non-looped case
+        `elif hasattr(op, "loop_member")` branch. The sibling non-looped case
         (same bug class, no loop involved) is covered by
         test_embedding_large_vocab_table_no_span_overflow in
         test_indirect_access_gather.py.
@@ -1706,7 +1705,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         per-trip relayout handled by ``_transfer_loop_info``'s first
         branch). The copy this test exercises is the *loop-invariant*
         full-table case handled by that function's ``elif hasattr(op,
-        "loop_info")`` branch -- the one the fix touches -- which SDSC
+        "loop_member")`` branch -- the one the fix touches -- which SDSC
         lowers to a plain ``op='identity'`` whose ``debug_handle.ir_chain``
         names the restickify IR node (``'restickify_default'``) instead.
         """
