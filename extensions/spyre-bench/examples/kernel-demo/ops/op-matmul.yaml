@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: kernel-demo-fp16}
+spec: {type: kernel/op-library, backend: spyre, library: torch-spyre, precision: fp16, harness: harness-a, extensions: {spyre: {mode: a}}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-matmul}
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: kernel-demo-fp16
+  workload: {type: kernel/op, op: matmul, load: {executor: iterations, iterations: 100, warmup_iterations: 3}}
+  env: {DEMO_FLAG_A: 2}
+  run: {repeats: 1, timeout: 30m, est: 2m, isolation: process}
+  matrix:
+    name_template: op_matmul_fp16_{shape}
+    axes:
+      shape:
+        - {token: m4096-n4096-k4096, patch: {tier: sanity, workload: {shape: [4096, 4096, 4096]}}}
+        - {token: m1-n4096-k4096, patch: {workload: {shape: [1, 4096, 4096]}}}

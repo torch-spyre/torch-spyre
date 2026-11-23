@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: hub}
+spec:
+  type: core/hf
+  endpoint: {value: huggingface.co}
+  auth: {mode: token, optional: true, refs: [{env: HF_TOKEN}]}
+  visibility: public
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: curated}
+spec:
+  type: core/artifactory
+  endpoint: {env: STORE_BASE_URL}
+  root: {env: STORE_DATASETS_PATH}
+  auth: {mode: token, refs: [{env: STORE_TOKEN}]}
+  visibility: internal

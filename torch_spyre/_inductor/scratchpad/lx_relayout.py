@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 from functools import cache
+import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
@@ -31,6 +32,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
+    Reduction,
     Scatter,
 )
 from torch_spyre._C import ElementArrangement
@@ -56,8 +58,7 @@ from ..lx_read_contracts import (
     local_read_certificate,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback
-from ..loop_facts import counted_loop_path
-from ..loop_info import COUNTED_LOOP_INFO
+from ..loop_facts import counted_loop_path, is_looped
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
@@ -72,9 +73,10 @@ from ..pass_utils import (
     iteration_space_with_splits,
     make_iteration_space_ownership,
     op_read_writes,
+    origin_in_graph,
     try_device_coordinates,
 )
-from .utils import _op_num_cores, storage_has_single_writer
+from .utils import _op_num_cores, is_loop_carry_storage, storage_has_single_writer
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -690,7 +692,7 @@ def _is_activation_source(
         if (
             isinstance(previous, ComputedBuffer)
             and isinstance(previous.layout, MutationLayoutSHOULDREMOVE)
-            and getattr(previous, "loop_info", None) is None
+            and not is_looped(previous)
             and previous.layout.get_buffer().get_name() == reads[0].name
         ):
             updated = True
@@ -782,8 +784,8 @@ def _persistent_scatter_consumer(
             or _pointwise_scatter_materializer(graph, producer, consumer, source_name)
         )
         or not isinstance(consumer.data, Pointwise)
-        or getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
+        or is_looped(producer)
+        or is_looped(consumer)
     ):
         return False
     return _persistent_scatter_storage_safe(graph, producer, consumer, source_name)
@@ -864,6 +866,37 @@ def _persistent_scatter_storage_safe(graph, producer, consumer, source_name):
     return storage_has_single_writer(graph, producer)
 
 
+def _relayout_consumer_kind_supported(producer: Operation, consumer: Operation) -> bool:
+    """Whether the solver may offer ``consumer`` a relayout copy of ``producer``.
+
+    A pointwise or matmul consumer qualifies. A reduction qualifies in one
+    case: a ``sum`` outside every counted loop that reads the storage of a
+    counted-loop carry. The loop's core map splits the carry (for example one
+    accumulator per core group), and the sum after the loop reads every part
+    of it. A division of the sum that keeps whole rows on a core then matches
+    no division of the carry, and the carry, with each in-loop update of it,
+    would live in HBM. The copy gives the sum the per-core view that its own
+    division reads, as it does for a pointwise consumer.
+
+    Loop membership comes from ``counted_loop_path``, the loop-facts read API,
+    not from ``loop_info``, so the rule follows that API when the loop
+    representation changes (#5863).
+
+    The carry clause is a limit of scope, not of legality: it is the reduction
+    that has a test. The copy is still subject to every later gate (movement
+    fan-in, LX capacity for the carry and the copy together, price).
+    """
+    data = getattr(consumer, "data", None)
+    if _is_matmul_op(consumer) or isinstance(data, Pointwise):
+        return True
+    return (
+        isinstance(data, Reduction)
+        and data.reduction_type == "sum"
+        and not counted_loop_path(consumer)
+        and is_loop_carry_storage(producer)
+    )
+
+
 def _supported_consumer_layout(graph, producer, consumer, source_name) -> bool:
     return isinstance(consumer, ComputedBuffer) and (
         not isinstance(consumer.layout, MutationLayoutSHOULDREMOVE)
@@ -883,7 +916,12 @@ def solver_relayout_edge_context(
     The same structural gates ``collect_lx_relayout_plans`` applies on the
     committed graph, restricted to what does not depend on a chosen division, so
     the solver's candidate enumeration can run them once per edge before any
-    per-division-pair work. Returns ``(write_dep, read_dep, producer_coords,
+    per-division-pair work. Two things are the solver's alone. A counted-loop
+    carry is a source only here: the committed path never keeps a carry in
+    LX, and its collector rejects a source that an in-place update reads; of
+    the reductions, the sum after the loop may take the copy
+    (``_relayout_consumer_kind_supported``). And both ends of an edge need an
+    FX origin in the lowering graph. Returns ``(write_dep, read_dep, producer_coords,
     consumer_coords, producer_space, consumer_space)`` - the two spaces are the
     loop-symbol -> extent mappings ``work_division_from_view`` projects into -
     or ``None`` when the edge can never host a relayout.
@@ -902,12 +940,10 @@ def solver_relayout_edge_context(
     # the parent's own loop trip count before handing a same-group candidate
     # to the solver, so a repeated shuffle is priced at its real total cost,
     # not once.
-    producer_loop_info = getattr(producer, "loop_info", None)
-    consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (
         config.lx_same_tile_group_relayout
-        and isinstance(producer_loop_info, COUNTED_LOOP_INFO)
-        and isinstance(consumer_loop_info, COUNTED_LOOP_INFO)
+        and is_looped(producer)
+        and is_looped(consumer)
         and counted_loop_path(producer, include_extern=True)
         == counted_loop_path(consumer, include_extern=True)
         and not (
@@ -915,9 +951,7 @@ def solver_relayout_edge_context(
             and is_restickify_op(consumer, graph)
         )
     )
-    if (
-        producer_loop_info is not None or consumer_loop_info is not None
-    ) and not same_tile_group:
+    if (is_looped(producer) or is_looped(consumer)) and not same_tile_group:
         return None
     if (
         not isinstance(producer, ComputedBuffer)
@@ -926,9 +960,26 @@ def solver_relayout_edge_context(
         or not _is_activation_source(graph, operations, producer)
     ):
         return None
+    # The copy's FX node goes after the producer's and replaces it in the
+    # consumer's (GraphEditor asserts both). A compiler-made buffer has none:
+    # the pre-loop copy of a caller-owned loop carry, for example. Such a
+    # buffer is no end of an edge.
+    fx_graph = getattr(graph, "graph", None)
+    if origin_in_graph(getattr(producer, "origins", ()), fx_graph) is None or (
+        getattr(consumer, "origin_node", None) is None
+        and origin_in_graph(getattr(consumer, "origins", ()), fx_graph) is None
+    ):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "relayout edge %s -> %s declined: an end has no FX origin in the "
+                "lowering graph",
+                producer.get_name(),
+                consumer.get_name(),
+            )
+        return None
     if not _supported_consumer_layout(graph, producer, consumer, source_name):
         return None
-    if not _is_matmul_op(consumer) and not isinstance(consumer.data, Pointwise):
+    if not _relayout_consumer_kind_supported(producer, consumer):
         return None
     consumer_deps = [
         d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
@@ -991,8 +1042,8 @@ def prefix_lx_contraction_axis(producer: Operation, consumer: Operation) -> int 
         or len(layout.size) < 2
         or any(not sympy.sympify(x).is_Integer for x in layout.size)
         or any(x != 1 for x in layout.size[:-2])
-        or getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
+        or is_looped(producer)
+        or is_looped(consumer)
         or getattr(producer, "_input_layout_overrides", None)
         or getattr(consumer, "_input_layout_overrides", None)
     ):
@@ -1130,7 +1181,7 @@ def _local_lx_parent_read(graph, producer, consumer):
             or len(constant.constant_args) != 1
             or type(constant.constant_args[0]) not in (bool, int, float)
             or op_read_writes(constant).reads
-            or getattr(constant, "loop_info", None) is not None
+            or is_looped(constant)
             or not storage_has_single_writer(graph, constant)
         ):
             return None
@@ -1163,7 +1214,7 @@ def _local_lx_pointwise_read(graph, producer, consumer):
         or sibling.layout.offset != 0
         or sibling.get_device() != consumer.get_device()
         or sibling.get_dtype() != consumer.get_dtype()
-        or getattr(sibling, "loop_info", None) is not None
+        or is_looped(sibling)
         or getattr(sibling, "_input_layout_overrides", None)
         or not storage_has_single_writer(graph, sibling)
         or is_partial_lx_read(sibling, dep)
@@ -1217,8 +1268,7 @@ def _local_lx_scatter_geometry(graph, producer, consumer):
         or producer.get_dtype() != consumer.get_dtype()
         or producer.layout.offset != 0
         or any(
-            getattr(op, "loop_info", None) is not None
-            or getattr(op, "_input_layout_overrides", None)
+            is_looped(op) or getattr(op, "_input_layout_overrides", None)
             for op in (producer, consumer)
         )
         or not storage_has_single_writer(graph, producer)
@@ -1295,7 +1345,7 @@ def local_lx_subrange_geometry(graph, producer, consumer):
         or producer.get_device() != consumer.get_device()
         or producer.get_dtype() != consumer.get_dtype()
         or any(
-            getattr(op, "loop_info", None) is not None
+            is_looped(op)
             or getattr(op, "_input_layout_overrides", None)
             or op.layout.offset != 0
             for op in (producer, consumer)
@@ -1409,7 +1459,7 @@ def local_lx_subrange_source(graph, name: str, uses: list[int]) -> bool:
 
 
 def _local_lx_emission_view(op, dep, name):
-    """Use the pointwise division transported to the scheduler at emission.
+    """Use the division transported to the scheduler at emission.
 
     Scheduler finalization removes iteration_space_ownership. Decode its
     existing coefficient transport exactly as create_op_spec does; retain all
@@ -1417,7 +1467,9 @@ def _local_lx_emission_view(op, dep, name):
     """
     ownership = getattr(op, "iteration_space_ownership", None)
     if ownership is None:
-        if not isinstance(op.data, Pointwise) or not hasattr(op, "op_it_space_splits"):
+        if not isinstance(op.data, (Pointwise, Reduction)) or not hasattr(
+            op, "op_it_space_splits"
+        ):
             raise ValueError(f"{name}: local LX emission lacks a committed division")
         transported = iteration_space_with_splits(
             op, op_read_writes(op), iteration_space_from_op(op)

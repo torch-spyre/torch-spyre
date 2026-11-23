@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: docs-benchmark, owner: example-team}
+spec:
+  component: docs-benchmark
+  packs: [{name: kernel, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: one-socket
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops, description: "one Benchmark per operation"}
+spec: {type: perf, pr_selectable: true}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: systems, description: "one case per distinct System of the ops Suite"}
+spec: {type: perf, pr_selectable: false}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke, description: "one case, one repeat; never ingested"}
+spec:
+  cases: [op_scale_n1024]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: ops-sanity}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: sanity}}}
+  reuse: {mode: if_valid, max_age: 7d}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: cpu-pool}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: docs}}
+  host_profile: {governor: performance}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: one-socket, description: "one CPU socket on a node of the cpu-pool class"}
+spec:
+  devices:
+    requests: [{name: cpus, device_class: cpu/socket, count: 1}]
+  host: {node_class: cpu-pool, arch: x86_64, exclusive: false}
+  labels: {node.class: cpu-pool}
+  policy: {validity_floor: shared_env}
