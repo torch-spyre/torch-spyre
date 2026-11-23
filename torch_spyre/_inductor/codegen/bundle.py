@@ -1085,6 +1085,7 @@ def _device_read_loop_level(
             f"whole number of {_STICK_BYTES}-byte sticks"
         )
     offset = f"%cnt_off_{lb_idx} = arith.constant {source.pool_offset} : index"
+    setup: "tuple[str, ...]"
     if source.outer_stride:
         # The address moves with the enclosing loop, so only its base and step
         # are constants here; _emit_specs writes the address inside that loop.
