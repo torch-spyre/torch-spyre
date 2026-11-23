@@ -1299,7 +1299,7 @@ def _build_fp32_proxy_cpu_refs(
 
 
 # keep_by_index / mask_by_index cases, as (shape, k, dim, fill value). Each runs
-# in fp16 (plain names) and fp32 (names suffixed _fp32); see _masking_ops_params.
+# in fp16 (plain names) and fp32 (names suffixed _fp32) - see _masking_ops_params.
 _MASKING_OPS_CASES = {
     # Stick-aligned (every dim a multiple of 64).
     "2d_aligned_dim0": ((64, 128), 8, 0, -1.0),
