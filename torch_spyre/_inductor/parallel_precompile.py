@@ -738,7 +738,8 @@ AOT_REUSE_ENV = "TORCH_SPYRE_AOT_REUSE_FX"
 
 # FX graph cache keys of the graphs a pool of this process compiled in a child (or
 # found in the FX graph cache), kept while ``TORCH_SPYRE_AOT_REUSE_FX=1``, with the
-# key's debug lines, so a lookup that misses can name the fields that differ.
+# key's debug lines, so a lookup that misses can name the fields that differ from
+# the pool's keys.
 _pool_fx_keys: dict = {}
 
 
@@ -760,15 +761,18 @@ def _pool_graph_state(*args: Any, **kwargs: Any) -> tuple:
     C++ code, whose kernels are built for that count; such a graph is not reused.
 
     Returns ``(state, detail)``. ``state`` is None when this does not apply (switch
-    off, not inside ``aot_compile``), ``"found"`` when a pool of this process noted
-    the key and the FX graph cache holds it, else ``"not seen"`` or ``"missing"``;
-    ``detail`` says why, for the log. On ``"found"`` the caller runs
-    the plain ``compile_fx_inner`` with the flag off, which loads that entry: the
-    ``CompiledFxGraph`` a plain compile of this graph returns. The key covers the
-    graph, the inputs (with the Spyre layouts) and the Inductor config, and the
-    other functorch flags ``aot_compile`` sets are read by AOTAutograd only, before
-    the inner compile. The entry holds no trace of the flag: torch adds it to the
-    key so that the FX graph cache and the bundled AOTAutograd cache do not mix
+    off, not inside ``aot_compile``), ``"found"`` when the FX graph cache holds the
+    key, ``"not seen"`` when there is no key (a backward graph, or an error) and
+    ``"missing"`` when the cache holds no entry for it; ``detail`` says why, for the
+    log. The entry may come from a pool child or from a plain compile of an earlier
+    start (an upgraded start whose saved ``aot_compile`` files no longer match, with
+    no pool to fork). On ``"found"`` the
+    caller runs the plain ``compile_fx_inner`` with the flag off, which loads that
+    entry: the ``CompiledFxGraph`` a plain compile of this graph returns. The key
+    covers the graph, the inputs (with the Spyre layouts) and the Inductor config,
+    and the other functorch flags ``aot_compile`` sets are read by AOTAutograd only,
+    before the inner compile. The entry holds no trace of the flag: torch adds it to
+    the key so that the FX graph cache and the bundled AOTAutograd cache do not mix
     their entries (pytorch#156611). Forward graphs only.
     """
     if not (_aot_reuse_on() and torch._functorch.config.bundled_autograd_cache):
@@ -783,11 +787,12 @@ def _pool_graph_state(*args: Any, **kwargs: Any) -> tuple:
     if not key_info:
         return "not seen", "no FX key (cache off or graph not cacheable)"
     key, lines = key_info
-    if key not in _pool_fx_keys:
-        return "not seen", f"key {key}; {_closest_pool_key(lines)}"
     if not _fx_cache_has(key):
-        return "missing", f"key {key}, no entry on disk"
-    return "found", f"key {key}"
+        if key in _pool_fx_keys:
+            return "missing", f"key {key}, a pool key, no entry on disk"
+        return "missing", f"key {key}, no entry on disk; {_closest_pool_key(lines)}"
+    source = "a pool key" if key in _pool_fx_keys else "not a pool key"
+    return "found", f"key {key}, {source}"
 
 
 def _closest_pool_key(lines: list) -> str:
@@ -816,9 +821,9 @@ _aot_reuse_counts = {"reused": 0, "not seen": 0, "miss": 0}
 
 def compile_reusing_pool_graph(compile_inner: Callable, *args: Any, **kwargs: Any):
     """``compile_inner(*args, **kwargs)``, but under ``aot_compile`` with
-    ``TORCH_SPYRE_AOT_REUSE_FX=1`` a graph a pool of this process left in the FX
-    graph cache is loaded from there (see ``_pool_graph_state``). Logs one line per
-    such compile: a reuse at INFO, a compile (the pool's work lost) as a warning."""
+    ``TORCH_SPYRE_AOT_REUSE_FX=1`` a graph the FX graph cache holds (left by a pool
+    child or a plain compile) is loaded from there (see ``_pool_graph_state``). Logs
+    one line per such compile: a reuse at INFO, a compile as a warning."""
     state, detail = _pool_graph_state(*args, **kwargs)
     if state is None:
         return compile_inner(*args, **kwargs)
@@ -837,9 +842,9 @@ def compile_reusing_pool_graph(compile_inner: Callable, *args: Any, **kwargs: An
             outcome, detail = "miss", detail + ", the FX lookup missed"
     _aot_reuse_counts[outcome] += 1
     message = {
-        "reused": "reused pool FX entry",
-        "not seen": "no pool entry (key not seen), compiled",
-        "miss": "pool key seen but FX miss, compiled",
+        "reused": "reused FX entry",
+        "not seen": "no FX key, compiled",
+        "miss": "FX miss, compiled",
     }[outcome]
     (logger.info if outcome == "reused" else logger.warning)(
         "aot_compile reuse: %s (%d reused, %d not seen, %d miss so far): %s",

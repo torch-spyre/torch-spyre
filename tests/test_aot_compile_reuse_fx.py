@@ -163,7 +163,7 @@ def test_aot_compile_takes_the_pool_graph(
         assert compiles[0] == 0
         assert reuse_log[0] == "aot_compile reuse: the pool noted 1 FX keys"
         assert reuse_log[1].startswith(
-            "aot_compile reuse: reused pool FX entry (1 reused, 0 not seen, 0 miss"
+            "aot_compile reuse: reused FX entry (1 reused, 0 not seen, 0 miss"
         )
         assert len(reuse_log) == 2
         path = tmp_path / "kern.aot"
@@ -192,21 +192,44 @@ def test_another_graph_is_compiled(monkeypatch, compiles, reuse_log):
         compiles[0] = 0
         _aot_compile(other, False)
         assert compiles[0] == 1
-        assert "no pool entry (key not seen)" in reuse_log[-1]
+        assert "FX miss, compiled" in reuse_log[-1]
         # The line names the key fields that differ from the closest pool key.
         assert "differs in: gm" in reuse_log[-1]
 
 
-def test_an_entry_the_pool_did_not_see_is_not_reused(monkeypatch, compiles, reuse_log):
+def test_an_entry_of_a_plain_compile_is_reused(
+    monkeypatch, compiles, reuse_log, tmp_path
+):
+    """A start with warm caches forks no pool, so no key is noted. When its saved
+    aot_compile files no longer match (an upgrade), aot_compile takes the plain
+    compile's entry of an earlier start instead of compiling every graph again."""
     monkeypatch.setenv(pp.AOT_REUSE_ENV, "1")
     with fresh_cache():
         torch._dynamo.reset()
         a, b = _inputs()
         torch.compile(kern, backend=_backend, fullgraph=True)(a, b)  # no pool
         assert compiles[0] == 1 and not pp._pool_fx_keys
+        compiled = _aot_compile(kern, False)
+        assert compiles[0] == 1
+        assert "reused FX entry" in reuse_log[-1]
+        assert reuse_log[-1].endswith("not a pool key")
+        path = tmp_path / "kern.aot"
+        compiled.save_compiled_function(str(path))
+    assert _load_in_new_process(path, tmp_path, False) == ["True", "0"]
+
+
+def test_a_stale_entry_is_not_reused(monkeypatch, compiles, reuse_log):
+    """An entry made under another Inductor config is another key: compiled."""
+    monkeypatch.setenv(pp.AOT_REUSE_ENV, "1")
+    with fresh_cache():
+        torch._dynamo.reset()
+        a, b = _inputs()
+        with torch._inductor.config.patch({"fallback_random": True}):
+            torch.compile(kern, backend=_backend, fullgraph=True)(a, b)
+        assert compiles[0] == 1
         _aot_compile(kern, False)
         assert compiles[0] == 2
-        assert "no pool entry (key not seen)" in reuse_log[-1]
+        assert "FX miss, compiled" in reuse_log[-1]
         assert reuse_log[-1].endswith("the pool noted no key")
 
 
@@ -222,7 +245,7 @@ def test_a_corrupt_entry_is_compiled_again(monkeypatch, compiles, reuse_log, tmp
         compiles[0] = 0
         compiled = _aot_compile(kern, False)
         assert compiles[0] == 1
-        assert "pool key seen but FX miss" in reuse_log[-1]
+        assert "FX miss, compiled" in reuse_log[-1]
         path = tmp_path / "kern.aot"
         compiled.save_compiled_function(str(path))
     assert _load_in_new_process(path, tmp_path, False) == ["True", "0"]
@@ -243,7 +266,7 @@ def test_a_graph_built_for_the_childs_thread_count_is_not_reused(
             compiles[0] = 0
             _aot_compile(kern, False)
             assert compiles[0] == 1
-            assert "pool key seen but FX miss" in reuse_log[-1]
+            assert "FX miss, compiled" in reuse_log[-1]
     finally:
         torch.set_num_threads(threads)
 
@@ -263,7 +286,7 @@ def test_the_pool_notes_the_key_its_child_writes(monkeypatch, compiles, reuse_lo
         assert os.listdir(FxGraphCache._get_tmp_dir_for_key(key))
         compiles[0] = 0
         _aot_compile(with_constant, False)
-        assert compiles[0] == 0 and "reused pool FX entry" in reuse_log[-1]
+        assert compiles[0] == 0 and "reused FX entry" in reuse_log[-1]
 
 
 @pytest.mark.parametrize("plain_mode", [True, False])
@@ -308,7 +331,7 @@ def test_aot_compile_under_inference_mode(monkeypatch, compiles, reuse_log, plai
             compiled = aot.aot_compile(((a, b), {}))
         assert torch.allclose(compiled(a, b), kern(a, b))
     if plain_mode:
-        assert compiles[0] == 0 and "reused pool FX entry" in reuse_log[-1]
+        assert compiles[0] == 0 and "reused FX entry" in reuse_log[-1]
     else:
         assert compiles[0] == 1
         assert reuse_log[-1].endswith(

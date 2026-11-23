@@ -69,9 +69,9 @@ def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
 
     NOTE: We are working on improving this in upstream PyTorch
 
-    Under ``aot_compile`` with ``TORCH_SPYRE_AOT_REUSE_FX=1``, a graph that a
-    parallel precompile pool of this process left in the FX graph cache is loaded
-    from there instead of compiled again (see
+    Under ``aot_compile`` with ``TORCH_SPYRE_AOT_REUSE_FX=1``, a graph the FX graph
+    cache holds (from a parallel precompile pool or a plain compile) is loaded from
+    there instead of compiled again (see
     ``parallel_precompile.compile_reusing_pool_graph``).
     """
     from torch._inductor.compile_fx import compile_fx_inner
