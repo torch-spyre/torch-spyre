@@ -4,6 +4,7 @@ name: downstream_integration
 # anyone comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
 # (informational) integration suites on their main against this PR's torch-spyre head. Inert unless
 # GHA_DOWNSTREAM_INTEGRATION is "true".
+# 1 line addition
 run-name: downstream-integration
 
 on:
