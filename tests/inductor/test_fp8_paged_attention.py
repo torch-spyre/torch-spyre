@@ -129,7 +129,6 @@ from torch_spyre._C import (
     copy_tensor,
     get_device_dtype,
     get_elem_in_stick,
-    spyre_empty_with_layout,
 )
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from torch_spyre.model_utils import zeros_qfp8wt
@@ -1992,13 +1991,11 @@ class TestFp8KvCacheWriteQFP8WT:
     computing the reference matmul, confirming scale correctness end-to-end.
 
     **Cache shape**: ``[NUM_BLOCKS, KV, D, BLOCK_SIZE]`` with the last two dims
-    as the QFP8WT ``[K=D, N=BLOCK_SIZE]`` matrix.  This requires the spyre_mem
-    QFP8WT DCI to support batch outer dimensions (``cpu_sizes[2..]`` beyond the
-    ``[K, N]`` innermost pair) — added in the accompanying ``spyre_mem.cpp``
-    enhancement.
+    as the QFP8WT ``[K=D, N=BLOCK_SIZE]`` matrix.  The cache is allocated with
+    ``zeros_qfp8wt``, and the QFP8WT host transfer in ``spyre_mem.cpp`` handles
+    the outer batch dimensions (the dims before the ``[K, N]`` pair).
 
-    Requires ``torch.ops.spyre.scaled_bmm`` and the QFP8WT batch-DCI
-    enhancement in ``spyre_mem.cpp``.
+    Requires ``torch.ops.spyre.scaled_bmm``.
     """
 
     @pytest.mark.parametrize("block", [0, 1, NUM_BLOCKS - 1])
@@ -2527,14 +2524,7 @@ class TestFp8Qfp8wtBatchTransfer:
         host = ((torch.arange(n) % 251).to(torch.float16).reshape(shape)).to(
             torch.float8_e4m3fn
         )
-        stl = SpyreTensorLayout(
-            list(host.shape),
-            list(host.stride()),
-            torch.float8_e4m3fn,
-            list(range(host.dim())),
-            ElementArrangement.QFP8WT,
-        )
-        dev = spyre_empty_with_layout(host.size(), host.stride(), host.dtype, stl)
+        dev = zeros_qfp8wt(shape)
         copy_tensor(host, dev, non_blocking=False)
         return host, dev
 
@@ -2634,15 +2624,6 @@ class TestFp8Qfp8wtBatchTransfer:
         view = raw.transpose(-1, -2).contiguous().transpose(-1, -2)
         assert not view.is_contiguous()
         expected = view.contiguous()
-        stl = SpyreTensorLayout(
-            list(expected.shape),
-            list(expected.stride()),
-            torch.float8_e4m3fn,
-            list(range(expected.dim())),
-            ElementArrangement.QFP8WT,
-        )
-        dev = spyre_empty_with_layout(
-            expected.size(), expected.stride(), expected.dtype, stl
-        )
+        dev = zeros_qfp8wt(shape)
         copy_tensor(view, dev, non_blocking=False)
         assert torch.equal(dev.cpu().view(torch.uint8), expected.view(torch.uint8))
