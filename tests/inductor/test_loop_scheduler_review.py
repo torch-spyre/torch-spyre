@@ -431,14 +431,6 @@ def test_deferred_division_when_the_solve_fails(case, request):
     # The fallback really divided body ops (everything was still deferred).
     assert left and all(any("while_loop_body" in n for n in names) for names in left)
     _assert_compiled_with_nodes(nodes)
-    if case == "nested_online_softmax":
-        strict_xfail(
-            request,
-            AssertionError,
-            "greedy LX placement, which the fallback uses, gives a wrong answer "
-            "(62% error against the CPU reference) on this graph: #6633",
-        )
-    _assert_matches_cpu(fn, args, nodes["out"])
     # And each op got the split the pass gives it when it runs up front.
     # (The greedy fallback may add ops of its own, so compare the ops the two
     # compiles share; every body op is among them.)
@@ -448,6 +440,16 @@ def test_deferred_division_when_the_solve_fails(case, request):
     assert {n: nodes["splits"][n] for n in shared} == {
         n: reference["splits"][n] for n in shared
     }
+    # The answer.  Only this check carries the xfail, so a failure above is not
+    # taken for the known one.
+    if case == "nested_online_softmax":
+        strict_xfail(
+            request,
+            AssertionError,
+            "greedy LX placement, which the fallback uses, gives a wrong answer "
+            "(62% error against the CPU reference) on this graph: #6633",
+        )
+    _assert_matches_cpu(fn, args, nodes["out"])
 
 
 # ---------------------------------------------------------------------------
