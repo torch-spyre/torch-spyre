@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,19 +32,6 @@ DTYPE_MAP = {
     "float32": torch.float32,
     "int64": torch.int64,
     "bool": torch.bool,
-}
-
-
-# Ops whose output holds uninitialized memory. Their element values are
-# non-deterministic, so CPU and Spyre results can never be compared by value;
-# only tensor metadata (shape, dtype, layout) is checked for these.
-UNINITIALIZED_OUTPUT_OPS = {
-    "torch.empty",
-    "torch.empty_like",
-    "torch.empty_strided",
-    "torch.empty_permuted",
-    "torch.new_empty",
-    "torch.new_empty_strided",
 }
 
 
@@ -181,6 +168,18 @@ def to_device(x: Any, device: torch.device) -> Any:
     return x
 
 
+def first_tensor_dtype(out: Any) -> Optional[torch.dtype]:
+    """Return the dtype of the first tensor in an op output, or None if none."""
+    if torch.is_tensor(out):
+        return out.dtype
+    if isinstance(out, (tuple, list)):
+        for x in out:
+            dt = first_tensor_dtype(x)
+            if dt is not None:
+                return dt
+    return None
+
+
 def _normalize_out(out: Any) -> Any:
     """
     Normalize operation output to a consistent format for comparison.
@@ -198,9 +197,8 @@ def _normalize_out(out: Any) -> Any:
 
 
 def _assert_same_metadata(
-    testCase,
     ref_out: torch.Tensor,
-    test_out: torch.Tensor,
+    test_out: Any,
     *,
     case_name: str,
     description,
@@ -210,8 +208,17 @@ def _assert_same_metadata(
 
     Used for ops such as ``torch.empty_like`` whose output holds
     uninitialized memory: the values are non-deterministic by definition, so
-    only shape/dtype/layout are meaningful to check.
+    only shape/dtype/layout/stride are meaningful to check.
     """
+    if not torch.is_tensor(test_out):
+        raise AssertionError(
+            f"{case_name} FAILED since output type does not match the "
+            f"expected result\n"
+            f"type: expected {type(ref_out).__name__}, "
+            f"got {type(test_out).__name__}\n"
+            f"location in a model: {description}\n"
+        )
+
     mismatches = []
     if tuple(test_out.shape) != tuple(ref_out.shape):
         mismatches.append(
@@ -221,6 +228,10 @@ def _assert_same_metadata(
         mismatches.append(f"dtype: expected {ref_out.dtype}, got {test_out.dtype}")
     if test_out.layout != ref_out.layout:
         mismatches.append(f"layout: expected {ref_out.layout}, got {test_out.layout}")
+    if test_out.stride() != ref_out.stride():
+        mismatches.append(
+            f"stride: expected {ref_out.stride()}, got {test_out.stride()}"
+        )
 
     if mismatches:
         details = "\n".join(mismatches)
@@ -249,7 +260,6 @@ def _assert_same(
     if torch.is_tensor(ref_out):
         if metadata_only:
             _assert_same_metadata(
-                testCase,
                 ref_out,
                 test_out,
                 case_name=case_name,
@@ -459,10 +469,14 @@ def run_test(
     test_sample: SampleInput,
     device: torch.device,
     compile_backend: str,
-    rtol: float,
-    atol: float,
+    tolerance: Callable[[Optional[torch.dtype]], Tuple[float, float]],
     description: str = "",
 ) -> None:
+    """Run op on CPU and device and compare the results.
+
+    tolerance maps the dtype of the reference output (None when the output
+    holds no tensor) to the (rtol, atol) pair used for the comparison.
+    """
     op_name = op.aten_name
     adapter = OP_REGISTRY[op_name]
 
@@ -488,6 +502,7 @@ def run_test(
             test_out = test_sample.input
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
+    rtol, atol = tolerance(first_tensor_dtype(ref_out_cpu))
 
     # Check if the operation specifies CPU device
     FACTORY_METHODS = {
@@ -547,5 +562,5 @@ def run_test(
         atol=atol,
         case_name=case_name,
         description=description,
-        metadata_only=op_name in UNINITIALIZED_OUTPUT_OPS,
+        metadata_only=adapter.uninitialized_output,
     )

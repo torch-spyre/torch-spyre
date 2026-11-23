@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: docs-data, owner: example-team}
+spec:
+  component: docs-data
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [serve]
+  default_environment: one-card
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core]}
+    - {name: suite, ordered: false, cardinality: many}
+  series_labels: [env.label.device.count]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: serve}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: smoke}
+spec:
+  cases: [serve_demo_c1_sample]
+  run: {repeats_min: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: one-card}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  labels: {device.count: 1}
