@@ -916,7 +916,11 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
     for entry in operations:
         _set_chain(entry, ())
         _fill_tiling(entry)
-    for node in _nodes_in(operations):
+    # Only the nodes this build made: a node an earlier build recorded has already
+    # lost its leaves' records, so reading them again would find none and turn its
+    # ``strict_loop_vars`` off.
+    new = [n for n in _nodes_in(operations) if not n.facts_recorded]
+    for node in new:
         node.facts_recorded = True
         flags = {
             bool(leaf.loop_member.strict_loop_vars)
@@ -933,8 +937,10 @@ def _record_node_facts(operations: list[ir.Operation]) -> None:
                 "another lowering"
             )
         node.strict_loop_vars = flags == {True}
-        # The nodes own the facts now: the lowering's record is spent. Removing it
-        # means nothing after the build can read it by accident.
+    # The nodes own the facts now: the lowering's record is spent. Removing it
+    # means nothing after the build can read it by accident. After every node's
+    # flag is set, so an outer node does not delete what an inner node still reads.
+    for node in new:
         for leaf in all_ops(node.body):
             if hasattr(leaf, "loop_member"):
                 del leaf.loop_member  # type: ignore[attr-defined]

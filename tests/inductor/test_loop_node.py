@@ -436,6 +436,40 @@ class TestPendingLoopNodes(unittest.TestCase):
         )
         self.assertEqual(graph.operations[1].body, [c, d])
 
+    def test_a_later_build_keeps_an_earlier_nodes_strict_flag(self):
+        """Two passes that tile build their nodes at different times (span-overflow
+        tiling, then the allocator's). The second build must not read the first
+        node's leaves, whose records were spent, as "not strict"."""
+        a, b = _Op("a", (0,), [2]), _Op("b", (0,), [2])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
+        c.loop_member.strict_loop_vars = d.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        request_loop_nodes(graph, {0: sympy.Symbol("u0")})
+        build_pending_loop_nodes(graph)
+        first = graph.operations[0]
+        self.assertTrue(first.strict_loop_vars)
+        graph.operations.extend([c, d])
+        request_loop_nodes(graph, {1: sympy.Symbol("u1")})
+        build_pending_loop_nodes(graph)
+        second = graph.operations[1]
+        self.assertIsNot(first, second)
+        self.assertTrue(first.strict_loop_vars)
+        self.assertTrue(second.strict_loop_vars)
+        self.assertFalse(hasattr(a, "loop_member"))
+
+    def test_a_nested_strict_loop_gives_the_inner_node_its_flag_too(self):
+        """The outer node's records are not deleted before the inner node reads
+        its own flag."""
+        a, b = _Op("a", (0, 0), [2, 3]), _Op("b", (0, 0), [2, 3])
+        a.loop_member.strict_loop_vars = b.loop_member.strict_loop_vars = True
+        graph = _graph([a, b])
+        collapse(graph)
+        (outer,) = graph.operations
+        (inner,) = outer.body
+        self.assertTrue(outer.strict_loop_vars)
+        self.assertTrue(inner.strict_loop_vars)
+
     def test_building_twice_changes_nothing(self):
         c, d = _Op("c", (1,), [4]), _Op("d", (1,), [4])
         graph = _graph([c, d])
