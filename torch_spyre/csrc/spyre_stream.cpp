@@ -21,8 +21,11 @@
 #include <c10/core/Stream.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
@@ -116,6 +119,32 @@ std::optional<flex::CompositeAddress> narrowD2HRange(
 // TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
 // creates/destroys individual streams when asked.
 
+// One pooled flex stream backing a c10::StreamId. The c10 stream id is
+// stable for the process lifetime; the underlying flex handle may be
+// recycled (see recycleStreamIfDue) to bound per-op state that flex retains
+// for the lifetime of a stream.
+struct PooledStream {
+  flex::RuntimeStream* handle = nullptr;
+  // Created by torch-spyre via RuntimeContext::createStream, so it can be
+  // destroyed on recycle. The flex default stream that initially backs
+  // c10 stream id 0 is borrowed and never destroyed.
+  bool owned = false;
+  // Handed out through getDefaultStreamRuntimeHandle(): spyre-comms keeps
+  // the raw handle for the library lifetime and relies on sharing this
+  // stream for ordering, so it must never be recycled.
+  bool pinned = false;
+  flex::RuntimeStreamPriority priority = flex::RuntimeStreamPriority::NORMAL;
+  // Ops submitted while this handle is current. Flex keeps per-op host state
+  // for every DMA, and for every launch on a hazard-tracking stream, until
+  // the stream is destroyed (torch-spyre#6569), so this count gates
+  // recycling.
+  std::atomic<uint64_t> submitted_ops{0};
+
+  PooledStream() = default;
+  PooledStream(const PooledStream&) = delete;
+  PooledStream& operator=(const PooledStream&) = delete;
+};
+
 // Global stream pool (shared across all threads)
 struct StreamPool {
   mutable std::shared_mutex mutex;
@@ -133,13 +162,13 @@ struct StreamPool {
   std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
   std::unordered_map<c10::DeviceIndex, size_t> next_host_compute_idx;
 
-  // Mapping from c10::StreamId to flex::RuntimeStream*.
+  // Mapping from c10::StreamId to the pooled flex stream backing it.
   // NOTE: this assumes one Spyre device per process (PyTorch's model for
   // multi-device use is one process per device), so the map is keyed by stream
   // id only. Supporting multiple devices in a single process would require
   // keying by (c10::DeviceIndex, c10::StreamId) so each device has its own
   // handles.
-  std::unordered_map<c10::StreamId, flex::RuntimeStream*> stream_handle_map;
+  std::unordered_map<c10::StreamId, PooledStream> stream_handle_map;
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
@@ -158,6 +187,235 @@ StreamPool& getStreamPool() {
 
 thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
     current_streams;
+
+// Resolves the pooled flex stream for id and runs fn while holding the
+// pool's shared lock. Holding the lock across the flex call keeps a
+// concurrent recycle from destroying the handle between lookup and use; the
+// lock is shared, so submissions on the same stream still proceed
+// concurrently.
+template <typename F>
+auto withResolvedStream(c10::StreamId id, F&& fn)
+    -> decltype(fn(std::declval<PooledStream&>())) {
+  auto& pool = getStreamPool();
+  std::shared_lock<std::shared_mutex> lock(pool.mutex);
+  auto it = pool.stream_handle_map.find(id);
+  TORCH_CHECK(it != pool.stream_handle_map.end(),
+              "SpyreStream: no flex handle for stream id ", id,
+              " — was the stream pool initialized for this device?");
+  return fn(it->second);
+}
+
+// Flex keeps per-op host state for a stream until the stream is destroyed
+// (torch-spyre#6569), so host RSS grows linearly with the op count of any
+// long-lived stream. Recycling swaps a fresh flex stream in behind the stable
+// c10 stream id and destroys the old handle, bounding that retention at about
+// TORCH_SPYRE_STREAM_RECYCLE_OPS submitted ops per stream; 0 disables it.
+//
+// A stream is recycled at the first of:
+//   * a synchronization of it (stream or device): it is idle anyway;
+//   * a submission on any stream while every pooled stream is idle, probed at
+//     most once per kIdleProbeIntervalNs, which covers streams nobody
+//     synchronizes (S_prep under SPYRE_HAZARD_TRACKER, every stream on a
+//     non-driver tensor-parallel rank);
+//   * a submission once it has carried kForcedRecycleFactor x the threshold:
+//     the whole pool is drained first, so retention stays bounded even when
+//     the pool never goes idle.
+// Swapping only with the whole pool idle means no queued op, including the
+// cross-stream edges flex's hazard tracker inserts, can refer to a destroyed
+// handle; it is the state a device synchronize leaves.
+constexpr uint64_t kDefaultStreamRecycleOps = 65536;
+constexpr uint64_t kForcedRecycleFactor = 2;
+constexpr int64_t kIdleProbeIntervalNs = 1'000'000;
+
+// Re-read from the environment at every synchronization so tests can change
+// it at runtime; the submission path only reads this cached copy.
+std::atomic<uint64_t> g_recycle_ops{kDefaultStreamRecycleOps};
+// Some recyclable stream has reached the threshold / the forced limit.
+std::atomic<bool> g_recycle_due{false};
+std::atomic<bool> g_recycle_overdue{false};
+std::atomic<int64_t> g_last_idle_probe_ns{0};
+
+std::atomic<uint64_t> g_recycles_at_sync{0};
+std::atomic<uint64_t> g_recycles_when_idle{0};
+std::atomic<uint64_t> g_recycles_forced{0};
+
+uint64_t refreshStreamRecycleOps() {
+  const char* env = std::getenv("TORCH_SPYRE_STREAM_RECYCLE_OPS");
+  uint64_t threshold = kDefaultStreamRecycleOps;
+  if (env != nullptr && *env != '\0') {
+    char* end = nullptr;
+    const int64_t parsed = std::strtoll(env, &end, 10);
+    TORCH_CHECK(end != nullptr && *end == '\0' && parsed >= 0,
+                "TORCH_SPYRE_STREAM_RECYCLE_OPS must be a non-negative "
+                "integer, got '",
+                env, "'");
+    threshold = static_cast<uint64_t>(parsed);
+  }
+  g_recycle_ops.store(threshold, std::memory_order_relaxed);
+  return threshold;
+}
+
+bool isRecycleDue(const PooledStream& entry, uint64_t threshold) {
+  return threshold != 0 && !entry.pinned &&
+         entry.submitted_ops.load(std::memory_order_relaxed) >= threshold;
+}
+
+// Swaps a fresh flex stream in for an idle entry. The caller holds the pool's
+// exclusive lock, so no submission can start until the swap is visible.
+// Returns the old handle when it must be destroyed once the lock is
+// released; the borrowed flex default stream is never destroyed and stays
+// idle for the rest of the process.
+flex::RuntimeStream* swapIdleStreamLocked(PooledStream& entry) {
+  flex::RuntimeStream* fresh = GlobalRuntime::get()->createStream(
+      entry.priority, flex::RuntimeStreamMode::STRICT_ORDERING,
+      /*track_hazards=*/get_hazard_tracker_enabled());
+  flex::RuntimeStream* old = entry.handle;
+  const bool destroy_old = entry.owned;
+  entry.handle = fresh;
+  entry.owned = true;
+  entry.submitted_ops.store(0, std::memory_order_relaxed);
+  return destroy_old ? old : nullptr;
+}
+
+// Re-derives the submission-path hints from the pool. Caller holds the lock.
+void refreshRecycleHintsLocked(const StreamPool& pool, uint64_t threshold) {
+  bool due = false;
+  bool overdue = false;
+  for (const auto& [id, entry] : pool.stream_handle_map) {
+    if (isRecycleDue(entry, threshold)) {
+      due = true;
+      overdue =
+          overdue || entry.submitted_ops.load(std::memory_order_relaxed) >=
+                         kForcedRecycleFactor * threshold;
+    }
+  }
+  g_recycle_due.store(due, std::memory_order_relaxed);
+  g_recycle_overdue.store(overdue, std::memory_order_relaxed);
+}
+
+// Recycles stream id from a synchronization point. The old handle is drained
+// again under the exclusive lock, so this stays correct when another thread
+// submitted after the caller's synchronize.
+void recycleStreamIfDue(c10::StreamId id) {
+  const uint64_t threshold = refreshStreamRecycleOps();
+  if (threshold == 0) {
+    return;
+  }
+  auto& pool = getStreamPool();
+  {
+    std::shared_lock<std::shared_mutex> lock(pool.mutex);
+    auto it = pool.stream_handle_map.find(id);
+    if (it == pool.stream_handle_map.end() ||
+        !isRecycleDue(it->second, threshold)) {
+      return;
+    }
+  }
+  flex::RuntimeStream* retired = nullptr;
+  {
+    std::unique_lock<std::shared_mutex> lock(pool.mutex);
+    auto it = pool.stream_handle_map.find(id);
+    if (it == pool.stream_handle_map.end() ||
+        !isRecycleDue(it->second, threshold)) {
+      return;
+    }
+    it->second.handle->synchronize();
+    retired = swapIdleStreamLocked(it->second);
+    refreshRecycleHintsLocked(pool, threshold);
+  }
+  g_recycles_at_sync.fetch_add(1, std::memory_order_relaxed);
+  SPYRE_RUNTIME_DEBUG() << "recycled flex stream backing c10 stream " << id
+                        << " at a synchronization";
+  if (retired != nullptr) {
+    GlobalRuntime::get()->destroyStream(retired);
+  }
+}
+
+// Recycles every due stream while the whole pool is idle. Without force it
+// gives up if another thread holds the pool lock or any stream is busy; with
+// force it drains the pool first.
+void recycleDueStreams(bool force) {
+  const uint64_t threshold = g_recycle_ops.load(std::memory_order_relaxed);
+  auto& pool = getStreamPool();
+  std::vector<flex::RuntimeStream*> retired;
+  uint64_t recycled = 0;
+  {
+    std::unique_lock<std::shared_mutex> lock(pool.mutex, std::defer_lock);
+    if (force) {
+      lock.lock();
+    } else if (!lock.try_lock()) {
+      return;
+    }
+    bool idle = true;
+    for (auto& [id, entry] : pool.stream_handle_map) {
+      if (force) {
+        entry.handle->synchronize();
+      } else if (!entry.handle->query()) {
+        idle = false;
+        break;
+      }
+    }
+    if (idle) {
+      for (auto& [id, entry] : pool.stream_handle_map) {
+        if (isRecycleDue(entry, threshold)) {
+          if (flex::RuntimeStream* old = swapIdleStreamLocked(entry)) {
+            retired.push_back(old);
+          }
+          ++recycled;
+        }
+      }
+    }
+    refreshRecycleHintsLocked(pool, threshold);
+  }
+  if (recycled == 0) {
+    return;
+  }
+  (force ? g_recycles_forced : g_recycles_when_idle)
+      .fetch_add(recycled, std::memory_order_relaxed);
+  SPYRE_RUNTIME_DEBUG() << "recycled " << recycled << " flex stream(s) "
+                        << (force ? "after draining the pool"
+                                  : "while the pool was idle");
+  for (flex::RuntimeStream* old : retired) {
+    GlobalRuntime::get()->destroyStream(old);
+  }
+}
+
+// Called before every submission, with no pool lock held. Two relaxed loads
+// unless some stream is due.
+void maybeRecycleBeforeSubmit() {
+  if (g_recycle_overdue.load(std::memory_order_relaxed)) {
+    recycleDueStreams(/*force=*/true);
+    return;
+  }
+  if (!g_recycle_due.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  int64_t last = g_last_idle_probe_ns.load(std::memory_order_relaxed);
+  if (now - last < kIdleProbeIntervalNs ||
+      !g_last_idle_probe_ns.compare_exchange_strong(
+          last, now, std::memory_order_relaxed)) {
+    return;
+  }
+  recycleDueStreams(/*force=*/false);
+}
+
+// Counts one submission on entry and raises the submission-path hints when it
+// crosses the threshold or the forced limit. Caller holds the shared lock.
+void countSubmission(PooledStream& entry) {
+  const uint64_t n =
+      entry.submitted_ops.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t threshold = g_recycle_ops.load(std::memory_order_relaxed);
+  if (threshold == 0 || entry.pinned) {
+    return;
+  }
+  if (n == threshold) {
+    g_recycle_due.store(true, std::memory_order_relaxed);
+  } else if (n == kForcedRecycleFactor * threshold) {
+    g_recycle_overdue.store(true, std::memory_order_relaxed);
+  }
+}
 
 }  // anonymous namespace
 
@@ -220,8 +478,8 @@ bool SpyreStream::query() const {
   SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
                         << static_cast<int>(device().index());
 
-  flex::RuntimeStream* handle = resolveRuntimeHandle();
-  return handle->query();
+  return withResolvedStream(
+      id(), [](PooledStream& entry) { return entry.handle->query(); });
 }
 
 void SpyreStream::synchronize() const {
@@ -231,7 +489,11 @@ void SpyreStream::synchronize() const {
   SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
                         << static_cast<int>(device().index());
 
-  resolveRuntimeHandle()->synchronize();
+  withResolvedStream(id(),
+                     [](PooledStream& entry) { entry.handle->synchronize(); });
+  // The stream is idle now, so a due recycle swaps the handle without
+  // having to wait for in-flight work.
+  recycleStreamIfDue(id());
 }
 
 c10::Stream SpyreStream::unwrap() const {
@@ -356,20 +618,11 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   }
 }
 
-flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
-  auto& pool = getStreamPool();
-  std::shared_lock<std::shared_mutex> lock(pool.mutex);
-
-  auto it = pool.stream_handle_map.find(id());
-  TORCH_CHECK(it != pool.stream_handle_map.end(),
-              "SpyreStream: no flex handle for stream id ", id(),
-              " — was the stream pool initialized for this device?");
-  return it->second;
-}
-
 SpyreStreamError SpyreStream::getError() const {
-  return resolveRuntimeHandle()->needsShutdown() ? SpyreStreamError::Shutdown
-                                                 : SpyreStreamError::Success;
+  return withResolvedStream(id(), [](PooledStream& entry) {
+    return entry.handle->needsShutdown() ? SpyreStreamError::Shutdown
+                                         : SpyreStreamError::Success;
+  });
 }
 
 void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
@@ -460,13 +713,29 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
   }
 }
 
+namespace {
+
+// Submits one operation on the resolved flex stream under the pool's shared
+// lock and counts it toward the recycle threshold. A due recycle runs first,
+// with no lock held, so the operation lands on the fresh stream.
+template <typename Params>
+decltype(auto) submitCounted(c10::StreamId id, Params* params) {
+  maybeRecycleBeforeSubmit();
+  return withResolvedStream(id, [&](PooledStream& entry) -> decltype(auto) {
+    countSubmission(entry);
+    return entry.handle->launchOperation(params);
+  });
+}
+
+}  // namespace
+
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
   TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
                   static_cast<int>(flex::RuntimeOperationType::H2D))
       << "launchH2D called with params tagged as D2H — check createDmaParams' "
          "to_device argument";
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
@@ -475,33 +744,33 @@ void SpyreStream::launchD2H(flex::DmaParams* params) const {
       << "launchD2H called with params tagged as H2D — check createDmaParams' "
          "to_device argument";
   RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 void SpyreStream::launchCopyRaw(flex::CopyRawParams* params) const {
   RECORD_FUNCTION("launch::CopyRaw", {});
-  resolveRuntimeHandle()->launchOperation(params);
+  submitCounted(id(), params);
 }
 
 flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
-  return resolveRuntimeHandle()->launchOperation(params);
+  return submitCounted(id(), params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
@@ -532,7 +801,9 @@ void SpyreStream::launch(const JobPlan& plan,
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
   const size_t max_corrections =
-      s_dev.resolveRuntimeHandle()->maxProgramCorrections();
+      withResolvedStream(s_dev.id(), [](PooledStream& entry) {
+        return entry.handle->maxProgramCorrections();
+      });
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
@@ -583,14 +854,18 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
               static_cast<int>(device_index));
   pool.initialized = true;
   pool.initialized_device_index = device_index;
+  refreshStreamRecycleOps();
 
-  // Initialize mapping from StreamId → RuntimeStream*.
-  // RuntimeStream instances are owned by GlobalRuntime.
-  // StreamPool only stores non-owning pointers for lookup.
+  // Initialize mapping from StreamId → pooled flex stream.
+  // RuntimeStream instances are owned by the RuntimeContext; the pool tracks
+  // which handles it created (recyclable) versus borrowed (the flex default
+  // stream, which destroyStream rejects).
   auto runtime = GlobalRuntime::get();
 
-  // Register default stream (ID 0).
-  pool.stream_handle_map[0] = runtime->getDefaultStream();
+  // Register default stream (ID 0). Backed by flex's default stream until
+  // the first recycle swaps in an owned handle.
+  pool.stream_handle_map.try_emplace(0).first->second.handle =
+      runtime->getDefaultStream();
 
   // Register host compute streams (IDs 65+)
   int num_host_streams = getNumHostComputeStreams();
@@ -606,10 +881,13 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         "Host compute stream id ", sid,
         " is already registered; only one Spyre device per process is "
         "supported.");
-    pool.stream_handle_map[sid] =
+    PooledStream& entry = pool.stream_handle_map.try_emplace(sid).first->second;
+    entry.handle =
         runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
                               flex::RuntimeStreamMode::STRICT_ORDERING,
                               /*track_hazards=*/get_hazard_tracker_enabled());
+    entry.owned = true;
+    entry.priority = flex::RuntimeStreamPriority::NORMAL;
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -650,12 +928,16 @@ flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::shared_lock<std::shared_mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
   auto it = pool.stream_handle_map.find(0);
   TORCH_CHECK(it != pool.stream_handle_map.end(),
               "Default stream handle not initialized for device ",
               device.index());
-  return it->second;
+  // The caller (spyre-comms) holds this raw handle for the lifetime of its
+  // library and relies on sharing torch-spyre's default stream for ordering,
+  // so the handle must never be recycled.
+  it->second.pinned = true;
+  return it->second.handle;
 }
 
 SpyreStream getCurrentStream(c10::Device device) {
@@ -760,13 +1042,24 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    flex::RuntimeStream* flex_handle = runtime->createStream(
+    PooledStream& entry =
+        pool.stream_handle_map.try_emplace(stream_id).first->second;
+    entry.handle = runtime->createStream(
         streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
         /*track_hazards=*/get_hazard_tracker_enabled());
-    pool.stream_handle_map[stream_id] = flex_handle;
+    entry.owned = true;
+    entry.priority = streamPriority;
   }
 
   return SpyreStream(c10::Stream(c10::Stream::UNSAFE, device, stream_id));
+}
+
+StreamRecycleStats getStreamRecycleStats() {
+  StreamRecycleStats stats;
+  stats.at_sync = g_recycles_at_sync.load(std::memory_order_relaxed);
+  stats.when_idle = g_recycles_when_idle.load(std::memory_order_relaxed);
+  stats.forced = g_recycles_forced.load(std::memory_order_relaxed);
+  return stats;
 }
 
 void synchronizeDevice(c10::optional<c10::Device> device) {
@@ -775,16 +1068,20 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       dev = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
     }
     const auto device_index = dev.index();
+    c10::DeviceGuard guard(dev);
 
-    std::vector<flex::RuntimeStream*> handles_to_sync;
+    std::vector<c10::StreamId> synced_ids;
     {
       auto& pool = getStreamPool();
+      // Synchronize under the pool's shared lock so a concurrent recycle
+      // cannot destroy a handle between lookup and use.
       std::shared_lock<std::shared_mutex> lock(pool.mutex);
 
       // Default stream (ID 0) is always present when the pool is initialized
       auto default_it = pool.stream_handle_map.find(0);
       if (default_it != pool.stream_handle_map.end()) {
-        handles_to_sync.push_back(default_it->second);
+        default_it->second.handle->synchronize();
+        synced_ids.push_back(0);
       }
 
       auto collect = [&](auto& stream_map) {
@@ -793,7 +1090,8 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
         for (auto sid : it->second) {
           auto h = pool.stream_handle_map.find(sid);
           if (h != pool.stream_handle_map.end()) {
-            handles_to_sync.push_back(h->second);
+            h->second.handle->synchronize();
+            synced_ids.push_back(sid);
           }
         }
       };
@@ -802,9 +1100,8 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       collect(pool.host_compute_streams);
     }  // lock released
 
-    c10::DeviceGuard guard(dev);
-    for (auto handle : handles_to_sync) {
-      handle->synchronize();
+    for (auto sid : synced_ids) {
+      recycleStreamIfDue(sid);
     }
   };
   if (device.has_value()) {

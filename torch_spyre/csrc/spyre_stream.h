@@ -77,7 +77,6 @@ class SpyreStream {
   SpyreStreamError getError() const;
 
  private:
-  flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                      const flex::CompositeAddress* device_address,
                      const DataConversionInfo* dci, bool host2device,
@@ -157,5 +156,18 @@ SpyreStream getCurrentStream(
 SpyreStream setCurrentStream(SpyreStream stream);
 
 void synchronizeDevice(c10::optional<c10::Device> device);
+
+/**
+ * Process-lifetime counts of flex-stream recycles (torch-spyre#6569), by the
+ * point that triggered them: a synchronization, a submission that found the
+ * whole pool idle, or a submission that had to drain the pool first.
+ */
+struct StreamRecycleStats {
+  uint64_t at_sync = 0;
+  uint64_t when_idle = 0;
+  uint64_t forced = 0;
+};
+
+StreamRecycleStats getStreamRecycleStats();
 
 }  // namespace spyre

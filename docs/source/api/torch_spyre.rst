@@ -693,6 +693,19 @@ Environment Variables
        edge, overlapping the two stages. Off by default, which keeps the
        single-stream FIFO ordering. On values match flex's grammar exactly:
        ``1``, ``true``, ``t``, ``yes``, ``y``
+   * - ``TORCH_SPYRE_STREAM_RECYCLE_OPS``
+     - Number of submitted operations after which the flex stream backing a
+       c10 stream id is recycled (swapped for a fresh flex stream, the old
+       one destroyed). Flex keeps host state for every DMA, and for every
+       launch on a hazard-tracking stream (``SPYRE_HAZARD_TRACKER``), until
+       the stream is destroyed
+       (`#6569 <https://github.com/torch-spyre/torch-spyre/issues/6569>`_);
+       recycling bounds it. A due stream is recycled at its next
+       synchronization, or at a submission that finds every stream idle, or,
+       at twice the count, after draining all streams, so streams that are
+       never synchronized are covered too. Default ``65536``; ``0`` disables.
+       The default stream is not recycled once spyre-comms holds it (after
+       ``init_process_group`` with ``spyreccl``).
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
