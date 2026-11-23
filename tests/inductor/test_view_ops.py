@@ -40,7 +40,13 @@ import torch
 import torch.nn.functional as F
 
 from torch._inductor.exc import InductorError, LoweringException
+from torch_spyre._inductor import config as ts_config
 from utils_inductor import compare_with_cpu, cached_randn, expects_raise, strict_xfail
+
+# The two lowerings of the CP-SAT cost objective break ties between core divisions of
+# one cost differently, and a float16 or bfloat16 sum rounds by the division's order of
+# accumulation, so which sum_last cases miss the CPU's rounding depends on the lowering.
+_TABLES = ts_config.cpsat_table_lowering
 
 torch.manual_seed(0xAFFE)
 
@@ -1497,7 +1503,10 @@ class TestTransposeUnaligned:
         self, request, execution_mode, dtype, consumer
     ):
         """[1,16,32,65]→transpose(2,3)→[1,16,65,32]. Inner changes 65→32. Both consumers."""
-        if consumer == "sum_last" and dtype == torch.float16:
+        # With the tables the solve takes the division {d2: 32}, at the cost of the
+        # printer's {d0: 16, d2: 2}; its bfloat16 sum misses the tolerance too.
+        mismatched = (torch.float16, torch.bfloat16) if _TABLES else (torch.float16,)
+        if consumer == "sum_last" and dtype in mismatched:
             strict_xfail(
                 request,
                 AssertionError,
@@ -2131,6 +2140,7 @@ class TestCatSize1:
             execution_mode == "eager"
             and consumer == "sum_last"
             and dtype in (torch.float16, torch.bfloat16)
+            and not _TABLES  # the division the tables take sums within tolerance
         ):
             strict_xfail(
                 request,

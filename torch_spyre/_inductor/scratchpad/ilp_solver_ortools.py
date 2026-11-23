@@ -650,7 +650,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def linear_cost_only(cls) -> bool:
-        return True
+        """The printer lowers linear terms only; the table lowering has no such
+        limit."""
+        return not config.cpsat_table_lowering
 
     def __init__(
         self,
@@ -836,7 +838,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver: "cp_model.CpSolver",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         cost_expr: sympy.Expr,
-    ) -> Optional["cp_model.CpSolverStatus"]:
+    ) -> tuple[Optional["cp_model.CpSolverStatus"], Any]:
+        """The solve's status and the objective it minimized, or (None, None) when
+        the expression could not be lowered and the caller falls back."""
         sym_map = {}
         buffer_map = {}
         for t in tensors.values():
@@ -865,7 +869,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            if config.cpsat_table_lowering:
+                from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+                    lower_cost_with_tables,
+                )
+
+                # A refusal is a TableLoweringError, which the except below does not
+                # catch: with the tables on, no objective falls back to another solve.
+                cp_cost = lower_cost_with_tables(
+                    model, sym_map, buffer_map, cost_expr, cap=config.cpsat_table_cap
+                )
+            else:
+                cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
@@ -885,7 +900,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     "[CP-SAT layout solver] CP-SAT cannot prove uniqueness of the "
                     "optimal solution"
                 )
-            return status
+            return status, cp_cost
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
                 "[CP-SAT layout solver] cannot linearize the sympy expr: %s", exc
@@ -900,7 +915,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "error": str(exc),
                 "objective_used": False,
             }
-            return None
+            return None, None
 
     def _add_tiling(
         self,
@@ -1449,9 +1464,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         status = None
         core_terms = None
         occupancy: Optional[int] = None
+        # Whether the cost expression made the plan: read by each stage's record.
+        priced = False
 
         def _solve_stage(stage: str) -> int:
-            result = self._solve_and_record(solver, model)
+            result = self._solve_and_record(solver, model, objective=priced)
             if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(result)} without a plan "
@@ -1459,14 +1476,25 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
             return result
 
+        cp_cost = None
         if cost_expr is not None:
-            # Only reached with auto_coarse_tiling off: the allocator withholds the
-            # expression when tiling is a solver axis, because the cost model is
-            # flat in tile size and cut count. Unchanged behaviour otherwise --
-            # a successful cost solve returns here and the ladder is skipped.
-            status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
+            # With auto_coarse_tiling on, the allocator withholds the expression from
+            # a solver that is linear_cost_only (the printer), so this is reached
+            # under tiling only with the table lowering.
+            status, cp_cost = self._minimize_cost_expr(
+                model, solver, tensors, cost_expr
+            )
+        priced = status is not None
+        # The cost model is flat in cut count and tile size, so the cost alone leaves
+        # a tiling to whichever optimum the portfolio reaches first. When tiling is a
+        # solver axis, hold the cost at its optimum and let stages 2 to 5 choose among
+        # those plans as they do on the ladder: fewest cuts, most parallel, balanced,
+        # fewest tiles.
+        tie_break = priced and bool(cut_terms or tile_terms)
+        if tie_break and not isinstance(cp_cost, (int, float)):
+            model.add(cp_cost <= round(solver.ObjectiveValue()))
 
-        if status is None:
+        if not priced:
             # Fallback discipline: the traffic objective below knows no relayout
             # price, and an unpriced shuffle looks free - the exact degeneracy
             # the cost term exists to remove. No relayout decision may be made
@@ -1490,6 +1518,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 if cut_terms or any(sb.cores is not None for sb in tensors.values()):
                     model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
 
+        if not priced or tie_break:
             # -- 2. cut count ---------------------------------------------------
             if cut_terms:
                 model.minimize(sum(cut_terms))

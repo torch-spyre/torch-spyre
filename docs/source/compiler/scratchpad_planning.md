@@ -300,6 +300,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
+| `cpsat_table_lowering.py` | `lower_cost_with_tables`, lowering it from exact tables instead (`cpsat_table_lowering`) |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
@@ -643,11 +644,18 @@ Those two modes minimize two different objectives:
   whole expression into the constraint model via `cost_expr_to_cpsat`
   (`_SympyExprToCpSat` in
   `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it symbolically
-  rather than evaluating it per candidate. When there is no usable
-  expression -- symbolic shapes, a serialized capture, `auto_coarse_tiling`
-  on (the allocator withholds it, the model being flat in tile size), or
-  the lowering raising -- the solve falls back to the ladder above, which
-  knows no relayout price and therefore pins every relayout copy out. See
+  rather than evaluating it per candidate. With `cpsat_table_lowering`
+  on, `lower_cost_with_tables` (`scratchpad/cpsat_table_lowering.py`)
+  lowers it instead: every cost value is computed in floating point before
+  the solve, and CP-SAT reads it from `element` tables, linear constraints
+  and `lin_max`. When there is no usable expression -- symbolic shapes, a
+  serialized capture, or, with the printer, `auto_coarse_tiling` on (the
+  allocator withholds it, the model being flat in tile size) or the
+  lowering raising -- the solve falls back to the ladder above, which
+  knows no relayout price and therefore pins every relayout copy out. The
+  table lowering has no such fallback: an objective it cannot lower raises
+  `TableLoweringError`, and it takes the expression under
+  `auto_coarse_tiling` too. See
   [The co-optimizer](co_optimizer.md#cost-model) for how both production
   solvers consume the same expression, and
   [Analytical Cost Model](cost_model.md) for the pricing itself.
