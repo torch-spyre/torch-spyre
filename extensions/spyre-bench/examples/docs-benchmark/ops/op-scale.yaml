@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: op-lib-cpu-fp32}
+spec: {type: kernel/op-library, backend: cpu, token: cpu-fp32, library: torch-cpu, precision: fp32, harness: pytorch-benchmark}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-scale, owner: example-team, description: "elementwise scale of a vector"}
+spec:
+  type: perf
+  level: kernel
+  tier: sanity
+  system: op-lib-cpu-fp32
+  est_hours: 0.05
+  workload:
+    type: kernel/op
+    op: scale
+    dtype: fp32
+    shape: [1024]
+    load: {executor: iterations, iterations: 50, warmup_iterations: 5}
+  metrics: {required: [kernel.time.mean], headline: [kernel.time.mean]}
+  run:
+    repeats: 3
+    timeout: 5m
+    est: 1m
+    isolation: process
+    command: ["{python}", "tools/emit_metrics.py", "--op", "{case.op}", "--shape", "{case.shape}", "--repeat", "{repeat}", "--raw", "{raw_dir}", "--out", "{repeat_dir}"]
+  matrix:
+    name_template: op_scale_n{size}
+    axes:
+      size:
+        - {token: "1024", patch: {workload: {shape: [1024]}}}
+        - {token: "65536", patch: {tier: core, workload: {shape: [65536]}}}

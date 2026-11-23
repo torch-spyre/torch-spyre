@@ -774,7 +774,12 @@ def main() -> None:
             secure=ClickHouseEnv.secure(),
         )
 
-    ops = Sandboxes(cfg, identity, lambda db: ClickHouse.connect(database=db), connect)
+    ops = Sandboxes(
+        cfg,
+        identity,
+        lambda db: ClickHouse.connect(database=db, role="schema"),
+        connect,
+    )
     host = cfg.public_url.split("://", 1)[-1]
     app = build_server(cfg, ops).streamable_http_app(
         stateless_http=True,

@@ -1,0 +1,57 @@
+# What a case needs: a number of cards and a CPU pinning policy. Architecture, queue and node pools are chosen by the launcher,
+# not named here. Policy `none` is the default until the vLLM path pins CPUs itself; the `-device-local` twins request it and
+# are used only by a run that sets BENCH_ENVIRONMENT (see benchmarks/README.md).
+
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-1card, description: "one card"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  host: {cpu_pinning: {policy: none}}
+  labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-1card-device-local, description: "one card, process tree pinned to the CPUs local to the cards"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 1}]
+  host: {cpu_pinning: {policy: device_local, require_verified: true}}
+  labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-2card, description: "two cards, tensor parallel 2"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 2}]
+  host: {cpu_pinning: {policy: none}}
+  labels: {device.count: 2}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-2card-device-local, description: "two cards, tensor parallel 2, process tree pinned to the CPUs local to the cards"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 2}]
+  host: {cpu_pinning: {policy: device_local, require_verified: true}}
+  labels: {device.count: 2}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-4card, description: "four cards, tensor parallel 4"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 4}]
+  host: {cpu_pinning: {policy: none}}
+  labels: {device.count: 4}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: spyre-4card-device-local, description: "four cards, tensor parallel 4, process tree pinned to the CPUs local to the cards"}
+spec:
+  devices:
+    requests: [{name: cards, device_class: spyre/pf, count: 4}]
+  host: {cpu_pinning: {policy: device_local, require_verified: true}}
+  labels: {device.count: 4}

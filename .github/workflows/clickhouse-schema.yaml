@@ -7,6 +7,8 @@ on:
   pull_request:
     paths:
       - extensions/clickhouse-ingest/schema/**
+      - extensions/clickhouse-ingest/spyre_clickhouse_ingest/**
+      - extensions/clickhouse-ingest/tests/**
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/apply_schema.py
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/sandbox.py
       - extensions/clickhouse-ingest/tests/test_sandbox.py

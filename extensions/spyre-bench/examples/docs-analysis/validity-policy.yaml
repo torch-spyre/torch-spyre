@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: ValidityPolicy
+metadata: {name: docs-default, owner: example-team}
+spec:
+  purposes:
+    pr:
+      description: "ordinary CI: usable for a PR check, never a baseline"
+      floor: shared_env
+      requires: {qualification: any, clean: any, min_repeats: 1, max_cv_pct: 10, discard_warmup: 1, placement: optional}
+      baseline: false
+      reference: false
+    nightly:
+      floor: shared_env
+      requires: {qualification: current, clean: any, min_repeats: 3, max_cv_pct: 5, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: false
+    reference:
+      floor: valid
+      requires: {qualification: current, clean: enforced, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
+      baseline: true
+      reference: true
