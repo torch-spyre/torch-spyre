@@ -1280,9 +1280,9 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
             ):
                 # QFP8WT EA: the scatter source and destination share a physical
                 # element layout (2D-stick) that cannot be transcoded by a plain
-                # byte-copy restickify.  Instead, rewrite the
-                # mutation target's layout in-place to the required (rotated) STL so
-                # the scatter writes directly into the target buffer with the correct
+                # byte-copy restickify.  Instead, rewrite the mutation target's
+                # layout in-place to the required (rotated) STL so the scatter
+                # writes directly into the target buffer with the correct
                 # 2D-stick addressing — no copy-in / copy-back needed.
                 #
                 # For graph inputs, try_get_buffer returns TensorBox(StorageBox(buf))
