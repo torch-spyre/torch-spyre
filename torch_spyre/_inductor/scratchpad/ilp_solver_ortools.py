@@ -1331,9 +1331,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         *,
         objective: bool = False,
+        stage: str = "cost objective",
     ) -> int:
         """Solve, and stash what it cost and returned for the cost-expression
         dump. The one way this class solves.
+
+        A solve that stops at the time limit with an incumbent returns
+        FEASIBLE: a plan, but not a proven optimum. That is logged, because
+        each stage gets the whole budget and a slow compile would otherwise
+        give no hint that raising ``CPSAT_TIME_LIMIT_SECONDS`` may help.
 
         Recording is bound to solving rather than left to each call site:
         ``_run`` solves in its own occupancy passes when
@@ -1364,12 +1370,23 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             status = solver.Solve(model)
         event.meta["status"] = solver.StatusName(status)
         event.meta["solver_wall_s"] = round(solver.WallTime(), 3)
+        limit_s = solver.parameters.max_time_in_seconds
+        if status == cp_model.FEASIBLE and limit_s:
+            logger.warning(
+                "[CP-SAT layout solver] the %s solve hit the %gs time limit "
+                "(%.2fs) and returned a feasible plan not proven optimal; raise "
+                "CPSAT_TIME_LIMIT_SECONDS (0 disables it) for a better plan at "
+                "the cost of compile time",
+                stage,
+                limit_s,
+                solver.WallTime(),
+            )
         self.last_solve_stats = {
             "status": solver.StatusName(status),
             "solve_s": round(solver.WallTime(), 3),
             "variables": len(model.proto.variables),
             "constraints": len(model.proto.constraints),
-            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "limit_s": limit_s or None,
             "objective_used": objective,
         }
         return status
@@ -1451,7 +1468,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         occupancy: Optional[int] = None
 
         def _solve_stage(stage: str) -> int:
-            result = self._solve_and_record(solver, model)
+            result = self._solve_and_record(solver, model, stage=stage)
             if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(result)} without a plan "
