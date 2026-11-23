@@ -1096,7 +1096,7 @@ def capture_backend_output_dirs():
 
     get_output_dir = async_compile_module.get_output_dir
 
-    def capture(kernel_name, sdsc_bundle_dir_prefix=None):
+    def capture_fresh(kernel_name, sdsc_bundle_dir_prefix=None):
         output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         output_dirs.append(Path(output_dir))
         return output_dir

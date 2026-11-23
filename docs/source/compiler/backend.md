@@ -182,7 +182,10 @@ and total pool size, the active compile config, and the versions of torch,
 torch_spyre, and the deeptools/flex toolchain. The toolchain version is read
 from the file named by `LIB_VERSION_FILE`; when that variable is unset the key
 cannot be formed, so caching is disabled for that kernel with a warning (set
-`SPYRE_KERNEL_CACHE=0` to silence it).
+`SPYRE_KERNEL_CACHE=0` to silence it). Because that version does not change
+when deeptools is rebuilt locally, the key also covers the `dbo-opt` that runs
+(resolved path, mtime and size) and the `KTIR_DEVICE_MLIR` device file passed
+to it.
 
 On a cache hit, `get_cached_kernel_dir` finds a directory that holds every
 required artifact and the kernel loads directly: neither `generate_bundle` nor
@@ -191,8 +194,11 @@ directory inside the cache root, which `commit_compile_dir` then renames into
 place atomically, so concurrent compiles of the same key do not corrupt each
 other. Caching is controlled by `SPYRE_KERNEL_CACHE` (default on; set it to `0`
 to disable) and is skipped in frontend-only mode, where a hit would record no frontend work.
-`clear_cache()` empties the cache, and `get_cache_stats()` reports the number of
-cached kernels and the total cache size. Per-key hit and miss counts are tracked
+The cache lives in `inductor-spyre-cache/` under the Inductor cache directory,
+so `TORCHINDUCTOR_CACHE_DIR` sets where it is. `clear_cache()` empties it
+(deleting that directory has the same effect), and `get_cache_stats()` reports
+the number of cached kernels and the total cache size. Nothing prunes entries
+from older compiler versions, so clear the cache when it grows. Per-key hit and miss counts are tracked
 separately in the process-global kernel registry (`get_kernel_registry()`).
 
 ## Further Reading

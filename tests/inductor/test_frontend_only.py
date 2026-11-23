@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch  # noqa: F401
-from torch._inductor.utils import fresh_cache
 
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre.execution import async_compile as ac
@@ -28,14 +27,6 @@ from torch_spyre.execution.kernel_runner import (
     SpyreFrontendOnlyRunner,
     SpyreSDSCKernelRunner,
 )
-
-
-@pytest.fixture(autouse=True)
-def _isolated_kernel_cache():
-    # The kernel cache is on by default, so these compiles write cache entries;
-    # keep them out of the developer's real cache.
-    with fresh_cache():
-        yield
 
 
 @pytest.fixture(autouse=True)

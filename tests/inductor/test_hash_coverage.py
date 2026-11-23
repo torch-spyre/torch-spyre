@@ -571,5 +571,101 @@ class TestVersionStringsHashed(unittest.TestCase):
         self.assertEqual(h1, h2, "Same versions must produce the same hash.")
 
 
+class TestBackendCompilerInputsHashed(unittest.TestCase):
+    """Inputs that reach dbo-opt but not the SDSC JSON must change the key."""
+
+    def _key(self, *, device: str = "", dbo_opt_identity: str = "dbo-opt=/a:1:1"):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        with (
+            patch(
+                "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+                return_value="test-backend-1.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                return_value="test-spyre-0.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._dbo_opt_identity",
+                return_value=dbo_opt_identity,
+            ),
+            patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            patch("torch_spyre._inductor.config.ktir_device_mlir", device),
+        ):
+            return compute_specs_hash([_make_op_spec()], kernel_name="k")
+
+    def test_ktir_device_mlir_changes_hash(self):
+        self.assertNotEqual(
+            self._key(device="/dev_a.mlir"),
+            self._key(device="/dev_b.mlir"),
+            "--device=... reaches dbo-opt, so a different device file must "
+            "not share a cache entry.",
+        )
+
+    def test_ktir_device_mlir_default_follows_config(self):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        with patch("torch_spyre._inductor.config.ktir_device_mlir", "/dev_a.mlir"):
+            explicit = self._key(device="/dev_a.mlir")
+            with (
+                patch(
+                    "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+                    return_value="test-backend-1.0",
+                ),
+                patch(
+                    "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                    return_value="test-spyre-0.0",
+                ),
+                patch(
+                    "torch_spyre.execution.kernel_cache._dbo_opt_identity",
+                    return_value="dbo-opt=/a:1:1",
+                ),
+                patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            ):
+                implicit = compute_specs_hash([_make_op_spec()], kernel_name="k")
+        self.assertEqual(explicit, implicit)
+
+    def test_dbo_opt_binary_change_changes_hash(self):
+        self.assertNotEqual(
+            self._key(dbo_opt_identity="dbo-opt=/a:1:1"),
+            self._key(dbo_opt_identity="dbo-opt=/a:2:1"),
+            "A rebuilt dbo-opt must invalidate entries it did not produce.",
+        )
+
+
+class TestDboOptIdentity(unittest.TestCase):
+    def setUp(self):
+        from torch_spyre.execution.kernel_cache import _dbo_opt_identity
+
+        self.fn = _dbo_opt_identity
+        self.fn.cache_clear()
+        self.addCleanup(self.fn.cache_clear)
+
+    def test_unresolved_does_not_raise(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(self.fn(empty), "dbo-opt=unresolved")
+
+    def test_mtime_and_size_are_part_of_identity(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "dbo-opt")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            first = self.fn(d)
+            self.assertIn(os.path.realpath(exe), first)
+
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n# rebuilt\n")
+            os.utime(exe, ns=(1, 1))
+            self.fn.cache_clear()
+            self.assertNotEqual(first, self.fn(d))
+
+
 if __name__ == "__main__":
     unittest.main()

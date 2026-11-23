@@ -242,6 +242,22 @@ class TestClearCache(unittest.TestCase):
             self.assertAlmostEqual(stats["cache_size_mb"], 0.0, places=1)
 
 
+def _populate_entry(d: str, *, complete: bool = True) -> None:
+    """Write the artifacts get_cached_kernel_dir requires into ``d``.
+
+    ``complete=False`` omits init_binary.bin, which is what a mocked backend
+    compiler leaves behind.
+    """
+    os.makedirs(os.path.join(d, "spyreCodeDir"), exist_ok=True)
+    files = ["bundle.mlir", "symbol_kinds.json", "sdsc_0.json"]
+    files.append(os.path.join("spyreCodeDir", "spyrecode.json"))
+    if complete:
+        files.append(os.path.join("spyreCodeDir", "init_binary.bin"))
+    for rel in files:
+        with open(os.path.join(d, rel), "w") as f:
+            f.write("x")
+
+
 class TestAtomicCommit(unittest.TestCase):
     def test_concurrent_commit_same_key_does_not_corrupt(self):
         """Four threads compiling the same key concurrently must leave exactly one valid entry."""
@@ -290,6 +306,9 @@ class TestAtomicCommit(unittest.TestCase):
         with fresh_cache():
             winner = allocate_compile_dir(fake_key, kernel_name="kernel_winner")
             loser = allocate_compile_dir(fake_key, kernel_name="kernel_loser")
+            # Both are complete compiles: only a complete entry wins a race.
+            _populate_entry(winner)
+            _populate_entry(loser)
 
             committed = commit_compile_dir(winner, fake_key)  # winner: rename
             commit_compile_dir(loser, fake_key)  # loser: merge names, then discard
@@ -414,6 +433,47 @@ class TestKernelNameRecordedNoDevice(unittest.TestCase):
     def test_missing_dir_does_not_raise(self):
         # Recording into a nonexistent dir must be swallowed, not raised.
         record_kernel_name("/nonexistent/dir/xyz", "kernel_a")
+
+
+class TestCommitReplacesIncompleteEntry(unittest.TestCase):
+    """An incomplete entry under a key must not block that key forever."""
+
+    def test_incomplete_entry_replaced_by_complete_compile(self):
+        with fresh_cache():
+            key = "d" + "b" * 63
+            root = get_cache_root_dir()
+
+            # What mock_backend_compiler() leaves behind: no init_binary.bin.
+            first = allocate_compile_dir(key)
+            _populate_entry(first, complete=False)
+            committed = commit_compile_dir(first, key)
+            self.assertIsNone(get_cached_kernel_dir(key))
+
+            second = allocate_compile_dir(key)
+            _populate_entry(second)
+            committed = commit_compile_dir(second, key)
+
+            self.assertEqual(committed, os.path.join(root, key))
+            self.assertEqual(get_cached_kernel_dir(key), committed)
+            self.assertFalse(os.path.exists(second))
+            failed = os.listdir(os.path.join(root, "failed"))
+            self.assertEqual(len(failed), 1)
+            self.assertTrue(failed[0].startswith(key))
+
+    def test_complete_entry_still_wins_race(self):
+        with fresh_cache():
+            key = "e" + "c" * 63
+            winner = allocate_compile_dir(key)
+            _populate_entry(winner)
+            winner_dir = commit_compile_dir(winner, key)
+
+            loser = allocate_compile_dir(key)
+            _populate_entry(loser)
+            self.assertEqual(commit_compile_dir(loser, key), winner_dir)
+            self.assertFalse(os.path.exists(loser))
+            self.assertFalse(
+                os.path.exists(os.path.join(get_cache_root_dir(), "failed"))
+            )
 
 
 class TestMergeKernelNames(unittest.TestCase):

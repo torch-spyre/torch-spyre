@@ -615,6 +615,25 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
             ) as runner_type,
+            # These specs carry no finalized core mapping, so the real cache
+            # key cannot be computed; bypass the cache like the sibling test.
+            patch(
+                "torch_spyre.execution.async_compile.compute_specs_hash",
+                return_value="deadbeef",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.get_cached_kernel_dir",
+                return_value=None,
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.allocate_compile_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.save_symbol_kinds"),
+            patch(
+                "torch_spyre.execution.async_compile.commit_compile_dir",
+                return_value="/tmp/kernel",
+            ),
         ):
             result = SpyreAsyncCompile().sdsc("sdsc_fused_mm_0", specs)
 
