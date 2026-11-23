@@ -688,9 +688,6 @@ class AllGatherKernel(SpyreCollectiveKernel):
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
 
 
-_STICK_BYTES = 128
-
-
 def _dim0_row_device_elems(layout: FixedLayout, what: str) -> int:
     """Device elements spanned by one dim-0 row, if rows are contiguous.
 
@@ -740,6 +737,22 @@ def _dim0_row_device_elems(layout: FixedLayout, what: str) -> int:
     return total // dim0
 
 
+def _dim0_rows_per_stick(layout: FixedLayout) -> int:
+    """Rows that make up whole sticks; every dim-0 split must be a multiple of it.
+
+    spyre-comms only splits on stick boundaries.  When ``_dim0_row_device_elems``
+    accepts an N-D layout, the stick (innermost) device dim lies inside each
+    row, so every row is already whole sticks and any split is aligned.  A 1-D
+    row is one element, so a split must hold whole sticks of elements.  Counted
+    in elements (``elems_per_stick``), not bytes, so it also holds for sub-byte
+    device formats.
+    """
+    assert isinstance(layout, FixedTiledLayout)
+    if len(layout.size) == 1 and int(layout.size[0]) > 1:
+        return layout.device_layout.elems_per_stick()
+    return 1
+
+
 class AllToAllKernel(SpyreCollectiveKernel):
     """Out-of-place ``_c10d_functional.all_to_all_single``, even or uneven splits.
 
@@ -771,15 +784,19 @@ class AllToAllKernel(SpyreCollectiveKernel):
                 "all_to_all: input and output rows span different device sizes "
                 f"({in_row} vs {out_row} elements)"
             )
-        elem_bytes = torch.tensor([], dtype=in_layout.dtype).element_size()
-        for s in output_splits + input_splits:
-            if (s * in_row * elem_bytes) % _STICK_BYTES:
-                raise Unsupported(
-                    f"all_to_all: a split of {s} rows is {s * in_row * elem_bytes}"
-                    f" bytes on device; each split must be a multiple of "
-                    f"{_STICK_BYTES} bytes (splits: output={output_splits}, "
-                    f"input={input_splits})"
-                )
+        for splits, layout in (
+            (output_splits, self.get_layout()),
+            (input_splits, in_layout),
+        ):
+            step = _dim0_rows_per_stick(layout)
+            for s in splits:
+                if s % step:
+                    raise Unsupported(
+                        f"all_to_all: a split of {s} elements does not end on a "
+                        f"stick boundary; each split of a 1-D tensor must be a "
+                        f"multiple of {step} elements (splits: "
+                        f"output={output_splits}, input={input_splits})"
+                    )
         out_elems = [s * in_row for s in output_splits]
         in_elems = [s * in_row for s in input_splits]
         return (

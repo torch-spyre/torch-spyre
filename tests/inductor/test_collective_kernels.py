@@ -332,9 +332,9 @@ class TestCodegen(_CollectiveGraphTest):
             a2a.codegen(_RecordingWrapper())
 
     def test_all_to_all_rejects_split_not_stick_aligned(self):
-        # A 1-D split of 32 fp16 elements is 64 bytes, half a stick.
+        # A 1-D split of 32 fp16 elements is half a 64-element stick.
         a2a = self._a2a([128], [32, 96], [32, 96])
-        with self.assertRaisesRegex(Unsupported, "multiple of 128 bytes"):
+        with self.assertRaisesRegex(Unsupported, "multiple of 64 elements"):
             a2a.codegen(_RecordingWrapper())
 
     def test_all_to_all_rejects_padded_1d(self):
