@@ -1,0 +1,55 @@
+name: bench-conformance
+
+# Advisory check that benchmarks/ validates and that its identity blocks derive the ids the ingest writes.
+# Hosted runner, no cards, no secrets. Not a required check.
+on:
+  pull_request:
+    branches: [main, release-*]
+    paths:
+      - benchmarks/**
+      - mk/bench.mk
+      - .github/workflows/_test_matrix.yaml
+      - .github/workflows/integration-tests.yaml
+      - extensions/spyre-bench/**
+      - extensions/clickhouse-ingest/spyre_clickhouse_ingest/identity.py
+      - extensions/clickhouse-ingest/spyre_clickhouse_ingest/results.py
+      - .github/workflows/bench-conformance.yml
+  workflow_dispatch: null
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  conformance:
+    name: Benchmark definitions and identity conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+      - name: Install the engine and the ingest
+        run: |
+          uv venv
+          uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml pytest jsonschema
+      - name: Validate, check ids, run the tests
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/.venv/bin:${PATH}"
+          make bench-validate BENCH_REQUIRED=1
+          make bench-check-ids BENCH_REQUIRED=1
+          python -m pytest -q -p no:cacheprovider benchmarks/tests
+          python -m pytest -q -p no:cacheprovider extensions/spyre-bench/tests/test_docs_examples.py extensions/spyre-bench/tests/test_docs_snippets.py

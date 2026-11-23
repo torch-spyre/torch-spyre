@@ -124,11 +124,11 @@ jobs:
     # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     # Repo variable GHA_FULL_MERGE_QUEUE_TESTS=true lifts the label and merge-queue skips so GHA runs the full suite;
     # GHA_TESTS_ON_AUTO_MERGE=true lifts the auto-merge skip on PRs.
-    # Fork PR runs cannot read repo variables, so both skips are bypassed for them; spyre_test_status.yaml posts the status only when GHA_FULL_MERGE_QUEUE_TESTS is true in the base repo.
+    # Fork PR runs read every variable as empty, so these skips apply to them as if the variables were unset, never more tests than a same-repo PR.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) &&
-      !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.auto_merge != null && vars.GHA_TESTS_ON_AUTO_MERGE != 'true') &&
+      (needs.changes.outputs.integration_labeled != 'true' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true') &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null && vars.GHA_TESTS_ON_AUTO_MERGE != 'true') &&
       (github.event_name != 'merge_group' || vars.GHA_FULL_MERGE_QUEUE_TESTS == 'true')
     uses: ./.github/workflows/_test_matrix.yaml
     with:
@@ -154,10 +154,11 @@ jobs:
     secrets:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
       CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+      CLICKHOUSE_V2_HOST: ${{ secrets.CLICKHOUSE_V2_HOST }}
+      CLICKHOUSE_V2_PORT: ${{ secrets.CLICKHOUSE_V2_PORT }}
+      CLICKHOUSE_V2_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+      CLICKHOUSE_V2_PASSWORD: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (advisory test-result gate)
@@ -223,8 +224,8 @@ jobs:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
-          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
-          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          app-id: ${{ vars.SPYRE_CI_APP_ID }}
+          private-key: ${{ secrets.SPYRE_CI_PRIVATE_KEY }}
           owner: torch-spyre
           repositories: hf-adapters
           permission-actions: write
@@ -258,8 +259,8 @@ jobs:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
-          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
-          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          app-id: ${{ vars.SPYRE_CI_APP_ID }}
+          private-key: ${{ secrets.SPYRE_CI_PRIVATE_KEY }}
           owner: torch-spyre
           repositories: spyre-inference
           permission-actions: write
