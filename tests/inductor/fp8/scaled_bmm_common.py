@@ -609,9 +609,9 @@ _KNOWN_FAILURES = [
         r"(3d_pv_32x64x64x128|4d_prefill_pv_1x32x64x64x128"
         r"|4d_global_prefill_pv_1x16x(12x12|24x24)x512)-cores\d+",
         InductorError,
-        _SCHEDULER_FAILURE,
-        "#6437: [fp8] scaled_bmm: P@V with sub-stick K fails to compile (now in "
-        "the scheduler, after layout planning)",
+        "StopIteration",
+        "#6437: [fp8] scaled_bmm: P@V with sub-stick K raises StopIteration in "
+        "_cost_model_matmul_planner (no QFP8WT input)",
     ),
     _KnownFailure(
         "test_boundary",
