@@ -211,6 +211,7 @@ def _run_main(ingest, monkeypatch, tmp_path, client):
     xml = tmp_path / "spyre_kernel_report.xml"
     xml.write_text(KERNEL_XML, encoding="utf-8")
     monkeypatch.setenv("CLICKHOUSE_HOST", "stub")
+    monkeypatch.setenv("INGEST_SCHEMA", "v1")  # covers the legacy v1 writer
     monkeypatch.setattr(ingest, "get_client", lambda: client)
     monkeypatch.setattr(
         sys, "argv", ["ingest_xml.py", "--xml-file", str(xml), "--workflow", "test"]

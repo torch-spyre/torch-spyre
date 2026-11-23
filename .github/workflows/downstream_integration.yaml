@@ -1,7 +1,7 @@
 name: downstream_integration
 
-# Pre-queue stand-in for Jenkins' downstream fan-out: once auto-merge is enabled on a PR, or a
-# maintainer comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
+# Pre-queue stand-in for Jenkins' downstream fan-out: once auto-merge is enabled on a PR, or
+# anyone comments /spyre-test, run hf-adapters (blocking in the queue) and spyre-inference
 # (informational) integration suites on their main against this PR's torch-spyre head. Inert unless
 # GHA_DOWNSTREAM_INTEGRATION is "true".
 run-name: downstream-integration
@@ -27,15 +27,14 @@ jobs:
   resolve:
     name: Resolve PR
     # Fork PRs get no secrets on pull_request; they can still be run with /spyre-test.
+    # Any commenter may run /spyre-test: no PR code or PR-authored input reaches this workflow, only the head SHA it dispatches.
     if: >-
       vars.GHA_DOWNSTREAM_INTEGRATION == 'true' && (
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (
-      github.event.issue.pull_request != null && (github.event.comment.body == '/spyre-test' || startsWith(github.event.comment.body, '/spyre-test ')) &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+      github.event.issue.pull_request != null && (github.event.comment.body == '/spyre-test' || startsWith(github.event.comment.body, '/spyre-test '))))
     runs-on: ubuntu-latest
     outputs:
       number: ${{ steps.pr.outputs.number }}
-      run: ${{ steps.pr.outputs.run }}
       sha: ${{ steps.pr.outputs.sha }}
       url: ${{ steps.pr.outputs.url }}
     steps:
@@ -43,23 +42,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-          COMMENTER: ${{ github.event.comment.user.login }}
         run: |
-          # author_association also covers org members without write access to this repo.
-          if [ -n "$COMMENTER" ]; then
-            perm=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${COMMENTER}/permission" --jq .permission || echo none)
-            case "$perm" in admin|maintain|write) ;; *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
-          fi
           {
-            echo "run=true"
             echo "number=${PR_NUMBER}"
             gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"sha=" + .head.sha, "url=" + .html_url'
           } >> "$GITHUB_OUTPUT"
 
   downstream-integration:
-    name: Integration (${{ matrix.repo }})
+    name: Integration (${{ matrix.repo }})${{ matrix.name_suffix }}
     needs: resolve
-    if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 270
     continue-on-error: ${{ matrix.wait != 'true' }}
@@ -69,15 +60,19 @@ jobs:
         include:
           - repo: hf-adapters
             wait: 'true'
+            name_suffix: ''
+            context_suffix: ''
             extra_inputs: '{}'
           # Informational: dispatched and linked in the run summary, never awaited, so a slow or hung run cannot hold this workflow open or leave a pending status.
           - repo: spyre-inference
             wait: 'false'
+            name_suffix: ' - dispatched, not awaited'
+            context_suffix: ' (not awaited)'
             extra_inputs: '{"image_rpms":"true"}'
     env:
       GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.resolve.outputs.sha }}
-      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}
+      STATUS_CONTEXT: downstream-integration / ${{ matrix.repo }}${{ matrix.context_suffix }}
     steps:
       - name: Report pending
         if: matrix.wait == 'true'
@@ -95,8 +90,8 @@ jobs:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
-          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
-          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+          app-id: ${{ vars.SPYRE_CI_APP_ID }}
+          private-key: ${{ secrets.SPYRE_CI_PRIVATE_KEY }}
           owner: torch-spyre
           repositories: ${{ matrix.repo }}
           permission-actions: write
@@ -110,6 +105,15 @@ jobs:
           torch_spyre_ref: ${{ needs.resolve.outputs.sha }}
           hash_source: ${{ needs.resolve.outputs.url }}
           pr_number: ${{ needs.resolve.outputs.number }}
+      # Green here only means the run was started; the status text and name say so, and link the run.
+      - name: Report dispatched
+        if: matrix.wait != 'true'
+        continue-on-error: true
+        env:
+          RUN_URL: ${{ steps.dispatch.outputs.run_url }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${STATUS_SHA}" -f state=success -f context="$STATUS_CONTEXT" \
+            -f description="Dispatched, not awaited: the result is on the linked run" -f target_url="$RUN_URL"
       - name: Report result
         if: always() && matrix.wait == 'true'
         continue-on-error: true

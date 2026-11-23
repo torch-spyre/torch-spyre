@@ -1,0 +1,199 @@
+name: bench-on-demand-fork
+run-name: ${{ format('bench-on-demand pr={0} by={1}', inputs.pr_number, inputs.requested_by) }}
+
+# Measures a pull request head that lives in a fork, for bench-pr-comment. The fork's code runs in this workflow, so
+# it references no secrets at all and stores nothing: no ClickHouse credentials, no artifact identity upload, no
+# ingest step. The engine comes from the default branch; only the head's benchmarks/ and Makefile are the fork's.
+# The answer is a counts-only comment. Keep it that way: `grep -n 'secrets\.' bench-on-demand-fork.yml` must stay empty.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full commit sha of the fork head (set by bench-pr-comment)
+        required: true
+        type: string
+      repository:
+        description: Fork repository, owner/name (set by bench-pr-comment)
+        required: true
+        type: string
+      pr_number:
+        description: Pull request this run answers
+        required: true
+        type: string
+      requested_by:
+        description: Login of the user who asked
+        required: true
+        type: string
+      bench_env:
+        description: JSON object of BENCH_* variables from the request
+        required: true
+        type: string
+
+# Same group as bench-on-demand: a newer request for the pull request cancels this one.
+concurrency:
+  group: ${{ format('bench-on-demand-pr-{0}', inputs.pr_number) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BENCH_ENVIRONMENT: one-device
+  PREBAKED_VENV_PATH: /home/senuser/.venv
+  RUNNER_SETUP_SCRIPT: /etc/profile.d/ibm-aiu-setup.sh
+  BENCH_INVOKER: gha
+  BENCH_QUIET: '1'
+  CI: '1'
+
+jobs:
+  bench:
+    name: On-demand benchmarks, fork head (advisory)
+    # The default runner labels of bench-on-demand, as /spyre-test uses for fork heads. The repository variable
+    # BENCH_FORK_RUNNER_LABEL, when set, replaces the card-size label (spyre_pf_x1) with a runner set of the owner's choice.
+    runs-on: ${{ fromJSON(vars.BENCH_FORK_RUNNER_LABEL != '' && format('["x86_64","{0}","linux","image_spyre_backend"]', vars.BENCH_FORK_RUNNER_LABEL) ||
+      '["x86_64","spyre_pf_x1","linux","image_spyre_backend"]') }}
+    timeout-minutes: 240
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      plan: ${{ steps.plan.outcome }}
+      run: ${{ steps.run.outcome }}
+    env:
+      BENCH_RESULTS_DIR: ${{ github.workspace }}/bench-results
+      BENCH_PLAN_FILE: ${{ github.workspace }}/bench-results/plan/plan.json
+      INPUT_REF: ${{ inputs.ref }}
+      INPUT_REPOSITORY: ${{ inputs.repository }}
+    steps:
+      - name: Check the inputs
+        run: |
+          set -euo pipefail
+          [[ "${INPUT_REF}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${INPUT_REPOSITORY}" =~ ^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$ ]]
+
+      - name: Check the request is still current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          api() { curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          pr=$(api "pulls/${PR}")
+          [ "$(jq -r .state <<< "${pr}")" = open ] || { echo "::error::the pull request is no longer open"; exit 1; }
+          [ "$(jq -r .head.sha <<< "${pr}")" = "${INPUT_REF}" ] || { echo "::error::the pull request head moved since this run was requested"; exit 1; }
+          created=$(api "actions/runs/${GITHUB_RUN_ID}" | jq -r .created_at)
+          [ "$(date -u -d "${created}" +%s)" -gt "$(date -u -d '24 hours ago' +%s)" ] || { echo "::error::this run waited more than a day"; exit 1; }
+
+      - name: Checkout the engine (default branch)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            extensions/spyre-bench
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout the fork head (pinned sha)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          path: head
+          persist-credentials: false
+          sparse-checkout: |
+            Makefile
+            mk
+            benchmarks
+          sparse-checkout-cone-mode: false
+
+      # The request is data from a trusted dispatch; checked again because anyone with write access can dispatch by hand.
+      - name: Apply the request
+        env:
+          REQUEST_JSON: ${{ inputs.bench_env }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${REQUEST_JSON}" | jq -e 'type == "object"' > /dev/null
+          allowed='BENCH_PURPOSE BENCH_REUSE BENCH_SELECTION BENCH_TIER BENCH_SUITES BENCH_FORCE BENCH_BUDGET BENCH_ENVIRONMENT BENCH_SET'
+          for key in ${allowed}; do
+            value=$(printf '%s' "${REQUEST_JSON}" | jq -r --arg k "${key}" 'if has($k) then .[$k] else empty end | select(type == "string" and test("\\A[A-Za-z0-9._,=#@+-]{0,300}\\z"))')
+            [ -z "${value}" ] || echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+          echo "BENCH_REUSE=never" >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Install the engine
+        run: |
+          uv venv .bench-venv
+          uv pip install --python .bench-venv/bin/python 'pyyaml==6.0.2' 'regex==2024.11.6' ./base/extensions/spyre-bench ./base/extensions/clickhouse-ingest lxml
+
+      - name: Validate definitions
+        working-directory: head
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          make bench-validate BENCH_REQUIRED=1
+
+      - name: Plan
+        id: plan
+        continue-on-error: true
+        working-directory: head
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          make bench-plan BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1
+
+      - name: Run
+        id: run
+        if: ${{ steps.plan.outcome == 'success' }}
+        continue-on-error: true
+        working-directory: head
+        run: |
+          set +u
+          unset _IBM_AIU_SETUP
+          rm -rf /tmp/etc/ibm/spyre/topo.json
+          # shellcheck disable=SC1090
+          source "${RUNNER_SETUP_SCRIPT}" || exit 1
+          set -u
+          # shellcheck disable=SC1091
+          source "${PREBAKED_VENV_PATH}/bin/activate"
+          make bench-run BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1 \
+            BENCH_PLAN="${BENCH_PLAN_FILE}" BENCH_INGEST=0
+
+  # Counts-only answer on the pull request. Trusted code only: nothing from the fork is checked out here.
+  report:
+    name: Answer on the pull request
+    needs: [bench]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ inputs.pr_number }}
+      PLAN: ${{ needs.bench.outputs.plan }}
+      RUN: ${{ needs.bench.outputs.run }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Comment
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          {
+            echo "### Benchmark run finished (fork head)"
+            echo
+            echo "plan: ${PLAN:-n/a} · run: ${RUN:-n/a}"
+            echo "This head is from a fork: it was measured without any credentials and nothing was stored."
+            echo
+            echo "[Workflow run](${RUN_URL})"
+          } > body.md
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@body.md > /dev/null

@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Validate and explain work as-is; stored ids need spyre-bench[ingest].
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: docs-ingest-identity, owner: example-team}
+spec:
+  component: docs-ingest-identity
+  packs: [{name: kernel, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: one-socket
+  visibility: public
+  series_labels: [env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: one-socket}
+spec:
+  devices:
+    requests: [{name: cpus, device_class: cpu/socket, count: 1}]
+  host: {arch: x86_64}
+  labels: {node.class: cpu-pool}

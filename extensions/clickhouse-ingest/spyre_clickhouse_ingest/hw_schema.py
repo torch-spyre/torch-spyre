@@ -87,13 +87,18 @@ class HwFailureDiagnostics:
     @classmethod
     def ensure_extra_columns(cls, client, table: str = "") -> None:
         """Add any missing EXTRA_COLUMNS. Non-fatal per column: the usual cause is that it
-        already exists, and a failure here must not cost the run its rows."""
+        already exists, and a failure here must not cost the run its rows. Takes a
+        `ClickHouse.connect(role="schema")` client; a writer one raises SchemaStatementOnWriter."""
+        from .client import SchemaStatementOnWriter
+
         table = table or cls.DEFAULT_TABLE
         for col_name, col_type in cls.EXTRA_COLUMNS:
             try:
                 client.command(
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
                 )
+            except SchemaStatementOnWriter:
+                raise
             except Exception as exc:
                 print(
                     f"  [warn] Could not add column {col_name}: {exc}", file=sys.stderr

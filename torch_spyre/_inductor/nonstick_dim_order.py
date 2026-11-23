@@ -88,7 +88,7 @@ from torch_spyre._C import (
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
-from .loop_node import insert_after
+from .loop_node import move_after, move_before, record_loop_info
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -1212,9 +1212,7 @@ def _insert_mutation_relayout_copy(
         mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
 
     operations = graph.operations
-    mutation_op_index = operations.index(mutation_op)
-    operations.remove(buf_tmp)
-    operations.insert(mutation_op_index, buf_tmp)
+    move_before(operations, mutation_op, buf_tmp)
 
     # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout).
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
@@ -1228,28 +1226,26 @@ def _insert_mutation_relayout_copy(
         buf_tmp,  # use buf_tmp as metadata source, not mutation_op
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
-    operations.remove(buf_copyback)
     # Right after the mutation op, in the list that holds it: a flat index past the
     # last op of a loop body would put the copy outside the loop.
-    insert_after(operations, mutation_op, buf_copyback)
+    move_after(operations, mutation_op, buf_copyback)
 
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's
     # loop so other carry readers observe the preceding iteration's updates.
     loop_info = getattr(mutation_op, "loop_info", None)
     if loop_info is not None:
-        from .loop_info import CoarseTileInfo
+        from .loop_info import LoopInfo
 
         for copy_op in (buf_tmp, buf_copyback):
             depth = len(loop_info.loop_count)
-            copy_op.loop_info = CoarseTileInfo(
+            copy_op.loop_info = LoopInfo(
                 loop_group_id=loop_info.loop_group_id,
                 loop_count=list(loop_info.loop_count),
                 loop_tiled_dims=[[] for _ in range(depth)],
                 loop_tiled_reduction_dims=[[] for _ in range(depth)],
-                tiled_dims_per_read=[[[] for _ in range(depth)]],
-                output_tiled_dims=[[] for _ in range(depth)],
             )
+            record_loop_info(copy_op)
 
     logger.info(
         "nonstick_dim_order: inserted mutation relayout copy for %s "
