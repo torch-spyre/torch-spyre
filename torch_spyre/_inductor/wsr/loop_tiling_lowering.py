@@ -56,7 +56,8 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout, SpyreConstantFallback
 from ..loop_facts import counted_loop_path
 from ..loop_node import insert_after, move_after
-from ..loop_info import LoopCarryRecord, LoopShim
+from ..loop_info import LoopInfo
+from ..loop_node import LoopCarryRecord
 from ..pass_utils import invalidate_op_read_writes, op_read_writes
 from ..propagate_hints import DimHint
 from .coarse_tile import (
@@ -671,20 +672,21 @@ def _insert_copy_out(
     )
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
-    copy_buf.loop_info = _shim(group, tiled)  # type: ignore[attr-defined]
+    copy_buf.loop_info = _loop_info(group, tiled)  # type: ignore[attr-defined]
     V.graph.name_to_buffer[copy_name] = copy_buf
     insert_after(operations, tiled_op, copy_buf)
     return copy_buf
 
 
-def _shim(group: LoopTilingGroup, tiled: TiledDim | None) -> LoopShim:
-    return LoopShim(
+def _loop_info(group: LoopTilingGroup, tiled: TiledDim | None) -> LoopInfo:
+    return LoopInfo(
         loop_group_id=(group.index,),
         loop_count=[sympy.Integer(group.trip_count)],
         loop_tiled_dims=[[tiled.position] if tiled and not tiled.in_reduction else []],
         loop_tiled_reduction_dims=[
             [tiled.position] if tiled and tiled.in_reduction else []
         ],
+        strict_loop_vars=True,
     )
 
 
@@ -768,7 +770,7 @@ def _lower_reduction(
         fact.full_ranges,
     )
     combine = _make_combine_buffer(op, accum)
-    combine.loop_info = _shim(group, fact.tiled)  # type: ignore[attr-defined]
+    combine.loop_info = _loop_info(group, fact.tiled)  # type: ignore[attr-defined]
     V.graph.name_to_buffer[combine.get_name()] = combine
     insert_after(operations, op, combine)
 
@@ -835,7 +837,7 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
             _apply_work_div_symbol_remap(fact.op, result.symbol_remap)
             if result.retiled_info is not None:
                 retiled[fact.op.get_name()] = result.retiled_info
-        fact.op.loop_info = _shim(group, fact.tiled)  # type: ignore[attr-defined]
+        fact.op.loop_info = _loop_info(group, fact.tiled)  # type: ignore[attr-defined]
 
     # Accumulate every reduction tiled on its reduction dim.
     combines: dict[str, str] = {}
@@ -922,7 +924,7 @@ def lower_loop_tiling(graph: Any, plan: LoopTilingPlan) -> dict[int, sympy.Symbo
     variable and every advancing access its term.
 
     Returns ``{group index: loop variable}`` for ``request_loop_nodes``. Each op
-    carries a ``LoopShim``, never a ``CoarseTileInfo``: the advances live in the
+    carries a ``LoopInfo`` with ``strict_loop_vars``: the advances live in the
     index. Everything the lowering needs (consumers, ranges, strides, steps) is read
     from the graph as it stands when the group is lowered, never from the plan.
     """

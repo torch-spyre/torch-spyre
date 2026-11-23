@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: random-prompts, description: "vllm bench's random dataset: a pure function of the seed and the lengths, nothing is stored"}
+spec:
+  type: generator
+  license: Apache-2.0
+  visibility: public
+  source: {generator: {tool: vllm-bench-random, seed: 0, params: {range_ratio: 0.0}}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: slot-16-files, description: "a recorded chat set staged in the curated store under its slug"}
+spec:
+  type: fileset
+  format: json
+  visibility: internal
+  source: {store: curated, slug: slot-16}
+  integrity: {files: [{path: prompts.json, sha256: "0000000000000000000000000000000000000000000000000000000000000010"}]}

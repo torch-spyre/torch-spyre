@@ -41,6 +41,7 @@ EXT = Path(__file__).resolve().parent.parent
 PKG = EXT / "spyre_bench"
 X = EXT / "examples"
 PG = X / "packs" / "postgres-example"
+TRACE_PACK = X / "packs" / "trace-example"
 CENTRAL = X / "central"
 TMP = Path(tempfile.mkdtemp(prefix="spyre-bench-tests-"))
 CATALOGS = {
@@ -51,6 +52,7 @@ CATALOGS = {
     "central": ([], []),
     "postgres-demo": ([PG], []),
     "pinning-demo": ([], []),
+    "trace-demo": ([TRACE_PACK], []),
 }
 NOW = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
 WITH_JSONSCHEMA = engine.Draft202012Validator is not None
@@ -188,13 +190,18 @@ class Examples(unittest.TestCase):
             "kernel-demo": 5,
             "comms-demo": 5,
             "postgres-demo": 7,
-            "pinning-demo": 2,
+            "pinning-demo": 4,
+            "trace-demo": 3,
             "central": 0,
         }
         self.assertEqual({n: len(cat(n).cases) for n in want}, want)
 
     def test_cli(self):
-        args = [str(X / n) for n in CATALOGS if n != "central"] + ["--pack", str(PG), "--central", str(CENTRAL)]
+        args = [str(X / n) for n in CATALOGS if n != "central"] + [
+            *("--pack", str(PG)),
+            *("--pack", str(TRACE_PACK)),
+            *("--central", str(CENTRAL)),
+        ]
         self.assertEqual(val.main(args), 0)
         self.assertEqual(val.main([str(CENTRAL)]), 0)
 
@@ -2510,6 +2517,90 @@ class DeriveAndCompare(unittest.TestCase):
                 edit(d / base, old, new)
                 errs = cat(d).errors
                 self.assertTrue(any(want in e for e in errs), f"{case}: want {want!r}, got {errs}")
+
+
+class TraceScalingExample(unittest.TestCase):
+    """Scaling across card counts: the card count differs by design, so the Analysis relaxes the environment id and label."""
+
+    LAT = {1: 330.0, 2: 210.0, 4: 160.0}
+
+    def results(self, other_subject=False, node_class=None):
+        c = cat("trace-demo")
+        by = {x["name"]: x for x in c.cases}
+        out = []
+        for n, lat in self.LAT.items():
+            env = f"cards-{n}"
+            v = c.env_view(env)
+            labels = {**v["labels"], **({"env.label.node_class": node_class} if node_class and n == 4 else {})}
+            reps = [
+                {"run.repeat": r, "placement": {"nodes": ["host-a"]}, "samples": {M: [lat + d]}, "props": {}}
+                for r, d in enumerate((-0.5, 0.0, 0.5), 1)
+            ]
+            subject = "subject-2" if other_subject and n == 4 else "subject-1"
+            out.append(
+                engine.build_result(
+                    c,
+                    by[f"decode_scaling_tp{n}"],
+                    f"decode_scaling_tp{n}",
+                    {"artifact_id": subject},
+                    {"env.fp.kernel": f"kernel-{n}"},
+                    {"env.node": "host-a"},
+                    labels,
+                    reps,
+                )
+            )
+        return out
+
+    def analyze(self, results, spec_edit=None):
+        doc = cat("trace-demo").by[("Analysis", "decode-scaling")]
+        spec = copy.deepcopy(doc.spec)
+        if spec_edit:
+            spec_edit(spec)
+        return analysis.analyze(spec, results, cat("trace-demo").reg.metrics)
+
+    def test_scaling_against_one_card(self):
+        cells = {c["env.label.device.count"]: c for c in self.analyze(self.results())["compare"]["cells"]}
+        self.assertAlmostEqual(cells["4"]["effect_pct"], (160.0 - 330.0) / 330.0 * 100)
+        self.assertIsNone(cells["1"]["effect_pct"])
+        self.assertEqual(cells["2"]["reading"], "better")
+
+    def test_without_relax_different_environments_are_refused(self):
+        def drop(spec):
+            del spec["relax"]
+
+        with self.assertRaisesRegex(analysis.AnalysisError, "different env_id"):
+            self.analyze(self.results(), drop)
+
+    def test_relax_does_not_excuse_a_different_subject_or_node_class(self):
+        with self.assertRaisesRegex(analysis.AnalysisError, "different subject"):
+            self.analyze(self.results(other_subject=True))
+        with self.assertRaisesRegex(analysis.AnalysisError, "different environment labels"):
+            self.analyze(self.results(node_class="node-b"))
+
+    def test_relax_accepts_a_trailing_wildcard_but_a_bare_star_relaxes_nothing(self):
+        def labels(spec):
+            spec["relax"] = ["env.id", "env.label.device.*"]
+
+        def bare(spec):
+            spec["relax"] = ["*"]
+
+        self.assertEqual(len(self.analyze(self.results(), labels)["compare"]["cells"]), 3)
+        with self.assertRaisesRegex(analysis.AnalysisError, "different env_id"):
+            self.analyze(self.results(), bare)
+
+    def test_relaxing_env_id_stops_comparing_the_fingerprint(self):
+        """Documented limit: the per-card-count kernel fingerprints differ in the fixture and the comparison still runs."""
+        r = self.results()
+        self.assertNotEqual(r[0]["status"]["environment"]["env_id"], r[2]["status"]["environment"]["env_id"])
+        self.assertEqual(len(self.analyze(r)["compare"]["cells"]), 3)
+
+    def test_rank_spread_resolves_against_the_registered_rank_attribute(self):
+        c = cat("trace-demo")
+        self.assertEqual(c.errors, [])
+        self.assertEqual(c.by[("Analysis", "rank-spread")].spec["vary"], ["run.rank"])
+        d = copy_catalog("trace-demo", "rank-unregistered")
+        edit(d / "analysis" / "rank-spread.yaml", "vary: [run.rank]", "vary: [run.rank_nope]")
+        self.assertTrue(any("matches no registered attribute" in e for e in cat(d, [TRACE_PACK], []).errors))
 
 
 class PinningExample(unittest.TestCase):

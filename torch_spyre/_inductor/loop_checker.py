@@ -73,7 +73,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
-from .loop_facts import counted_loop_path
+from .loop_facts import counted_loop_path, node_levels, stamped_levels
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -267,6 +267,49 @@ def _non_members(entries: list[ir.Operation], depth: int, problems: list[str]) -
         _non_members(entry.body, depth + 1, problems)
 
 
+def _facts(levels) -> list[tuple]:
+    return [
+        (
+            level.group_path,
+            level.trip_count,
+            level.tiled_dims,
+            level.tiled_reduction_dims,
+        )
+        for level in levels
+    ]
+
+
+def _node_fact_problems(
+    op: ir.Operation, enclosing: tuple[LoopNode, ...], problems: list[str]
+) -> None:
+    """Rule 6: the facts the nodes around ``op`` hold (group path, trip count,
+    tiled dims, from ``loop_facts.node_levels``) equal what ``op.loop_info`` says.
+
+    Until the lowerings stop writing ``loop_info`` (stage 9.4) both exist; a pass
+    that changes the stamp after the node was built, without telling the node,
+    leaves the node answering differently, which this reports. An op with no
+    ``loop_info`` has nothing to compare with and is skipped.
+    """
+    if (
+        not enclosing
+        or getattr(op, "loop_info", None) is None
+        or not all(n.facts_recorded for n in enclosing)
+    ):
+        return
+    if tuple(getattr(op, "_loop_chain", ())) != enclosing:
+        problems.append(
+            f"{op.get_name()}: its recorded node chain "
+            f"{[n.get_name() for n in getattr(op, '_loop_chain', ())]} is not the "
+            f"nodes around it {[n.get_name() for n in enclosing]}"
+        )
+        return
+    stamped, derived = _facts(stamped_levels(op)), _facts(node_levels(op))
+    if stamped != derived:
+        problems.append(
+            f"{op.get_name()}: loop_info says {stamped} but its nodes say {derived}"
+        )
+
+
 def find_violations(operations: list[ir.Operation]) -> list[str]:
     """Every structural violation in ``operations``, as messages."""
     problems: list[str] = []
@@ -303,6 +346,8 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             carries(entry.body)
 
     carries(operations)
+    for op, enclosing in _walk(operations):
+        _node_fact_problems(op, enclosing, problems)
     _membership_problems(operations, 0, (), problems, _covered_keys(operations))
     _non_members(operations, 0, problems)
     return problems

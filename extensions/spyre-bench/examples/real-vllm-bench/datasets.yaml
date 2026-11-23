@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: random-lengths, description: "random prompts; the lengths come from the workload"}
+spec: {asset: random-prompts, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: slot-16, description: "recorded chat prompts, replayed through the completions endpoint"}
+spec: {asset: slot-16-files, role: trace}

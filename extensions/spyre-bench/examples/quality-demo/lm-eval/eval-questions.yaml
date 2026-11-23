@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# temperature 0 = greedy: no seed in identity. The input declares how many records the run must score and the digest of
+# the question list; llm.records_complete and llm.dataset_digest check what the run reports against both.
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: eval-questions}
+spec:
+  type: quality
+  level: model
+  tier: sanity
+  system: demo-llm-a-fp16
+  workload:
+    type: llm/lm-eval
+    inputs:
+      - name: tasks
+        dataset: demo-questions
+        subset: first-8
+        expect: {records: 8, selection_digest: "sha256:4f3a1c0de2b64a5f8c7e91d0b2a36f5e4d8c7b6a5f4e3d2c1b0a99887766554a"}
+    eval: {task: demo-questions, num_fewshot: 5, temperature: 0, filter: strict-match}
+  metrics: {required: [llm.eval.exact_match, llm.eval.exact_match_stderr, llm.eval.n_samples, llm.eval.error_frac, llm.eval.truncated_frac], headline: [llm.eval.exact_match]}
+  run:
+    repeats: 1
+    timeout: 5m
+    est: 1m
+    isolation: process
+    command: ["{python}", "stub_eval.py", "--out", "{repeat_dir}"]
+  variants:
+    - name: eval_questions_demoa_fp16_l8
+    - name: eval_questions_demoa_ref_l8
+      system: demo-llm-a-ref

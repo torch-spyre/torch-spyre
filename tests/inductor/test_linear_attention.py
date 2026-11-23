@@ -462,12 +462,88 @@ def _probe_input(probes, shape, differentiation, dtype):
     return flat.view(shape)
 
 
+def _cpu_model():
+    try:
+        with open("/proc/cpuinfo") as cpuinfo:
+            for line in cpuinfo:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _feature_map_diagnostics(x, actual, expected, worst=5):
+    """What a reader needs to tell a tolerance problem from a bad ``exp``.
+
+    Both formulas are fp32 CPU computations that agree to about 6e-8 (one ulp), so
+    a failure of ``atol = rtol = 1e-6`` is not rounding noise. One CI failure
+    (merge queue, one pod; the pod-level retry on another pod passed) showed
+    1.05e-4 / 1.5e-4 on 670 of 4096 elements and could not be reproduced afterwards.
+    This reports the environment, which side is far from an fp64 reference, the
+    elements that are worst, and whether recomputing gives the same bits, so the
+    next occurrence says where to look.
+    """
+    reference = F.elu(x.double()) + 1.0
+    far = (actual.double() - reference).abs()
+    far_expected = (expected.double() - reference).abs()
+    difference = (actual - expected).abs().flatten()
+    order = difference.argsort(descending=True)[:worst]
+    rows = [
+        f"  x={x.flatten()[i].item()!r} actual={actual.flatten()[i].item()!r} "
+        f"expected={expected.flatten()[i].item()!r} "
+        f"fp64={reference.flatten()[i].item()!r}"
+        for i in order.tolist()
+    ]
+    negative = torch.minimum(x, torch.zeros_like(x))
+    exp_error = (torch.exp(negative).double() - torch.exp(negative.double())).abs()
+    again = feature_map(x)
+    return "\n".join(
+        [
+            "feature-map diagnostics:",
+            f"  torch {torch.__version__}, cpu capability "
+            f"{torch.backends.cpu.get_cpu_capability()}, "
+            f"{torch.get_num_threads()} threads, cpu {_cpu_model()}",
+            f"  max |feature_map - fp64 reference| = {far.max().item()!r}, "
+            f"max |elu + 1 - fp64 reference| = {far_expected.max().item()!r}",
+            f"  max |torch.exp(min(x, 0)) - fp64 exp| = {exp_error.max().item()!r}",
+            f"  recomputing feature_map(x) gives the same bits: "
+            f"{bool(torch.equal(again, actual))}",
+            "  worst elements by |actual - expected|:",
+            *rows,
+        ]
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
 def test_feature_map_matches_elu_plus_one(dtype):
     """The Spyre-safe formula is ``elu(x) + 1``: negative, near-zero, positive."""
     x = _probe_input(FEATURE_MAP_WIDE_PROBES, (64, 64), 32, dtype)
+    actual, expected = feature_map(x), F.elu(x) + 1.0
 
-    torch.testing.assert_close(feature_map(x), F.elu(x) + 1.0, atol=1e-6, rtol=1e-6)
+    try:
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    except AssertionError as error:
+        # The same failure, with what is needed to attribute it.
+        raise AssertionError(
+            f"{error}\n{_feature_map_diagnostics(x, actual, expected)}"
+        ) from error
+
+
+def test_the_feature_map_failure_report_names_the_worst_elements():
+    """The report names the worst elements and the environment. Fed a result that is
+    wrong in one place, the wrong place comes first."""
+    x = _probe_input(FEATURE_MAP_WIDE_PROBES, (64, 64), 32, torch.float32)
+    expected = F.elu(x) + 1.0
+    actual = feature_map(x).clone()
+    actual.view(-1)[37 * 64 + 39] += 1e-3
+
+    report = _feature_map_diagnostics(x, actual, expected)
+
+    assert "cpu capability" in report and "worst elements" in report
+    first = report.split("worst elements by |actual - expected|:\n")[1].splitlines()[0]
+    assert f"x={x[37, 39].item()!r}" in first
+    assert "recomputing feature_map(x) gives the same bits: False" in report
 
 
 def test_feature_map_does_not_overflow_in_fp16():
