@@ -675,8 +675,8 @@ class TestGatherBoundaryNumericsAndAPIForms:
 
     def test_cor_gather_then_norm(self, execution_mode):
         """Gather + F.normalize downstream."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/6340
-        _xfail_existing(execution_mode, eager=_CLAMP_MIN_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((64, 128), differentiation="cor09", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         compare_mode(
