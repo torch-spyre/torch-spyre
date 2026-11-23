@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import dataclasses
 import hashlib
+import io
 import json
 import os
+import pickle
 import shutil
 import uuid
 from collections.abc import Sequence
 from functools import lru_cache
 from typing import Optional
 
+import regex
 import sympy
 import torch
 from torch._inductor.codecache import code_hash
@@ -846,6 +850,192 @@ def register_precomputed_key(cache_key: str, kernel_name: str, specs: Sequence) 
         kernel_name or "<unknown>",
         ",".join(ops),
         cache_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Refresh table for stale precomputed keys.
+#
+# The stored key lives in the generated wrapper, and the wrapper lives in the
+# FX graph cache, whose key does not see _C or most torch_spyre sources. After
+# an upgrade that keeps the FX keys, every start loads the old wrappers, finds
+# their fingerprints stale and computes every key again. To pay that only once,
+# the computed key is recorded in a small file per kernel, looked up by the
+# stored key and fingerprint, the current fingerprint and a digest of the specs
+# themselves: two spec trees that shared a key under the old code may differ
+# under the new one, so the specs stay part of the lookup.
+# ---------------------------------------------------------------------------
+
+_KEY_REFRESH_FORMAT = "spyre-key-refresh-v1"
+# A key is used as a directory name, so only plain characters are accepted.
+_KEY_RE = regex.compile(r"[A-Za-z0-9_-]{1,256}")
+
+# Stale stored keys seen in this process, and how many the table answered.
+_stale_key_counts = {"stale": 0, "from_table": 0}
+_stale_key_counts_logged = dict(_stale_key_counts)
+
+
+def get_key_refresh_dir() -> str:
+    """Directory of the refresh table, next to the kernel cache root.
+
+    Not inside the root: every directory there is a kernel entry.
+    """
+    return os.path.join(cache_dir(), "inductor-spyre-key-refresh")
+
+
+def specs_digest(specs: Sequence) -> Optional[str]:
+    """SHA-256 of the spec tree's own content, or None if it cannot be taken.
+
+    A pickle without its memo: the bytes then depend only on the values, not
+    on which equal objects (for example cached sympy numbers) happen to be
+    shared, so a tree evaluated from the same wrapper source gives the same
+    digest in every process. Much cheaper than compute_specs_hash(), which
+    generates the SDSC JSON of every OpSpec. A tree that does not pickle
+    returns None, and its key is then computed as without the table.
+    """
+    buf = io.BytesIO()
+    pickler = pickle.Pickler(buf, protocol=4)
+    pickler.fast = True
+    try:
+        pickler.dump(list(specs))
+    except Exception as e:  # noqa: BLE001 - no digest means "compute the key"
+        logger.debug("No specs digest for the key refresh table: %r", e)
+        return None
+    return hashlib.sha256(buf.getvalue()).hexdigest()
+
+
+@dataclasses.dataclass
+class StaleKeyRefresh:
+    """A stored key whose fingerprint does not match this process.
+
+    ``key`` is the refresh table's answer, or None when it has none; the
+    caller then computes the key and passes it to record().
+    """
+
+    lookup: str
+    key: Optional[str]
+
+    @property
+    def path(self) -> str:
+        return os.path.join(get_key_refresh_dir(), self.lookup)
+
+    def record(self, cache_key: str) -> None:
+        """Write the computed key for later starts. Never raises.
+
+        Written to a temporary file and renamed into place, so other processes
+        (TP ranks, forked compile workers) see either no entry or a whole one.
+        """
+        if not _KEY_RE.fullmatch(cache_key):
+            return
+        tmp = f"{self.path}.tmp.{uuid.uuid4().hex}"
+        try:
+            os.makedirs(get_key_refresh_dir(), exist_ok=True)
+            with open(tmp, "w") as f:
+                f.write(f"{_KEY_REFRESH_FORMAT}\n{self.lookup}\n{cache_key}\n")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            logger.debug("Could not record refreshed key %s: %s", cache_key, e)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def _read_refreshed_key(path: str, lookup: str) -> Optional[str]:
+    """The key in a refresh table entry, or None if missing or not valid."""
+    try:
+        with open(path) as f:
+            lines = f.read().split("\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(lines) != 4 or lines[3] != "":
+        return None
+    if lines[0] != _KEY_REFRESH_FORMAT or lines[1] != lookup:
+        return None
+    return lines[2] if _KEY_RE.fullmatch(lines[2]) else None
+
+
+def lookup_stale_precomputed_key(
+    precomputed_key: Optional[str],
+    specs: Sequence,
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
+) -> Optional[StaleKeyRefresh]:
+    """Runtime side, for a stored key that resolve_precomputed_key() refused.
+
+    Returns None unless the stored key is well formed and only its fingerprint
+    differs from this process's, and the specs have a digest; the caller then
+    computes the key and records nothing. Otherwise returns the table entry
+    for these specs (``key`` None on a miss or an unreadable entry). Never
+    raises.
+    """
+    from torch_spyre._inductor import config as _spyre_config
+
+    if not precomputed_key:
+        return None
+    stored_key, sep, stored_fp = precomputed_key.rpartition(_PRECOMPUTED_KEY_SEP)
+    if not sep or not stored_key or not stored_fp:
+        return None
+    if backend_loop_unroll is None:
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
+    current = _current_fingerprint(
+        pool_size,
+        backend_loop_unroll=backend_loop_unroll,
+        ktir_device_mlir=ktir_device_mlir,
+    )
+    if current is None or current == stored_fp:
+        return None
+    _note_stale_key()
+    digest = specs_digest(specs)
+    if digest is None:
+        return None
+    parts = [
+        _KEY_REFRESH_FORMAT,
+        stored_key,
+        stored_fp,
+        current,
+        digest,
+        f"pool_size:{int(pool_size)}",
+        f"loop_unroll:{int(bool(backend_loop_unroll))}",
+        f"ktir_device_mlir:{ktir_device_mlir}",
+    ]
+    lookup = hashlib.sha256("||".join(parts).encode()).hexdigest()
+    refresh = StaleKeyRefresh(lookup, None)
+    refresh.key = _read_refreshed_key(refresh.path, lookup)
+    if refresh.key is not None:
+        _stale_key_counts["from_table"] += 1
+    return refresh
+
+
+def _note_stale_key() -> None:
+    """Count a stale stored key; warn at the first one in this process."""
+    _stale_key_counts["stale"] += 1
+    if _stale_key_counts["stale"] == 1:
+        logger.warning(
+            "Precomputed kernel keys in the cached wrappers are stale: the "
+            "torch-spyre build, its sources or the config changed after the FX "
+            "graph cache entries were written. Each stale key is computed once "
+            "and remembered in %s, so later starts read it from there. Counts "
+            "are logged at INFO when a compile finishes.",
+            get_key_refresh_dir(),
+        )
+
+
+def log_stale_key_counts() -> None:
+    """Log the stale-key counts at INFO if they changed since the last call."""
+    if _stale_key_counts == _stale_key_counts_logged:
+        return
+    _stale_key_counts_logged.update(_stale_key_counts)
+    stale = _stale_key_counts["stale"]
+    from_table = _stale_key_counts["from_table"]
+    logger.info(
+        "Stale precomputed kernel keys in this process: %d (%d from the refresh "
+        "table, %d computed)",
+        stale,
+        from_table,
+        stale - from_table,
     )
 
 

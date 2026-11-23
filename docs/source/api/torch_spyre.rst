@@ -885,7 +885,10 @@ Environment Variables
        torch-spyre sources and ``_C`` file) matches the running process;
        otherwise the key is computed as usual. Any edit under
        ``torch_spyre/_inductor`` changes the fingerprint, so a build with
-       local edits computes its keys again. ``verify`` computes both and
+       local edits computes its keys again. Such a computed key is recorded in
+       ``inductor-spyre-key-refresh`` next to the kernel cache, looked up by
+       the stored key, both fingerprints and a digest of the specs, so later
+       starts on the same build read it instead. ``verify`` computes both and
        raises ``PrecomputedKernelKeyMismatch`` if they differ. Any other value
        warns and leaves it off. Generated wrappers now pass a
        ``precomputed_key`` keyword to ``async_compile.sdsc()``, so code that

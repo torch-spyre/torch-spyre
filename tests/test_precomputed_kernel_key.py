@@ -140,6 +140,11 @@ def _env(**config):
         yield
 
 
+def _eval_specs(src: str):
+    """The specs a generated wrapper module builds from ``src``."""
+    return eval(src, spec_eval_namespace())  # noqa: S307
+
+
 def _runtime_key(src: str, pool_size: int) -> str:
     """What sdsc() computes today for the specs the wrapper module builds."""
     specs = eval(src, spec_eval_namespace())  # noqa: S307
@@ -662,6 +667,236 @@ class TestEmittedSdscCall(unittest.TestCase):
             )
         self.assertEqual(name, "sdsc_existing_0")
         wrapper.define_kernel.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Stale fingerprints: the refresh table
+# ---------------------------------------------------------------------------
+
+
+class TestStaleKeyRefresh(unittest.TestCase):
+    """A wrapper stored by an older build: its fingerprint no longer matches.
+
+    The FX graph cache keeps such wrappers across an upgrade, so without the
+    refresh table every start computes every key again.
+    """
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.cache_dir = tmp
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": tmp}))
+        self.stack = stack
+
+    @contextlib.contextmanager
+    def _process(self, mode="1"):
+        """One process: fresh per-process state, the current build."""
+        counts = getattr(kernel_cache, "_stale_key_counts", {})
+        logged = getattr(kernel_cache, "_stale_key_counts_logged", {})
+        with (
+            _env(precomputed_kernel_key=mode),
+            patch.dict(counts, {k: 0 for k in counts}),
+            patch.dict(logged, {k: 0 for k in logged}),
+        ):
+            sympy.core.cache.clear_cache()
+            yield
+
+    @staticmethod
+    def _old_build_stored(src, pool_size=0):
+        """precomputed_key as an older build (another _C file) wrote it."""
+        with (
+            _env(),
+            patch.object(
+                kernel_cache, "_get_native_extension_digest", return_value="0" * 64
+            ),
+        ):
+            return precompute_kernel_key(src, "k", pool_size)
+
+    @staticmethod
+    def _key(src, stored, pool_size=0):
+        """sdsc()'s key for the wrapper source; returns (key, hash calls)."""
+        specs = eval(src, spec_eval_namespace())  # noqa: S307
+        with patch.object(
+            async_compile_mod, "compute_specs_hash", wraps=compute_specs_hash
+        ) as hashed:
+            key = async_compile_mod.SpyreAsyncCompile._kernel_cache_key(
+                MagicMock(),
+                "k",
+                specs,
+                pool_size,
+                spyre_config.backend_loop_unroll,
+                spyre_config.ktir_device_mlir,
+                stored,
+            )
+        return key, hashed.call_count
+
+    def _table_files(self):
+        root = os.path.join(self.cache_dir, "inductor-spyre-key-refresh")
+        if not os.path.isdir(root):
+            return []
+        return [os.path.join(root, f) for f in sorted(os.listdir(root))]
+
+    def test_stale_key_is_computed_once_then_read(self):
+        src = _src(_spec_sets()["two_ops"])
+        stored = self._old_build_stored(src)
+        with self._process():
+            expected = _runtime_key(src, 0)
+            self.assertIsNone(resolve_precomputed_key(stored, 0))
+            self.assertEqual(self._key(src, stored), (expected, 1))
+        self.assertEqual(len(self._table_files()), 1)
+        # The next start (fresh spec objects, fresh sympy cache) reads it.
+        for _ in range(2):
+            with self._process():
+                self.assertEqual(self._key(src, stored), (expected, 0))
+        self.assertEqual(len(self._table_files()), 1)
+
+    def test_pool_size_and_loop_kernels(self):
+        src = _src(_spec_sets()["loop"])
+        stored = self._old_build_stored(src, 8192)
+        with self._process():
+            expected = _runtime_key(src, 8192)
+            self.assertEqual(self._key(src, stored, 8192), (expected, 1))
+        with self._process():
+            self.assertEqual(self._key(src, stored, 8192), (expected, 0))
+
+    def test_specs_are_part_of_the_lookup(self):
+        # Two wrappers whose stored key and fingerprint are equal but whose
+        # specs differ must not share an entry.
+        srcs = [_src(_spec_sets()[name]) for name in ("single", "two_ops")]
+        stored = self._old_build_stored(srcs[0])
+        with self._process():
+            expected = [_runtime_key(src, 0) for src in srcs]
+            self.assertNotEqual(expected[0], expected[1])
+            for src, key in zip(srcs, expected):
+                self.assertEqual(self._key(src, stored), (key, 1))
+        self.assertEqual(len(self._table_files()), 2)
+        with self._process():
+            for src, key in zip(srcs, expected):
+                self.assertEqual(self._key(src, stored), (key, 0))
+
+    def test_corrupt_entry_is_computed_and_rewritten(self):
+        src = _src(_spec_sets()["single"])
+        stored = self._old_build_stored(src)
+        with self._process():
+            expected = _runtime_key(src, 0)
+            self._key(src, stored)
+        (entry,) = self._table_files()
+        for garbage in (b"", b"\xff\xfe", b"not a key file\n", b"x/../y\n"):
+            with self.subTest(garbage=garbage):
+                with open(entry, "wb") as f:
+                    f.write(garbage)
+                with self._process():
+                    self.assertEqual(self._key(src, stored), (expected, 1))
+                with self._process():
+                    self.assertEqual(self._key(src, stored), (expected, 0))
+
+    def test_entry_of_another_lookup_is_not_used(self):
+        src = _src(_spec_sets()["single"])
+        stored = self._old_build_stored(src)
+        with self._process():
+            expected = _runtime_key(src, 0)
+            self._key(src, stored)
+        (entry,) = self._table_files()
+        with open(entry) as f:
+            lines = f.read().split("\n")
+        lines[1] = "0" * 64
+        with open(entry, "w") as f:
+            f.write("\n".join(lines))
+        with self._process():
+            self.assertEqual(self._key(src, stored), (expected, 1))
+
+    def test_verify_checks_a_table_entry(self):
+        src = _src(_spec_sets()["single"])
+        stored = self._old_build_stored(src)
+        with self._process("verify"):
+            expected = _runtime_key(src, 0)
+            self.assertEqual(self._key(src, stored), (expected, 1))
+        with self._process("verify"):
+            self.assertEqual(self._key(src, stored), (expected, 1))
+        (entry,) = self._table_files()
+        with open(entry) as f:
+            lines = f.read().split("\n")
+        lines[2] = "cwrongkey"
+        with open(entry, "w") as f:
+            f.write("\n".join(lines))
+        with self._process("verify"), self.assertRaises(PrecomputedKernelKeyMismatch):
+            self._key(src, stored)
+
+    def test_switch_off_is_unchanged(self):
+        src = _src(_spec_sets()["single"])
+        stored = self._old_build_stored(src)
+        for _ in range(2):
+            with self._process("0"):
+                self.assertEqual(self._key(src, stored), (_runtime_key(src, 0), 1))
+        self.assertEqual(self._table_files(), [])
+
+    def test_matching_and_missing_stored_keys_record_nothing(self):
+        src = _src(_spec_sets()["single"])
+        with self._process():
+            current = precompute_kernel_key(src, "k", 0)
+            self.assertEqual(self._key(src, current)[1], 0)
+            for stored in (None, "", "k", "k|"):
+                self.assertEqual(self._key(src, stored)[1], 1)
+        self.assertEqual(self._table_files(), [])
+
+    def test_one_warning_per_process_with_counts(self):
+        srcs = [_src(specs) for specs in _spec_sets().values()]
+        stored = [self._old_build_stored(src) for src in srcs]
+        with self._process(), self.assertLogs(kernel_cache.logger, "INFO") as logs:
+            for src, key in zip(srcs, stored):
+                self._key(src, key)
+            kernel_cache.log_stale_key_counts()
+            kernel_cache.log_stale_key_counts()
+        warnings_ = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings_), 1)
+        self.assertIn("stale", warnings_[0].getMessage())
+        summaries = [r.getMessage() for r in logs.records if "in this process" in r.msg]
+        self.assertEqual(
+            summaries,
+            [
+                f"Stale precomputed kernel keys in this process: "
+                f"{len(srcs)} (0 from the refresh table, "
+                f"{len(srcs)} computed)"
+            ],
+        )
+        with self._process(), self.assertLogs(kernel_cache.logger, "INFO") as logs:
+            for src, key in zip(srcs, stored):
+                self._key(src, key)
+            kernel_cache.log_stale_key_counts()
+        self.assertEqual(sum(r.levelname == "WARNING" for r in logs.records), 1)
+        self.assertIn(
+            f"{len(srcs)} (3 from the refresh table, 0 computed)",
+            [r.getMessage() for r in logs.records][-1],
+        )
+
+    def test_unwritable_table_does_not_fail_the_compile(self):
+        src = _src(_spec_sets()["single"])
+        stored = self._old_build_stored(src)
+        # A file where the table directory should be.
+        with open(os.path.join(self.cache_dir, "inductor-spyre-key-refresh"), "w"):
+            pass
+        for _ in range(2):
+            with self._process():
+                self.assertEqual(self._key(src, stored), (_runtime_key(src, 0), 1))
+
+    def test_specs_digest_ignores_object_sharing(self):
+        # A plain pickle records which equal objects are shared, which depends
+        # on sympy's cache; the digest must not.
+        src = _src(_spec_sets()["two_ops"])
+        with _env():
+            first = kernel_cache.specs_digest(_eval_specs(src))
+            sympy.core.cache.clear_cache()
+            _ = [sympy.Symbol("c0") % n + n for n in range(1, 50)]
+            again = kernel_cache.specs_digest(_eval_specs(src))
+            other = kernel_cache.specs_digest(
+                eval(_src(_spec_sets()["single"]), spec_eval_namespace())  # noqa: S307
+            )
+        self.assertEqual(len(first), 64)
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self.assertIsNone(kernel_cache.specs_digest([lambda: None]))
 
 
 class TestSwitchValues(unittest.TestCase):

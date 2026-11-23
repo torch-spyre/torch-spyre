@@ -651,7 +651,9 @@ def _precomputed_kernel_key_from_env() -> str:
 # for the list). With the kernel cache on and this set to "1",
 # sdsc() uses <key> when <fp> matches the running process instead of
 # regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
-# mismatch falls back to compute_specs_hash(). "verify" computes both and
+# mismatch falls back to compute_specs_hash(), and a stale fingerprint records
+# the computed key in a refresh table for later starts (see
+# lookup_stale_precomputed_key). "verify" computes both and
 # raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
 # time; the generated code is the same for every value, so it is left out of
 # the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
