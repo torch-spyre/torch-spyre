@@ -24,8 +24,8 @@ spec:
     - {key: system.ext.spyre.mode, class: run, role: root, type: enum, values: [a, b], plot: true, stored_in: benchmark_runs.props}
     - {key: system.ext.spyre.tag, class: run, role: root, type: string, stored_in: benchmark_runs.props}
   metrics:
-    - {name: spyre.compiled_graphs, unit: "{graph}", direction: none, category: diagnostic, statistic: count, compare: exact}
-    - {name: spyre.compile.time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative}
+    - {name: spyre.compiled_graphs, class: diagnostic, unit: "{graph}", direction: none, category: diagnostic, statistic: count, compare: exact}
+    - {name: spyre.compile.time, class: startup_time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative}
   resolvers:
     - {name: spyre/artifact, produces: [subject.id, "subject.dep.<name>"]}
   probes:

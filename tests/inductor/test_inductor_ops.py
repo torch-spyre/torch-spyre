@@ -4860,9 +4860,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # A cat piece that needs a restickify is written straight into a slice of
         # the cat buffer; the padding pass cannot pad such a write in place.
-        # TODO: restickify into a fresh buffer and copy it into the slice (the
-        # TODO in padding._pad_restickify_output); then this becomes a positive
-        # case.
+        # This is case 1 of #6163; the yolo26 Detect head, where three views of
+        # different sizes meet a cat on the stick dim, is covered in
+        # test_stick_relocation.py.
+        # TODO(#6163): restickify into a fresh buffer and copy it into the slice
+        # (the TODO in padding._pad_restickify_output); then this becomes a
+        # positive case.
         (
             "test_cat_of_reshapes",
             "test_cat_of_reshapes_cpu",

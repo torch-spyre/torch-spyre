@@ -1,3 +1,7 @@
+# REMAINING V1 WRITER, kept on purpose: the dashboard's model-enablement view still reads the v1
+# model_ops_* tables (the same data reaches capability_runs through the JUnit path).
+# Depends on the legacy secrets CLICKHOUSE_HOST/PORT/USER/PASS/DB; retire them only after this
+# workflow and the dashboard reader are gone, or this ingest breaks.
 # v1 model-ops: delete once the dashboard reads v2 capabilities
 name: push-model-ops-logs-to-clickhouse
 
@@ -76,6 +80,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-schema-user: ${{ secrets.CLICKHOUSE_SCHEMA_USER }}
+          clickhouse-schema-pass: ${{ secrets.CLICKHOUSE_SCHEMA_PASSWORD }}
 
       - name: Upload Logs artifact
         if: always() && steps.ingest.outputs.log-file != ''

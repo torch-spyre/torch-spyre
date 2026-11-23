@@ -85,6 +85,7 @@ from collections.abc import Iterable, Sequence
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from .. import config
+from ..loop_facts import is_looped
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
@@ -424,7 +425,7 @@ def _untileable_reason(op: object) -> str | None:
         return f"layout is a {type(layout).__name__}, not a FixedTiledLayout"
     if getattr(op, "dim_hints", []):
         return "already tiled by the hint or span-overflow pass (dim_hints)"
-    if getattr(op, "loop_info", None) is not None:
+    if is_looped(op):
         return "already a member of a coarse-tiling loop group (loop_info)"
     return None
 

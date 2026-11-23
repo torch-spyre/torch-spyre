@@ -1,0 +1,385 @@
+name: bench-on-demand
+run-name: ${{ inputs.pr_number != '' && format('bench-on-demand pr={0} by={1}', inputs.pr_number, inputs.requested_by) || 'bench-on-demand' }}
+
+# On-demand run of the benchmarks/ catalog through spyre-bench: validate -> plan -> run -> ingest ->
+# verdict. Nightly and weekly runs are triggered from Jenkins presets (they must run on the nightly-built image);
+# this is the manual route. Never a required check: the job is continue-on-error and every stage after validation is advisory.
+# Rows go to the dev instance unless the run explicitly selects prod (the clickhouse_env input). Results are never uploaded as workflow artifacts.
+# `smoke` swaps in a card-free stub engine on a hosted runner and ingests nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to check out and benchmark
+        required: false
+        type: string
+        default: ''
+      selection:
+        description: Selection of benchmarks/ to run
+        required: false
+        type: string
+        default: ops-core
+      clickhouse_env:
+        description: >-
+          Which ClickHouse instance receives the rows: "dev" (default) or "prod". Prod only when
+          this is set to prod explicitly.
+        required: false
+        type: string
+        default: dev
+      ingest:
+        description: Write the rows to ClickHouse (off = run and verdict only)
+        required: false
+        type: boolean
+        default: true
+      smoke:
+        description: Card-free dry run with the stub engine on a hosted runner; nothing is measured or ingested
+        required: false
+        type: boolean
+        default: false
+      pr_number:
+        description: Pull request this run answers (set by bench-pr-comment; same-repository heads only)
+        required: false
+        type: string
+        default: ''
+      requested_by:
+        description: Login of the user who asked (set by bench-pr-comment)
+        required: false
+        type: string
+        default: ''
+      bench_env:
+        description: JSON object of BENCH_* variables from the request (set by bench-pr-comment)
+        required: false
+        type: string
+        default: ''
+
+# A newer request for the same pull request cancels the older one (also across bench-on-demand-fork).
+concurrency:
+  group: ${{ inputs.pr_number != '' && format('bench-on-demand-pr-{0}', inputs.pr_number) || format('bench-on-demand-{0}', inputs.smoke && 'smoke' || 'full')
+    }}
+  cancel-in-progress: ${{ inputs.pr_number != '' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PREBAKED_VENV_PATH: /home/senuser/.venv
+  RUNNER_SETUP_SCRIPT: /etc/profile.d/ibm-aiu-setup.sh
+  BENCH_SELECTION: ${{ inputs.selection || 'ops-core' }}
+  BENCH_PURPOSE: on-demand
+  BENCH_ENVIRONMENT: one-device
+  BENCH_REUSE: never
+  BENCH_INVOKER: gha
+  BENCH_QUIET: '1'
+  CI: '1'
+
+jobs:
+  # What the prebaked image under test is, so the rows name their subject. Telemetry only: never fails the run.
+  artifact_identity:
+    name: Derive artifact identity
+    if: ${{ !inputs.smoke }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 10
+    continue-on-error: true
+    outputs:
+      record: >-
+        ${{ steps.derive.outputs.artifact_id != '' && format('{0}|{1}|',
+        steps.derive.outputs.artifact_id, steps.derive.outputs.base_artifact_id) || '' }}
+    steps:
+      - name: Checkout the identity action, script and library
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          sparse-checkout: |
+            .github/actions/derive-gha-artifact-id
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      - name: Derive and upload the artifact identity
+        id: derive
+        uses: ./.github/actions/derive-gha-artifact-id
+        with:
+          component: torch-spyre
+          arch: x86_64
+          installed: ''
+
+  bench:
+    name: On-demand op benchmarks (advisory)
+    needs: [artifact_identity]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(inputs.smoke && '["ubuntu-latest"]' || '["x86_64","spyre_pf_x1","linux","image_spyre_backend"]') }}
+    timeout-minutes: 240
+    # Advisory: a failing benchmark never turns the workflow red or blocks anything.
+    continue-on-error: true
+    outputs:
+      plan: ${{ steps.plan.outcome }}
+      run: ${{ steps.run.outcome }}
+      ingest: ${{ steps.ingest.outcome }}
+      verdict: ${{ steps.verdict.outcome }}
+    env:
+      BENCH_RESULTS_DIR: ${{ github.workspace }}/bench-results
+      BENCH_PLAN_FILE: ${{ github.workspace }}/bench-results/plan/plan.json
+      # Selects the instance; prod only on an explicit "prod". Secrets cannot gate a step `if:`, so the host is
+      # mapped to env; the password is passed to the ingest action as an input only.
+      BENCH_CLICKHOUSE_ENV: ${{ inputs.clickhouse_env || 'dev' }}
+      CLICKHOUSE_HOST: ${{ fromJSON(inputs.clickhouse_env == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
+        || secrets.CLICKHOUSE_HOST_DEV)) }}
+      DO_INGEST: ${{ !inputs.smoke && inputs.ingest }}
+      # Prod needs a host and the scoped login; guards against a silent skip of a prod request.
+      PROD_SET: ${{ (secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) != '' && secrets.CLICKHOUSE_V2_USER != '' && secrets.CLICKHOUSE_V2_PASSWORD
+        != '' }}
+      # Non-secret names the benchmark command needs from the runner setup (the engine passes an allowlist only).
+      BENCH_PASS_ENV: ${{ vars.BENCH_PASS_ENV }}
+      CH_REQUIRE_V2_HOST: ${{ vars.CH_REQUIRE_V2_HOST }}
+      CH_V2_DATABASES: ${{ vars.CH_V2_DATABASES }}
+      CH_WRITE_RESILIENCE: ${{ vars.CH_WRITE_RESILIENCE }}
+      CH_WRITE_STRICT: ${{ vars.CH_WRITE_STRICT }}
+      CH_WRITE_DEADLINE_S: ${{ vars.CH_WRITE_DEADLINE_S || '120' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          sparse-checkout: |
+            .github
+            Makefile
+            mk
+            benchmarks
+            extensions/spyre-bench
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # The request is data from a trusted dispatch; keys and values are checked again here because anyone with
+      # write access can also dispatch this workflow by hand.
+      - name: Check the request is still current
+        if: ${{ inputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          api() { curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"; }
+          pr=$(api "pulls/${PR}")
+          [ "$(jq -r .state <<< "${pr}")" = open ] || { echo "::error::the pull request is no longer open"; exit 1; }
+          [ "$(jq -r .head.sha <<< "${pr}")" = "${INPUT_REF}" ] || { echo "::error::the pull request head moved since this run was requested"; exit 1; }
+          created=$(api "actions/runs/${GITHUB_RUN_ID}" | jq -r .created_at)
+          [ "$(date -u -d "${created}" +%s)" -gt "$(date -u -d '24 hours ago' +%s)" ] || { echo "::error::this run waited more than a day"; exit 1; }
+
+      - name: Apply the request
+        if: ${{ inputs.bench_env != '' }}
+        env:
+          REQUEST_JSON: ${{ inputs.bench_env }}
+          PINNED_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${PINNED_REF}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full commit sha for a pull request run"; exit 1; }
+          printf '%s' "${REQUEST_JSON}" | jq -e 'type == "object"' > /dev/null
+          allowed='BENCH_PURPOSE BENCH_REUSE BENCH_SELECTION BENCH_TIER BENCH_SUITES BENCH_FORCE BENCH_BUDGET BENCH_ENVIRONMENT BENCH_SET'
+          echo "BENCH_SELECTION=" >> "$GITHUB_ENV"
+          for key in ${allowed}; do
+            value=$(printf '%s' "${REQUEST_JSON}" | jq -r --arg k "${key}" 'if has($k) then .[$k] else empty end | select(type == "string" and test("\\A[A-Za-z0-9._,=#@+-]{0,300}\\z"))')
+            [ -z "${value}" ] || echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Set up Python (hosted runner)
+        if: ${{ inputs.smoke }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      # The engine lives in its own venv so it never perturbs the image's shared environment; the benchmarks
+      # themselves run from that shared venv (PATH), see "Run".
+      - name: Install the engine
+        id: install
+        run: |
+          uv venv .bench-venv
+          uv pip install --python .bench-venv/bin/python ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml
+
+      - name: Validate definitions and identity conformance
+        id: validate
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          make bench-validate BENCH_REQUIRED=1
+          make bench-check-ids BENCH_REQUIRED=1
+
+      - name: Smoke (stub engine, no cards, nothing ingested)
+        if: ${{ inputs.smoke }}
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/.bench-venv/bin:${PATH}"
+          make bench-nightly-smoke
+
+      - name: Plan
+        id: plan
+        if: ${{ !inputs.smoke }}
+        continue-on-error: true
+        env:
+          ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+        run: |
+          export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          make bench-plan BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1
+
+      # Card topology is refreshed exactly as the perf job does; the engine runs from its own venv, the
+      # benchmark runner comes from the image's shared venv on PATH.
+      - name: Run
+        id: run
+        if: ${{ !inputs.smoke && steps.plan.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          ARTIFACT_RECORD: ${{ needs.artifact_identity.outputs.record }}
+        run: |
+          export BENCH_SUBJECT_ID="${ARTIFACT_RECORD%%|*}"
+          set +u
+          unset _IBM_AIU_SETUP
+          rm -rf /tmp/etc/ibm/spyre/topo.json
+          # shellcheck disable=SC1090
+          source "${RUNNER_SETUP_SCRIPT}" || exit 1
+          set -u
+          # shellcheck disable=SC1091
+          source "${PREBAKED_VENV_PATH}/bin/activate"
+          make bench-run BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1 \
+            BENCH_PLAN="${BENCH_PLAN_FILE}" BENCH_INGEST=0
+
+      # The per-case report.xml files, flat, for the XML ingest below.
+      - name: Collect reports
+        id: collect
+        if: ${{ !inputs.smoke && steps.run.outcome != 'skipped' }}
+        continue-on-error: true
+        run: |
+          bench_env="${BENCH_CLICKHOUSE_ENV,,}"
+          if [ "${DO_INGEST}" = "true" ]; then
+            case "${bench_env}" in dev|prod) ;; *) echo "::error::clickhouse_env must be dev or prod, got '${BENCH_CLICKHOUSE_ENV}'"; exit 1 ;; esac
+          fi
+          if [ "${bench_env}" = "prod" ] && [ "${DO_INGEST}" = "true" ] && [ "${PROD_SET}" != "true" ]; then
+            echo "::error::prod selected but the prod ClickHouse host or v2 login is not set; refusing to fall back to dev"
+            exit 1
+          fi
+          .bench-venv/bin/python benchmarks/tools/collect_ingest_xml.py "${BENCH_RESULTS_DIR}" "${BENCH_RESULTS_DIR}/ingest-xml" --github-output
+          if [ "$(find "${BENCH_RESULTS_DIR}/ingest-xml" -name '*.xml' | wc -l)" -gt 0 ] && [ -n "${CLICKHOUSE_HOST}" ] && [ "${DO_INGEST}" = "true" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ingest skipped (no reports, no ClickHouse host, or ingest off)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Same ingest implementation the perf job uses, run inline: the rows never pass through a workflow artifact.
+      - name: Ingest into ClickHouse (${{ env.BENCH_CLICKHOUSE_ENV }})
+        id: ingest
+        if: ${{ steps.collect.outputs.ready == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          xml-dir: ${{ env.BENCH_RESULTS_DIR }}/ingest-xml
+          workflow: bench-on-demand
+          branch: ${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.ref || github.ref_name }}
+          sha: ${{ inputs.ref || github.sha }}
+          run-id: ${{ steps.collect.outputs.run_id }}
+          gha-run-id: ${{ github.run_id }}
+          component: torch-spyre
+          trigger-type: perf
+          platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
+          torch-spyre-dir: ${{ github.workspace }}
+          clickhouse-v2-host: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
+            || secrets.CLICKHOUSE_HOST_DEV)) }}
+          clickhouse-v2-port: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
+          clickhouse-v2-user: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
+            }}
+          clickhouse-v2-pass: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+            }}
+          clickhouse-db-v2: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV))
+            }}
+
+      # The verdict only SELECTs, but reads the same connection the ingest used; it is set on this step alone.
+      - name: Verdict
+        id: verdict
+        if: ${{ !inputs.smoke && steps.ingest.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          CLICKHOUSE_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
+          CLICKHOUSE_USER: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
+            }}
+          CLICKHOUSE_PASS: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+            }}
+          CLICKHOUSE_DB_V2: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_DB_V2) || toJSON(secrets.CLICKHOUSE_DB_V2_DEV))
+            }}
+          CLICKHOUSE_V2_HOST: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_HOST || secrets.CLICKHOUSE_HOST) || toJSON(secrets.CLICKHOUSE_V2_HOST_DEV
+            || secrets.CLICKHOUSE_HOST_DEV)) }}
+          CLICKHOUSE_V2_PORT: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON((secrets.CLICKHOUSE_V2_HOST && secrets.CLICKHOUSE_V2_PORT) || (!secrets.CLICKHOUSE_V2_HOST
+            && secrets.CLICKHOUSE_PORT) || '') || toJSON((secrets.CLICKHOUSE_V2_HOST_DEV && secrets.CLICKHOUSE_V2_PORT_DEV) || (!secrets.CLICKHOUSE_V2_HOST_DEV
+            && secrets.CLICKHOUSE_PORT_DEV) || '')) }}
+          CLICKHOUSE_V2_USER: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_USER) || toJSON(secrets.CLICKHOUSE_V2_USER_DEV))
+            }}
+          CLICKHOUSE_V2_PASSWORD: ${{ fromJSON(env.BENCH_CLICKHOUSE_ENV == 'prod' && toJSON(secrets.CLICKHOUSE_V2_PASSWORD) || toJSON(secrets.CLICKHOUSE_V2_PASSWORD_DEV))
+            }}
+          # The ingest threads --run-id verbatim (RunId.for_args), so the engine run id is the stored one; the
+          # target fails loudly when no row exists under it.
+          BENCH_RUN_ID: ${{ steps.collect.outputs.stored_run_id || steps.collect.outputs.run_id }}
+        run: make bench-verdict BENCH="${GITHUB_WORKSPACE}/.bench-venv/bin/spyre-bench" BENCH_REQUIRED=1
+
+      # Counts and stage outcomes only: no measured values reach the public log or summary.
+      - name: Summary
+        if: ${{ always() }}
+        env:
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+          VERDICT_OUTCOME: ${{ steps.verdict.outcome }}
+        run: |
+          {
+            echo "### bench-on-demand (advisory)"
+            echo "- target: ${BENCH_CLICKHOUSE_ENV}; selection: ${BENCH_SELECTION}; smoke: ${{ inputs.smoke || false }}"
+            echo "- validate: ${VALIDATE_OUTCOME:-n/a}; collect: ${COLLECT_OUTCOME:-n/a}; ingest requested: ${DO_INGEST}"
+            echo "- plan: ${PLAN_OUTCOME:-n/a}; run: ${RUN_OUTCOME:-n/a}; ingest: ${INGEST_OUTCOME:-n/a}; verdict: ${VERDICT_OUTCOME:-n/a}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Counts-only answer on the pull request. Trusted code only: nothing from the PR head is checked out here.
+  report:
+    name: Answer on the pull request
+    needs: [bench]
+    if: ${{ !cancelled() && inputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ inputs.pr_number }}
+      PLAN: ${{ needs.bench.outputs.plan }}
+      RUN: ${{ needs.bench.outputs.run }}
+      INGEST: ${{ needs.bench.outputs.ingest }}
+      VERDICT: ${{ needs.bench.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Comment
+        run: |
+          set -euo pipefail
+          [[ "${PR}" =~ ^[0-9]{1,9}$ ]]
+          {
+            echo "### Benchmark run finished"
+            echo
+            echo "plan: ${PLAN:-n/a} · run: ${RUN:-n/a} · stored: ${INGEST:-n/a} · verdict: ${VERDICT:-n/a}"
+            echo
+            echo "[Workflow run](${RUN_URL})"
+          } > body.md
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@body.md > /dev/null

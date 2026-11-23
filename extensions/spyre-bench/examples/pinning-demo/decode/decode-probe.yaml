@@ -1,5 +1,6 @@
 # yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
-# Two output lengths of the same latency workload; the Analysis turns the pair into a per-token decode cost.
+# Two output lengths of the same latency workload; the Analysis turns the pair into a per-token decode cost. The stub
+# command stands in for a real benchmark (see ../../docs/pinning.md for the real flow).
 apiVersion: bench/v1alpha1
 kind: System
 metadata: {name: demo-llm-a-hf-fp16}
@@ -17,7 +18,12 @@ spec:
     type: llm/latency
     shape: {batch_size: 1, input_len: 512, output_len: 1}
     load: {executor: iterations, iterations: 10, warmup_iterations: 2}
-  run: {timeout: 30m, est: 10m}
+  run:
+    repeats: 5
+    timeout: 30m
+    est: 10m
+    isolation: process
+    command: ["{python}", "stub_decode.py", "--out-len", "{case.shape.output_len}", "--repeat", "{repeat}", "--out", "{repeat_dir}"]
   matrix:
     axes:
       out: {path: workload.shape.output_len, values: [1, 129], token: "out{}"}
