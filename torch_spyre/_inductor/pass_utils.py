@@ -3081,7 +3081,15 @@ def compute_restickify_target_layout(
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
     if not candidates:
         return None
-    new_sd_outer_dim = candidates[0]
+    if len(candidates) > 1:
+        # The new stick variable spans several outer dims.  Move only the dim
+        # with the smallest host stride (its lowest digits) to the stick, sized
+        # by that dim alone; its other dims keep their part of the variable.
+        new_sd_outer_dim = min(candidates, key=lambda j: stl.stride_map[j])
+        new_sd_host_size = stl.device_size[new_sd_outer_dim]
+        new_sd_host_stride = stl.stride_map[new_sd_outer_dim]
+    else:
+        new_sd_outer_dim = candidates[0]
     # Swapping one device axis cannot preserve another host dimension folded
     # into it (for example page * block_size + token in a paged cache).
     old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
