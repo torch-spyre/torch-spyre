@@ -3312,14 +3312,6 @@ def lower_c10d_all_to_all_single(
     input_split_sizes = [int(s) for s in input_split_sizes]
     output_split_sizes = [int(s) for s in output_split_sizes]
     dim0 = tensor.get_size()[0]
-    # TODO: allow zero splits once spyre-comms alltoallw handles them; today
-    # it segfaults applying tensors to such a plan.
-    if any(s == 0 for s in [*input_split_sizes, *output_split_sizes]):
-        raise Unsupported(
-            "all_to_all_single: zero-size splits are not supported yet "
-            f"(input_split_sizes={input_split_sizes}, "
-            f"output_split_sizes={output_split_sizes})"
-        )
     if any(s < 0 for s in splits) or sum(input_split_sizes) != dim0:
         raise Unsupported(
             "all_to_all_single: split sizes must be non-negative and "

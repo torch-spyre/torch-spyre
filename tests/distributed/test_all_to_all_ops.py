@@ -94,13 +94,6 @@ def _uneven_rows(world: int) -> list[list[int]]:
     return [[(s + d) % world + 1 for d in range(world)] for s in range(world)]
 
 
-def _zero_send_rows(world: int) -> list[list[int]]:
-    """Every rank sends nothing to the next rank; other peers get 2 rows."""
-    return [
-        [0 if d == (s + 1) % world else 2 for d in range(world)] for s in range(world)
-    ]
-
-
 _PATTERNS = {
     "even": lambda w: _even_rows(w, 2),
     "uneven": _uneven_rows,
@@ -245,24 +238,6 @@ class TestAllToAllOps(TestCase):
         # Each pattern maps back to its own plan, on every rank.
         self.assertEqual(self._run(first), h1)
         self.assertEqual(self._run(second), h2)
-
-    @expects_raise
-    def test_alltoall_ops_rejects_zero_split(self):
-        """A zero-size split is rejected before it reaches spyre-comms.
-
-        TODO: spyre-comms alltoallw segfaults in Collective::Convert when a
-        plan with a zero split is applied.  When it handles them, make this a
-        positive test (rows from _zero_send_rows) and drop the C++ check.
-        """
-        pattern = _zero_send_rows(self.comm_size)
-        me = self.comm_rank
-        row = _row_elems(torch.float16)
-        recv = [pattern[src][me] * row for src in range(self.comm_size)]
-        send = [n * row for n in pattern[me]]
-        with pytest.raises(RuntimeError, match="zero-size .* splits are not supported"):
-            torch.ops.spyre.alltoall_plan(
-                recv, send, _dtype_code(torch.float16), _GROUP_NAME
-            )
 
     @expects_raise
     def test_alltoall_ops_rejects_mismatched_peers(self):

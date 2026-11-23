@@ -327,20 +327,6 @@ class TestAllToAllCompiled(TestCase):
         with pytest.raises(Exception, match="rows are not contiguous"):
             compiled_module(x)
 
-    @expects_raise
-    def test_all_to_all_compiled_rejects_zero_split(self):
-        """A zero-size split is rejected at compile time.
-
-        TODO: spyre-comms alltoallw segfaults applying a plan with a zero
-        split; make this a positive test once it handles them.
-        """
-        width = _row_elems(torch.float16)
-        splits = [0] + [2] * (self.comm_size - 1)
-        x = torch.ones((sum(splits), width), dtype=torch.float16).to(DEVICE)
-        compiled_module = torch.compile(UnevenAllToAllModule(splits, splits))
-        with pytest.raises(Exception, match="zero-size splits are not supported"):
-            compiled_module(x)
-
 
 if __name__ == "__main__":
     run_tests()
