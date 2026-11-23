@@ -26,6 +26,7 @@ the expression's value, not to the bits of another evaluator.
 import inspect
 import itertools
 import math
+import sys
 from collections.abc import Iterable
 
 import numpy as np
@@ -152,8 +153,8 @@ class Recording(TableLowering):
         super().__init__(inputs, cap=cap)
         self.printed: dict[sympy.Basic, AbstractRealization] = {}
 
-    def print(self, expr: sympy.Basic) -> AbstractRealization:
-        realization = super().print(expr)
+    def _realization(self, expr: sympy.Basic) -> AbstractRealization:
+        realization = super()._realization(expr)
         self.printed.setdefault(expr, realization)
         return realization
 
@@ -240,7 +241,8 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     """print is the printer's public method. A node is printed by the print method of
     the nearest class along its MRO that has one, so a Dummy, a subclass of Symbol, is
     its column, and a class with none goes to emptyPrinter. A printer keeps what it
-    has printed: what two calls of print share is one realization."""
+    has printed: what two calls of print share is one realization. doprint, which
+    returns a string, is refused."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
@@ -259,6 +261,8 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     assert root is printer.print(sympy.log(a) + dummy)
     assert not hasattr(printer, "lower")  # print is the entry point
     assert printer.print(sympy.log(a)) is logs
+    with pytest.raises(NotImplementedError, match="call print"):
+        printer.doprint(sympy.log(a))
 
 
 def test_the_printer_makes_a_symbols_position_on_its_variable():
@@ -380,6 +384,24 @@ def test_print_touches_no_model_and_a_refusal_comes_from_print():
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
         TableLowering(case.inputs, cap=4).print(a**0.5 * b)
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
+
+
+def test_an_expression_nested_past_the_recursion_limit_is_refused():
+    """The printer recurses a few frames per level of the expression. One nested
+    deeper than the interpreter's recursion limit allows is refused as a
+    TableLoweringError naming no node, and no RecursionError, a RuntimeError, leaves
+    print, so an except around the objective cannot take it for another failure."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    expr = case.symbol("a")
+    for _ in range(sys.getrecursionlimit()):  # unevaluated: sympy's own checks recurse
+        expr = sympy.Pow(
+            sympy.Add(expr, 1, evaluate=False), sympy.Rational(1, 2), evaluate=False
+        )
+    with pytest.raises(TableLoweringError, match="recursion limit") as caught:
+        TableLowering(case.inputs, cap=CAP).print(expr)
+    assert caught.value.node is None
+    assert isinstance(caught.value.__cause__, RecursionError)
 
 
 # ------------------------------------------------------------------------- values
