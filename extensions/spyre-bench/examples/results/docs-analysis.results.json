@@ -1,0 +1,526 @@
+[
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "op_scale_n1024"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "f0acb4e5-a5e3-5c99-a418-7ba84ebe5fd4",
+    "component": "docs-analysis",
+    "name": "op-scale",
+    "tags": [],
+    "disc": {
+     "case.type": "kernel/op",
+     "case.op": "scale",
+     "case.dtype": "fp32",
+     "case.shape": "[1024]",
+     "case.load.executor": "iterations",
+     "case.load.iterations": "50",
+     "case.load.warmup_iterations": "5",
+     "system.type": "kernel/op-library",
+     "system.library": "torch-cpu",
+     "system.precision": "fp32",
+     "system.harness": "pytorch-benchmark"
+    },
+    "props": {
+     "system.name": "op-lib-cpu-fp32",
+     "system.backend": "cpu"
+    }
+   },
+   "subject": {
+    "artifact_id": "9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2"
+   },
+   "environment": {
+    "env_id": "4e631a5a-16db-5358-bef9-245a04c84685",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "kernel-x"
+    },
+    "observations": {
+     "env.node": "host-a"
+    },
+    "labels": {
+     "env.label.cpu_pinning": "none",
+     "env.label.node.class": "metal-a",
+     "env.label.device.count": "2"
+    }
+   },
+   "series": {
+    "key": "38e3f746-007c-504c-b818-95e81c0dc73d",
+    "labels": {
+     "env.label.node.class": "metal-a",
+     "env.label.cpu_pinning": "none"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.00202752
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.002048
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.0020684799999999997
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "kernel.time.mean": {
+      "value": 0.002048,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "op_scale_n4096"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "ae54dba5-b59a-54b9-87ce-d47272a6b907",
+    "component": "docs-analysis",
+    "name": "op-scale",
+    "tags": [],
+    "disc": {
+     "case.type": "kernel/op",
+     "case.op": "scale",
+     "case.dtype": "fp32",
+     "case.shape": "[4096]",
+     "case.load.executor": "iterations",
+     "case.load.iterations": "50",
+     "case.load.warmup_iterations": "5",
+     "system.type": "kernel/op-library",
+     "system.library": "torch-cpu",
+     "system.precision": "fp32",
+     "system.harness": "pytorch-benchmark"
+    },
+    "props": {
+     "system.name": "op-lib-cpu-fp32",
+     "system.backend": "cpu"
+    }
+   },
+   "subject": {
+    "artifact_id": "9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2"
+   },
+   "environment": {
+    "env_id": "4e631a5a-16db-5358-bef9-245a04c84685",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "kernel-x"
+    },
+    "observations": {
+     "env.node": "host-a"
+    },
+    "labels": {
+     "env.label.cpu_pinning": "none",
+     "env.label.node.class": "metal-a",
+     "env.label.device.count": "2"
+    }
+   },
+   "series": {
+    "key": "2b3b7eda-f52e-5f06-bb55-9d41dbc85d46",
+    "labels": {
+     "env.label.node.class": "metal-a",
+     "env.label.cpu_pinning": "none"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.00811008
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.008192
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "none",
+      "run.exec.pinning_verified": "unknown"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.008273919999999999
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "kernel.time.mean": {
+      "value": 0.008192,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "op_scale_n1024"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "f0acb4e5-a5e3-5c99-a418-7ba84ebe5fd4",
+    "component": "docs-analysis",
+    "name": "op-scale",
+    "tags": [],
+    "disc": {
+     "case.type": "kernel/op",
+     "case.op": "scale",
+     "case.dtype": "fp32",
+     "case.shape": "[1024]",
+     "case.load.executor": "iterations",
+     "case.load.iterations": "50",
+     "case.load.warmup_iterations": "5",
+     "system.type": "kernel/op-library",
+     "system.library": "torch-cpu",
+     "system.precision": "fp32",
+     "system.harness": "pytorch-benchmark"
+    },
+    "props": {
+     "system.name": "op-lib-cpu-fp32",
+     "system.backend": "cpu"
+    }
+   },
+   "subject": {
+    "artifact_id": "9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2"
+   },
+   "environment": {
+    "env_id": "4e631a5a-16db-5358-bef9-245a04c84685",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "kernel-x"
+    },
+    "observations": {
+     "env.node": "host-a"
+    },
+    "labels": {
+     "env.label.cpu_pinning": "device_local",
+     "env.label.node.class": "metal-a",
+     "env.label.device.count": "2"
+    }
+   },
+   "series": {
+    "key": "40699d37-d46a-555f-9ea8-dd888883d3d7",
+    "labels": {
+     "env.label.node.class": "metal-a",
+     "env.label.cpu_pinning": "device_local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.0018247679999999998
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.0018432
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.001861632
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "kernel.time.mean": {
+      "value": 0.0018432,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "op_scale_n4096"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "ae54dba5-b59a-54b9-87ce-d47272a6b907",
+    "component": "docs-analysis",
+    "name": "op-scale",
+    "tags": [],
+    "disc": {
+     "case.type": "kernel/op",
+     "case.op": "scale",
+     "case.dtype": "fp32",
+     "case.shape": "[4096]",
+     "case.load.executor": "iterations",
+     "case.load.iterations": "50",
+     "case.load.warmup_iterations": "5",
+     "system.type": "kernel/op-library",
+     "system.library": "torch-cpu",
+     "system.precision": "fp32",
+     "system.harness": "pytorch-benchmark"
+    },
+    "props": {
+     "system.name": "op-lib-cpu-fp32",
+     "system.backend": "cpu"
+    }
+   },
+   "subject": {
+    "artifact_id": "9b8e17c5-d204-5f60-8a31-2c7f90e4b1d2"
+   },
+   "environment": {
+    "env_id": "4e631a5a-16db-5358-bef9-245a04c84685",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "kernel-x"
+    },
+    "observations": {
+     "env.node": "host-a"
+    },
+    "labels": {
+     "env.label.cpu_pinning": "device_local",
+     "env.label.node.class": "metal-a",
+     "env.label.device.count": "2"
+    }
+   },
+   "series": {
+    "key": "719bf3c7-e7fd-5c1c-9112-51b874dddf77",
+    "labels": {
+     "env.label.node.class": "metal-a",
+     "env.label.cpu_pinning": "device_local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.007299071999999999
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.0073728
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "id": "058dae16-a8c2-582a-9295-65cdac701214"
+     },
+     "clean": {},
+     "props": {
+      "run.exec.cpu_pinning": "device_local",
+      "run.exec.pinning_verified": "true"
+     },
+     "samples": {
+      "kernel.time.mean": [
+       0.007446528
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "kernel.time.mean": {
+      "value": 0.0073728,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null
+  }
+ }
+]

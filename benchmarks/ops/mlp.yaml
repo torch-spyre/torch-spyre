@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata:
+  name: mlp
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: op-library
+  est_hours: 0.1
+  workload:
+    type: kernel/op
+    op: mlp
+    load:
+      executor: iterations
+      iterations: 100
+      warmup_iterations: 3
+  run:
+    command:
+      - python3
+      - benchmarks/tools/run_kernel_case.py
+      - --op
+      - '{benchmark}'
+      - --shape
+      - '{case.flags.input_shapes}'
+      - --suite-dir
+      - '{out_dir}/suite'
+      - --raw-dir
+      - '{raw_dir}'
+      - --repeat-dir
+      - '{repeat_dir}'
+  identity:
+    mode: ingest
+    profile: perf-kernel
+    discriminators:
+      - {key: record_type, value: op}
+      - {key: config_name, value: ''}
+      - {key: input_shapes, from: case.flags.input_shapes}
+      - {key: run_mode, value: op_benchmark}
+      - {key: kernel_name, value: ''}
+      - {key: is_total, value: ''}
+  matrix:
+    name_template: mlp_{shape}
+    axes:
+      shape:
+        - token: prefill
+          patch: {workload: {flags: {input_shapes: '[[1, 512, 4096]]'}}}
+        - token: decode
+          patch: {workload: {flags: {input_shapes: '[[4, 1, 4096]]'}}}

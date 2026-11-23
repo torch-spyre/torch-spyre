@@ -29,9 +29,13 @@ Each case records what the current lowering produces:
   ``..._fill_*``, ``..._combine_*``), which ``scratchpad.coarse_tiling`` and work
   division depend on (``apply_tilings`` sets ``JOINT_TILING_AND_DIVISION_ATTR`` on
   ops "not in before and with a loop_info");
-* the result against an fp32 reference;
-* that the generated code is deterministic once run-specific ids are
-  normalised, so a later comparison against a new lowering can be trusted.
+* the result against an fp32 reference.
+
+(A test that two compiles of one graph give the same generated text lived here, to
+make a comparison against a new lowering trustworthy. The lowering was replaced and
+that comparison is gone. The text it compared includes what the CP-SAT layout
+solver chose, and a parallel search with a few workers does not always return the
+same one of several equally good plans, so the test failed intermittently in CI.)
 
 Cases outside what a replacement will support (more than one level, a chain the
 planner cannot join) are pinned as rejections.
@@ -55,7 +59,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor import nonstick_dim_order, passes, work_division
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.coarse_tiling import MAX_SEARCH_TILE_DEPTH
-from torch_spyre._inductor.wsr import coarse_tile, span_overflow_hint_analysis
+from torch_spyre._inductor.wsr import span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
 
@@ -107,7 +111,7 @@ def normalise(text):
 def compile_span_overflow(fn, args, limit_bytes):
     """Compile ``fn`` with span-overflow on and the span limit lowered."""
     formed, added = [], []
-    original = coarse_tile.coarse_tile_post_stickify
+    original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
         before = {op.get_operation_name() for op in graph.operations}
@@ -129,8 +133,7 @@ def compile_span_overflow(fn, args, limit_bytes):
 
     torch._dynamo.reset()
     with (
-        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
-        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "tile_groups", spy),
         span_limit(limit_bytes),
         config.patch({"ignore_span_overflow_hints": False}),
         torch._inductor.config.patch(force_disable_caches=True),
@@ -273,21 +276,6 @@ def test_the_current_lowering_on_a_compiled_span_overflow_graph(case):
     # the K-tiled accumulation, about 4e-3. 2e-2 leaves headroom without hiding a
     # wrong tile or a NaN.
     assert _relative_error(compiled.outputs, reference) < 2e-2
-
-
-@pytest.mark.parametrize("case", sorted(CASES))
-def test_the_generated_code_is_deterministic_after_normalising(case):
-    """A comparison against a new lowering is only worth anything if two compiles
-    of the same graph agree. Every case, in one process; for five of them
-    (a copy-out, a K-tiled matmul, a joined group, an output-tiled matmul and an
-    independent pair) two separate processes also gave identical text, which this
-    does not repeat: a spurious difference from a token the normaliser misses
-    would show up here as a failure."""
-    fn, shapes, limit, _, _ = CASES[case]
-    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    first = compile_span_overflow(fn, args, limit)
-    second = compile_span_overflow(fn, args, limit)
-    assert first.code == second.code
 
 
 @expects_raise

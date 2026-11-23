@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: gemma-4-26b-a4b-it}
+spec:
+  assets: [{role: weights, asset: gemma-4-26b-a4b-it-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: mistral-7b-instruct-v0.3}
+spec:
+  assets: [{role: weights, asset: mistral-7b-instruct-v0.3-weights}]
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: qwen2.5-0.5b-instruct}
+spec:
+  assets: [{role: weights, asset: qwen2.5-0.5b-instruct-weights}]

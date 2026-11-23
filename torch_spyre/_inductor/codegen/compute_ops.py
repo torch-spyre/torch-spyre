@@ -27,7 +27,10 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+from torch_spyre._inductor.sharded_hbm import (
+    verify_mixed_ring_args,
+    verify_non_unified_split,
+)
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -795,7 +798,7 @@ def generate_sdsc(
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
-            str(dim): int(expr.subs({Symbol("core_id"): c}))
+            str(dim): int(expr.xreplace({Symbol("core_id"): c}))
             for dim, expr in sdsc_spec.core_id_to_work_slice.items()
         }
         for c in range(sdsc_spec.num_cores)
@@ -949,7 +952,9 @@ def generate_sdsc(
     non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
     if non_unified_args:
         if len(non_unified_args) != len(sdsc_spec.args):
-            raise Unsupported("non-unified kernels need every tensor argument sharded")
+            # Only a cross-shard (ring) reduction mixes the two: sharded
+            # inputs, one ordinary output written by the chain's end core.
+            verify_mixed_ring_args(sdsc_spec, non_unified_args)
         verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
         if tensor.non_unified:
@@ -1026,7 +1031,7 @@ def generate_sdsc(
             #
             # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
             # a minted symbol names a loop-nesting *level*, not a
-            # dimension -- _general_tile_advance (spyre_kernel.py) sums
+            # dimension -- _index_tile_advance (spyre_kernel.py) sums
             # every host dim tiled at a level into ONE combined
             # coefficient on that level's minted symbol before this
             # tensor's device_tile_advance_expr is ever built, so by the

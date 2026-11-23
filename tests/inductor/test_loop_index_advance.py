@@ -16,8 +16,8 @@
 
 The loop plan (epic #5863, stage 7) makes the index the single source of an
 access's advance: the coefficient of the loop's induction variable in
-``dep.index``, projected through ``tiling_expr_to_device_expr``. Today the
-kernel combines the index with the stored per-read record.
+``dep.index``, projected through ``tiling_expr_to_device_expr``. The kernel reads
+it from the index alone (stage 7.4).
 
 This file measures the premise on compiled ``for_each_tile`` graphs. At the
 point where the kernel builds each ``TensorArg`` it computes the advance from the
@@ -25,14 +25,15 @@ index alone and compares it with the expression the kernel emits, with the
 kernel's own level symbol standing in for the induction variable. That compares
 VALUES, not just whether the variable is present.
 
-``test_loop_advance.py`` is the gate on the record-based accessors; this is a
-different question over the same corpus, so it is a separate file.
+``test_loop_advance.py`` compares the accessors with the kernel; this recomputes
+the advance independently (``coeff`` of the induction variable, from the nodes'
+own inductions) over the same corpus, so it is a separate file.
 
 What it pins:
 
 * every access in the corpus agrees, including the block-table reads of the
   ``paged_gather*`` fixtures. Those are POINT reads (no iteration variable) whose
-  index used to be rewritten to ``0`` by ``_rebase_point_splice_reads`` because
+  index used to be rewritten to ``0`` by a rebase step of the legacy transform because
   layout propagation was thought to reject the loop variable, so their advance
   survived only in the stored record. Stage 7.2 removed that rewrite (layout
   propagation accepts the variable: the three fixtures compile and give the same
@@ -90,7 +91,13 @@ class _Probe:
     def hand_off(self, original):
         def wrapper(graph):
             operations = getattr(graph.operations, "real", graph.operations)
-            self.inductions.update(loop_node._inductions_of(operations))
+            self.inductions.update(
+                {
+                    node.group_id: node.induction
+                    for node in loop_node._nodes_in(operations)
+                    if node.induction is not None
+                }
+            )
             return original(graph)
 
         return wrapper
@@ -112,7 +119,7 @@ class _Probe:
             d for d in reads_writes.reads if isinstance(d, MemoryDep) and d.name == name
         ]
         # The kernel has already consumed one match for this call.
-        consumed = kernel._general_tile_advance_seen.get(name, 0)
+        consumed = kernel._tile_advance_seen.get(name, 0)
         if 0 < consumed <= len(matching):
             return matching[consumed - 1]
         return matching[0] if matching else None
@@ -160,9 +167,9 @@ def _compile_and_probe(fn, args, ctx=None):
     with (
         mock.patch.object(
             SpyreKernel,
-            "_general_tile_advance",
+            "_tile_advance",
             autospec=True,
-            side_effect=probe.wrap(SpyreKernel._general_tile_advance),
+            side_effect=probe.wrap(SpyreKernel._tile_advance),
         ),
         mock.patch.object(
             spyre_passes,
@@ -403,10 +410,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    transferred = SimpleNamespace(
-        tiled_dims_per_read=[[[]]], squeezed_advance_per_read=[[[(16384, 1)]]]
-    )
-    copy = SimpleNamespace(loop_info=transferred)
+    copy = SimpleNamespace(loop_info=SimpleNamespace())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata:
+  name: sample-trace-files
+  annotations: {consumer.env: DEMO_TRACE_PATH}
+spec:
+  type: fileset
+  format: jsonl
+  version: "1"
+  license: internal
+  visibility: internal
+  source: {store: datasets, path: traces/sample/1}
+  integrity:
+    files: [{path: sample.jsonl, sha256: "1111111111111111111111111111111111111111111111111111111111111111", size: 4096}]
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata:
+  name: sample-images-archive
+  annotations: {consumer.env: DEMO_IMAGES_PATH, archive: tar.gz, extract: "images/ into $DEMO_IMAGES_PATH"}
+spec:
+  type: fileset
+  format: tar.gz
+  version: "1"
+  license: internal
+  visibility: internal
+  source: {store: datasets, path: images/sample/1}
+  integrity:
+    files: [{path: images.tar.gz, sha256: "2222222222222222222222222222222222222222222222222222222222222222", size: 1048576}]
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: random-prompts, description: "a pure function of (tool, seed, params): nothing is stored"}
+spec:
+  type: generator
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {generator: {tool: random-prompts, seed: 0, params: {range_ratio: 0.0}}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+  access: {mode: pull, resolve: [node-cache, primary], offline: use-cache}
