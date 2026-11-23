@@ -713,6 +713,48 @@ class TestEmptyLxEligibility(unittest.TestCase):
         self.assertEqual(reason, "empty tensor")
 
 
+class TestMutatedInputLxEligibility(unittest.TestCase):
+    def test_input_written_in_place_is_not_cloned(self):
+        """Both planners refuse to clone a graph input the graph writes in place."""
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        nonempty = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(
+                layout=_fixed_tiled_layout((64, 64))
+            )
+        )
+        empty = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(
+                layout=_fixed_tiled_layout((0, 64))
+            )
+        )
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            for division_is_fixed in (False, True):
+                with self.subTest(division_is_fixed=division_is_fixed):
+                    self.assertEqual(
+                        allocator._input_residency_reason(
+                            nonempty,
+                            "value",
+                            [0, 1],
+                            mutated_buffers={"value"},
+                            division_is_fixed=division_is_fixed,
+                        ),
+                        "mutation target",
+                    )
+            # Writing a different buffer does not refuse this input.
+            self.assertEqual(
+                allocator._input_residency_reason(
+                    empty,
+                    "value",
+                    [0, 1],
+                    mutated_buffers={"other"},
+                    division_is_fixed=False,
+                ),
+                "empty tensor",
+            )
+
+
 def _make_context(
     op,
     output_td,

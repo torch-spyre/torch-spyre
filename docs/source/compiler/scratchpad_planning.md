@@ -422,7 +422,8 @@ detail, such as the restickify proof failure or the mismatched core division.
 The adapter tests check the returned strings; the table does not replace them.
 
 Graph inputs use `_input_residency_reason`. They also require boundary cloning,
-rewritable uses, complete reads and useful LX reuse.
+rewritable uses, complete reads and useful LX reuse, and must not be written in
+place.
 
 A narrow exception permits an untiled matmul to read a zero-offset prefix made
 of complete storage sticks. It requires one private, full-width producer and a
