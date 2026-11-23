@@ -2185,6 +2185,10 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
+  // As aten::_copy_from does; the DMA path below has no zero-size transfer.
+  if (self.numel() == 0) {
+    return dst;
+  }
   if (spyre_is_sharded(self) || spyre_is_sharded(dst)) {
     // Sharded copies are blocking by contract; non_blocking is honored by
     // completing before return.
@@ -2312,7 +2316,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     }
   }
 
-  stream.copyAsync(*copy_from, *copy_to);
+  stream.copyAsync(*copy_from, *copy_to, /*stage_pageable_h2d=*/non_blocking);
   if (!non_blocking) {
     stream.synchronize();
   }

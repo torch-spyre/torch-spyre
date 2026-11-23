@@ -779,8 +779,10 @@ PYBIND11_MODULE(_C, m) {
   // of the time goes to turning the host data into the device format.
   // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
-        "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false,
+        "Copy tensor between host and device using DMA. A non_blocking H2D "
+        "copy returns before the DMA completes: a pageable source may be "
+        "modified at once, a pinned one only after synchronize().",
+        py::arg("self"), py::arg("dst"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
   // Single KV page copy
