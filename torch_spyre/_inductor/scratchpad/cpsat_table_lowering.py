@@ -32,6 +32,7 @@ anything wider is refused. Nothing imports the module yet.
 from __future__ import annotations
 
 import math
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -242,7 +243,9 @@ def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
 def _apply(func: Callable[..., Any], arguments: Sequence[np.ndarray]) -> Any:
     """func on its operands' lists. A function that takes scalars only, as
     RelayoutCharge's ``_imp_`` does, raises TypeError or ValueError on arrays and is
-    applied point by point."""
+    applied point by point. Only such implemented functions are meant to reach that
+    retry: a bug that raises either on arrays is retried too, and refused as no
+    value only if it fails on a point as well."""
     try:
         return np.asarray(func(*arguments), dtype=float)
     except (TypeError, ValueError):
@@ -251,11 +254,13 @@ def _apply(func: Callable[..., Any], arguments: Sequence[np.ndarray]) -> Any:
 
 def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.ndarray:
     """expr's list of count values, from compute(). Raises TableLoweringError naming
-    expr when evaluating it raises. A value need not be finite here: the printer
-    refuses that."""
+    expr when evaluating it raises, except a RecursionError, which TableLowering.print
+    refuses. A value need not be finite here: the printer refuses that."""
     with np.errstate(all="ignore"):
         try:
             result = np.asarray(compute(), dtype=float)
+        except RecursionError:
+            raise
         except NameError as exc:
             raise TableLoweringError(expr, f"no numeric value ({exc})") from exc
         except Exception as exc:
@@ -302,6 +307,7 @@ class TableLowering(Printer):
     inputs gives each symbol's variable and values; cap bounds the entries of one
     table. The printer holds no model. It keeps each realization by its sympy node,
     so a shared subexpression is printed once, and a printer is for one set of inputs.
+    What it keeps, at most cap floats per node, lives until the printer is dropped.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
@@ -311,11 +317,29 @@ class TableLowering(Printer):
         self._realizations: dict[sympy.Basic, AbstractRealization] = {}
 
     def print(self, expr: sympy.Basic) -> AbstractRealization:
-        """expr's realization, printed the first time expr is met and kept. Raises
-        TableLoweringError, naming the node, for a node that cannot be lowered."""
+        """expr's realization. Raises TableLoweringError, naming the node, for a node
+        that cannot be lowered, and, naming none, for an expression nested too deep to
+        print within the interpreter's recursion limit."""
+        try:
+            return self._realization(expr)
+        except RecursionError as exc:
+            # No node: printing one this deep into the message would recurse too.
+            raise TableLoweringError(
+                None,
+                "an expression nested too deep to print within the recursion limit "
+                f"of {sys.getrecursionlimit()}",
+            ) from exc
+
+    def _realization(self, expr: sympy.Basic) -> AbstractRealization:
+        """expr's realization, printed the first time expr is met and kept. The print
+        methods reach their operands through it."""
         if expr not in self._realizations:
             self._realizations[expr] = self._print(expr)
         return self._realizations[expr]
+
+    def doprint(self, expr: sympy.Basic) -> str:
+        """Refused: this printer's print of a node is a realization, not a string."""
+        raise NotImplementedError("TableLowering prints realizations: call print")
 
     def _print_Symbol(self, expr: sympy.Symbol) -> AbstractRealization:
         """A symbol's column: its values on an InputIndex made here on its variable.
@@ -374,7 +398,7 @@ class TableLowering(Printer):
             value = TableRealization(values=[_constant(expr)], index=UNIT)
             return self._finite(expr, value)
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-        columns = [self.print(symbol).table(self.cap) for symbol in symbols]
+        columns = [self._realization(s).table(self.cap) for s in symbols]
         # an operation on numbers has no input: its one entry is on UNIT
         positions = list(dict.fromkeys(column.index for column in columns)) or [UNIT]
         entries = math.prod(position.size for position in positions)
@@ -392,11 +416,11 @@ class TableLowering(Printer):
         forms: list[Form] = []
         for operand in operands:
             # prints the operand, which refuses its own value that is not finite
-            table = self.print(operand).table(self.cap)
+            table = self._realization(operand).table(self.cap)
             form: Form = CONDITION if _is_condition(operand) else None
             if _divides(expr, operand):
                 base, form = operand.base, operand.exp  # type: ignore[attr-defined]
-                table = self.print(base).table(self.cap)
+                table = self._realization(base).table(self.cap)
             # A constant operand is a broadcast of its one entry, under an operation on
             # numbers too: numpy computes x**0.5 as sqrt(x) for a broadcast exponent
             # only, and both sides of a tie must take one path.
