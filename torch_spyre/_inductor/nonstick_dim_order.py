@@ -543,6 +543,11 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+        element_arrangement=(
+            ElementArrangement.QFP8WT
+            if stl.element_arrangement == ElementArrangement.QFP8WT
+            else ElementArrangement.STANDARD
+        ),
         valid_elements=reorder_valid_elements(stl, order),
     )
 
@@ -1262,7 +1267,38 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
         if entry.kind == "producer_rewrite":
             _rewrite_producer_layout(buf, entry.required_stl)
         elif entry.kind == "copy":
-            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
+            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE) and (
+                entry.required_stl.element_arrangement == ElementArrangement.QFP8WT
+            ):
+                # QFP8WT EA: the scatter source and destination share a physical
+                # element layout (2D-stick) that cannot be transcoded by a plain
+                # byte-copy restickify.  Instead, rewrite the
+                # mutation target's layout in-place to the required (rotated) STL so
+                # the scatter writes directly into the target buffer with the correct
+                # 2D-stick addressing — no copy-in / copy-back needed.
+                #
+                # For graph inputs, try_get_buffer returns TensorBox(StorageBox(buf))
+                # which has no writable .layout.  Unwrap to reach the InputBuffer.
+                real_buf = buf
+                if isinstance(real_buf, TensorBox) and isinstance(
+                    real_buf.data, StorageBox
+                ):
+                    real_buf = real_buf.data.data
+                if entry.buf_name in graph.graph_inputs:
+                    # The caller's tensor keeps the layout it was allocated
+                    # with, so the scatter must be compiled against exactly it.
+                    caller_layout = _real_layout(buf)
+                    if (
+                        isinstance(caller_layout, FixedTiledLayout)
+                        and caller_layout.device_layout != entry.required_stl
+                    ):
+                        raise Unsupported(
+                            f"QFP8WT scatter into graph input {entry.buf_name} "
+                            f"needs layout {entry.required_stl}, but the tensor "
+                            f"was allocated as {caller_layout.device_layout}"
+                        )
+                _rewrite_producer_layout(real_buf, entry.required_stl)
+            elif isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
                 _insert_mutation_relayout_copy(graph, entry.op, entry.required_stl)
             else:
                 layout = _real_layout(buf)

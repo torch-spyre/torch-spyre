@@ -704,19 +704,12 @@ class TestPrequantizedFp8ModelShapes:
             for c in SENCORES_BASE
         ],
     )
-    def test_loader_matches_reference(self, n_out, k_in, variant, m, sencores, request):
+    def test_loader_matches_reference(self, n_out, k_in, variant, m, sencores):
         """SBDMA-08: the FP8 linear on a transferred weight gives the CPU result.
 
         "loader" transfers the weight through load_fp8_model_to_spyre, which passes
         the view p.t(); "contiguous" passes w.t().contiguous().
         """
-        if variant == "loader":
-            strict_xfail(
-                request,
-                raises=AssertionError,
-                reason="#6064: [fp8] FP8 model loader silently produces wrong weights:"
-                " it passes a transposed view, not a copy",
-            )
         from torch_spyre.model_utils import (
             _dma_to_spyre_fp8_kernel,
             load_fp8_model_to_spyre,

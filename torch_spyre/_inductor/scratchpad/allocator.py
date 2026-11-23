@@ -712,6 +712,23 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
             delattr(op, attr)
 
 
+def _read_after_mutation(graph: GraphLowering, name: str, uses: list[int]) -> bool:
+    """Whether an op reads graph input ``name`` after another op mutates it.
+
+    An input clone is made once, before the first consumer, and every consumer is
+    pointed at it. A read that follows an in-place write to the input would then
+    see the value from before that write.
+    """
+    mutators = []
+    for i, op in enumerate(graph.operations):
+        try:
+            if name in op.get_mutation_names():
+                mutators.append(i)
+        except (AttributeError, NotImplementedError):
+            continue
+    return bool(mutators) and any(u > mutators[0] and u not in mutators for u in uses)
+
+
 def _hoisted_input_clone_entry(
     graph: GraphLowering, name: str, users: Sequence[Operation]
 ) -> Optional[Operation]:
@@ -1490,6 +1507,8 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
+        if _read_after_mutation(graph, name, uses):
+            return "read after in-place mutation"
         if division_is_fixed:
             # See the matching comment in _buffer_residency_reason: on the
             # joint path this is redundant with (and less accurate than) the
