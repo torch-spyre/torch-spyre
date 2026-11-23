@@ -1066,6 +1066,11 @@ def _device_read_loop_level(
             f"device-read loop count max_value={source.max_value} is not a "
             f"multiple of granularity={source.granularity}"
         )
+    if source.pool_offset < 0 or source.pool_offset % _STICK_BYTES:
+        raise Unsupported(
+            f"device-read loop count pool_offset={source.pool_offset} is not at the "
+            f"start of a {_STICK_BYTES}-byte stick"
+        )
     if source.outer_stride < 0 or source.outer_stride % _STICK_BYTES:
         raise Unsupported(
             f"device-read loop count outer_stride={source.outer_stride} is not a "

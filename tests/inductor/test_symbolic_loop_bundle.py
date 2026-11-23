@@ -552,6 +552,17 @@ class TestADeviceReadCountRefusesRatherThanGuesses(_DeviceReadHarness):
 
         self.assertIn("only supported from the bundle's pool", str(caught.exception))
 
+    @expects_raise
+    def test_a_pool_offset_that_is_not_at_a_stick_start(self):
+        """The count is the first value of a stick, so an offset inside a stick
+        would read some other value as the count."""
+        for offset in (4100, -128):
+            with self.subTest(pool_offset=offset):
+                self._refuses(
+                    self._device_read_loop(source=self._source(pool_offset=offset)),
+                    f"pool_offset={offset} is not at the start of a",
+                )
+
 
 class TestADeviceReadCountCanMoveWithItsEnclosingLoop(_DeviceReadHarness):
     """With an outer_stride, each trip of the directly enclosing loop reads its
