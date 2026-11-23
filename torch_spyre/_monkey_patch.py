@@ -176,13 +176,14 @@ def _parse_dynamic_to_args(self, args, kwargs):
 def _layout_to_non_blocking(args, kwargs) -> bool:
     """``non_blocking`` of a ``.to(..., device_layout=...)`` call.
 
-    Every ``Tensor.to`` overload puts non_blocking first among its bool
-    arguments, after the device, dtype or other tensor.
+    Parsed with torch's own ``.to()`` parser, as on the ``dynamic=`` path. That
+    parser rejects ``copy``, which a host-to-device transfer satisfies either
+    way, so a ``copy`` keyword is dropped first.
     """
-    if "non_blocking" in kwargs:
-        return bool(kwargs["non_blocking"])
-    flags = [arg for arg in args if type(arg) is bool]
-    return flags[0] if flags else False
+    import torch
+
+    kwargs = {key: value for key, value in kwargs.items() if key != "copy"}
+    return torch._C._nn._parse_to(*args, **kwargs)[2]
 
 
 def _reserve_and_copy(
