@@ -252,8 +252,12 @@ with torch.inference_mode():
   of every `out` leaf, which must be `trips * extent` long along `d`.
 - `out_dim=Gather(axis, index)`: step `i`'s tile lands at the rows `index[i]`
   names along `axis`. `index` is `[trips]` (one row per step) or
-  `[trips, rows]` (`rows` rows per step), and must not repeat a row. On Spyre
-  the per-trip index row follows the index-table rules above: use
+  `[trips, rows]` (`rows` rows per step). A row named more than once is
+  written once per mention, in no defined order, so it is well defined only
+  when every such write carries the same value, as for pad lanes clamped to
+  the last real row. `index` may also be an operand sliced one row per step
+  (`dims=0`, `tile_size=1`); the loop then reads it once. On Spyre the
+  per-trip index row follows the index-table rules above: use
   `[trips, rows]` with `rows` a multiple of 32.
 - `out` leaves match the body's output tiles in flattened order, with the same
   dtype and the tile's shape on every other axis.

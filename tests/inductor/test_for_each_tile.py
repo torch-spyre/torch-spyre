@@ -2480,6 +2480,77 @@ class TestCallerOwnedOutput(unittest.TestCase):
 
         self._assert_writes_in_place(fn, lambda: (values, initial.clone()), expected)
 
+    def test_gather_index_may_be_int32(self):
+        """An int32 index works eagerly too, where index_copy_ takes only int64."""
+        torch.manual_seed(2)
+        n, rows, P, D = 3, 4, 20, 6
+        values = torch.randn(n * rows, D)
+        index = torch.randperm(P)[: n * rows].reshape(n, rows).to(torch.int32)
+        initial = torch.randn(P, D)
+        expected = initial.clone()
+        expected[index.reshape(-1).long()] = values + 1
+
+        def fn(values, pool):
+            def body(_, tiles):
+                (v,) = tiles
+                return None, v + 1
+
+            return for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=rows,
+                out_dim=Gather(0, index),
+                out=pool,
+            )
+
+        self._assert_writes_in_place(fn, lambda: (values, initial.clone()), expected)
+
+    def test_gather_index_shared_with_an_operand_is_not_copied(self):
+        """A row table that is both an operand and the index enters the loop once.
+
+        Passed twice, it would be two loop carries on one buffer, and the second is
+        cloned in full before the loop.
+        """
+        from torch._inductor import config as inductor_config
+
+        torch.manual_seed(3)
+        n, rows, P, D = 4, 8, 64, 6
+        table = torch.randperm(P)[: n * rows].reshape(n, rows).contiguous()
+        src = torch.randn(P, D)
+        expected = torch.zeros(P, D)
+        expected[table.reshape(-1)] = src[table.reshape(-1)] + 1
+
+        def fn(table, src, dest):
+            def body(_, tiles):
+                rows_t, src_whole = tiles
+                return None, src_whole.index_select(0, rows_t[0]) + 1
+
+            for_each_tile(
+                body,
+                (table, src),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=Gather(0, table),
+                out=dest,
+            )
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            dest = torch.zeros(P, D)
+            fn(table, src, dest)
+            torch.testing.assert_close(dest, expected)
+            dest = torch.zeros(P, D)
+            with inductor_config.patch(force_disable_caches=True):
+                _, code = run_and_get_code(
+                    torch.compile(fn, backend="inductor", fullgraph=True),
+                    table,
+                    src,
+                    dest,
+                )
+        torch.testing.assert_close(dest, expected)
+        self.assertNotIn(f"empty_strided_cpu(({n}, {rows})", "\n".join(code))
+
     def _split_m(self, out_dim=0, out=None, **kwargs):
         (X, Y), _ = matmul_inputs()
 

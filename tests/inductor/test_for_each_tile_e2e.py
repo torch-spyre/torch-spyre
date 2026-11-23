@@ -2667,6 +2667,69 @@ class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
             doubled.cpu().float(), expected * 2, atol=0.01, rtol=0.02
         )
 
+    def test_gather_index_shared_with_an_operand_under_a_declared_dim(self):
+        """One row table feeds the body's gather and scatters its result, at every count.
+
+        The trip count is declared with ``dynamic=``. A second loop input on the same
+        table was cloned outside the loop, which a declared dim refuses.
+        """
+        from torch._dynamo.utils import counters
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        trips_max, rows, width, pool_rows = 16, 32, 64, 1024
+        spec = {"min": 8, "max": trips_max, "granularity": 1}
+
+        def fn(table, src, dest):
+            def body(_, tiles):
+                rows_t, src_whole = tiles
+                return None, src_whole.index_select(0, rows_t[0]) + 1
+
+            for_each_tile(
+                body,
+                (table, src),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=Gather(0, table),
+                out=dest,
+            )
+
+        generator = torch.Generator().manual_seed(7)
+        table_cpu = torch.randperm(pool_rows, generator=generator)[: trips_max * rows]
+        table_cpu = table_cpu.reshape(trips_max, rows).to(torch.int32).contiguous()
+        src_cpu = (
+            torch.randn(pool_rows, width, generator=generator, dtype=torch.float16)
+            * 0.125
+        )
+        layout = SpyreTensorLayout(
+            device_size=[trips_max, rows // 32, 32],
+            stride_map=[rows, 32, 1],
+            device_dtype=get_device_dtype(torch.int32),
+            valid_elements={(0,): trips_max, (1, 2): rows},
+        )
+        table = table_cpu.to(DEVICE_NAME, device_layout=layout, dynamic={0: spec})
+        src = _dma_to_spyre_indirect_access(src_cpu)
+        compiled = torch.compile(fn, fullgraph=True)
+        counters.clear()
+        with torch.inference_mode(), config.patch(backend_loop_unroll=False):
+            for trips in (trips_max, 8, 11):
+                if table.size(0) != trips:
+                    table.resize_((trips, rows))
+                dest_cpu = torch.zeros(pool_rows, width, dtype=torch.float16)
+                dest = _dma_to_spyre_indirect_access(dest_cpu)
+                compiled(table, src, dest)
+                written = table_cpu[:trips].reshape(-1).long()
+                expected = dest_cpu.float()
+                expected[written] = src_cpu[written].float() + 1
+                torch.testing.assert_close(
+                    dest.cpu().float(),
+                    expected,
+                    atol=0.005,
+                    rtol=0.02,
+                    msg=f"at {trips} trips",
+                )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
