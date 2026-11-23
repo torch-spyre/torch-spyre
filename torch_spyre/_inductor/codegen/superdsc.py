@@ -1579,7 +1579,7 @@ def _create_sdsc_tensors(
         ):
             if indirect_stick_sym is not None:
                 # Sub-stick indirect scatter: the stick sym was injected into the
-                # iteration space by compile_op_spec (e.g. "y":64).  Use it directly
+                # iteration space by parse_op_spec (e.g. "y":64).  Use it directly
                 # as the stick dim for value/destination tensors.  The first-missing-dim
                 # fallback below would wrongly pick the outer loop variable (e.g. mb=T)
                 # as the stick, causing the token loop to be treated as the stick
