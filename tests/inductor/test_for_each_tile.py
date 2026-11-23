@@ -1398,6 +1398,8 @@ class TestScanInputAliasing(unittest.TestCase):
     def test_out_sharing_a_storage_with_an_operand_is_rejected(self):
         """for_each_tile's out= destination may not share a storage with an operand."""
 
+        index = torch.arange(8).reshape(4, 2)
+
         def fn(x, buf):
             w, dest = buf[:4], buf[4:]
 
@@ -1406,7 +1408,12 @@ class TestScanInputAliasing(unittest.TestCase):
                 return None, x_tile @ w_whole
 
             return for_each_tile(
-                body, (x, w), dims=(0, None), tile_size=2, out_dim=0, out=dest
+                body,
+                (x, w),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=Gather(0, index),
+                out=dest,
             )[1]
 
         with torch.no_grad(), self.assertRaisesRegex(Exception, "(?i)mutation"):
@@ -2207,9 +2214,9 @@ class TestCallerOwnedOutput(unittest.TestCase):
 
     Same instrument as TestForEachTileLowering: the post-grad graphs, while_loop
     bodies included, must hold one while_loop per level and NO materialization -- no
-    stacked `ys`, no fold copy (which `out_dim=1` costs without `out=`, case B), and no
-    clone of the destination, which is what writing in place is for. The destination
-    must hold the result afterwards, and the call returns the caller's tensor itself.
+    stacked `ys` and no clone of the destination, which is what writing in place is
+    for. The destination must hold the result afterwards, and the call returns the
+    caller's tensor itself.
     """
 
     def _assert_writes_in_place(self, fn, make_args, ref, *, loops=1):
@@ -2242,39 +2249,17 @@ class TestCallerOwnedOutput(unittest.TestCase):
         self.assertEqual(copies, [], f"materializations: {copies}")
         self.assertEqual("\n".join(code).count("while should_loop:"), loops)
 
-    def test_out_dim_0(self):
-        """Case A into a caller buffer: tile `i` lands at `out[2*i : 2*i + 2]`."""
-        (X, Y), ref = matmul_inputs()
-
-        def fn(X, Y, dest):
-            def body(_, ops):
-                x_tile, y_whole = ops
-                return None, x_tile @ y_whole
-
-            return for_each_tile(
-                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
-            )
-
-        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
-
-    def test_out_dim_1_needs_no_fold_copy(self):
-        """Case B into a caller buffer: the fold copy case B pays is gone."""
-        (X, Y), ref = matmul_inputs()
-
-        def fn(X, Y, dest):
-            def body(_, ops):
-                x_whole, y_tile = ops
-                return None, x_whole @ y_tile
-
-            return for_each_tile(
-                body, (X, Y), dims=(None, 1), tile_size=2, out_dim=1, out=dest
-            )
-
-        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
+    @staticmethod
+    def _row_index(n, rows, pool_rows, seed=0):
+        """`[n, rows]` distinct pool rows, so every scattered row has one writer."""
+        generator = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(pool_rows, generator=generator)
+        return perm[: n * rows].reshape(n, rows).contiguous()
 
     def test_destination_is_a_view_of_a_larger_tensor(self):
         """`out` is a column band of a wider tensor; the other columns stay intact."""
         (X, Y), ref = matmul_inputs()
+        index = self._row_index(M // 2, 2, M)
         wide = torch.randn(M, N + 4)
 
         def fn(X, Y, wide):
@@ -2284,12 +2269,17 @@ class TestCallerOwnedOutput(unittest.TestCase):
 
             dest = wide[:, 2 : 2 + N]
             for_each_tile(
-                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=Gather(0, index),
+                out=dest,
             )
             return None, wide
 
         expected = wide.clone()
-        expected[:, 2 : 2 + N] = ref
+        expected[index.reshape(-1), 2 : 2 + N] = ref
         torch._dynamo.reset()
         with torch.no_grad():
             eager_wide = wide.clone()
@@ -2313,6 +2303,9 @@ class TestCallerOwnedOutput(unittest.TestCase):
         ordered after it, and the loop itself is dropped as dead code.
         """
         (X, Y), ref = matmul_inputs()
+        index = self._row_index(M // 2, 2, M)
+        expected = torch.zeros(M, N)
+        expected[index.reshape(-1)] = ref
 
         def fn(X, Y, dest):
             def body(_, ops):
@@ -2320,7 +2313,12 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 return None, x_tile @ y_whole
 
             for_each_tile(
-                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dest
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=Gather(0, index),
+                out=dest,
             )
             return dest.sum(dim=0), dest * 2
 
@@ -2330,13 +2328,14 @@ class TestCallerOwnedOutput(unittest.TestCase):
             col_sums, doubled = torch.compile(fn, backend="inductor", fullgraph=True)(
                 X, Y, dest
             )
-        torch.testing.assert_close(dest, ref)
-        torch.testing.assert_close(col_sums, ref.sum(dim=0))
-        torch.testing.assert_close(doubled, ref * 2)
+        torch.testing.assert_close(dest, expected)
+        torch.testing.assert_close(col_sums, expected.sum(dim=0))
+        torch.testing.assert_close(doubled, expected * 2)
 
     def test_pytree_out(self):
-        """Two output leaves, written into two caller buffers in flattened order."""
+        """Two output leaves, scattered into two caller buffers in flattened order."""
         (X, Y), ref = matmul_inputs()
+        index = self._row_index(M // 2, 2, M)
 
         def fn(X, Y, dests):
             def body(_, ops):
@@ -2345,9 +2344,16 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 return None, {"prod": prod, "relu": prod.relu()}
 
             return for_each_tile(
-                body, (X, Y), dims=(0, None), tile_size=2, out_dim=0, out=dests
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=Gather(0, index),
+                out=dests,
             )
 
+        expected = torch.zeros(M, N)
+        expected[index.reshape(-1)] = ref
         torch._dynamo.reset()
         with torch.no_grad():
             for name, run in (
@@ -2357,21 +2363,24 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 with self.subTest(name):
                     dests = {"prod": torch.zeros(M, N), "relu": torch.zeros(M, N)}
                     run(X, Y, dests)
-                    torch.testing.assert_close(dests["prod"], ref)
-                    torch.testing.assert_close(dests["relu"], ref.relu())
+                    torch.testing.assert_close(dests["prod"], expected)
+                    torch.testing.assert_close(dests["relu"], expected.relu())
 
     def test_reduction_level_with_out(self):
         """Split-K whose carry accumulates while each step's partial product is kept.
 
-        Step `i`'s `(M, N)` partial product lands at rows `i*M : (i+1)*M` of `out`,
-        and the carry still returns the full product.
+        Step `i` scatters its `(M, N)` partial product into the rows `index[i]` of
+        `out`, and the carry still returns the full product.
         """
         (X, Y), ref = matmul_inputs()
         TK = 3
         nK = K // TK
+        index = self._row_index(nK, M, nK * M)
         partials = torch.cat(
             [X[:, i * TK : (i + 1) * TK] @ Y[i * TK : (i + 1) * TK] for i in range(nK)]
         )
+        expected = torch.zeros(nK * M, N)
+        expected[index.reshape(-1)] = partials
 
         def fn(X, Y, dest):
             def body(acc, ops):
@@ -2385,36 +2394,16 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 dims=(-1, 0),
                 tile_size=TK,
                 init=torch.zeros(M, N),
-                out_dim=0,
+                out_dim=Gather(0, index),
                 out=dest,
             )
 
         self._assert_writes_in_place(
-            fn, lambda: (X, Y, torch.zeros(nK * M, N)), partials
+            fn, lambda: (X, Y, torch.zeros(nK * M, N)), expected
         )
         with torch.no_grad():
             acc, _ = fn(X, Y, torch.zeros(nK * M, N))
         torch.testing.assert_close(acc, ref)
-
-    def test_reverse_lands_in_natural_order(self):
-        (X, Y), ref = matmul_inputs()
-
-        def fn(X, Y, dest):
-            def body(_, ops):
-                x_tile, y_whole = ops
-                return None, x_tile @ y_whole
-
-            return for_each_tile(
-                body,
-                (X, Y),
-                dims=(0, None),
-                tile_size=2,
-                out_dim=0,
-                out=dest,
-                reverse=True,
-            )
-
-        self._assert_writes_in_place(fn, lambda: (X, Y, torch.zeros(M, N)), ref)
 
     def test_gather_scatters_one_row_per_step(self):
         """`out_dim=Gather(0, index)`: step `i` writes its row at `pool[index[i]]`.
@@ -2551,7 +2540,9 @@ class TestCallerOwnedOutput(unittest.TestCase):
         torch.testing.assert_close(dest, expected)
         self.assertNotIn(f"empty_strided_cpu(({n}, {rows})", "\n".join(code))
 
-    def _split_m(self, out_dim=0, out=None, **kwargs):
+    def _split_m(
+        self, out_dim=Gather(0, torch.arange(M).reshape(M // 2, 2)), out=None, **kwargs
+    ):
         (X, Y), _ = matmul_inputs()
 
         def body(_, ops):
@@ -2579,10 +2570,11 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 ValueError,
                 "needs out_dim",
             ),
-            "size not a multiple of the tiles": (
-                dict(out=torch.zeros(M + 1, N)),
-                ValueError,
-                "not a multiple",
+            # TODO: becomes a positive test once out= takes an int out_dim.
+            "int out_dim": (
+                dict(out_dim=0),
+                NotImplementedError,
+                r"Gather\(axis, index\) only",
             ),
             "Gather without out": (
                 dict(out_dim=Gather(0, torch.arange(M // 2)), out=None),

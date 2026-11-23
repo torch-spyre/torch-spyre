@@ -132,17 +132,16 @@ DimSpec = Union[int, None, Gather, Slice]  # noqa: UP007  # needs runtime presen
 
 @dataclass(frozen=True)
 class _OutSpec:
-    """Where each step writes its output tiles when the caller passes `out=`.
+    """Where each step scatters its output tiles when the caller passes `out=`.
 
-    `leaves` are the caller's destination leaves in flattened order. `dims` holds,
-    per leaf, the canonical axis the tiles are laid along (`out_dim=int`) or
-    scattered along (`out_dim=Gather`). `index` is the Gather index table, `[n]` or
-    `[n, rows]`, and `None` for `out_dim=int`.
+    `leaves` are the caller's destination leaves in flattened order, `dims` the
+    canonical axis each is scattered along, and `index` the Gather index table,
+    `[n]` or `[n, rows]`.
     """
 
     leaves: tuple[torch.Tensor, ...]
     dims: tuple[int, ...]
-    index: torch.Tensor | None = None
+    index: torch.Tensor
 
 
 def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
@@ -487,88 +486,60 @@ def _normalize_out(out, out_dim, num_tiles) -> _OutSpec:
         raise ValueError(
             "for_each_tile() out must be a tensor or a non-empty pytree of tensors"
         )
-    index = None
-    if isinstance(out_dim, Gather):
-        index = out_dim.index
-        if not isinstance(index, torch.Tensor) or index.ndim not in (1, 2):
-            shape = tuple(index.shape) if isinstance(index, torch.Tensor) else None
-            raise ValueError(
-                "for_each_tile() out_dim=Gather index must be a [trip count] or "
-                f"[trip count, rows] tensor, got {shape or type(index)}"
-            )
-        if index.dtype not in (torch.int32, torch.int64):
-            raise ValueError(
-                "for_each_tile() out_dim=Gather index must be int32 or int64, got "
-                f"{index.dtype}"
-            )
-        if not index.is_contiguous():
-            raise ValueError(
-                "for_each_tile() out_dim=Gather index must be contiguous, got "
-                f"strides {tuple(index.stride())}; pass index.contiguous()"
-            )
-        if index.shape[0] != num_tiles:
-            raise ValueError(
-                f"for_each_tile() out_dim=Gather index has {index.shape[0]} rows "
-                f"for {num_tiles} tiles"
-            )
-        axis = out_dim.axis
-    elif isinstance(out_dim, int) and not isinstance(out_dim, bool):
-        axis = out_dim
-    else:
+    if isinstance(out_dim, int) and not isinstance(out_dim, bool):
+        # TODO: out= with out_dim=int, step i writing narrow(d, i*extent, extent).
+        raise NotImplementedError(
+            "for_each_tile() out= supports out_dim=Gather(axis, index) only so far; "
+            "for an int out_dim, leave out=None and use the returned output"
+        )
+    if not isinstance(out_dim, Gather):
         raise ValueError(
-            "for_each_tile() out= needs out_dim=, an int axis the tiles are laid "
-            f"along or a Gather to scatter them, got out_dim={out_dim!r}"
+            "for_each_tile() out= needs out_dim=Gather(axis, index), the rows each "
+            f"step's tiles are scattered to, got out_dim={out_dim!r}"
+        )
+    index = out_dim.index
+    if not isinstance(index, torch.Tensor) or index.ndim not in (1, 2):
+        shape = tuple(index.shape) if isinstance(index, torch.Tensor) else None
+        raise ValueError(
+            "for_each_tile() out_dim=Gather index must be a [trip count] or "
+            f"[trip count, rows] tensor, got {shape or type(index)}"
+        )
+    if index.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "for_each_tile() out_dim=Gather index must be int32 or int64, got "
+            f"{index.dtype}"
+        )
+    if not index.is_contiguous():
+        raise ValueError(
+            "for_each_tile() out_dim=Gather index must be contiguous, got "
+            f"strides {tuple(index.stride())}; pass index.contiguous()"
+        )
+    if index.shape[0] != num_tiles:
+        raise ValueError(
+            f"for_each_tile() out_dim=Gather index has {index.shape[0]} rows "
+            f"for {num_tiles} tiles"
         )
 
     dims = []
     for path, leaf in leaves_with_path:
         try:
-            dim = utils.canonicalize_dim(leaf.ndim, axis, wrap_scalar=False)
+            dim = utils.canonicalize_dim(leaf.ndim, out_dim.axis, wrap_scalar=False)
         except IndexError as exc:
             raise IndexError(
                 f"for_each_tile() out_dim={out_dim} is invalid for out"
                 f"{keystr(path)} of rank {leaf.ndim}: {exc}"
             ) from exc
-        if index is None:
-            length = leaf.shape[dim]
-            if length % num_tiles != 0:
-                raise ValueError(
-                    f"for_each_tile() out{keystr(path)} has size {length} along dim "
-                    f"{out_dim}, which is not a multiple of the {num_tiles} tiles"
-                )
-            torch._check(length % num_tiles == 0)
         dims.append(dim)
     return _OutSpec(tuple(t for _, t in leaves_with_path), tuple(dims), index)
 
 
-def _out_write_targets(spec: _OutSpec, num_tiles: int) -> list[torch.Tensor]:
-    """The tensors the loop writes, one per `out` leaf, lifted into the body.
+def _write_out_tiles(spec: _OutSpec, targets, y, row) -> None:
+    """Scatter one step's output tiles into the caller's destinations, in place.
 
-    For `out_dim=int d` this is `torch.unflatten(leaf, d, (num_tiles, extent))`,
-    taken here rather than inside the body: the body then writes its placeholder
-    with no view in between, which Inductor reinplaces whatever the leaf's offset
-    and strides. A view taken inside the body is reinplaced only when the leaf is
-    dense with offset 0; for any other leaf the destination is copied every step.
-    `torch.unflatten`, not `Tensor.unflatten`, for the reason in `_xs_leaf`.
-    """
-    if spec.index is not None:
-        return list(spec.leaves)
-    return [
-        torch.unflatten(leaf, dim, (num_tiles, leaf.shape[dim] // num_tiles))
-        for leaf, dim in zip(spec.leaves, spec.dims)
-    ]
-
-
-def _write_out_tiles(spec: _OutSpec, targets, y, step, row, num_tiles, reverse) -> None:
-    """Write one step's output tiles into the caller's destinations, in place.
-
-    `targets` are `_out_write_targets` as the body sees them (lifted operands),
-    `step` is the step counter, and `row` is this step's Gather index row, or
-    `None` for `out_dim=int`.
-
-    Each write is one `index_copy_` on the target itself. Writing through a
-    `narrow`/`select` of it instead would copy the destination region on every
-    step, which is why the position is an index and not a slice.
+    `targets` are the destination leaves as the body sees them (lifted operands) and
+    `row` is this step's index row. Each write is one `index_copy_` on the target
+    itself: through a `narrow`/`select` of it, Inductor would copy the destination
+    region on every step.
     """
     tiles = tree_leaves(y)
     if len(tiles) != len(targets):
@@ -576,11 +547,7 @@ def _write_out_tiles(spec: _OutSpec, targets, y, step, row, num_tiles, reverse) 
             f"for_each_tile() out has {len(targets)} leaves but the body returns "
             f"{len(tiles)} output tiles"
         )
-    if row is None:
-        # The counter counts steps; under reverse=True step k visits tile n-1-k.
-        ids = (num_tiles - 1 - step if reverse else step).reshape(1)
-    else:
-        ids = row.reshape(-1)
+    ids = row.reshape(-1)
     for k, (target, tile, dim) in enumerate(zip(targets, tiles, spec.dims)):
         if not isinstance(tile, torch.Tensor):
             raise ValueError(
@@ -591,19 +558,13 @@ def _write_out_tiles(spec: _OutSpec, targets, y, step, row, num_tiles, reverse) 
                 f"for_each_tile() output tile {k} has dtype {tile.dtype} but out "
                 f"leaf {k} has dtype {target.dtype}"
             )
-        if row is None:
-            # `target` is [..., num_tiles, extent, ...] with the tile axis at dim.
-            expected = (*target.shape[:dim], *target.shape[dim + 1 :])
-            source = tile.unsqueeze(dim)
-        else:
-            expected = _tile_size_vector(target.shape, dim, ids.shape[0])
-            source = tile
+        expected = _tile_size_vector(target.shape, dim, ids.shape[0])
         if tuple(tile.shape) != expected:
             raise ValueError(
                 f"for_each_tile() output tile {k} has shape {tuple(tile.shape)}, but "
                 f"out leaf {k} takes tiles of shape {expected}"
             )
-        target.index_copy_(dim, ids, source)
+        target.index_copy_(dim, ids, tile)
 
 
 def _movedim(t: torch.Tensor, src: int, dst: int) -> torch.Tensor:
@@ -745,23 +706,21 @@ def for_each_tile(
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Output tiles may be a tensor or a
             pytree of tensors. ``None`` means the body emits no tile. With ``out``,
-            ``out_dim`` may also be ``Gather(axis, index)``: step ``i``'s tile is
-            then written at the rows ``index[i]`` names along ``axis``, where
+            ``out_dim`` is ``Gather(axis, index)``: step ``i``'s tile is then
+            written at the rows ``index[i]`` names along ``axis``, where
             ``index`` is ``[trip count]`` (one row per step) or ``[trip count,
             rows]`` (``rows`` rows per step). A row named more than once is
             written once per mention, in no defined order, so it is well defined
             only if every such write carries the same value.
         out: the caller's destination for the output tiles, a tensor or a pytree of
             tensors whose leaves match the body's output tiles in flattened order.
-            Each step writes its tiles into it in place, so no stacked or folded
-            output is materialized, and ``out`` itself is returned. Each leaf has
-            the tile's shape except along ``out_dim``: ``trip count * extent`` long
-            for ``int d``, and at least as long as the largest index for
-            ``Gather``. The leaves must not share storage with an operand or with
-            each other. Requires grad mode to be disabled, and is not supported in
-            a decomposition (see the tracing contract). On Spyre only
-            ``out_dim=Gather`` is supported so far. ``None`` (the default)
-            returns a new output tensor instead.
+            Each step writes its tiles into it in place, so no stacked output is
+            materialized, and ``out`` itself is returned. Each leaf has the tile's
+            shape except along the Gather axis, where it is at least as long as
+            the largest index. The leaves must not share storage with an operand
+            or with each other. Requires grad mode to be disabled, and is not
+            supported in a decomposition (see the tracing contract). ``None``
+            (the default) returns a new output tensor instead.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -876,13 +835,9 @@ def for_each_tile(
     # increments, whereas a padded per-step output costs a stacked buffer for the whole
     # trip count and an `aten.copy_` in the innermost body graph.
     # Fixed upstream by pytorch/pytorch#197832 (torch 2.15).
-    #
-    # With out= a reduction level carries the counter too: it is the position
-    # step i writes its tile at.
     init_leaves = [] if map_mode else tree_leaves(init)
-    count_mode = not map_mode and (
-        out_spec is not None or (out_dim is None and len(init_leaves) == 1)
-    )
+    emits_ys = out_dim is not None and out_spec is None
+    count_mode = not map_mode and not emits_ys and len(init_leaves) == 1
     if count_mode:
         scan_init = (_step_counter(init_leaves[0]), init)
 
@@ -929,20 +884,17 @@ def for_each_tile(
         )
         next_carry, y = body(carry, tiles)
         if out_spec is not None:
-            row = sliced[out_row] if out_row is not None else None
-            targets = lifted[len(lifted_idx) :]
-            _write_out_tiles(out_spec, targets, y, step, row, num_tiles, reverse)
+            _write_out_tiles(out_spec, lifted[len(lifted_idx) :], y, sliced[out_row])
         if map_mode:
             next_carry = step + 1 if pad is None else (step + 1, pad + 1)
         elif count_mode:
             next_carry = (step + 1, next_carry)
-        emits_ys = out_dim is not None and out_spec is None
         return next_carry, (y if emits_ys else ())
 
-    # The out= write targets come last, after the operands read whole.
+    # The out= destinations come last, after the operands read whole.
     lifted = [operands[i] for i in lifted_idx]
     if out_spec is not None:
-        lifted += _out_write_targets(out_spec, num_tiles)
+        lifted += out_spec.leaves
     if in_decomposition:
         # Reached from an AOT decomposition: trace the HOP without Dynamo.
         final_carry, ys = _scan_in_make_fx(combine_fn, scan_init, xs, lifted, reverse)

@@ -446,49 +446,6 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
     return result
 
 
-def _carry_indexed_destination_write(while_op: "ir.WhileLoop") -> str | None:
-    """Describe a body write into an additional input indexed by an evolving carry.
-
-    ``for_each_tile(out=..., out_dim=int)`` writes step ``i``'s tile at the
-    position its step counter holds: a carry the body advances every trip, read
-    as a runtime index. The indirect-access path only indexes by per-trip rows of
-    a tensor the loop slices (``out_dim=Gather``'s index table, a pass-through
-    carry), so such a write cannot be lowered. Returns a description of the first
-    one found, or None.
-    """
-    from torch._inductor import ir
-
-    from torch_spyre._inductor.wsr.while_loop_bridge import (
-        _body_fx_carry_is_passthrough,
-    )
-
-    body_graph = while_op.body_subgraph.graph
-    placeholders = list(body_graph.graph_inputs.keys())
-    num_carried = len(while_op.carried_inputs)
-    additional = set(placeholders[num_carried:])
-    evolving = {
-        name
-        for i, (name, output) in enumerate(
-            zip(placeholders[:num_carried], body_graph.graph_outputs)
-        )
-        if getattr(output, "get_name", lambda: None)() != name
-        and not _body_fx_carry_is_passthrough(while_op, i)
-    }
-    for op in body_graph.operations:
-        layout = getattr(op, "layout", None)
-        if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
-            continue
-        if layout.get_buffer().get_name() not in additional:
-            continue
-        index_carries = {dep.name for dep in op.get_read_writes().reads} & evolving
-        if index_carries:
-            return (
-                f"{op.get_name()} writes {layout.get_buffer().get_name()} at a "
-                f"position read from the carry {sorted(index_carries)}"
-            )
-    return None
-
-
 def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
     """Find the real per-iteration index symbol the spliced body already uses.
 
@@ -3388,18 +3345,6 @@ def splice_while_loops(graph) -> None:
                     f"WhileLoop {while_op.get_name()}: the body has no scalar read of "
                     "its counter to take the loop variable from, so it is not a "
                     "for_each_tile loop this backend can run"
-                )
-
-            # TODO: lower this as a tile-advancing write instead: the counter
-            # starts at 0 and steps by 1, so it equals loop_var.
-            write = _carry_indexed_destination_write(while_op)
-            if write is not None:
-                raise Unsupported(
-                    "for_each_tile(out=..., out_dim=int) is not supported on Spyre "
-                    "yet: the step writes out at its step counter's position, which "
-                    "the indirect-access path cannot index by "
-                    f"({while_op.get_name()}: {write}). Use out_dim=Gather with a "
-                    "[trip count, rows] index table, or leave out=None."
                 )
 
             # Operations synthesized while splicing this loop (notably a
