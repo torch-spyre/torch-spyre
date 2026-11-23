@@ -1024,6 +1024,46 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     return self
 
 
+# The generic clone, which every unsharded Spyre tensor still takes.
+_CLONE_GENERIC = torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeExplicitAutograd)
+
+
+@compile_once(aten.clone.default, dynamic=False)
+def _clone_sharded(x, compiled):
+    return compiled(x)
+
+
+@torch.library.register_kernel("aten::clone", ["spyre"])  # type:ignore
+def spyre__clone(self: torch.Tensor, *, memory_format=None) -> torch.Tensor:
+    """Clone a Spyre tensor; a sharded tensor's clone stays sharded (#5823).
+
+    The generic clone (``empty_like`` + ``copy_``) gives an unsharded tensor,
+    and its ``copy_`` is an in-place write that ``plan_sharded_hbm`` rejects for
+    a sharded source. Compiled, the clone of a sharded input is an identity
+    pointwise op whose result is the graph output, so ``plan_sharded_hbm``
+    allocates it sharded with the input's placement. Box views and other
+    non-whole views of sharded tensors fail closed there, as for any compiled
+    op. Every other tensor takes the generic clone, unchanged.
+    """
+    from torch_spyre import _C
+
+    if _C._spyre_is_sharded(self):
+        if memory_format not in (
+            None,
+            torch.preserve_format,
+            torch.contiguous_format,
+        ):
+            raise RuntimeError(
+                "clone of a sharded Spyre tensor supports only "
+                "memory_format=torch.preserve_format or torch.contiguous_format, "
+                f"got {memory_format}"
+            )
+        return _clone_sharded(self)
+    return torch.ops.aten.clone.default.redispatch(
+        _CLONE_GENERIC, self, memory_format=memory_format
+    )
+
+
 @torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     """Zero out the tensor in-place using device-side FillDMA."""
