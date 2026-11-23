@@ -562,6 +562,12 @@
    "runs": 4,
    "cases": 41
   },
+  "inductor/test_loop_node_equivalence_config.yaml": {
+   "p50_min": 1.508,
+   "p90_min": 1.576,
+   "runs": 81,
+   "cases": 7
+  },
   "inductor/test_lx_context_switching_config.yaml": {
    "p50_min": 0.56,
    "p90_min": 0.6,
