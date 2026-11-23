@@ -51,7 +51,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache, sympy_index_symbol
 from torch._inductor.virtualized import V
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 from utils_inductor import mock_op_split_space
 
@@ -75,11 +75,9 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
-    LoopCarryRecord,
-    copy_op_metadata,
-)
+from torch_spyre._inductor.loop_node import LoopMember
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
@@ -113,11 +111,14 @@ from torch_spyre._inductor.work_division import (
     _matmul_hbm_us,
     _matmul_multicast_penalty,
     _matmul_split_cost,
+    _work_distribution_op,
     adjust_it_space_for_sticks,
     apply_splits,
+    defer_work_division,
+    deferred_work_division,
     enumerate_work_division_candidates,
     multi_dim_iteration_space_split,
-    span_reduction_pass,
+    span_floors,
     work_division_context_for_op,
     work_division_splits_are_legal,
 )
@@ -1002,7 +1003,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_only_whole_stick_partitions_are_legal(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(3)],
             loop_tiled_dims=[[]],
@@ -1039,7 +1040,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_short_loop_does_not_force_source_compatible_division(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="short_direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(2)],
             loop_tiled_dims=[[]],
@@ -1159,9 +1160,12 @@ class TestWorkDivisionCandidates(unittest.TestCase):
     def test_candidates_respect_span_floor(self):
         x = _isym("x")
         op = _computed_buffer((8,), name="span_floor")
-        op._work_division_span_min_splits = {x: 2}
         output_td = _tensor_dep("span_floor", (8,), (x,))
         with (
+            patch(
+                "torch_spyre._inductor.work_division.must_split_vars",
+                return_value={x: 2},
+            ),
             patch(
                 "torch_spyre._inductor.work_division.iteration_space_from_op",
                 return_value={x: 8},
@@ -1228,7 +1232,7 @@ class _Probe(NamedTuple):
     """One externally supplied split and the verdict each entry point owes it.
 
     ``committed`` is :func:`work_division_splits_are_legal` -- the op's own
-    constraints plus the committed span floors, asked of a split that is
+    constraints plus its span floors, asked of a split that is
     already committed. ``proposed`` is :meth:`WorkDivisionContext.is_legal`,
     which adds the case's core budget and the ``MAX_SPAN_BYTES`` cap. They
     differ exactly where those two extra rules bite.
@@ -1270,6 +1274,7 @@ class _CandidateCase:
         stick_vars=None,
         constraints=None,
         symbol_meta=None,
+        span_floors=None,
     ):
         self.name = name
         self.op = op
@@ -1286,6 +1291,7 @@ class _CandidateCase:
         self.stick_vars = stick_vars or {}
         self.constraints = constraints or ConstraintResult()
         self.symbol_meta = symbol_meta
+        self.span_floors = span_floors or {}
 
     def patches(self):
         """Patch the module inputs a work-division context is derived from."""
@@ -1309,6 +1315,7 @@ class _CandidateCase:
                 "collect_work_division_constraints",
                 {"return_value": self.constraints},
             ),
+            ("must_split_vars", {"return_value": self.span_floors}),
         ] + (
             []
             if self.symbol_meta is None
@@ -1329,9 +1336,6 @@ def _candidate_cases():
     reduction-count rule, blocked dims and hard domains."""
     x, y, m, k0, k1 = (_isym(n) for n in ("x", "y", "m", "k0", "k1"))
 
-    floor_op = _computed_buffer((8,), name="span_floor")
-    floor_op._work_division_span_min_splits = {x: 2}
-
     red_out = _tensor_dep("reduction_out", (8,), (m,))
     red_in = _tensor_dep("reduction_in", (8, 4, 4), (m, k0, k1))
 
@@ -1341,10 +1345,11 @@ def _candidate_cases():
     return [
         _CandidateCase(
             name="span_floor",
-            op=floor_op,
+            op=_computed_buffer((8,), name="span_floor"),
             it_space={x: 8},
             output_td=_tensor_dep("span_floor", (8,), (x,)),
             constraints=ConstraintResult(allowed_splits={x: frozenset({1, 2, 4})}),
+            span_floors={x: 2},
             max_cores=8,
             axes=(x,),
             # The floor of 2 removes the unsplit candidate; 8 is outside the
@@ -2481,9 +2486,9 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
 
 
 class TestApplySplitsRepresentabilityGate(unittest.TestCase):
-    """apply_splits() is the gate span_reduction, the default greedy
-    distributor, the cost-model matmul re-pricer, and user hints all commit a
-    split through. Unlike WorkDivisionContext.is_legal / _apply_user_hint,
+    """apply_splits() is the gate the default greedy distributor, the
+    cost-model matmul re-pricer, and user hints all commit a split through.
+    Unlike WorkDivisionContext.is_legal / _apply_user_hint,
     the default distributor and the cost-model re-pricer never ask those
     checks (see TestDepthwiseConvWindowBlocked for the real-compile
     instance), so apply_splits must itself reject a split the scheduler's
@@ -2762,38 +2767,123 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
         )
 
 
-class TestSpanReductionConstraints(unittest.TestCase):
+class TestSpanFloors(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division"
 
-    def test_span_search_excludes_blocked_dimensions(self):
-        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
-        op = _computed_buffer((8,), name="indirect_reduction")
-        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+    @contextmanager
+    def _context_inputs(self, op, it_space, output_td, constraints, floors):
+        """Patch what ``span_floors`` derives the op's context from, with the
+        span search itself (``must_split_vars``) answering ``floors``."""
         with (
             patch(
                 f"{self._PATCH_TARGET}.iteration_space_from_op",
-                return_value={o: 8, r0: 8, r1: 8},
+                return_value=it_space,
             ),
             patch(
                 f"{self._PATCH_TARGET}.collect_tensor_deps",
                 return_value=([], output_td),
             ),
             patch(
+                f"{self._PATCH_TARGET}.op_read_writes",
+                return_value=MagicMock(writes=[output_td.dep], reads=[]),
+            ),
+            patch(f"{self._PATCH_TARGET}.get_mem_deps_from_rw", return_value=[]),
+            patch(
                 f"{self._PATCH_TARGET}.adjust_it_space_for_sticks",
-                return_value=({o: 8, r0: 8, r1: 8}, {}),
+                return_value=(it_space, {}),
             ),
             patch(
-                f"{self._PATCH_TARGET}.must_split_vars", return_value={}
+                f"{self._PATCH_TARGET}.must_split_vars", return_value=floors
             ) as must_split,
             patch(
                 f"{self._PATCH_TARGET}.collect_work_division_constraints",
-                return_value=ConstraintResult(blocked={r0, r1}),
-            ),
-            patch(f"{self._PATCH_TARGET}.apply_splits") as apply_splits,
+                return_value=constraints,
+            ) as collect,
         ):
-            span_reduction_pass(op, [], 32)
-        self.assertEqual(apply_splits.call_args.args[1], {})
+            yield must_split, collect
+
+    def test_span_search_excludes_blocked_dimensions(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="indirect_reduction")
+        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+        with self._context_inputs(
+            op,
+            {o: 8, r0: 8, r1: 8},
+            output_td,
+            ConstraintResult(blocked={r0, r1}),
+            floors={},
+        ) as (must_split, _):
+            self.assertEqual(span_floors(op), {})
         self.assertEqual(must_split.call_args.args[-1], {r0, r1})
+
+    def test_floors_are_checked_against_the_constraints(self):
+        """The floors the search finds go back through the constraints as
+        committed splits, which is what rejects a floor a hard domain forbids."""
+        x = _isym("x")
+        op = _computed_buffer((8,), name="floored")
+        output_td = _tensor_dep("floored", (8,), (x,))
+        with self._context_inputs(
+            op, {x: 8}, output_td, ConstraintResult(), floors={x: 2}
+        ) as (_, collect):
+            self.assertEqual(span_floors(op), {x: 2})
+        committed = [call.args[0].committed_splits for call in collect.call_args_list]
+        self.assertEqual(committed, [{}, {x: 2}])
+
+    def test_floors_on_two_reduction_dims_raise(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="two_reduction_floors")
+        output_td = _tensor_dep("two_reduction_floors", (8,), (o,))
+        with (
+            self._context_inputs(
+                op,
+                {o: 8, r0: 8, r1: 8},
+                output_td,
+                ConstraintResult(),
+                floors={r0: 2, r1: 2},
+            ),
+            self.assertRaisesRegex(Unsupported, "at most 1"),
+        ):
+            span_floors(op)
+
+    def test_infeasible_floors_fail_the_same_with_and_without_the_solve(self):
+        """Infeasible floors raise wherever they are first computed, with one
+        message. Without the solve that is work distribution. With division
+        left to the solve, the op's menu raises first; the solve then falls
+        back to the split work distribution would commit, which raises again."""
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="infeasible_floors")
+        output_td = _tensor_dep("infeasible_floors", (8,), (o,))
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
+        with self._context_inputs(
+            op,
+            {o: 8, r0: 8, r1: 8},
+            output_td,
+            ConstraintResult(),
+            floors={r0: 2, r1: 2},
+        ):
+            with self.assertRaisesRegex(Unsupported, "at most 1") as no_solve:
+                _work_distribution_op(op, max_cores=32)
+            defer_work_division(graph)
+            with self.assertRaises(Unsupported) as solve:
+                allocator._enumerate_core_divisions(op, 32, graph)
+        self.assertEqual(str(solve.exception), str(no_solve.exception))
+        # Raised by the fallback, not by the menu alone: dividing the deferred
+        # op took it off the deferred set.
+        self.assertEqual(deferred_work_division(graph), set())
+
+    def test_ops_that_are_not_divided_have_no_floors(self):
+        """No context is built for them, so nothing about them is asked."""
+        cpu_op = _computed_buffer((8,), name="cpu_buf")
+        cpu_op.layout = FixedLayout("cpu", torch.float16, [8], [1])
+        other_data = _computed_buffer((8,), name="other_data")
+        other_data.data = MagicMock()
+        with patch(
+            f"{self._PATCH_TARGET}.work_division_context_for_op",
+            side_effect=AssertionError("context built"),
+        ):
+            for op in (MagicMock(), cpu_op, other_data):
+                self.assertEqual(span_floors(op), {})
 
 
 def _physical_view(*splits):
@@ -3134,11 +3224,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         # One counted loop holds the update and the reader. The update writes
         # through the storage.
-        loop = CoarseTileInfo(
+        loop = LoopMember(
             loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
         )
-        update_op.loop_info = loop
-        reader_op.loop_info = loop
+        update_op.loop_member = loop
+        reader_op.loop_member = loop
         record = LoopCarryRecord(
             storage_name="plain",
             update_name="update",
@@ -4059,7 +4149,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "collect_work_division_constraints",
                 return_value=ConstraintResult(),
             ),
-            patch.object(work_division_module, "_span_min_splits", return_value={}),
+            patch.object(work_division_module, "_compute_span_floors", return_value={}),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -4386,7 +4476,7 @@ class TestDeferredWorkDivision(unittest.TestCase):
 
 
 class _SqueezingPostStickify:
-    """Stands in for ``coarse_tile_post_stickify``: divides each grouped op's
+    """Stands in for ``tile_groups``: divides each grouped op's
     ranges by ``tiling``, which is the part of the apply that renumbers its
     iteration symbols."""
 
@@ -4479,9 +4569,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 )
             ]
             with (
-                patch.object(
-                    coarse_tiling, "coarse_tile_post_stickify", post_stickify(tiling)
-                ),
+                patch.object(coarse_tiling, "tile_groups", post_stickify(tiling)),
                 patch.object(
                     allocator_module, "commit_iteration_space_ownership"
                 ) as commit,
@@ -4787,7 +4875,7 @@ class TestFp8MatmulConsumerAlignmentOnDevice(unittest.TestCase):
 
 
 class TestTopKConstraints(unittest.TestCase):
-    def test_topk_uses_minimum_supported_split_domains(self):
+    def test_topk_exposes_all_per_core_legal_k_splits(self):
         k, search = _isym("k"), _isym("search")
         op = _computed_buffer(
             (8, 16),
@@ -4806,18 +4894,18 @@ class TestTopKConstraints(unittest.TestCase):
             )
         )
         self.assertEqual(result.allowed_splits[search], frozenset({1}))
-        self.assertEqual(result.allowed_splits[k], frozenset({2}))
+        self.assertEqual(result.allowed_splits[k], frozenset({2, 4, 8}))
 
-    def test_default_planner_uses_minimum_supported_k_split(self):
+    def test_default_planner_uses_largest_allowed_k_split(self):
         k, search = _isym("k"), _isym("search")
         splits = multi_dim_iteration_space_split(
             {k: 8, search: 16},
             32,
             [k],
             [search],
-            allowed_splits={search: frozenset({1}), k: frozenset({2})},
+            allowed_splits={search: frozenset({1}), k: frozenset({2, 4, 8})},
         )
-        self.assertEqual(splits[k], 2)
+        self.assertEqual(splits[k], 8)
         self.assertEqual(splits[search], 1)
 
 
@@ -5043,6 +5131,56 @@ class TestOpSplitSpace(unittest.TestCase):
             self.assertIsNone(
                 work_division_module.build_op_split_space(case.op, case.max_cores)
             )
+
+    def test_nonlinear_write_symbol_is_an_output_axis_everywhere(self):
+        """A symbol that appears in the write index only under ``FloorDiv`` or
+        ``ModularIndexing`` has coefficient 0 there but is still an output axis.
+        The space, the classifier, the scheduler encoder and its validator must
+        all say so; the validator then rejects a split on it, since the
+        coefficient transport has no key to carry it by."""
+        s0, s1 = _isym("s0"), _isym("s1")
+        read_index = 64 * s0 + s1
+        for write_index in (
+            FloorDiv(s0, 64) * 64 + s1,
+            ModularIndexing(s0, 1, 64) * 64 + s1,
+        ):
+            with self.subTest(write_index=str(write_index)):
+                self.assertEqual(write_index.coeff(s0), 0)
+                op = _computed_buffer((128, 64), name="nonlinear_write")
+                write = MemoryDep("nonlinear_write", write_index, (s0, s1), (128, 64))
+                read = MemoryDep("nonlinear_read", read_index, (s0, s1), (128, 64))
+                rw = SimpleNamespace(writes=[write], reads=[read])
+                context = MagicMock()
+                context.axes = [s0, s1]
+                context.factor_domain.side_effect = lambda axis: [1, 2]
+                splits = {s0: 2, s1: 1}
+                with (
+                    patch.object(
+                        work_division_module, "op_read_writes", return_value=rw
+                    ),
+                    patch.object(
+                        work_division_module,
+                        "work_division_context_for_op",
+                        return_value=context,
+                    ),
+                ):
+                    space = work_division_module.build_op_split_space(op, 32)
+                    expected = work_division_module._core_division(op, splits)
+                self.assertEqual(space.output_axes, frozenset({s0, s1}))
+                self.assertEqual(space.division(splits).reduction_syms, frozenset())
+                self.assertEqual(expected.reduction_syms, frozenset())
+                self.assertEqual(
+                    pass_utils_module.splits_by_index_coeff(
+                        splits, write_index, read_index
+                    ),
+                    ({}, {}),
+                )
+                self.assertEqual(
+                    pass_utils_module.unrepresentable_splits_by_index_coeff(
+                        splits, {s0: 128, s1: 64}, write_index, read_index
+                    ),
+                    ["output:s0=absent"],
+                )
 
 
 _SPEC_ON_DIM_0 = TileSpec((TileAxis(host_dim=0, count=2),))
@@ -5688,17 +5826,17 @@ class TestMultiReadEdgeInversion(unittest.TestCase):
 
 class TestJointTilingAndDivisionExemption(unittest.TestCase):
     """``coarse_tile_local_dim_split_domains`` pins a coarse-tile-local dim's
-    core split to 1 because ``work_distribution``/``span_reduction`` divide each
-    op independently. A solver that chose the tiling and the division together
+    core split to 1 because ``work_distribution`` divides each op
+    independently. A solver that chose the tiling and the division together
     is not in that position -- the same ground the user-hint exemption stands on
     -- so it is exempt, and only it."""
 
     def _tiled_op(self, marked):
         op = MagicMock()
         op.get_name.return_value = "buf0"
-        # One level, as CoarseTileInfo always has: group id, count and the
+        # One level, as LoopMember always has: group id, count and the
         # tiled-dim lists are the same length.
-        op.loop_info = SimpleNamespace(
+        op.loop_member = SimpleNamespace(
             loop_group_id=(0,),
             loop_count=[8],
             loop_tiled_dims=[[0]],

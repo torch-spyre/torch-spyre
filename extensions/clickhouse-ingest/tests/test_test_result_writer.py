@@ -144,10 +144,37 @@ def test_a_rerun_verdict_replaces_the_earlier_attempts():
     assert dict(zip(cols, rows[0]))["props"]["run_attempt"] == "2"
 
 
+def test_a_rerun_verdict_is_inserted_before_the_earlier_attempts_are_dropped():
+    c = FakeClient(run_count=0)
+    log = []
+    c.insert = lambda table, *a, **k: log.append(("insert", table))
+    c.command = lambda sql, parameters=None: log.append(("command", sql.split()[0]))
+    assert _verdict(c, 2)
+    assert log.index(("insert", "artifact_results")) < log.index(("command", "DELETE"))
+
+
+class OnlyThisAttempt(FakeClient):
+    def query(self, sql, parameters=None):
+        self.queries.append((sql, parameters or {}))
+
+        class R:
+            result_rows = [(0 if "< {attempt" in sql else 1,)]
+
+        return R()
+
+
 def test_a_verdict_from_this_attempt_is_not_rewritten():
-    c = FakeClient(run_count=1)
+    c = OnlyThisAttempt()
     assert _verdict(c, 2)
     assert c.commands == [] and not [i for i in c.inserts if i[0] == "artifact_results"]
+
+
+def test_a_rerun_after_a_stop_between_insert_and_delete_drops_the_older_verdict():
+    c = FakeClient(run_count=1)  # this attempt's verdict and an older one both count
+    assert _verdict(c, 2)
+    assert not [i for i in c.inserts if i[0] == "artifact_results"]
+    (sql, params) = c.commands[0]
+    assert sql.startswith("DELETE FROM db.artifact_results") and params["attempt"] == 2
 
 
 def test_no_attempt_keeps_first_write_wins_for_verdicts():
@@ -367,3 +394,51 @@ def test_a_reingested_retry_replaces_rather_than_adds_verdicts():
     )
     (run,) = _rows(c, CAPABILITY_RUNS)
     assert run["props"]["run_attempt"] == "2"
+
+
+class OlderAttemptOnly(FakeClient):
+    """Holds rows of an earlier attempt only: a count with no attempt filter, or `< attempt`,
+    finds them; `>= attempt` finds nothing."""
+
+    def query(self, sql, parameters=None):
+        self.queries.append((sql, parameters or {}))
+
+        class R:
+            result_rows = (
+                []
+                if "count()" not in sql
+                else [(0,)]
+                if ">= {attempt" in sql
+                else [(1,)]
+            )
+
+        return R()
+
+
+def test_an_earlier_attempts_verdicts_do_not_block_this_attempts():
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    c = OlderAttemptOnly()
+    insert_test_results(
+        c, "db", "torch-spyre", RUN, [_declared("a")], "a.xml", attempt=2
+    )
+    (run,) = _rows(c, CAPABILITY_RUNS)
+    assert run["props"]["run_attempt"] == "2"
+
+
+def test_a_file_is_not_ingested_while_an_earlier_attempts_verdicts_remain():
+    from spyre_clickhouse_ingest.writer import TestResultWriter
+
+    class Counts(FakeClient):
+        def query(self, sql, parameters=None):
+            self.queries.append((sql, parameters or {}))
+            older_verdicts = "capability_runs" in sql and "< {attempt" in sql
+
+            class R:
+                result_rows = [(1 if older_verdicts or ">= {attempt" in sql else 0,)]
+
+            return R()
+
+    assert not TestResultWriter.already_ingested(
+        Counts(), "db", RUN, "torch-spyre", "a.xml", attempt=2
+    )

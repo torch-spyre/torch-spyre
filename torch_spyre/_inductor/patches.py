@@ -563,6 +563,9 @@ def enable_spyre_context(
         # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
         # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
         "fallback_random": True,
+        # Spyre never fuses (SpyreHeuristics.can_fuse is False), and the reindex
+        # analysis asserts on a for_each_tile loop node (#6496).
+        "loop_reindexing_after_fusion": False,
     }
 
     from torch._inductor.fx_passes import joint_graph
@@ -598,14 +601,14 @@ def enable_spyre_context(
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
     # coarse_tile.py's nested output-dim + reduction-dim tiling
-    # (_propagate_tiled_reduction_op) inserts a copy-out op
-    # (_insert_reduction_copy_op) that mutates a pre-loop accumulation buffer
+    # (lower_loop_tiling) inserts a copy-out op
+    # (_lower_reduction) that mutates a pre-loop accumulation buffer
     # (accum_full) so its updated value is visible to the NEXT outer-tile
     # iteration's copy-in. That cross-iteration read has no representation in
     # the single-pass, pre-unroll IR the scheduler's own dead_node_elimination
     # walks, so a copy-out with no other downstream reader looks dead and is
     # removed — even though it is required for correctness. Mark such ops
-    # with _coarse_tile_force_live (see _insert_reduction_copy_op) and force
+    # with _coarse_tile_force_live (see _lower_reduction) and force
     # SchedulerNode.has_side_effects() to report True for them, mirroring how
     # upstream itself protects effectful FallbackKernels from the same DCE
     # pass (torch/_inductor/lowering.py, effectful op handling).

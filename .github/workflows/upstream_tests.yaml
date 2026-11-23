@@ -119,7 +119,8 @@ jobs:
     secrets:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
       CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+      CLICKHOUSE_V2_HOST: ${{ secrets.CLICKHOUSE_V2_HOST }}
+      CLICKHOUSE_V2_PORT: ${{ secrets.CLICKHOUSE_V2_PORT }}
+      CLICKHOUSE_V2_USER: ${{ secrets.CLICKHOUSE_V2_USER }}
+      CLICKHOUSE_V2_PASSWORD: ${{ secrets.CLICKHOUSE_V2_PASSWORD }}

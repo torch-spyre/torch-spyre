@@ -38,6 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .parallel_precompile import report_output_layouts
 from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
@@ -82,7 +83,6 @@ from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
-    span_reduction,
     work_distribution,
     cost_model_matmul_division,
     defer_work_division,
@@ -102,21 +102,20 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
 from .loop_checker import check_loops
+from .loop_facts import counted_loop_path
 from .loop_node import (
     OpsView,
     all_ops,
     build_pending_loop_nodes,
     expand,
-    expanded,
     has_loop_nodes,
-    peel_non_members,
     request_loop_nodes,
 )
 from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
-from .wsr.coarse_tile import coarse_tile_post_stickify
+from .wsr.loop_tiling_lowering import tile_groups
 from .dump_cost_model import dump_cost_model
 
 # The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
@@ -394,7 +393,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 @_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
-    coarse_tile_post_stickify,
+    tile_groups,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -403,7 +402,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Loops built from for_each_tile (splice_while_loops) are intentionally
     absent: they have already run pre-stickification.
 
-    Uses coarse_tile_post_stickify: layout propagation has already
+    Uses tile_groups: layout propagation has already
     committed every op's device layout by this point, so a read-copy here
     would only produce an HBM-to-HBM copy with no layout-reconciliation
     benefit.
@@ -415,18 +414,17 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         return
     # span_overflow_groups is a pure planning step: it decides each op's
     # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/coarse_tile_post_stickify run, since
-    # dim_hints is an input those consume (via plan_coarse_tile_groups's
-    # hint lookups), not something they produce.
+    # validate_coarse_tile_groups/tile_groups run, since dim_hints is an input
+    # those consume (the plan's hint lookups), not something they produce.
     for op, dim_hints in dim_hint_assignments:
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any groups already
     # stamped by splice_while_loops (for_each_tile).
     # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
-        op.loop_info.loop_group_id[0]
+        counted_loop_path(op, include_extern=True)[0]
         for op in graph.operations
-        if hasattr(op, "loop_info") and op.loop_info is not None
+        if counted_loop_path(op, include_extern=True)
     ]
     group_idx_offset = max(used_ids, default=-1) + 1
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
@@ -435,7 +433,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     reject_nested_loops(groups, "span-overflow coarse tiling")
     request_loop_nodes(
         graph,
-        coarse_tile_post_stickify(
+        tile_groups(
             graph,
             groups=groups,
             group_idx_offset=group_idx_offset,
@@ -467,33 +465,20 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
-# Passes the flat view cannot run as they run today, so they run on the
-# expanded list and the nodes are rebuilt after them. None at present: the only
-# one was ``dedup_and_promote_constants``, which hoists every constant to the head
-# of the whole graph, and now does so across node boundaries itself
-# (``OpsView.hoist_to_front``). The mechanism stays, with ``expanded()``, until the
-# flat view is deleted.
-_PASSES_RUN_EXPANDED: frozenset[str] = frozenset()
-
-
 @contextlib.contextmanager
 def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
     """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
     (and the observer, timing and logging around it) a flat view of them.
 
-    No pass is node-aware yet. While the pass runs, ``graph.operations`` is a
-    ``loop_node.OpsView`` over the real nested list: it iterates the leaf ops
-    in program order and forwards each edit to the list that owns the op. The
-    real list is put back afterwards. A pass that rebinds ``graph.operations``
+    While the pass runs, ``graph.operations`` is a ``loop_node.OpsView`` over
+    the real nested list: it iterates the leaf ops in program order and refuses
+    edits (a pass edits with the ``loop_node`` helpers, which find the owning
+    list). The real list is put back afterwards. A pass that rebinds ``graph.operations``
     to a new list would silently drop the nodes, so that raises.
     """
     real = graph.operations
     if not has_loop_nodes(real):
         yield
-        return
-    if pass_name in _PASSES_RUN_EXPANDED:
-        with expanded(graph):
-            yield
         return
     view = OpsView(real)
     graph.operations = view
@@ -535,9 +520,6 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
         raise loop_scheduler.refuse_release()
-    # A pass may have put an op that belongs before (or after) a loop at the
-    # edge of its body; the scheduler runs a node's whole body every trip.
-    peel_non_members(graph)
 
 
 class CustomPreSchedulingPasses:
@@ -637,15 +619,15 @@ class CustomPreSchedulingPasses:
             finalize_layouts,
             # insert_restickify's advance-transfer logic (see its own
             # docstring) branches on whether old_name already has
-            # `loop_info` stamped, to decide whether the per-trip advance
+            # `loop_member` stamped, to decide whether the per-trip advance
             # belongs on the restickify stage or stays on the consumer.
             # splice_while_loops runs first in this list and stamps every
-            # for_each_tile level's CoarseTileInfo in one deferred final
+            # for_each_tile level's LoopMember in one deferred final
             # phase, so by the time insert_restickify runs, every tiled
-            # stage's loop_info is already in place. If this pass ever
+            # stage's loop_member is already in place. If this pass ever
             # moved ahead of splice_while_loops' stamping, that check would
             # silently take the "not yet tiled" branch and emit an empty
-            # tiled_dims_per_read for a stage that is actually tiled -- a
+            # loop_member for a stage that is actually tiled -- a
             # wrong-answer, not a crash.
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
@@ -667,11 +649,13 @@ class CustomPreSchedulingPasses:
             # Invariant: this must run before any pass that could insert a
             # consumer of a sharded buffer (its rejection loops only see the
             # graph as of this point); compute_ops' all-sharded check is the
-            # second net.
+            # second net. Every division computes the op's span floors itself.
             plan_sharded_hbm,
-            span_reduction,
             _distribute_work,
             #
+            # The graph outputs' layouts are final here. A forked precompile child
+            # reports them to its parent before the planning below (parallel_precompile).
+            report_output_layouts,
             # LX Planning
             _maybe_scratchpad_planning,
             # Preserve copies through physical planning, then remove only

@@ -31,6 +31,7 @@ from .cost_model import (
     _select,
     max,
 )
+from .loop_facts import enclosing_loops, is_looped
 from .logging_utils import get_logger, warn_once
 from .pass_utils import (
     _build_indirect_store_subs,
@@ -258,31 +259,29 @@ def _input_traffic(name: str):
 
 def _loop_features(op):
     """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the coarse-tiling
-    ``loop_info`` (loop_info.py / coarse_tile.py). ``loop_trip`` = product of
+    ``loop_member`` (loop_node.LoopMember). ``loop_trip`` = product of
     loop_count (1 if not tiled). tiles_reduction_dim = loop_tiled_reduction_dims is
     non-empty (reduction-dim tiling); tiles_output_dim = loop_tiled_dims is non-empty
-    (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_info
+    (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_member
     but tile NEITHER (both lists empty), so their accumulators stay fixed (factor L); a
     genuinely tiled op's args advance (factor 1)."""
-    li = getattr(op, "loop_info", None)
-    if li is None:
+    levels = enclosing_loops(op)
+    if not levels:
         return 1, False, False
     trip = 1
-    for c in getattr(li, "loop_count", None) or []:
-        trip *= trip_count_estimate(c)
-    red_dims = getattr(li, "loop_tiled_reduction_dims", None) or []
-    out_dims = getattr(li, "loop_tiled_dims", None) or []
+    for level in levels:
+        trip *= trip_count_estimate(level.trip_count)
     return (
         max(1, trip),
-        any(bool(level) for level in red_dims),
-        any(bool(level) for level in out_dims),
+        any(bool(level.tiled_reduction_dims) for level in levels),
+        any(bool(level.tiled_dims) for level in levels),
     )
 
 
 def _tiled_symbols_per_level(op):
     """Per NESTING LEVEL, the set of loop symbols that level tiles.
 
-    ``CoarseTileInfo`` stores the tiled dims as HOST-RANGE indices, one list per level
+    ``LoopMember`` stores the tiled dims as HOST-RANGE indices, one list per level
     (``loop_tiled_dims`` for output dims, ``loop_tiled_reduction_dims`` for reduction
     dims), while the index expressions are written in iteration-space symbols. The
     iteration space SKIPS unit-size ranges, so a host index must be mapped through the
@@ -298,13 +297,11 @@ def _tiled_symbols_per_level(op):
         loop_tiled_dims          = [[0], []]      # level 0 tiles output dim 0 -> i0
         loop_tiled_reduction_dims= [[],  [0]]     # level 1 tiles reduction dim 0 -> r0_0
     """
-    li = getattr(op, "loop_info", None)
-    if li is None:
-        return []
-    counts = list(getattr(li, "loop_count", None) or [])
-    out_lv = list(getattr(li, "loop_tiled_dims", None) or [])
-    red_lv = list(getattr(li, "loop_tiled_reduction_dims", None) or [])
-    n_levels = max(len(out_lv), len(red_lv))
+    loops = enclosing_loops(op)
+    counts = [level.trip_count for level in loops]
+    out_lv = [list(level.tiled_dims) for level in loops]
+    red_lv = [list(level.tiled_reduction_dims) for level in loops]
+    n_levels = len(loops)
     if not n_levels:
         return []
     try:
@@ -363,7 +360,7 @@ def _dep_index(dep):
 def _level_loop_vars(op, levels) -> list:
     """The ``for_each_tile`` loop variable of each level of ``levels``, or ``None``.
 
-    The ``for_each_tile`` lowering stamps one ``CoarseTileInfo`` level per nesting
+    The ``for_each_tile`` lowering stamps one ``LoopMember`` level per nesting
     level, outermost first, and appends one ``DimHint(loop_var, loop_var_range=trip)``
     per level in the same order, so the i-th hint carrying a ``loop_var_range`` (read
     through ``loop_var_ranges_from_dim_hints``) is the loop variable of level i.  Each
@@ -390,46 +387,19 @@ def _level_loop_vars(op, levels) -> list:
     ]
 
 
-def _stamped_advances(tiled, squeezed, n_levels: int) -> list[bool] | None:
-    """Per-level "this dependency's address advances" verdict stamped by the lowering.
-
-    ``tiled`` is one dependency's ``CoarseTileInfo.tiled_dims_per_read`` entry (or
-    ``output_tiled_dims``) and ``squeezed`` the parallel
-    ``squeezed_advance_per_read`` entry (or ``squeezed_advance_output``).  The
-    ``for_each_tile`` lowering decides advancement per dependency
-    (``_stamp_direct_loop_info``: a nonzero coefficient on the loop variable), and
-    ``insert_restickify`` rewrites the verdict when it moves an advance onto a copy;
-    code generation reads only these stamps.  A level advances when either list names
-    something at that level; an empty level is the explicit "pinned" verdict.
-    ``None`` when the stamp is missing or does not cover every level.
-    """
-    if tiled is None or len(tiled) != n_levels:
-        return None
-    if squeezed and len(squeezed) != n_levels:
-        return None
-    return [
-        bool(tiled[lv]) or bool(squeezed and squeezed[lv]) for lv in range(n_levels)
-    ]
-
-
-def _loop_var_advances(index, loop_vars, stamped=None) -> list[bool]:
+def _loop_var_advances(index, loop_vars) -> list[bool]:
     """Per level: does a dependency at ``index`` advance with that level's loop?
 
-    A complete stamped verdict decides for every level, with or without a paired
-    ``for_each_tile`` loop variable (``_stamped_advances``); the tiled dims of every
-    level are handled by ``_loop_factor_for_index`` itself.  Without a stamp, only a
-    level with a paired loop variable can say yes, by the lowering's own rule: the
-    address advances iff the index has a nonzero coefficient on the loop variable.  A
-    loop variable that is merely a free symbol of the index does not advance the
-    address; the tested example is the synthetic index ``4096*FloorDiv(u0, 2)``
-    (coefficient 0).  No lowered kernel is known to produce such a read; following the
-    lowering's rule keeps the price consistent with what the lowering stamps.
+    Only a level with a paired loop variable can say yes, by the lowering's own rule:
+    the address advances iff the index has a nonzero coefficient on the loop
+    variable (the tiled dims of every level are handled by ``_loop_factor_for_index``
+    itself).  A loop variable that is merely a free symbol of the index does not
+    advance the address; the tested example is the synthetic index
+    ``4096*FloorDiv(u0, 2)`` (coefficient 0).
     """
     advances = []
     for lv, var in enumerate(loop_vars):
-        if stamped is not None:
-            advances.append(stamped[lv])
-        elif var is None:
+        if var is None:
             advances.append(False)
         else:
             try:
@@ -472,7 +442,7 @@ def _loop_factor_for_index(index, levels, advances=None) -> int:
         # An arg REPEATS at a level whenever that level's tiled symbols are absent from
         # its index -- for EITHER reason:
         # * the level tiles nothing this op has (`coarse_tile_fill` / `_combine`, whose
-        # loop_info names a dim they do not iterate), or * the level tiles a dim this
+        # loop_member names a dim they do not iterate), or * the level tiles a dim this
         # arg's address does not depend on (matmul B under M-tiling). Both mean the same
         # physical thing: the op re-enters the same address each iteration of that
         # level. An earlier version guarded this with `if syms`, which silently dropped
@@ -509,10 +479,10 @@ def _candidate_tiling(op, tiling: Mapping):
     flags are conditions rather than bools when a count is symbolic, since the
     candidate the solver picks may leave that axis untiled (count 1).
 
-    The op must not already be coarse-tiled: its ``loop_info`` would describe a
+    The op must not already be coarse-tiled: its ``loop_member`` would describe a
     second loop nest this cannot compose with.
     """
-    if getattr(op, "loop_info", None) is not None:
+    if is_looped(op):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )
@@ -1241,8 +1211,7 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
-    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
-    records.
+    the graph returns.
 
     ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
     "interior write", and unlike the input side an output arg has no naming-convention
@@ -1412,7 +1381,7 @@ def extract_op_features(
     ``sym_tiling`` is a candidate coarse tiling of the (untiled) op during LX
     planning: loop variable -> trip count, concrete or the solver's symbols, as
     ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
-    Otherwise the op's committed ``loop_info`` supplies the tiling. The op's
+    Otherwise the op's committed ``loop_member`` supplies the tiling. The op's
     sizes are then the whole loop's, not one tile's, so each LX arg is cut to
     its per-tile size, as a committed tiling allocates it; an HBM arg keeps
     its full extent either way.
@@ -1472,9 +1441,8 @@ def extract_op_features(
 
     # Per-level loop structure, shared by the output's loop factor (which also scales a
     # matmul's work) and every read's (see the PER-ARG comment below). ``_levels`` is
-    # set above, from the committed loop_info or the candidate tiling.
+    # set above, from the committed loop_member or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
-    _li = getattr(op, "loop_info", None)
     _rw = None
     try:
         _rw = op_read_writes(op)
@@ -1482,20 +1450,10 @@ def extract_op_features(
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
     if _levels and _write_index is not None:
-        _write_advances = _loop_var_advances(
-            _write_index,
-            _loop_vars,
-            _stamped_advances(
-                getattr(_li, "output_tiled_dims", None),
-                getattr(_li, "squeezed_advance_output", None),
-                len(_levels),
-            ),
-        )
+        _write_advances = _loop_var_advances(_write_index, _loop_vars)
         out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
-    else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
+    else:  # no loop_member (or unreadable index) -> the pre-existing behaviour
         out_factor = _select(tiles_out_dim, 1, loop_trip)
-    _stamped_reads = getattr(_li, "tiled_dims_per_read", None) or []
-    _squeezed_reads = getattr(_li, "squeezed_advance_per_read", None) or []
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -1632,18 +1590,9 @@ def extract_op_features(
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
-    # The lowering stamps one verdict per MemoryDep read, in read order; StarDep and
-    # WeakDep have no index and no entry.
-    n_indexed_reads = sum(_dep_index(dep) is not None for dep in reads)
-    stamps_cover_reads = len(_stamped_reads) == n_indexed_reads and (
-        not _squeezed_reads or len(_squeezed_reads) == n_indexed_reads
-    )
-    indexed_pos = -1
     for dep in reads:
         name = getattr(dep, "name", "?")
         index = _dep_index(dep)
-        if index is not None:
-            indexed_pos += 1
         # Broadcast heuristic: the read index references fewer loop variables than
         # the output rank -> it is loaded ONCE and reused across the broadcast dim, so
         # it is counted at its own (small) device size, not the output size. This
@@ -1657,22 +1606,11 @@ def extract_op_features(
         except Exception:  # noqa: BLE001
             broadcast = False
         # One verdict per read and level: does this read's address advance with
-        # that level's for_each_tile variable? The lowering stamps it, else its
-        # own coefficient rule decides (``_loop_var_advances``). It sets both the
+        # that level's loop variable (``_loop_var_advances``)? It sets both the
         # read's loop factor and its loop-delivery eligibility, so the two prices
         # cannot disagree about one read.
         read_advances = (
-            _loop_var_advances(
-                index,
-                _loop_vars,
-                _stamped_advances(
-                    _stamped_reads[indexed_pos],
-                    _squeezed_reads[indexed_pos] if _squeezed_reads else None,
-                    len(_levels),
-                )
-                if stamps_cover_reads
-                else None,
-            )
+            _loop_var_advances(index, _loop_vars)
             if (_levels and index is not None)
             else []
         )

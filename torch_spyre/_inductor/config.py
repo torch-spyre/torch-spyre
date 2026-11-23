@@ -231,6 +231,11 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Compiling for Spyre 1p5 (the backend compiler reads the same SENARCH). Its
+# matmul takes BFLOAT16 inputs only, so a matmul input must already be BFLOAT16
+# on the device: see spyre_kernel._check_sen1p5_matmul_inputs.
+sen1p5: bool = os.environ.get("SENARCH", "").lower() == "sen1p5"
+
 # Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
 # The pointwise work-division PR (#2499) wires that helper into the
 # compilation pipeline; until then these knobs are read only by the
@@ -408,23 +413,6 @@ ignore_span_overflow_hints: bool = (
 )
 
 
-# Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
-# CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
-# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
-# the CoarseTileInfo transform is deleted.
-def _choose_loop_tiling_lowering(value: str) -> str:
-    if value not in ("legacy", "plan"):
-        raise ValueError(
-            f"SPYRE_INDUCTOR_LOOP_TILING_LOWERING={value!r}: expected 'legacy' or "
-            "'plan'"
-        )
-    return value
-
-
-loop_tiling_lowering: str = _choose_loop_tiling_lowering(
-    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
-)
-
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
 # hardware limitation that can't support it) makes planning treat any op
@@ -595,7 +583,7 @@ enable_uniqueness_check: bool = (
 # direct read, no staging op between them). With it, every such edge is priced,
 # which can enumerate and cost a large number of candidate divisions on a graph
 # with many eligible same-group edges -- see #5609's compile-time report.
-# This is not for_each_tile-specific: loop_group_id/CoarseTileInfo is stamped
+# This is not for_each_tile-specific: loop_group_id/LoopMember is stamped
 # by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
 # path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
 # any graph with coarse-tiled ops sharing a loop_group_id with their consumer,

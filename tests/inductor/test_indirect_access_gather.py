@@ -47,7 +47,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch._inductor.utils import run_and_get_code
+from torch._dynamo.utils import counters
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -1366,6 +1367,44 @@ class _GatherMulticoreScenarios:
     def test_gather_index_padding_past_table_fp32(self):
         self._gather_with_index_padding(torch.float32, 1000)
 
+    # -- partial-stick gather output: same layout as a fresh tensor --------
+    def _gather_feeds_graph_compiled_on_fresh_tensor(self, entries):
+        """A partial-stick gather output reuses a graph compiled on a fresh tensor.
+
+        The consumer is compiled first on a fresh tensor of the output's shape,
+        as a decoder block is during warmup. The Dynamo layout guard compares
+        whole device layouts, so a gather output padded past its entry count
+        recompiles the consumer. The table is two sticks wide, so an output whose
+        layout does not describe its allocation reads the second stick column
+        from the wrong addresses.
+        """
+        cols = 128
+        table = torch.rand(300, cols, dtype=torch.float16).to("spyre")
+        rows = torch.randint(0, 300, (entries,), dtype=torch.int32)
+        expected = table.cpu()[rows.long()]
+        gather = torch.compile(lambda t, i: torch.index_select(t, 0, i), dynamic=False)
+        consumer = torch.compile(lambda hidden: hidden * 2.0, dynamic=False)
+        with fresh_cache():
+            gathered = gather(table, rows.to("spyre"))
+            consumer(torch.zeros(entries, cols, dtype=torch.float16).to("spyre"))
+            counters.clear()
+            doubled = consumer(gathered)
+        self.assertEqual(
+            counters["stats"]["unique_graphs"],
+            0,
+            "the consumer recompiled for the gather output's layout",
+        )
+        torch.testing.assert_close(gathered.cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(doubled.cpu(), expected * 2.0, atol=0, rtol=0)
+
+    def test_gather_one_partial_stick_feeds_graph_compiled_on_fresh_tensor(self):
+        """P=4: a single partial index stick, as in a small decode bucket."""
+        self._gather_feeds_graph_compiled_on_fresh_tensor(4)
+
+    def test_gather_partial_last_stick_feeds_graph_compiled_on_fresh_tensor(self):
+        """P=40: one full index stick plus a partial second."""
+        self._gather_feeds_graph_compiled_on_fresh_tensor(40)
+
     # -- shared value table: cross-core read correctness ------------------
     def test_gather_cross_core_shared_value(self):
         """Every output row gathers a value row in a DIFFERENT core's work slice,
@@ -1414,8 +1453,7 @@ class _EmbeddingAllIndexBucketsScenario:
     The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
     sticks. For each count s:
       N = s*32 - offset  (offset ∈ [1,31] seeded from s)
-      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
-      → the partial-stick entry dim stays on one core
+      → N is non-stick-aligned, so the entry dim stays on one core
       → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
 

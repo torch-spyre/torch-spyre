@@ -16,8 +16,8 @@
 
 The loop plan (epic #5863, stage 7) makes the index the single source of an
 access's advance: the coefficient of the loop's induction variable in
-``dep.index``, projected through ``tiling_expr_to_device_expr``. Today the
-kernel combines the index with the stored per-read record.
+``dep.index``, projected through ``tiling_expr_to_device_expr``. The kernel reads
+it from the index alone (stage 7.4).
 
 This file measures the premise on compiled ``for_each_tile`` graphs. At the
 point where the kernel builds each ``TensorArg`` it computes the advance from the
@@ -25,14 +25,15 @@ index alone and compares it with the expression the kernel emits, with the
 kernel's own level symbol standing in for the induction variable. That compares
 VALUES, not just whether the variable is present.
 
-``test_loop_advance.py`` is the gate on the record-based accessors; this is a
-different question over the same corpus, so it is a separate file.
+``test_loop_advance.py`` compares the accessors with the kernel; this recomputes
+the advance independently (``coeff`` of the induction variable, from the nodes'
+own inductions) over the same corpus, so it is a separate file.
 
 What it pins:
 
 * every access in the corpus agrees, including the block-table reads of the
   ``paged_gather*`` fixtures. Those are POINT reads (no iteration variable) whose
-  index used to be rewritten to ``0`` by ``_rebase_point_splice_reads`` because
+  index used to be rewritten to ``0`` by a rebase step of the legacy transform because
   layout propagation was thought to reject the loop variable, so their advance
   survived only in the stored record. Stage 7.2 removed that rewrite (layout
   propagation accepts the variable: the three fixtures compile and give the same
@@ -75,6 +76,7 @@ from torch_spyre._inductor.padding import restride_loop_step
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 from test_loop_advance import CORPUS
+from utils_inductor import loop_member_view
 
 
 d1, d2 = (sympy_index_symbol(f"d{i}") for i in (1, 2))
@@ -90,7 +92,13 @@ class _Probe:
     def hand_off(self, original):
         def wrapper(graph):
             operations = getattr(graph.operations, "real", graph.operations)
-            self.inductions.update(loop_node._inductions_of(operations))
+            self.inductions.update(
+                {
+                    node.group_id: node.induction
+                    for node in loop_node._nodes_in(operations)
+                    if node.induction is not None
+                }
+            )
             return original(graph)
 
         return wrapper
@@ -112,14 +120,14 @@ class _Probe:
             d for d in reads_writes.reads if isinstance(d, MemoryDep) and d.name == name
         ]
         # The kernel has already consumed one match for this call.
-        consumed = kernel._general_tile_advance_seen.get(name, 0)
+        consumed = kernel._tile_advance_seen.get(name, 0)
         if 0 < consumed <= len(matching):
             return matching[consumed - 1]
         return matching[0] if matching else None
 
     def _record(self, kernel, tensor, is_input, name, result):
         node = kernel.current_node.node
-        info = getattr(node, "loop_info", None)
+        info = loop_member_view(node)
         if info is None:
             return
         dep = self._dep(kernel, node, is_input, name)
@@ -160,9 +168,9 @@ def _compile_and_probe(fn, args, ctx=None):
     with (
         mock.patch.object(
             SpyreKernel,
-            "_general_tile_advance",
+            "_tile_advance",
             autospec=True,
-            side_effect=probe.wrap(SpyreKernel._general_tile_advance),
+            side_effect=probe.wrap(SpyreKernel._tile_advance),
         ),
         mock.patch.object(
             spyre_passes,
@@ -181,7 +189,7 @@ def _compile_and_probe(fn, args, ctx=None):
 def test_the_index_gives_the_kernels_advance(case):
     fn, args, ctx = CORPUS[case]()
     probe = _compile_and_probe(fn, args, ctx)
-    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_info"
+    assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_member"
 
     differing = [r for r in probe.rows if not r[6]]
     assert not differing, [
@@ -389,11 +397,21 @@ def test_loop_induction_symbols_is_the_unbacked_non_iteration_non_indirect_set()
     assert loop_induction_symbols(0, set()) == []
 
 
+def _one_level_loop_info():
+    """A one-level loop stamp: a stand-in that lists no group is not in a loop."""
+    return SimpleNamespace(
+        loop_group_id=(0,),
+        loop_count=[2],
+        loop_tiled_dims=[[]],
+        loop_tiled_reduction_dims=[[]],
+    )
+
+
 class _ReadOp:
     """A consumer with one memory read, enough for ``_moved_loop_term``."""
 
     def __init__(self, index):
-        self.loop_info = SimpleNamespace()
+        self.loop_member = _one_level_loop_info()
         self._dep = MemoryDep("buf", index, (), ())
 
     def get_read_writes(self):
@@ -403,10 +421,7 @@ class _ReadOp:
 def _moved_term(index):
     from torch_spyre._inductor import insert_restickify as ir
 
-    transferred = SimpleNamespace(
-        tiled_dims_per_read=[[[]]], squeezed_advance_per_read=[[[(16384, 1)]]]
-    )
-    copy = SimpleNamespace(loop_info=transferred)
+    copy = SimpleNamespace(loop_member=_one_level_loop_info())
     info = SimpleNamespace(arg_name="buf", dep_index=index, occurrence=0)
     return ir._moved_loop_term(_ReadOp(index), info, copy, 1, 1)
 

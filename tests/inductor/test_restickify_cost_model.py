@@ -458,15 +458,35 @@ def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypa
 
 
 @pytest.fixture
-def staged_transport_graph():
+def staged_transport_graph(monkeypatch):
     from torch import fx
     from torch._inductor.graph import GraphLowering
     from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
     from torch._inductor.virtualized import ops
     from torch_spyre._inductor.ir import FixedTiledLayout
-    from torch_spyre._inductor.loop_info import CoarseTileInfo, ReadCopyElisionRecord
+    from torch_spyre._inductor.loop_node import LoopMember
+    from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
+    from torch_spyre._inductor.propagate_hints import DimHint
 
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+
+    # TODO(#6509): the proof's local bound (``_affine_bounds``) does not tolerate a loop
+    # variable in the index, so on a real looped graph, where the direct read
+    # carries its loop term (stage 7.2b), it declines ("source element range is
+    # not statically provable") even though the advance bound is right. This
+    # fixture models the intended behaviour: the local bound is the index at
+    # loop trip zero.
+    local_bounds = rce._affine_bounds
+
+    def loop_aware_bounds(dep):
+        index = dep.index.xreplace({u0: sympy.S.Zero})
+        return local_bounds(MemoryDep(dep.name, index, dep.var_names, dep.size))
+
+    monkeypatch.setattr(rce, "_affine_bounds", loop_aware_bounds)
+    original_affine_bounds = local_bounds
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
@@ -507,7 +527,9 @@ def staged_transport_graph():
             data=Pointwise(
                 device=device,
                 dtype=torch.float16,
-                inner_fn=lambda i: ops.load("input", 1024 * i[0] + 128 * i[1] + i[2]),
+                inner_fn=lambda i: ops.load(
+                    "input", 1024 * i[0] + 128 * i[1] + i[2] + 1048576 * u0
+                ),
                 ranges=list(map(sympy.Integer, [1024, 8, 128])),
             ),
         )
@@ -536,26 +558,49 @@ def staged_transport_graph():
         for op in (stage, consumer):
             op.operation_name = op.get_name()
             commit_iteration_space_ownership(op, {})
-        stage.loop_info = CoarseTileInfo(
-            (0,),
-            [sympy.Integer(32)],
-            [[]],
-            tiled_dims_per_read=[[[(0, sympy.Integer(1024))]]],
+        # The loop walks the source 1024 rows (1048576 elements) per trip; the
+        # staged copy carries the term in its read of the input, the consumer
+        # reads the copy at a fixed address.
+        hint = DimHint(
+            dim_names=[],
+            split_count=1,
+            loop_var=u0,
+            is_reduction=False,
+            loop_var_range=sympy.Integer(32),
         )
-        consumer.loop_info = CoarseTileInfo(
-            (0,), [sympy.Integer(32)], [[]], tiled_dims_per_read=[[[]]]
-        )
+        for op in (stage, consumer):
+            op.dim_hints = [hint]
+        stage.loop_member = LoopMember((0,), [sympy.Integer(32)], [[]])
+        consumer.loop_member = LoopMember((0,), [sympy.Integer(32)], [[]])
         consumer._read_copy_elision_record = ReadCopyElisionRecord(
             consumer_name="consumer",
             copy_name="stage",
             source_name="input",
             direct_inner_fn=lambda i: ops.load(
-                "input", 1024 * i[2] + 128 * i[0] + i[1]
+                "input", 1024 * i[2] + 128 * i[0] + i[1] + 1048576 * u0
             ),
-            direct_tiled_dims_per_level=(((2, sympy.Integer(1024)),),),
-            direct_squeezed_advance_per_level=((),),
         )
+        graph.original_affine_bounds = original_affine_bounds
         yield graph, stage, consumer
+
+
+def test_a_looped_direct_read_is_declined_while_the_local_bound_ignores_the_loop_term(
+    staged_transport_graph, monkeypatch
+):
+    """Pins today's behaviour (#6509): with the production ``_affine_bounds`` the
+    direct read of a looped consumer, which carries its loop term in the index, is
+    declined, although its advance bound is right. The fixture patches the local bound
+    so the other tests can reach the pricing; fixing #6509 turns this test into the
+    positive one."""
+    from torch_spyre._inductor import read_copy_elision as rce
+
+    graph, stage, consumer = staged_transport_graph
+    monkeypatch.setattr(rce, "_affine_bounds", graph.original_affine_bounds)
+    direct, reason = rce._prove_matmul_direct_read(
+        consumer, stage, consumer._read_copy_elision_record
+    )
+    assert direct is None
+    assert reason == "source element range is not statically provable"
 
 
 def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_graph):
@@ -591,7 +636,6 @@ def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_grap
     "failure",
     [
         "one_candidate",
-        "validation",
         "disabled",
         "shared",
         "graph_output",
@@ -621,8 +665,6 @@ def test_projection_declines_without_a_universal_proof(
                 return proof(op, *args)
 
             monkeypatch.setattr(rce, "_prove_matmul_direct_read", prove)
-        elif failure == "validation":
-            monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
         elif failure == "disabled":
             pass  # read_copy_elision=False, patched above
         elif failure == "source_placement":
@@ -756,7 +798,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
                 name="other", layout=consumer.layout, data=consumer.data
             )
             other.operation_name = "other"
-            other.loop_info = consumer.loop_info
+            other.loop_member = consumer.loop_member
             commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
             graph.operations.append(other)
             graph.name_to_buffer[other.name] = other
