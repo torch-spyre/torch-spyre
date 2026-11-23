@@ -185,39 +185,59 @@ inputs:
       building its own. Empty = build .venv in the workspace.
     required: false
     default: ''
-  clickhouse-host:
-    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+  clickhouse-v2-host:
+    description: ClickHouse endpoint serving the v2 database. Empty (with clickhouse-host also empty) = skip the whole ingest (clean no-op).
     required: false
     default: ''
-  clickhouse-port:
-    description: ClickHouse port (default 443 inside the script).
+  clickhouse-v2-port:
+    description: Port of clickhouse-v2-host (default 443 inside the library).
     required: false
     default: ''
-  clickhouse-user:
-    description: ClickHouse user (default "default" inside the script).
+  clickhouse-v2-user:
+    description: Scoped v2 writer login; required once a host is set.
     required: false
     default: ''
-  clickhouse-pass:
-    description: ClickHouse password.
-    required: false
-    default: ''
-  clickhouse-db:
-    description: ClickHouse database (default "spyre" inside the script).
+  clickhouse-v2-pass:
+    description: Password for clickhouse-v2-user.
     required: false
     default: ''
   clickhouse-db-v2:
-    description: >
-      Schema-v2 database. Every v2 statement is qualified with it, because test_cases and
-      benchmark_runs exist in both generations with incompatible shapes. Empty makes the v2
-      write a no-op, so an un-updated caller is unaffected.
+    description: The v2 database every statement is written to.
+    required: false
+    default: spyre_v2
+  clickhouse-host:
+    description: Deprecated, used when clickhouse-v2-host is empty (host and port resolve together).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: Deprecated, see clickhouse-host. Never used once clickhouse-v2-host is set.
+    required: false
+    default: ''
+  clickhouse-user:
+    description: Deprecated, used when clickhouse-v2-user is empty (user and password resolve together). Never used once clickhouse-v2-host is set.
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: Deprecated, see clickhouse-user. Never used once clickhouse-v2-host is set.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: Deprecated and ignored (the legacy database); everything is written to clickhouse-db-v2.
     required: false
     default: ''
   schema:
-    description: >
-      Which schema generation to write: v1 (default) | v2 | both. `both` is the migration
-      window -- v1 stays authoritative while v2 accumulates the same runs.
+    description: Deprecated and ignored; the schema is always v2.
     required: false
     default: ''
+  strict:
+    description: >
+      'true' (default) passes --strict: a failed v2 write, an unrecorded artifact verdict, a tag
+      that fell back to misc, or v2 tables the login cannot see fail the step. 'false' downgrades
+      those, and parked rows (exit 75), to warnings. It does not cover a missing login, an
+      unreachable host or a perf report with no records, which still fail (use continue-on-error
+      on the step to tolerate an outage). An unset host skips either way.
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -232,7 +252,8 @@ runs:
       id: gate
       shell: bash
       env:
-        CH_HOST: ${{ inputs.clickhouse-host }}
+        CH_V2_HOST_IN: ${{ inputs.clickhouse-v2-host }}
+        CH_OLD_HOST_IN: ${{ inputs.clickhouse-host }}
         XML_DIR: ${{ inputs.xml-dir }}${{ inputs.vllm-results-dir }}${{ inputs.sendnn-report }}${{ inputs.benchmarks-dir }}${{ inputs.tables-dir }}${{ inputs.bench-dir
           }}
         VENV: ${{ inputs.venv }}
@@ -256,6 +277,7 @@ runs:
               exit 1 ;;
           esac
         fi
+        CH_HOST="${CH_V2_HOST_IN:-${CH_OLD_HOST_IN}}"
         if [ -z "${CH_HOST}" ]; then
           echo "::notice::ClickHouse host not configured — skipping ingest."
           echo "configured=false" >> "$GITHUB_OUTPUT"
@@ -331,17 +353,18 @@ runs:
       if: steps.gate.outputs.configured == 'true'
       shell: bash
       env:
-        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
-        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
-        # Port/user/db are optional. Only export them when non-empty: the script
-        # reads PORT via int(os.environ.get("CLICKHOUSE_PORT", 443)), so an
-        # empty-string value would break int(""), and empty user/db would
-        # override the script's sensible defaults ("default" / "spyre").
-        CH_PORT_IN: ${{ inputs.clickhouse-port }}
-        CH_USER_IN: ${{ inputs.clickhouse-user }}
-        CH_DB_IN: ${{ inputs.clickhouse-db }}
-        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
+        CH_V2_HOST_IN: ${{ inputs.clickhouse-v2-host }}
+        CH_V2_PORT_IN: ${{ inputs.clickhouse-v2-port }}
+        CH_V2_USER_IN: ${{ inputs.clickhouse-v2-user }}
+        CH_V2_PASS_IN: ${{ inputs.clickhouse-v2-pass }}
+        CH_OLD_HOST_IN: ${{ inputs.clickhouse-host }}
+        CH_OLD_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_OLD_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_OLD_PASS_IN: ${{ inputs.clickhouse-pass }}
+        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 || 'spyre_v2' }}
+        CH_DB_OLD_IN: ${{ inputs.clickhouse-db }}
         SCHEMA_IN: ${{ inputs.schema }}
+        STRICT_IN: ${{ inputs.strict }}
         PLATFORM_IN: ${{ inputs.platform }}
         COMPONENT_IN: ${{ inputs.component }}
         ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
@@ -372,15 +395,26 @@ runs:
         TRIGGER_TYPE_IN: ${{ inputs.trigger-type }}
       run: |
         source "${VENV}/bin/activate"
-        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
-        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
-        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        # Only exported when non-empty: target_database() treats an unset value as "v2 not
-        # configured", which is what makes the v1 default cost nothing.
-        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
-        [ -n "${SCHEMA_IN}" ] && export INGEST_SCHEMA="${SCHEMA_IN}"
+        # Host and login resolve as one unit: a v2 host never receives the deprecated login.
+        if [ -n "${CH_V2_HOST_IN}" ]; then
+          CH_HOST_IN="${CH_V2_HOST_IN}" CH_PORT_IN="${CH_V2_PORT_IN}" CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"
+        else
+          CH_HOST_IN="${CH_OLD_HOST_IN}" CH_PORT_IN="${CH_OLD_PORT_IN}"
+          if [ -n "${CH_V2_USER_IN}" ]; then CH_USER_IN="${CH_V2_USER_IN}" CH_PASS_IN="${CH_V2_PASS_IN}"; else CH_USER_IN="${CH_OLD_USER_IN}" CH_PASS_IN="${CH_OLD_PASS_IN}"; fi
+        fi
+        if [ -n "${SCHEMA_IN}" ] && [ "${SCHEMA_IN}" != v2 ]; then echo "::warning::the schema input is deprecated and ignored: writing v2 only"; fi
+        if [ -n "${CH_DB_OLD_IN}" ] && [ "${CH_DB_OLD_IN}" != "${CH_DB_V2_IN}" ]; then echo "::warning::the clickhouse-db input is deprecated and ignored: writing to ${CH_DB_V2_IN}"; fi
+        [ -n "${CH_USER_IN}" ] && [ -n "${CH_PASS_IN}" ] || { echo "::error::a ClickHouse host is set but the login is missing: set clickhouse-v2-user and clickhouse-v2-pass (a v2 host never gets the deprecated login)"; exit 1; }
+        export CLICKHOUSE_HOST="${CH_HOST_IN}" CLICKHOUSE_V2_HOST="${CH_HOST_IN}"
+        export CLICKHOUSE_USER="${CH_USER_IN}" CLICKHOUSE_V2_USER="${CH_USER_IN}"
+        export CLICKHOUSE_PASS="${CH_PASS_IN}" CLICKHOUSE_V2_PASSWORD="${CH_PASS_IN}"
+        export CLICKHOUSE_DB="${CH_DB_V2_IN}" CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
+        unset CLICKHOUSE_PORT CLICKHOUSE_V2_PORT
+        [ -z "${CH_PORT_IN}" ] || export CLICKHOUSE_PORT="${CH_PORT_IN}" CLICKHOUSE_V2_PORT="${CH_PORT_IN}"
+        export INGEST_SCHEMA=v2
         # Optional flags only when set: an empty --arch would override the host-arch default.
-        ARGS=()
+        ARGS=(--schema v2)
+        [ "${STRICT_IN}" = false ] || ARGS+=(--strict)
         [ -n "${PLATFORM_IN}" ] && ARGS+=(--arch "${PLATFORM_IN}")
         [ -n "${COMPONENT_IN}" ] && ARGS+=(--component "${COMPONENT_IN}")
         [ -n "${RUN_ATTEMPT_IN}" ] && ARGS+=(--run-attempt "${RUN_ATTEMPT_IN}")
@@ -410,6 +444,7 @@ runs:
           kv="${kv//[[:space:]]/}"
           [ -n "${kv}" ] && ARGS+=(--perf "${kv}")
         done <<< "${PERF_IN}"
+        rc=0
         python -m spyre_clickhouse_ingest results \
           --workflow "${WORKFLOW_IN}" \
           --branch "${BRANCH_IN}" \
@@ -419,4 +454,47 @@ runs:
           --triggered-at "${TRIGGERED_AT_IN}" \
           --pr-number "${PR_NUMBER_IN}" \
           --trigger-type "${TRIGGER_TYPE_IN}" \
-          "${ARGS[@]}"
+          "${ARGS[@]}" || rc=$?
+        # strict=false: parked rows (exit 75) are a warning, not a failed step.
+        if [ "${rc}" -eq 75 ] && [ "${STRICT_IN}" = false ]; then
+          echo "::warning title=ClickHouse::rows were parked, not stored; strict is false, so the step passes"
+          rc=0
+        fi
+        exit "${rc}"
+
+    # The spool holds full rows and is never uploaded; `spool list` prints one line per batch without them.
+    - name: Publish a rows-free manifest of parked ClickHouse rows
+      id: ch-spool
+      if: always() && steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        VENV: ${{ inputs.venv || '.venv' }}
+      run: |
+        spool="${CH_WRITE_SPOOL:-${RUNNER_TEMP}/ch-spool}"
+        compgen -G "${spool}/[0-9]*.json" > /dev/null || exit 0
+        py="${VENV:-.venv}/bin/python"
+        if [ ! -x "${py}" ]; then
+          echo "::warning title=ClickHouse::rows are parked in ${spool}, but this action's venv is missing"
+          exit 0
+        fi
+        # One manifest line per batch for the whole job: batches another action already listed are skipped.
+        seen="${RUNNER_TEMP}/ch-spool-listed.jsonl"
+        touch "${seen}"
+        errs="${RUNNER_TEMP}/ch-spool-list.err"
+        CH_WRITE_SPOOL="${spool}" "${py}" -m spyre_clickhouse_ingest spool list 2> "${errs}" \
+          | grep -vxF -f "${seen}" > "${RUNNER_TEMP}/ch-spool-manifest.jsonl" || true
+        if [ -s "${errs}" ]; then
+          echo "::warning title=ClickHouse spool::$(head -c 500 "${errs}" | tr '\n' ' ')"
+        fi
+        [ -s "${RUNNER_TEMP}/ch-spool-manifest.jsonl" ] || exit 0
+        cat "${RUNNER_TEMP}/ch-spool-manifest.jsonl" >> "${seen}"
+        { echo "parked=true"; echo "id=$(date +%s)-${RANDOM}${RANDOM}"; } >> "$GITHUB_OUTPUT"
+        echo "::warning title=ClickHouse::rows were parked, not stored; see the step summary"
+
+    - name: Upload the parked-rows manifest
+      if: always() && steps.ch-spool.outputs.parked == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ch-spool-manifest-xml-${{ github.job }}-${{ github.run_attempt }}-${{ steps.ch-spool.outputs.id }}
+        path: ${{ runner.temp }}/ch-spool-manifest.jsonl
+        retention-days: 7

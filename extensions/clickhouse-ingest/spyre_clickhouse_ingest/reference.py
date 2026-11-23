@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .batching import BatchParked
 
 COMPONENT = "reference"
 TAG_FAMILY = "reference"
@@ -1264,6 +1265,11 @@ def write(client, db: str, doc: dict, ctx: WriteContext, dry_run: bool = False) 
         raise
     except (AttributeError, KeyError, TypeError, ValueError, AssertionError):
         raise  # a bug, not a write error: never retried
+    except BatchParked as err:  # the retry resumes the write; a replay of these batches would double them
+        raise ReferenceError(
+            f"reference rows parked, not stored ({err}): retry the upload to resume; do not replay them",
+            retry=True,
+        ) from err
     except Exception as err:  # noqa: BLE001 -- a driver or storage error: the same upload resumes where it stopped
         raise ReferenceError(f"reference write failed: {err!r}", retry=True) from err
     return {

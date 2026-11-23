@@ -3,8 +3,8 @@ description: >
   Runs a single run_test.sh config once. A stall (no stdout for
   stall_timeout_secs) kills the attempt and retries it once, in the same
   pod, with -n1 (pytest-xdist worker isolation). Any other failure is left
-  for pod-level retry (_test_matrix.yaml's test_retry/test_multi_spyre_retry
-  jobs) instead of retrying here.
+  for pod-level retry (_test_matrix.yaml's test_retry/test_retry_final jobs)
+  instead of retrying here.
 
 inputs:
   torch_spyre_dir:
@@ -349,7 +349,7 @@ runs:
         echo "=== Attempt 1 FAILED (exit=${TEST_EXIT}) ==="
 
         if [[ $_STALLED -ne 1 ]]; then
-          echo "    --> Non-stall failure — leaving retry to the pod-level retry (test_retry/test_multi_spyre_retry)"
+          echo "    --> Non-stall failure — leaving retry to the pod-level retry (test_retry/test_retry_final)"
           exit 1
         fi
 

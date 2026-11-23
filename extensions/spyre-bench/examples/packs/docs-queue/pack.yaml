@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: docs-queue, owner: example-team, description: "message-queue benchmarks: the pack the developer guides build"}
+spec:
+  prefix: mq
+  version: 0.1.0
+  requires: {core: "0.2"}
+  types:
+    - {name: broker, for: System, schema: schemas/system-broker.json}
+    - {name: produce, for: Workload, schema: schemas/workload-produce.json, levels: [service], runner: producer,
+       load: [closed], default_metrics: [mq.throughput, mq.latency.p99, mq.errors.ratio], non_identity: [progress_s]}
+  attributes:
+    - {key: system.partitions, class: identity, role: root, type: int, order: numeric, plot: true}
+    - {key: case.message_bytes, class: identity, role: root, type: int, order: numeric, plot: true}
+    - {key: env.fp.broker.version, class: environment, role: root, type: string, fingerprint: true}
+  runners:
+    - {name: producer, protocol: process/v1, command: [python3, -m, mq_bench.producer]}
+  probes:
+    - {name: broker-version, protocol: process/v1, command: [python3, -m, mq_bench.probe], produces: [env.fp.broker.version]}
+  gates:
+    - {id: mq.broker_ready, phase: pre, reason: BROKER_NOT_READY, check: "broker accepts a test message"}
+  metrics:
+    - {name: mq.throughput, unit: "{message}/s", direction: higher_is_better, category: performance, statistic: value, compare: relative,
+       noise: {min_repeats: 3, cv_max: 0.05}, description: "sustained messages per second after warmup"}
+    - {name: mq.latency.p99, unit: s, direction: lower_is_better, category: performance, statistic: p99, compare: relative,
+       noise: {min_repeats: 3}, description: "99th percentile produce-to-ack latency"}
+    - {name: mq.errors.ratio, unit: "1", direction: lower_is_better, category: performance, statistic: ratio, compare: absolute,
+       noise: {min_repeats: 3}, description: "failed sends divided by attempted sends"}
+    - {name: mq.depth.max, unit: "{message}", direction: none, category: diagnostic, statistic: max, compare: exact,
+       description: "largest backlog seen during the run; context for a throughput change, never judged"}

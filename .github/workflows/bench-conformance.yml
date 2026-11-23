@@ -8,6 +8,8 @@ on:
     paths:
       - benchmarks/**
       - mk/bench.mk
+      - .github/workflows/_test_matrix.yaml
+      - .github/workflows/integration-tests.yaml
       - extensions/spyre-bench/**
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/identity.py
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/results.py
@@ -43,10 +45,11 @@ jobs:
       - name: Install the engine and the ingest
         run: |
           uv venv
-          uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml pytest
+          uv pip install ./extensions/spyre-bench ./extensions/clickhouse-ingest lxml pytest jsonschema
       - name: Validate, check ids, run the tests
         run: |
           export PATH="${GITHUB_WORKSPACE}/.venv/bin:${PATH}"
           make bench-validate BENCH_REQUIRED=1
           make bench-check-ids BENCH_REQUIRED=1
           python -m pytest -q -p no:cacheprovider benchmarks/tests
+          python -m pytest -q -p no:cacheprovider extensions/spyre-bench/tests/test_docs_examples.py extensions/spyre-bench/tests/test_docs_snippets.py

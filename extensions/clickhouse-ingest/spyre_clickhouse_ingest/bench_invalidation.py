@@ -624,7 +624,10 @@ def apply(
             actor, e["evidence_url"], {"channel": channel, **{k: str(v) for k, v in (props or {}).items()}},
         ])  # fmt: skip
     if rows and not dry_run:
-        client.insert("result_invalidations", rows, column_names=list(COLUMNS))
+        from . import writes
+
+        if writes.insert(client, "result_invalidations", rows, list(COLUMNS)) is None:
+            client.insert("result_invalidations", rows, column_names=list(COLUMNS))
     return results
 
 
