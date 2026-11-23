@@ -21,7 +21,13 @@ each through its own start address (``nonUnifiedAllocInHBM_``).
 
 Two op kinds are admitted:
 
-- same-shape pointwise ops: the result has the operands' placement;
+- same-shape pointwise ops: the result has the sharded operands' placement.
+  Such an op may also read *unsharded* operands, which act as read-only
+  replicas: a scalar constant, or a plain unified graph input (a bias, or a
+  full-size tensor). Every core reads the replica through the ordinary
+  unified addressing, so no shard table is involved. Sharded operands must
+  still agree on one placement; two different placements need data movement
+  between chunks and are rejected;
 - shard-local reductions: a reduction over dims that do not include the
   shard dim. Each core reduces its own shard and writes its own output
   shard, so no data crosses shards. The result is sharded along the
@@ -52,6 +58,7 @@ from torch._inductor.virtualized import V
 
 from . import config
 from .errors import Unsupported
+from .ir import SpyreConstantFallback
 from .pass_utils import op_read_writes
 from torch_spyre.sharding import _require_exact_int, _require_int_list
 
@@ -246,21 +253,29 @@ def _mutation_target(op: ComputedBuffer) -> str | None:
     return target.get_name() if hasattr(target, "get_name") else None
 
 
-def verify_mixed_ring_args(sdsc_spec, shard_kernel_args) -> None:
-    """Codegen guard for a ring reduction: sharded inputs, one plain output.
+def verify_mixed_args(sdsc_spec, shard_kernel_args) -> None:
+    """Codegen guard for a kernel that mixes sharded and ordinary tensors.
 
-    A cross-shard reduction reads sharded storage (non-unified, one start per
-    core) and writes an ordinary tensor that the ring chain's end core fills.
-    Every non-sharded argument must be that output.
+    Two shapes are admitted:
+
+    - a cross-shard (ring) reduction reads sharded storage (non-unified, one
+      start per core) and writes an ordinary tensor that the ring chain's end
+      core fills: the one ordinary argument is the output;
+    - a pointwise op writes a sharded output and may also read ordinary
+      inputs (a scalar constant or a unified tensor, see ``plan_sharded_hbm``).
+      Those are addressed as in any unified kernel, so only the output is
+      constrained.
     """
     # SDSC args list inputs first and the output last. (For a reduction,
     # ``num_inputs`` counts the output too, because it is also the
     # accumulator, so position is the reliable test.)
+    output = len(sdsc_spec.args) - 1
     plain = [i for i, t in enumerate(sdsc_spec.args) if not t.non_unified]
-    if plain != [len(sdsc_spec.args) - 1] or not shard_kernel_args:
+    if not shard_kernel_args or (output in plain and plain != [output]):
         raise Unsupported(
-            "non-unified kernels need every tensor argument sharded, except the "
-            "single output of a cross-shard (ring) reduction"
+            "non-unified kernels need a sharded output, or sharded inputs and "
+            "one ordinary output (a cross-shard ring reduction); other "
+            "ordinary arguments may only be inputs"
         )
 
 
@@ -508,14 +523,83 @@ def _plan_shard_local_reduction(
     return out_placement
 
 
+def _describe_placements(placements: set[ShardedPlacement]) -> str:
+    return " and ".join(
+        f"Shard({p.shard_dim}) over {p.num_shards} shards "
+        f"({p.shard_device_bytes} B each)"
+        for p in sorted(
+            placements,
+            key=lambda p: (p.shard_dim, p.num_shards, p.shard_device_bytes),
+        )
+    )
+
+
+def _require_replica_source(graph: GraphLowering, name: str, dep: MemoryDep) -> None:
+    """An unsharded operand of a sharded pointwise op must be a read-only
+    replica that exists before the kernel runs: a scalar constant or a graph
+    input. Anything computed in the graph would be placed (LX, HBM pool) by
+    planning passes that know nothing about the shard plan, so it fails closed.
+    """
+    if dep.name in graph.graph_inputs or isinstance(
+        graph.try_get_buffer(dep.name), SpyreConstantFallback
+    ):
+        return
+    raise Unsupported(
+        f"{name}: non-unified kernels admit an unsharded operand only when it "
+        f"is a scalar constant or a graph input; {dep.name} is computed in the "
+        "graph (compute it outside the compiled function and pass it in)"
+    )
+
+
+def _require_replica_read(
+    graph: GraphLowering,
+    name: str,
+    dep: MemoryDep,
+    write: MemoryDep,
+    size: list[int],
+) -> None:
+    """The unsharded operand must be the op's shape, or broadcast to it.
+
+    The operand keeps ordinary unified addressing: with the split pinned to
+    the shard dim, core c reads the part of it that matches its shard (the
+    whole operand when it does not span the shard dim: a scalar, or a bias
+    broadcast along it). That is the addressing every unified multi-core
+    kernel already uses, and the pinned split is checked against the same
+    work-division constraints as any other split.
+
+    What is admitted is torch broadcasting only: right-aligned dims equal to
+    the op's or 1, and an index built from the write's own iteration
+    variables. Indirect or otherwise reindexed reads fail closed.
+    """
+    buf = graph.get_buffer(dep.name)
+    shape = [int(s) for s in buf.get_size()] if buf is not None else None
+    if (
+        shape is None
+        or len(shape) > len(size)
+        or any(
+            got not in (1, want)
+            for got, want in zip(shape, size[len(size) - len(shape) :])
+        )
+        or not dep.index.free_symbols <= write.index.free_symbols
+    ):
+        raise Unsupported(
+            f"{name}: non-unified kernels read an unsharded operand ({dep.name}, "
+            f"shape {shape}) only as the op's shape {size} or broadcast to it "
+            "(no reindexing or indirect reads)"
+        )
+
+
 def plan_sharded_hbm(graph: GraphLowering) -> None:
     """Pin the work split of ops on sharded operands to their shard plan.
 
-    Admits two kinds of op whose memory reads are all sharded with one
-    placement (no broadcast, no redistribution):
+    Admits two kinds of op whose sharded reads all have one placement (no
+    redistribution between placements):
 
-    - same-shape pointwise ops that read each operand with the write's index;
-      the output gets the same placement;
+    - same-shape pointwise ops that read each sharded operand with the write's
+      index; the output gets the same placement. They may also read unsharded
+      operands as read-only replicas (see ``_require_replica_source`` and
+      ``_require_replica_read``): a scalar constant, or a graph input of the
+      op's shape or broadcast to it;
     - shard-local reductions (see ``_plan_shard_local_reduction``) of one
       sharded operand; the output gets the remapped placement.
 
@@ -557,11 +641,20 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
                 "dynamic=False"
             )
         placement = sharded[0]
-        if any(p != placement for p in sharded) or len(sharded) != len(reads):
+        if len(set(sharded)) > 1:
             raise Unsupported(
-                f"{name}: non-unified kernels need every operand sharded with the "
-                "same placement"
+                f"{name}: non-unified kernels cannot combine operands sharded "
+                f"differently ({_describe_placements(set(sharded))}); moving "
+                "data between placements is not supported"
             )
+        unsharded = [dep for dep in reads if dep.name not in placements]
+        if unsharded and is_reduction:
+            raise Unsupported(
+                f"{name}: non-unified kernels admit an unsharded operand only "
+                f"in pointwise ops; this reduction also reads {unsharded[0].name}"
+            )
+        for dep in unsharded:
+            _require_replica_source(graph, name, dep)
         if any(not isinstance(dep, MemoryDep) for dep in rw.reads):
             raise Unsupported(
                 f"{name}: non-unified kernels need plain pointwise reads "
@@ -589,7 +682,8 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             else:
                 ring_reductions.add(name)
             continue
-        for dep in reads:
+        sharded_reads = [dep for dep in reads if dep.name in placements]
+        for dep in sharded_reads:
             buf = graph.get_buffer(dep.name)
             if buf is None or list(buf.get_size()) != list(op.get_size()):
                 raise Unsupported(
@@ -598,11 +692,11 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
                 )
         write = next(iter(rw.writes))
         if not isinstance(write, MemoryDep) or any(
-            d.index != write.index for d in reads
+            d.index != write.index for d in sharded_reads
         ):
             raise Unsupported(
-                f"{name}: non-unified kernels need operands read element for "
-                "element (no broadcast or reindexing)"
+                f"{name}: non-unified kernels need sharded operands read element "
+                "for element (no broadcast or reindexing)"
             )
         size = [int(s) for s in op.get_size()]
         if len(size) == 0 or size[placement.shard_dim] % placement.num_shards:
@@ -617,6 +711,8 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             )
         _check_shard_layout(name, size, op.get_dtype(), placement)
         sym = _shard_symbol(write, size, placement.shard_dim)
+        for dep in unsharded:
+            _require_replica_read(graph, name, dep, write, size)
         op.shard_pinned_splits = {sym: placement.num_shards}
         placements[name] = placement
     # A sharded result is allocated as sharded storage only at the graph
