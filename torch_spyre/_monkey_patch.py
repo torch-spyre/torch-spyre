@@ -716,6 +716,7 @@ def _patch_tensor_for_spyre():
     # ──────── while_loop writes to additional inputs (pytorch#195393) ────────
     # Keeps a loop whose only effect is writing a captured tensor, such as
     # for_each_tile(out=...)'s destination, and orders later reads after it.
+    # Remove in torch 2.15: https://github.com/pytorch/pytorch/pull/195393
     # ──────────────────────────────────────────────────────────────────────────
     _patch_while_loop_additional_input_mutation()
 
@@ -1015,8 +1016,9 @@ def _patch_while_loop_additional_input_mutation() -> bool:
     Only on torch 2.14: 2.13's scan cannot mutate its inputs, and 2.15 has the fix.
     Returns whether the patch is active. Idempotent.
 
-    TODO: remove when the pin reaches torch 2.15; TestWhileLoopMutationBackportProbe
-    in tests/inductor/test_for_each_tile.py then XPASSes.
+    TODO: remove in torch 2.15, which ships the upstream fix,
+    https://github.com/pytorch/pytorch/pull/195393. TestWhileLoopMutationBackportProbe
+    in tests/inductor/test_for_each_tile.py XPASSes then.
     """
     import functools
 

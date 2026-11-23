@@ -109,6 +109,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.wsr import Gather, Slice, for_each_tile
@@ -2207,6 +2208,43 @@ class TestWhileLoopMutationBackportProbe(unittest.TestCase):
             col_sums = torch.compile(fn, backend="inductor", fullgraph=True)(x, dest)
         torch.testing.assert_close(dest, 2 * x)
         torch.testing.assert_close(col_sums, (2 * x).sum(dim=0))
+
+
+class TestSingleFlatOutputScanProbe(unittest.TestCase):
+    """Detects when the pinned torch lowers a scan whose only flat output is one tensor.
+
+    torch 2.14 cannot (fixed by https://github.com/pytorch/pytorch/pull/197832, in
+    torch 2.15), so for_each_tile gives such a scan a second scalar carry: the step
+    counter of a one-leaf reduction (`count_mode`) and the extra scalar of map mode
+    with `out=`. A strict XPASS means the pinned torch has the fix: drop both
+    workarounds and this probe.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason=(
+            "torch 2.14's decompose_scan_to_while_loop leaves the getitem users of a "
+            "one-element scan result on the replacement, so lowering fails with "
+            "'getitem is not an OpOverload' (pytorch/pytorch#197832, in torch 2.15)"
+        ),
+    )
+    def test_stock_scan_with_one_flat_output_lowers(self):
+        from torch._higher_order_ops.scan import scan
+        from torch._inductor import config as inductor_config
+
+        def fn(x):
+            def step(acc, x_t):
+                return acc + x_t, ()
+
+            final, _ = scan(step, torch.zeros(4), x)
+            return final
+
+        x = torch.randn(3, 4)
+        torch._dynamo.reset()
+        with torch.no_grad(), inductor_config.patch(force_disable_caches=True):
+            out = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+        torch.testing.assert_close(out, x.sum(dim=0))
 
 
 class TestCallerOwnedOutput(unittest.TestCase):

@@ -61,10 +61,10 @@ class Gather:
     `index` is a contiguous 1-D integer tensor and its length corresponds to the
     loop's trip count.
 
-    As `out_dim` together with `out=`, the direction reverses: step `i` writes its
-    output tile into the caller's destination at the rows `index[i]` names along
-    `axis`. There `index` may also be 2-D, `[trip count, rows]`, for `rows` rows per
-    step.
+    Used as `out_dim` with `out=`, a Gather writes instead of reads: step `i`
+    writes its output tile into rows `index[i]` of the caller's destination, along
+    `axis`. Here `index` may also be 2-D, `[trip count, rows]`, so that each step
+    writes `rows` rows.
     """
 
     axis: int
@@ -487,7 +487,8 @@ def _normalize_out(out, out_dim, num_tiles) -> _OutSpec:
             "for_each_tile() out must be a tensor or a non-empty pytree of tensors"
         )
     if isinstance(out_dim, int) and not isinstance(out_dim, bool):
-        # TODO: out= with out_dim=int, step i writing narrow(d, i*extent, extent).
+        # TODO: a follow-up PR adds out= with out_dim=int, where step i writes
+        # narrow(d, i*extent, extent) of out.
         raise NotImplementedError(
             "for_each_tile() out= supports out_dim=Gather(axis, index) only so far; "
             "for an int out_dim, leave out=None and use the returned output"
@@ -533,11 +534,12 @@ def _normalize_out(out, out_dim, num_tiles) -> _OutSpec:
     return _OutSpec(tuple(t for _, t in leaves_with_path), tuple(dims), index)
 
 
-def _write_out_tiles(spec: _OutSpec, targets, y, row) -> None:
+def _write_out_tiles(spec: _OutSpec, targets, y, dest_rows) -> None:
     """Scatter one step's output tiles into the caller's destinations, in place.
 
     `targets` are the destination leaves as the body sees them (lifted operands) and
-    `row` is this step's index row. Each write is one `index_copy_` on the target
+    `dest_rows` is this step's row of the out_dim=Gather index, the destination rows
+    its tiles are written to. Each write is one `index_copy_` on the target
     itself: through a `narrow`/`select` of it, Inductor would copy the destination
     region on every step.
     """
@@ -547,7 +549,7 @@ def _write_out_tiles(spec: _OutSpec, targets, y, row) -> None:
             f"for_each_tile() out has {len(targets)} leaves but the body returns "
             f"{len(tiles)} output tiles"
         )
-    ids = row.reshape(-1)
+    dest_rows = dest_rows.reshape(-1)
     for k, (target, tile, dim) in enumerate(zip(targets, tiles, spec.dims)):
         if not isinstance(tile, torch.Tensor):
             raise ValueError(
@@ -558,13 +560,13 @@ def _write_out_tiles(spec: _OutSpec, targets, y, row) -> None:
                 f"for_each_tile() output tile {k} has dtype {tile.dtype} but out "
                 f"leaf {k} has dtype {target.dtype}"
             )
-        expected = _tile_size_vector(target.shape, dim, ids.shape[0])
+        expected = _tile_size_vector(target.shape, dim, dest_rows.shape[0])
         if tuple(tile.shape) != expected:
             raise ValueError(
                 f"for_each_tile() output tile {k} has shape {tuple(tile.shape)}, but "
                 f"out leaf {k} takes tiles of shape {expected}"
             )
-        target.index_copy_(dim, ids, tile)
+        target.index_copy_(dim, dest_rows, tile)
 
 
 def _movedim(t: torch.Tensor, src: int, dst: int) -> torch.Tensor:
@@ -606,11 +608,11 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     return torch.unflatten(trimmed, 0, (tiles, spec.extent))
 
 
-def _is_index_row_leaf(index: torch.Tensor, o: torch.Tensor, s: TileSpec) -> bool:
-    """Whether an operand's per-step xs slice is row `i` of the out_dim=Gather index."""
+def _is_out_index_leaf(out_index: torch.Tensor, o: torch.Tensor, s: TileSpec) -> bool:
+    """Whether an operand's xs leaf steps through `out_index`, one row per step."""
     if s.kind is Kind.GATHER:
-        return s.index is index
-    return o is index and s.dim == 0 and s.extent == 1
+        return s.index is out_index
+    return o is out_index and s.dim == 0 and s.extent == 1
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
@@ -834,7 +836,9 @@ def for_each_tile(
     # An extra CARRY leaf, not an extra `ys` leaf: the counter is a scalar the body
     # increments, whereas a padded per-step output costs a stacked buffer for the whole
     # trip count and an `aten.copy_` in the innermost body graph.
-    # Fixed upstream by pytorch/pytorch#197832 (torch 2.15).
+    # Fixed upstream by https://github.com/pytorch/pytorch/pull/197832 (torch 2.15):
+    # TestSingleFlatOutputScanProbe in tests/inductor/test_for_each_tile.py XPASSes
+    # then. Remove this counter and map mode's second scalar with it.
     init_leaves = [] if map_mode else tree_leaves(init)
     emits_ys = out_dim is not None and out_spec is None
     count_mode = not map_mode and not emits_ys and len(init_leaves) == 1
@@ -843,22 +847,23 @@ def for_each_tile(
 
     leaf_ops = [(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT]
     xs = tuple(_xs_leaf(o, s) for o, s in leaf_ops)
-    # Take the out_dim=Gather row from an operand that already steps through the
-    # index: a second leaf of that tensor would be a second while_loop carry on its
-    # buffer, which WhileLoop.create clones in full, outside the loop, where a
-    # declared dim is refused.
-    out_row = None
+    # If an operand already steps through the out index one row per step, reuse its
+    # slices instead of passing the index to the loop again. The same tensor passed
+    # twice gives the loop two inputs on one buffer, and torch then copies one of
+    # them in full before the loop: wasted work, and on Spyre an error when the trip
+    # count is declared with dynamic=.
+    out_index_leaf = None
     if out_index is not None:
-        out_row = next(
+        out_index_leaf = next(
             (
                 j
                 for j, (o, s) in enumerate(leaf_ops)
-                if _is_index_row_leaf(out_index, o, s)
+                if _is_out_index_leaf(out_index, o, s)
             ),
             None,
         )
-        if out_row is None:
-            out_row = len(xs)
+        if out_index_leaf is None:
+            out_index_leaf = len(xs)
             xs = (*xs, out_index)
 
     # Operands every step reads whole: invariants, and the pools Gather rows index.
@@ -884,7 +889,9 @@ def for_each_tile(
         )
         next_carry, y = body(carry, tiles)
         if out_spec is not None:
-            _write_out_tiles(out_spec, lifted[len(lifted_idx) :], y, sliced[out_row])
+            _write_out_tiles(
+                out_spec, lifted[len(lifted_idx) :], y, sliced[out_index_leaf]
+            )
         if map_mode:
             next_carry = step + 1 if pad is None else (step + 1, pad + 1)
         elif count_mode:
