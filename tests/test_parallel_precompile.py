@@ -347,6 +347,20 @@ def test_without_placeholders_nothing_changes(monkeypatch):
     assert pool.submitted == 1 and not pool.reports
 
 
+def test_a_caller_can_switch_an_open_pool_to_abort_stand_ins(monkeypatch):
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", lambda *a, **k: None)
+    gm = _graph_with_outputs(((1,), torch.float32))
+    with pp.fork_inner_compiles(1, placeholders=True) as pool:
+        pool.placeholders = False
+        stand_in = spyre_inductor._spyre_inner_compile(gm, [])
+        with pytest.raises(pp.CompileOnlyAbort):
+            stand_in([])
+        assert not pool.reports  # nothing to wait for
+        pool.placeholders = True
+        out = spyre_inductor._spyre_inner_compile(gm, [])([])
+        assert len(out) == 1 and out[0].shape == (1,)
+
+
 def test_the_report_pass_sends_the_specs_once_and_only_in_a_child(monkeypatch):
     graph = types.SimpleNamespace(graph_input_names=[], graph_outputs=[3])
     # Not a child: nothing to send, and the graph is left alone.

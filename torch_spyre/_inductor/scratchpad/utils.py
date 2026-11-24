@@ -122,8 +122,8 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
 def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
     """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
 
-    Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
-    An extern kernel keeps its loop_member (e.g. a loop-body constant that
+    Only SchedulerNodes join a counted loop.
+    An extern kernel keeps its loop membership (e.g. a loop-body constant that
     dedup_and_promote_constants hoisted to the graph head) but runs once,
     outside the loop.
     """
