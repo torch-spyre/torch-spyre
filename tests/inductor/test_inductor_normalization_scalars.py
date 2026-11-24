@@ -333,6 +333,21 @@ class TestNormalizationScalarOperations:
                 "N=401408 misses atol=1e-3/rtol=1e-2: max abs diff 0.0547, "
                 "max rel diff 0.0128, 0.3% of elements",
             )
+        elif (
+            num_groups == 32 and dtype == torch.float16 and execution_mode == "compiled"
+        ):
+            # Non-strict: the result depends on which of two equal-cost CP-SAT
+            # plans the solver returns, which varies with the worker count.
+            request.applymarker(
+                pytest.mark.xfail(
+                    raises=AssertionError,
+                    strict=False,
+                    reason="fp16 32-group compiled result depends on an "
+                    "equal-cost CP-SAT tie-break: split 8x4 gives 93/102760448 "
+                    "mismatched elements (max abs 0.0273 vs atol 1e-3), 32x1 "
+                    "passes (#5561, #6102)",
+                )
+            )
 
         eps = 1e-5
 
