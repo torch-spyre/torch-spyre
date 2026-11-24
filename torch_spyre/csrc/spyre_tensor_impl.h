@@ -98,7 +98,7 @@ inline std::string elementArrangementToString(ElementArrangement ea) {
 // SpyreTensorLayout pickle in module.cpp is stable regardless of source order.
 enum class PADDING {
   UNINITIALIZED = 0,  // padding elements may hold any value
-  CONSTANT = 1,       // DMA sets padding elements to padding_value
+  CONSTANT = 1,       // every padding element holds padding_value
 };
 
 inline std::string paddingToString(PADDING p) {
@@ -140,17 +140,20 @@ class SpyreTensorLayout {
   std::map<std::vector<int64_t>, int64_t> valid_elements;
 
   /**
-   * Signals whether a padding value should be replicated by DMA
+   * Whether every padding element holds one known value. A record only: it
+   * describes the padding a kernel or a DMA left, for the padding analysis of
+   * later graphs. A DMA that fills the padding from it must also handle the
+   * element arrangement, which places the padding lanes.
    */
   PADDING padding = PADDING::UNINITIALIZED;
 
   /**
-   * The value of one padding element, encoded in device_dtype exactly as it
-   * is stored in device memory, so the DMA can replicate these bytes as-is.
-   * Its size is the element size of device_dtype (1 to 8 bytes). Empty unless
-   * padding is PADDING::CONSTANT.
+   * The value every padding element holds, when padding is
+   * PADDING::CONSTANT; 0 otherwise. Stored as a value, not as device bytes,
+   * so any device_dtype and element arrangement can record one (for example
+   * an interleaved fp8 padding that is still one constant).
    */
-  std::vector<uint8_t> padding_value;
+  double padding_value = 0.0;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
@@ -316,16 +319,15 @@ class SpyreTensorLayout {
   }
 
   /**
-   * Set padding to PADDING::CONSTANT and padding_value to the device_dtype
-   * encoding of value. Only SEN169_FP16 and IEEE_FP32 with
-   * ElementArrangement::STANDARD are supported; value is rounded to
-   * device_dtype.
+   * Set padding to PADDING::CONSTANT and padding_value to value. Any
+   * device_dtype and element arrangement is accepted. For SEN169_FP16 and
+   * IEEE_FP32 value is rounded to device_dtype; other formats store it as
+   * given.
    */
   void set_constant_padding(double value);
 
   /**
-   * Decode padding_value back to a double, or std::nullopt when padding is
-   * not PADDING::CONSTANT.
+   * padding_value, or std::nullopt when padding is not PADDING::CONSTANT.
    */
   std::optional<double> constant_padding_value() const;
 
@@ -334,7 +336,7 @@ class SpyreTensorLayout {
    */
   void clear_padding() {
     padding = PADDING::UNINITIALIZED;
-    padding_value.clear();
+    padding_value = 0.0;
   }
 
   /**
@@ -514,8 +516,8 @@ struct hash<spyre::SpyreTensorLayout> {
     //
     // seed = c10::hash_combine(
     //     seed, std::hash<int>{}(static_cast<int>(layout.padding)));
-    // for (uint8_t b : layout.padding_value)
-    //   seed = c10::hash_combine(seed, std::hash<uint8_t>{}(b));
+    // seed = c10::hash_combine(seed,
+    //                          std::hash<double>{}(layout.padding_value));
     return seed;
   }
 };

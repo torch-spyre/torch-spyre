@@ -2725,7 +2725,9 @@ def track_padding_value(graph: GraphLowering) -> None:
             decision = tracer.run_node(op)
             if decision.do_mask:
                 if decision.output_padding is not None:
-                    # set the propagated output padding
+                    # Set the propagated output padding. Any dtype and element
+                    # arrangement can record it, even one that cannot be
+                    # masked or overwritten: the padding is still a constant.
                     op.layout.device_layout.padding_value = decision.output_padding
                 op.input_mask_values = decision.input_vals
             elif decision.do_overwrite:
@@ -2740,13 +2742,6 @@ def track_padding_value(graph: GraphLowering) -> None:
             tracer.handle_mutation_output(op)
 
     _record_mutated_input_padding(graph, tracer)
-
-
-def _can_record_padding(layout: SpyreTensorLayout) -> bool:
-    """Whether layout can record a constant padding (set_constant_padding)."""
-    return layout.element_arrangement == ElementArrangement.STANDARD and (
-        layout.device_dtype in (DataFormats.SEN169_FP16, DataFormats.IEEE_FP32)
-    )
 
 
 def _record_mutated_input_padding(
@@ -2764,13 +2759,13 @@ def _record_mutated_input_padding(
     _SpyreWrapperCodegenMixin._input_padding_update). This only supplies the
     value, so it lists just the inputs whose final padding is proven to be one
     value; the wrapper clears any other mutated input (unknown padding, a
-    fallback-kernel mutation, or a layout that cannot record a value).
+    fallback-kernel mutation, or an input with no device layout).
     """
     padding: dict[str, float] = {}
     for name in graph.graph_input_names:
         pad_set = tracer.buffer_range.get(name)
         stl = _get_stl(graph, graph.get_buffer(name))
-        if pad_set is None or stl is None or not _can_record_padding(stl):
+        if pad_set is None or stl is None:
             continue
         if (value := _single_padding_value(pad_set)) is not None:
             padding[name] = value

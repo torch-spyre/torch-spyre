@@ -28,7 +28,12 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
-from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
+from torch_spyre._C import (
+    PADDING,
+    DataFormats,
+    ElementArrangement,
+    get_device_size_in_bytes,
+)
 
 
 def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.float16):
@@ -1592,20 +1597,43 @@ class TestSpyreTensorLayout(TestCase):
     def test_stl_pickle_writes_v6(self):
         fp16_df = get_device_dtype(torch.float16)
         stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df, {(0, 2): 64, (1,): 1})
+        stl.padding_value = 0.5
         state = stl.__getstate__()
         self.assertEqual(state[0], 6)
         self.assertEqual(len(state), 8)
+        restored = pickle.loads(pickle.dumps(stl))
+        self.assertEqual(restored.padding_value, 0.5)
+
+    def test_constant_padding_in_any_format(self):
+        """Any dtype and element arrangement records a constant padding: an
+        interleaved padding (fp8, DL16_TO_FP32) is still one value."""
+        for df, ea in (
+            (DataFormats.IEEE_FP32, ElementArrangement.DL16_TO_FP32),
+            (DataFormats.SEN143_FP8, ElementArrangement.STANDARD),
+            (DataFormats.SENINT8, ElementArrangement.STANDARD),
+        ):
+            with self.subTest(df=df, ea=ea):
+                stl = SpyreTensorLayout(
+                    [2, 64], [64, 1], df, {(0,): 2, (1,): 64}, ea, padding_value=0.0
+                )
+                self.assertEqual(stl.padding, PADDING.CONSTANT)
+                self.assertEqual(stl.padding_value, 0.0)
+                restored = pickle.loads(pickle.dumps(stl))
+                self.assertEqual(restored.padding_value, 0.0)
+                stl.padding_value = None
+                self.assertEqual(stl.padding, PADDING.UNINITIALIZED)
+                self.assertIsNone(stl.padding_value)
 
     def test_stl_v5_pickle_loads_without_padding(self):
         """A v5 pickle (no padding fields) loads with UNINITIALIZED padding."""
         fp16_df = get_device_dtype(torch.float16)
-        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
+        stl = SpyreTensorLayout([2, 32], torch.float16)
         restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
         restored.__setstate__(
             (
                 5,
-                [2, 1, 32],
-                [32, 0, 1],
+                list(stl.device_size),
+                list(stl.stride_map),
                 fp16_df,
                 stl.element_arrangement,
                 dict(stl.valid_elements),

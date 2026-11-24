@@ -14,6 +14,7 @@ __all__: list[str] = [
     "ElementArrangement",
     "SpyreStreamError",
     "SpyreDeviceState",
+    "PADDING",
     "SpyreTensorLayout",
     "SymbolicArg",
     "SymbolicArgKind",
@@ -212,6 +213,22 @@ class ElementArrangement:
     @property
     def value(self) -> int: ...
 
+class PADDING:
+    """
+    Members:
+
+      UNINITIALIZED
+
+      CONSTANT
+    """
+
+    CONSTANT: typing.ClassVar[PADDING]  # value = <PADDING.CONSTANT: 1>
+    UNINITIALIZED: typing.ClassVar[PADDING]  # value = <PADDING.UNINITIALIZED: 0>
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class SpyreTensorLayout:
     def __hash__(self) -> int: ...
     def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
@@ -255,8 +272,11 @@ class SpyreTensorLayout:
     def stride_map(self) -> list[int]: ...
     @property
     def valid_elements(self) -> dict[tuple[int, ...], int]: ...
-    # The constant padding value (rounded to device_dtype), or None when the
-    # padding is uninitialized. Assigning None resets it to uninitialized.
+    @property
+    def padding(self) -> PADDING: ...
+    # The constant padding value, or None when the padding is uninitialized.
+    # Any device_dtype and element arrangement can record one; fp16 and fp32
+    # round it to device_dtype. Assigning None resets it to uninitialized.
     @property
     def padding_value(self) -> float | None: ...
     @padding_value.setter
