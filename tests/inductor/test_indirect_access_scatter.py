@@ -687,10 +687,13 @@ class _ScatterScenarios:
     def test_scatter_dim1_router(self):
         """dst.scatter(1, idx, src) on a [192, 128] fp16 router map -- #4404.
 
-        Llama 4 router densify (K=1). Codegen asserted in
+        Llama 4 router densify (K=1). Codegen used to assert in
         _restickify_restore_elided_dim because the restickify copy-in kept an
-        input-layout override naming the unpadded layout. It now compiles and
-        runs, but the device values still differ from CPU (#4403).
+        input-layout override naming the unpadded layout (#4404, fixed). The
+        compile now stops one step later: the destination is re-tiled so its
+        stick sits on a size-1 dim, and the copy-back out of it is a restickify
+        with an elided input, which needs a gap dim on the destination itself.
+        insert_restickify_padding cannot pad a buffer written in place (#6163).
         """
         T, E = 192, 128
         dst = torch.full((T, E), float("-inf"), dtype=torch.float16).to("spyre")
@@ -699,16 +702,18 @@ class _ScatterScenarios:
         src = (torch.arange(T, dtype=torch.float32) / 7.0).to(torch.float16)
         src = src.unsqueeze(1).to("spyre")
 
-        # The device result is wrong (#4403); drop the pin once that is fixed.
-        self._stage_and_e2e(
-            lambda d, i, s: d.scatter(1, i, s),
-            dst,
-            idx,
-            src,
-            expect=SCATTER_OP_SPEC,
-            expect_close=False,
+        # TODO(#6163): once the copy-back restickifies into a fresh buffer, run
+        # this end to end with _stage_and_e2e; the values still differ from CPU
+        # until #4403 is fixed, so pin that with expect_close=False.
+        result = self.check(
+            lambda d, i, s: d.scatter(1, i, s), dst, idx, src, expect=CRASHED
         )
-        
+        self.assertRegex(
+            str(result.exc),
+            r"insert_restickify_padding: restickify written into a slice of "
+            r"another buffer",
+        )
+
     def test_index_copy_twice_into_one_destination_e2e(self):
         """Two in-place index_copy_ calls into one graph input: the second
         scatter must start from the destination the first one wrote."""
