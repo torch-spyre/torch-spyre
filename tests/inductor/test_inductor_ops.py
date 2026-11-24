@@ -11930,15 +11930,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_count_nonzero_float_dim0(self):
-        # count_nonzero is (x != 0).sum(0). The reduction runs over a non-stick dim, and
-        # its input is the staggered fp32 upcast while the output is STANDARD. The
-        # staggered result is read back without restoring its order (#4393).
+        # count_nonzero is (x != 0).sum(0). The reduction runs over a non-stick dim.
+        # The staggered readback order issue (#4393) was fixed on main.
         x = cached_randint((67, 256), high=2).to(torch.float16)
         self.compare_with_cpu(
             lambda x: torch.count_nonzero(x, dim=0),
