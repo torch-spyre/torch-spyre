@@ -584,7 +584,9 @@ def _contiguous_device_run(
         )
         inner_whole = sympy.And(inner_whole, sympy.Eq(split, 1))
         extent *= size
-    return run
+    # Concrete splits fold the run to a constant. Return it as an ``int`` so the
+    # cost model prices it with Python arithmetic rather than sympy's.
+    return int(run) if run.is_Integer else run
 
 
 def _device_run_axes(coords, dims, iteration_space, stick_planes):
@@ -1567,7 +1569,7 @@ def extract_op_features(
                 _tile_count(_write_index, sym_tiling),
             ),
             dims=list(out_dims),
-            logical=list(out_size),
+            logical=[int(s) if isinstance(s, sympy.Integer) else s for s in out_size],
             loop_factor=out_factor,
             # Against the op's BUFFER name (and its mutation target), not the
             # operation name this arg carries. ``None`` means unstamped, not

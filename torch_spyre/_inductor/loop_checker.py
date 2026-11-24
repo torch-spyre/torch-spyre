@@ -37,11 +37,10 @@ What it checks:
    (an op without one reads as "not in the loop", which would drop its advance
    silently).
 
-A loop no node covers is not checked: span-overflow tiling still stamps flat
-loop ops (stage 7a replaces it), and ``build_loop_scheduler_nodes`` groups them
-later. So rule 4 fires only when a node already claims the op's loop, which is
-how a copy-back placed after its loop by a flat index (#6101) is told from a
-flat loop.
+A loop no node covers is not checked: a loop-tiling lowering requests its
+nodes and the pass loop builds them once the pass has returned. So rule 4 fires
+only when a node already claims the op's loop, which is how a copy-back placed
+after its loop by a flat index (#6101) is told from a loop not yet built.
 
 Rules 4 and 5 compare each op's loop path with the node it sits in, using the
 path that builds the nodes (:func:`counted_loop_path`, which gives an
