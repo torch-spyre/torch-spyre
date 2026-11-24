@@ -6,10 +6,12 @@
  "additionalProperties": false,
  "properties": {
   "endpoint": {
+   "description": "vLLM serves reranking at both /rerank and /v1/rerank; a benchmark declares the one it calls.",
    "enum": [
     "/v1/completions",
     "/v1/chat/completions",
     "/v1/embeddings",
+    "/rerank",
     "/v1/rerank",
     "/pooling"
    ]

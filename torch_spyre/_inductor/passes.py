@@ -96,7 +96,6 @@ from .scratchpad.allocator import (
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
-    build_loop_scheduler_nodes,
     prepare_spyre_kernels,
 )
 from .constants import DEVICE_NAME
@@ -335,18 +334,11 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     The returned list of nodes must also be in topological order.
     """
 
-    # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-    # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
-    # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
-    # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
-    # False), so loop groups survive Inductor fusion intact.
+    # A counted loop reaches the scheduler already as one LoopSchedulerNode (a
+    # CountedLoopSchedulerNode), which SuperDSCScheduling.can_fuse_vertical/horizontal
+    # refuse to fuse, so loops survive Inductor's fusion intact.
     def __init__(self):
-        super().__init__(
-            [
-                propagate_mutation_layouts,
-                build_loop_scheduler_nodes,
-            ]
-        )
+        super().__init__([propagate_mutation_layouts])
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
@@ -506,17 +498,11 @@ def _hand_off_loop_nodes(graph: GraphLowering) -> None:
 
     On any other release a graph that holds a ``LoopNode`` is refused here,
     with ``Unsupported`` naming the release: flattening it would compile the
-    loop through the old path without saying that the release is
-    unsupported (decided policy: fail loudly outside the supported set). A
-    graph with no loop is unaffected on every release.
-
-    ``loop_scheduler.SCHEDULE_LOOP_NODES`` off (the equivalence test only)
-    expands the nodes as before, whatever the release.
+    loop without saying that the release is unsupported (decided policy: fail
+    loudly outside the supported set). A graph with no loop is unaffected on
+    every release.
     """
     if not has_loop_nodes(graph.operations):
-        return
-    if not loop_scheduler.SCHEDULE_LOOP_NODES:
-        expand(graph)
         return
     if not loop_scheduler.loop_scheduler_supported():
         expand(graph)
