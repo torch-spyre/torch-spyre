@@ -195,7 +195,7 @@ class TestAlignReshapePlan(unittest.TestCase):
 
     def test_dropped_extent_raises(self):
         # An input axis with extent > 1 that no output axis matches would lose
-        # data -> needs a cross-stick transpose (restickify), not a reshape.
+        # data -> needs a restickify, not a reshape.
         a, d, c = sympy.symbols("a d c")
         with self.assertRaises(NotImplementedError):
             align_reshape_plan(
@@ -204,6 +204,28 @@ class TestAlignReshapePlan(unittest.TestCase):
                 [d, sympy.Mod(c, 64)],
                 [4, 64],
             )
+
+    def test_lanes_of_another_variable_are_refused(self):
+        """The lane axes are paired only if they walk the same loop variable.
+
+        The input's lanes hold ``c0`` and the output's hold ``c1``.  Paired by
+        position alone this came back as a broadcast plan, ``([1, 64], [64, 64])``,
+        which reads ``c0``'s lanes as if they were ``c1``'s.
+        """
+        c0, c1 = sympy.symbols("c0 c1")
+        with self.assertRaisesRegex(NotImplementedError, "needs a transpose"):
+            align_reshape_plan(
+                [sympy.Mod(c0, 64)], [64], [c0, sympy.Mod(c1, 64)], [64, 64]
+            )
+
+    def test_constant_lanes_are_still_a_broadcast(self):
+        """A constant lane coordinate (one value) still pairs with the output's
+        lanes: it is a broadcast across them, not data moved across the stick."""
+        c0, c1 = sympy.symbols("c0 c1")
+        plan = align_reshape_plan(
+            [c0, sympy.Integer(0)], [64, 1], [c0, sympy.Mod(c1, 64)], [64, 64]
+        )
+        self.assertEqual(plan, ([64, 1], [64, 64]))
 
 
 class TestCoreDivisions(unittest.TestCase):
