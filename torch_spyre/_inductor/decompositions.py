@@ -1698,15 +1698,7 @@ class _OPWrapper:
         # dispatch reaches that rewrite through this lazy compilation path,
         # outside Dynamo's usual scalar-capture setup.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
-            try:
-                return self._compiled_fn(*args, **kwargs)
-            except Exception:
-                # A RuntimeError raised while the decomposition is traced makes
-                # Dynamo skip the function from then on. Later calls would run
-                # its Python body, whose custom ops have no eager kernel and
-                # return None. Clear that state so the next call compiles again.
-                torch._C._dynamo.eval_frame.reset_code(self._fn.__code__)
-                raise
+            return self._compiled_fn(*args, **kwargs)
 
 
 def _register_spyre_dispatchkey_kernels_permanently():
@@ -1902,6 +1894,16 @@ def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
     return pos * valid + (valid - 1.0)
 
 
+# The count compares every element with every bin, and its time follows the size
+# of that table: N x bins (rounded up to a full stick) x the element size.
+# Measured at 32 cores against the CPU round trip, the device ties or wins up to
+# 16 MB and is 4x slower at 32 MB, so larger tables are counted on the CPU. This
+# also keeps the table far below the per-core span limit, which no single formula
+# gives: the largest table that compiles depends on the core count.
+# TODO: count in chunks, so large inputs stay on the device.
+_HISTC_DEVICE_TABLE_MAX_BYTES = 16 * 2**20
+
+
 @register_spyre_decompositions([torch.ops.aten.histc.default])
 def spyre_histc(
     input: torch.Tensor,
@@ -1912,7 +1914,11 @@ def spyre_histc(
     """1-D int32/int64/float32/float16 histc: bin index per element, then
     spyre::histc_count. The index maths is fp32, so integers are exact below
     2**24, and a value within a float step of a bin edge can land in the
-    neighbouring bin: device fp32 arithmetic rounds differently from the CPU's."""
+    neighbouring bin: device fp32 arithmetic rounds differently from the CPU's.
+
+    A compare table over _HISTC_DEVICE_TABLE_MAX_BYTES, or an input whose length
+    is symbolic, is counted on the CPU instead (spyre::histc_cpu), with torch's
+    own bin rule."""
     if input.dtype not in (torch.int32, torch.int64, torch.float32, torch.float16):
         raise Unsupported(
             f"histc: {input.dtype} input is not supported "
@@ -1942,11 +1948,26 @@ def spyre_histc(
     if input.numel() == 0:
         return input.new_zeros((bins,))
 
-    # First, so this extern call does not split the kernels that follow.
     stick = get_elem_in_stick(idx_dtype)
-    bin_ids = torch.ops.spyre.histc_bin_ids(
-        (bins + stick - 1) // stick * stick, idx_dtype
-    )
+    bins_pad = (bins + stick - 1) // stick * stick
+    n = input.numel()
+    if not isinstance(n, int):
+        # The count's lowering needs the length at compile time.
+        logger.debug("histc: the input length %s is symbolic; counting on the CPU", n)
+        return torch.ops.spyre.histc_cpu(input, bins, lo, hi)
+    table_bytes = n * bins_pad * idx_dtype.itemsize
+    if table_bytes > _HISTC_DEVICE_TABLE_MAX_BYTES:
+        logger.debug(
+            "histc: %d elements x %d bins needs a %.1f MB compare table, over "
+            "the %d MB device limit; counting on the CPU",
+            n,
+            bins,
+            table_bytes / 2**20,
+            _HISTC_DEVICE_TABLE_MAX_BYTES // 2**20,
+        )
+        return torch.ops.spyre.histc_cpu(input, bins, lo, hi)
+    # First, so this extern call does not split the kernels that follow.
+    bin_ids = torch.ops.spyre.histc_bin_ids(bins_pad, idx_dtype, input.device)
     x = input.to(torch.float32)
     if lo == hi:
         # min == max: the data's range, widened by 1 if constant, as torch does.

@@ -36,6 +36,7 @@ from torch_spyre.ops import fftn as spyre_fftn
 from torch_spyre.ops import ifft as spyre_ifft
 from torch_spyre.ops import ifftn as spyre_ifftn
 from torch_spyre.ops.fallbacks import FallbackWarning
+from torch_spyre.ops.warning_types import DeclaredRangeNarrowedWarning
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
@@ -1296,6 +1297,14 @@ def _build_fp32_proxy_cpu_refs(
         else:
             kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
     return kwargs
+
+
+def _histc_counted_on_cpu(caught):
+    """Whether the recorded warnings show histc's CPU fallback (spyre::histc_cpu)."""
+    return any(
+        issubclass(w.category, FallbackWarning) and "histc_cpu" in str(w.message)
+        for w in caught
+    )
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -2650,6 +2659,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1025,
                     0,
                     1,
+                ),
+                # The count compares every element with every bin. 32768 x 128
+                # fp32 values is a 16 MB table, the largest the device counts.
+                "int32_table_16mb": (
+                    torch.randint(0, 128, (32768,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # One element more: counted on the CPU (spyre::histc_cpu).
+                "int32_table_over_16mb": (
+                    torch.randint(0, 128, (32769,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # On the CPU the bins are torch's own, so random values are exact.
+                "fp32_table_over_16mb": (
+                    torch.rand((32769,), dtype=torch.float32),
+                    128,
+                    0,
+                    1,
+                ),
+                "fp32_table_over_16mb_auto_range": (
+                    torch.rand((4097,), dtype=torch.float32),
+                    1024,
+                    0,
+                    0,
                 ),
                 # TODO: an fp16 input is counted in fp16, exact only up to 1024.
                 # When it is counted in fp32 (#5553) this becomes a positive case.
@@ -11661,6 +11698,87 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             **ref,
         )
+
+    def test_histc_bin_ids_stay_intact(self):
+        # The bin ids are one device tensor shared between calls. With 128 bins the
+        # count has their shape and dtype, the case a memory planner would reuse a
+        # buffer for, so check the shared tensor after each of two calls.
+        x = torch.randint(0, 128, (192,), dtype=torch.int32)
+        ref = torch.histc(x.float(), bins=128, min=0, max=127).to(torch.int32)
+        device = torch.empty(1, device="spyre").device
+        for _ in range(2):
+            out = _compile_and_run(
+                lambda x: torch.histc(x, bins=128, min=0, max=127), [x], "spyre"
+            )
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+            ids = torch.ops.spyre.histc_bin_ids(128, torch.float32, device)
+            torch.testing.assert_close(
+                ids.cpu(), torch.arange(128, dtype=torch.float32), rtol=0, atol=0
+            )
+
+    def test_histc_path_by_table_size(self):
+        # N x 128 bins x 4 bytes is exactly 16 MB at N = 32768, the largest table
+        # the device counts. One element more is counted on the CPU.
+        for n, on_cpu in ((32768, False), (32769, True)):
+            x = torch.randint(0, 128, (n,), dtype=torch.int32)
+            ref = torch.histc(x.float(), bins=128, min=0, max=127).to(torch.int32)
+            for compile_mode in (True, False):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out = _compile_and_run(
+                        lambda x: torch.histc(x, bins=128, min=0, max=127),
+                        [x],
+                        "spyre",
+                        compile=compile_mode,
+                    )
+                torch.testing.assert_close(out, ref, rtol=0, atol=0)
+                self.assertEqual(
+                    _histc_counted_on_cpu(caught),
+                    on_cpu,
+                    f"N={n}, compile={compile_mode}",
+                )
+
+    def test_histc_second_length_counted_on_cpu(self):
+        # A second input length makes Dynamo recompile with a symbolic length.
+        # The count needs the length at compile time, so that program counts on
+        # the CPU, for every later length too.
+        torch._dynamo.reset()
+        compiled = torch.compile(lambda x: torch.histc(x, bins=128, min=0, max=127))
+        for n, on_cpu in ((192, False), (256, True), (320, True)):
+            x = torch.randint(0, 128, (n,), dtype=torch.int32)
+            ref = torch.histc(x.float(), bins=128, min=0, max=127).to(torch.int32)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                out = compiled(x.to(utils_inductor.DEVICE)).cpu()
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+            self.assertEqual(_histc_counted_on_cpu(caught), on_cpu, f"N={n}")
+
+    def test_histc_declared_dynamic_length_counted_on_cpu(self):
+        # A 1-D tensor's only dim is its stick dim, which cannot be declared
+        # dynamic, so a symbolic length reaches histc through a flatten. It is
+        # counted on the CPU: one program for the whole declared range.
+        torch._dynamo.reset()
+        spec = {0: {"min": 64, "max": 512, "granularity": 64}}
+        compiled = torch.compile(
+            lambda x: torch.histc(x.flatten(), bins=128, min=0, max=127),
+            fullgraph=True,
+        )
+        # Caches off: a hit on the FX graph cache adds the cached graph's guards.
+        with torch._inductor.config.patch(force_disable_caches=True):
+            for rows in (192, 320):
+                x = torch.randint(0, 128, (rows, 64), dtype=torch.int32)
+                ref = torch.histc(x.flatten().float(), bins=128, min=0, max=127)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out = compiled(x.to(utils_inductor.DEVICE, dynamic=spec)).cpu()
+                torch.testing.assert_close(out, ref.to(torch.int32), rtol=0, atol=0)
+                self.assertTrue(_histc_counted_on_cpu(caught), f"rows={rows}")
+                narrowed = [
+                    str(w.message)
+                    for w in caught
+                    if issubclass(w.category, DeclaredRangeNarrowedWarning)
+                ]
+                self.assertFalse(narrowed, "\n".join(narrowed))
 
     @expects_raise
     def test_histc_argument_errors(self):
