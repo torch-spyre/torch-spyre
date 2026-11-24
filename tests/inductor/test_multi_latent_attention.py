@@ -402,6 +402,61 @@ class TestMultiLatentAttention(unittest.TestCase):
         inputs = _inputs(1, 4, 1, 256, latent_rank=128)
         _compare_attention(inputs, absorbed=True)
 
+    def test_unmasked_padded_cache_excludes_the_padding(self):
+        """A cache length that is not a whole number of blocks is padded with
+        zero rows. Those rows score zero rather than -inf, so unless something
+        masks them they take softmax weight and scale every output down.
+
+        An all-zero mask is the identity, so these two calls are the same
+        function on the same inputs -- they differ only in which branch builds
+        the exclusion. Both run in fp16 on device, so the tolerance can be
+        tight: the failure mode is a uniform scale-down of several percent,
+        which the file's usual 0.1 would hide.
+        """
+        inputs = _inputs(1, 4, 8, 100)
+        device_inputs = [tensor.to("spyre") for tensor in inputs]
+        zero_mask = torch.zeros((1, 1, 8, 100), dtype=torch.float16).to("spyre")
+        compiled = torch.compile(_attention, dynamic=False)
+
+        without_mask = compiled(*device_inputs, None, False, None, True)
+        with_zero_mask = compiled(*device_inputs, zero_mask, False, None, True)
+
+        torch.testing.assert_close(
+            without_mask.cpu(), with_zero_mask.cpu(), atol=0.02, rtol=0.02
+        )
+
+    def test_short_nondivisible_cache_extent(self):
+        # 100 cached tokens: no equal block size divides it, and the padding
+        # is a large enough fraction of the cache to move the result if it is
+        # not excluded.
+        inputs = _inputs(1, 4, 8, 100)
+        _compare_attention(inputs, absorbed=True)
+        _compare_attention(inputs, absorbed=False)
+
+    def test_long_nondivisible_cache_extent(self):
+        inputs = _inputs(1, 4, 8, 2112)
+        _compare_attention(inputs, absorbed=True)
+        _compare_attention(inputs, absorbed=False)
+
+    def test_masked_block_contributes_nothing(self):
+        # A whole K/V block every query excludes: each one hits the finite
+        # clamp in the recurrence, which must leave the result defined.
+        inputs = _inputs(1, 4, 16, 1024)
+        mask = torch.zeros((1, 1, 16, 1024), dtype=torch.float16)
+        mask[:, :, :, 256:512] = float("-inf")
+        _compare_attention(inputs, attention_mask=mask, absorbed=True)
+
+    def test_late_maximum_in_the_scan(self):
+        # The last cached block carries far larger scores than the first, so
+        # the running maximum is revised on the final iteration and every
+        # earlier contribution has to be corrected down.
+        q_nope, q_pe, kv_latent, k_pe, w_uk, w_uv = _inputs(1, 4, 8, 1024)
+        kv_latent = kv_latent.clone()
+        kv_latent[:, 960:, :] *= 6.0
+        inputs = (q_nope, q_pe, kv_latent, k_pe, w_uk, w_uv)
+        _compare_attention(inputs, absorbed=True)
+        _compare_attention(inputs, absorbed=False)
+
     def test_nondivisible_cache_extent_uses_one_counted_loop(self):
         # 2112 cached tokens pad to a whole number of equal blocks and are
         # scanned by a single counted loop rather than an unrolled chain.
