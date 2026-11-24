@@ -50,9 +50,11 @@ everything outside it fails at compile time with a specific message:
   graph input of the op's shape or broadcast to it, such as a bias along the
   non-shard dims. Every core reads it with ordinary unified addressing;
   the result takes the sharded operand's placement. An unsharded operand
-  computed inside the graph, or read by a reduction, is rejected. There is
-  no `Replicate()` placement for `to_sharded` yet: a plain `.to("spyre")`
-  tensor is the replica.
+  computed inside the graph, or read by a reduction, is rejected. The
+  one-dtype rule below applies to replicas too, so an fp16 sharded tensor
+  times an fp32 scale (including a 0-d one) is rejected: cast the scale to
+  fp16 first. There is no `Replicate()` placement for `to_sharded` yet: a
+  plain `.to("spyre")` tensor is the replica.
 * Each shard must be a whole device dim of whole sticks: the shard keeps
   the global device layout's dim structure, the shard boundary falls on
   whole sticks for a last-dim shard (a stick cannot be split between

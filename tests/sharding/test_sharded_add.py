@@ -897,7 +897,12 @@ def test_multi_output_op_with_conversion_fails_at_compile():
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="admit an unsharded operand only"):
+    # TODO: pin to the one message this hits once confirmed on a device run.
+    unsharded_rejection = (
+        "admit an unsharded operand only "
+        "(in pointwise ops|when it is a scalar constant or a graph input)"
+    )
+    with pytest.raises(RuntimeError, match=unsharded_rejection):
         torch.compile(lambda x, y: torch.argsort(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
@@ -918,18 +923,21 @@ def test_dynamic_shapes_fail_at_compile():
 
 @requires_emulation
 @expects_raise
-def test_unsharded_operand_computed_in_graph_fails_at_compile():
-    """An unsharded operand is admitted only in a pointwise op, and only when
-    it exists before the kernel (a scalar constant or a graph input). Any
-    other is rejected at compile, not at launch with an error that names
-    neither the op nor the sharding. cumsum decomposes to a matmul (a
-    reduction) over the sharded operand and an unsharded triu mask."""
+def test_unsharded_operand_read_by_reduction_fails_at_compile():
+    """An unsharded operand is admitted only in a pointwise op, so a reduction
+    that reads one is rejected at compile, not at launch with an error that
+    names neither the op nor the sharding. cumsum decomposes to a matmul (a
+    reduction) over the sharded operand and an unsharded triu mask. The
+    computed-operand path is covered by
+    test_scaled_unsharded_operand_fails_at_compile."""
     n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="admit an unsharded operand only"):
+    with pytest.raises(
+        RuntimeError, match="admit an unsharded operand only in pointwise ops"
+    ):
         torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
@@ -937,7 +945,12 @@ def test_unsharded_operand_computed_in_graph_fails_at_compile():
 @expects_raise
 def test_scaled_unsharded_operand_fails_at_compile():
     """add(x, b, alpha=2) scales b inside the graph, so b is no longer a graph
-    input: rejected, and the message says how to get past it."""
+    input: rejected, and the message says how to get past it.
+
+    lower_add realizes y * alpha as its own buffer (the split_multi_ops "No FX
+    node" workaround in lowering.py), which is why b counts as computed.
+    TODO: positive once that workaround is gone and the mul fuses into the add.
+    """
     n = num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)

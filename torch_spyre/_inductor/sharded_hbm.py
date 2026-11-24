@@ -265,6 +265,10 @@ def verify_mixed_args(sdsc_spec, shard_kernel_args) -> None:
       inputs (a scalar constant or a unified tensor, see ``plan_sharded_hbm``).
       Those are addressed as in any unified kernel, so only the output is
       constrained.
+
+    This is only a backstop: any ordinary input is accepted when the output is
+    sharded. The planner is the real gate; see ``_require_replica_source`` and
+    ``_require_replica_read``.
     """
     # SDSC args list inputs first and the output last. (For a reduction,
     # ``num_inputs`` counts the output too, because it is also the
@@ -567,9 +571,11 @@ def _require_replica_read(
     kernel already uses, and the pinned split is checked against the same
     work-division constraints as any other split.
 
-    What is admitted is torch broadcasting only: right-aligned dims equal to
-    the op's or 1, and an index built from the write's own iteration
-    variables. Indirect or otherwise reindexed reads fail closed.
+    What is admitted: right-aligned dims equal to the op's or 1, and an index
+    built from the write's own iteration variables. Indirect reads (an index
+    with a variable the write does not have) fail closed; affine reads over
+    the write's own variables, including a permuted or flipped graph input of
+    the op's shape, use ordinary unified addressing.
     """
     buf = graph.get_buffer(dep.name)
     shape = [int(s) for s in buf.get_size()] if buf is not None else None
@@ -585,7 +591,7 @@ def _require_replica_read(
         raise Unsupported(
             f"{name}: non-unified kernels read an unsharded operand ({dep.name}, "
             f"shape {shape}) only as the op's shape {size} or broadcast to it "
-            "(no reindexing or indirect reads)"
+            "(no indirect reads)"
         )
 
 
