@@ -158,14 +158,14 @@ sequenceDiagram
         Alloc->>Flex: getFlexAllocator() then allocate(nbytes, directive)
         Flex-->>Alloc: flex::CompositeAddress
         ATen->>Py: copy_ dispatches aten::_copy_from to spyre__copy_from
-        Py->>Mem: copy_tensor(self, dst)
+        Py->>Mem: copy_tensor(self, dst, non_blocking)
     else device_layout or dynamic given
         Py->>Mem: spyre_empty_with_layout, spyre_empty_reserved, or spyre_empty_reserved_with_layout
         Mem->>Alloc: SpyreStorageImpl calls allocate(nbytes)
-        Py->>Mem: copy_tensor(src, dst, non_blocking=False)
+        Py->>Mem: copy_tensor(src, dst, non_blocking)
     end
     Mem->>Mem: spyre_copy_from calls getCurrentStream(dst.device())
-    Mem->>Stream: copyAsync(src, dst)
+    Mem->>Stream: copyAsync(src, dst, stage_pageable_h2d=non_blocking)
     Stream->>Mem: get_spyre_tensor_layout, generate_dci(cpu_tensor, dev_tensor, stl, host2device)
     opt layout has a staggered element arrangement
         Mem->>Mem: fill output_dimwise_ea_, and pre_expand_dcsi_ for a padded stick dim
@@ -173,6 +173,10 @@ sequenceDiagram
     Mem-->>Stream: DataConversionInfo
     opt dci_is_identity_copy and both extents equal the allocation total_size()
         Stream->>Stream: pass no DCI (dci_arg is nullptr)
+    end
+    opt no DCI, stage_pageable_h2d, and a pageable source
+        Stream->>Pin: allocate(dev_total_size), memcpy the source into it
+        Stream->>Stream: copyAsyncImpl on the pinned staging buffer
     end
     Stream->>Pin: copyAsyncImpl calls retain(cpu_ptr)
     alt source allocated by SpyrePinnedAllocator
@@ -184,7 +188,9 @@ sequenceDiagram
     end
     Stream->>Flex: launchH2D(params) calls launchOperation(params)
     Flex->>Dev: DMA from host memory, converted by the DCI when one is passed
-    Mem->>Stream: synchronize()
+    opt non_blocking is false
+        Mem->>Stream: synchronize()
+    end
 ```
 
 A device-to-host copy, such as `x.cpu()`, enters through the same `spyre__copy_from` and `copy_tensor` calls with a CPU destination. It allocates no device memory and differs in the steps below.

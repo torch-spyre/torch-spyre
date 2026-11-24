@@ -330,8 +330,8 @@ returned `[1024, 4096]` output.
 This is the same tiling shape as the
 [Small Example](coarse_tiling_loops.md#small-example) in the companion
 document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
-same downstream mechanism (`loop_info: LoopInfo`, a `CountedLoopSchedulerNode`,
-a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
+same downstream mechanism (a `LoopNode`, a `LoopSchedulerNode`, a
+`LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
 captured IR/OpSpec/`bundle.mlir` for this exact example, which the
 [implementation reference](coarse_tiling_loops.md) quotes at length.
 
@@ -362,7 +362,7 @@ def fn(a, b, c):
 
 The compiler's lowering pipeline (see [Layer 1's Prove → Splice → Identify →
 Stamp
-sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info))
+sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_member))
 runs to a fixed point over nested `for_each_tile`/`while_loop` structures, so
 this composition is handled uniformly rather than as a special case. See
 that section for how a two-level nest like this ends up with a two-entry
@@ -382,19 +382,19 @@ Inductor as an `ir.WhileLoop` (`scan`'s own lowering), not as a distinct
 The Spyre backend's job is then to recognize which `ir.WhileLoop`s are
 provably bounded, tile-shaped loops (as opposed to genuinely
 data-dependent `while_loop`s, which stay as `ir.WhileLoop`) and rewrite them
-into a `loop_info`-carrying representation. The mechanics of that
+into a counted loop held as a `LoopNode`. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
-which covers everything past "a run of ops carries a `loop_info:
-LoopInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
-and the `LoopSpec` codegen tree (Layer 3).
+which also covers everything past "the loop's ops are wrapped in a
+`LoopNode`": the `LoopSchedulerNode` scheduler wrapper (Layer 2) and the
+`LoopSpec` codegen tree (Layer 3).
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, after
 `apply_reserved_dims_contract` and before dead-code elimination, since it must resolve every `for_each_tile`-shaped
-`ir.WhileLoop` down to a `loop_info`-carrying group before later passes see
-a flat op list. Work-division and scratchpad planning run after, consuming
+`ir.WhileLoop` down to a `LoopNode` before later passes see the op list.
+Work-division and scratchpad planning run after, consuming
 the resulting tiled iteration spaces. See
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md#pass-placement)
 for the full pass ordering.
@@ -446,7 +446,7 @@ a fixed-address LX scratchpad slot instead. See
 - [`coarse_tiling_loops.md`](coarse_tiling_loops.md): implementation
   reference for the transformation stage (Layer 1 IR pass, Layer 2
   scheduler wrapper, Layer 3 codegen tree) that turns `for_each_tile`'s
-  `loop_info` into an executable tiled loop nest.
+  loop into an executable tiled loop nest.
 - [RFC 1358: Coarse-Tiling Loop IR Design
   Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
   which explains the reasoning behind the three-layer design.

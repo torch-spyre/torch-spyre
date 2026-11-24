@@ -51,20 +51,20 @@ demanded by that layer's type system:
 
 | Layer | Loop identity | Form |
 |---|---|---|
-| 1, pre-scheduling IR pass | `loop_info: LoopInfo` on `ir.Operation`, with the loop's ops wrapped in a `LoopNode` | Per-op tag plus a structural node |
+| 1, pre-scheduling IR pass | `LoopNode` wrapping the loop's ops; the lowering's `loop_member: LoopMember` on each `ir.Operation` until the node is built | Structural node built from a per-op record |
 | 2, scheduler | `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) | Perimeter wrapper |
 | 3, codegen output | `LoopSpec` | Serializable tree node |
 
 :::{figure} ../_static/images/coarse-tiling-layers.svg
-:alt: Three layers of coarse-tiling loop IR: the pre-scheduling pass stamps LoopInfo and divides ranges, the pre-fusion pass wraps runs in CountedLoopSchedulerNode, and codegen emits a LoopSpec that serializes to scf.for
+:alt: Three layers of coarse-tiling loop IR: the pre-scheduling pass stamps loop_member and divides ranges, each LoopNode reaches the scheduler as one LoopSchedulerNode, and codegen emits a LoopSpec that serializes to scf.for
 :width: 100%
 :align: center
 
-The three layers, from the pre-scheduling IR pass through the pre-fusion
-scheduler pass to codegen. Layer 1 stamps `loop_info` (`LoopInfo`) on
-each `ir.Operation`, divides the tiled dimension by `K`, and wraps the loop's
-ops in a `LoopNode` so the loop is a structural unit from the first pass after
-the splice. Layer 2 hands each `LoopNode` to Inductor's scheduler as one
+The three layers, from the pre-scheduling IR pass through the scheduler to
+codegen. Layer 1 stamps `loop_member` (`LoopMember`) on each `ir.Operation`,
+divides the tiled dimension by `K`, and wraps the loop's ops in a `LoopNode`,
+which takes the loop facts from the record, so the loop is a structural unit
+from the first pass after the splice. Layer 2 hands each `LoopNode` to Inductor's scheduler as one
 `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass), which is opaque to
 Inductor fusion. Layer 3 drives `SpyreKernel` for the inner ops and wraps their
 `OpSpec`s in a `LoopSpec` that serializes to an `scf.for` with late-bound
@@ -113,7 +113,7 @@ output, not hand-derived. When compiler internals drift and these snippets
 go stale, regenerate them with that script rather than hand-editing; see
 `docs/tools/README.md` for usage.
 
-### Prove, splice, identify, stamp: how a `for_each_tile` call becomes `loop_info`
+### Prove, splice, identify, stamp: how a `for_each_tile` call becomes `loop_member`
 
 `for_each_tile` lowers to `torch._higher_order_ops.scan.scan`, which Inductor
 traces into an `ir.WhileLoop`. `splice_while_loops`
@@ -121,14 +121,15 @@ traces into an `ir.WhileLoop`. `splice_while_loops`
 proves its trip count statically via `try_prove_for_each_tile`/
 `_extract_trip_count`, splices the loop body's ops directly into the
 top-level `graph.operations` list, and calls `_stamp_direct_loop_info` to
-attach `loop_info` to each spliced op, **directly**, with no intervening
-planning step. This is the real, captured value of
-`while_loop_body_graph_0_0_op8`'s (`y_tile = a_tile + b_tile`'s) `loop_info`,
-immediately after `splice_while_loops` runs, before any later pass touches
-it:
+attach `loop_member` (a `LoopMember`, defined in `loop_node.py`) to each
+spliced op, **directly**, with no intervening planning step. The record exists
+from this stamp until the final step of `splice_while_loops` builds the
+`LoopNode`s (see the next section). This is the value of
+`while_loop_body_graph_0_0_op8`'s (`y_tile = a_tile + b_tile`'s) `loop_member`
+between the stamp and the node build:
 
 ```python
-op.loop_info = LoopInfo(
+op.loop_member = LoopMember(
     loop_group_id=(0,),            # depth-1 path: single loop level
     loop_count=[8],                # trip_count=8 (1024 rows / 128-row tiles)
     loop_tiled_dims=[[0]],         # dim 0 (rows) is tiled
@@ -142,7 +143,7 @@ is not stored: `_stamp_direct_loop_info` also appends a `DimHint` with
 `loop_var=u0` and `loop_var_range=8` to the op's `dim_hints`, and every reader
 takes an access's advance from the coefficient of `u0` in that access's index
 (`loop_facts.read_advance`, `SpyreKernel._index_tile_advance`). The
-span-overflow lowering stamps the same `LoopInfo` record, with
+span-overflow lowering stamps the same `LoopMember` record, with
 `strict_loop_vars=True`, and follows the same rule (see [Layer 1](#layer-1-pre-scheduling-ir-pass) below),
 so both frontends share every downstream layer.
 
@@ -156,23 +157,30 @@ advance.
 The final step of `splice_while_loops` is `collapse` (`loop_node.py`), which
 wraps each loop's ops in a `LoopNode` (nested for a nested loop). A `LoopNode`
 is one `ir.Operation` held in `graph.operations`; its `body` holds the ordinary
-ops and any nested `LoopNode`s, and it carries the per-loop facts (induction
-variable, trip count, carries). `loop_info` stays on the leaf ops; the node
-adds the loop structure and those facts without changing the leaf ops. So from
-the first pass after the splice, the loop is a structural unit in the IR.
+ops and any nested `LoopNode`s. `collapse` reads each op's `loop_member` and
+records the loop facts in the nodes: the group id (`group_id`), trip count,
+induction variable, carries, each member's tiled dims at that level
+(`tiling`), and `strict_loop_vars`. Each leaf op records the chain of nodes
+around it in `_loop_chain`. `collapse` then deletes `loop_member` from every
+op a node holds, so from the first pass after the splice the nodes are the
+only owner of the loop facts and the loop is a structural unit in the IR.
+Readers ask the accessors in `loop_facts.py` (`is_looped`, `enclosing_loops`,
+`node_levels`, `strict_loop_vars`, `counted_loop_path`, `read_advance`,
+`output_advance`), which answer from the nodes. A pass that adds an op to a
+loop states what the op tiles with `record_member` (`loop_node.py`).
 
 Pre-scheduling passes that know nothing about loop nodes run against an
-`OpsView`, which iterates the leaf ops in program order and forwards every
-mutation to the list that owns the op. The nested nodes therefore survive the
-whole pass pipeline. `dedup_and_promote_constants` hoists constants across node
+`OpsView`, which iterates the leaf ops in program order and refuses
+`insert`, `remove`, item assignment, and `del`. The nested nodes therefore
+survive the whole pass pipeline. `dedup_and_promote_constants` hoists constants across node
 boundaries itself (`OpsView.hoist_to_front`). A pass that inserts or moves an op
 names its anchor through the helpers in
 [Placing ops relative to a loop](#placing-ops-relative-to-a-loop). At the hand-off to the scheduler,
-`peel_non_members` moves any op a pass left at a body edge without the loop's
-`loop_info` back out of the node, and each `LoopNode` becomes one
-`LoopSchedulerNode` (gated by `loop_scheduler_supported()`; `SCHEDULE_LOOP_NODES`
-defaults to true). Building the nodes is gated by `BUILD_LOOP_NODES`, which
-defaults to true and is set false only by a no-behaviour-change test.
+each `LoopNode` becomes one `LoopSchedulerNode` (`loop_scheduler.py`). On a
+torch release outside `SUPPORTED_RELEASES`, `loop_scheduler_supported()` is
+false and `apply_loop_scheduler_patches` raises the `Unsupported` error from
+`refuse_release()`. A kernel op in a node that is not a member of that loop
+raises `Unsupported` there (`_check_members`).
 
 ### The single-level `graph.operations` dump
 
@@ -541,10 +549,10 @@ same `LoopSchedulerNode`.
 flowchart TD
     subgraph L1["Layer 1: pre-scheduling IR passes"]
         FET["for_each_tile"] --> SWL["splice_while_loops"]
-        SWL --> SDLI["_stamp_direct_loop_info<br/>(LoopInfo)"]
+        SWL --> SDLI["_stamp_direct_loop_info<br/>(loop_member)"]
         SOG["span_overflow_groups"] --> VAL["validate_coarse_tile_groups<br/>reject_nested_loops"]
         VAL --> TG["tile_groups<br/>build_loop_tiling_plan"]
-        TG --> LLT["lower_loop_tiling<br/>(LoopInfo, strict_loop_vars)"]
+        TG --> LLT["lower_loop_tiling<br/>(loop_member, strict_loop_vars)"]
         LLT --> RLN["request_loop_nodes<br/>build_pending_loop_nodes"]
         SDLI --> LN["LoopNode"]
         RLN --> LN
@@ -562,17 +570,30 @@ flowchart TD
 
 ### Attribute contract on `ir.Operation`
 
-Each `ir.Operation` inside a counted loop carries a `loop_info` attribute that
-holds the loop's own facts. Both lowerings stamp the same record, `LoopInfo`,
-defined in `torch_spyre/_inductor/loop_info.py` and attached with `setattr`; no
-Inductor base class is modified. The `for_each_tile` lowering
+A loop lowering writes a `loop_member` attribute on each `ir.Operation` it
+puts in a counted loop. The record holds the loop's own facts. Both lowerings
+write the same record, `LoopMember`, defined in
+`torch_spyre/_inductor/loop_node.py` and attached with `setattr`; no Inductor
+base class is modified. The `for_each_tile` lowering
 (`_stamp_direct_loop_info` in `for_each_tile_lowering.py`) stamps it with
 `strict_loop_vars=False`; the span-overflow lowering (`loop_tiling_lowering.py`)
 stamps it with `strict_loop_vars=True`.
 
+The record is a build-time input. `collapse` and `build_pending_loop_nodes`
+read it to build the `LoopNode`s, record its facts in them, and then delete it
+from every op a node holds. After the build, `LoopNode.group_id`,
+`LoopNode.trip_count`, `LoopNode.tiling` (each member's tiled dims at that
+level), and `LoopNode.strict_loop_vars` hold these facts, and the readers in
+`loop_facts.py` answer from the nodes. `pending_levels` reads the record
+itself, for an op no node holds yet. The loop checker (`check_loops` in
+`loop_checker.py`, rule 6) reports an op in built nodes that still carries a
+`loop_member`. A pass that adds an op to a built loop calls
+`record_member(op, tiling)`, which records the op's per-level tiled dims in the
+nodes around it and writes nothing on the op.
+
 ```python
 @dataclass
-class LoopInfo:
+class LoopMember:
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
@@ -586,7 +607,7 @@ class LoopInfo:
 | `loop_count` | `list[sympy.Expr]` | Trip counts, one per nesting level from outermost to innermost. For a flat (depth-1) group this is a 1-element list `[K]`. For a two-level nested group it is `[K1, K2]`. All ops sharing the same `loop_group_id` must agree on the count at every level. |
 | `loop_tiled_dims` | `list[list[int]]` | Per-level positional indices into `data.ranges` (the output iteration space) that are divided by the corresponding count. An empty sub-list means the op is loop-invariant at that level in the output space. |
 | `loop_tiled_reduction_dims` | `list[list[int]]` | Per-level positional indices into `data.reduction_ranges` that are tiled at that level. Parallel to `loop_tiled_dims`. An empty sub-list means no reduction dim is tiled at that level. |
-| `strict_loop_vars` | `bool` | True on an op the loop-tiling lowering made: its `dim_hints` list the loop variable of every level, so an op that lists none is a compiler bug. False on a `for_each_tile` op, where an op that lists no loop variable (the loop's fill, for example) does not move with the loop. Read by `loop_facts` and the kernel's advance lookup. |
+| `strict_loop_vars` | `bool` | True on an op the loop-tiling lowering made: its `dim_hints` list the loop variable of every level, so an op that lists none is a compiler bug. False on a `for_each_tile` op, where an op that lists no loop variable (the loop's fill, for example) does not move with the loop. The node build copies it to `LoopNode.strict_loop_vars` and raises `RuntimeError` for a node whose members disagree; `loop_facts.strict_loop_vars(op)` and the kernel's advance lookup read the node. |
 
 The record does not store how an access advances from one trip to the next. An
 access's per-trip advance is the coefficient of the level's loop variable in
@@ -609,12 +630,14 @@ done per trip. For reduction-dim tiling, `_divide_reduction_ranges`
 loops. See "Nested loops and the `loop_group_id` tree" below.
 
 `loop_count` is redundant across all ops sharing the same `loop_group_id`
-(they must agree), but keeping it on each op means the scheduler does not need
-a separate side table. `loop_tiled_dims` and `loop_tiled_reduction_dims` are
-**per-op**: each op resolves its own tiled position from its own `DimHint`
+(they must agree). The node build (`_wrap` in `loop_node.py`) takes each
+node's `trip_count` from the first member's `loop_count` at that depth.
+`loop_tiled_dims` and `loop_tiled_reduction_dims` are **per-op**: each op
+resolves its own tiled position from its own `DimHint`
 (`resolve_level_positions` in `coarse_tile.py`, the same function both
 lowerings use), so a broadcast op whose iteration space lacks the tiled
-dimension gets an empty sub-list and is loop-invariant at that level.
+dimension gets an empty sub-list and is loop-invariant at that level. The node
+build stores them per member, by op name, in `LoopNode.tiling`.
 
 ### `Loops` is a frozen dataclass
 
@@ -658,7 +681,7 @@ def tile_groups(
 entry point of the span-overflow pass (`_maybe_coarse_tile_span_overflow` in
 `passes.py`) and of the LX allocator's tiling (`apply_tilings` in
 `scratchpad/coarse_tiling.py`). `for_each_tile` does not call it: its
-`loop_info` is stamped by `_stamp_direct_loop_info` from the trip count and
+`loop_member` is stamped by `_stamp_direct_loop_info` from the trip count and
 loop variable of the traced `ir.WhileLoop`.
 
 `groups` is a list of `(ops, levels)` tuples, where `levels` is a list of
@@ -695,7 +718,8 @@ supported in this release", #6088) for a group with more than one level.
      mutates a buffer, or that already carries a loop-variable hint, raises
      `Unsupported`.
    - Each tiled member's ranges are divided by the trip count and every member
-     gets a `LoopInfo` with `strict_loop_vars=True`.
+     gets a `LoopMember` (`_loop_info` in `loop_tiling_lowering.py`) with
+     `strict_loop_vars=True`.
    - `_lower_reduction` handles each `reduction` member; `_insert_copy_out`
      drains each `copy_out` member into a full buffer.
    - `_patch_retiled_load_indexes` rewrites the stale stride coefficients of
@@ -743,13 +767,13 @@ the output, filled once before the loop, and a combine op inside the loop:
 1. `_allocate_full_buffer` allocates `accum_full` with the full output shape,
    before the group's first op.
 2. `_insert_fill` writes the reduction's identity into `accum_full`. The fill
-   has no `loop_info`, so it runs once, outside the loop. The identity is a
+   has no `loop_member`, so it runs once, outside the loop. The identity is a
    `SpyreConstantFallback` scalar with a hand-built `FixedTiledLayout`, because
    layout finalization has already run. The fill is marked
    `_coarse_tile_force_live` (see the DCE subsection of the appendix).
 3. `_make_combine_buffer` builds a `coarse_tile_combine_<buf>` pointwise op that
    folds each trip's partial result into `accum_full` in place
-   (`MutationLayoutSHOULDREMOVE`). It carries the loop's `LoopInfo` and is
+   (`MutationLayoutSHOULDREMOVE`). It carries the loop's `LoopMember` and is
    inserted right after the reduction.
 4. The reduction records `_tiled_reduction_accum_name`, which
    `finalize_layouts` (`insert_restickify.py`) reads to give the accumulator
@@ -811,14 +835,12 @@ Every counted loop, from `for_each_tile` or from the span-overflow lowering,
 enters the scheduler as a `LoopSchedulerNode` (`loop_scheduler.py`), the
 subclass of `CountedLoopSchedulerNode` that carries the loop's `LoopNode`
 through the scheduler's dependency analysis and topological sorts via
-per-compile patches on Inductor's `Scheduler`. Because a `LoopSchedulerNode` is
-a `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes` passes it through
-unchanged, and fusion, kernel preparation, HBM-pool planning, and codegen all
-operate on the counted loop described below. `build_loop_scheduler_nodes`
-builds a `CountedLoopSchedulerNode` from flat `loop_info`-carrying nodes only
-when the `LoopNode`s were expanded before the Scheduler
-(`loop_scheduler.SCHEDULE_LOOP_NODES` off, which only the equivalence test
-does).
+per-compile patches on Inductor's `Scheduler`. Each `LoopNode` in
+`graph.operations` becomes exactly one `LoopSchedulerNode` (a nested
+`LoopNode` becomes a nested one), and no pass regroups scheduler nodes into
+loops. Because a `LoopSchedulerNode` is a
+`CountedLoopSchedulerNode`, fusion, kernel preparation, HBM-pool planning, and
+codegen all operate on the counted loop described below.
 
 ### Class definition
 
@@ -877,16 +899,19 @@ constituent nodes, exposes `get_nodes()`, and registers all constituent
 names in `scheduler.name_to_fused_node`.  Nothing needs to be
 reimplemented.
 
-### Pre-fusion pass placement and ordering
+### Scheduler placement and ordering
 
-`CountedLoopSchedulerNode`s are created by `build_loop_scheduler_nodes`,
-which is registered as the **second pass in `CustomPreFusionPasses`**,
-running before Inductor's own fusion pass:
+`LoopSchedulerNode`s are created while Inductor's `Scheduler` builds its
+nodes, before its fusion pass. `apply_loop_scheduler_patches`
+(`loop_scheduler.py`) patches `Scheduler.create_scheduler_node` for the
+compile, so a `LoopNode` becomes one `LoopSchedulerNode`
+(`_build_loop_scheduler_node`) and every other operation takes the original
+path. `CustomPreFusionPasses` holds only `propagate_mutation_layouts`:
 
 ```python
 class CustomPreFusionPasses(_SpyreNodePassPipeline):
     def __init__(self):
-        super().__init__([propagate_mutation_layouts, build_loop_scheduler_nodes])
+        super().__init__([propagate_mutation_layouts])
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
     def __init__(self):
@@ -896,66 +921,32 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         )
 ```
 
-**`build_loop_scheduler_nodes` must run before Inductor's fusion pass and
-before `spyre_fuse_nodes`.**  Placing it in `CustomPreFusionPasses` means
-`CountedLoopSchedulerNode`s are already present when Inductor calls
+Because the loops exist as `CountedLoopSchedulerNode`s from the start of
+scheduling, they are already present when Inductor calls
 `can_fuse_vertical` / `can_fuse_horizontal` on `SuperDSCScheduling`
 (both return `False`), so loop groups are never split by Inductor's own
 fusion logic.  `spyre_fuse_nodes` accumulates a `CountedLoopSchedulerNode`
 alongside plain `SchedulerNode`s, so a loop can share a bundle with adjacent
 ops, but it never splits the loop's members.  `can_fuse = False` on
-`CountedLoopSchedulerNode` provides a belt-and-suspenders guard against
-any future fusion path that might otherwise merge across group boundaries.
+`CountedLoopSchedulerNode` is a second guard against any fusion path that
+might otherwise merge across group boundaries.
 
-### The grouping algorithm
+### Building a `LoopSchedulerNode`
 
-`build_loop_scheduler_nodes` first calls `_regroup_by_outer_loop_key`, then
-scans the resulting node list and groups contiguous runs sharing the same
-outermost `loop_group_id` key. The regroup step is necessary because
-Inductor's own `Scheduler.topological_sort_schedule` runs (twice) before
-this pass ever sees the node list, via a plain DFS over
-`unmet_dependencies`, that DFS only guarantees a *valid* topological
-order, not that mutually independent nodes keep their original relative
-order, so it can interleave unrelated nodes into the middle of what
-a lowering built as a single contiguous loop group.
-`_regroup_by_outer_loop_key` merges every node sharing an outermost
-`loop_group_id[0]` key into one virtual unit (dependency set = the union of
-its members' real cross-group dependencies), runs a dependency-respecting
-DFS over `{merged units, ungrouped nodes}`, then expands each unit back
-into its original members in their original relative order, restoring
-contiguity while still producing a valid topological order:
+`_build_loop_scheduler_node` creates the scheduler nodes of the `LoopNode`'s
+body in body order and wraps them. A nested `LoopNode` in the body becomes a
+nested `LoopSchedulerNode` child. A no-op or extern-kernel body op is not a
+kernel, and Spyre's codegen rejects it inside a counted loop, so it is created
+as an ordinary scheduler node and placed immediately before its outermost
+loop; one that reads a buffer the loop writes raises `Unsupported`.
+`_check_members` raises `Unsupported` when the kernel ops directly in a body do
+not share one loop path (`counted_loop_path`), because such an op would run
+every trip. The node's `loop_count` is the `LoopNode`'s `trip_count`.
 
-```
-nodes = _regroup_by_outer_loop_key(nodes)
-result = []
-i = 0
-while i < len(nodes):
-    node = nodes[i]
-    gid = _loop_group_id(node)   # reads loop_info.loop_group_id from the inner ir.Operation
-    if gid is None:
-        result.append(node)
-        i += 1
-        continue
-    outer_key = gid[0]
-    run = [node]; i += 1
-    while i < len(nodes) and _loop_group_id(nodes[i])[0] == outer_key:
-        run.append(nodes[i]); i += 1
-    # Recursively wrap deeper nesting within this run.
-    inner = _build_loop_group(run, depth=1)
-    result.append(CountedLoopSchedulerNode.create(inner, loop_count))
-return result
-```
-
-Key invariant: the pre-scheduling pass runs in topological order, but
-Inductor's own topological sort does **not** by itself guarantee that a
-loop group's `SchedulerNode`s stay contiguous, it only guarantees a valid
-order among mutually independent nodes, which can interleave. Contiguity
-is restored by `_regroup_by_outer_loop_key` before grouping runs. If
-`build_loop_scheduler_nodes` still finds a non-contiguous run after that
-call, it means either a bug in `_regroup_by_outer_loop_key` itself, or a
-genuine data-flow constraint that makes the group's own op sequence
-topologically invalid (which would be a tiling-pass bug). The pass raises
-in that case.
+The order of the children is the body's program order, which the scheduler
+does not change: a `LoopSchedulerNode`'s read set holds only the reads from
+outside the loop, so Inductor's topological sort orders the loop as one unit
+and cannot interleave unrelated nodes into its body.
 
 ## Layer 3: `LoopSpec` and codegen
 
@@ -1022,7 +1013,7 @@ longer populates it: it refuses a `mark_dynamic(max=...)` size outside a
 
 `OpSpec.tiled_symbol_trip_counts` maps each minted level symbol appearing
 in `tiled_symbols` to that level's own trip count
-(`LoopInfo.loop_count` for that level); it lets downstream codegen
+(the `trip_count` of that level in `enclosing_loops`); it lets downstream codegen
 recover a level's full (untiled) extent as `(per-step device-element
 advance) * trip_count` without a separately tracked extent field on
 `TensorArg`. Only correct when a symbol belongs to exactly one nesting
@@ -1036,7 +1027,7 @@ each level, the coefficient of the level's loop variable in the access's
 (`tiling_expr_to_device_expr`), and multiplies it by that level's symbol from
 `_get_or_mint_level_symbol`. The result is `None` for an op in no loop, an op
 that lists no loop variable, and an access whose index does not move with the
-loop. An op whose `LoopInfo` has `strict_loop_vars=True` and that has no
+loop. An op in a loop with `strict_loop_vars` set (`loop_facts.strict_loop_vars`) that has no
 advance in its index raises `RuntimeError`, because the span-overflow lowering
 lists the loop variable on every member. Each level's term is picked out by `expr.coeff(sym)` on that
 level's own symbol, not by list position the way `tiled_symbols` is; because
@@ -1049,8 +1040,8 @@ mapping each level's strides to the correct loop variable by index.
 
 ### Nested loops and the `loop_group_id` tree
 
-Each `ir.Operation` carries a `loop_info.loop_group_id` that is a **path**
-rather than a flat integer.  A path is a tuple of integers, one element per
+Each `ir.Operation` a lowering puts in a loop carries a
+`loop_member.loop_group_id` that is a **path** rather than a flat integer.  A path is a tuple of integers, one element per
 nesting level:
 
 | `loop_group_id` | Meaning |
@@ -1059,30 +1050,32 @@ nesting level:
 | `(0, 0)` | single op nested two levels deep inside group 0 |
 | `(0, 1)` | ops at depth 2 inside outer group 0, inner group 1 |
 
-`loop_info.loop_count` is a **list** parallel to the path.  For a flat op at
-`(0,)`, `loop_count = [K]`.  For a single op at `(0, 0)`,
-`loop_count = [K1, K2]`, the scheduler reads `loop_count[0] = K1` when
-building the outer `CountedLoopSchedulerNode` and `loop_count[1] = K2`
-when building the inner one.  This allows a single op to supply the counts
-for all its enclosing loops without requiring sibling ops at intermediate
-depths.
+`loop_member.loop_count` is a **list** parallel to the path.  For a flat op
+at `(0,)`, `loop_count = [K]`.  For a single op at `(0, 0)`,
+`loop_count = [K1, K2]`: the node build reads `loop_count[0] = K1` for the
+outer `LoopNode`'s `trip_count` and `loop_count[1] = K2` for the inner one.
+This allows a single op to supply the counts for all its enclosing loops
+without requiring sibling ops at intermediate depths.
 
-When the flat nodes reach `build_loop_scheduler_nodes`, the pre-fusion
-pass (`_build_loop_group`) reconstructs the tree recursively:
+`collapse` and `build_pending_loop_nodes` build the tree in `_wrap`
+(`loop_node.py`), recursively:
 
-1. Group the flat `SchedulerNode` list into runs that share the same
-   outermost group id element (index `depth`).
-2. Read the count for this depth from `_loop_count(node, depth)`, which
-   returns the trip count of the node's enclosing loop at that depth
-   (`scheduler_enclosing_loops`).  All nodes in the run must agree on this
-   count.
-3. Recursively call `_build_loop_group(run, depth + 1)` to build the
-   inner level.
-4. Wrap the result in a `CountedLoopSchedulerNode` with that count.
+1. Group the op list into runs that share the path prefix of length
+   `depth + 1`. A run spans from its first member to its last member; an op
+   between two members that is not one stays in the span, in program order.
+2. Create a `LoopNode` with the last element of that prefix as `group_id`
+   and the first member's `loop_count[depth]` as `trip_count`.
+3. Recursively call `_wrap` on the run at `depth + 1` to build the node's
+   body, including any inner `LoopNode`s.
 
-Because every op carries the full `loop_count` list, the algorithm works
-even when a run contains only a single op that spans all nesting levels,
-there is no need for placeholder ops at intermediate depths.
+After the build, `node_levels(op)` reads the same path back from the chain of
+nodes around the op (`group_path` is the `group_id` of each enclosing node),
+and the scheduler turns the tree into nested `LoopSchedulerNode`s as described
+in [Building a `LoopSchedulerNode`](#building-a-loopschedulernode).
+
+Because every op carries the full `loop_count` list, the build works even
+when a run contains only a single op that spans all nesting levels, so there
+is no need for placeholder ops at intermediate depths.
 
 ### Bundle boundary constraint
 
@@ -1242,15 +1235,14 @@ landed.
 
 | File | Role |
 |---|---|
-| `torch_spyre/_inductor/loop_info.py` | Layer 1: the `LoopInfo` dataclass, the per-op loop record stamped by both lowerings |
-| `torch_spyre/_inductor/loop_facts.py` | Layer 1: loop-structure accessors (`enclosing_loops`, `scheduler_enclosing_loops`) and the index-derived advances (`read_advance`, `output_advance`, `advancing_levels`) |
-| `torch_spyre/_inductor/loop_node.py` | Layer 1: `LoopNode` structural node; `collapse` wraps each loop's ops, `request_loop_nodes`/`build_pending_loop_nodes` wrap the span-overflow groups, `OpsView` presents the body flat to passes, the edit helpers (`insert_before`, `insert_after`, `move_before`, `move_after`, `remove_op`, `top_level_entry`) place ops relative to loops, `expand`/`peel_non_members` for the scheduler hand-off |
-| `torch_spyre/_inductor/loop_scheduler.py` | Layer 2: `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass) and the per-compile `Scheduler` patches; `SCHEDULE_LOOP_NODES`, `loop_scheduler_supported` |
-| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Layer 1 (span-overflow path): `tile_groups`, `build_loop_tiling_plan` (`LoopTilingPlan`), `lower_loop_tiling`; divides ranges, stamps `LoopInfo` (`strict_loop_vars=True`), inserts copy-outs and reduction accumulators, adds the loop terms to the indexes |
+| `torch_spyre/_inductor/loop_facts.py` | Layer 1: loop-structure accessors that answer from the built nodes (`is_looped`, `enclosing_loops`, `node_levels`, `strict_loop_vars`, `counted_loop_path`; `pending_levels` for an op no node holds yet) and the index-derived advances (`read_advance`, `output_advance`, `advancing_levels`) |
+| `torch_spyre/_inductor/loop_node.py` | Layer 1: the `LoopMember` dataclass, the per-op record both lowerings write; the `LoopNode` structural node; `collapse` wraps each loop's ops, `request_loop_nodes`/`build_pending_loop_nodes` wrap the span-overflow groups, and both record the loop facts in the nodes and delete `loop_member`; `record_member` records the tiling of an op a pass adds to a loop; `OpsView` presents the body flat to passes; the edit helpers (`insert_before`, `insert_after`, `move_before`, `move_after`, `remove_op`, `top_level_entry`) place ops relative to loops; `expand` restores the leaf list once the scheduler has built its nodes |
+| `torch_spyre/_inductor/loop_scheduler.py` | Layer 2: `LoopSchedulerNode` (a `CountedLoopSchedulerNode` subclass), `_build_loop_scheduler_node`, and the per-compile `Scheduler` patches (`apply_loop_scheduler_patches`); `loop_scheduler_supported` |
+| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Layer 1 (span-overflow path): `tile_groups`, `build_loop_tiling_plan` (`LoopTilingPlan`), `lower_loop_tiling`; divides ranges, stamps `loop_member` (`strict_loop_vars=True`), inserts copy-outs and reduction accumulators, adds the loop terms to the indexes |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: helpers shared by both lowerings: `validate_coarse_tile_groups`, `reject_nested_loops`, `resolve_level_positions`, `_divide_reduction_ranges`, `_allocate_full_buffer`, `_make_combine_buffer`, `_patch_consumers` |
 | `torch_spyre/_inductor/wsr/loop_tiling_common.py` | Layer 1: `_divide_ranges`, `_patch_retiled_load_indexes`, `_AddLoopTermHandler`, `_ReadThroughLayout`, `_hint_ranges_pos` |
-| `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
-| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `prepare_kernel`, `_codegen_loop_body`, `_regroup_by_outer_loop_key` |
+| `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also records a restickify copy's tiling with `record_member` (what the op it feeds tiles) so the copy is a member of the same loop |
+| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `prepare_kernel`, `_codegen_loop_body` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
 | `torch_spyre/_inductor/codegen/bundle.py` | Layer 3: emits `scf.for` wrapping `affine.apply`/`sdsc_execute` in `bundle.mlir` |
@@ -1265,29 +1257,31 @@ landed.
 
 ## Invariants and failure modes
 
-**Contiguity invariant**: all ops sharing a `loop_info.loop_group_id` must be
-contiguous. `_lower_group` checks this before it lowers a group, via
+**Contiguity invariant**: all ops sharing a `loop_member.loop_group_id` must
+be contiguous. `_lower_group` checks this before it lowers a group, via
 `_validate_contiguous`, which raises `RuntimeError` if the ops are not a
 contiguous slice of the operation list. Each loop is then one `LoopNode`, so
-its members stay together through the pre-scheduling passes, and
-`build_loop_scheduler_nodes` raises `RuntimeError` if a loop group is still not
-contiguous after `_regroup_by_outer_loop_key`.
+its members stay together through the pre-scheduling passes and reach the
+scheduler as one `LoopSchedulerNode`; `check_loops` (`loop_checker.py`)
+reports an op that is outside the node of its loop or in another loop's body.
 
 **Consistent `loop_count`**: all ops sharing a `loop_group_id` must agree on
-`loop_info.loop_count` at every depth level.  The post-fusion pass asserts
-this.
+`loop_member.loop_count` at every depth level. The node build takes each
+node's `trip_count` from the first member's count (`_wrap` in
+`loop_node.py`).
 
 **`tiled_symbols` populated iff inside a loop**: `OpSpec.tiled_symbols` is
 non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
 It is a `list[list[Symbol]]` (innermost first) derived from the per-level
-tiled dims in `loop_info.loop_tiled_dims` on the corresponding
-`ir.Operation`, selected from the scheduler-level `iteration_space` keys.
+tiled dims that the enclosing `LoopNode`s hold for the corresponding
+`ir.Operation` (`LoopNode.tiling`, read through `enclosing_loops`), selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: the span-overflow lowering must run after stickify/padding
 and before `cost_model_matmul_division`, `work_distribution`, and
-`scratchpad_planning`. `build_loop_scheduler_nodes` must run in
-`CustomPreFusionPasses` (before Inductor's own fusion pass and before
-`spyre_fuse_nodes`); see [Pass placement](#pass-placement) above.
+`scratchpad_planning`; see [Pass placement](#pass-placement) above. Each
+`LoopNode` becomes a `LoopSchedulerNode` when the `Scheduler` builds its nodes,
+before Inductor's own fusion pass and before `spyre_fuse_nodes`; see
+[Scheduler placement and ordering](#scheduler-placement-and-ordering).
 `for_each_tile`'s `splice_while_loops` is the second
 `CustomPreSchedulingPasses` pass, after `apply_reserved_dims_contract` and
 ahead of `deadcode_elimination`: it must prove the trip count and splice the
@@ -1314,7 +1308,7 @@ kind classification or the reduction accumulator pattern, both covered above.
 
 **Scope note**: the copy-out, fill, and combine insertion below belongs to the
 span-overflow lowering (`tile_groups`). The `for_each_tile` lowering
-(`splice_while_loops` in `for_each_tile_lowering.py`) stamps `loop_info` onto
+(`splice_while_loops` in `for_each_tile_lowering.py`) stamps `loop_member` onto
 ops already produced by tracing `scan` and has no read-copy staging (see the
 Small Example above), but it reuses `_divide_ranges`,
 `_patch_retiled_load_indexes`, and `_NameSwapHandler` from

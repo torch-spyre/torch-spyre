@@ -1120,7 +1120,8 @@ Environment Variables
 and ``FLEX_DEVICE`` are read by the flex library when
 ``torch_spyre/csrc/spyre_device_enum.cpp`` calls ``flex::getNumDevices()``.
 ``LOCAL_RANK`` is read by torch-spyre (``parse_local_rank`` in
-``torch_spyre/csrc/spyre_guard.h``):
+``torch_spyre/csrc/spyre_guard.h``), and ``LOCAL_WORLD_SIZE`` by
+``_local_ranks`` in ``torch_spyre/_inductor/parallel_precompile.py``:
 
 .. list-table::
    :header-rows: 1
@@ -1139,6 +1140,11 @@ and ``FLEX_DEVICE`` are read by the flex library when
      - Per-process rank set by torchrun. Seeds the logical Spyre device
        index when ``set_device()`` has not been called (0 when unset;
        invalid or out-of-range values raise)
+   * - ``LOCAL_WORLD_SIZE``
+     - Ranks on this host (vLLM workers set it). Inside
+       ``fork_inner_compiles``, each forked compile's LX planning solver gets
+       the CPU count divided by this value, else by the process group's size
+       (``torch_spyre/_inductor/parallel_precompile.py``)
 
 **Internal:**
 

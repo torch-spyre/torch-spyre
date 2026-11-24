@@ -887,7 +887,8 @@ so `_maybe_coarse_tile_span_overflow` refuses a group with more than one level:
   lowers it with `lower_loop_tiling`, which divides the tiled ops, drains each
   tile that something outside the loop reads into a full buffer, and gives every
   op the loop variable and every advancing access its term. Each op carries a
-  `LoopInfo` with `strict_loop_vars=True`;
+  `LoopMember` (`op.loop_member`) with `strict_loop_vars=True` until its
+  `LoopNode` is built;
 - `request_loop_nodes` (`loop_node.py`) records the loops, and the pass loop
   wraps each one in a `LoopNode` after the pass returns;
 - the `LoopNode` reaches the scheduler as a `LoopSchedulerNode` (a
@@ -1177,7 +1178,7 @@ terminating its group.
 |---|---|
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
-| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Loop-tiling lowering (`tile_groups`, `lower_loop_tiling`): divides the tiled ops and gives each a `LoopInfo` with `strict_loop_vars=True` |
+| `torch_spyre/_inductor/wsr/loop_tiling_lowering.py` | Loop-tiling lowering (`tile_groups`, `lower_loop_tiling`): divides the tiled ops and gives each a `LoopMember` with `strict_loop_vars=True` |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Helpers shared with the `for_each_tile` lowering: range division, consumer patching, `validate_coarse_tile_groups`, `reject_nested_loops` |
 | `torch_spyre/_inductor/passes.py` | Wires `splice_while_loops` (`for_each_tile`) and automatic span-overflow tiling into the pipeline |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
