@@ -30,10 +30,11 @@ from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
+    is_looped,
     output_advances_anywhere,
     read_advances_anywhere,
 )
-from torch_spyre._inductor.loop_info import LoopCarryRecord
+from torch_spyre._inductor.loop_node import LoopCarryRecord
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -122,7 +123,7 @@ def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
     """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
 
     Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
-    An extern kernel keeps its loop_info (e.g. a loop-body constant that
+    An extern kernel keeps its loop_member (e.g. a loop-body constant that
     dedup_and_promote_constants hoisted to the graph head) but runs once,
     outside the loop.
     """
@@ -415,7 +416,7 @@ def _is_tiled_advancing(op: Operation) -> bool:
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    # The loop fact (False without a loop_info) lives in loop_facts; the layout
+    # The loop fact (False without a loop_member) lives in loop_facts; the layout
     # gate above is an LX question and stays here.
     return output_advances_anywhere(op)
 
@@ -443,7 +444,7 @@ def _is_read_advancing_anywhere(
     whether its index moves with one of the op's loop variables.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
-        if getattr(reader_op, "loop_info", None) is None:
+        if not is_looped(reader_op):
             continue
         # read_advances_anywhere is False when dep is not one of the reader's
         # MemoryDep reads (it is name's write on this op).

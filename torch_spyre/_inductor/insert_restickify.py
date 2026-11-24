@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import dataclasses
 import logging
 from collections import defaultdict
@@ -26,9 +25,9 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .loop_facts import counted_loop_path, enclosing_loops
-from .loop_info import ReadCopyElisionRecord
-from .loop_node import insert_after
+from .loop_facts import counted_loop_path, enclosing_loops, is_looped
+from .read_copy_elision import ReadCopyElisionRecord
+from .loop_node import move_after, move_before, record_member
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -70,7 +69,8 @@ logger = get_inductor_logger("insert_restickify")
 #   op.committed_stl          set by optimize_restickify; consumed+deleted by finalize_layouts
 #   op.layouts                set by propagate_layouts / stickify; consumed+deleted by finalize_layouts
 #   op.restick_cost_fn        set by propagate_layouts; consumed+deleted by finalize_layouts
-#   op.loop_info              set by coarse_tile; read (and cloned) by insert_restickify_on_node_inputs
+#   (loop facts)              owned by the LoopNodes once built; insert_restickify_on_node_inputs
+#                             records the copy's tiling with loop_node.record_member
 #   op._restickify_plan       set by propagate_layouts; consumed+deleted by insert_post_mutation_restickify
 #   op._tiled_reduction_accum_name  set by coarse_tile; read by finalize_layouts
 #   op._input_layout_overrides      set by insert_post_mutation_restickify; read by codegen
@@ -272,9 +272,7 @@ def _moved_loop_term(
     leave a fixed-address read advancing. With no shared level the consumer keeps
     its term.
     """
-    consumer_li = getattr(op, "loop_info", None)
-    copy_li = getattr(restick_buff, "loop_info", None)
-    if consumer_li is None or copy_li is None:
+    if not is_looped(op) or not is_looped(restick_buff):
         return None
     if not n_levels or shared_loop_depth == 0:
         return None
@@ -497,43 +495,39 @@ def _transfer_loop_info(
     restick_arg_info: RestickifyArgInfo,
     shared_loop_depth: int,
 ) -> None:
-    """Assign loop_info to a newly-created restickify buffer.
+    """Make a newly placed restickify buffer a member of its consumer's loops.
 
-    When coarse-tiling has already annotated the consumer op with loop_info,
-    the restickify node must also carry loop_info to remain contiguous in
-    build_loop_scheduler_nodes: it gets a copy of the consumer's. Which accesses
-    advance is the index's business (``_moved_loop_term`` moves the loop term to
-    the copy when the copy takes over the swapped read's advance).
+    When the consumer is in a loop, the copy was just placed beside it (so it is in
+    the same nodes) and must be told what it tiles: it tiles what the consumer
+    tiles. That is how it stays contiguous in the loop's node. Which accesses
+    advance is the index's business (``_moved_loop_term`` moves the loop term to the
+    copy when the copy takes over the swapped read's advance).
 
     No shared loop scope (``old_name_buf`` is not itself a tiled stage): the copy
     reads a fixed full copy of ``old_name_buf``, made once, and its output is
-    consumed at a fixed address by every trip, so its extent is pinned.
+    consumed at a fixed address by every trip, so its extent is pinned, and it tiles
+    nothing: the consumer's tiled dims (e.g. a per-tile token dim) would be misread
+    against this copy's own unrelated dim at the same index.
+    work_division_constraints.py reads them to pin a dim's split to 1, so a stale
+    entry would block the split this full, untiled copy needs to fit the per-core
+    span limit (issue #6277).
+
+    TODO(#5863 8.3): that fixed full copy sits inside the loop body and runs on
+    every trip. Placing it before the node (insert_before) would run it once;
+    test_embedding_restickify_table_no_span_overflow is the acceptance case.
     """
-    source_li = getattr(old_name_buf, "loop_info", None)
-    consumer_li = getattr(op, "loop_info", None)
-    if consumer_li is None:
+    consumer_levels = enclosing_loops(op)
+    if not consumer_levels:
         return
-    restick_buff.loop_info = copy.deepcopy(consumer_li)
-    has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+    has_shared_loop_scope = is_looped(old_name_buf) and shared_loop_depth > 0
+    if has_shared_loop_scope:
+        tiling = [
+            (level.tiled_dims, level.tiled_reduction_dims) for level in consumer_levels
+        ]
+    else:
+        tiling = [((), ()) for _ in consumer_levels]
+    record_member(restick_buff, tiling, like=op)
     if not has_shared_loop_scope:
-        # Also clear loop_tiled_dims/loop_tiled_reduction_dims: left as the
-        # consumer's (e.g. a per-tile token dim), they get misread against this
-        # copy's own unrelated dim at the same index. work_division_constraints.py
-        # reads them to pin a dim's split to 1, so a stale entry here blocks the
-        # split this full, untiled copy needs to fit the per-core span limit
-        # (issue #6277).
-        # TODO(#5863 8.3): this fixed full copy sits inside the loop body and runs on
-        # every trip. Once insert_restickify is node-aware, place it before the node
-        # (insert_before) so it runs once; an op outside every loop cannot carry a
-        # stale loop_tiled_dims. Stage 9 needs another source for the dims
-        # coarse_tile_local_dim_split_domains pins once loop_tiled_dims is deleted;
-        # test_embedding_restickify_table_no_span_overflow is the acceptance case.
-        levels = len(getattr(consumer_li, "loop_count", []) or [])
-        restick_buff.loop_info = dataclasses.replace(
-            restick_buff.loop_info,
-            loop_tiled_dims=[[] for _ in range(levels)],
-            loop_tiled_reduction_dims=[[] for _ in range(levels)],
-        )
         # Only this case needs the pin: a tiled-stage copy advances per trip and
         # takes its extent from the tile, while this fixed copy takes the whole
         # operand's, which may be symbolic (a reserved pool).
@@ -658,13 +652,6 @@ def insert_restickify_on_node_inputs(
     edge_swaps: list[tuple] = []
     name_map: dict[str, str] = {}
     moved_terms: dict[str, sympy.Expr] = {}
-    try:
-        op_index = operations.index(op)
-    except ValueError:
-        raise AssertionError(
-            f"Consumer op {op.get_name()} not found in operations list"
-        ) from None
-
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         old_name_buf = V.graph.try_get_buffer(old_name)
@@ -683,10 +670,10 @@ def insert_restickify_on_node_inputs(
             name_map[old_name] = new_name
 
         # lower_restickify calls pw.realize() which appends restick_buff to operations.
-        # Move it to just before the consumer op to preserve topological order.
-        operations.remove(restick_buff)
-        operations.insert(op_index, restick_buff)
-        op_index += 1  # consumer shifted right by 1
+        # Move it to just before the consumer op to preserve topological order: in the
+        # consumer's loop body when the consumer is a body op, before the node when
+        # the consumer is a node.
+        move_before(operations, op, restick_buff)
 
         source_group_id = counted_loop_path(old_name_buf, include_extern=True)
         consumer_group_id = counted_loop_path(op, include_extern=True)
@@ -848,8 +835,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # Tiled-reduction scratch: propagate the reduction op's device
             # layout to accum_full so fill, combine, and copy all agree on
             # the device coordinate system.
-            loop_info = getattr(op, "loop_info", None)
-            if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
+            if is_looped(op) and isinstance(op.layout, FixedTiledLayout):
                 all_tiled_rdims_empty = not any(
                     level.tiled_reduction_dims for level in enclosing_loops(op)
                 )
@@ -1079,15 +1065,13 @@ def _bracket_mutation(operations, mutation_op, buf_tmp, buf_copyback) -> None:
     """Put ``buf_tmp`` right before ``mutation_op`` and ``buf_copyback`` right after.
 
     ``_create_restickify_node`` appends both nodes at the end of ``operations``, so
-    they are taken out first. Each goes next to the mutation op in the list that
-    holds it: the copy-back is placed with ``insert_after``, not at a flat index
+    they are moved from there. Each goes next to the mutation op in the list that
+    holds it: the copy-back is placed with ``move_after``, not at a flat index
     ``index(mutation_op) + 2``, which puts it before whatever follows the mutation,
     and that is outside the loop when the mutation is the last op of a loop body.
     """
-    operations.remove(buf_tmp)
-    operations.insert(operations.index(mutation_op), buf_tmp)
-    operations.remove(buf_copyback)
-    insert_after(operations, mutation_op, buf_copyback)
+    move_before(operations, mutation_op, buf_tmp)
+    move_after(operations, mutation_op, buf_copyback)
 
 
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:

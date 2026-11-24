@@ -93,8 +93,13 @@ from .pass_utils import (
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
-from .loop_facts import _loop_coefficient, advancing_levels, enclosing_loops
-from .loop_info import LoopShim
+from .loop_facts import (
+    _loop_coefficient,
+    advancing_levels,
+    enclosing_loops,
+    is_looped,
+    strict_loop_vars,
+)
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -848,7 +853,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         consumes no new read (``x + x`` is one dependency) answers ``None``.
         """
         ir_node = self.current_node.node
-        if getattr(ir_node, "loop_info", None) is None:
+        if not is_looped(ir_node):
             return None
         if is_input:
             scheduler = getattr(V.graph, "scheduler", None)
@@ -867,7 +872,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             self._tile_advance_seen[name] = consumed + 1
         indexed = self._index_tile_advance(tensor, is_input, name)
         if indexed is None:
-            if isinstance(ir_node.loop_info, LoopShim):
+            if strict_loop_vars(ir_node):
                 # The lowering lists the variable of every level on every member,
                 # so a shim op with no advance in its index is a bug, not a zero.
                 raise RuntimeError(

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The temporary loop_info shim and the index-derived advances for it.
+"""Index-derived advances, for an op the loop-tiling lowering made.
 
-Device-free tests on stub ops. A ``LoopShim`` (what the loop-tiling lowering stamps
-instead of a ``CoarseTileInfo``) carries the plan's own content and no advance
-lists, so ``loop_facts`` reads a shim op's advances from the op's own index: the
-coefficient of each loop variable its ``dim_hints`` list.
+Device-free tests on stub ops. A ``LoopMember`` with ``strict_loop_vars`` (what the
+loop-tiling lowering stamps) lists the variable of every level in the op's
+``dim_hints``, so ``loop_facts`` reads its advances from the op's own index: the
+coefficient of each loop variable it lists. ("Shim" in the test names is that op.)
 """
 
 from types import SimpleNamespace
@@ -37,7 +37,7 @@ from torch_spyre._inductor.loop_facts import (
     read_advances_anywhere,
     advancing_levels,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.propagate_hints import DimHint
 
 d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
@@ -59,9 +59,9 @@ def _hint(variable, trips):
     )
 
 
-def _op(loop_info, reads, writes, hints=()):
+def _op(loop_member, reads, writes, hints=()):
     op = SimpleNamespace(
-        loop_info=loop_info,
+        loop_member=loop_member,
         dim_hints=list(hints),
         get_read_writes=lambda: SimpleNamespace(reads=reads, writes=writes),
     )
@@ -69,17 +69,18 @@ def _op(loop_info, reads, writes, hints=()):
 
 
 def _shim(levels=1, tiled=None):
-    return LoopShim(
+    return LoopMember(
         loop_group_id=(3,) + (0,) * (levels - 1),
         loop_count=[sympy.Integer(8)] * levels,
         loop_tiled_dims=tiled if tiled is not None else [[1]] + [[]] * (levels - 1),
         loop_tiled_reduction_dims=[[] for _ in range(levels)],
+        strict_loop_vars=True,
     )
 
 
 def test_shim_levels_are_read_by_enclosing_loops():
     shim = _shim()
-    legacy = CoarseTileInfo(
+    legacy = LoopMember(
         loop_group_id=(3,),
         loop_count=[sympy.Integer(8)],
         loop_tiled_dims=[[1]],
@@ -184,7 +185,7 @@ def test_a_for_each_tile_op_that_lists_no_loop_variable_does_not_advance():
     """It is inside the loop but indexes nothing with its variable (the loop's fill,
     for one): zero at every level, not an error."""
     dep = _dep("arg0_1", d0 + d1)
-    legacy = CoarseTileInfo(
+    legacy = LoopMember(
         loop_group_id=(3, 0),
         loop_count=[sympy.Integer(8)] * 2,
         loop_tiled_dims=[[], []],
@@ -224,7 +225,7 @@ def test_a_non_affine_use_of_the_variable_is_unsupported():
 def test_a_coarsetileinfo_op_is_read_from_its_index_too():
     """A ``for_each_tile`` op carries no more than the loop's own facts; whatever
     stored lists it still has are ignored, so an empty record gives the same advance."""
-    info = CoarseTileInfo(
+    info = LoopMember(
         loop_group_id=(3,),
         loop_count=[sympy.Integer(8)],
         loop_tiled_dims=[[1]],
@@ -244,8 +245,6 @@ def test_a_coarsetileinfo_op_is_read_from_its_index_too():
 # the readers found)
 # ---------------------------------------------------------------------------
 
-import ast  # noqa: E402
-import pathlib  # noqa: E402
 from unittest import mock  # noqa: E402
 
 from torch._inductor.ir import Pointwise  # noqa: E402
@@ -260,7 +259,7 @@ from torch_spyre._inductor.scratchpad.allocator import (  # noqa: E402
 
 def _equal_infos():
     shim = _shim()
-    legacy = CoarseTileInfo(
+    legacy = LoopMember(
         loop_group_id=shim.loop_group_id,
         loop_count=list(shim.loop_count),
         loop_tiled_dims=[list(d) for d in shim.loop_tiled_dims],
@@ -275,46 +274,11 @@ def test_the_allocator_treats_a_shim_op_as_coarse_tiled():
     relayout prices."""
     shim, legacy = _equal_infos()
     for info in (shim, legacy):
-        op = SimpleNamespace(loop_info=info)
+        op = SimpleNamespace(loop_member=info)
         assert _is_coarse_tiled(op) is True
         assert _coarse_tile_loop_trip_count(op) == 8
     assert _is_coarse_tiled(SimpleNamespace()) is False
-    assert _coarse_tile_loop_trip_count(SimpleNamespace(loop_info=None)) == 1
-
-
-# Where a bare ``isinstance(x, CoarseTileInfo)`` is correct, and why. Anything else
-# must test for the shim as well (``COUNTED_LOOP_INFO``).
-_BARE_ISINSTANCE_ALLOWED = {
-    # pass 0: runs before any shim can exist, on for_each_tile ops only
-    "wsr/for_each_tile_lowering.py": "for_each_tile ops are stamped at pass 0",
-    # declines by design: it keeps a copy for an op without a complete address record
-    "read_copy_elision.py": "keeps the copy for a shim consumer (decided)",
-    # patches the per-read lists a CoarseTileInfo consumer stores; a shim consumer
-    # keeps none, and its redirected read advances by its index
-    "wsr/coarse_tile.py": "_patch_consumers skips a LoopShim consumer on purpose",
-}
-
-
-def test_every_bare_isinstance_coarsetileinfo_site_is_classified():
-    root = pathlib.Path(__file__).resolve().parents[2] / "torch_spyre" / "_inductor"
-    unclassified = []
-    for path in sorted(root.rglob("*.py")):
-        rel = str(path.relative_to(root))
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "isinstance"
-                and len(node.args) == 2
-                and ast.unparse(node.args[1]) == "CoarseTileInfo"
-                and rel not in _BARE_ISINSTANCE_ALLOWED
-            ):
-                unclassified.append(f"{rel}:{node.lineno}")
-    assert unclassified == [], (
-        "these tests would read as False for a LoopShim op; widen them to "
-        f"COUNTED_LOOP_INFO or classify them above: {unclassified}"
-    )
+    assert _coarse_tile_loop_trip_count(SimpleNamespace(loop_member=None)) == 1
 
 
 def _kernel_for(op_loop_info, *, reads=()):
@@ -324,7 +288,7 @@ def _kernel_for(op_loop_info, *, reads=()):
     kernel._tile_advance_seen = {}
     kernel._tile_advance_rw = None
     node = SimpleNamespace(
-        loop_info=op_loop_info,
+        loop_member=op_loop_info,
         get_operation_name=lambda: "op7",
         get_read_writes=lambda: SimpleNamespace(reads=list(reads), writes=[]),
     )
@@ -412,8 +376,8 @@ def test_a_write_takes_the_first_write_and_counts_no_read():
 
 def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
     """Decided: it does not migrate; only a ``for_each_tile`` consumer (a
-    ``CoarseTileInfo``) has a saved direct form, so a shim consumer keeps its copy,
-    and says so, not crashes."""
+    ``LoopMember`` without ``strict_loop_vars``) has a saved direct form, so a consumer
+    the loop-tiling lowering made keeps its copy, and says so, not crashes."""
     consumer_is_shim, copy_is_shim = True, False
     _, legacy = _equal_infos()
     other = _dep("other", d0)
@@ -425,14 +389,14 @@ def test_read_copy_elision_keeps_a_copy_for_a_shim_consumer():
         data=mock.MagicMock(spec=Pointwise),
         get_read_writes=lambda: SimpleNamespace(reads=[cp, other], writes=[out]),
         get_layout=lambda: layout,
-        loop_info=_shim() if consumer_is_shim else legacy,
+        loop_member=_shim() if consumer_is_shim else legacy,
     )
     copy_op = SimpleNamespace(
         get_layout=lambda: mock.MagicMock(spec=FixedTiledLayout),
         get_read_writes=lambda: SimpleNamespace(
             reads=[_dep("src", d0 + d1)], writes=[cp]
         ),
-        loop_info=_shim() if copy_is_shim else legacy,
+        loop_member=_shim() if copy_is_shim else legacy,
     )
     direct = SimpleNamespace(
         get_read_writes=lambda: SimpleNamespace(

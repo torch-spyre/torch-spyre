@@ -301,7 +301,7 @@ class TensorArg:
             level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_info/coarse tiling.
+            ops without loop_member/coarse tiling.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this
@@ -397,7 +397,7 @@ class OpSpec:
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
         tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
-            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            to its own nesting level's trip count (LoopMember.loop_count
             for that level). Used by SDSC codegen to compute each tiled
             tensor's full pre-tiling extent as
             (per-unit-step device element advance) * trip_count, without

@@ -226,7 +226,7 @@ tables_present(client, db, tables)   # the v2 write gate, per table set
 ```
 
 **Use case.** Every composite action gates its own v2 write on
-`clickhouse-host` being non-empty *before* even installing the library — but
+`clickhouse-v2-host` being non-empty *before* even installing the library — but
 `tables_present` is the second gate, inside the script, that lets a database
 with v1 tables only (no v2 yet) skip the v2 insert cleanly rather than
 crashing on a missing table.

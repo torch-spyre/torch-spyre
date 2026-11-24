@@ -39,7 +39,7 @@ from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     build_loop_tiling_plan,
 )
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, loop_member_view
 from test_span_overflow_gate import (
     _relative_error,
     CASES,
@@ -212,14 +212,14 @@ def test_the_group_index_counts_from_the_offset():
 
 @expects_raise
 def test_a_group_holding_an_op_with_loop_info_is_refused():
-    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.loop_node import LoopMember
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     original = passes.tile_groups
 
     def spy(graph, groups, group_idx_offset=0):
-        groups[0][0][0].loop_info = CoarseTileInfo(
+        groups[0][0][0].loop_member = LoopMember(
             loop_group_id=(9,),
             loop_count=[2],
             loop_tiled_dims=[[0]],
@@ -229,15 +229,15 @@ def test_a_group_holding_an_op_with_loop_info_is_refused():
 
     with (
         mock.patch.object(passes, "tile_groups", spy),
-        pytest.raises(Exception, match="existing loop_info"),
+        pytest.raises(Exception, match="existing loop_member"),
     ):
         compile_span_overflow(fn, args, limit)
 
 
 @pytest.mark.parametrize("case", ["pointwise_copy_out", "pointwise_chain"])
-def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
-    """Every looped op carries a LoopShim: nothing keeps a stored per-read record."""
-    from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+def test_the_new_lowering_stamps_strict_loop_info_and_no_stored_lists(case):
+    """Every looped op carries a strict LoopMember: nothing keeps a stored per-read
+    record."""
     from torch_spyre._inductor.loop_node import all_ops
 
     fn, shapes, limit, *_ = CASES[case]
@@ -247,9 +247,9 @@ def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
 
     def spy(graph):
         infos.extend(
-            getattr(op, "loop_info", None)
+            loop_member_view(op)
             for op in all_ops(graph.operations)
-            if getattr(op, "loop_info", None) is not None
+            if loop_member_view(op) is not None
         )
         return original(graph)
 
@@ -257,8 +257,7 @@ def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
         mock.patch.object(passes, "_hand_off_loop_nodes", spy),
     ):
         compile_span_overflow(fn, args, limit)
-    assert infos and all(isinstance(i, LoopShim) for i in infos), infos
-    assert not any(isinstance(i, CoarseTileInfo) for i in infos)
+    assert infos and all(i.strict_loop_vars for i in infos), infos
 
 
 def _carries(fn, args, limit):
@@ -342,7 +341,7 @@ def _allocator_post_call_state():
                         bool(getattr(op, JOINT_TILING_AND_DIVISION_ATTR, False)),
                     )
                     for op in all_ops(graph.operations)
-                    if getattr(op, "loop_info", None) is not None
+                    if loop_member_view(op) is not None
                 }
             )
 
@@ -392,13 +391,12 @@ def _mixed_graph():
     return fn, [_shaped(shape, seed) for seed, shape in enumerate(shapes)], 4 * MB
 
 
-def test_no_for_each_tile_op_has_a_loop_shim():
+def test_no_for_each_tile_op_has_strict_loop_vars():
     """A graph with a ``for_each_tile`` loop and a span-overflow loop, compiled under
-    the plan: each loop node holds one kind of record, the ``for_each_tile`` one a
-    ``CoarseTileInfo`` and the span-overflow one a ``LoopShim``, never the reverse."""
+    the plan: each loop node holds one kind of record, the ``for_each_tile`` one with
+    ``strict_loop_vars`` False and the span-overflow one True, never the reverse."""
     from test_span_overflow_loop_terms import _nodes_of
 
-    from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
     from torch_spyre._inductor.loop_node import all_ops
 
     fn, args, limit = _mixed_graph()
@@ -407,7 +405,7 @@ def test_no_for_each_tile_op_has_a_loop_shim():
 
     def spy(graph):
         kinds.extend(
-            {type(getattr(op, "loop_info", None)) for op in all_ops(node.body)}
+            {loop_member_view(op).strict_loop_vars for op in all_ops(node.body)}
             for node in _nodes_of(graph.operations)
         )
         return original(graph)
@@ -416,11 +414,7 @@ def test_no_for_each_tile_op_has_a_loop_shim():
         mock.patch.object(passes, "_hand_off_loop_nodes", spy),
     ):
         compiled = compile_span_overflow(fn, args, limit)
-    assert sorted(map(sorted, ([t.__name__ for t in k] for k in kinds))) == [
-        ["CoarseTileInfo"],
-        ["LoopShim"],
-    ], kinds
-    assert CoarseTileInfo and LoopShim
+    assert sorted(map(sorted, kinds)) == [[False], [True]], kinds
     x, y, a, b = (t.float() for t in args)
     assert _relative_error(compiled.outputs, (x @ y, a + b)) < 2e-2
 
@@ -499,7 +493,7 @@ def test_a_member_the_loop_does_not_tile_may_not_read_a_tiled_members_tile():
 
 def _compile_with_menu(fn, args, menu):
     """Compile ``fn`` under the plan with the allocator offered ``menu(op)`` for each
-    op; returns ``(device result, cpu result, {op: loop_info}, {op: per-read advances})``."""
+    op; returns ``(device result, cpu result, {op: loop_member}, {op: per-read advances})``."""
     from test_solver_auto_coarse_tiling import CollectTilingPasses
     from torch._inductor import config as t_inductor_config
 

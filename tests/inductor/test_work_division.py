@@ -51,7 +51,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache, sympy_index_symbol
 from torch._inductor.virtualized import V
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 from utils_inductor import mock_op_split_space
 
@@ -75,11 +75,9 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
-    LoopCarryRecord,
-    copy_op_metadata,
-)
+from torch_spyre._inductor.loop_node import LoopMember
+from torch_spyre._inductor.loop_node import LoopCarryRecord
+from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
@@ -695,7 +693,7 @@ class TestEmptyLxEligibility(unittest.TestCase):
             allocator_module, "clone_at_graph_boundaries", return_value=True
         ):
             reason = allocator._input_residency_reason(
-                graph, "value", [0, 1], division_is_fixed=False
+                graph, "value", [0, 1], mutated_buffers=set(), division_is_fixed=False
             )
         self.assertEqual(reason, "empty tensor")
         with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
@@ -713,6 +711,48 @@ class TestEmptyLxEligibility(unittest.TestCase):
                 buf_user_deps={},
             )
         self.assertEqual(reason, "empty tensor")
+
+
+class TestMutatedInputLxEligibility(unittest.TestCase):
+    def test_input_written_in_place_is_not_cloned(self):
+        """Both planners refuse to clone a graph input the graph writes in place."""
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        nonempty = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(
+                layout=_fixed_tiled_layout((64, 64))
+            )
+        )
+        empty = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(
+                layout=_fixed_tiled_layout((0, 64))
+            )
+        )
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            for division_is_fixed in (False, True):
+                with self.subTest(division_is_fixed=division_is_fixed):
+                    self.assertEqual(
+                        allocator._input_residency_reason(
+                            nonempty,
+                            "value",
+                            [0, 1],
+                            mutated_buffers={"value"},
+                            division_is_fixed=division_is_fixed,
+                        ),
+                        "mutation target",
+                    )
+            # Writing a different buffer does not refuse this input.
+            self.assertEqual(
+                allocator._input_residency_reason(
+                    empty,
+                    "value",
+                    [0, 1],
+                    mutated_buffers={"other"},
+                    division_is_fixed=False,
+                ),
+                "empty tensor",
+            )
 
 
 def _make_context(
@@ -1005,7 +1045,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_only_whole_stick_partitions_are_legal(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(3)],
             loop_tiled_dims=[[]],
@@ -1042,7 +1082,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
     def test_short_loop_does_not_force_source_compatible_division(self):
         head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
         op = _computed_buffer((2, 128, 64), name="short_direct_read_candidate")
-        op.loop_info = CoarseTileInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[sympy.Integer(2)],
             loop_tiled_dims=[[]],
@@ -3226,11 +3266,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         # One counted loop holds the update and the reader. The update writes
         # through the storage.
-        loop = CoarseTileInfo(
+        loop = LoopMember(
             loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
         )
-        update_op.loop_info = loop
-        reader_op.loop_info = loop
+        update_op.loop_member = loop
+        reader_op.loop_member = loop
         record = LoopCarryRecord(
             storage_name="plain",
             update_name="update",
@@ -4877,7 +4917,7 @@ class TestFp8MatmulConsumerAlignmentOnDevice(unittest.TestCase):
 
 
 class TestTopKConstraints(unittest.TestCase):
-    def test_topk_uses_minimum_supported_split_domains(self):
+    def test_topk_exposes_all_per_core_legal_k_splits(self):
         k, search = _isym("k"), _isym("search")
         op = _computed_buffer(
             (8, 16),
@@ -4896,18 +4936,18 @@ class TestTopKConstraints(unittest.TestCase):
             )
         )
         self.assertEqual(result.allowed_splits[search], frozenset({1}))
-        self.assertEqual(result.allowed_splits[k], frozenset({2}))
+        self.assertEqual(result.allowed_splits[k], frozenset({2, 4, 8}))
 
-    def test_default_planner_uses_minimum_supported_k_split(self):
+    def test_default_planner_uses_largest_allowed_k_split(self):
         k, search = _isym("k"), _isym("search")
         splits = multi_dim_iteration_space_split(
             {k: 8, search: 16},
             32,
             [k],
             [search],
-            allowed_splits={search: frozenset({1}), k: frozenset({2})},
+            allowed_splits={search: frozenset({1}), k: frozenset({2, 4, 8})},
         )
-        self.assertEqual(splits[k], 2)
+        self.assertEqual(splits[k], 8)
         self.assertEqual(splits[search], 1)
 
 
@@ -5133,6 +5173,56 @@ class TestOpSplitSpace(unittest.TestCase):
             self.assertIsNone(
                 work_division_module.build_op_split_space(case.op, case.max_cores)
             )
+
+    def test_nonlinear_write_symbol_is_an_output_axis_everywhere(self):
+        """A symbol that appears in the write index only under ``FloorDiv`` or
+        ``ModularIndexing`` has coefficient 0 there but is still an output axis.
+        The space, the classifier, the scheduler encoder and its validator must
+        all say so; the validator then rejects a split on it, since the
+        coefficient transport has no key to carry it by."""
+        s0, s1 = _isym("s0"), _isym("s1")
+        read_index = 64 * s0 + s1
+        for write_index in (
+            FloorDiv(s0, 64) * 64 + s1,
+            ModularIndexing(s0, 1, 64) * 64 + s1,
+        ):
+            with self.subTest(write_index=str(write_index)):
+                self.assertEqual(write_index.coeff(s0), 0)
+                op = _computed_buffer((128, 64), name="nonlinear_write")
+                write = MemoryDep("nonlinear_write", write_index, (s0, s1), (128, 64))
+                read = MemoryDep("nonlinear_read", read_index, (s0, s1), (128, 64))
+                rw = SimpleNamespace(writes=[write], reads=[read])
+                context = MagicMock()
+                context.axes = [s0, s1]
+                context.factor_domain.side_effect = lambda axis: [1, 2]
+                splits = {s0: 2, s1: 1}
+                with (
+                    patch.object(
+                        work_division_module, "op_read_writes", return_value=rw
+                    ),
+                    patch.object(
+                        work_division_module,
+                        "work_division_context_for_op",
+                        return_value=context,
+                    ),
+                ):
+                    space = work_division_module.build_op_split_space(op, 32)
+                    expected = work_division_module._core_division(op, splits)
+                self.assertEqual(space.output_axes, frozenset({s0, s1}))
+                self.assertEqual(space.division(splits).reduction_syms, frozenset())
+                self.assertEqual(expected.reduction_syms, frozenset())
+                self.assertEqual(
+                    pass_utils_module.splits_by_index_coeff(
+                        splits, write_index, read_index
+                    ),
+                    ({}, {}),
+                )
+                self.assertEqual(
+                    pass_utils_module.unrepresentable_splits_by_index_coeff(
+                        splits, {s0: 128, s1: 64}, write_index, read_index
+                    ),
+                    ["output:s0=absent"],
+                )
 
 
 _SPEC_ON_DIM_0 = TileSpec((TileAxis(host_dim=0, count=2),))
@@ -5786,9 +5876,9 @@ class TestJointTilingAndDivisionExemption(unittest.TestCase):
     def _tiled_op(self, marked):
         op = MagicMock()
         op.get_name.return_value = "buf0"
-        # One level, as CoarseTileInfo always has: group id, count and the
+        # One level, as LoopMember always has: group id, count and the
         # tiled-dim lists are the same length.
-        op.loop_info = SimpleNamespace(
+        op.loop_member = SimpleNamespace(
             loop_group_id=(0,),
             loop_count=[8],
             loop_tiled_dims=[[0]],

@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: op-lib-cpu-fp32}
+spec: {type: kernel/op-library, backend: cpu, library: torch-cpu, precision: fp32, harness: pytorch-benchmark}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: op-scale, owner: example-team}
+spec:
+  type: perf
+  level: kernel
+  tier: sanity
+  system: op-lib-cpu-fp32
+  est_hours: 0.05
+  workload: {type: kernel/op, op: scale, dtype: fp32, load: {executor: iterations, iterations: 50, warmup_iterations: 5}}
+  identity:
+    mode: ingest
+    profile: perf-kernel
+    discriminators:
+      - {key: record_type, value: op}
+      - {key: config_name, value: ""}
+      - {key: input_shapes, from: case.shape, join: "_"}
+      - {key: run_mode, value: op_benchmark}
+      - {key: kernel_name, value: ""}
+      - {key: is_total, value: ""}
+  matrix:
+    name_template: op_scale_n{size}
+    axes:
+      size:
+        - {token: "1024", patch: {workload: {shape: [1024]}}}
+        - {token: "4096", patch: {workload: {shape: [4096]}}}

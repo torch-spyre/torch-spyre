@@ -19,7 +19,7 @@ These tests intentionally mirror the compiler layers used by user
 
 1. Planner: span_overflow_hint_analysis returns a selected dim and split count.
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
-3. Coarse-tile IR: the lowering consumes the group and stamps a LoopShim.
+3. Coarse-tile IR: the lowering consumes the group and stamps a strict LoopMember.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
 
 Coverage in this file:
@@ -30,7 +30,7 @@ Coverage in this file:
 - planner boundary errors when no legal divisor validates post-tile span;
 - hard failure when output MemoryDep address math is unavailable;
 - adapter mapping with both constant and symbolic batch output coordinates;
-- the lowering's stamping of ranges/layout/LoopShim;
+- the lowering's stamping of ranges/layout/LoopMember;
 - equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 
@@ -4097,9 +4097,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(op.loop_info.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
-        self.assertEqual(op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(op.loop_member.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
+        self.assertEqual(op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(op.loop_member.loop_tiled_reduction_dims, [[]])
 
     def test_combined_plan_reaches_coarse_tile_planner(self):
         bmm = _reduction_op(
@@ -5645,12 +5645,12 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(auto_op.layout.size), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(auto_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(manual_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(auto_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(auto_op.loop_info.loop_tiled_reduction_dims, [[]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(auto_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(manual_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(auto_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(auto_op.loop_member.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_reduction_dims, [[]])
 
         # Layer 4: scheduler wrapping sees the same counted loop on both paths.
         created = []
