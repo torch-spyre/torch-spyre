@@ -649,13 +649,28 @@ class TestDomainRangeSolverNaN(unittest.TestCase):
             )
         with self.assertRaises(InvalidDomain):
             self.s.indirect_indexing(nan_padding, 4)
-        # One zero-padded matmul operand still zeroes the products.
+        # A zero-padded (or unpadded) operand does not save the products:
+        # 0 * NaN is NaN. The operand that holds NaN is the one to mask.
+        for zero in (FiniteSet(0), S.EmptySet):
+            for nan_index in (0, 1):
+                operands = [zero, zero]
+                operands[nan_index] = nan_padding
+                with self.subTest(zero=zero, nan_index=nan_index):
+                    with self.assertRaises(InvalidDomain) as caught:
+                        self.s.reduction(
+                            torch.float16,
+                            torch.float16,
+                            BATCH_MATMUL_OP,
+                            tuple(operands),
+                        )
+                    self.assertEqual(caught.exception.arg_index, nan_index)
+        # Against finite padding, one zero-padded operand zeroes the products.
         self.assertSetEqual(
             self.s.reduction(
                 torch.float16,
                 torch.float16,
                 BATCH_MATMUL_OP,
-                (nan_padding, FiniteSet(0)),
+                (S.Reals, FiniteSet(0)),
             ),
             FiniteSet(0),
         )

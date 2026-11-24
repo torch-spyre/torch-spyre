@@ -1513,9 +1513,14 @@ class TestMatmulCoordinateMask(InductorTestCase):
     def test_unaligned_k_is_masked(self):
         # The activation's K padding lanes hold whatever its producer left
         # there; against the kernel's zero-padded K rows, inf * 0 = NaN.
+        # Only strict mode assumes that garbage can be non-finite: otherwise
+        # track_padding_value takes it as finite, 0 * finite = 0, and K needs
+        # no mask.
         x = torch.randn(64, 32, dtype=torch.float16)
         w = torch.randn(32, 64, dtype=torch.float16)
-        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+        with patch("torch_spyre._inductor.config.padding_strict_mode", True):
+            specs = self._compiled_matmul_specs(lambda a, b: a @ b, x, w)
+        for spec in specs:
             (dim,) = spec.coordinate_masking
             self.assertEqual(str(dim), "in")
             self.assertEqual(spec.iteration_space[dim], 64)
@@ -1539,15 +1544,16 @@ class TestMatmulCoordinateMask(InductorTestCase):
             SimpleNamespace(scales={mb: 1, n: 1}),
         ]
         it_space = {mb: 64, n: 128, k: 128}
+        op_spec = SimpleNamespace(op="batchmatmul")
         mask = superdsc._get_coordinate_mask(
-            it_space, args[-1], {n: 28}, "batchmatmul", args[:-1]
+            it_space, args[-1], {n: 28}, op_spec, args[:-1]
         )
         self.assertEqual(mask, {n: [[100, 28]]})
         mask = superdsc._get_coordinate_mask(
             it_space,
             args[-1],
             {n: 28},
-            "batchmatmul",
+            op_spec,
             args[:-1],
             symbolic_dim_names={"out"},
         )

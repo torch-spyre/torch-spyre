@@ -857,8 +857,13 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     if in_dep is None:
         return False
 
-    in_coords = device_coordinates(in_layout.device_layout, in_dep)
-    out_coords = device_coordinates(out_layout.device_layout, _write_dep(op))
+    # Probe rather than raise: before insert_restickify runs (track_padding_value
+    # calls this), an op whose read its input layout cannot serve (the flatten of
+    # [8, 65], whose stick coordinate is Mod(Mod(d0, 65), 64)) still reads that
+    # input directly; the restickify that serves it is only in
+    # graph.restickify_plan. Such an op is not itself a restickify.
+    in_coords = try_device_coordinates(in_layout.device_layout, in_dep, None)
+    out_coords = try_device_coordinates(out_layout.device_layout, _write_dep(op), None)
     # A scalar / zero-dim layout has no coordinates, so it can't be a restickify.
     if not in_coords or not out_coords:
         return False
@@ -1535,9 +1540,12 @@ _INDIRECT_INDEX_SYM = sympy.Symbol("indirect_index")
 
 
 # NaN as a set element. sympy's S.NaN cannot be in a set with numbers: sets
-# sort their elements, and NaN is not comparable. A non-real symbol can, and
-# it is in no domain, so every domain check rejects it.
-_NAN = sympy.Symbol("NaN", real=False)
+# sort their elements, and NaN is not comparable. A non-extended-real symbol
+# can, and it is in no domain, so every domain check rejects it. It must be
+# non-extended-real, not just non-real: +-oo are extended reals, so with
+# real=False sympy cannot decide Eq(NaN, oo) and a Union that merges into an
+# interval ending at +-oo raises "did not evaluate to a bool".
+_NAN = sympy.Symbol("NaN", extended_real=False)
 
 
 def _without_nan(s: Any) -> tuple[Any, bool]:
@@ -1658,11 +1666,20 @@ class DomainRangeSolver(DefaultHandler):
         if reduction_type.startswith("batchmatmul"):
             assert isinstance(value, tuple) and len(value) == 2
 
-            # at least one of the paddings has to be zero
-            if not any(v.is_subset(required_padding) for v in value):
-                # TODO: verify which choice is optimal.
-                raise InvalidDomain(required_padding, reduction_type, arg_index=0)
-            return FiniteSet(0)
+            # The padding lanes of one operand meet the other operand's
+            # padding, or, along a K that insert_bmm_padding extended with
+            # zero rows, its real zeros (an unpadded operand, EmptySet). The
+            # product is 0 only when one side is 0 and the other is finite:
+            # 0 * inf and 0 * NaN are NaN.
+            for i, v in enumerate(value):
+                if v.is_subset(required_padding) and value[1 - i].is_subset(S.Reals):
+                    return FiniteSet(0)
+            # Mask the operand that can hold inf or NaN, else the first one.
+            # TODO: verify which choice is optimal.
+            arg_index = next(
+                (i for i, v in enumerate(value) if not v.is_subset(S.Reals)), 0
+            )
+            raise InvalidDomain(required_padding, reduction_type, arg_index=arg_index)
         else:
             if (pad := get_pad_value(reduction_type, dtype)) is not None:
                 required_padding = FiniteSet(pad)
