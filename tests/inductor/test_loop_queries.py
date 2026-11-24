@@ -258,3 +258,27 @@ def test_one_op_reaching_a_buffer_twice_counts_once():
     r = _Op("r", reads=["x", "x@512"])
     p = LoopProgram([_Op("x", writes=["x"]), _node("n0", [r], trip=4)])
     assert p.uses("x") == [0, 1] and p.runtime_reads("x") == 4
+
+
+def test_a_carry_alone_widens_a_storage_that_is_only_written_in_the_loop():
+    init = _Op("init", writes=["acc"])
+    upd = _Op("upd", writes=["acc"])
+    rec = LoopCarryRecord(storage_name="acc", update_name="upd")
+    n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
+    assert LoopProgram([init, n]).live_interval("acc") == (0, 3)
+    # Without the carry, a write inside the loop does not widen.
+    plain = _node("n0", [_Op("k"), _Op("upd", writes=["acc"]), _Op("k2")], trip=4)
+    assert LoopProgram([_Op("init", writes=["acc"]), plain]).live_interval("acc") == (
+        0,
+        2,
+    )
+
+
+def test_a_graph_input_mutated_in_a_loop_is_born_outside_it():
+    w = _Op("w", reads=["in0"], writes=["in0"])
+    r = _Op("r", reads=["in0"])
+    n = _node("n0", [_Op("k"), w, r, _Op("k2")], trip=4)
+    p = LoopProgram(
+        SimpleNamespace(operations=[_Op("a"), n], graph_input_names=["in0"])
+    )
+    assert p.live_interval("in0") == (1, 4)

@@ -248,7 +248,9 @@ class LoopProgram:
                 continue
             lo, hi = ts[0], ts[-1]
             _, writer, wrote = first[name]
-            birth = self._leaf(writer).loops if wrote else ()
+            # A graph input is born outside every loop, whoever writes it later.
+            born_in = wrote and name not in self._input_names
+            birth = self._leaf(writer).loops if born_in else ()
             widen = list(carried.get(name, ()))
             for op in index.readers.get(name, ()):
                 for loop in self._leaf(op).loops:
