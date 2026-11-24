@@ -49,10 +49,11 @@ everything outside it fails at compile time with a specific message:
   chunks — a 32×32 fp16 `Shard(1)` tensor fails for that reason), and
   exactly one (the shard) dim may be divided. Shard-local strides may
   differ from the global ones: the backend addresses each core's tile with
-  the shard-local layout, and the codegen guard
-  (`verify_non_unified_split` in `sharded_hbm.py`) checks that the
-  committed work split lands on the shard dim, so core *c* works exactly
-  on shard *c* (`_check_shard_layout` in `sharded_hbm.py`).
+  the shard-local layout. Two guards make this safe: `_check_shard_layout`
+  in `sharded_hbm.py` checks the sharding itself (whole device dims, whole
+  sticks), and `verify_non_unified_split` in `sharded_hbm.py` checks that
+  the committed work split lands on the shard dim, so core *c* works
+  exactly on shard *c*.
 * Static shapes only (`dynamic=False`), one dtype across operands and
   output, and `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a
   bundle `input_arg`).

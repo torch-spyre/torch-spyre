@@ -467,10 +467,9 @@ def test_verify_non_unified_split_rejects_an_arg_that_does_not_index_the_split()
         )
 
 
-def test_non_unified_shard_dim_rejects_an_unmatched_shard_dim():
+def test_non_unified_shard_dim_rejects_an_unmatched_shard_dim(monkeypatch):
     """The derivation fails closed when no iteration symbol matches the
-    shard dim's stride and extent -- the Unsupported
-    branches were reached only end-to-end before)."""
+    shard dim's stride and extent in the iteration space."""
     import sympy
     from types import SimpleNamespace
 
@@ -478,26 +477,26 @@ def test_non_unified_shard_dim_rejects_an_unmatched_shard_dim():
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.sharded_hbm import ShardedPlacement
 
-    saved = spyre_kernel.placement_of
-    spyre_kernel.placement_of = lambda name: ShardedPlacement(
-        shard_dim=1, num_shards=8, shard_device_bytes=128
+    monkeypatch.setattr(
+        spyre_kernel,
+        "placement_of",
+        lambda name: ShardedPlacement(
+            shard_dim=1, num_shards=8, shard_device_bytes=128
+        ),
     )
-    try:
-        # layout [4, 64]: shard dim 1 has stride 1 and extent 64, but no
-        # iteration symbol has that coefficient and extent.
-        with pytest.raises(Unsupported, match="cannot identify the shard dim"):
-            spyre_kernel._non_unified_shard_dim(
-                "arg0",
-                # Any layout object carrying the tensor's logical size.
-                SimpleNamespace(size=[4, 64]),
-                {sympy.Symbol("mb"): 4},
-                sympy.Symbol("mb") * 64 + sympy.Symbol("out"),
-            )
-    finally:
-        spyre_kernel.placement_of = saved
+    # layout [4, 64]: shard dim 1 has stride 1 and extent 64, but no
+    # iteration symbol has that coefficient and extent.
+    with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+        spyre_kernel._non_unified_shard_dim(
+            "arg0",
+            # Any layout object carrying the tensor's logical size.
+            SimpleNamespace(size=[4, 64]),
+            {sympy.Symbol("mb"): 4},
+            sympy.Symbol("mb") * 64 + sympy.Symbol("out"),
+        )
 
 
-def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim():
+def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim(monkeypatch):
     """Two symbols matching the shard dim's stride and extent means the
     identification is not unique; the derivation must fail closed."""
     import sympy
@@ -507,23 +506,22 @@ def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim():
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.sharded_hbm import ShardedPlacement
 
-    saved = spyre_kernel.placement_of
-    spyre_kernel.placement_of = lambda name: ShardedPlacement(
-        shard_dim=1, num_shards=8, shard_device_bytes=128
+    monkeypatch.setattr(
+        spyre_kernel,
+        "placement_of",
+        lambda name: ShardedPlacement(
+            shard_dim=1, num_shards=8, shard_device_bytes=128
+        ),
     )
-    try:
-        # Both s0 and s1 have coefficient 1 and extent 64 in the iteration
-        # space, so the shard dim (stride 1, extent 64) matches twice.
-        with pytest.raises(Unsupported, match="cannot identify the shard dim"):
-            spyre_kernel._non_unified_shard_dim(
-                "arg0",
-                # Any layout object carrying the tensor's logical size.
-                SimpleNamespace(size=[4, 64]),
-                {sympy.Symbol("s0"): 64, sympy.Symbol("s1"): 64},
-                sympy.Symbol("s0") + sympy.Symbol("s1"),
-            )
-    finally:
-        spyre_kernel.placement_of = saved
+    # Both s0 and s1 have coefficient 1 and extent 64 in the iteration
+    # space, so the shard dim (stride 1, extent 64) matches twice.
+    with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+        spyre_kernel._non_unified_shard_dim(
+            "arg0",
+            SimpleNamespace(size=[4, 64]),
+            {sympy.Symbol("s0"): 64, sympy.Symbol("s1"): 64},
+            sympy.Symbol("s0") + sympy.Symbol("s1"),
+        )
 
 
 @requires_emulation

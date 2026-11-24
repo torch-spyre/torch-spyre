@@ -601,6 +601,8 @@ def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
     return placement.shard_device_bytes
 
 
+# TODO(#6175): share one symbol finder with sharded_hbm._shard_symbol
+# (and fold _reduced_input_dims in) when the matmul work shapes it.
 def _non_unified_shard_dim(
     name: str,
     layout: FixedTiledLayout,

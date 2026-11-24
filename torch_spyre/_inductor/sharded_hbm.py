@@ -159,6 +159,8 @@ def _check_core_match(placement: ShardedPlacement) -> None:
         )
 
 
+# TODO(#6175): share one symbol finder with spyre_kernel._non_unified_shard_dim
+# (and fold _reduced_input_dims in) when the matmul work shapes it.
 def _shard_symbol(write: MemoryDep, size: list[int], shard_dim: int) -> sympy.Symbol:
     """The iteration symbol that walks ``shard_dim`` of a contiguous output."""
     stride = math.prod(size[shard_dim + 1 :])
