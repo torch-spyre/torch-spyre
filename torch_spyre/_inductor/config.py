@@ -16,7 +16,8 @@ import decimal
 import math
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING
+import warnings
 
 from torch.utils._config_module import install_config_module
 
@@ -230,14 +231,23 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Compiling for Spyre 1p5 (the backend compiler reads the same SENARCH). Its
+# matmul takes BFLOAT16 inputs only, so a matmul input must already be BFLOAT16
+# on the device: see spyre_kernel._check_sen1p5_matmul_inputs.
+sen1p5: bool = os.environ.get("SENARCH", "").lower() == "sen1p5"
+
 # Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
 # The pointwise work-division PR (#2499) wires that helper into the
 # compilation pipeline; until then these knobs are read only by the
 # helper and its unit tests. See #2284, #2287 for the design.
 
-# Cap on bucket count (= max_size / granularity).
-# TODO: confirm the default with the Deeptools team.
-max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+# Cap on bucket count (= max_size / granularity): the number of candidate
+# iterations of a loop over a declared dimension, one correction slot each.
+# 256 covers a 32K context at 128 tokens per page with granularity 1. Nothing
+# in the kernel, launch or correction path reads this knob; the measurements
+# behind the default are on #6432. A consumer may set it per process, by this
+# env variable or on this module before the first declaration.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "256"))
 
 # Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
 # plugin's linear wrapper branches on a row count below this, which would
@@ -251,6 +261,72 @@ min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 # is not provided. Keeps the picked granularity from collapsing to a
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
+
+
+def reservation_violations(
+    dim_min: int,
+    dim_max: int,
+    granularity: int,
+    *,
+    enforce_min_floor: bool = True,
+) -> list[str]:
+    """Problems with ``(dim_min, dim_max, granularity)`` as a reservation contract.
+
+    Shared by the two places such a triple is created: a user's own
+    ``tensor.to("spyre", dynamic=...)`` declaration (``_monkey_patch.py``) and
+    a derived output contract handed from one compiled kernel to the next
+    (``reserved_dims_contract.py``'s ``output_reserved_dims``). A derived
+    contract is held to the same structural bar as a typed one, instead of
+    silently carrying a triple the declare-time path would have rejected.
+
+    ``enforce_min_floor`` defaults on for a user-typed declaration, where
+    ``min_reserved_dim_size`` matters (the serving plugin's eager row-count
+    branching, see that constant's own docstring). A derived output contract
+    is purely an internal compiler value with no such caller, and a real
+    kernel-to-kernel contract routinely has a ``min`` under that floor (a
+    reduction's output row count, say) -- so ``output_reserved_dims`` passes
+    ``False``. The two divisibility rules hold on a derived contract by
+    construction, given a valid input; the bucket cap does not (a derived
+    granularity can be finer than any input's), so it is the one rule that
+    genuinely needs checking there too.
+
+    Empty when the triple is valid. Callers decide how to report a
+    violation: a user-typed declaration raises ``ValueError``; a
+    compiler-derived contract that fails the cap raises ``Unsupported``
+    rather than silently stamping it or silently loosening the cap.
+    """
+    # install_config_module (below) moves every config value off this
+    # module's plain globals and onto its own accessor, so a bare reference
+    # to max_buckets/min_reserved_dim_size from here -- a function living in
+    # this same file -- would raise NameError once the module is installed.
+    # Re-importing it by name resolves through that accessor instead, the
+    # same way every external caller (e.g. pass_utils.py) already reads it.
+    from torch_spyre._inductor import config as _config
+
+    violations = []
+    if dim_min > dim_max:
+        violations.append(f"min={dim_min} exceeds max={dim_max}")
+    if dim_max % granularity != 0:
+        violations.append(
+            f"max={dim_max} is not a multiple of granularity={granularity}"
+        )
+    if dim_min % granularity != 0:
+        violations.append(
+            f"min={dim_min} is not a multiple of granularity={granularity}"
+        )
+    if enforce_min_floor and dim_min < _config.min_reserved_dim_size:
+        violations.append(
+            f"min={dim_min} is below the minimum supported reservation floor "
+            f"({_config.min_reserved_dim_size})"
+        )
+    num_buckets = dim_max // granularity
+    if num_buckets > _config.max_buckets:
+        violations.append(
+            f"max={dim_max} / granularity={granularity} = {num_buckets} buckets, "
+            f"exceeding the cap of {_config.max_buckets} (config.max_buckets)"
+        )
+    return violations
+
 
 # Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
@@ -335,6 +411,7 @@ dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
+
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
 # capability is exercised by passing tests today. Disabling it (or a future
@@ -506,7 +583,7 @@ enable_uniqueness_check: bool = (
 # direct read, no staging op between them). With it, every such edge is priced,
 # which can enumerate and cost a large number of candidate divisions on a graph
 # with many eligible same-group edges -- see #5609's compile-time report.
-# This is not for_each_tile-specific: loop_group_id/CoarseTileInfo is stamped
+# This is not for_each_tile-specific: loop_group_id/LoopMember is stamped
 # by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
 # path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
 # any graph with coarse-tiled ops sharing a loop_group_id with their consumer,
@@ -545,10 +622,53 @@ _cache_config_ignore_prefix: list[str] = [
     "timing",
     "dump_cost_expr_file",
     "spyre_kernel_cache",
+    # Read at call time; the generated code is the same for every value.
+    "precomputed_kernel_key",
 ]
 
 # Strict mode assumes that a block of uninitialized memory contains NaN
 # values, that will corrupt matmuls and potentially other operations
 padding_strict_mode: bool = os.environ.get("PADDING_STRICT_MODE", "0") == "1"
+
+
+def _precomputed_kernel_key_from_env() -> str:
+    value = os.environ.get("TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY", "0")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return "1"
+    if normalized == "verify":
+        return "verify"
+    if normalized not in ("", "0", "false", "no"):
+        warnings.warn(
+            "TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY must be 1/true/yes, verify or "
+            f"0/false/no, got {value!r}; leaving it off",
+            stacklevel=2,
+        )
+    return "0"
+
+
+# Trust the kernel-cache key that codegen stored in the generated wrapper.
+# Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
+# (None when it could not be computed): <key> is compute_specs_hash() of the
+# call's specs and pool_size, <fp> a fingerprint of everything else that key
+# depends on (see kernel_key_fingerprint in torch_spyre.execution.kernel_cache
+# for the list). With the kernel cache on and this set to "1",
+# sdsc() uses <key> when <fp> matches the running process instead of
+# regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
+# mismatch falls back to compute_specs_hash(). "verify" computes both and
+# raises PrecomputedKernelKeyMismatch if they differ (for tests). Read at call
+# time; the generated code is the same for every value, so it is left out of
+# the cache key. Off by default; set TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY=1
+# (true and yes work too). Any other value warns and leaves it off.
+precomputed_kernel_key: str = _precomputed_kernel_key_from_env()
+
+if TYPE_CHECKING:
+    # install_config_module below adds ``patch`` (and the rest of the config
+    # API) at runtime. Declare it for mypy, which pre-commit runs without torch
+    # installed, so torch.utils._config_typing cannot supply it.
+    def patch(
+        arg1: str | dict[str, Any] | None = None, arg2: Any = None, **kwargs: Any
+    ) -> Any: ...
+
 
 install_config_module(sys.modules[__name__])

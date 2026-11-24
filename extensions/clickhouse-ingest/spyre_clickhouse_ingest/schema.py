@@ -194,11 +194,17 @@ class Table:
     ) -> int:
         """Insert dicts, ordering every row through the one column list, in retried batches.
 
+        A Replicated target goes through `writes.insert` (token, retry, park); otherwise
         `landed` counts this call's rows already stored (see batching.insert_chunks).
         """
         if not rows:
             return 0
         ordered = [cls.row(r) for r in rows]
+        from . import writes  # lazily: the offline modes never import the retry module
+
+        stored = writes.insert(client, cls.name, ordered, list(cls.columns), db or None)
+        if stored is not None:
+            return stored
         return insert_chunks(
             client,
             cls.name,

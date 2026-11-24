@@ -46,6 +46,7 @@ REDUCTIONS_NON_STICK_DIM_ONLY = {"prod"}
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
 FP8TODL16_OP = "fp8todl16"
+QFP8CH_OP = "qfp8ch"
 FP32TOINT32_OP = "fp32toint32"
 INT32TOFP32_OP = "int32tofp32"
 
@@ -61,8 +62,8 @@ DEVICE_NAME = "spyre"
 # NOTE: this is deliberately narrower than "all non-STANDARD EAs". is_ea_compatible
 # does NOT use this set — it treats any single non-STANDARD EA (except EXX2) as
 # broadcastable. QFP8CH is intentionally excluded here because membership also
-# forces the convert-preserve path, which would mishandle the degenerate qfp8ch
-# convert layout.
+# forces the convert-preserve path, and the fp8->fp16 convert after qfp8ch
+# rebuilds a dense layout instead.
 STAGGERED_EAS = frozenset(
     {
         ElementArrangement.DL16_TO_FP32,
@@ -109,8 +110,8 @@ def is_ea_compatible(eas) -> bool:
     # combination — QFP8CH tensors are consumed by an fp8 matmul or the fp8->fp16
     # convert, never a multi-arg pointwise. So QFP8CH is intentionally kept OUT of
     # STAGGERED_EAS (which doubles as the "convert must preserve the device
-    # layout" gate; adding QFP8CH there would mis-handle the degenerate qfp8ch
-    # convert layout). If QFP8CH broadcast ever becomes real, split those two
+    # layout" gate; adding QFP8CH there would send the fp8->fp16 convert down
+    # the preserve path). If QFP8CH broadcast ever becomes real, split those two
     # uses rather than widening STAGGERED_EAS.
     non_standard = unique - {ElementArrangement.STANDARD}
     return len(non_standard) == 1 and ElementArrangement.EXX2 not in non_standard
@@ -226,14 +227,19 @@ SPYRE_FP8_OPS = {
 }
 
 # Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
-# Used consistently in both compute_ops._layout_info_for_tensor and
-# superdsc._create_sdsc_tensors to gate device-size flattening and
-# 2D-stick metadata restoration.
+# Used in compute_ops._layout_info_for_tensor to restore 2D-stick metadata
+# that was erased by device-size flattening when an op is compiled individually.
+# Other ops (e.g. identity copies and index_copy_ scatters) are not gated here:
+# superdsc selects the 2D stick from the tensor's element arrangement alone, so
+# their metadata is never flattened away.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
+# topkindex counts in the input dtype, and fp16 holds integers exactly only up to
+# this many elements along the search dim (#5847).
+FP16_TOPK_MAX_DIM = 1024
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

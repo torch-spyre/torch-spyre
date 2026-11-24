@@ -236,15 +236,6 @@ class SpyreTensorLayout:
         device_size: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
-        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
-        valid_elements: dict[tuple[int, ...], int] = {},
-    ) -> None: ...
-    @typing.overload
-    def __init__(
-        self,
-        device_size: collections.abc.Sequence[typing.SupportsInt],
-        stride_map: collections.abc.Sequence[typing.SupportsInt],
-        device_dtype: DataFormats,
         valid_elements: dict[tuple[int, ...], int],
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
@@ -620,6 +611,24 @@ def spyre_empty_reserved(
     tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
     """
     ...
+
+def spyre_empty_reserved_with_layout(
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    device_layout: SpyreTensorLayout,
+    dim: int,
+    min_size: int,
+    max_size: int,
+    granularity: int,
+) -> torch.Tensor:
+    """
+    spyre_empty_reserved with an explicit device layout. The layout
+    describes the buffer at `max_size`: the reserved host dimension must
+    occupy one whole device dimension, not the stick-elements one, with
+    extent `max_size`. Backs tensor.to("spyre", dynamic={...},
+    device_layout=...).
+    """
 
 def spyre_empty_with_layout(
     size: tuple[int, ...],

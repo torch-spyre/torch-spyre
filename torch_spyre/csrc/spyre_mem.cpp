@@ -30,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -162,6 +163,225 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return tile_map;
 }
 
+auto is_ea_staggered(const ElementArrangement ea) -> bool {
+  return ea == ElementArrangement::DL16_TO_FP32 ||
+         ea == ElementArrangement::FP32_TO_DL16;
+}
+
+/**
+ * DL16_TO_FP32: host col = pair*64 + group*8 + stick_in_pair*4 + elem.
+ *
+ * Fills the logical split of the stick dim coordinate (sub_elems, innermost
+ * first) and the stride of each piece in the device column space (sub_stride).
+ */
+void ea_shuffle_fp16tofp32(int64_t elems_per_stick, int64_t sticks,
+                           int64_t elems_per_group, int64_t sticks_per_pair,
+                           std::vector<int64_t>& sub_elems,
+                           std::vector<int64_t>& sub_stride) {
+  sub_elems = {elems_per_group, sticks_per_pair,
+               elems_per_stick / elems_per_group, sticks / sticks_per_pair};
+  sub_stride = {1, elems_per_stick, elems_per_group,
+                sticks_per_pair * elems_per_stick};
+}
+
+/**
+ * FP32_TO_DL16: host col = stick*64 + half*32 + group*4 + elem.
+ *
+ * Same outputs as ea_shuffle_fp16tofp32.
+ */
+void ea_shuffle_fp32tofp16(int64_t elems_per_stick, int64_t sticks,
+                           int64_t elems_per_group, int64_t halves_per_stick,
+                           std::vector<int64_t>& sub_elems,
+                           std::vector<int64_t>& sub_stride) {
+  const int64_t groups_per_half =
+      elems_per_stick / elems_per_group / halves_per_stick;
+  sub_elems = {elems_per_group, groups_per_half, halves_per_stick, sticks};
+  sub_stride = {1, halves_per_stick * elems_per_group, elems_per_group,
+                elems_per_stick};
+}
+
+/**
+ * Describes the boundary adjustment needed when the host's valid width
+ * doesn't fill a whole number of stick *pairs* (DL16_TO_FP32 only). The
+ * shuffle must run at `padded_width`; `boundary_dcsi` moves data between
+ * that padded extent and the host's real `valid_width`.
+ *   - D2H (restore): boundary_dcsi slices padded -> valid  (post_slice_dcsi_)
+ *   - H2D (apply):    boundary_dcsi expands valid -> padded (pre_expand_dcsi_,
+ *                     zero-filling the pad region)
+ */
+struct EaPairBoundary {
+  bool needed = false;
+  int64_t valid_width = 0;
+  int64_t padded_width = 0;
+  int stick_host_dim = -1;  // index into the (PyTorch ordered) host sizes
+  DataConversionStrideInfo boundary_dcsi;
+};
+
+auto make_width_boundary_dcsi(int64_t outer_count, int64_t padded_width,
+                              int64_t valid_width, bool padded_is_src)
+    -> DataConversionStrideInfo {
+  DataConversionStrideInfo dcsi;
+  dcsi.size_ = {valid_width, outer_count};  // innermost first
+  dcsi.offset_src_ = 0;
+  dcsi.offset_dst_ = 0;
+  dcsi.stride_src_ = {1, padded_is_src ? padded_width : valid_width};
+  dcsi.stride_dst_ = {1, padded_is_src ? valid_width : padded_width};
+  return dcsi;
+}
+
+/**
+ * Inverts a shuffle given as (sub_elems, sub_stride). The strides must be the
+ * place values of some ordering of the pieces (true for both staggers).
+ * Sorting the pieces by stride gives the radix order of the staggered
+ * coordinate, and the old place values become the new strides.
+ */
+void ea_invert_shuffle(std::vector<int64_t>& sub_elems,
+                       std::vector<int64_t>& sub_stride) {
+  const size_t n = sub_elems.size();
+  std::vector<int64_t> place(n, 1);
+  for (size_t m = 1; m < n; m++) place[m] = place[m - 1] * sub_elems[m - 1];
+
+  std::vector<size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return sub_stride[a] < sub_stride[b];
+  });
+
+  std::vector<int64_t> inv_elems(n), inv_stride(n);
+  for (size_t k = 0; k < n; k++) {
+    inv_elems[k] = sub_elems[order[k]];
+    inv_stride[k] = place[order[k]];
+  }
+  sub_elems = std::move(inv_elems);
+  sub_stride = std::move(inv_stride);
+}
+
+/**
+ * Fills `dim` (the stick dim) with the permutation between the STANDARD
+ * element arrangement and the staggered one of `stl`, for Dimwise_ea
+ * (DataConvertOpFuncs::GENERAL_SHUFFLE). Let c be the standard (host order)
+ * coordinate and p(c) = sum(digit_m(c) * subStride_[m]), digits taken in mixed
+ * radix over subElems_ (innermost first). p(c) is the staggered coordinate.
+ *
+ *   - D2H (restore): the entry goes to input_dimwise_ea_ and the engine
+ *     computes out[layout(c)] = in[layout(p(c))].
+ *   - H2D (apply): the entry goes to output_dimwise_ea_ and the engine
+ *     computes out[layout(p(c))] = in[layout(c)].
+ *
+ * The entry itself does not depend on the copy direction. The DCSIs are not
+ * touched.
+ *
+ * The permutation covers the allocated (padded) extent of the stick dim, so a
+ * partial last stick needs no special case. If `stl` is DL16_TO_FP32 and
+ * `host_valid_width` needs an odd number of sticks, the last pair straddles
+ * real data and padding: the shuffle is built at the padded (even-pair)
+ * extent, and `boundary` is filled with the slice/expand needed to reconcile
+ * that with the host's real width. The caller must splice
+ * `boundary.boundary_dcsi` into post_slice_dcsi_ (D2H) or pre_expand_dcsi_
+ * (H2D), and use `boundary.padded_width` (not host_valid_width) when sizing
+ * the main dcsi_'s walk over this dim.
+ *
+ * @param stl SpyreTensorLayout describing the element arrangement.
+ * @param device_elem_stride Device stride of one element inside a stick.
+ * @param device_stick_stride Device stride between two sticks.
+ * @param allocated_sticks Number of sticks allocated along the stick dim.
+ * @param host_valid_width Real (unpadded) element width of the stick host dim.
+ * @param outer_count Product of the host sizes outside the stick host dim.
+ * @param dim Entry of the stick dim, filled by this function.
+ * @param invert True for H2D (apply), false for D2H (restore).
+ * @param boundary Pair-straddle adjustment, filled by this function.
+ */
+void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
+                int64_t device_stick_stride, int64_t allocated_sticks,
+                int64_t host_valid_width, int64_t outer_count,
+                perdim_element_arrangement& dim, bool invert,
+                EaPairBoundary& boundary) {
+  constexpr int64_t kElemsPerGroup = 4;
+  constexpr int64_t kSticksPerPair = 2;
+  constexpr int64_t kHalvesPerStick = 2;
+
+  const ElementArrangement ea = stl.element_arrangement;
+  TORCH_CHECK(is_ea_staggered(ea),
+              "Element arrangement expected DL16_TO_FP32 or FP32_TO_DL16, "
+              "got: ",
+              elementArrangementToString(ea));
+
+  const int64_t elems_per_stick = stl.elems_per_stick();
+  TORCH_CHECK(elems_per_stick > 0 &&
+                  elems_per_stick % (kSticksPerPair * kElemsPerGroup) == 0,
+              "Unsupported stick size ", elems_per_stick,
+              " for element arrangement ", elementArrangementToString(ea));
+  TORCH_CHECK(allocated_sticks > 0, "No sticks allocated for ",
+              elementArrangementToString(ea), " element arrangement");
+
+  boundary = EaPairBoundary{};
+  if (ea == ElementArrangement::DL16_TO_FP32) {
+    TORCH_CHECK(allocated_sticks % kSticksPerPair == 0,
+                "DL16_TO_FP32 element arrangement requires whole stick pairs "
+                "along the stick dimension, but ",
+                allocated_sticks, " sticks are allocated");
+    const int64_t valid_sticks =
+        (host_valid_width + elems_per_stick - 1) / elems_per_stick;
+    // Only an odd valid-stick count makes a pair straddle real data and pure
+    // padding. A partial last stick with an even valid-stick count (e.g. 44,
+    // 63, 100) stays inside whole pairs and needs no boundary.
+    if (valid_sticks % kSticksPerPair != 0) {
+      TORCH_CHECK(allocated_sticks == valid_sticks + 1,
+                  "Unexpected padding for DL16_TO_FP32: valid_sticks=",
+                  valid_sticks, " allocated_sticks=", allocated_sticks);
+      const int64_t padded_width = allocated_sticks * elems_per_stick;
+      boundary.needed = true;
+      boundary.valid_width = host_valid_width;
+      boundary.padded_width = padded_width;
+      // D2H restore (!invert): the shuffle output is padded, the host wants the
+      //   valid width, so slice with the padded side as the source.
+      // H2D apply (invert): the host input is valid, the shuffle wants padded,
+      //   so expand with the padded side as the destination.
+      boundary.boundary_dcsi =
+          make_width_boundary_dcsi(outer_count, padded_width, host_valid_width,
+                                   /*padded_is_src=*/!invert);
+    }
+  }
+
+  dim.dimShape_ = allocated_sticks * elems_per_stick;
+  dim.cumElemsBefore_ = {1, elems_per_stick};
+  dim.cumOffset_ = {device_elem_stride, device_stick_stride};
+
+  if (ea == ElementArrangement::DL16_TO_FP32) {
+    ea_shuffle_fp16tofp32(elems_per_stick, allocated_sticks, kElemsPerGroup,
+                          kSticksPerPair, dim.subElems_, dim.subStride_);
+  } else {
+    ea_shuffle_fp32tofp16(elems_per_stick, allocated_sticks, kElemsPerGroup,
+                          kHalvesPerStick, dim.subElems_, dim.subStride_);
+  }
+
+  if (invert) {
+    ea_invert_shuffle(dim.subElems_, dim.subStride_);
+  }
+}
+
+/**
+ * Entry that leaves the coordinate of a host dim unchanged and lays it out over
+ * the device dims `tiles` (innermost first, as stored in the tile map).
+ * Device dims of size 1 are skipped.
+ */
+auto identity_dim_ea(const std::vector<int>& tiles,
+                     const std::vector<int64_t>& device_size,
+                     const std::vector<int64_t>& device_strides)
+    -> perdim_element_arrangement {
+  perdim_element_arrangement dim;
+  dim.dimShape_ = 1;
+  for (const int tile : tiles) {
+    if (device_size[tile] == 1) continue;
+    dim.cumElemsBefore_.push_back(dim.dimShape_);
+    dim.cumOffset_.push_back(device_strides[tile]);
+    dim.dimShape_ *= device_size[tile];
+  }
+  dim.subElems_ = {dim.dimShape_};
+  dim.subStride_ = {1};
+  return dim;
+}
+
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
@@ -171,17 +391,59 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * @param device_offset: storage offset of the dev tensor
  * @param stl: SpyreTensorLayout of dev tensor
  * @param host2device: direction of data conversion
+ * @param dimwise_ea: EA shuffle: receives, one entry per host dim (outermost
+ *                    first), the permutation between STANDARD and the
+ *                    staggered element arrangement of stl. The caller puts it
+ *                    on the input side for D2H (restore) and on the output
+ *                    side for H2D (apply). Left empty unless the layout is
+ *                    staggered.
+ * @param ea_boundary: receives the slice/expand of an odd number of stick
+ *                     pairs (see ea_shuffle). When needed, the walk below
+ *                     covers the pair-aligned (padded) width of the stick host
+ *                     dim and the caller splices ea_boundary.boundary_dcsi
+ *                     around it.
  * @return description of data conversion
  */
-auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                             int64_t cpu_offset, int64_t device_offset,
-                             SpyreTensorLayout stl, bool host2device)
-    -> std::vector<DataConversionStrideInfo> {
+auto get_device_stride_infos(
+    c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t cpu_offset,
+    int64_t device_offset, SpyreTensorLayout stl, bool host2device,
+    std::vector<perdim_element_arrangement>& dimwise_ea,
+    EaPairBoundary& ea_boundary) -> std::vector<DataConversionStrideInfo> {
   const std::vector<std::vector<int>> tile_map =
       get_tile_map(sizes, strides, stl.device_size, stl.stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
+
+  // EA shuffle: copies of staggered layouts (D2H restore, H2D apply) need the
+  // element arrangement shuffled.
+  //
+  // Known limitation:
+  //
+  // Slices of a staggered tensor: host storage offset must be aligned to whole
+  // stick pairs (or sticks for FP32_TO_DL16); mid-pair offsets misalign the
+  // sticks and are rejected. See issue #5556.
+  const bool shuffle_ea = is_ea_staggered(stl.element_arrangement);
+
+  // EA shuffle: stick tiling facts. The innermost device dim holds the elements
+  // of a stick, the host dim tiled into it is the stick dim, and the other
+  // device dim that host dim is tiled into counts the sticks.
+  const int stick_elem_dim = device_rank - 1;
+  int stick_host_dim = -1;
+  int stick_count_dev_dim = -1;
+  bool stick_ambiguous = false;
+  for (int i = 0; shuffle_ea && i < host_rank; i++) {
+    const auto& tiles = tile_map[i];
+    if (std::find(tiles.begin(), tiles.end(), stick_elem_dim) == tiles.end()) {
+      continue;
+    }
+    stick_host_dim = i;
+    for (const int tile : tiles) {
+      if (tile == stick_elem_dim) continue;
+      stick_ambiguous |= stick_count_dev_dim >= 0;
+      stick_count_dev_dim = tile;
+    }
+  }
 
   // The host strides based on stride_map, used for remainder calculation.
   std::vector<int64_t> host_strides(device_rank, 1);
@@ -212,6 +474,91 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     host_strides[i] = stl.stride_map[i];
   }
 
+  // EA shuffle: describe the permutation between STANDARD and the staggered
+  // arrangement, and widen the walked host sizes to the padded (whole-pair)
+  // extent when the host's valid width straddles a pair boundary. This runs
+  // before the per-host-dim loop below, which sizes the stick-count device dim
+  // from the host size: it has to see the padded size or it silently picks the
+  // smaller one. The DCSIs the loop builds stay as built for STANDARD
+  // arrangement.
+  dimwise_ea.clear();
+  std::vector<int64_t> walk_sizes(sizes.begin(), sizes.end());
+  std::vector<int64_t> walk_strides(strides.begin(), strides.end());
+  ea_boundary = EaPairBoundary{};
+  if (shuffle_ea) {
+    // Guard EA shuffle against unsupported dtypes.
+    TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32 ||
+                    stl.device_dtype == DataFormats::IEEE_FP16 ||
+                    stl.device_dtype == DataFormats::IEEE_INT64 ||
+                    stl.device_dtype == DataFormats::IEEE_INT32 ||
+                    stl.device_dtype == DataFormats::SEN169_FP16,
+                "EA shuffle unsupported dtype, got: ", stl.device_dtype,
+                " (element arrangement: ",
+                elementArrangementToString(stl.element_arrangement), ")");
+
+    TORCH_CHECK(stick_host_dim >= 0 && !stick_ambiguous,
+                "Unable to determine the stick dimension for ",
+                elementArrangementToString(stl.element_arrangement));
+
+    constexpr int64_t kSticksPerPair = 2;
+    const int64_t elems_per_stick = stl.elems_per_stick();
+    const bool is_dl16_to_fp32 =
+        stl.element_arrangement == ElementArrangement::DL16_TO_FP32;
+    const int64_t align_elems =
+        is_dl16_to_fp32 ? kSticksPerPair * elems_per_stick : elems_per_stick;
+    TORCH_CHECK(
+        cpu_offset % align_elems == 0,
+        "Staggered EA does not support a host storage offset that is not "
+        "aligned to a stick ",
+        is_dl16_to_fp32 ? "pair " : "", "boundary (got cpu_offset=", cpu_offset,
+        ", alignment=", align_elems, ")");
+
+    for (int i = 0; i < host_rank; i++) {
+      dimwise_ea.push_back(
+          identity_dim_ea(tile_map[i], stl.device_size, device_strides));
+    }
+
+    const bool has_stick_count = stick_count_dev_dim >= 0;
+    // Stride unused when a single stick is allocated (has_stick_count is
+    // false).
+    const int64_t allocated_sticks =
+        has_stick_count ? stl.device_size[stick_count_dev_dim] : 1;
+    const int64_t outer_count =
+        std::accumulate(sizes.begin(), sizes.end(), int64_t{1},
+                        std::multiplies<>()) /
+        std::max<int64_t>(sizes[stick_host_dim], 1);
+
+    ea_shuffle(stl, device_strides[stick_elem_dim],
+               has_stick_count ? device_strides[stick_count_dev_dim] : 0,
+               allocated_sticks, sizes[stick_host_dim], outer_count,
+               dimwise_ea[stick_host_dim], host2device, ea_boundary);
+
+    if (ea_boundary.needed) {
+      ea_boundary.stick_host_dim = stick_host_dim;
+      walk_sizes[stick_host_dim] = ea_boundary.padded_width;
+
+      // The padded staging buffer (pre-expand output for H2D, intermediate for
+      // D2H) has the padded row length, so every stride that steps over a whole
+      // stick dim must use the padded length too. Otherwise row r lands at
+      // r*valid but is read back at r*padded.
+      const int64_t valid = ea_boundary.valid_width;
+      const int64_t padded = ea_boundary.padded_width;
+      const int64_t threshold = valid * strides[stick_host_dim];
+      auto rescale = [&](int64_t s) -> int64_t {
+        if (s < threshold) return s;
+        TORCH_CHECK(s % valid == 0, "Cannot rescale host stride ", s,
+                    " to the padded stick width ", padded);
+        return s / valid * padded;
+      };
+      for (int i = 0; i < host_rank; i++) {
+        if (i != stick_host_dim) walk_strides[i] = rescale(strides[i]);
+      }
+      for (int k = 0; k < device_rank; k++) {
+        if (stl.stride_map[k] > 0) host_strides[k] = rescale(host_strides[k]);
+      }
+    }
+  }
+
   // The sizes for the subsequent DataConversionStrideInfo (remainders) match
   // the first DataConversionStrideInfo sizes except for dimensions with a
   // remainder.
@@ -226,15 +573,15 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     // Dimensions that do not appear in the tile map are ignored.
     if (tile_map[i].size() == 0) continue;
 
-    const int64_t host_stride = strides[i];
-    int64_t host_size = sizes[i];
+    const int64_t host_stride = walk_strides[i];
+    int64_t host_size = walk_sizes[i];
 
     // Fold leading host dimensions that do not appear in the tile map.
     for (int j = i - 1; j > -1 && tile_map[j].size() == 0; j--) {
       // Expanded dimensions are ignored.
       if (strides[j] == 0) continue;
 
-      host_size *= sizes[j];
+      host_size *= walk_sizes[j];
     }
 
     int64_t elements_before = 1;
@@ -789,63 +1136,197 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
     // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    // For a 2D weight [K, N] this gives [N, K] after reversal, so cpu_sizes[0]
+    // = N and cpu_sizes[1] = K.  For higher-rank tensors (3D paged KV cache
+    // [BATCH, K, N] or 4D [BATCH0, BATCH1, K, N]) the two innermost dims after
+    // reversal are still [N, K]; the remaining leading dims are outer batch
+    // dimensions over which we emit one DataConversionStrideInfo each.
+    //
+    // Host element addresses come from the host tensor's own strides, so
+    // transposed or otherwise non-contiguous host views are read and written
+    // in logical order.
+    const std::vector<int64_t> host_tensor_sizes = cpu_tensor->sizes().vec();
+    const std::vector<int64_t> host_tensor_strides =
+        cpu_tensor->strides().vec();
+    TORCH_CHECK(host_tensor_sizes.size() >= 2,
+                "QFP8WT tensor must have at least 2 dimensions");
+    cpu_sizes = host_tensor_sizes;
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
 
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    // After reversal: cpu_sizes[0] = N (columns), cpu_sizes[1] = K (rows).
+    // Any cpu_sizes[2..] are outer batch dimensions.
     const int64_t N = cpu_sizes[0];
     const int64_t K = cpu_sizes[1];
 
-    // Expanded device shape: [si, so, K/si, N/so]
+    // Expanded device shape per [K, N] matrix: [si, so, K/si, N/so]
     TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
     TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
 
-    // Host strides for the expanded layout
-    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
+    // Host strides for the expanded 4D index space [si, so, dim2, dim3]:
     //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+    //   host element = k*sK + n*sN = a*sK + b*sN + d2*(si*sK) + d3*(so*sN)
+    //   where sK, sN are the host strides of K and N (N, 1 when contiguous)
+    //   → stride_src = [sK, sN, si*sK, so*sN]
+    const int64_t sK = host_tensor_strides[host_tensor_strides.size() - 2];
+    const int64_t sN = host_tensor_strides[host_tensor_strides.size() - 1];
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const std::vector<int64_t> host_strides = {sK, sN, si * sK, so * sN};
 
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
+    // The device interleaves the matrices of a batched tensor with their
+    // N-strips, in this order (outermost first):
+    //   [outer batch dims] [N-strip] [last batch dim] [K/si] [stick]
+    // ignoring batch dims of extent 1, so one [K, N] matrix is not contiguous:
+    // consecutive N-strips of it are dst3 apart.  The allocation's own sizes
+    // (dma_sizes) give the batch geometry, so a view such as ``dev[b]``
+    // addresses the right matrices.
+    const size_t full_rank = dma_sizes.size();
+    TORCH_CHECK(full_rank >= 2 && full_rank <= 4,
+                "QFP8WT host transfers support tensors of rank 2 to 4, got ",
+                full_rank);
+    const int64_t full_K = dma_sizes[full_rank - 2];
+    const int64_t full_N = dma_sizes[full_rank - 1];
+    TORCH_CHECK(full_K == K && full_N == N,
+                "QFP8WT host transfers of a view must cover whole [K, N] "
+                "matrices: view is [",
+                K, ", ", N, "], allocation is [", full_K, ", ", full_N, "]");
+    const int64_t matrix_elems = K * N;
+    const int64_t matrix_stride = dim2 * eps;  // one matrix's share of a strip
+    // Batch dims of extent 1 take no part in the interleave.
+    int64_t last_batch_extent = 1;
+    for (size_t d = 0; d + 2 < full_rank; ++d) {
+      if (dma_sizes[d] > 1) last_batch_extent = dma_sizes[d];
+    }
+    const int64_t dst3 = last_batch_extent * matrix_stride;  // strip stride
     const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
 
-    DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = host2device ? host_strides : device_strides;
-    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-    dcsi.offset_src_ = host2device ? cpu_offset : 0;
-    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
-    dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    // Batch geometry of the view (row-major over its leading dims).
+    const size_t host_batch_rank = host_tensor_sizes.size() - 2;
+    // dev_strides was inflated above for sliced views; use the view's own.
+    const std::vector<int64_t> view_strides = dev_tensor->strides().vec();
+    TORCH_CHECK(view_strides.size() == host_tensor_sizes.size(),
+                "QFP8WT host transfer: device and host ranks differ");
+    const int64_t dev_storage_offset = dev_tensor->storage_offset();
+    TORCH_CHECK(dev_storage_offset % matrix_elems == 0,
+                "QFP8WT host transfers must start on a whole [K, N] matrix, "
+                "got storage offset ",
+                dev_storage_offset);
+    int64_t batch = 1;
+    for (size_t d = 0; d < host_batch_rank; ++d) {
+      batch *= host_tensor_sizes[d];
+      TORCH_CHECK(view_strides[d] % matrix_elems == 0,
+                  "QFP8WT host transfers require whole-matrix batch strides");
+    }
+
+    // Emit one DataConversionStrideInfo per batch element so each independent
+    // [K, N] QFP8WT matrix is transferred with the correct 2D-stick interleave.
+    // For the common 2D case (batch==1) this produces a single entry.
+    dci.dcsi_.reserve(static_cast<size_t>(batch));
+    for (int64_t b = 0; b < batch; ++b) {
+      // Unravel b over the view's batch dims (row-major) to get the host
+      // element offset and the matrix's index in the allocation.
+      int64_t host_batch_offset = 0;
+      int64_t dev_matrix_index = dev_storage_offset / matrix_elems;
+      int64_t rem = b;
+      for (size_t d = host_batch_rank; d-- > 0;) {
+        const int64_t idx = rem % host_tensor_sizes[d];
+        host_batch_offset += idx * host_tensor_strides[d];
+        dev_matrix_index += idx * (view_strides[d] / matrix_elems);
+        rem /= host_tensor_sizes[d];
+      }
+      const int64_t outer = dev_matrix_index / last_batch_extent;
+      const int64_t last = dev_matrix_index % last_batch_extent;
+      const int64_t device_matrix_offset =
+          outer * dim3 * dst3 + last * matrix_stride;
+      DataConversionStrideInfo dcsi;
+      dcsi.size_ = {si, so, dim2, dim3};
+      dcsi.stride_src_ = host2device ? host_strides : device_strides;
+      dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+      dcsi.offset_src_ =
+          host2device ? cpu_offset + host_batch_offset : device_matrix_offset;
+      dcsi.offset_dst_ =
+          host2device ? device_matrix_offset : cpu_offset + host_batch_offset;
+      dci.dcsi_.push_back(dcsi);
+    }
+
+    // For H2D, output (device) shape is the expanded form including batch dims.
+    // For D2H, output (host) shape is the original cpu_sizes (all dims
+    // reversed). The batch dims are appended after the four expanded dims in
+    // reversed (innermost-first) order.
+    std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    for (size_t i = 2; i < cpu_sizes.size(); ++i)
+      expanded_dev_shape.push_back(cpu_sizes[i]);
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
+    // EA shuffle: dimwise_ea is filled only for copies of staggered layouts.
+    std::vector<perdim_element_arrangement> dimwise_ea;
+    EaPairBoundary ea_boundary;
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                        device_offset, stl, host2device);
+                                        device_offset, stl, host2device,
+                                        dimwise_ea, ea_boundary);
+    if (!dimwise_ea.empty()) {
+      // The shapes of the DCI are innermost first, so the per-dim EA is too.
+      std::reverse(dimwise_ea.begin(), dimwise_ea.end());
+      // The device side carries the arrangement: the input of a D2H copy
+      // (restore STANDARD) or the output of a H2D copy (apply staggered).
+      if (host2device) {
+        dci.output_dimwise_ea_ = std::move(dimwise_ea);
+      } else {
+        dci.input_dimwise_ea_ = std::move(dimwise_ea);
+      }
+    }
+
+    // Host shape with the stick dim widened to the pair-aligned extent. The
+    // main dcsi_ walks this extent, so the buffer on the host side of the
+    // shuffle (the pre-expand output for H2D, the intermediate buffer for D2H)
+    // must be allocated at this size, not the real one.
+    std::vector<int64_t> padded_cpu_sizes = cpu_sizes;
+    if (ea_boundary.needed) {
+      padded_cpu_sizes[ea_boundary.stick_host_dim] = ea_boundary.padded_width;
+    }
 
     // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(padded_cpu_sizes.begin(), padded_cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
-    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+
+    if (ea_boundary.needed) {
+      if (host2device) {
+        // The main dcsi_ reads from the intermediate padded buffer (offset 0),
+        // not the real host buffer.  Move cpu_offset to the pre_expand step,
+        // which reads from the real host buffer.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_src_ -= cpu_offset;
+        ea_boundary.boundary_dcsi.offset_src_ = cpu_offset;
+        // Zero-pad the real-width host tensor before the shuffle runs.
+        dci.pre_expand_dcsi_ = {ea_boundary.boundary_dcsi};
+        dci.pre_input_shape_ = cpu_sizes;  // real, unpadded
+        dci.usePadVal_ = true;
+        dci.inputPadVal_ = 0.0;
+        dci.input_shape_ = padded_cpu_sizes;
+        dci.output_shape_ = device_sizes;
+      } else {
+        // The main dcsi_ writes to the intermediate padded buffer (offset 0),
+        // not the real host buffer.  Move cpu_offset to the post_slice step,
+        // which writes to the real host buffer.
+        for (auto& dcsi : dci.dcsi_) dcsi.offset_dst_ -= cpu_offset;
+        ea_boundary.boundary_dcsi.offset_dst_ = cpu_offset;
+        // Slice the padded, now-unstaggered intermediate down to the host's
+        // real width.
+        dci.post_slice_dcsi_ = {ea_boundary.boundary_dcsi};
+        dci.post_output_shape_ = cpu_sizes;  // real, unpadded
+        dci.input_shape_ = device_sizes;
+        dci.output_shape_ = padded_cpu_sizes;
+      }
+    } else {
+      dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+      dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+    }
   }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
@@ -1022,26 +1503,14 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-/**
- * Allocate a Spyre tensor sized/laid out for a ceiling (`max_size`) at
- * `dim` rather than for `size[dim]` itself. `size`/`stride` remain the
- * tensor's logical (PyTorch-visible) shape; only the SpyreTensorLayout and
- * the underlying storage are computed against the padded shape. Because
- * padding dim 0 (the outermost dimension) does not change stride_map (see
- * SpyreTensorLayout::init), dma_sizes/dma_strides stay at the real shape:
- * only the real data is ever transferred, into the front of the larger
- * buffer.
- *
- * Only dim 0 is supported. Padding any other non-stick dimension changes the
- * host stride of every dimension outside it, so stride_map (built from the
- * padded shape) would disagree with dma_strides (the real shape) and the
- * host-to-device copy would place data at the wrong offsets and can write
- * past the buffer. spyre_empty_reserved() rejects such a `dim`.
- */
-at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
-                                c10::ScalarType dtype, int64_t dim,
-                                int64_t min_size, int64_t max_size,
-                                int64_t granularity) {
+namespace {
+
+// The reservation rules shared by spyre_empty_reserved and
+// spyre_empty_reserved_with_layout: the declaration itself (positivity, range,
+// max a multiple of granularity), today's size inside it, and dim 0 only.
+void check_reservation_args(c10::IntArrayRef size, c10::ScalarType dtype,
+                            int64_t dim, int64_t min_size, int64_t max_size,
+                            int64_t granularity) {
   at::detail::check_size_nonnegative(size);
   TORCH_CHECK(spyre::is_supported_dtype(dtype),
               "Spyre backend does not support dtype ", dtype);
@@ -1077,6 +1546,31 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
               "any other dimension changes the host stride of every "
               "dimension outside it, which the host-to-device copy does not "
               "handle");
+}
+
+}  // namespace
+
+/**
+ * Allocate a Spyre tensor sized/laid out for a ceiling (`max_size`) at
+ * `dim` rather than for `size[dim]` itself. `size`/`stride` remain the
+ * tensor's logical (PyTorch-visible) shape; only the SpyreTensorLayout and
+ * the underlying storage are computed against the padded shape. Because
+ * padding dim 0 (the outermost dimension) does not change stride_map (see
+ * SpyreTensorLayout::init), dma_sizes/dma_strides stay at the real shape:
+ * only the real data is ever transferred, into the front of the larger
+ * buffer.
+ *
+ * Only dim 0 is supported. Padding any other non-stick dimension changes the
+ * host stride of every dimension outside it, so stride_map (built from the
+ * padded shape) would disagree with dma_strides (the real shape) and the
+ * host-to-device copy would place data at the wrong offsets and can write
+ * past the buffer. spyre_empty_reserved() rejects such a `dim`.
+ */
+at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
+                                c10::ScalarType dtype, int64_t dim,
+                                int64_t min_size, int64_t max_size,
+                                int64_t granularity) {
+  check_reservation_args(size, dtype, dim, min_size, max_size, granularity);
 
   auto padded_size = size.vec();
   padded_size[dim] = max_size;
@@ -1116,11 +1610,102 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
-                                   c10::IntArrayRef stride,
-                                   c10::ScalarType dtype,
-                                   SpyreTensorLayout device_layout,
-                                   std::optional<c10::Device> device_opt) {
+at::Tensor spyre_empty_reserved_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, int64_t dim, int64_t min_size,
+    int64_t max_size, int64_t granularity) {
+  check_reservation_args(size, dtype, dim, min_size, max_size, granularity);
+  const auto& device_size = device_layout.device_size;
+  const auto& stride_map = device_layout.stride_map;
+  TORCH_CHECK(!device_size.empty() && stride_map.size() == device_size.size(),
+              "device_layout with a reservation: the layout has no usable "
+              "device dimensions");
+  TORCH_CHECK(device_layout.device_dtype == get_device_dtype(dtype),
+              "device_layout with a reservation: the layout's device dtype "
+              "does not match tensor dtype ",
+              dtype);
+
+  // The layout describes the buffer at max_size. The reserved host dimension
+  // must therefore occupy exactly one device dimension, whole (its stride-map
+  // entry is the host stride of `dim`), never the stick-elements dimension,
+  // and that dimension's extent must be max_size. Those are the dimension the
+  // transfer at the current size and every later resize_ move along; a
+  // reserved dimension folded into another or split across the stick could
+  // not be resized in place.
+  const int64_t host_stride = stride[dim];
+  int64_t carrier = -1;
+  int64_t carriers = 0;
+  for (size_t d = 0; d < device_size.size(); ++d) {
+    if (stride_map[d] == host_stride && device_size[d] > 1) {
+      carrier = static_cast<int64_t>(d);
+      ++carriers;
+    }
+  }
+  TORCH_CHECK(carriers == 1,
+              "device_layout with a reservation: the reserved "
+              "host dimension ",
+              dim, " (host stride ", host_stride,
+              ") must occupy exactly one device dimension of the layout, "
+              "found ",
+              carriers, " in ", device_layout.toString(),
+              carriers > 1
+                  ? ". More than one device dimension walks that host "
+                    "stride (another host dimension with the same stride, "
+                    "or a layout that repeats it), so the reserved rows "
+                    "have no single device dimension to resize along: "
+                    "give the reserved dimension a device dimension of "
+                    "its own"
+                  : "");
+  TORCH_CHECK(carrier != static_cast<int64_t>(device_size.size()) - 1,
+              "device_layout with a reservation: the reserved host dimension ",
+              dim,
+              " lands on the stick-elements dimension of the layout, which "
+              "cannot be resized");
+  TORCH_CHECK(device_size[carrier] == max_size,
+              "device_layout with a reservation: the layout describes the "
+              "buffer at the declared max, so device dimension ",
+              carrier, " (the reserved host dimension ", dim,
+              ") must have extent max=", max_size, ", got ",
+              device_size[carrier]);
+
+  // The layout must also hold the host shape at max_size as a whole. The
+  // storage below is sized from the layout, so a layout too small in another
+  // dimension would let today's transfer run and the first resize_ past the
+  // host bytes fail inside the reservation invariant, with a message that
+  // does not name the layout. Overflow-checked like spyre_empty_reserved.
+  auto padded_size = size.vec();
+  padded_size[dim] = max_size;
+  const size_t layout_bytes = get_device_size_in_bytes(device_layout);
+  const size_t host_bytes_at_max = at::detail::computeStorageNbytesContiguous(
+      padded_size, c10::elementSize(dtype));
+  TORCH_CHECK(layout_bytes >= host_bytes_at_max,
+              "device_layout with a reservation: the layout holds ",
+              layout_bytes, " bytes, fewer than the ", host_bytes_at_max,
+              " bytes of the host shape at max=", max_size,
+              " (every dimension of the layout must cover the host shape at "
+              "the declared maximum): ",
+              device_layout.toString());
+
+  // From here on exactly spyre_empty_with_layout, plus the contract. Storage
+  // is sized from the layout, which is at max_size by the check above, and
+  // dma_sizes/dma_strides stay at the real shape as for spyre_empty_reserved.
+  auto tensor =
+      spyre_empty_with_layout(size, stride, dtype, device_layout, std::nullopt);
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  spyre_tensor_impl->reserved_dims = {
+      {dim, ReservedDimInfo{min_size, max_size, granularity}}};
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (explicit, reserved dim=" << dim
+                        << " min=" << min_size << " max=" << max_size
+                        << " granularity=" << granularity
+                        << "): " << device_layout.toString();
+  return tensor;
+}
+
+at::Tensor spyre_empty_with_layout(
+    c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+    SpyreTensorLayout device_layout, std::optional<c10::Device> device_opt,
+    std::optional<std::map<int64_t, ReservedDimInfo>> reserved_dims) {
   at::detail::check_size_nonnegative(size);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
@@ -1150,6 +1735,22 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
+  if (reserved_dims.has_value()) {
+    // The compiled wrapper passes a graph output's [min, max, granularity]
+    // here so that a later compile can read it back with get_reserved_dims.
+    // Unlike spyre_empty_reserved this does not pad the layout: the compiler
+    // has already sized device_layout for the declared max.
+    for (const auto& [rdim, info] : *reserved_dims) {
+      TORCH_CHECK(rdim >= 0 && rdim < static_cast<int64_t>(size.size()),
+                  "reserved dim ", rdim, " out of range for tensor of rank ",
+                  size.size());
+      TORCH_CHECK(info.granularity >= 1, "granularity must be >= 1, got ",
+                  info.granularity);
+      TORCH_CHECK(info.min <= info.max, "min=", info.min,
+                  " must be <= max=", info.max, " at dim ", rdim);
+    }
+    spyre_tensor_impl->reserved_dims = std::move(*reserved_dims);
+  }
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -1822,16 +2423,20 @@ const at::Tensor& spyre_resize_(
   std::vector<int64_t> layout_size = size_int.vec();
   if (!self_impl->reserved_dims.empty()) {
     // reserved_dims keys are absolute dim indices. If the shape, strides or
-    // offset were changed in place since allocation (t_, squeeze_,
-    // as_strided_, ...), a key can name a different axis than it did, and
-    // every check below would validate the wrong dimension. Fail rather than
-    // trust it; falling through as "unreserved" would reallocate instead.
+    // offset no longer match the allocation, a key can name a different axis
+    // than it did, and every check below would validate the wrong dimension.
+    // That happens after an in-place change (t_, squeeze_, as_strided_, ...)
+    // and on a view that changed the geometry (a slice, a reshape): views
+    // copy the map, and has_intact_reservation() is what rejects them here.
+    // Fail rather than trust it; falling through as "unreserved" would
+    // reallocate instead.
     TORCH_CHECK(self_impl->has_intact_reservation(),
-                "resize_ on a max-reserved Spyre tensor: its shape, strides "
-                "or storage offset were changed in place after allocation "
-                "(e.g. t_(), transpose_(), squeeze_(), as_strided_()), so the "
-                "reservation no longer refers to the same axis. current "
-                "shape=",
+                "resize_ on a max-reserved Spyre tensor: this tensor's shape, "
+                "strides or storage offset no longer match the allocation, so "
+                "the reservation no longer refers to the same axis. This "
+                "happens after an in-place change (t_(), transpose_(), "
+                "squeeze_(), as_strided_()) and on a view that changed the "
+                "geometry (a slice, a reshape). current shape=",
                 self.sizes(), ", shape at allocation=",
                 c10::IntArrayRef(self_impl->dma_sizes));
     // Scope today: at most one entry, so this loop runs once; the guard is
@@ -1875,8 +2480,15 @@ const at::Tensor& spyre_resize_(
     }
   }
   // Use STL device bytes (stick-padded) to determine if existing allocation
-  // suffices.
-  auto new_layout = SpyreTensorLayout(layout_size, dtype);
+  // suffices. A reserved tensor keeps the layout it was allocated with: it
+  // was sized for the maximum at allocation, derived from the host size or
+  // given explicitly through device_layout=, and rebuilding it from the host
+  // size here would replace an explicit layout with the default one, after
+  // which every later read goes through a layout the bytes were not written
+  // in (#6027). The plain path keeps rebuilding, as before.
+  const SpyreTensorLayout new_layout =
+      self_impl->reserved_dims.empty() ? SpyreTensorLayout(layout_size, dtype)
+                                       : self_impl->spyre_layout;
   const size_t new_device_bytes = get_device_size_in_bytes(new_layout);
   const size_t new_cpu_bytes =
       at::detail::computeStorageNbytesContiguous(size_int, self.itemsize());
@@ -1938,19 +2550,32 @@ const at::Tensor& spyre_resize_(
   return self;
 }
 
-at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
-  TORCH_CHECK(self.is_privateuseone(),
-              "spyre_fill_tensor: tensor must be on spyre device");
-  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+namespace {
 
+// Launch a device-side MEMORY_FILL DMA over one composite address: every
+// stick of it, padding included. createFillAsyncParams converts value to the
+// dtype-specific fill pattern; launchFillAsync submits it.
+void launch_device_fill(const flex::CompositeAddress* addr, double value,
+                        c10::ScalarType scalar_type) {
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // flex::createFillAsyncParams performs internally.
-  DataFormats dtype = get_device_dtype(self.scalar_type());
+  DataFormats dtype = get_device_dtype(scalar_type);
 
-  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
-  // to the dtype-specific fill pattern; launchFillAsync submits it.
-  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
-                                             dtype, /*use_dmai=*/true);
+  // flex::createFillAsyncParams has no value->pattern conversion for the fp8
+  // formats. Zero is the all-zero bit pattern in every format, and the fill
+  // writes raw bytes, so a zero fill of fp8 storage can use any supported
+  // format. A nonzero fp8 value would need an fp8 encoding, which we do not
+  // have, so reject it here instead of failing inside the runtime.
+  if (dtype == DataFormats::SEN143_FP8 || dtype == DataFormats::SEN152_FP8) {
+    TORCH_CHECK(value == 0.0,
+                "fill_ of a float8 Spyre tensor is only supported with the "
+                "value 0 (the device fill has no fp8 pattern); got ",
+                value);
+    dtype = DataFormats::SEN169_FP16;
+  }
+
+  auto* params =
+      flex::createFillAsyncParams(addr, value, dtype, /*use_dmai=*/true);
   struct Guard {
     flex::FillAsyncParams* p;
     ~Guard() {
@@ -1959,9 +2584,107 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   } guard{params};
   SpyreStream stream;
   stream.launchFillAsync(params);
+}
+
+// Fill a sharded tensor one shard at a time: each shard is its own
+// single-chunk allocation, so a fill of each shard view covers the whole
+// tensor. Only whole sharded tensors reach this (views of sharded tensors are
+// rejected when created); the checks mirror copy_sharded's.
+void fill_sharded(const at::Tensor& sharded, double value) {
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
+              "sharded Spyre tensors only support whole-tensor fills");
+  const auto& info = *sharding_of(sharded)->sharding;
+  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "metadata no longer matches the sharded allocation (",
+              sharded.sizes(), " vs ", info.global_shape, ")");
+  TORCH_CHECK(sharded.scalar_type() == info.dtype,
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "dtype no longer matches the sharded allocation (",
+              sharded.scalar_type(), " vs ", info.dtype, ")");
+  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+    at::Tensor shard = spyre_shard_view(sharded, i);
+    launch_device_fill(get_composite_address(shard), value,
+                       shard.scalar_type());
+  }
+}
+
+}  // namespace
+
+at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
+  TORCH_CHECK(self.is_privateuseone(),
+              "spyre_fill_tensor: tensor must be on spyre device");
+  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+
+  // A sharded tensor's layout describes one shard, not the whole tensor, so
+  // the view checks below do not apply to it; fill_sharded fills each shard
+  // and rejects anything but the whole tensor.
+  if (spyre_is_sharded(self)) {
+    fill_sharded(self, value);
+    return self;
+  }
+
+  // The device-side MEMORY_FILL below writes every stick of the composite
+  // address, i.e. the whole storage, so it is only correct when self covers
+  // every element of the tensor that owns the storage, each exactly once. A
+  // partial view (d[8:16], d[:, 32:], d[:8], ...) would otherwise silently
+  // overwrite the elements outside it.
+  //  - self must be non-overlapping and dense: a broadcast view such as
+  //    d[:1].expand(64, 64) has the base's offset and element count but
+  //    covers only row 0. A transpose (d.t()) is dense and still fills.
+  //  - The root (a tracked view's base, otherwise self) must be the whole
+  //    tensor: at storage offset 0, with the elements its layout holds. That
+  //    catches a tensor sharing storage without view tracking
+  //    (d[8:16].detach()), and also a tracked view of one
+  //    (d[8:16].detach().view(-1)), whose base is that partial tensor. For a
+  //    reservation (to("spyre", dynamic=...)) the layout is sized for the
+  //    reserved max, and the space beyond the current shape holds no other
+  //    tensor's data, so the current shape is the whole tensor. A layout
+  //    whose valid_elements is unknown ({}) is not checked.
+  //  - A tracked view must also cover all of its base: the same storage
+  //    offset and element count.
+  // TODO(brunhe704): fill partial views that cover whole sticks with per-run
+  // fills.
+  TORCH_CHECK(self.is_non_overlapping_and_dense(),
+              "fill_/zero_ of a broadcast or overlapping view of a Spyre "
+              "tensor is not supported yet: the device fill writes every "
+              "stick of the storage once (view: ",
+              self.sizes(), " with strides ", self.strides(),
+              "). Fill the underlying tensor, or a CPU copy, instead.");
+  const at::TensorBase& root =
+      self.is_view() ? self._base() : static_cast<const at::TensorBase&>(self);
+  const auto* root_impl =
+      static_cast<SpyreTensorImpl*>(root.unsafeGetTensorImpl());
+  int64_t whole_elements = -1;  // -1: unknown, do not check the root
+  if (root_impl->has_intact_reservation()) {
+    whole_elements = root.numel();
+  } else if (!root_impl->spyre_layout.valid_elements.empty()) {
+    whole_elements = 1;
+    for (const auto& [dims, count] : root_impl->spyre_layout.valid_elements) {
+      whole_elements *= count;
+    }
+  }
+  const bool root_is_whole =
+      whole_elements < 0 ||
+      (root.storage_offset() == 0 && root.numel() == whole_elements);
+  const bool covers_root = self.storage_offset() == root.storage_offset() &&
+                           self.numel() == root.numel();
+  TORCH_CHECK(root_is_whole && covers_root,
+              "fill_/zero_ of a partial view of a Spyre tensor is not "
+              "supported yet: the device fill writes whole sticks of the "
+              "storage, so it would also overwrite the elements outside the "
+              "view (view: ",
+              self.sizes(), " at storage offset ", self.storage_offset(),
+              "; the whole tensor has ",
+              whole_elements >= 0 ? whole_elements : root.numel(),
+              " elements at storage offset ",
+              whole_elements >= 0 ? 0 : root.storage_offset(),
+              "). Fill the whole tensor, or fill a CPU copy and copy it "
+              "back.");
+
+  launch_device_fill(get_composite_address(self), value, self.scalar_type());
   // The fill DMA covers the whole allocation, padding included.
   record_padding_after_write(self, value);
-
   return self;
 }
 

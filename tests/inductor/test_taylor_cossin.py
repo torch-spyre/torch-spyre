@@ -128,9 +128,9 @@ map" at N = 16, 32, 65, 80, 96, 129, 160, 224.  The rule is the pairing, not
 graph, while pure fp16 pointwise ops are bit-exact, so this is the backend cast
 and not the decomposition.  #2818 has since been closed by rejecting such a cast
 (#3809: "cannot rescale device layout"), and ``test_low_precision_odd_stick_count_rejected``
-pins that rejection.  Some odd-count shapes still come back wrong without
-an error (#5361).  All model head dims (64, 128, 256) are even-stick and
-unaffected.
+pins that rejection.  Odd stick-pair widths are padded via boundary slice/expand
+(#5048, #6065), while single partial sticks are rejected.  All model head dims
+(64, 128, 256) are even-stick and unaffected.
 
 Note: fp32 itself can only represent values near 128000 with spacing ~0.008,
 which is larger than π; a linspace sweep at |x|_max=128000 is meaningless in
@@ -461,18 +461,7 @@ _DEVICE_INTEGRAL_DTYPES = [
     pytest.param(torch.int32, False, id="int32"),
     pytest.param(torch.int64, True, id="int64"),
     pytest.param(torch.int8, True, id="int8"),
-    pytest.param(
-        torch.bool,
-        False,
-        id="bool",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=AssertionError,
-            reason="the float32 result is staggered and read back without "
-            "restoring its order (#4393), and its 17-wide rows are not padded to "
-            "whole stick pairs (#3999)",
-        ),
-    ),
+    pytest.param(torch.bool, False, id="bool"),
 ]
 
 
@@ -510,8 +499,8 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
       the cast has nowhere to go but CPU.  The promoted polynomial still runs on
       device and the result matches aten.
     * bool -> fp32 runs on device (``dl16tofp32``) and does not offload, but its
-      float32 result is staggered, and a staggered graph output is read back
-      without restoring its order (#4393), so the bool case is a strict xfail.
+      float32 result is staggered with a single partial stick, which D2H rejects
+      as requiring whole stick pairs.
 
     The split is visible in ``output_code.py`` under ``TORCH_COMPILE_DEBUG=1``,
     and it is the *only* difference between these dtypes: the FX graph is
@@ -545,6 +534,15 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
         dtype
     )
     x = x.reshape(4, 17)
+    if dtype is torch.bool:
+        # bool -> fp32 on device (dl16tofp32) produces a staggered tensor with a
+        # single partial stick (17 elems < 32 elems_per_stick = 1 stick), which
+        # is rejected at D2H because DL16_TO_FP32 requires whole stick pairs.
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            _compile_on_spyre(
+                op, x, allow_fallback="conversion from" if cast_offloads else None
+            )
+        return
     out = _compile_on_spyre(
         op, x, allow_fallback="conversion from" if cast_offloads else None
     )
@@ -555,26 +553,23 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("dtype, tol", _UPCAST_DTYPES)
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
-def test_low_precision_odd_stick_count_rejected(op_name, dtype):
-    """The fp32 upcast at an odd fp32-stick count is rejected, not computed wrongly.
+def test_low_precision_odd_stick_count(op_name, dtype, tol):
+    """The fp32 upcast stays accurate at an odd number of fp32 sticks.
 
     (2, 3, 32) spans an odd number of fp32 sticks, so the closing fp32 ->
-    fp16/bf16 cast cannot rescale the device layout to whole fp16 sticks, and the
-    compiler says so ("cannot rescale device layout", #3809).  A bare
-    ``(x.float() * 2.0).to(dtype)`` on this shape is rejected the same way with no
-    cos/sin in the graph, so this is the backend cast and not the decomposition.
-    If the cast is ever supported this stops raising and has to become a positive
-    test.
-
+    fp16/bf16 cast narrows a stick dim that does not fill whole fp16 sticks.
     Every shape in ``_SPYRE_SHAPES`` has an even fp32-stick count, which is why
-    the rest of the suite cannot see this.
+    the rest of the suite cannot see this. Scored like
+    ``test_low_precision_compiles_and_accurate``, against the input as the device
+    holds it.
     """
     op = getattr(torch, op_name)
     x = torch.linspace(-3.0, 3.0, 192, dtype=dtype).reshape(2, 3, 32)
-    with pytest.raises(Exception, match="cannot rescale device layout"):
-        _compile_on_spyre(op, x)
+    held = x.to("spyre").cpu()
+    out = _compile_on_spyre(op, x)
+    torch.testing.assert_close(out, op(held.double()).to(dtype), atol=tol, rtol=tol)
 
 
 def test_cos_sin_non_contiguous():

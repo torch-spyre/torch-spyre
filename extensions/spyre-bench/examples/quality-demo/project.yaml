@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# A quality case you can run with the stub in this folder (synthetic scores, not a measurement):
+#   spyre-bench plan --catalog examples/quality-demo --central examples/central --purpose nightly --subject-id <uuid> ...
+#   spyre-bench run  --plan plan.json --workdir examples/quality-demo --catalog examples/quality-demo --central examples/central
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: quality-demo}
+spec:
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [lm-eval]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: lm-eval}
+spec: {type: quality}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-questions-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: "1"
+  license: MIT
+  visibility: public
+  source: {uri: "hf://datasets/example-org/demo-questions", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {files: [{path: test.jsonl, sha256: 4f3a1c0de2b64a5f8c7e91d0b2a36f5e4d8c7b6a5f4e3d2c1b0a99887766554a}]}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: demo-questions}
+spec:
+  asset: demo-questions-files
+  role: eval
+  schema: {record: {question: text, answer: text}}
+  subsets: {first-8: {limit: 8, order: sequential}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a}
+spec: {assets: [{role: weights, asset: demo-llm-a-weights}], family: demo, architecture: decoder-only}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-fp16}
+spec: {type: llm/lm-eval-model, backend: demo-device, token: demoa, model: demo-llm-a, precision: fp16}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-ref}
+spec: {type: llm/lm-eval-model, backend: reference, token: demoa, model: demo-llm-a, precision: fp32}

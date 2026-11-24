@@ -88,7 +88,8 @@ from torch_spyre._C import (
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
-from .loop_node import insert_after
+from .loop_facts import enclosing_loops
+from .loop_node import move_after, move_before, record_member
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -106,6 +107,7 @@ from .pass_utils import (
     get_matmul_m_size,
     get_matmul_n_size,
     indirect_info_from_op,
+    reorder_valid_elements,
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
@@ -465,9 +467,10 @@ def _matmul_reorder_stl(
         new_stride_map,
     )
     return SpyreTensorLayout(
-        device_size=new_device_size,
-        stride_map=new_stride_map,
-        device_dtype=stl.device_dtype,
+        new_device_size,
+        new_stride_map,
+        stl.device_dtype,
+        reorder_valid_elements(stl, new_order),
     )
 
 
@@ -540,6 +543,12 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+        element_arrangement=(
+            ElementArrangement.QFP8WT
+            if stl.element_arrangement == ElementArrangement.QFP8WT
+            else ElementArrangement.STANDARD
+        ),
+        valid_elements=reorder_valid_elements(stl, order),
     )
 
 
@@ -635,8 +644,8 @@ def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
         [stl.device_size[i] for i in order],
         [stl.stride_map[i] for i in order],
         stl.device_dtype,
-        stl.element_arrangement,
         valid_elements,
+        stl.element_arrangement,
     )
 
 
@@ -1207,9 +1216,7 @@ def _insert_mutation_relayout_copy(
         mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
 
     operations = graph.operations
-    mutation_op_index = operations.index(mutation_op)
-    operations.remove(buf_tmp)
-    operations.insert(mutation_op_index, buf_tmp)
+    move_before(operations, mutation_op, buf_tmp)
 
     # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout).
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
@@ -1223,28 +1230,17 @@ def _insert_mutation_relayout_copy(
         buf_tmp,  # use buf_tmp as metadata source, not mutation_op
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
-    operations.remove(buf_copyback)
     # Right after the mutation op, in the list that holds it: a flat index past the
     # last op of a loop body would put the copy outside the loop.
-    insert_after(operations, mutation_op, buf_copyback)
+    move_after(operations, mutation_op, buf_copyback)
 
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's
     # loop so other carry readers observe the preceding iteration's updates.
-    loop_info = getattr(mutation_op, "loop_info", None)
-    if loop_info is not None:
-        from .loop_info import CoarseTileInfo
-
+    levels = enclosing_loops(mutation_op)
+    if levels:
         for copy_op in (buf_tmp, buf_copyback):
-            depth = len(loop_info.loop_count)
-            copy_op.loop_info = CoarseTileInfo(
-                loop_group_id=loop_info.loop_group_id,
-                loop_count=list(loop_info.loop_count),
-                loop_tiled_dims=[[] for _ in range(depth)],
-                loop_tiled_reduction_dims=[[] for _ in range(depth)],
-                tiled_dims_per_read=[[[] for _ in range(depth)]],
-                output_tiled_dims=[[] for _ in range(depth)],
-            )
+            record_member(copy_op, [((), ()) for _ in levels], like=mutation_op)
 
     logger.info(
         "nonstick_dim_order: inserted mutation relayout copy for %s "
@@ -1271,7 +1267,38 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
         if entry.kind == "producer_rewrite":
             _rewrite_producer_layout(buf, entry.required_stl)
         elif entry.kind == "copy":
-            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
+            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE) and (
+                entry.required_stl.element_arrangement == ElementArrangement.QFP8WT
+            ):
+                # QFP8WT EA: the scatter source and destination share a physical
+                # element layout (2D-stick) that cannot be transcoded by a plain
+                # byte-copy restickify.  Instead, rewrite the
+                # mutation target's layout in-place to the required (rotated) STL so
+                # the scatter writes directly into the target buffer with the correct
+                # 2D-stick addressing — no copy-in / copy-back needed.
+                #
+                # For graph inputs, try_get_buffer returns TensorBox(StorageBox(buf))
+                # which has no writable .layout.  Unwrap to reach the InputBuffer.
+                real_buf = buf
+                if isinstance(real_buf, TensorBox) and isinstance(
+                    real_buf.data, StorageBox
+                ):
+                    real_buf = real_buf.data.data
+                if entry.buf_name in graph.graph_inputs:
+                    # The caller's tensor keeps the layout it was allocated
+                    # with, so the scatter must be compiled against exactly it.
+                    caller_layout = _real_layout(buf)
+                    if (
+                        isinstance(caller_layout, FixedTiledLayout)
+                        and caller_layout.device_layout != entry.required_stl
+                    ):
+                        raise Unsupported(
+                            f"QFP8WT scatter into graph input {entry.buf_name} "
+                            f"needs layout {entry.required_stl}, but the tensor "
+                            f"was allocated as {caller_layout.device_layout}"
+                        )
+                _rewrite_producer_layout(real_buf, entry.required_stl)
+            elif isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
                 _insert_mutation_relayout_copy(graph, entry.op, entry.required_stl)
             else:
                 layout = _real_layout(buf)

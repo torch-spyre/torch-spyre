@@ -19,7 +19,7 @@ These tests intentionally mirror the compiler layers used by user
 
 1. Planner: span_overflow_hint_analysis returns a selected dim and split count.
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
-3. Coarse-tile IR: coarse_tile consumes the group and stamps CoarseTileInfo.
+3. Coarse-tile IR: the lowering consumes the group and stamps a strict LoopMember.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
 
 Coverage in this file:
@@ -30,7 +30,7 @@ Coverage in this file:
 - planner boundary errors when no legal divisor validates post-tile span;
 - hard failure when output MemoryDep address math is unavailable;
 - adapter mapping with both constant and symbolic batch output coordinates;
-- coarse_tile stamping of ranges/layout/CoarseTileInfo;
+- the lowering's stamping of ranges/layout/LoopMember;
 - equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 
@@ -73,10 +73,11 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.wsr.coarse_tile import (
-    _apply_plan,
-    coarse_tile_post_stickify,
-    plan_coarse_tile_groups,
+from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
+from torch_spyre._inductor.wsr.loop_tiling_lowering import (
+    TiledDim,
+    build_loop_tiling_plan,
+    tile_groups,
 )
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
@@ -4092,13 +4093,13 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
             groups = _apply_span_overflow(graph)
-            coarse_tile_post_stickify(graph, groups)
+            tile_groups(graph, groups)
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(op.loop_info.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
-        self.assertEqual(op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(op.loop_member.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
+        self.assertEqual(op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(op.loop_member.loop_tiled_reduction_dims, [[]])
 
     def test_combined_plan_reaches_coarse_tile_planner(self):
         bmm = _reduction_op(
@@ -4173,7 +4174,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
         ):
             groups = _apply_span_overflow(graph)
-            coarse_plan = plan_coarse_tile_groups(graph.operations, groups)
 
         self.assertEqual(groups[0][0], [bmm])
         self.assertEqual(
@@ -4181,10 +4181,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             [sympy.Integer(5), sympy.Integer(4)],
         )
         self.assertEqual([hint.is_reduction for hint in bmm.dim_hints], [False, True])
-        info = coarse_plan[id(bmm)]
-        self.assertEqual(info.loop_count, [sympy.Integer(5), sympy.Integer(4)])
-        self.assertEqual(info.loop_tiled_dims, [[1], []])
-        self.assertEqual(info.loop_tiled_reduction_dims, [[], [0]])
         self.assertEqual(list(bmm.data.ranges), [1, 20, 16, 64])
         self.assertEqual(list(bmm.data.reduction_ranges), [256])
 
@@ -5315,10 +5311,13 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
                     op, ((0, 2, True),), [_SPAN_OVERFLOW_HINT_ID]
                 )
                 levels = [(_SPAN_OVERFLOW_HINT_ID, sympy.Integer(2))]
-                plan = plan_coarse_tile_groups([op], [([op], levels)])
-                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
-                self.assertEqual(op.loop_info.loop_count, [2])
-                self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[tiled_pos]])
+                # One level only: the lowering refuses a nest, so the plan's position
+                # and the divide are checked directly.
+                (group,) = build_loop_tiling_plan([op], [([op], levels)]).groups
+                (planned,) = group.ops
+                self.assertEqual(group.trip_count, 2)
+                self.assertEqual(planned.tiled, TiledDim(tiled_pos, True))
+                _divide_reduction_ranges(op, sympy.Integer(2), [planned.tiled.position])
                 self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
 
     def test_output_only_overflow_on_reduction_op_is_not_a_reduction_tile(self):
@@ -5638,20 +5637,20 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                 self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
                 self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
-                # Layer 3: coarse_tile stamps identical per-tile IR shape.
-                coarse_tile_post_stickify(auto_graph, auto_groups)
-                coarse_tile_post_stickify(manual_graph, manual_groups)
+                # Layer 3: the lowering stamps identical per-tile IR shape.
+                tile_groups(auto_graph, auto_groups)
+                tile_groups(manual_graph, manual_groups)
 
         self.assertEqual(list(auto_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(auto_op.layout.size), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(auto_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(manual_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(auto_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(auto_op.loop_info.loop_tiled_reduction_dims, [[]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(auto_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(manual_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(auto_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(auto_op.loop_member.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_reduction_dims, [[]])
 
         # Layer 4: scheduler wrapping sees the same counted loop on both paths.
         created = []
@@ -5908,8 +5907,8 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     #   "writer-advance check failed for 'coarse_tile_copy_buf1' -- level 0
     #    tiles output dims [1] but output_tiled_dims has no extents for that
     #    level, so its write pointer would not advance there."
-    # _insert_copy_op keyed the synthesized copy-out writer's per-level
-    # extents by RAW dim index, while _tiled_dims_for_dep matched those keys
+    # (Legacy transform, deleted in stage 7a.6.) Its copy-out writer keyed the
+    # per-level extents by RAW dim index, while the dep matcher matched those keys
     # against the SQUEEZED dN symbols of dep.index. This group's terminal
     # reduction has output [1, 20] -> divided [1, 4]; the leading unit dim is
     # squeezed away, so the raw key 1 matched no symbol, output_tiled_dims
@@ -7701,61 +7700,13 @@ class TestSpanOverflowMutationE2E(InductorTestCase):
         }
     )
     def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
-        """Originally a regression repro for the Case 2/"Case 3"
-        layout-reconciliation gap; now an xfail for a separate, deeper,
-        pre-existing bug this task's fix newly exposes on this exact op.
+        """``x + y`` with ``x`` a transposed (non-contiguous) view, tiled by automatic
+        span-overflow planning; the compiled result matches the CPU.
 
-        Task 2 (this task) deleted the direct-mutation Case 2/"Case 3"
-        branch in `_propagate_tiled_op` entirely, so every cross-loop-group
-        write -- including this test's -- now takes the `_insert_copy_op`
-        path unconditionally. That fix *is* correct and closes the gap this
-        test originally targeted: `TestCoarseTileBufferPropagation`'s
-        `test_case2_condition_now_produces_copy_op` unit test directly
-        confirms the old Case 2 branch's code no longer exists and the
-        copy-op path is taken instead. A control probe run without any
-        divergent input layout at all (plain contiguous `x`/`y`, same
-        shapes, same span-overflow trigger) confirms the external-input-
-        layout-mismatch scenario is no longer what's failing here.
-
-        What still fails: `_insert_copy_op`'s interaction with a
-        post-stickify, span-overflow-scaled `full_buf` has its own,
-        independent, pre-existing addressing bug in `superdsc.py`'s per-arg
-        `device_size`/`device_coordinates` handling -- confirmed present on
-        the *pre-Task-2* code too, via a second control probe that forces a
-        real inside-consumer (so the OLD Case 2/"Case 3" branch does not
-        apply and the OLD code already takes the Case 1 copy-op path) on
-        this same post-stickify span-overflow setup: it fails the same way
-        (~87% mismatch) with zero divergent input layouts. This is the same
-        general class of latent Case-1-copy-path bug flagged as "item 4,
-        out of scope" in task-1-report.md (there triggered by a 3-input
-        case); here it's shown to need neither 3 inputs nor a divergent
-        layout, only `_insert_copy_op` + post-stickify span-overflow with
-        `loop_count > 1`. It was never exercised end to end before because,
-        pre-Task-2, an op with no inside consumers and no loop-internal
-        input (this test's exact shape) always took Case 2 instead, and no
-        other post-stickify span-overflow e2e test in this file forces
-        Case 1 with `loop_count > 1`.
-
-        This bug is in `_insert_copy_op`/`superdsc.py` addressing, not in
-        the Case 2/"Case 3" deletion this task performs, and is out of this
-        task's scope (its fix would require changes to `superdsc.py`, not
-        listed in this task's file scope). Per this task's explicit
-        instructions, this test stays `@unittest.expectedFailure` -- do not
-        un-xfail a test that still fails, and do not reinstate any form of
-        the deleted Case 2/"Case 3" branch as a workaround.
-
-        Confirmed failure mode (current code, post-Task-2 fix): 15779/16384
-        elements (96.3%) mismatch at atol=0.01/rtol=0.01, max abs diff
-        ~6.74 -- still far outside fp16 rounding noise, but a different
-        mismatch count/magnitude than the pre-fix 12221/16384 (74.6%),
-        max abs diff ~5.89 recorded in task-1-report.md, consistent with a
-        different root cause now being hit.
-
-        MAX_SPAN_BYTES is patched down so a small tensor triggers automatic
-        span-overflow tiling without needing a multi-hundred-MB real
-        allocation (technique matches
-        test_span_overflow_hint_analysis.py's TestSpanOverflowNumericValidation
-        class).
+        MAX_SPAN_BYTES is patched down so a small tensor triggers span-overflow
+        tiling without a multi-hundred-MB allocation (the technique of
+        ``TestSpanOverflowNumericValidation``). The operand layouts differ, so the
+        copy-out of the tiled op has to reconcile them.
         """
         from unittest.mock import patch as patch2
 

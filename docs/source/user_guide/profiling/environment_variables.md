@@ -66,6 +66,16 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## Declared-range checks
+
+Report when a size range declared with `tensor.to("spyre", dynamic=...)` is not
+served by one compiled program. An unknown value falls back to `warn`.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_NARROWING_CHECK` | After each compile, report guards that reject some declared sizes. `warn` (default), `error` (stop the compile), `off` |
+| `TORCH_SPYRE_RECOMPILE_CHECK` | Report a recompile while a declared input has a declared size. `warn` (default), `error` (stop the recompile), `all` (every recompile of user code), `off` |
+
 ## Compile-time timing
 
 Measures how long the compiler frontend takes, per pass pipeline and per

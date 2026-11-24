@@ -32,7 +32,7 @@ preparation, HBM-pool planning, codegen) sees the counted loop it always saw.
 Once the scheduler nodes exist, ``graph.operations`` is the flat leaf list
 again (the structure lives in the scheduler nodes): kernel preparation's LX
 read contracts read it and expect leaf ops.  A kernel op inside a node that
-is not a member of that loop (no matching ``loop_info``) is refused, since it
+is not a member of that loop (no matching ``loop_member``) is refused, since it
 would run every trip here and once on the flat path.
 
 The patch reaches into private Inductor code.  It is supported only on the
@@ -75,7 +75,7 @@ SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 # Set to False only by the equivalence test, to compare the flow-through path
 # with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
 # ``LoopNode`` after the pass loop, as before, and ``build_loop_scheduler_nodes``
-# rebuilds the loops from the flat ops' ``loop_info``.
+# rebuilds the loops from the flat ops' ``loop_member``.
 SCHEDULE_LOOP_NODES = True
 
 # The Inductor surface this module depends on.  "patched": replaced for the
@@ -183,6 +183,9 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
                 f"counted loop {loop_node.get_name()} whose body has no kernel"
             )
         BaseSchedulerNode.__init__(self, scheduler)
+        # The loop's own fake dependencies (see add_fake_dep), kept across a rebuild
+        # of its dependencies from its children (_refresh_keeping_fake_deps).
+        self._fake_deps: tuple[dependencies.Dep, ...] = ()
         self.snodes = list(snodes)
         self.loop_count = loop_node.trip_count
         self.node = loop_node
@@ -240,6 +243,7 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
         # as a dependency of the loop on itself it is a KeyError later.
         if dep.name in self.get_buffer_names():
             return
+        self._fake_deps = (*self._fake_deps, dep)
         BaseSchedulerNode.add_fake_dep(self, dep)
 
     def update_mutated_names(self, renames: dict[str, str]) -> None:
@@ -311,11 +315,11 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     member of that loop.
 
     A ``LoopSchedulerNode`` runs every kernel child ``trip_count`` times.  The
-    path it replaced decided membership op by op, from ``loop_info``
+    path it replaced decided membership op by op, from ``loop_member``
     (``build_loop_scheduler_nodes``): an op without this loop's group path ran
     outside the loop, once.  ``collapse`` keeps an op that sits between two
     members inside the span, so such an op (an op a pass placed there without
-    ``loop_info``) would silently run every trip on this path -- an
+    ``loop_member``) would silently run every trip on this path -- an
     accumulator's zero-fill re-run each trip, a wrong answer.  Every direct
     kernel child must therefore share one group path, and so be in the loop
     on both paths; a nested loop's members are checked at their own level.
@@ -323,14 +327,14 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     No pass produces such an op today: across the seven graphs of
     ``test_loop_scheduler_equivalence.py`` this check never fires.  It guards a
     future pass that places an op between two members without stamping its
-    ``loop_info``.  Ops at the head or tail of a body are not refused: they
-    are moved out at the hand-off (``loop_node.peel_non_members``).
+    ``loop_member``.  An op at the head or tail of a body is refused the same way
+    (before stage 8.5 the hand-off moved such an op out of the node).
     """
     paths = {op.get_name(): counted_loop_path(op) for op in kernels}
     # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on
     # longer paths, so the direct kernel children of a node built from
-    # ``loop_info`` all have the SAME full path, and a node always starts at
-    # a member.  (A node built by hand from ops without ``loop_info``, as the
+    # ``loop_member`` all have the SAME full path, and a node always starts at
+    # a member.  (A node built by hand from ops without ``loop_member``, as the
     # unit tests do, has only empty paths and is not checked.)
     if len(set(paths.values())) <= 1:
         return
@@ -396,6 +400,62 @@ _PATCHED = (
     "compute_ancestors",
     "dead_node_elimination",
 )
+
+
+def _refresh_keeping_fake_deps(original):
+    """Wrap ``refresh_group_node_dependencies`` so a loop keeps its own fake deps.
+
+    Stock Inductor rebuilds a group node's reads and ``unmet_dependencies`` from
+    its children (fusion scoring does: ``_try_reindex_pointwise_for_reduction``).
+    The children never saw the fake dependencies ``compute_dependencies`` gave the
+    LOOP, so the rebuild drops them. One of them is the loop's ordering after the
+    prior writer of a buffer it mutates (the allocation of a span-overflow
+    copy-out's full output): without it ``reorder_for_peak_memory`` can place the
+    loop before that allocation.
+
+    Only the dependencies still present when the rebuild starts are put back, so
+    whatever a pruner has already removed (``prune_deps``, ``prune_weak_deps``,
+    ``_prune_redundant_deps``) stays removed.
+    """
+
+    def refresh(group_snode):
+        if not isinstance(group_snode, LoopSchedulerNode):
+            return original(group_snode)
+        reads = [
+            d for d in group_snode._fake_deps if d in group_snode.read_writes.reads
+        ]
+        unmet = [d for d in reads if d in group_snode.unmet_dependencies]
+        original(group_snode)
+        read_writes = group_snode.read_writes
+        for dep in reads:
+            if dep not in read_writes.reads:
+                read_writes = read_writes.with_read(dep)
+        group_snode.read_writes = read_writes
+        group_snode.clear_read_writes_dependent_caches()
+        group_snode.unmet_dependencies = OrderedSet(
+            [*group_snode.unmet_dependencies, *unmet]
+        )
+
+    return refresh
+
+
+@contextlib.contextmanager
+def _replace_refresh() -> Iterator[None]:
+    """Install :func:`_refresh_keeping_fake_deps` on Inductor's scheduler module
+    for the block (it calls the function through its module globals)."""
+    import torch._inductor.scheduler as scheduler_module
+
+    saved = scheduler_module.refresh_group_node_dependencies
+    wrapper = _refresh_keeping_fake_deps(saved)
+    scheduler_module.refresh_group_node_dependencies = wrapper
+    try:
+        yield
+    finally:
+        current = scheduler_module.refresh_group_node_dependencies
+        scheduler_module.refresh_group_node_dependencies = saved
+        # Nested blocks restore in order, so what is installed now is this block's
+        # own wrapper; anything else means something replaced it while it was active.
+        assert current is wrapper, "refresh_group_node_dependencies was replaced"
 
 
 @contextlib.contextmanager
@@ -504,13 +564,16 @@ def apply_loop_scheduler_patches() -> Iterator[None]:
                     buf.set_users([*buf.users, NodeUser(loop)])
         return result
 
-    with _replace(
-        {
-            "create_scheduler_node": create_scheduler_node,
-            "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
-            "compute_ancestors": compute_ancestors,
-            "dead_node_elimination": dead_node_elimination,
-        }
+    with (
+        _replace(
+            {
+                "create_scheduler_node": create_scheduler_node,
+                "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
+                "compute_ancestors": compute_ancestors,
+                "dead_node_elimination": dead_node_elimination,
+            }
+        ),
+        _replace_refresh(),
     ):
         yield
 

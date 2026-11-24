@@ -30,14 +30,14 @@ from torch_spyre._inductor.loop_facts import (
     loop_depth,
     scheduler_enclosing_loops,
 )
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.scheduler import _loop_count, _loop_group_id
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 
 
 def _info(gid, counts, tiled=None, tiled_red=None):
     n = len(counts) if hasattr(counts, "__len__") else 0
-    return CoarseTileInfo(
+    return LoopMember(
         loop_group_id=gid,
         loop_count=counts,
         loop_tiled_dims=tiled if tiled is not None else [[] for _ in range(n)],
@@ -48,12 +48,12 @@ def _info(gid, counts, tiled=None, tiled_red=None):
 
 
 def _op(info=None):
-    return SimpleNamespace(loop_info=info) if info is not None else SimpleNamespace()
+    return SimpleNamespace(loop_member=info) if info is not None else SimpleNamespace()
 
 
 def _extern(info):
     op = MagicMock(spec=ExternKernel)
-    op.loop_info = info
+    op.loop_member = info
     return op
 
 
@@ -120,7 +120,7 @@ def test_scheduler_node_without_scheduler_nodes_yields_empty():
 
 def test_default_tiled_reduction_dims_is_still_a_loop():
     # Like test_restickify_cost_model: loop_tiled_reduction_dims left empty.
-    op = _op(CoarseTileInfo((0,), [32], [[]]))
+    op = _op(LoopMember((0,), [32], [[]]))
     (lvl,) = enclosing_loops(op)
     assert lvl.trip_count == 32
     assert lvl.tiled_dims == () and lvl.tiled_reduction_dims == ()
@@ -137,7 +137,7 @@ def test_agrees_with_existing_readers():
         _op(_info((0,), [4], [[1]], [[]])),
         _op(_info((0, 1), [2, 8], [[0], [1]], [[], [0]])),
         _op(_info((3, 0, 2), [2, 3, 4], [[0], [], [1]], [[], [], []])),
-        _op(CoarseTileInfo((0,), [32], [[]])),
+        _op(LoopMember((0,), [32], [[]])),
     ]
     for op in ops:
         path = counted_loop_group_path(op)
@@ -149,7 +149,7 @@ def test_agrees_with_existing_readers():
             gid[: i + 1] for i in range(len(gid))
         ]
         if levels:
-            info = op.loop_info
+            info = op.loop_member
             assert [lvl.trip_count for lvl in levels] == list(info.loop_count)
             assert [lvl.tiled_dims for lvl in levels] == [
                 tuple(d) for d in info.loop_tiled_dims
@@ -203,15 +203,15 @@ class TestBroadcastBatchVars:
     """
 
     @staticmethod
-    def _op(loop_info):
+    def _op(loop_member):
         return SimpleNamespace(
-            loop_info=loop_info,
+            loop_member=loop_member,
             data=SimpleNamespace(ranges=[sympy.Integer(8), sympy.Integer(16)]),
         )
 
     @staticmethod
     def _info(tiled):
-        return CoarseTileInfo(
+        return LoopMember(
             loop_group_id=(0,),
             loop_count=[2],
             loop_tiled_dims=[tiled],
