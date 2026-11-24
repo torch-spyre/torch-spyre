@@ -42,6 +42,12 @@ class _TensorSubclass(torch.Tensor):
     pass
 
 
+def expects_raise(test):
+    """Tag a rejection test (see tests/inductor/utils_inductor.py)."""
+    test._expects_raise = True
+    return test
+
+
 def _source(shape=(16,), dtype=torch.float32):
     count = 1
     for extent in shape:
@@ -435,10 +441,10 @@ def test_clone_keeps_sharding(active_cores, dim, dtype, call):
 
 
 @_requires_spyre
+@expects_raise
 def test_clone_of_box_view_of_sharded_fails_closed(active_cores):
-    # Only whole sharded tensors can be cloned so far. Without box views
-    # (#6225) the view itself is rejected; with them, its clone is rejected
-    # like any other compiled op on a box view. Either way the base is
+    # Only whole sharded tensors can be cloned so far: a box view's clone is
+    # rejected like any other compiled op on a box view, and the base is
     # unchanged.
     n = num_shards()
     active_cores["cores"] = n
@@ -446,15 +452,13 @@ def test_clone_of_box_view_of_sharded_fails_closed(active_cores):
         _source((4 * n, 64), torch.float16), Shard(0), num_shards=n
     )
     before = y.cpu()
-    with pytest.raises(
-        Exception,
-        match="views of sharded Spyre tensors are not supported|base tensors from to_sharded",
-    ):
+    with pytest.raises(RuntimeError, match="base tensors from to_sharded"):
         y[0:n].clone()
     assert torch.equal(y.cpu(), before)
 
 
 @_requires_spyre
+@expects_raise
 def test_clone_of_sharded_rejects_other_memory_formats(active_cores):
     n = num_shards()
     active_cores["cores"] = n
