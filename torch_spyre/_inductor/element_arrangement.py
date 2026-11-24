@@ -26,8 +26,6 @@ so layouts are not re-propagated. It first marks all such ops, then inserts the
 shuffles.
 """
 
-import logging
-
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -129,6 +127,68 @@ def _with_ea(layout: FixedTiledLayout, ea: ElementArrangement) -> FixedTiledLayo
     )
 
 
+def _get_compact_buf_info(
+    graph: GraphLowering, name: str, stl: SpyreTensorLayout | None
+) -> str:
+    """Returns compact string: name:shape:ea[flags] for easy grep debugging."""
+    layout = _committed_layout(graph, name)
+    if stl is None and layout is not None:
+        stl = layout.device_layout
+
+    buf = graph.try_get_buffer(name) or graph.graph_inputs.get(name)
+    shape = (
+        list(layout.size)
+        if layout
+        else (list(buf.get_size()) if buf and hasattr(buf, "get_size") else "?")
+    )
+    ea = stl.element_arrangement.name if stl else "NONE"
+
+    flags = []
+    if stl and _is_broadcast(stl):
+        flags.append("bcast")
+    if isinstance(buf, SpyreConstantFallback):
+        flags.append("const")
+    if isinstance(shape, list) and 1 in shape:
+        flags.append("size1")
+
+    flag_str = f"[{','.join(flags)}]" if flags else ""
+    return f"{name}:{shape}:{ea}{flag_str}"
+
+
+def _log_ea_decision(
+    op_name: str,
+    op_type: str,
+    out_shape: list | str,
+    out_ea: str,
+    in_str: str,
+    targets: dict,
+    reason: str,
+) -> None:
+    """Compact, grep-friendly logging for EA shuffle decisions."""
+    action = "SELECT" if targets else "SKIP"
+    target_str = (
+        ", ".join(f"{n}->{ea.name}" for n, ea in targets.items()) if targets else "none"
+    )
+    logger.debug(
+        "[EA-SHUFFLE] %s | op=%s type=%s out=%s:%s | in=[%s] | targets=[%s] | reason=%s",
+        action,
+        op_name,
+        op_type,
+        out_shape,
+        out_ea,
+        in_str,
+        target_str,
+        reason,
+    )
+    if action == "SELECT":
+        logger.info(
+            "[EA-SHUFFLE] INSERT | op=%s | targets=[%s] | in=[%s]",
+            op_name,
+            target_str,
+            in_str,
+        )
+
+
 def _insert_shuffle_op(
     graph: GraphLowering,
     src_name: str,
@@ -179,6 +239,16 @@ def _insert_shuffle_op(
         )
     # Move the copy to just before ``before_op``.
     move_before(graph.operations, before_op, shuffle_buf)
+
+    logger.debug(
+        "[EA-SHUFFLE] INSERT_OP | buf=%s src=%s shape=%s %s->%s before=%s",
+        shuffle_buf.get_name(),
+        src_name,
+        list(src_layout.size),
+        src_layout.device_layout.element_arrangement.name,
+        target_ea.name,
+        before_op.get_name(),
+    )
     return shuffle_buf
 
 
@@ -258,65 +328,6 @@ def validate_ops(graph: GraphLowering) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def _format_op(
-    graph: GraphLowering,
-    op,
-    stls: dict[str, SpyreTensorLayout],
-    targets: dict[str, ElementArrangement] | None = None,
-) -> str:
-    """``buf7_<ea>: [buf4_<ea>, buf5_<target>[insert], ...]``.
-
-    The op is shown with its committed output EA and its operands with their
-    committed EAs; an operand in ``targets`` is shown in its target EA.
-    """
-    targets = targets or {}
-    out_stl = _committed_stl(graph, op.get_name())
-    out_ea = "?" if out_stl is None else out_stl.element_arrangement.name
-    operands = ", ".join(
-        f"{n}_{targets[n].name}[insert]"
-        if n in targets
-        else f"{n}_{s.element_arrangement.name}"
-        for n, s in stls.items()
-    )
-    return f"{op.get_name()}_{out_ea}: [{operands}]"
-
-
-def _log_op(graph: GraphLowering, op, stls, targets) -> None:
-    """DEBUG: the op before and after the shuffles. INFO: the shuffles chosen."""
-    committed = _format_op(graph, op, stls)
-    if not targets:
-        logger.debug("EA shuffle skip %s", committed)
-        return
-    planned = _format_op(graph, op, stls, targets)
-    logger.debug("EA shuffle %s\n  path0: %s", committed, planned)
-    logger.info(
-        "EA shuffle select %s: shuffles=%d path: %s",
-        op.get_name(),
-        len(targets),
-        planned,
-    )
-
-
-def _log_ea_graph(graph: GraphLowering, marked: list) -> None:
-    """DEBUG: every pointwise or reduction op with the shuffles marked on it."""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    targets = {op.get_name(): t for op, t in marked}
-    lines = ["EA shuffle graph:"]
-    for op in graph.operations:
-        if isinstance(op, ComputedBuffer) and isinstance(
-            op.data, (Pointwise, Reduction)
-        ):
-            stls = _operand_stls(graph, op, indirect_info_from_op(op)[0])
-            if stls:
-                name = op.get_name()
-                lines.append("  " + _format_op(graph, op, stls, targets.get(name)))
-    logger.debug("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
 # mark the ops that need a shuffle
 # ---------------------------------------------------------------------------
 def _check_staggered_eas(op, stls: dict[str, SpyreTensorLayout]) -> None:
@@ -337,22 +348,33 @@ def _check_indirect_op(op, stls: dict[str, SpyreTensorLayout]) -> None:
         )
 
 
-def _shuffle_targets(
+def _shuffle_targets_with_reason(
     stls: dict[str, SpyreTensorLayout], out_ea: ElementArrangement
-) -> dict[str, ElementArrangement]:
+) -> tuple[dict[str, ElementArrangement], str]:
     """Operands to shuffle, mapped to the EA to shuffle them to (``out_ea``).
 
     Broadcast operands are ignored: a sparse stick has a single element, so its
     arrangement is unobservable. Only the full operands decide whether the
     arrangements are mixed.
     """
+    if not stls:
+        return {}, "no_operands"
+
     full = {n: s for n, s in stls.items() if not _is_broadcast(s)}
     full_eas = {s.element_arrangement for s in full.values()}
-    if EA.STANDARD not in full_eas or not full_eas & STAGGERED_EAS:
-        return {}
-    if not {out_ea, *full_eas} <= _ALL_EAS:
-        return {}
-    return {n: out_ea for n, s in full.items() if s.element_arrangement != out_ea}
+
+    if not full:
+        return {}, "all_broadcast"
+    if EA.STANDARD not in full_eas or not (full_eas & STAGGERED_EAS):
+        return {}, "no_mixed_ea"
+    if not ({out_ea, *full_eas} <= _ALL_EAS):
+        return {}, "invalid_ea"
+
+    targets = {n: out_ea for n, s in full.items() if s.element_arrangement != out_ea}
+    if not targets:
+        return {}, "already_matched"
+
+    return targets, "mixed_ea_needs_shuffle"
 
 
 def _without_constants(
@@ -384,32 +406,50 @@ def _mark_mismatched_ea(
         stls = _operand_stls(graph, op, indirect_names)
         if out_stl is None:
             continue
+
+        op_name = op.get_name()
+        op_type = type(op.data).__name__
+        out_shape = (
+            list(op.layout.size)
+            if hasattr(op, "layout") and hasattr(op.layout, "size")
+            else (list(op.get_size()) if hasattr(op, "get_size") else "?")
+        )
+        out_ea = out_stl.element_arrangement.name
+
+        in_str = ", ".join(_get_compact_buf_info(graph, n, s) for n, s in stls.items())
+        stls_no_const = _without_constants(graph, stls)
+
         if is_topk(op):
             targets = {
-                n: ElementArrangement.STANDARD
-                for n, s in stls.items()
-                if s.element_arrangement != ElementArrangement.STANDARD
+                n: EA.STANDARD
+                for n, s in stls_no_const.items()
+                if s.element_arrangement != EA.STANDARD
             }
+            reason = "topk_requires_STANDARD" if targets else "topk_already_STANDARD"
+            _log_ea_decision(
+                op_name, op_type, out_shape, out_ea, in_str, targets, reason
+            )
             if targets:
-                _log_op(graph, op, stls, targets)
                 marked.append((op, targets))
             continue
         if len(stls) < 2:
             continue
         if _has_indirect_access(op, indirect_names):
             _check_indirect_op(op, stls)
+            _log_ea_decision(
+                op_name, op_type, out_shape, out_ea, in_str, {}, "indirect_access_skip"
+            )
             continue
-        _check_staggered_eas(op, stls)
-        targets = _shuffle_targets(
-            _without_constants(graph, stls), out_stl.element_arrangement
+        _check_staggered_eas(op, stls_no_const)
+        targets, reason = _shuffle_targets_with_reason(
+            stls_no_const, out_stl.element_arrangement
         )
-        _log_op(graph, op, stls, targets)
+        _log_ea_decision(op_name, op_type, out_shape, out_ea, in_str, targets, reason)
         if not targets:
             continue
         if getattr(op, "loop_info", None) is not None:
             raise Unsupported(
-                f"EA shuffle for {op.get_name()} inside a coarse-tiled loop "
-                f"is not supported"
+                f"EA shuffle for {op_name} inside a coarse-tiled loop is not supported"
             )
         marked.append((op, targets))
     return marked
@@ -425,7 +465,6 @@ def insert_ea_shuffle(graph: GraphLowering) -> None:
     ops that read it.
     """
     marked = _mark_mismatched_ea(graph)
-    _log_ea_graph(graph, marked)
     shuffles: dict[tuple[str, ElementArrangement], str] = {}
     for op, targets in marked:
         for src, ea in targets.items():
@@ -438,4 +477,9 @@ def insert_ea_shuffle(graph: GraphLowering) -> None:
             pass_name=_PASS_NAME,
             reason="read EA-shuffled operands",
         )
-    logger.info("EA shuffle plan: ops=%d shuffles=%d", len(marked), len(shuffles))
+    if shuffles:
+        logger.info(
+            "[EA-SHUFFLE] SUMMARY | ops_marked=%d shuffles_inserted=%d",
+            len(marked),
+            len(shuffles),
+        )
