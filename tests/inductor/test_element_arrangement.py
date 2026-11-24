@@ -1520,6 +1520,7 @@ class TestEAShuffle:
         "flip_then_shuffle_back": lambda x16, y32: (
             ((x16.float() * 2.0) * y32 + x16.float()) + y32
         ),
+        "gemma4_downcast_add_upcast": lambda x16, y32: y32.to(x16.dtype) + y32,
     }
 
     # Reduction ops mixing a staggered operand with a STANDARD one.
@@ -1550,6 +1551,10 @@ class TestEAShuffle:
         (4, 320),
         (4, 448),
         (64, 448),
+        # Gemma 4 hidden state shapes that trigger the downcast-add-upcast shuffle
+        (1, 64, 2816),
+        (1, 1, 2816),
+        (1, 2816),
     ]
     _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS}
 
