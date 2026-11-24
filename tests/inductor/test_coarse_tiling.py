@@ -22,10 +22,9 @@ Covers six areas, each in its own class group:
      TestCoarseTileNested, TestRetileLoadIndexFromStrides,
      TestSqueezedRetileDims, TestIndexVarPrefix, TestConsumerOwnDimSymbol,
      TestRetileLoadIndexWithConsumer)
-  3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
+  3. CountedLoopSchedulerNode,
      _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
-     (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
-      TestSpyreFuseNodesLoopFusion)
+     (TestTiledSymsForSchedNode, TestSpyreFuseNodesLoopFusion)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -69,7 +68,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 from torch_spyre._inductor.propagate_hints import DimHint
@@ -118,12 +117,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
-from torch_spyre._inductor.scheduler import (
-    CountedLoopSchedulerNode,
-    _loop_count,
-    _loop_group_id,
-    build_loop_scheduler_nodes,
-)
+from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
@@ -238,7 +232,7 @@ def _make_op(data, name="op0"):
     op.layout = MagicMock()
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_info
+    del op.loop_member
     return op
 
 
@@ -538,7 +532,7 @@ def _make_scheduler():
 
 
 def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
-    """Return a fake ir.Operation optionally stamped with loop_info.
+    """Return a fake ir.Operation optionally stamped with loop_member.
 
     loop_count must be a list of trip counts (one per nesting level), matching
     the contract stamped by coarse_tile().  A bare Expr is accepted as a
@@ -548,13 +542,13 @@ def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
     op.name = name
     if loop_group_id is not None:
         counts = loop_count if isinstance(loop_count, list) else [loop_count]
-        op.loop_info = LoopInfo(
+        op.loop_member = LoopMember(
             loop_group_id=loop_group_id,
             loop_count=counts,
             loop_tiled_dims=[],
         )
     else:
-        del op.loop_info
+        del op.loop_member
     return op
 
 
@@ -736,13 +730,13 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
 
 
 # ===========================================================================
-# 0. LoopInfo dataclass
+# 0. LoopMember dataclass
 # ===========================================================================
 
 
 class TestLoopInfo(unittest.TestCase):
     def test_fields(self):
-        info = LoopInfo(
+        info = LoopMember(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
@@ -752,7 +746,7 @@ class TestLoopInfo(unittest.TestCase):
         self.assertEqual(info.loop_tiled_dims, [[0]])
 
     def test_nested(self):
-        info = LoopInfo(
+        info = LoopMember(
             loop_group_id=(0, 0),
             loop_count=[Integer(4), Integer(2)],
             loop_tiled_dims=[[0], [1]],
@@ -1285,7 +1279,7 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
         q1 = sympy.Symbol("q1")
         consumer = _make_consumer_with_ranges([4, 256])
-        consumer.loop_info = LoopInfo(
+        consumer.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[2],
             loop_tiled_dims=[[]],
@@ -1450,7 +1444,7 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
             new_size=(Integer(1), Integer(32), Integer(64), Integer(128)),
         )
         consumer = _make_consumer_with_ranges([1, 8, 4, 32, 128])
-        consumer.loop_info = SimpleNamespace(
+        consumer.loop_member = SimpleNamespace(
             loop_group_id=(0,),
             loop_count=[2],
             loop_tiled_dims=[[3]],
@@ -1645,7 +1639,7 @@ class TestPatchConsumersReadsThroughFullBuffer(unittest.TestCase):
 
 
 class TestPatchConsumersLoopInfo(unittest.TestCase):
-    """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
+    """``_patch_consumers`` redirecting a tiled buffer's ``loop_member`` readers.
 
     The tile [1024, 128] (stride [128, 1]) of a [1024, 256] buffer (stride
     [256, 1]) is redirected to the full buffer.
@@ -1667,7 +1661,7 @@ class TestPatchConsumersLoopInfo(unittest.TestCase):
         self._graph_ctx.__exit__(None, None, None)
 
     def _redirected_index(self, consumer, old_name: str) -> sympy.Expr:
-        consumer.loop_info = SimpleNamespace(
+        consumer.loop_member = SimpleNamespace(
             loop_count=[],
             loop_tiled_dims=[],
             loop_tiled_reduction_dims=[],
@@ -2682,7 +2676,7 @@ class TestCoarseTile(unittest.TestCase):
             op.get_operation_name = lambda n=name: n
             op.get_name = lambda n=name: n
             if loop is not None:
-                op.loop_info = SimpleNamespace(loop_group_id=loop)
+                op.loop_member = SimpleNamespace(loop_group_id=loop)
             return op
 
         # Loop is indices 1..4. ``local`` lives [1, 3); ``v`` is first read at 3,
@@ -2729,7 +2723,7 @@ class TestCoarseTile(unittest.TestCase):
         """A loop-body constant hoisted to the graph head is not in the loop.
 
         ``dedup_and_promote_constants`` moves every ``SpyreConstantFallback`` to
-        the front of ``graph.operations`` but leaves its ``loop_info``. The
+        the front of ``graph.operations`` but leaves its ``loop_member``. The
         scheduler only groups SchedulerNodes into counted loops, so the extern
         kernel runs once before the loop. Counting it as a loop member would
         start the loop at index 0 and widen the start of every value born before
@@ -2763,11 +2757,11 @@ class TestCoarseTile(unittest.TestCase):
             op = SimpleNamespace() if cls is None else cls.__new__(cls)
             op.get_read_writes = lambda rw=rw: rw
             if loop is not None:
-                op.loop_info = SimpleNamespace(loop_group_id=loop)
+                op.loop_member = SimpleNamespace(loop_group_id=loop)
             return op
 
         # The loop is really indices 3..4; ``const`` at 0 still carries its
-        # loop-body ``loop_info``. ``child`` is born before the loop, in place
+        # loop-body ``loop_member``. ``child`` is born before the loop, in place
         # over ``parent``, and is read inside the loop.
         operations = [
             _op("const", [], ["const"], loop=(0,), cls=_HoistedConstant),
@@ -2825,167 +2819,6 @@ class TestCoarseTileNested(unittest.TestCase):
         op = _make_hinted_op(data, "op0", hints=((1, 0),))
         with self.assertRaisesRegex(Unsupported, "not divisible"):
             _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
-
-
-# ===========================================================================
-# 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
-# ===========================================================================
-
-
-class TestHelpers(unittest.TestCase):
-    def test_loop_group_id_present(self):
-        sched = _make_scheduler()
-        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(4))
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_group_id(snode), (0,))
-
-    def test_loop_group_id_absent(self):
-        sched = _make_scheduler()
-        op = _make_ir_op()
-        snode = _make_snode(sched, op)
-        self.assertIsNone(_loop_group_id(snode))
-
-    def test_loop_count(self):
-        sched = _make_scheduler()
-        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(8))
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode, depth=0), Integer(8))
-
-    def test_loop_count_symbolic(self):
-        sched = _make_scheduler()
-        s = Symbol("s0")
-        op = _make_ir_op(loop_group_id=(0,), loop_count=s)
-        snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode, depth=0), s)
-
-
-class TestBuildLoopSchedulerNodes(unittest.TestCase):
-    def _run(self, nodes):
-        created = []
-
-        def fake_create(snodes, loop_count):
-            node = MagicMock(spec=CountedLoopSchedulerNode)
-            node.snodes = snodes
-            node.loop_count = loop_count
-            node.get_nodes.return_value = snodes
-            node.get_name.return_value = "_".join(n.get_name() for n in snodes)
-            node.scheduler = snodes[0].scheduler
-            created.append(node)
-            return node
-
-        with patch.object(
-            CountedLoopSchedulerNode, "create", staticmethod(fake_create)
-        ):
-            result = build_loop_scheduler_nodes(nodes)
-        return result, created
-
-    def test_passthrough_no_loop_group(self):
-        sched = _make_scheduler()
-        nodes = [
-            _make_snode(sched, _make_ir_op(), "a"),
-            _make_snode(sched, _make_ir_op(), "b"),
-        ]
-        result, created = self._run(nodes)
-        self.assertEqual(result, nodes)
-        self.assertEqual(created, [])
-
-    def test_single_group_two_nodes(self):
-        sched = _make_scheduler()
-        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "b")
-        result, created = self._run([n1, n2])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(len(created), 1)
-        self.assertEqual(created[0].loop_count, Integer(4))
-        self.assertIn(n1, created[0].snodes)
-        self.assertIn(n2, created[0].snodes)
-
-    def test_non_group_nodes_pass_through_around_group(self):
-        sched = _make_scheduler()
-        before = _make_snode(sched, _make_ir_op(), "before")
-        g1 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g1")
-        g2 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g2")
-        after = _make_snode(sched, _make_ir_op(), "after")
-        result, created = self._run([before, g1, g2, after])
-        self.assertEqual(len(result), 3)
-        self.assertIs(result[0], before)
-        self.assertIsInstance(result[1], MagicMock)
-        self.assertIs(result[2], after)
-        self.assertEqual(created[0].loop_count, Integer(2))
-
-    def test_dependency_of_later_group_member_precedes_whole_group(self):
-        """A preheader copy inserted before a later consumer stays outside.
-
-        Coarse tiling may place a loop-invariant copy between two flat loop
-        members when only the later member reads it. Scheduler regrouping must
-        move that dependency before the counted-loop unit, not split the unit.
-        """
-        sched = _make_scheduler()
-        first = _make_snode(sched, _make_ir_op((0,), Integer(4)), "first")
-        copy = _make_snode(sched, _make_ir_op(), "copy")
-        consumer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "consumer")
-
-        for node, name in ((first, "first"), (copy, "copy"), (consumer, "consumer")):
-            node.get_buffer_names.return_value = {name}
-        consumer.unmet_dependencies = OrderedSet(
-            [inductor_deps.MemoryDep("copy", Integer(0), (), ())]
-        )
-
-        result, created = self._run([first, copy, consumer])
-
-        self.assertEqual(result, [copy, created[0]])
-        self.assertEqual(created[0].snodes, [first, consumer])
-
-    def test_two_separate_groups(self):
-        sched = _make_scheduler()
-        g0a = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0a")
-        g0b = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0b")
-        g1a = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1a")
-        g1b = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1b")
-        result, created = self._run([g0a, g0b, g1a, g1b])
-        self.assertEqual(len(result), 2)
-        self.assertEqual(len(created), 2)
-        self.assertEqual(created[0].loop_count, Integer(4))
-        self.assertEqual(created[1].loop_count, Integer(8))
-
-    def test_nested_group(self):
-        sched = _make_scheduler()
-        outer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "outer")
-        inner1 = _make_snode(
-            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner1"
-        )
-        inner2 = _make_snode(
-            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner2"
-        )
-        result, created = self._run([outer, inner1, inner2])
-        self.assertEqual(len(result), 1)
-        outer_loop = result[0]
-        self.assertEqual(len(outer_loop.snodes), 2)
-        inner_loop = outer_loop.snodes[1]
-        self.assertEqual(inner_loop.loop_count, Integer(2))
-        self.assertIn(inner1, inner_loop.snodes)
-        self.assertIn(inner2, inner_loop.snodes)
-
-    def test_inconsistent_loop_count_raises(self):
-        sched = _make_scheduler()
-        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), Integer(8)), "b")
-        with self.assertRaises(AssertionError):
-            self._run([n1, n2])
-
-    def test_empty_list(self):
-        result, created = self._run([])
-        self.assertEqual(result, [])
-        self.assertEqual(created, [])
-
-    def test_symbolic_loop_count(self):
-        sched = _make_scheduler()
-        s = Symbol("K")
-        n1 = _make_snode(sched, _make_ir_op((0,), s), "a")
-        n2 = _make_snode(sched, _make_ir_op((0,), s), "b")
-        result, created = self._run([n1, n2])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(created[0].loop_count, s)
 
 
 # ===========================================================================
@@ -4751,7 +4584,7 @@ def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
     op.layout = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = LoopInfo(
+    op.loop_member = LoopMember(
         loop_group_id=loop_group_id,
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
@@ -4773,7 +4606,7 @@ def _make_consumer_op(name, reads_buf):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_info
+    del op.loop_member
     op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
     op.origins = OrderedSet()
     return op
@@ -4797,7 +4630,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = LoopInfo(
+    op.loop_member = LoopMember(
         loop_group_id=loop_group_id,
         loop_count=[Integer(4)],
         loop_tiled_dims=[[0]],
@@ -4994,9 +4827,9 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
         dep = MemoryDep(name="weight", index=index(u0), var_names=var_names, size=size)
-        info = LoopInfo(loop_group_id=(0,), loop_count=[trips], loop_tiled_dims=[[]])
+        info = LoopMember(loop_group_id=(0,), loop_count=[trips], loop_tiled_dims=[[]])
         op = SimpleNamespace(
-            loop_info=info,
+            loop_member=info,
             dim_hints=[
                 DimHint(
                     dim_names=[],
@@ -5205,7 +5038,7 @@ def _make_full_buffer_read_fixture():
     )
     tiled_op.operation_name = "tiled_op0"
     tiled_op.origins = OrderedSet()
-    tiled_op.loop_info = LoopInfo(
+    tiled_op.loop_member = LoopMember(
         loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
     )
     V.graph.name_to_buffer["tiled_op0"] = tiled_op
@@ -5433,7 +5266,7 @@ def _make_tiled_reduction_op(
     op.get_layout.return_value = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_info = LoopInfo(
+    op.loop_member = LoopMember(
         loop_group_id=loop_group_id,
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
@@ -5507,9 +5340,9 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_count=[Integer(2), Integer(4)],
             loop_tiled_dims=[[0], []],
         )
-        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        op.loop_member.loop_tiled_reduction_dims = [[], [0]]
         _validate_planned_reduction_tiling(
-            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+            op, op.loop_member.loop_tiled_dims, op.loop_member.loop_tiled_reduction_dims
         )  # must not raise
 
     def test_reduction_output_dim_tiled_ok(self):
@@ -5529,7 +5362,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
         )
         # output-dim-only tiling should not raise
         _validate_planned_reduction_tiling(
-            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+            op, op.loop_member.loop_tiled_dims, op.loop_member.loop_tiled_reduction_dims
         )
 
 
@@ -5537,7 +5370,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
     """Tests for _validate_planned_reduction_tiling: raising on unsupported
     cases, passing on supported ones. Called from build_loop_tiling_plan
     (planning time) with the op's own per-level tiled-dims lists, before any
-    loop_info is stamped."""
+    loop_member is stamped."""
 
     def _make_op(self, loop_tiled_dims, loop_tiled_reduction_dims):
         from torch._inductor.ir import ComputedBuffer, Reduction
@@ -5549,7 +5382,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = LoopInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=loop_tiled_dims,
@@ -6352,12 +6185,12 @@ class TestSymbolKind(unittest.TestCase):
 
 
 class TestLoopInfoReductionField(unittest.TestCase):
-    """LoopInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
+    """LoopMember carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
 
     def test_field_present_and_defaults_to_empty(self):
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
 
-        info = LoopInfo(
+        info = LoopMember(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
@@ -6365,9 +6198,9 @@ class TestLoopInfoReductionField(unittest.TestCase):
         self.assertEqual(info.loop_tiled_reduction_dims, [])
 
     def test_field_can_be_set(self):
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
 
-        info = LoopInfo(
+        info = LoopMember(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[]],
@@ -6377,9 +6210,9 @@ class TestLoopInfoReductionField(unittest.TestCase):
 
     def test_nested_parallel_shape(self):
         """For a two-level nest, both fields have two sub-lists."""
-        from torch_spyre._inductor.loop_info import LoopInfo
+        from torch_spyre._inductor.loop_node import LoopMember
 
-        info = LoopInfo(
+        info = LoopMember(
             loop_group_id=(0, 0),
             loop_count=[Integer(2), Integer(4)],
             loop_tiled_dims=[[0], []],
@@ -6698,7 +6531,7 @@ class TestReductionIdentityValues(unittest.TestCase):
 
 
 class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
-    """Unit test for loop_info.py's _SPYRE_METADATA_ATTRS coverage."""
+    """Unit test for pass_utils' _SPYRE_METADATA_ATTRS coverage."""
 
     def test_copy_op_metadata_no_longer_carries_old_attr_name(self):
         src = SimpleNamespace()
@@ -8420,7 +8253,7 @@ class TestDerivedBases(unittest.TestCase):
     def test_group_idx_offset_avoids_existing_loop_group_ids(self):
         op = _make_op(_make_pointwise([Integer(64)]), "op0")
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 0)
-        op.loop_info = LoopInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(3,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
         )
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
@@ -8471,8 +8304,8 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         ]
         self.assertEqual(hint_ids, [[0], [1]])
         self.assertNotEqual(
-            tuple(ops[0].loop_info.loop_group_id),
-            tuple(ops[2].loop_info.loop_group_id),
+            tuple(ops[0].loop_member.loop_group_id),
+            tuple(ops[2].loop_member.loop_group_id),
         )
         # op1 was never in a group, so it is untiled and unhinted.
         self.assertEqual(getattr(ops[1], "dim_hints", []), [])
@@ -8507,15 +8340,15 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
-            self.assertFalse(hasattr(op, "loop_info"))
+            self.assertFalse(hasattr(op, "loop_member"))
             self.assertEqual(op.data.ranges[0], Integer(64))
 
     def test_a_single_level_spec_divides_the_range_and_keeps_its_symbol(self):
         got = self._bare([256], "op0")
         apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
         self.assertEqual(got.data.ranges[0], Integer(64))
-        self.assertEqual(tuple(got.loop_info.loop_group_id), (0,))
-        self.assertEqual(list(got.loop_info.loop_count), [Integer(4)])
+        self.assertEqual(tuple(got.loop_member.loop_group_id), (0,))
+        self.assertEqual(list(got.loop_member.loop_count), [Integer(4)])
         # The tile still iterates dim 0, so its one symbol is the one it had.
         c0 = sympy.Symbol("c0")
         self.assertEqual(got.symbols_on_tile, {c0: c0})
@@ -8587,9 +8420,9 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
 
     def _stamped(self, name):
         """An op stamped the way ``_stamp_direct_loop_info`` stamps a loop body
-        op: ``loop_info`` plus a DimHint carrying the trip count."""
+        op: ``loop_member`` plus a DimHint carrying the trip count."""
         op = self._bare(name)
-        op.loop_info = LoopInfo(
+        op.loop_member = LoopMember(
             loop_group_id=(0,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
         )
         op.dim_hints = [
@@ -8605,7 +8438,7 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
 
     def _state(self, ops):
         return [
-            (list(op.dim_hints), getattr(op, "loop_info", None), list(op.data.ranges))
+            (list(op.dim_hints), getattr(op, "loop_member", None), list(op.data.ranges))
             for op in ops
         ]
 
@@ -8619,7 +8452,7 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
-        """op1 has no ``loop_info``; only its position puts it in the loop."""
+        """op1 has no ``loop_member``; only its position puts it in the loop."""
         ops = [self._stamped("op0"), self._bare("op1"), self._stamped("op2")]
         before = self._state(ops)
         with self.assertRaisesRegex(
@@ -8632,8 +8465,8 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
         apply_tilings({"op1": self._SPEC}, _graph(ops))
-        self.assertTrue(ops[1].loop_info.strict_loop_vars)
-        self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
+        self.assertTrue(ops[1].loop_member.strict_loop_vars)
+        self.assertEqual(ops[1].loop_member.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))
         self.assertEqual(self._state(ops[:1]), loop_before)
 
@@ -8824,7 +8657,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         graph.get_buffer.return_value = storage_op
         buffer = SimpleNamespace(name="buf2", address=address, lx_view=object())
         clone = SimpleNamespace(
-            loop_info=object(),
+            loop_member=object(),
             _loop_carry_record=object(),
         )
         if with_plan:
@@ -8867,7 +8700,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         )
         # The real clearing helper ran; the clone loses exactly the
         # loop/carry metadata.
-        self.assertFalse(hasattr(result.clone, "loop_info"))
+        self.assertFalse(hasattr(result.clone, "loop_member"))
         self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
         result.editor.change_graph_output.assert_called_once_with(
             result.storage_op, result.clone
@@ -8881,7 +8714,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             result.storage_op, [result.update_op], input=False
         )
         # The ordinary clone path is not touched by the drain-only clearing.
-        self.assertTrue(hasattr(result.clone, "loop_info"))
+        self.assertTrue(hasattr(result.clone, "loop_member"))
         self.assertTrue(hasattr(result.clone, "_loop_carry_record"))
 
     def test_push_emits_no_copy_when_solver_chose_hbm(self):
@@ -8890,7 +8723,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         result.editor.change_graph_output.assert_not_called()
         # Nothing touched the clone: the HBM fallback emits no copy and no
         # metadata rewrite.
-        self.assertTrue(hasattr(result.clone, "loop_info"))
+        self.assertTrue(hasattr(result.clone, "loop_member"))
         self.assertTrue(hasattr(result.clone, "_loop_carry_record"))
 
     def test_second_output_clone_in_same_push_keeps_the_drain_anchor(self):
@@ -8933,7 +8766,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             buffer,
         ]
         clone = SimpleNamespace(
-            loop_info=object(),
+            loop_member=object(),
             _loop_carry_record=object(),
         )
         with (
@@ -9570,7 +9403,7 @@ class _LoopOp:
         self.name = name
         self.operation_name = name
         if path is not None:
-            self.loop_info = SimpleNamespace(loop_group_id=path)
+            self.loop_member = SimpleNamespace(loop_group_id=path)
         self._mutates = list(mutates)
 
     def get_name(self):
@@ -9597,7 +9430,7 @@ def _extern_op(name, path=None):
     op = _Extern()
     object.__setattr__(op, "name", name)
     if path is not None:
-        object.__setattr__(op, "loop_info", SimpleNamespace(loop_group_id=path))
+        object.__setattr__(op, "loop_member", SimpleNamespace(loop_group_id=path))
     return op
 
 
@@ -9632,7 +9465,7 @@ class TestHoistedInputClone(unittest.TestCase):
         self.assertIsNone(counted_loop_entry(ops, pre))
 
     def test_extern_kernel_with_loop_info_is_not_a_member(self):
-        # Same rule as counted_loop_lifetime_overrides / scheduler._loop_group_id.
+        # Same rule as counted_loop_lifetime_overrides: an extern kernel runs once.
         from torch_spyre._inductor.scratchpad.utils import (
             counted_loop_entry,
             counted_loop_group_path,
@@ -9646,7 +9479,7 @@ class TestHoistedInputClone(unittest.TestCase):
     def test_the_allocator_path_matches_the_scratchpad_path(self):
         # Both are now one call to loop_facts.counted_loop_path, so they cannot
         # drift apart. What this pins is the DEFAULT they share: an extern kernel
-        # that keeps its loop_info (a hoisted constant) is not in the loop.
+        # that keeps its loop_member (a hoisted constant) is not in the loop.
         # Nothing else pins _access_group_path (the one other test patches it out).
         from torch_spyre._inductor.scratchpad.allocator import _access_group_path
         from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
@@ -9768,7 +9601,7 @@ class TestHoistedInputClone(unittest.TestCase):
             lx_view=result.lx_view,
             lower_before=None,
         )
-        for attr in ("loop_info", "_loop_carry_record"):
+        for attr in ("loop_member", "_loop_carry_record"):
             self.assertTrue(hasattr(result.clone, attr), attr)
         result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
 
@@ -9787,7 +9620,7 @@ class TestHoistedInputClone(unittest.TestCase):
         lx_view = object()
         buffer = SimpleNamespace(name="x", address=0x4000, lx_view=lx_view)
         clone = SimpleNamespace(
-            loop_info=object(),
+            loop_member=object(),
             _loop_carry_record=object(),
         )
         with (
@@ -9823,7 +9656,7 @@ class TestHoistedInputClone(unittest.TestCase):
             lx_view=result.lx_view,
             lower_before=head,
         )
-        self.assertFalse(hasattr(result.clone, "loop_info"))
+        self.assertFalse(hasattr(result.clone, "loop_member"))
         self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
         result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
 
@@ -9838,7 +9671,7 @@ class TestHoistedInputClone(unittest.TestCase):
             lower_before=None,
         )
         # No hoist, no metadata change: the clone keeps whatever it copied.
-        self.assertTrue(hasattr(result.clone, "loop_info"))
+        self.assertTrue(hasattr(result.clone, "loop_member"))
 
     def test_no_hoist_when_the_last_reader_can_take_the_slot_in_place(self):
         """A hoisted clone's LX slot is never handed off in place.
