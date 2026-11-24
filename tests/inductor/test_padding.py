@@ -2425,10 +2425,17 @@ class TestRecordedPadding(unittest.TestCase):
         w = torch.randn(16, 1, 3, dtype=torch.float16)
         # 16 channels in a 64-wide stick: 48 padding elements per stick.
         x_dev = x.to(
-            device_layout=SpyreTensorLayout([64, 1, 1, 64], [1, -1, 1024, 64], dtype)
+            device_layout=SpyreTensorLayout(
+                [64, 1, 1, 64],
+                [1, -1, 1024, 64],
+                dtype,
+                {(0,): 16, (1,): 0, (2, 3): 64},
+            )
         )
         w_dev = w.to(
-            device_layout=SpyreTensorLayout([3, 1, 1, 64], [1, -1, 3, 3], dtype)
+            device_layout=SpyreTensorLayout(
+                [3, 1, 1, 64], [1, -1, 3, 3], dtype, {(0,): 3, (1,): 0, (2, 3): 16}
+            )
         )
         # An in-place compiled graph leaves the padding unrecorded.
         for t in (x_dev, w_dev):
