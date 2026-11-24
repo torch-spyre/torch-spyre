@@ -168,6 +168,13 @@ causing silent wrong-code bugs (see issue #2797). Canonical examples of the
 correct pattern: `NameSwapHandler` in `insert_restickify.py`,
 `_SplitOpsHandler`/`_IntermediateOpHandler` in `split_multi_ops.py`.
 
+**Loop questions: ask the program model, never positions.**
+The flat order (`graph.operations` in a pass, `all_ops`) is program order, not
+execution count or time, so do not read how often an op runs or when a buffer
+lives off its index. Ask `LoopProgram` in `torch_spyre/_inductor/loop_queries.py`
+(`executions`, `shared_loops`, `span`, `uses`, `live_interval`). Ask
+`loop_facts` for what a loop tiles and how an access advances.
+
 ## Skills
 
 Task-specific guidance is available in `.claude/skills/`. These cover:

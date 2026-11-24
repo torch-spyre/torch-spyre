@@ -303,6 +303,11 @@ class OpsView(MutableSequence):
     pass that edits the graph says where an op goes with ``insert_before`` /
     ``insert_after`` / ``move_before`` / ``move_after`` / ``remove_op`` /
     ``replace_op``.
+
+    The order is program order, not execution count or time: an op's position
+    says nothing about how often it runs. Ask ``loop_queries.LoopProgram`` for
+    that, for shared loops, a loop's span and a buffer's uses and lifetime; ask
+    ``loop_facts`` for what a loop tiles and how an access advances.
     """
 
     def __init__(self, real: list[ir.Operation]) -> None:

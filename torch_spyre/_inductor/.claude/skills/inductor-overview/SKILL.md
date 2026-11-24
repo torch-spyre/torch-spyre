@@ -83,6 +83,16 @@ they don't. Any new pass that swaps a buffer name/identity under a
 consumer's `inner_fn` should check whether this applies — a bare rename
 is only safe when the swap is addressing-equivalent.
 
+## Asking loop questions
+
+The flat order (`graph.operations` in a pass, `all_ops`) is program order, not
+execution count or time. Do not derive how often an op runs, which loops two ops
+share, or a buffer's lifetime from positions in it. Ask
+`loop_queries.LoopProgram(graph)` (`executions`, `shared_loops`,
+`same_iteration`, `span`, `uses`, `runtime_reads`, `live_interval`). Ask
+`loop_facts` for what a loop tiles and how an access advances
+(`enclosing_loops`, `read_advance`).
+
 ## Test execution conventions
 
 Never run Spyre tests in parallel (the device is exclusive to one
