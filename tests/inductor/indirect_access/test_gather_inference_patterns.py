@@ -83,11 +83,6 @@ _TOPK_K_PER_CORE = rejection(
     "topk(k=16): no divisor within 1 cores gives k_per_core <= 4.",
     r"no divisor within 1 cores gives k_per_core",
 )
-_GATHER_EXPANDED_MISMATCH = (
-    4840,
-    "compile gather along dim>=1 with expanded index produces numerical mismatch vs CPU.",
-    r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
-)
 _INDEX_PUT_IMPL_EAGER = rejection(
     692,
     "aten::_index_put_impl_ is not registered on Spyre.",
@@ -315,10 +310,7 @@ class TestGatherInferencePatternsEagerCompile:
     def test_vllm_logit_extraction(self, execution_mode):
         """Decode-step per-request last-token gather: logits[b, last_pos[b], :] via torch.gather."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4328
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4840
-        _xfail_existing(
-            execution_mode, eager=_GATHER_OUT_EAGER, compiled=_GATHER_EXPANDED_MISMATCH
-        )
+        _xfail_existing(execution_mode, eager=_GATHER_OUT_EAGER)
         logits = cached_randn(
             (12, 4, 512), differentiation="vllm05", dtype=torch.float16
         )
