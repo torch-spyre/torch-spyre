@@ -144,7 +144,10 @@ UNIT = UnitIndex()
 
 
 def _read_only(values: Any, index: Index) -> np.ndarray:
-    array = np.array(values, dtype=float)
+    """values as a read-only list of index's size: bool when they are bool, as a
+    condition's are, and float otherwise."""
+    array = np.asarray(values)
+    array = np.array(array, dtype=bool if array.dtype == bool else float)
     if array.shape != (index.size,):
         raise ValueError(
             f"a list of shape {array.shape} on an index of size {index.size}"
@@ -184,7 +187,8 @@ class AbstractRealization(ABC):
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class TableRealization(AbstractRealization):
-    """values[index]: a read-only list, one value per entry of index."""
+    """values[index]: a read-only list, one value per entry of index: bool for a
+    condition, float for any other node."""
 
     values: np.ndarray
     index: Index
@@ -271,47 +275,20 @@ class SumRealization(SymbolicRealization):
 # --------------------------------------------------------------------- a node's list
 
 
-# The form of an operand in its node's function: as it is (None), a condition
-# (CONDITION), or the base of a Mul's factor with a negative rational exponent, which
-# the Mul divides by (the exponent, a sympy.Rational).
-CONDITION = "condition"
-Form: TypeAlias = "str | sympy.Rational | None"
-
-
-def _evaluate(
-    expr: sympy.Basic, forms: tuple[Form, ...], arguments: Sequence[np.ndarray]
-) -> Any:
-    """expr's list from arguments, its operands' lists in the forms they take, by the
-    numpy core's function of its class. A condition is compared with 0, and a Mul
-    divides its other factors' product by the bases of the factors it divides by, as
-    lambdify prints a quotient: 98/a, where 98*(1/a) floors one low at a = 49."""
-    plain = [
-        argument != 0 if form == CONDITION else argument
-        for argument, form in zip(arguments, forms)
-        if form is None or form == CONDITION
-    ]
-    divisors = [
-        argument ** float(-form)  # type: ignore[operator]
-        for argument, form in zip(arguments, forms)
-        if not (form is None or form == CONDITION)
-    ]
-    value = numpy_eval(expr, plain)
-    return value / math.prod(divisors) if divisors else value
-
-
 def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.ndarray:
-    """expr's list of count values, from compute(). A RecursionError is left to
-    TableLowering.print."""
+    """expr's list of count values, from compute(): bool for a condition, float
+    otherwise. A RecursionError is left to TableLowering.print."""
+    dtype = bool if _is_condition(expr) else float
     with np.errstate(all="ignore"):
         try:
-            result = np.asarray(compute(), dtype=float)
+            result = np.asarray(compute(), dtype=dtype)
         except RecursionError:
             raise
         except Exception as exc:
             raise TableLoweringError(
                 expr, f"no value ({type(exc).__name__}: {exc})"
             ) from exc
-    return np.broadcast_to(result, (count,)).astype(float)
+    return np.broadcast_to(result, (count,)).astype(dtype)
 
 
 def _combined(positions: Sequence[Index]) -> Index:
@@ -344,12 +321,11 @@ def _on(
 # ---------------------------------------------------------------------- the printer
 
 
-def _divides(expr: sympy.Basic, factor: sympy.Basic) -> bool:
-    """Whether factor is a factor of the Mul expr with a negative rational exponent,
-    which lambdify prints as a division."""
+def _divides(factor: sympy.Basic) -> bool:
+    """Whether factor, a factor of a Mul, has a negative rational exponent, which
+    lambdify prints as a division."""
     return (
-        isinstance(expr, sympy.Mul)
-        and isinstance(factor, sympy.Pow)
+        isinstance(factor, sympy.Pow)
         and bool(factor.exp.is_Rational)
         and bool(factor.exp.is_negative)
     )
@@ -467,14 +443,39 @@ class TableLowering(Printer):
         return SumRealization(constant, terms, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A constant times one operand is the operand scaled in float. Any other
-        product is declined, and so is a quotient, which _operation divides."""
+        """A quotient is one table (_quotient). A constant times one operand is the
+        operand scaled in float. Any other product is declined."""
+        if any(_divides(factor) for factor in expr.args):
+            return self._quotient(expr)
         constants = [factor for factor in expr.args if not factor.free_symbols]
         operands = [factor for factor in expr.args if factor.free_symbols]
-        if len(operands) != 1 or _divides(expr, operands[0]):
+        if len(operands) != 1:
             return None
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
         return self._print(operands[0]).scaled(coefficient)
+
+    def _quotient(self, expr: sympy.Mul) -> TableRealization:
+        """expr as one table: the product of its other factors divided by the product
+        of the bases of its factors with a negative rational exponent, each raised to
+        minus that exponent, as lambdify prints a quotient: 98/a, where 98*(1/a)
+        floors one low at a = 49. A factor it divides by is still printed, refusing
+        its own value that is not finite."""
+        index, grid = self._position(expr)
+        numerator: list[np.ndarray] = []
+        denominator: list[tuple[np.ndarray, float]] = []
+        for factor in expr.args:
+            if _divides(factor):
+                self._table(factor)
+                base, exp = factor.args
+                denominator.append((_on(self._table(base), index, grid), float(-exp)))
+            else:
+                numerator.append(_on(self._table(factor), index, grid))
+        values = _values(
+            expr,
+            index.size,
+            lambda: math.prod(numerator) / math.prod(b**e for b, e in denominator),
+        )
+        return TableRealization(values=values, index=index)
 
     def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Over its arms' values and conditions: an ExprCondPair is not printed."""
@@ -493,6 +494,14 @@ class TableLowering(Printer):
         so nothing under a refused node is evaluated."""
         if not operands:
             return TableRealization(values=[_constant(expr)], index=UNIT)
+        index, grid = self._position(expr)
+        arguments = [_on(self._table(operand), index, grid) for operand in operands]
+        values = _values(expr, index.size, lambda: numpy_eval(expr, arguments))
+        return TableRealization(values=values, index=index)
+
+    def _position(self, expr: sympy.Basic) -> tuple[Index, dict[Index, np.ndarray]]:
+        """expr's position over its inputs, in symbol order, and the grid of their
+        coordinates. Refuses a table past the cap before any operand is printed."""
         positions = self._inputs(expr) or [UNIT]
         entries = math.prod(position.size for position in positions)
         if entries > self.cap:
@@ -501,22 +510,7 @@ class TableLowering(Printer):
                 f"one table over its inputs would hold {entries} entries, past the "
                 f"cap of {self.cap}",
             )
-        index = _combined(positions)
-        grid = _grid(positions)
-        arguments = []
-        forms: list[Form] = []
-        for operand in operands:
-            table = self._table(operand)
-            form: Form = CONDITION if _is_condition(operand) else None
-            if _divides(expr, operand):
-                base, form = operand.base, operand.exp  # type: ignore[attr-defined]
-                table = self._table(base)
-            arguments.append(_on(table, index, grid))
-            forms.append(form)
-        values = _values(
-            expr, index.size, lambda: _evaluate(expr, tuple(forms), arguments)
-        )
-        return TableRealization(values=values, index=index)
+        return _combined(positions), _grid(positions)
 
     def _inputs(self, expr: sympy.Basic) -> list[Index]:
         """The positions of expr's inputs, in the order of its symbols."""
@@ -532,10 +526,10 @@ class TableLowering(Printer):
             raise TableLoweringError(expr, exc.reason) from exc
 
 
-def _constant(expr: sympy.Basic) -> float:
-    """The value of a node with no operand: a number, true or false."""
+def _constant(expr: sympy.Basic) -> float | bool:
+    """The value of a node with no operand: a number, or true or false as a bool."""
     if expr is sympy.true or expr is sympy.false:
-        return float(bool(expr))
+        return bool(expr)
     try:
         return float(expr)  # type: ignore[arg-type]
     except TypeError as exc:
