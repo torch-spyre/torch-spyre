@@ -44,6 +44,49 @@
         numIter: 1500,
       },
     },
+    lowering: {
+      label: "Lowering Paths",
+      description:
+        "How each op reaches the device: decompositions, Spyre " +
+        "lowerings, the Inductor ops they emit, and the SDSC opfuncs those " +
+        "map to, plus the FX passes that rewrite an op. Select an op to " +
+        "trace its path; dashed edges are inferred by name.",
+      types: [
+        "op",
+        "decomposition",
+        "lowering",
+        "inductor_op",
+        "opfunc",
+        "pass_function",
+      ],
+      relationships: [
+        "has_overload",
+        "decomposed_by",
+        "decomposes_into",
+        "lowered_by",
+        "delegates_to",
+        "emits",
+        "inductor_default",
+        "maps_to",
+        "rewritten_by",
+      ],
+      // Only nodes on some path; selecting a node traces what it reaches.
+      connectedOnly: true,
+      traceDownstream: true,
+      layout: {
+        name: "cose",
+        animate: false,
+        nodeRepulsion: function () {
+          return 7000;
+        },
+        idealEdgeLength: function () {
+          return 60;
+        },
+        nodeOverlap: 20,
+        gravity: 0.5,
+        numIter: 1500,
+      },
+    },
     compiler: {
       label: "Compiler Passes",
       description:
@@ -130,6 +173,8 @@
     class: { color: "#8e44ad", label: "Classes" },
     dataclass: { color: "#d35400", label: "Dataclasses" },
     env_var: { color: "#16a085", label: "Env Variables" },
+    inductor_op: { color: "#5d6d7e", label: "Inductor Ops" },
+    opfunc: { color: "#2c3e50", label: "SDSC OpFuncs" },
   };
 
   // -------------------------------------------------------------------------
@@ -267,6 +312,44 @@
         },
       },
       {
+        selector: "edge[relationship = 'emits'], edge[relationship = 'maps_to']",
+        style: {
+          "line-color": "#5d6d7e",
+          "target-arrow-color": "#5d6d7e",
+        },
+      },
+      {
+        selector: "edge[relationship = 'delegates_to']",
+        style: {
+          "line-color": "#27ae60",
+          "target-arrow-color": "#27ae60",
+        },
+      },
+      {
+        selector: "edge[relationship = 'has_overload']",
+        style: { width: 1, "line-color": "#ddd", "target-arrow-shape": "none" },
+      },
+      {
+        selector: "edge[relationship = 'rewritten_by']",
+        style: {
+          "line-style": "dotted",
+          "line-color": "#95a5a6",
+          "target-arrow-color": "#95a5a6",
+        },
+      },
+      {
+        selector: "edge[?inferred]",
+        style: { "line-style": "dashed" },
+      },
+      {
+        selector: "node.on-path",
+        style: { "border-width": 3, "border-color": "#2c3e50" },
+      },
+      {
+        selector: "edge.on-path",
+        style: { width: 2.5, "line-color": "#2c3e50", "target-arrow-color": "#2c3e50" },
+      },
+      {
         selector: "node.highlighted",
         style: {
           "border-width": 3,
@@ -347,6 +430,17 @@
       return relSet[e.relationship] && nodeIds[e.source] && nodeIds[e.target];
     });
 
+    if (view.connectedOnly) {
+      var linked = {};
+      edges.forEach(function (e) {
+        linked[e.source] = true;
+        linked[e.target] = true;
+      });
+      nodes = nodes.filter(function (n) {
+        return linked[n.id];
+      });
+    }
+
     return { nodes: nodes, edges: edges };
   }
 
@@ -387,6 +481,7 @@
           source: e.source,
           target: e.target,
           relationship: e.relationship,
+          inferred: !!e.inferred,
         },
       });
     });
@@ -535,6 +630,21 @@
         html += " <em>+" + (neighbors.length - 15) + " more</em>";
       }
     }
+    var view = VIEWS[activeView];
+    if (view && view.traceDownstream) {
+      var reached = activeCy
+        .getElementById(data.id)
+        .successors("node")
+        .filter(function (n) {
+          return n.data("type") === "opfunc";
+        })
+        .map(function (n) {
+          return escapeHtml(n.data("label"));
+        });
+      html +=
+        "<br><strong>Reaches SDSC opfuncs:</strong> " +
+        (reached.length ? reached.join(", ") : "<em>none found</em>");
+    }
     info.innerHTML = html;
   }
 
@@ -551,11 +661,22 @@
     if (!activeCy) return;
     var node = activeCy.getElementById(nodeId);
     if (!node || node.empty()) return;
-    activeCy.elements().removeClass("selected-node neighbor");
+    activeCy.elements().removeClass("selected-node neighbor on-path");
     node.addClass("selected-node");
     node.neighborhood("node").addClass("neighbor");
-    if (focusMode) applyFocus(node);
-    if (!opts || opts.center !== false) {
+    var view = VIEWS[activeView];
+    var tracing = view && view.traceDownstream;
+    if (tracing) {
+      tracePath(node);
+    } else if (focusMode) {
+      applyFocus(node);
+    }
+    if (tracing) {
+      activeCy.animate({
+        fit: { eles: node.successors().union(node), padding: 80 },
+        duration: 250,
+      });
+    } else if (!opts || opts.center !== false) {
       activeCy.animate({ center: { eles: node }, duration: 250 });
     }
     showNodeInfo(node.data());
@@ -571,6 +692,15 @@
   function applyFocus(node) {
     activeCy.elements().addClass("faded");
     node.closedNeighborhood().removeClass("faded");
+  }
+
+  // Fade everything except what a node reaches: an op's whole path through
+  // decompositions and lowerings down to the SDSC opfuncs.
+  function tracePath(node) {
+    var path = node.successors().union(node);
+    activeCy.elements().addClass("faded");
+    path.removeClass("faded").addClass("on-path");
+    node.removeClass("on-path");
   }
 
   function clearFocus() {
@@ -590,7 +720,9 @@
   }
 
   function clearSelection() {
-    if (activeCy) activeCy.elements().removeClass("selected-node neighbor");
+    if (activeCy) {
+      activeCy.elements().removeClass("selected-node neighbor on-path");
+    }
     clearFocus();
     clearInfo();
     updateHash(null);

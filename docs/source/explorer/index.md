@@ -34,6 +34,12 @@ decomposition node links on to the ops it expands into, so you can follow a
 chain such as `aten.silu.default` to `silu` to `spyre.silu` and check whether a
 specific op is supported.
 
+**Lowering Paths**: how an op reaches the device. An op links to its
+decomposition and the ops it produces, to its Spyre lowering, to the Inductor
+ops the lowering emits, and to the SDSC opfuncs those Inductor ops map to. It
+also links to the FX graph passes that match or create it. Selecting a node
+traces everything it reaches and lists the SDSC opfuncs at the end of the path.
+
 **Compiler Passes**: pass groups and their constituent transformation
 functions, laid out top-to-bottom in pipeline order.
 
@@ -88,6 +94,12 @@ The extractors cover:
 - `@dataclass`-decorated structs and their typed fields
 - Intra-package import statements
 - `os.environ` and `os.getenv` call sites
+- Lowering paths: the Inductor ops and SDSC opfuncs each Spyre lowering emits
+  (`ops_wrapper(...)`, `ops.<name>(...)`, `reduction_type=`, and `*_OP`
+  constants, following module-level helpers), the opfunc each `SpyreOpFuncs`
+  method builds with `PointwiseOp` or `ReductionOp`, calls from one Spyre
+  lowering to another, and the aten ops each FX graph pass in
+  `CustomPrePasses` and `CustomPostPasses` references
 
 Within each decomposition, the extractor also records the ops it calls as
 `decomposes_into` edges. This is best-effort: it names explicit

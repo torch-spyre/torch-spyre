@@ -56,6 +56,40 @@ accelerator and what it actually becomes, which matters when a result or a
 performance number is surprising. For a developer adding a related op, it shows
 the existing rewrite to follow.
 
+### Lowering Paths
+
+Select an op to trace its path to the device. For `aten.gelu.default` the
+trace is `aten.gelu.default` to the decomposition `spyre_gelu`, to
+`spyre.gelu`, to the lowering `lower_gelu`, to the Inductor op `ops.gelu`, to
+the SDSC opfunc `gelufwd`. The information panel lists the opfuncs the selected
+node reaches.
+
+The edges have these meanings:
+
+| Edge | Meaning | Read from |
+|---|---|---|
+| `has_overload` | An op name to one of its overloads (`aten.bmm` to `aten.bmm.default`) | op ids |
+| `decomposed_by`, `decomposes_into` | The decomposition of an op, and the ops it produces | `decompositions.py` |
+| `lowered_by` | The Spyre lowering registered for an op | `lowering.py` |
+| `delegates_to` | A Spyre lowering that calls another Spyre lowering | `lowering.py` |
+| `emits` | An Inductor op or SDSC opfunc a lowering produces | `lowering.py` |
+| `maps_to` | The SDSC opfunc an Inductor op becomes | `SpyreOpFuncs` in `spyre_kernel.py` |
+| `inductor_default` | An aten op with no Spyre path, to the Inductor op of the same name | op names |
+| `rewritten_by` | An FX graph pass that matches or creates the op | `temp_passes.py`, `passes.py` |
+
+Dashed edges are inferred by name rather than read from a call. An
+`inductor_default` edge assumes that Inductor's default lowering of `aten.X`
+emits `ops.X`. An inferred `emits` edge comes from a reference to
+`lowering.X`, Inductor's lowering of that name. A reduction opfunc can also
+receive a `nonstick` suffix at code generation (`_get_op_func` in
+`codegen/superdsc.py`), which the graph does not show.
+
+For a developer, the trace shows which lowering and which Inductor op an
+operation depends on before a change to either. For a user, an op that reaches
+no SDSC opfunc either moves data only (a copy, `cat`, or a collective), runs
+through an eager kernel or a CPU fallback, or has a path the extractor cannot
+read; check the Operations view and the source link.
+
 ### Compiler Passes
 
 A pass-group node such as `CustomPreSchedulingPasses` has a `contains_pass` edge
@@ -193,9 +227,11 @@ Three properties are worth relying on:
   checkout.
 
 The graph covers registrations, class hierarchies, imports, dataclass
-fields, and environment-variable reads. It does not trace runtime call
-graphs or data flow, and it only parses the files listed in
-`build_graph()`. If a new registration pattern or source file is not
+fields, environment-variable reads, and the lowering paths described above. It
+does not trace runtime call graphs or data flow, and it only parses the files
+listed in `build_graph()`. A lowering path is read from the lowering's own body
+and from module-level helpers up to three calls deep; an op chosen at run time
+(from a variable or a dictionary) does not appear. If a new registration pattern or source file is not
 showing up, the extractor needs updating. The {doc}`../contributing/index`
 notes and the `check-docs` checklist explain how.
 

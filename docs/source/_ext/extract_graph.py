@@ -355,18 +355,11 @@ def extract_decompositions(filepath):
     return nodes, edges
 
 
-def extract_lowerings(filepath):
-    """Parse @register_spyre_lowering decorators, expanding factory-registered ones
-    (``_register_cmp_lowerings("eq", ...)``) once per call site."""
-    nodes = []
-    edges = []
-    source = Path(filepath).read_text()
-    tree = ast.parse(source)
-    rel_path = str(filepath)
+def _lowering_registrations(tree):
+    """(lowering FunctionDef, op name, lowering id suffix) for every
+    @register_spyre_lowering, with factory-registered lowerings expanded per
+    call site."""
     aliases = _module_op_aliases(tree)
-
-    # (lowering FunctionDef, op name, lowering id suffix) for every
-    # registration, with factory-registered lowerings expanded per call site.
     registrations = []
     factory_inner = set()
     for stmt in tree.body:
@@ -408,8 +401,19 @@ def extract_lowerings(filepath):
                     op = _normalize_op_name(raw)
                     if op:
                         registrations.append((node, op, node.name))
+    return registrations
 
-    for node, op, lowering_name in registrations:
+
+def extract_lowerings(filepath):
+    """Parse @register_spyre_lowering decorators, expanding factory-registered ones
+    (``_register_cmp_lowerings("eq", ...)``) once per call site."""
+    nodes = []
+    edges = []
+    source = Path(filepath).read_text()
+    tree = ast.parse(source)
+    rel_path = str(filepath)
+
+    for node, op, lowering_name in _lowering_registrations(tree):
         lowering_id = f"lowering::{lowering_name}"
         op_id = f"op::{op}"
         nodes.append(
@@ -430,6 +434,311 @@ def extract_lowerings(filepath):
             }
         )
     return nodes, edges
+
+
+def _string_constants(filepath):
+    """Module-level ``NAME = "string"`` assignments of a file, or {} if absent."""
+    path = Path(filepath)
+    if not path.exists():
+        return {}
+    constants = {}
+    for stmt in ast.parse(path.read_text()).body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            constants[stmt.targets[0].id] = stmt.value.value
+    return constants
+
+
+def _string_value(node, constants):
+    """A string literal, or a name bound to one in ``constants``."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return None
+
+
+def _opfunc_node(name, rel_path, line):
+    return {
+        "id": f"opfunc::{name}",
+        "label": name,
+        "type": "opfunc",
+        "source_file": rel_path,
+        "line": line,
+    }
+
+
+def extract_inductor_ops(filepath):
+    """Map each ``SpyreOpFuncs`` method (an Inductor op) to the SDSC opfunc
+    strings it builds with ``PointwiseOp(...)`` or ``ReductionOp(...)``."""
+    nodes = []
+    edges = []
+    tree = ast.parse(Path(filepath).read_text())
+    rel_path = str(filepath)
+    constants = _string_constants(Path(filepath).with_name("constants.py"))
+    constants.update(_string_constants(filepath))
+
+    for cls in tree.body:
+        if not (isinstance(cls, ast.ClassDef) and cls.name == "SpyreOpFuncs"):
+            continue
+        for fn in cls.body:
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            iop_id = f"iop::{fn.name}"
+            nodes.append(
+                {
+                    "id": iop_id,
+                    "label": f"ops.{fn.name}",
+                    "type": "inductor_op",
+                    "source_file": rel_path,
+                    "line": fn.lineno,
+                }
+            )
+            for call in ast.walk(fn):
+                if not (isinstance(call, ast.Call) and call.args):
+                    continue
+                func = _resolve_attr(call.func) or ""
+                if func.split(".")[-1] not in ("PointwiseOp", "ReductionOp"):
+                    continue
+                opfunc = _string_value(call.args[0], constants)
+                if not opfunc:
+                    continue
+                nodes.append(_opfunc_node(opfunc, rel_path, call.lineno))
+                edges.append(
+                    {
+                        "source": iop_id,
+                        "target": f"opfunc::{opfunc}",
+                        "relationship": "maps_to",
+                    }
+                )
+    return nodes, edges
+
+
+def _emits_of(fn, helpers, constants, depth=0, seen=None):
+    """(exact Inductor op or opfunc ids, name-inferred Inductor op ids) that
+    ``fn`` emits, following calls to module-level helpers up to three deep.
+
+    Exact: ``ops_wrapper(...)`` names, ``ops.<name>(...)`` calls, and any
+    ``*_OP`` constant (an SDSC opfunc name) the body uses. Inferred: a
+    reference to ``lowering.<name>``, Inductor's lowering of that name, which
+    emits the Inductor op of the same name."""
+    seen = seen if seen is not None else set()
+    seen.add(fn.name)
+    exact, inferred = set(), set()
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Attribute):
+            ref = _resolve_attr(sub) or ""
+            if ref.startswith("lowering.") and ref.count(".") == 1:
+                inferred.add(f"iop::{ref[len('lowering.') :]}")
+        if isinstance(sub, ast.Name) and sub.id.endswith("_OP") and sub.id in constants:
+            exact.add(f"opfunc::{constants[sub.id]}")
+        if not isinstance(sub, ast.Call):
+            continue
+        func = _resolve_attr(sub.func) or ""
+        if func.split(".")[-1] == "ops_wrapper" and sub.args:
+            arg = sub.args[0]
+            name = _string_value(arg, constants)
+            if (
+                name is None
+                and isinstance(arg, ast.Attribute)
+                and arg.attr == "__name__"
+            ):
+                name = (_resolve_attr(arg.value) or "").split(".")[-1]
+            if name:
+                exact.add(f"iop::{name}")
+        elif func.startswith("ops.") and func.count(".") == 1:
+            exact.add(f"iop::{func[len('ops.') :]}")
+        for kw in sub.keywords:
+            if kw.arg == "reduction_type":
+                opfunc = _string_value(kw.value, constants)
+                if opfunc:
+                    exact.add(f"opfunc::{opfunc}")
+        if (
+            depth < 3
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id in helpers
+            and sub.func.id not in seen
+        ):
+            e, i = _emits_of(helpers[sub.func.id], helpers, constants, depth + 1, seen)
+            exact |= e
+            inferred |= i
+    return exact, inferred
+
+
+def extract_lowering_emits(filepath):
+    """What each Spyre lowering emits (see ``_emits_of``), and which other Spyre
+    lowerings it calls. An edge to an Inductor op that ``SpyreOpFuncs`` does not
+    define is dropped when the graph is assembled."""
+    nodes = []
+    edges = []
+    tree = ast.parse(Path(filepath).read_text())
+    rel_path = str(filepath)
+    constants = _string_constants(Path(filepath).with_name("constants.py"))
+    constants.update(_string_constants(filepath))
+
+    registrations = _lowering_registrations(tree)
+    ids_by_function = {}
+    for fn, _op, lowering_name in registrations:
+        ids_by_function.setdefault(fn.name, set()).add(f"lowering::{lowering_name}")
+    # Module-level functions that are not themselves registered lowerings.
+    helpers = {
+        f.name: f
+        for f in tree.body
+        if isinstance(f, ast.FunctionDef) and f.name not in ids_by_function
+    }
+
+    for fn, _op, lowering_name in registrations:
+        lowering_id = f"lowering::{lowering_name}"
+        exact, inferred = _emits_of(fn, helpers, constants)
+        # A factory-registered lowering (``_tensor[eq]``) names its op only as the
+        # literal passed to the factory: the Inductor op of that name (inferred).
+        if lowering_name.endswith("]") and "[" in lowering_name:
+            inferred.add(f"iop::{lowering_name[lowering_name.rindex('[') + 1 : -1]}")
+        delegates = set()
+        for sub in ast.walk(fn):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id in ids_by_function
+                and sub.func.id != fn.name
+            ):
+                delegates |= ids_by_function[sub.func.id]
+        for target in sorted(exact):
+            if target.startswith("opfunc::"):
+                nodes.append(
+                    _opfunc_node(target[len("opfunc::") :], rel_path, fn.lineno)
+                )
+            edges.append(
+                {"source": lowering_id, "target": target, "relationship": "emits"}
+            )
+        for target in sorted(inferred - exact):
+            edges.append(
+                {
+                    "source": lowering_id,
+                    "target": target,
+                    "relationship": "emits",
+                    "inferred": True,
+                }
+            )
+        for target in sorted(delegates - {lowering_id}):
+            edges.append(
+                {
+                    "source": lowering_id,
+                    "target": target,
+                    "relationship": "delegates_to",
+                }
+            )
+    return nodes, edges
+
+
+def _aten_refs(node, aliases):
+    """Normalized ``aten.*`` op references inside ``node``, longest form only
+    (``aten.mm.default`` rather than both it and ``aten.mm``)."""
+    refs = set()
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Attribute):
+            continue
+        name = _normalize_op_name(_apply_alias(_resolve_attr(sub), aliases))
+        if name and name.startswith("aten.") and name.count(".") in (1, 2):
+            refs.add(name)
+    return {r for r in refs if not any(o != r and o.startswith(r + ".") for o in refs)}
+
+
+def extract_fx_rewrites(filepath):
+    """Aten ops each FX graph rewrite matches or creates.
+
+    Pattern passes are ``@register_graph_pattern(..., pass_dict=P)`` functions;
+    their ops are attributed to ``P.apply``. Every other top-level function is
+    attributed to itself. Edges whose pass is not an FX pass function are
+    dropped when the graph is assembled."""
+    nodes = []
+    edges = []
+    tree = ast.parse(Path(filepath).read_text())
+    aliases = _module_op_aliases(tree)
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        pass_name = fn.name
+        for dec in fn.decorator_list:
+            if isinstance(dec, ast.Call) and (_get_decorator_name(dec) or "").endswith(
+                "register_graph_pattern"
+            ):
+                for kw in dec.keywords:
+                    if kw.arg == "pass_dict" and isinstance(kw.value, ast.Name):
+                        pass_name = f"{kw.value.id}.apply"
+        for op in sorted(_aten_refs(fn, aliases)):
+            nodes.append(
+                {"id": f"op::{op}", "label": op, "type": "op", "_rewrite_only": True}
+            )
+            edges.append(
+                {
+                    "source": f"op::{op}",
+                    "target": f"passfn::{pass_name}",
+                    "relationship": "rewritten_by",
+                }
+            )
+    return nodes, edges
+
+
+def _link_lowering_paths(nodes_by_id, edges):
+    """Edges that join the op-level chains: an op packet to its overloads, and
+    an aten op with no Spyre path to the Inductor op of the same name, which
+    Inductor's default lowering emits (inferred by name)."""
+    op_ids = {i for i in nodes_by_id if i.startswith("op::")}
+    added = []
+    for oid in sorted(op_ids):
+        parts = oid[len("op::") :].split(".")
+        if len(parts) == 3 and f"op::{parts[0]}.{parts[1]}" in op_ids:
+            added.append(
+                {
+                    "source": f"op::{parts[0]}.{parts[1]}",
+                    "target": oid,
+                    "relationship": "has_overload",
+                }
+            )
+
+    handled = {
+        e["source"]
+        for e in edges
+        if e["relationship"] in ("lowered_by", "decomposed_by", "falls_back_to")
+    }
+
+    def _family(oid):
+        parts = oid[len("op::") :].split(".")
+        packet = f"op::{parts[0]}.{parts[1]}" if len(parts) >= 2 else oid
+        return {i for i in op_ids if i == packet or i.startswith(packet + ".")}
+
+    done = set()
+    for oid in sorted(op_ids):
+        parts = oid[len("op::") :].split(".")
+        if parts[0] != "aten" or len(parts) < 2:
+            continue
+        family = _family(oid)
+        key = min(family)
+        if family & handled or key in done:
+            continue
+        iop = f"iop::{parts[1]}"
+        if iop not in nodes_by_id:
+            continue
+        done.add(key)
+        # Attach once per family, to the packet when it exists.
+        source = f"op::aten.{parts[1]}"
+        if source not in op_ids:
+            source = min(family)
+        added.append(
+            {
+                "source": source,
+                "target": iop,
+                "relationship": "inductor_default",
+                "inferred": True,
+            }
+        )
+    return added
 
 
 def extract_custom_ops(filepath):
@@ -1126,6 +1435,12 @@ def build_graph(torch_spyre_root):
         (extract_eager_kernels, root / "ops" / "eager.py"),
         (extract_eager_kernels, root / "_inductor" / "customops.py"),
         (extract_passes, root / "_inductor" / "passes.py"),
+        (extract_inductor_ops, root / "_inductor" / "spyre_kernel.py"),
+        (extract_lowering_emits, root / "_inductor" / "lowering.py"),
+        (extract_fx_rewrites, root / "_inductor" / "temp_passes.py"),
+        (extract_fx_rewrites, root / "_inductor" / "passes.py"),
+        (extract_fx_rewrites, root / "_inductor" / "materialize_hinted_views.py"),
+        (extract_fx_rewrites, root / "_inductor" / "propagate_hints.py"),
     ]
 
     for extractor, filepath in op_extractors:
@@ -1212,6 +1527,27 @@ def build_graph(torch_spyre_root):
     valid_edges = [
         e for e in unique_edges if e["source"] in node_ids and e["target"] in node_ids
     ]
+
+    # An FX rewrite edge only counts for a pass in an FX graph pipeline.
+    fx_passes = {
+        e["target"]
+        for e in valid_edges
+        if e["relationship"] == "contains_pass"
+        and e["source"] in ("pass::CustomPrePasses", "pass::CustomPostPasses")
+    }
+    valid_edges = [
+        e
+        for e in valid_edges
+        if e["relationship"] != "rewritten_by" or e["target"] in fx_passes
+    ]
+    # Drop op nodes that only a discarded rewrite edge introduced.
+    connected = {e["source"] for e in valid_edges} | {e["target"] for e in valid_edges}
+    for nid in [i for i, n in seen.items() if n.get("_rewrite_only")]:
+        if nid not in connected:
+            del seen[nid]
+    for n in seen.values():
+        n.pop("_rewrite_only", None)
+    valid_edges.extend(_link_lowering_paths(seen, valid_edges))
 
     graph = {
         "metadata": {

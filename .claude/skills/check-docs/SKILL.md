@@ -463,6 +463,13 @@ Check that the output counts reflect recent code changes:
   module node with correct import edges.
 - **New environment variables:** If a new `os.environ.get()` or `os.getenv()`
   call was added, it should appear in the Configuration view.
+- **Lowering paths:** a new `SpyreOpFuncs` method in `spyre_kernel.py` should
+  appear as an `inductor_op` with a `maps_to` edge to its opfunc, and a new
+  lowering that produces compute should have an `emits` edge. Spot-check with a
+  deep link such as `#lowering/op::aten.gelu.default`: the info panel lists the
+  SDSC opfuncs the op reaches. A lowering with no `emits` edge either moves
+  data only or emits its op in a way the extractor does not read (a variable,
+  a dictionary lookup, or a helper more than three calls deep).
 
 ### 12b. Source file paths in extractors
 
@@ -475,6 +482,10 @@ file paths for op-level extractors:
 - `torch_spyre/ops/fallbacks.py`
 - `torch_spyre/ops/eager.py`
 - `torch_spyre/_inductor/passes.py`
+- `torch_spyre/_inductor/spyre_kernel.py` (`SpyreOpFuncs`, for the lowering
+  paths)
+- `torch_spyre/_inductor/temp_passes.py`, `materialize_hinted_views.py` and
+  `propagate_hints.py` (the FX graph rewrites)
 
 If any of these files were renamed, split, or if new registration files were
 created (e.g., a second lowering file), verify the extractor list is updated.
