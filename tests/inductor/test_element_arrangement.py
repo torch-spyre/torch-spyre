@@ -1791,3 +1791,16 @@ class TestEAValidateOps:
         graph = self._make_mock_graph([op], {"buf0": EA.STANDARD, "buf1": EA.EXX2})
         with V.set_graph_handler(graph):
             validate_ops(graph)
+
+
+def test_ea_h2d_gapped_host_rows():
+    """H2D of a host view with gaps between rows into a staggered tensor."""
+    # Row stride 192 is not a whole multiple of the width 128 (issue 6326).
+    base = (torch.arange(4 * 192) % 251).to(torch.float32).reshape(4, 192)
+    src = base[:, :128]
+    y = _convert_one_row_per_core(
+        torch.zeros(4, 128, dtype=torch.float16), torch.float32
+    )
+    assert_ea(y, ElementArrangement.DL16_TO_FP32)
+    y.copy_(src)
+    assert torch.equal(y.cpu(), src)
