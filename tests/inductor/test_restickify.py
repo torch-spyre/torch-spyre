@@ -2863,7 +2863,7 @@ def _size1_restickify_op_spec():
     from torch_spyre._C import DataFormats
     from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
-    def tensor_arg(is_input, arg_index, device_size, coords):
+    def tensor_arg(is_input, arg_index, device_size, stride_map, coords):
         return TensorArg(
             is_input=is_input,
             arg_index=arg_index,
@@ -2871,6 +2871,7 @@ def _size1_restickify_op_spec():
             device_size=list(device_size),
             device_coordinates=list(coords),
             allocation={"hbm": 0x400000000 + arg_index * 0x1000},
+            stride_map=list(stride_map),
         )
 
     c = sympy.Symbol("c")
@@ -2880,6 +2881,7 @@ def _size1_restickify_op_spec():
         is_input=True,
         arg_index=0,
         device_size=[67, 1, 1, 64],
+        stride_map=[7, 0, 469, 0],
         coords=[c, sympy.Integer(0), sympy.Integer(0), sympy.Integer(0)],
     )
     # Intact OUTPUT: the grow prepended an outermost size-64, symbol-less gap dim;
@@ -2888,6 +2890,7 @@ def _size1_restickify_op_spec():
         is_input=False,
         arg_index=1,
         device_size=[64, 67, 1, 64],
+        stride_map=[0, 7, 469, 1],
         coords=[sympy.Integer(0), c, sympy.Integer(0), sympy.Mod(c, 64)],
     )
     return OpSpec(
@@ -2932,10 +2935,63 @@ def test_size1_restore_asserts_when_phantom_absent():
     out_arg = op_spec.args[1]
     # Drop the prepended gap dim to simulate the un-grown STL.
     out_arg.device_size = [67, 1, 64]
+    out_arg.stride_map = out_arg.stride_map[1:]
     out_arg.device_coordinates = out_arg.device_coordinates[1:]
 
     with pytest.raises(AssertionError, match="padding-prepended"):
         _restickify_restore_elided_dim(op_spec)
+
+
+def _sum_plus_dense(rows):
+    """``x.sum(-1) + y[64, rows]``: ``x.sum(-1)`` is sparse (one value per stick),
+    so ``y`` is restickified from it to dense: a size-1 restickify whose target
+    needs exactly one size-64 gap dim; a second multiplied the allocation and the
+    sweep by 64 (#6105).
+    Exact: the values are small integers, sums stay under 1024.
+    """
+    x = ((torch.arange(rows * 64) * 7 + 3) % 5 - 2).to(torch.float16).reshape(rows, 64)
+    y = ((torch.arange(64 * rows) * 3 + 1) % 257).to(torch.float16).reshape(64, rows)
+    return (lambda a, b: a.sum(-1) + b), x, y
+
+
+def _restickify_output_sizes(fn, *args):
+    """Run ``fn`` compiled and return (CPU result, the device size of every
+    size-1 restickify's output after the padding pass)."""
+    import torch_spyre._inductor.padding as _padding
+    from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+    sizes = []
+    run_one_pass = CustomPreSchedulingPasses._run_one_pass
+
+    def capturing_run_one_pass(self, graph, pipeline, pass_fn, pass_name):
+        run_one_pass(self, graph, pipeline, pass_fn, pass_name)
+        if pass_fn is not _padding.insert_restickify_padding:
+            return
+        for op in graph.operations:
+            if _padding.is_restickify_op(op, graph):
+                sizes.append(list(op.get_layout().device_layout.device_size))
+
+    with patch.object(
+        CustomPreSchedulingPasses, "_run_one_pass", capturing_run_one_pass
+    ):
+        result = _compile_and_run(fn, args, DEVICE)
+    return result, sizes
+
+
+def test_sparse_to_dense_restickify_has_one_size64_dim():
+    fn, x, y = _sum_plus_dense(256)
+    result, sizes = _restickify_output_sizes(fn, x, y)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
+    # One gap dim: [64, 4, 64], not [64, 64, 4, 64].
+    assert sizes == [[64, 4, 64]]
+
+
+def test_sparse_to_dense_restickify_above_4mib():
+    # 8 MiB of sparse data. With two gap dims each core swept 64 x 64 x rows / 64
+    # sticks, over the backend's 256 MiB address offset above 4 MiB.
+    fn, x, y = _sum_plus_dense(65536)
+    result = _compile_and_run(fn, (x, y), DEVICE)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
 
 
 def test_round_up_to_stick_geometry():
