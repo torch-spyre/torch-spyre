@@ -481,6 +481,29 @@ class UnimplementedOp:
     op: str
 
 
+@dataclasses.dataclass(frozen=True)
+class CountSource:
+    """Where a loop reads its trip count from device memory at run time.
+
+    The count stays in device memory, so the host never needs to see it. It is
+    an FP32 value holding a whole number of trips. Only a count stored in the
+    bundle's pool is supported for now, as the first value of a stick, typically
+    written by an earlier op in the same bundle.
+
+    Plain integers only, so the record survives the generated-code round trip.
+
+    Attributes:
+        pool_offset: Byte offset of the count in the bundle's pool.
+        max_value: Largest count that can be read. The loop is planned for this
+            many trips, so it equals the owning ``LoopSpec.count``.
+        granularity: A number the count is always a multiple of.
+    """
+
+    pool_offset: int
+    max_value: int
+    granularity: int = 1
+
+
 @dataclasses.dataclass
 class LoopSpec:
     """A counted loop whose body is a sequence of ops, possibly nested.
@@ -499,6 +522,10 @@ class LoopSpec:
             name. Resolved during kernel codegen, where the launch argument
             ordering is still live. A symbol that cannot be placed is left out,
             and bundle generation then refuses to declare a parameter for it.
+        count_from_buffer: When set, the loop runs as many trips as a count
+            read from device memory right before the loop starts. ``count``
+            then stays the static maximum, so every pass that reads it is
+            unchanged. None for every other loop.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -517,6 +544,7 @@ class LoopSpec:
     count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    count_from_buffer: CountSource | None = None
 
 
 def walk_loop_specs(specs):
