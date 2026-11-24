@@ -1096,10 +1096,11 @@ def lower_histc_count(idx, bin_ids, bins, out_dtype):
     aten = torch.ops.aten
     sum_dtype = idx.get_dtype()
     # bin_ids is one tensor shared between calls (histc_bin_ids), and the count
-    # below has its shape and dtype. Nothing reuses a fallback op's output today:
-    # Inductor's buffer reuse is off for Spyre (allow_buffer_reuse, patches.py),
-    # and the HBM pool only takes buffers written and read inside one kernel.
-    # This keeps the ids safe if either changes.
+    # below has its shape and dtype. A fallback op's output is eligible for both
+    # of Inductor's reuse paths; neither runs on Spyre today (allow_buffer_reuse
+    # is False in patches.py, and the backend does not declare INPLACE_BUFFERS).
+    # Both skip a buffer listed here, so the ids stay safe if that changes.
+    # TODO(#4647): use the shared device arange and drop this.
     V.graph.never_reuse_buffers.add(bin_ids.get_name())
     n = int(idx.get_size()[0])
     bins_pad = int(bin_ids.get_size()[0])

@@ -1879,8 +1879,8 @@ def spyre_topk(
 
 
 def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
-    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range; below ``lo``,
-    above ``hi`` or for NaN, a negative number or NaN, which matches no bin."""
+    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range. Below ``lo``,
+    above ``hi`` or for NaN it is negative or NaN, which matches no bin."""
     valid = (x <= hi).to(torch.float32)
     scaled = (x - lo) * float(bins)
     pos = torch.floor(scaled / width_den)
@@ -1894,12 +1894,9 @@ def _histc_bin_index(x, lo, hi, width_den, bins, repair_division=False):
     return pos * valid + (valid - 1.0)
 
 
-# The count compares every element with every bin, and its time follows the size
-# of that table: N x bins (rounded up to a full stick) x the element size.
-# Measured at 32 cores against the CPU round trip, the device ties or wins up to
-# 16 MB and is 4x slower at 32 MB, so larger tables are counted on the CPU. This
-# also keeps the table far below the per-core span limit, which no single formula
-# gives: the largest table that compiles depends on the core count.
+# The count compares every element with every bin, and its time grows with that
+# table: N x bins (rounded up to a full stick) x the element size. Above 16 MB
+# the CPU round trip is faster (measured at 32 cores), so histc counts there.
 # TODO: count in chunks, so large inputs stay on the device.
 _HISTC_DEVICE_TABLE_MAX_BYTES = 16 * 2**20
 

@@ -207,11 +207,8 @@ def _(
     return idx.new_empty((bins,), dtype=out_dtype)
 
 
-# Bounded: the 64 most recently used (bins_pad, dtype, device). lru_cache keeps
-# itself consistent across threads; two threads racing on a new key each build
-# the tensor and one is dropped.
-# TODO(#4647): use the shared device arange cache once it lands, so there is one
-# cache.
+# The 64 most recently used (bins_pad, dtype, device); lru_cache is thread-safe.
+# TODO(#4647): use the shared device arange cache instead.
 @functools.lru_cache(maxsize=64)
 def _histc_bin_ids_on_device(
     bins_pad: int, dtype: torch.dtype, device: torch.device
@@ -236,12 +233,10 @@ def _(bins_pad: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::histc_cpu", mutates_args=())
 def histc_cpu(input: torch.Tensor, bins: int, min: float, max: float) -> torch.Tensor:
-    """CPU fallback for torch.histc, for the inputs ``spyre_histc`` keeps off
-    the device: a compare table over its size limit, or a length that is not
-    known at compile time. Counts have the input's dtype.
-
-    CPU histc has no integer or fp16 kernel, so those inputs are counted as
-    fp32, the same copy the device path bins.
+    """CPU fallback for torch.histc when ``spyre_histc`` keeps the input off the
+    device: a compare table over its size limit, or a symbolic length. Counts
+    have the input's dtype. Integer and fp16 input is counted as fp32, as on the
+    device: CPU histc has no kernel for them.
 
     Mirrors max_dim_int64_fallback: the Spyre kernel is registered in
     fallbacks.py, and this body computes the real result for non-Spyre inputs.
