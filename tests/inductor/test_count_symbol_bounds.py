@@ -59,6 +59,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import LoopSpec
 from torch_spyre._inductor.pass_utils import (
     concretize_expr,
+    concretize_index,
     declared_dims,
     declared_dims_in,
     declared_max_or_none,
@@ -953,6 +954,45 @@ class TestTheDeclaredDimsOfACompile(unittest.TestCase):
             self.assertEqual(
                 symbolic_count_bounds(FloorDiv(_sym(), TILE)), {SYM: (MAX, TILE)}
             )
+
+
+class TestAStartOffsetOnADeclaredDimIsRefused(unittest.TestCase):
+    """A read that starts at a position computed from a declared size.
+
+    ``x.narrow(0, n - 64, 64)`` on a ``[n, 64]`` operand reads at
+    ``64*(n - 64) + 64*x0 + x1``. ``concretize_index`` resolved ``n`` to the
+    warm-up call's size, so the binary read the warm-up's rows at every other
+    size. A declared size may only set a trip count, so the start offset is
+    refused. An undeclared size recompiles at every size and keeps resolving.
+    """
+
+    def setUp(self):
+        self.x0 = sympy.Symbol("x0", integer=True, nonnegative=True)
+        self.x1 = sympy.Symbol("x1", integer=True, nonnegative=True)
+        self.loop_vars = {self.x0, self.x1}
+        self.graph = _graph_with_bounds({}, hint=256)
+
+    def _tail_read(self):
+        return TILE * (_sym() - TILE) + TILE * self.x0 + self.x1
+
+    @expects_raise
+    def test_a_start_that_follows_the_declared_size_is_refused(self):
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(self.graph):
+            with self.assertRaises(Unsupported) as caught:
+                concretize_index(self._tail_read(), self.loop_vars)
+
+        message = str(caught.exception)
+        self.assertIn(SYM, message)
+        self.assertIn("trip count", message)
+        self.assertIn("for_each_tile", message)
+
+    def test_an_undeclared_start_keeps_the_hint(self):
+        """A ``mark_dynamic`` size is not declared. Its layout guard recompiles
+        every size, so its start keeps resolving to the hint as before."""
+        with V.set_graph_handler(self.graph):
+            result = concretize_index(self._tail_read(), self.loop_vars)
+
+        self.assertEqual(result, TILE * (256 - TILE) + TILE * self.x0 + self.x1)
 
 
 if __name__ == "__main__":
