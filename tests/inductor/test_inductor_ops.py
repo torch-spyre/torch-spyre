@@ -7032,6 +7032,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bool_2d_dim_0": "the host bool upcast to fp32 is staggered; the dim 0 sum output is STANDARD, and the staggered result is read back without restoring its order (#4393)",
             },
         },
+        # Integer and bool sums are deterministic counts — compare exactly.
         ("test_sum_default", "test_reduce_exact_cpu"): {
             "ops_dict": {
                 "sum": torch.sum,
@@ -7056,16 +7057,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int32_2d": (cached_randint((67, 256), dtype=torch.int32),),
                 "int64_1d": (cached_randint((64,), dtype=torch.int64),),
                 "int64_2d": (cached_randint((67, 256), dtype=torch.int64),),
-                "fp16_1d": (cached_randn((64,), dtype=torch.float16),),
-                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
-                "fp32_1d": (cached_randn((64,), dtype=torch.float32),),
-                "fp32_2d": (cached_randn((67, 256), dtype=torch.float32),),
             },
             # Unaligned staggered inputs raise Unsupported until #4014 is fixed.
             "expect_fail": {
                 "sum_bool_1d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
                 "sum_bool_2d_unaligned": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
                 "sum_bool_2d_unaligned_cmp": "unaligned staggered DL16_TO_FP32 reduction (#4014)",
+            },
+        },
+        # Float sums use default tolerance (fp16/fp32 results are not exact).
+        ("test_sum_default", "test_reduce_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "fp16_1d": (cached_randn((64,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp32_1d": (cached_randn((64,), dtype=torch.float32),),
+                "fp32_2d": (cached_randn((67, 256), dtype=torch.float32),),
             },
         },
         # Reductions over an expand()-broadcast operand, across dim alignment,
