@@ -1428,6 +1428,12 @@ _RESCALE_REJECTION = "cannot rescale device layout"
 _NOT_DIVISIBLE = "cannot be divided safely"
 
 
+def _rms_norm_fp32(h):
+    """Gemma 4 RMSNorm: normalize in fp32 and cast back to the input dtype."""
+    x = h.to(torch.float32)
+    return (x * torch.rsqrt((x * x).mean(-1, keepdim=True) + 1e-6)).to(h.dtype)
+
+
 class TestEAShuffle:
     # Shapes for both directions: stick-aligned, shorter than a stick, ending
     # inside a stick; ranks 1 to 4. (256,) has more than one fp32 stick pair, to
@@ -1520,7 +1526,6 @@ class TestEAShuffle:
         "flip_then_shuffle_back": lambda x16, y32: (
             ((x16.float() * 2.0) * y32 + x16.float()) + y32
         ),
-        "gemma4_downcast_add_upcast": lambda x16, y32: y32.to(x16.dtype) + y32,
     }
 
     # Reduction ops mixing a staggered operand with a STANDARD one.
@@ -1551,12 +1556,36 @@ class TestEAShuffle:
         (4, 320),
         (4, 448),
         (64, 448),
-        # Gemma 4 hidden state shapes that trigger the downcast-add-upcast shuffle
+        # Gemma 4 hidden state shapes
         (1, 64, 2816),
         (1, 1, 2816),
         (1, 2816),
     ]
     _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS}
+
+    # Gemma 4 patterns that mix a staggered operand with a STANDARD one, with the
+    # arrangement of the result.
+    GEMMA4_MIXED_EA_PROGRAMS = {
+        "downcast_add_upcast": (
+            lambda x16, y32: y32.to(x16.dtype) + y32,
+            EA.STANDARD,
+        ),
+        # Two chained fp32 RMSNorms with a downcast weight. The last multiply by
+        # the downcast weight leaves the result staggered.
+        "double_rms_norm": (
+            lambda x16, y32: (
+                _rms_norm_fp32(_rms_norm_fp32(x16) * y32.to(x16.dtype))
+                * y32.to(x16.dtype)
+            ),
+            EA.FP32_TO_DL16,
+        ),
+    }
+
+    GEMMA4_MIXED_EA_SHAPES = [
+        (1, 64, 2816),
+        (1, 1, 2816),
+        (1, 2816),
+    ]
 
     _FP16 = pytest.mark.parametrize(
         "fp16",
@@ -1575,13 +1604,21 @@ class TestEAShuffle:
         y = _small_int_fp16(shape, 5, base=3).to(y_dtype)
         return x, y
 
-    def _check(self, fn, shape, fp16, ea=EA.DL16_TO_FP32, reset_dynamo=False):
+    def _check(
+        self,
+        fn,
+        shape,
+        fp16,
+        ea=EA.DL16_TO_FP32,
+        reset_dynamo=False,
+        result_ea=EA.STANDARD,
+    ):
         """Run ``fn(x, y)`` compiled on the device; it must equal the CPU result."""
         x, y = self._operands(ea, shape, fp16)
         result = _run(
             fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME), reset_dynamo=reset_dynamo
         )
-        assert_ea(result, EA.STANDARD)
+        assert_ea(result, result_ea)
         assert_val(fn, (x, y), result)
 
     @staticmethod
@@ -1620,6 +1657,16 @@ class TestEAShuffle:
     def test_mixed_ea_pointwise(self, request, program, shape, fp16):
         """A pointwise op on a staggered and a STANDARD operand matches the CPU."""
         self._check(self.MIXED_EA_PROGRAMS[program], shape, fp16, reset_dynamo=True)
+
+    @_FP16
+    @pytest.mark.parametrize(
+        "shape", GEMMA4_MIXED_EA_SHAPES, ids=lambda s: shapes2key((s,))
+    )
+    @pytest.mark.parametrize("program", list(GEMMA4_MIXED_EA_PROGRAMS))
+    def test_mixed_ea_gemma4(self, program, shape, fp16):
+        """Gemma 4 RMS norm that has mixed EA cases with size=1 inputs."""
+        fn, result_ea = self.GEMMA4_MIXED_EA_PROGRAMS[program]
+        self._check(fn, shape, fp16, reset_dynamo=True, result_ea=result_ea)
 
     @expects_raise
     @_FP16

@@ -2030,6 +2030,29 @@ def _broadcast_split(
     return broadcast, non_broadcast
 
 
+def _operand_ea(arg: PropArg) -> ElementArrangement:
+    """The arrangement an operand's candidates hold their elements in.
+
+    Candidates of one buffer may differ in arrangement: a conversion tags a
+    candidate whose stick holds one element STANDARD (``_typecast_layouts``),
+    while its full-stick candidates keep the staggered arrangement. A
+    one-element stick reads the same in every arrangement, so the full-stick
+    candidates decide; an operand with only one-element sticks takes its first
+    candidate's.
+    """
+    _, full = _broadcast_split(arg)
+    full_eas = {stl.element_arrangement for stl in full}
+    if len(full_eas) > 1:
+        # TODO: split the operand's candidates by arrangement and resolve each.
+        raise Unsupported(
+            f"pointwise operand {arg.dep.name} has full-stick candidates in "
+            f"several arrangements: {full_eas}"
+        )
+    if full_eas:
+        return full_eas.pop()
+    return arg.layouts[0].element_arrangement
+
+
 def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     """Resolve the output ElementArrangement for a multi-arg pointwise op.
 
@@ -2061,10 +2084,8 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     layernormnorm / layernormscale carrying EXX2 -- have dedicated layout
     handlers and never reach this path.
     """
-    input_eas: set[ElementArrangement] = set()
-    for arg in ea_args:
-        if arg.layouts:
-            input_eas.add(arg.layouts[0].element_arrangement)
+    operand_eas = {id(arg): _operand_ea(arg) for arg in ea_args if arg.layouts}
+    input_eas = set(operand_eas.values())
 
     staggered_inputs = input_eas & STAGGERED_EAS
 
@@ -2097,13 +2118,12 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     std_split = [
         (arg, *_broadcast_split(arg))
         for arg in ea_args
-        if arg.layouts
-        and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
+        if arg.layouts and operand_eas[id(arg)] == ElementArrangement.STANDARD
     ]
     stag_split = [
         (arg, *_broadcast_split(arg))
         for arg in ea_args
-        if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
+        if arg.layouts and operand_eas[id(arg)] == staggered_ea
     ]
 
     std_can_broadcast = all(broadcast for _, broadcast, _ in std_split)
@@ -2405,6 +2425,18 @@ def _multi_arg_pointwise_layouts(
             r for r in results if (tuple(r.device_size), tuple(r.stride_map)) != key
         ]
         results.insert(0, candidate)
+
+    if output_ea in STAGGERED_EAS:
+        # A candidate whose stick holds one element is the same in every
+        # arrangement, so it stays STANDARD, as a conversion's output does.
+        results = [
+            _with_input_ea(
+                r.with_element_arrangement(ElementArrangement.STANDARD),
+                output_dep,
+                output_ea,
+            )
+            for r in results
+        ]
 
     if not results:
         # Reaches here when no stick-compatible output layout survives — e.g. in
