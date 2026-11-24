@@ -23,11 +23,10 @@ is computed in floating point and rounded once, where it enters CP-SAT: it is he
 the expression's value, not to the bits of another evaluator.
 """
 
-import inspect
 import itertools
 import math
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -48,7 +47,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CombineIndex,
     AbstractRealization,
     Index,
-    Input,
     InputIndex,
     SumRealization,
     TableRealization,
@@ -70,7 +68,7 @@ class Case:
 
     def __init__(self) -> None:
         self.model = cp_model.CpModel()
-        self.inputs: dict[sympy.Symbol, Input] = {}
+        self.inputs: dict[sympy.Symbol, tuple[cp_model.IntVar, Sequence[float]]] = {}
         self.variables: list[cp_model.IntVar] = []
         self.values: dict[cp_model.IntVar, list[int]] = {}
 
@@ -151,7 +149,11 @@ class Recording(TableLowering):
     """A printer that keeps what it prints: each node's realization by its sympy node,
     in the order the realizations are returned, operands before their parents."""
 
-    def __init__(self, inputs: dict[sympy.Symbol, Input], cap: int = CAP) -> None:
+    def __init__(
+        self,
+        inputs: dict[sympy.Symbol, tuple[cp_model.IntVar, Sequence[float]]],
+        cap: int = CAP,
+    ) -> None:
         super().__init__(inputs, cap=cap)
         self.printed: dict[sympy.Basic, AbstractRealization] = {}
 
@@ -689,13 +691,6 @@ def test_a_piecewise_with_no_arm_true_is_refused():
     assert caught.value.node == expr
 
 
-def test_functions_numpy_does_not_share_give_sympys_values():
-    case = Case()
-    case.add_input("a", a=[1.0, 2.0, 4.0])
-    a = case.symbol("a")
-    case.assert_exact(sympy.sec(a / 4) + sympy.sinc(a))
-
-
 def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case = Case()
     model = case.model
@@ -712,38 +707,16 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     assert plan.table(CAP).index.size == 6
 
 
-def test_an_undefined_function_is_refused():
+@pytest.mark.parametrize(
+    "make", [sympy.sec, sympy.sinc, sympy.Function("f")], ids=["sec", "sinc", "f"]
+)
+def test_a_class_the_numpy_core_has_no_function_for_is_refused(make):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
-    a = case.symbol("a")
-    expr = sympy.Function("f")(a)
-    with pytest.raises(TableLoweringError, match="no numeric value") as caught:
-        case.lower(expr)
+    expr = make(case.symbol("a"))
+    with pytest.raises(TableLoweringError, match="no numpy function for") as caught:
+        case.lower(expr + 1)
     assert caught.value.node == expr
-
-
-def test_a_function_that_takes_scalars_only_is_evaluated_point_by_point():
-    """On an array, an implemented function that tests its value with ``if`` raises
-    ValueError, and one that rounds raises TypeError; both are retried point by
-    point. One that fails on a point too is refused, naming its node."""
-
-    class Step(sympy.Function):
-        @staticmethod
-        def _imp_(x):
-            return 3.0 if x > 2 else 1.0
-
-    class Broken(sympy.Function):
-        @staticmethod
-        def _imp_(x):
-            raise KeyError(x)
-
-    case = Case()
-    case.add_input("a", a=[1.0, 2.0, 4.0])
-    a = case.symbol("a")
-    case.assert_exact(Step(a) + a)
-    with pytest.raises(TableLoweringError, match="no value .KeyError") as caught:
-        case.lower(Broken(a))
-    assert caught.value.node == Broken(a)
 
 
 def test_a_coefficient_is_applied_before_the_rounding():
@@ -977,64 +950,6 @@ def test_a_sum_that_is_not_finite_is_refused_at_the_sum():
 # ---------------------------------------------------------------- a node's function
 
 
-def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
-    """The expressions lambdified from here on."""
-    calls: list[sympy.Basic] = []
-    lambdify = sympy.lambdify
-
-    def counting(args, expr, **kwargs):
-        calls.append(expr)
-        return lambdify(args, expr, **kwargs)
-
-    monkeypatch.setattr(sympy, "lambdify", counting)
-    return calls
-
-
-def test_a_node_is_lambdified_only_when_the_core_has_no_function(monkeypatch):
-    """A node's list comes from the numpy core's function of its class, with no
-    lambdify: forty terms of one shape make hundreds of nodes and none is lambdified.
-    For a node of a class the core has no function for, here sinc and sec, the printer
-    lambdifies the class over placeholders once, when it prints the node. Nothing is
-    kept between printers, so a second lowering lambdifies as many again."""
-    case = Case()
-    case.add_input("a", a=[float(v) for v in range(1, 65)])
-    case.add_input("b", b=[float(v) for v in range(1, 9)])
-    a, b = case.symbol("a"), case.symbol("b")
-    terms = [
-        (i + 1)
-        * sympy.Piecewise(
-            (sympy.floor((i + 64) / a) ** -0.25, a > i), (sympy.log(b + i), True)
-        )
-        + sympy.Max(a**0.5, b / (i + 1))
-        for i in range(40)
-    ]
-    expr = sympy.Add(*terms) + sympy.sinc(a) * sympy.sec(b / 16)
-    calls = _count_lambdify(monkeypatch)
-    printer = Recording(case.inputs)
-    root = printer.print(expr)
-    computed = _operations(printer.printed)
-    assert len(computed) > 300
-    assert sorted(str(c) for c in calls) == ["sec(operand0)", "sinc(operand0)"]
-    printer.print(expr)
-    root.cp_expr(cp_model.CpModel())  # a realization is kept by its printer
-    assert len(calls) == 2
-    TableLowering(case.inputs, cap=CAP).print(expr)
-    assert len(calls) == 4
-    np.testing.assert_allclose(root.table(CAP).values, _stage_1(case, expr), rtol=1e-12)
-
-
-def test_a_function_takes_its_operands_by_their_own_names():
-    """lambdify renames every argument when any is a Dummy, rebuilding the node once
-    per argument: seconds for a Min or Max of a few dozen operands. Plain symbols
-    whose names are identifiers are taken as they are, so the function's parameters
-    are the placeholders' own names, and a Min of 35 is quick to lambdify."""
-    func = lowering._lambdified(sympy.Min, (None,) * 35)
-    assert list(inspect.signature(func).parameters) == [
-        f"operand{i}" for i in range(35)
-    ]
-    assert func(*np.arange(35.0, 0.0, -1.0)) == 1.0
-
-
 def test_a_constant_is_read_as_the_double_it_is():
     """A list is the expression's value in floating point, rounded once where it
     enters CP-SAT, and is not held to another evaluator's bits. lambdify prints a
@@ -1084,7 +999,6 @@ def test_a_quotient_is_divided_as_lambdify_prints_it():
 # Expressions over a, b and c, each node's list compared with Stage 1's.
 STAGE_1_LISTS = [
     lambda a, b, c: a**2 * b + b**0.5 / a,
-    lambda a, b, c: sympy.sec(a / 4) + sympy.sinc(a),
     lambda a, b, c: (a**0.5 + b) * a + sympy.log(a**0.5 + b),
     lambda a, b, c: sympy.Piecewise((a**2, a > 1.5), (b, True)) + sympy.Max(a, b),
     lambda a, b, c: sympy.Min(a + b, 3 * a) * sympy.floor(4 / a) + sympy.Abs(b - 2),

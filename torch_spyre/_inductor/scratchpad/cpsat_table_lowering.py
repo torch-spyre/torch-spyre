@@ -29,7 +29,7 @@ A sum stays linear, so no table crosses two of its terms. Any other node is one 
 over its inputs, refused when they do not fit the cap together. Its list
 is the numpy core's function of its sympy class (``cost_expr_numpy.py``, which the
 CP-SAT printer evaluates its candidates with) applied to its operands' tables; a
-class the core has no function for is lambdified. Nothing imports the module yet.
+class the core has no function for is refused. Nothing imports the module yet.
 """
 
 from __future__ import annotations
@@ -268,12 +268,6 @@ class SumRealization(SymbolicRealization):
         return SumRealization(factor * self.constant, terms, self.positions)
 
 
-# Each symbol's input: the variable that picks its value, and the symbol's value at
-# each of that variable's values, from its lowest to its highest.
-Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
-Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
-
-
 # --------------------------------------------------------------------- a node's list
 
 
@@ -287,11 +281,10 @@ Form: TypeAlias = "str | sympy.Rational | None"
 def _evaluate(
     expr: sympy.Basic, forms: tuple[Form, ...], arguments: Sequence[np.ndarray]
 ) -> Any:
-    """expr's list from arguments, its operands' lists in the forms they take: by the
-    numpy core's function of its class, or by its class lambdified (_lambdified) when
-    the core has none. A condition is compared with 0, and a Mul divides its other
-    factors' product by the bases of the factors it divides by, as lambdify prints a
-    quotient: 98/a, where 98*(1/a) floors one low at a = 49."""
+    """expr's list from arguments, its operands' lists in the forms they take, by the
+    numpy core's function of its class. A condition is compared with 0, and a Mul
+    divides its other factors' product by the bases of the factors it divides by, as
+    lambdify prints a quotient: 98/a, where 98*(1/a) floors one low at a = 49."""
     plain = [
         argument != 0 if form == CONDITION else argument
         for argument, form in zip(arguments, forms)
@@ -302,46 +295,8 @@ def _evaluate(
         for argument, form in zip(arguments, forms)
         if not (form is None or form == CONDITION)
     ]
-    try:
-        value = numpy_eval(expr, plain)
-    except NotImplementedError:
-        return _apply(_lambdified(expr.func, forms), arguments)
+    value = numpy_eval(expr, plain)
     return value / math.prod(divisors) if divisors else value
-
-
-def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
-    """The function of a node of sympy class func whose operands take forms, lambdified
-    with the numpy module over one placeholder per operand: for a class the numpy core
-    has no function for. Nothing keeps it.
-
-    The placeholders are plain symbols with identifier names: when one is a Dummy,
-    lambdify renames every argument and rebuilds the node each time (a Min of 35
-    operands took 10.5 s, against 0.28 s). A condition is compared with 0, a Piecewise
-    pairs its operands, and a Mul raises the base of a factor it divides by to the
-    factor's exponent, so a quotient is divided as lambdify prints it: 98/a, where
-    98*(1/a) floors one low at a = 49."""
-    placeholders = [sympy.Symbol(f"operand{i}") for i in range(len(forms))]
-    args = [
-        p if form is None else sympy.Ne(p, 0) if form == CONDITION else p**form
-        for p, form in zip(placeholders, forms)
-    ]
-    if func is sympy.Piecewise:
-        expr = sympy.Piecewise(*zip(args[0::2], args[1::2]))
-    else:
-        expr = func(*args)
-    return sympy.lambdify(placeholders, expr, modules="numpy")
-
-
-def _apply(func: Callable[..., Any], arguments: Sequence[np.ndarray]) -> Any:
-    """func on its operands' lists. A function that takes scalars only, as
-    RelayoutCharge's ``_imp_`` does, raises TypeError or ValueError on arrays and is
-    applied point by point. Only such implemented functions are meant to reach that
-    retry: a bug that raises either on arrays is retried too, and refused as no
-    value only if it fails on a point as well."""
-    try:
-        return np.asarray(func(*arguments), dtype=float)
-    except (TypeError, ValueError):
-        return np.array([func(*point) for point in zip(*arguments)], dtype=float)
 
 
 def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.ndarray:
@@ -352,8 +307,6 @@ def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.nda
             result = np.asarray(compute(), dtype=float)
         except RecursionError:
             raise
-        except NameError as exc:
-            raise TableLoweringError(expr, f"no numeric value ({exc})") from exc
         except Exception as exc:
             raise TableLoweringError(
                 expr, f"no value ({type(exc).__name__}: {exc})"
@@ -412,12 +365,18 @@ class TableLowering(Printer):
     """A sympy Printer whose print of a node is its realization. A print method
     returns None to decline a node, which is then one table over its inputs.
 
-    inputs gives each symbol's variable and values; cap bounds one table's entries.
+    inputs gives each symbol's variable and the symbol's value at each of the
+    variable's values, lowest first; cap bounds one table's entries.
     A printer is for one set of inputs: it keeps each node's realization, so a shared
     subexpression is printed once.
     """
 
-    def __init__(self, inputs: Inputs, *, cap: int) -> None:
+    def __init__(
+        self,
+        inputs: Mapping[sympy.Symbol, tuple[cp_model.IntVar, Sequence[float]]],
+        *,
+        cap: int,
+    ) -> None:
         super().__init__()
         self.inputs = inputs
         self.cap = cap
