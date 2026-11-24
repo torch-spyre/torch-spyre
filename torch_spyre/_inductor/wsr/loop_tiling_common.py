@@ -1371,13 +1371,13 @@ def _retile_load_index(
     tile-local coefficients retain the general decomposition supported by that
     helper.
 
-    When ``consumer`` is given AND has no loop_info of its own (i.e. it is an
+    When ``consumer`` is given AND has no loop_member of its own (i.e. it is an
     "outside" consumer with no enclosing coarse-tile loop nest), any dim
     squeezed out of the old (tile-local) buffer but real in the new (full)
     buffer -- see _squeezed_retile_dims -- is added back as an explicit
     ``consumer``-own-symbol * new_stride term, since compute_tile_index
     cannot rescale a coefficient that isn't in the incoming index at all.
-    Inside consumers (those with their own loop_info) are never patched this
+    Inside consumers (those with their own loop_member) are never patched this
     way: their incoming index is already derived from a real, enclosing loop
     nest via normal codegen and already carries a correct term for every
     real dimension -- adding another would double-count it. Only meaningful
@@ -1474,10 +1474,10 @@ def _retile_load_index(
         new_index += preserved_index
 
     # The squeezed-dim term injection is only meaningful for a consumer with
-    # no loop_info of its own -- an "outside" consumer whose incoming index
+    # no loop_member of its own -- an "outside" consumer whose incoming index
     # was traced against buf_name's tile-local (squeezed) layout with no
     # enclosing coarse-tile loop nest to supply a term for a dim that layout
-    # squeezed away. An "inside" consumer (has loop_info) already derives its
+    # squeezed away. An "inside" consumer (has loop_member) already derives its
     # index from a real, enclosing loop nest that supplies a correct term for
     # every one of *its own* real dimensions; injecting anyway adds a bogus
     # term for any dim this consumer tiles as an output dim but that the new

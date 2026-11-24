@@ -37,7 +37,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
-from torch_spyre._inductor.loop_info import LoopInfo
+from torch_spyre._inductor.loop_node import LoopMember
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -277,7 +277,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     @staticmethod
     def _tiled(loop_count):
-        return LoopInfo(
+        return LoopMember(
             loop_group_id=(0,) * len(loop_count),
             loop_count=loop_count,
             loop_tiled_dims=[[] for _ in loop_count],
@@ -285,15 +285,15 @@ class TestCoarseTileLoopTripCount(TestCase):
         )
 
     def test_untiled_op_is_one_trip(self):
-        op = types.SimpleNamespace(loop_info=None)
+        op = types.SimpleNamespace(loop_member=None)
         self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
     def test_single_level_concrete_count(self):
-        op = types.SimpleNamespace(loop_info=self._tiled([4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
     def test_nested_levels_multiply(self):
-        op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([2, 4]))
         self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
 
     _UNRESOLVED = mock.patch(
@@ -306,7 +306,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         one trip, not propagated as a symbol into RelayoutCandidate.cost_ns
         (a float consumed by min()/round() in the solver)."""
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n]))
         with self._UNRESOLVED:
             self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
 
@@ -327,7 +327,7 @@ class TestCoarseTileLoopTripCount(TestCase):
 
     def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n, 4]))
         with self._UNRESOLVED:
             self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
@@ -335,7 +335,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         """An unbacked count is one trip, not the unbacked-symint fallback hint
         that concretize_expr would return."""
         u = sympy.Symbol("u0", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([u // 8, 4]))
+        op = types.SimpleNamespace(loop_member=self._tiled([u // 8, 4]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=1024
         ) as concretize:
@@ -346,7 +346,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         """A symbolic count that concretize_expr resolves (the declared maximum
         or the hint) is priced at that value, not as one trip."""
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n // 8, 2]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n // 8, 2]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
         ):
@@ -357,7 +357,7 @@ class TestCoarseTileLoopTripCount(TestCase):
         from torch_spyre._inductor.cost_features import _loop_features
 
         n = sympy.Symbol("n", positive=True, integer=True)
-        op = types.SimpleNamespace(loop_info=self._tiled([n // 8]))
+        op = types.SimpleNamespace(loop_member=self._tiled([n // 8]))
         with mock.patch(
             "torch_spyre._inductor.pass_utils.concretize_expr", return_value=32
         ):
