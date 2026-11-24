@@ -364,11 +364,15 @@ the lowering's `loop_member`.
 `loop_facts` answers membership: what a loop tiles and how an access advances. It
 does not say how often an op runs or when a buffer is live. The flat order a pass
 sees (`graph.operations`, `all_ops`) is program order, not execution count or time,
-so do not derive those from positions. `loop_queries.LoopProgram` answers them from
-one walk of the program, built as `LoopProgram(graph)`, or as
-`LoopProgram(graph.operations, input_names=graph.graph_input_names)` (without the
-input names, a graph input written inside a loop is taken to be born in it). It
-describes the graph as it was when built: after an edit, build a new one:
+so do not derive those from positions (ordering itself, "does A come before B", is
+fine). `loop_queries.LoopProgram` answers them from one walk of the program, built
+as `LoopProgram(graph)`, or as
+`LoopProgram(graph.operations, input_names=graph.graph_input_names)`; built from a
+list without input names it answers the loop queries but refuses buffer queries,
+since it cannot tell a graph input from a buffer born in a loop. A program describes
+one state of the graph: build it once per pass and ask it everything, and build a new
+one after an edit. Building one per query, inside a loop over candidates, turns a
+linear walk into a quadratic one.
 
 | Method | Answer |
 |---|---|
@@ -379,8 +383,10 @@ describes the graph as it was when built: after an edit, build a new one:
 | `slot(op)`, `time(op)` | the op's position in program order, and the slot it takes effect at |
 | `uses(buffer)`, `runtime_reads(buffer)`, `live_interval(buffer)` | the times of the ops that touch a buffer, how many times it is read when run, and the slots it is live over |
 
-Until stage A0.5, an extern kernel placed in a body is answered as running once,
-before its outermost loop, because that is where the loop scheduler runs it.
+An extern kernel placed in a body is answered as running once, before its outermost
+loop: Spyre cannot run one inside a counted loop, and the loop scheduler moves it
+there. Moving such kernels out of bodies in the IR itself, so that where an op sits
+always says how it runs, is planned in #6675.
 
 ### The advance comes from the index
 

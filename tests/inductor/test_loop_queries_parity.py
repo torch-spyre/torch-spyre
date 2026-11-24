@@ -21,7 +21,12 @@ buffer: the model's ``live_interval`` and ``uses``, and today's
 ``calculate_liveness`` with ``counted_loop_lifetime_overrides`` applied. They must
 agree, except where :func:`classified` names a difference the design expects: the
 model answers *execution*, today's liveness answers *membership* (the design's
-"Three relations, kept apart").
+"Three relations, kept apart"). A classified difference must still go the expected
+way (:func:`difference_is_expected`), and ``uses`` must agree for every buffer once
+an extern kernel in a body is timed at its loop's start.
+
+The hand-off is after the pass loop, so the graphs include what LX planning added
+(clones, pad buffers, relayouts).
 """
 
 import contextlib
@@ -30,16 +35,21 @@ from unittest import mock
 
 import pytest
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.loop_facts import counted_loop_path
 from torch_spyre._inductor.loop_node import LoopNode, OpsView
-from torch_spyre._inductor.loop_queries import LoopProgram, _runs_once
+from torch_spyre._inductor.loop_queries import LoopProgram
 from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.scratchpad.utils import (
     calculate_liveness,
     counted_loop_lifetime_overrides,
 )
 
+from for_each_tile_fixtures import (
+    paged_gather_kv_inputs,
+    paged_gather_kv_one_hinted_fn,
+)
 from test_loop_queries import _Alloc, _Extern, _Op
 from test_loop_scheduler_review import (
     _CASES as _REVIEW_CASES,
@@ -49,10 +59,18 @@ from test_loop_scheduler_review import (
 )
 
 # The review file's cases, plus the one real graph with an extern kernel (the
-# FallbackKernel behind cumsum's triu mask) in a loop body at the hand-off.
+# FallbackKernel behind cumsum's triu mask) in a loop body at the hand-off, and the
+# two-scan paged gather, whose LX input clones the allocator hoists before their
+# loops (``test_lx_input_clone_hoisted_before_a_loop_runs_once``; placement-only LX
+# planning, as there, because the co-optimizing solve varies between compiles).
 _CASES = {
     **_REVIEW_CASES,
     "cumsum_split_k": (_cumsum_split_k_fn, _matmul_inputs, None),
+    "paged_gather_kv_lx_clones": (
+        paged_gather_kv_one_hinted_fn,
+        paged_gather_kv_inputs,
+        lambda: config.patch({"co_optimizing_lx_planning": False}),
+    ),
 }
 
 
@@ -76,13 +94,6 @@ def legacy_interval(
     return (start, end)
 
 
-def _placement(program: LoopProgram, op) -> tuple:
-    """The loops whose ``LoopNode`` bodies hold ``op``, outermost first; ``()`` at
-    the top level. Read from the program's own walk (``LoopProgram`` keeps the
-    placement it records per leaf), so it holds on any tree, hand-built or not."""
-    return program._leaf(op).placement
-
-
 def classified(program: LoopProgram, name: str) -> str | None:
     """Why ``program``'s answer for ``name`` may differ from today's liveness, or
     ``None`` when the two must agree.
@@ -103,17 +114,42 @@ def classified(program: LoopProgram, name: str) -> str | None:
 
     Stage A3 uses this to tell an expected difference from one it must classify."""
     for op in program.ops():
-        placement = _placement(program, op)
+        placement = program.placement(op)
         if not placement:
             continue
         rw = op_read_writes(op)
         if name not in {d.name for d in rw.reads | rw.writes}:
             continue
-        if _runs_once(op):
+        if not program.loops_of(op):  # placed in a body, runs once before it
             return "extern-in-body"
         if counted_loop_path(op) != tuple(loop.node.group_id for loop in placement):
             return "non-member-in-body"
     return None
+
+
+def difference_is_expected(
+    classification: str | None,
+    model: tuple[int, int] | None,
+    legacy: tuple[int, int] | None,
+) -> bool:
+    """Whether the model's lifetime differs from today's the way ``classification``
+    predicts (equal is always fine).
+
+    * ``"non-member-in-body"``: the op runs every trip, so the model's interval
+      covers today's (the loop widening can only add).
+    * ``"extern-in-body"``: the op runs once, before the loop, so the model's
+      interval can only move earlier: neither end later than today's.
+
+    Anything else, including an unclassified difference, is not expected."""
+    if model == legacy:
+        return True
+    if model is None or legacy is None:
+        return False
+    if classification == "non-member-in-body":
+        return model[0] <= legacy[0] and model[1] >= legacy[1]
+    if classification == "extern-in-body":
+        return model[0] <= legacy[0] and model[1] <= legacy[1]
+    return False
 
 
 def _answers(graph) -> dict:
@@ -129,13 +165,22 @@ def _answers(graph) -> dict:
     for op in program.ops():
         rw = op_read_writes(op)
         names |= {d.name for d in rw.reads | rw.writes}
+    # Today's liveness times an extern kernel in a body at its slot; the model, at
+    # its outermost loop's start. Everything else has the same time in both.
+    moved = {
+        program.slot(op): program.time(op)
+        for op in program.ops()
+        if program.placement(op) and not program.loops_of(op)
+    }
     out = {}
     for name in sorted(names):
+        legacy_uses = list(liveness.get(name, ()))
         out[name] = {
             "model": program.live_interval(name),
             "legacy": legacy_interval(liveness, starts, ends, name),
             "model_uses": program.uses(name),
-            "legacy_uses": list(liveness.get(name, ())),
+            "legacy_uses": legacy_uses,
+            "expected_uses": sorted({moved.get(u, u) for u in legacy_uses}),
             "classification": classified(program, name),
         }
     return out
@@ -180,25 +225,30 @@ def _diffs_at_hand_off(case: str) -> dict:
 
 @pytest.mark.parametrize("case", sorted(_CASES))
 def test_live_intervals_match_todays_liveness_except_classified_differences(case):
+    # A classified difference must still go the way its classification predicts.
     diffs = _diffs_at_hand_off(case)
-    unexplained = {n: d for n, d in diffs.items() if d[2] is None}
-    assert not unexplained, unexplained
+    wrong = {
+        n: d for n, d in diffs.items() if not difference_is_expected(d[2], d[0], d[1])
+    }
+    assert not wrong, wrong
 
 
 @pytest.mark.parametrize("case", sorted(_CASES))
-def test_uses_match_calculate_liveness_for_unclassified_buffers(case):
+def test_uses_match_calculate_liveness_with_externs_timed_at_their_loop(case):
+    # Every buffer, classified or not: the model's uses are today's, with an extern
+    # kernel in a body timed at its outermost loop's start.
     mismatched = {
-        f"{i}:{name}": (a["model_uses"], a["legacy_uses"])
+        f"{i}:{name}": (a["model_uses"], a["expected_uses"])
         for i, graph in enumerate(_at_hand_off(case))
         for name, a in graph.items()
-        if a["classification"] is None and a["model_uses"] != a["legacy_uses"]
+        if a["model_uses"] != a["expected_uses"]
     }
     assert not mismatched, mismatched
 
 
-# The helpers on hand-built trees (CPU, stub ops): the compiled cases above hold
-# no extern kernel or non-member op in a body, so these are what exercise the
-# classifications.
+# The helpers on hand-built trees (CPU, stub ops). Of the compiled cases above only
+# cumsum_split_k has an op the classifications name (an extern kernel in a body),
+# and none has a non-member op in a body, so these exercise the rest.
 
 
 def _body(*ops):
@@ -211,6 +261,20 @@ def test_legacy_interval_applies_the_overrides_with_an_exclusive_end():
     assert legacy_interval(liveness, {"x": 1}, {"x": 8}, "x") == (1, 7)
     assert legacy_interval(liveness, {}, {}, "in0") is None
     assert legacy_interval(liveness, {}, {}, "nope") is None
+
+
+def test_difference_is_expected_accepts_only_the_predicted_direction():
+    assert difference_is_expected(None, (1, 4), (1, 4))
+    assert not difference_is_expected(None, (1, 4), (2, 4))
+    # A non-member runs every trip: the model may only cover more.
+    assert difference_is_expected("non-member-in-body", (0, 5), (1, 4))
+    assert not difference_is_expected("non-member-in-body", (2, 4), (1, 4))
+    assert not difference_is_expected("non-member-in-body", (1, 3), (1, 4))
+    # An extern runs once, before the loop: the model may only move earlier.
+    assert difference_is_expected("extern-in-body", (0, 3), (2, 6))
+    assert not difference_is_expected("extern-in-body", (2, 7), (2, 6))
+    assert not difference_is_expected("extern-in-body", (3, 6), (2, 6))
+    assert not difference_is_expected("extern-in-body", None, (2, 6))
 
 
 def test_classified_names_an_extern_kernel_in_a_body():

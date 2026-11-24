@@ -86,14 +86,14 @@ is only safe when the swap is addressing-equivalent.
 ## Asking loop questions
 
 The flat order (`graph.operations` in a pass, `all_ops`) is program order, not
-execution count or time. Do not derive how often an op runs, which loops two ops
-share, or a buffer's lifetime from positions in it. Ask
-`loop_queries.LoopProgram(graph)` (or `LoopProgram(graph.operations,
-input_names=graph.graph_input_names)`; build a new one after an edit)
-(`executions`, `shared_loops`,
-`same_iteration`, `span`, `uses`, `runtime_reads`, `live_interval`). Ask
-`loop_facts` for what a loop tiles and how an access advances
-(`enclosing_loops`, `read_advance`).
+execution count or time. Ordering ("does A come before B") is fine; do not derive
+how often an op runs, which loops two ops share, or a buffer's lifetime from
+positions in it. Ask `loop_queries.LoopProgram` for those (`executions`,
+`shared_loops`, `same_iteration`, `span`, `uses`, `runtime_reads`,
+`live_interval`). Build it from the graph, `LoopProgram(graph)`, once per pass and
+again after an edit; from a list, pass
+`input_names=graph.graph_input_names`. Ask `loop_facts` for what a loop tiles
+and how an access advances (`enclosing_loops`, `read_advance`).
 
 ## Test execution conventions
 

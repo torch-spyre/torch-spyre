@@ -214,7 +214,9 @@ def test_nested_pending_loops_are_shared_by_group_path():
 def test_a_value_born_outside_and_read_inside_lives_for_the_whole_loop():
     x = _Op("x", writes=["x"])
     r = _Op("r", reads=["x"])
-    p = LoopProgram([x, _node("n0", [_Op("k0"), r, _Op("k2")], trip=4), _Op("z")])
+    p = LoopProgram(
+        [x, _node("n0", [_Op("k0"), r, _Op("k2")], trip=4), _Op("z")], input_names=()
+    )
     assert p.uses("x") == [0, 2] and p.live_interval("x") == (0, 3)
 
 
@@ -222,13 +224,15 @@ def test_a_body_temporary_keeps_a_per_trip_lifetime():
     alloc = _Alloc("t")
     w = _Op("w", writes=["t"])
     r = _Op("r", reads=["t"])
-    p = LoopProgram([_node("n0", [_Op("k"), alloc, w, r, _Op("k2")], trip=4)])
+    p = LoopProgram(
+        [_node("n0", [_Op("k"), alloc, w, r, _Op("k2")], trip=4)], input_names=()
+    )
     assert p.live_interval("t") == (1, 3)
 
 
 def test_a_write_inside_a_loop_does_not_widen():
     x, w = _Op("x", writes=["x"]), _Op("w", writes=["x"])
-    p = LoopProgram([x, _node("n0", [_Op("k"), w, _Op("k2")], trip=4)])
+    p = LoopProgram([x, _node("n0", [_Op("k"), w, _Op("k2")], trip=4)], input_names=())
     assert p.live_interval("x") == (0, 2)
 
 
@@ -237,13 +241,15 @@ def test_a_carry_storage_covers_its_loop():
     upd = _Op("upd", reads=["acc"], writes=["acc"])
     rec = LoopCarryRecord(storage_name="acc", update_name="upd")
     n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
-    assert LoopProgram([init, n]).live_interval("acc") == (0, 3)
+    assert LoopProgram([init, n], input_names=()).live_interval("acc") == (0, 3)
 
 
 def test_runtime_reads_count_each_reading_op_per_execution():
     x, r = _Op("x", writes=["x"]), _Op("r", reads=["x"])
     inner = _node("n1", [r], trip=3)
-    p = LoopProgram([x, _node("n0", [inner], trip=4), _Op("z", reads=["x"])])
+    p = LoopProgram(
+        [x, _node("n0", [inner], trip=4), _Op("z", reads=["x"])], input_names=()
+    )
     assert p.runtime_reads("x") == 13
 
 
@@ -251,12 +257,13 @@ def test_an_unused_buffer_has_no_uses_and_no_lifetime():
     p = LoopProgram(SimpleNamespace(operations=[_Op("a")], graph_input_names=["in0"]))
     assert p.uses("in0") == [] and p.live_interval("in0") is None
     assert p.live_interval("nope") is None
-    assert p.input_names() == ("in0",) and LoopProgram([]).input_names() == ()
+    assert p.input_names() == ("in0",)
+    assert LoopProgram([], input_names=()).input_names() == ()
 
 
 def test_one_op_reaching_a_buffer_twice_counts_once():
     r = _Op("r", reads=["x", "x@512"])
-    p = LoopProgram([_Op("x", writes=["x"]), _node("n0", [r], trip=4)])
+    p = LoopProgram([_Op("x", writes=["x"]), _node("n0", [r], trip=4)], input_names=())
     assert p.uses("x") == [0, 1] and p.runtime_reads("x") == 4
 
 
@@ -265,10 +272,12 @@ def test_a_carry_alone_widens_a_storage_that_is_only_written_in_the_loop():
     upd = _Op("upd", writes=["acc"])
     rec = LoopCarryRecord(storage_name="acc", update_name="upd")
     n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
-    assert LoopProgram([init, n]).live_interval("acc") == (0, 3)
+    assert LoopProgram([init, n], input_names=()).live_interval("acc") == (0, 3)
     # Without the carry, a write inside the loop does not widen.
     plain = _node("n0", [_Op("k"), _Op("upd", writes=["acc"]), _Op("k2")], trip=4)
-    assert LoopProgram([_Op("init", writes=["acc"]), plain]).live_interval("acc") == (
+    assert LoopProgram(
+        [_Op("init", writes=["acc"]), plain], input_names=()
+    ).live_interval("acc") == (
         0,
         2,
     )
@@ -287,7 +296,7 @@ def test_an_inner_carry_reset_every_outer_trip_does_not_cover_the_outer_loop():
         trip=4,
         carries=[rec],
     )
-    assert LoopProgram([outer]).live_interval("acc") == (1, 4)
+    assert LoopProgram([outer], input_names=()).live_interval("acc") == (1, 4)
 
 
 def test_a_carry_first_written_in_its_own_loop_still_covers_the_loop():
@@ -296,7 +305,9 @@ def test_a_carry_first_written_in_its_own_loop_still_covers_the_loop():
     rec = LoopCarryRecord(storage_name="acc", update_name="upd")
     upd = _Op("upd", reads=["acc"], writes=["acc"])
     n = _node("n0", [_Op("k"), upd, _Op("k2")], trip=4, carries=[rec])
-    assert LoopProgram([_Op("a"), n, _Op("z")]).live_interval("acc") == (1, 3)
+    assert LoopProgram([_Op("a"), n, _Op("z")], input_names=()).live_interval(
+        "acc"
+    ) == (1, 3)
     # An initializer placed in the carry loop's own body (a non-member clone, say).
     upd2 = _Op("upd", reads=["acc"], writes=["acc"])
     n2 = _node(
@@ -305,7 +316,9 @@ def test_a_carry_first_written_in_its_own_loop_still_covers_the_loop():
         trip=4,
         carries=[rec],
     )
-    assert LoopProgram([_Op("a"), n2, _Op("z")]).live_interval("acc") == (1, 4)
+    assert LoopProgram([_Op("a"), n2, _Op("z")], input_names=()).live_interval(
+        "acc"
+    ) == (1, 4)
 
 
 def test_a_graph_input_mutated_in_a_loop_is_born_outside_it():
@@ -335,7 +348,7 @@ def test_an_unresolved_carry_widens_to_its_listing_node_in_either_order():
             trip=4,
             carries=[recs[i] for i in order],
         )
-        p = LoopProgram([_Op("a"), _Op("b2", writes=["b2"]), outer])
+        p = LoopProgram([_Op("a"), _Op("b2", writes=["b2"]), outer], input_names=())
         assert p.span(p.loop_for(outer)) == (2, 5)
         assert p.live_interval("b2") == (1, 5), order
 
@@ -364,6 +377,27 @@ def test_input_names_keyword_gives_the_graph_answer_from_operations():
             SimpleNamespace(operations=ops, graph_input_names=["in0"]),
             input_names=["in0"],
         )
+
+
+def test_a_buffer_query_without_input_names_raises_but_loop_queries_work():
+    # Built from a list, the program cannot tell a graph input from a buffer born
+    # in the loop, so a buffer query must not guess.
+    x = _Op("x")
+    p = LoopProgram([_node("n0", [x], trip=4)])
+    assert p.executions(x) == 4 and p.slot(x) == 0
+    for query in (p.uses, p.live_interval, p.runtime_reads):
+        with pytest.raises(ValueError, match="input_names"):
+            query("x")
+    with pytest.raises(ValueError, match="input_names"):
+        p.input_names()
+
+
+def test_placement_and_execution_differ_only_for_an_extern_in_a_body():
+    k, ext = _Op("k"), _Extern("ext")
+    n = _node("n0", [k, ext], trip=4)
+    p = LoopProgram([n], input_names=())
+    assert p.placement(k) == p.loops_of(k) == (p.loop_for(n),)
+    assert p.placement(ext) == (p.loop_for(n),) and p.loops_of(ext) == ()
 
 
 def test_executions_is_a_sympy_integer_with_no_loops():

@@ -19,9 +19,10 @@ Three relations are kept apart:
 * *placement*: the ``LoopNode`` bodies an op sits in (the tree);
 * *execution*: how the op actually runs. An op placed in a body runs every trip of
   each node it sits in. That includes a non-member LX clone in a body and an
-  allocation (a zero-element buffer, ``is_no_op()``): with pooled allocation an
-  allocation is a static address reservation, so modelling it as happening every
-  trip, where it is placed, is exact. The one exception today is an extern kernel
+  allocation (a zero-element buffer, ``is_no_op()``): an allocation computes
+  nothing and the loop's kernel is emitted with its buffers already reserved, so
+  modelling it as happening every trip, where it is placed, changes no answer about
+  when its buffer holds a value. The one exception today is an extern kernel
   in a body, which the loop scheduler moves before its outermost loop because
   Spyre's codegen cannot run one inside a counted loop;
 * *membership*: whether a node holds a tiling entry for the op (what it tiles, how
@@ -29,12 +30,19 @@ Three relations are kept apart:
   ``counted_loop_path``) and is not what these queries answer.
 
 Every query here is about execution. The program is the leaf ops in program order,
-numbered from 0: an op's *slot*. Everything is computed once, in ``__init__``, from
-one walk; nothing is stored on the IR ops. The program describes the graph as it
-was when built (the buffer index is filled lazily, on the first buffer query, from
-the ops' accesses at that moment): after any edit, a list edit or an ``inner_fn``
-rewrite, build a new one. Built from ``graph.operations`` or a list, a program
-does not know the graph's inputs; pass ``input_names`` (or build from the graph).
+numbered from 0: an op's *slot*. ``__init__`` walks the tree once for the loop
+structure; the buffer index is built on the first buffer query, from the ops'
+accesses at that moment. Nothing is stored on the IR ops.
+
+A program describes one state of the graph. Build it once per graph state, per
+pass, and ask it everything; after any edit (a list edit or an ``inner_fn``
+rewrite) build a new one. Building one per query inside a loop over candidates
+turns a linear walk into a quadratic one.
+
+Built from the graph, a program knows the graph's inputs. Built from
+``graph.operations`` or a list, it answers the loop queries, but a buffer query
+raises ``ValueError`` unless ``input_names`` was given: an input written inside a
+loop is born outside it, which the program could not know otherwise.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ from typing import Any
 import sympy
 from torch._inductor.ir import ExternKernel, Operation
 
-from .loop_facts import _in_built_node, pending_levels
+from .loop_facts import in_built_node, pending_levels
 from .loop_node import LoopNode, OpsView
 from .pass_utils import op_read_writes, trip_count_estimate
 
@@ -100,21 +108,24 @@ class _BufferIndex:
 class LoopProgram:
     """The loop structure of a graph's operations, answered per op."""
 
-    def __init__(self, source, *, input_names: Iterable[str] = ()) -> None:
+    def __init__(self, source, *, input_names: Iterable[str] | None = None) -> None:
         """``source`` is a graph, ``graph.operations`` or a list of ops/nodes.
 
-        A graph supplies its own input names. For any other source, pass
-        ``input_names`` if the ops touch graph inputs: an input written inside a
-        loop is born outside it, which the program cannot know otherwise. Giving
-        both a graph and ``input_names`` raises ``ValueError``."""
+        A graph supplies its own input names. For any other source, a buffer query
+        needs ``input_names`` (``()`` when the ops touch no graph input) and raises
+        ``ValueError`` without it. Giving both a graph and ``input_names`` raises
+        ``ValueError``."""
         graph_inputs = getattr(source, "graph_input_names", None)
-        input_names = tuple(input_names)
-        if graph_inputs is not None and input_names:
+        if graph_inputs is not None and input_names is not None:
             raise ValueError(
                 "input_names: the graph already has graph_input_names; pass one"
             )
-        self._input_names: tuple[str, ...] = (
-            tuple(graph_inputs) if graph_inputs is not None else input_names
+        self._input_names: tuple[str, ...] | None = (
+            tuple(graph_inputs)
+            if graph_inputs is not None
+            else None
+            if input_names is None
+            else tuple(input_names)
         )
         self._index: _BufferIndex | None = None
         if hasattr(source, "operations"):
@@ -149,7 +160,7 @@ class LoopProgram:
                 loops: tuple[Loop, ...] = ()
             elif stack:
                 loops = stack
-            elif not _in_built_node(op) and (levels := pending_levels(op)):
+            elif not in_built_node(op) and (levels := pending_levels(op)):
                 made = []
                 for level in levels:
                     path = tuple(level.group_path)
@@ -179,7 +190,14 @@ class LoopProgram:
         return self._leaf(op).slot
 
     def loops_of(self, op: Operation) -> tuple[Loop, ...]:
+        """The loops ``op`` executes in, outermost first."""
         return self._leaf(op).loops
+
+    def placement(self, op: Operation) -> tuple[Loop, ...]:
+        """The node loops whose bodies hold ``op``, outermost first. It differs from
+        ``loops_of`` for an op that does not run every trip where it is placed
+        (today, an extern kernel in a body)."""
+        return self._leaf(op).placement
 
     def outermost(self, op: Operation) -> Loop | None:
         loops = self._leaf(op).loops
@@ -240,11 +258,20 @@ class LoopProgram:
     # of this program object only, so nothing outlives an edit of the graph.
 
     def input_names(self) -> tuple[str, ...]:
+        return self._known_inputs()
+
+    def _known_inputs(self) -> tuple[str, ...]:
+        if self._input_names is None:
+            raise ValueError(
+                "a buffer query needs the graph's input names: build the program "
+                "from the graph, or pass input_names= (() when there are none)"
+            )
         return self._input_names
 
     def _buffers(self) -> _BufferIndex:
         if self._index is not None:
             return self._index
+        inputs = self._known_inputs()
         index = _BufferIndex()
         first: dict[str, tuple[int, Operation, bool]] = {}  # time, op, is a write
         times: dict[str, set[int]] = {}
@@ -263,7 +290,7 @@ class LoopProgram:
                     first[name] = (t, op, name in written)
             for name in read:
                 index.readers.setdefault(name, []).append(op)
-        for name in self._input_names:
+        for name in inputs:
             times.setdefault(name, set())
         index.uses = {name: sorted(ts) for name, ts in times.items()}
         # A carry crosses the back edge of its own loop: the node whose body holds
@@ -292,7 +319,7 @@ class LoopProgram:
             lo, hi = ts[0], ts[-1]
             _, writer, wrote = first[name]
             # A graph input is born outside every loop, whoever writes it later.
-            born_in = wrote and name not in self._input_names
+            born_in = wrote and name not in inputs
             birth = self._leaf(writer).loops if born_in else ()
             widen = list(carried.get(name, ()))
             for op in index.readers.get(name, ()):
