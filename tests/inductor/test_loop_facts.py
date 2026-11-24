@@ -20,7 +20,6 @@ from unittest.mock import MagicMock
 import torch  # noqa: F401
 import sympy
 from torch._inductor.ir import ExternKernel
-from torch._inductor.scheduler import SchedulerNode
 
 from torch_spyre._inductor.cost_model_pass import _loop_group_id as cost_gid
 from torch_spyre._inductor.loop_facts import (
@@ -52,12 +51,6 @@ def _extern(info):
     op = MagicMock(spec=ExternKernel)
     op.loop_member = info
     return op
-
-
-def _snode(info):
-    sn = MagicMock(spec=SchedulerNode)
-    sn.node = _op(info)
-    return sn
 
 
 def test_flat_op():
