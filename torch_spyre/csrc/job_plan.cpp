@@ -17,7 +17,6 @@
 #include "job_plan.h"
 
 #include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -26,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include "logging.h"
 #include "spyre_composite_address.h"
 #include "spyre_mem.h"
 #include "spyre_pinned_allocator.h"
@@ -34,9 +34,6 @@
 namespace spyre {
 
 namespace {
-
-// Device sticks, and so flex's pinned DMA sizes, are 128-byte aligned.
-constexpr size_t kStickBytes = 128;
 
 struct CorrectionUploadCounters {
   std::atomic<uint64_t> launches{0};
@@ -48,14 +45,6 @@ struct CorrectionUploadCounters {
 CorrectionUploadCounters& correction_upload_counters() {
   static CorrectionUploadCounters counters;
   return counters;
-}
-
-// TORCH_SPYRE_FULL_CORRECTION_UPLOAD=1 keeps every correction upload whole and
-// on the path it took before the loop prefix, as an escape hatch and for
-// comparisons. Read per launch so a test can set it in process.
-bool full_correction_upload_forced() {
-  const char* value = std::getenv("TORCH_SPYRE_FULL_CORRECTION_UPLOAD");
-  return value != nullptr && value[0] == '1';
 }
 
 }  // namespace
@@ -244,12 +233,13 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
 
 bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
                                                   size_t* bytes) const {
-  if (address_table_bytes_ == 0 || reads_input_.empty() ||
-      correction_size_ <= address_table_bytes_) {
+  if (!prefix_candidate_) {
     return false;
   }
-  // Exactly one loop dimension: nested symbolic levels multiply the slots in
-  // an order this step does not know.
+  // The loop dimension's slot and maximum live on the SymbolicArg, which
+  // arrives with the launch, so this lookup is the part of the gate that stays
+  // on the launch path. Exactly one loop dimension: nested symbolic levels
+  // multiply the slots in an order this step does not know.
   int dimensions = 0;
   size_t slot = 0;
   int64_t count = 0;
@@ -275,22 +265,30 @@ bool JobPlanStepHostCompute::loopCorrectionPrefix(const LaunchContext& ctx,
   if (dimensions != 1 || count <= 0 || max_count <= 0 || count > max_count) {
     return false;
   }
-  // The loop's own correction is the step whose definitions read the loop
-  // dimension input, which the trip count is derived from. A kernel's other
-  // correction steps never read it.
+  // This check carries the gate. The loop's own correction is the step whose
+  // definitions read the loop dimension input, because the trip count
+  // MIN(DIV_CEIL(dim, G), N) is derived from it, and a kernel's other
+  // correction steps never read it. The layout checks below cannot stand
+  // alone: at a maximum of 32 any blob whose body is a multiple of 4 KiB
+  // divides into stick-aligned copies, a static correction included.
   if (slot >= reads_input_.size() || !reads_input_[slot]) {
     return false;
   }
-  // One stick-aligned copy per candidate iteration behind a stick-aligned
-  // table. Any other layout is left whole.
-  const size_t copies_bytes = correction_size_ - address_table_bytes_;
+  // One stick-aligned copy per candidate iteration behind the table, whose
+  // own alignment was checked at construction. Any other layout stays whole.
+  //
+  // The bytes past copy n stay as the previous launch left them. The device
+  // reads a fixed window from each copy's start, and the entries past a
+  // copy's own flits go to dummy addresses by construction, so the stale
+  // bytes never reach the program. That is backend-internal: an explicit
+  // marker on the Hcm (slot count and bytes per slot) would replace this
+  // inference, and is the follow-up asked of the DeepTools team.
   const size_t copies = static_cast<size_t>(max_count);
-  if (copies_bytes % copies != 0) {
+  if (copies_bytes_ % copies != 0) {
     return false;
   }
-  const size_t stride = copies_bytes / copies;
-  if (stride == 0 || stride % kStickBytes != 0 ||
-      address_table_bytes_ % kStickBytes != 0) {
+  const size_t stride = copies_bytes_ / copies;
+  if (stride == 0 || stride % kStickBytes != 0) {
     return false;
   }
   *bytes = address_table_bytes_ + static_cast<size_t>(count) * stride;
@@ -392,9 +390,13 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   counters.launches++;
   counters.bytes_full += host_buffer->size();
   size_t upload_bytes = host_buffer->size();
-  const bool loop_correction = symbolic && !full_correction_upload_forced() &&
-                               loopCorrectionPrefix(ctx, &upload_bytes);
+  const bool loop_correction =
+      symbolic && loopCorrectionPrefix(ctx, &upload_bytes);
   counters.bytes_sent += upload_bytes;
+  SPYRE_RUNTIME_DEBUG() << "correction upload "
+                        << (loop_correction ? "prefix " : "whole ")
+                        << upload_bytes << " of " << host_buffer->size()
+                        << " bytes";
   if (loop_correction) {
     if (upload_bytes < host_buffer->size()) {
       counters.prefixed++;

@@ -415,20 +415,13 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
   return nullptr;  // unreachable
 }
 
-/**
- * @brief Parse a ComputeOnHost + adjacent DataTransfer-H2D command pair into a
- * single JobPlanStepHostCompute that owns both the produce and the H2D launch.
- *
- * @param hc_props  Properties from the ComputeOnHost command.
- * @param h2d_props Properties from the adjacent DataTransfer H2D command.
- */
-namespace {
-
 // Which host-compute input slots a correction's symbol definitions read, from
 // the Hcm's variable data conversion info: inputSym_ holds one symbol id per
-// input slot and every definition is an array whose terms name a symbol as
-// "V-<id>". An empty result means the metadata did not have this shape, and
-// the launch then uploads the whole correction.
+// input slot and every definition is an array whose terms name a symbol as the
+// letter V followed by the signed id, the spelling the backend writes
+// ("V" + std::to_string(sym) in deeptools' VariableDefinition.cpp), so slot
+// id -3 is the token "V-3". An empty result means the metadata did not have
+// this shape, and the launch then uploads the whole correction.
 std::vector<bool> correctionReadsInputs(const nlohmann::json& hcm) {
   std::vector<bool> reads;
   try {
@@ -443,8 +436,7 @@ std::vector<bool> correctionReadsInputs(const nlohmann::json& hcm) {
     std::vector<std::string> tokens;
     for (const auto& symbol : vdci["inputSym_"]) {
       if (symbol.is_number_integer()) {
-        tokens.push_back("V-" +
-                         std::to_string(std::llabs(symbol.get<int64_t>())));
+        tokens.push_back("V" + std::to_string(symbol.get<int64_t>()));
       } else if (symbol.is_string()) {
         tokens.push_back(symbol.get<std::string>());
       } else {
@@ -475,8 +467,13 @@ std::vector<bool> correctionReadsInputs(const nlohmann::json& hcm) {
   return reads;
 }
 
-}  // namespace
-
+/**
+ * @brief Parse a ComputeOnHost + adjacent DataTransfer-H2D command pair into a
+ * single JobPlanStepHostCompute that owns both the produce and the H2D launch.
+ *
+ * @param hc_props  Properties from the ComputeOnHost command.
+ * @param h2d_props Properties from the adjacent DataTransfer H2D command.
+ */
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
     const nlohmann::json& hc_props, const nlohmann::json& h2d_props) {
   // ---- Parse ComputeOnHost properties ----

@@ -286,9 +286,8 @@ reads pre-mapped memory instead of a shadow copy of the raw host buffer. The
 step recognises the loop's correction from the compiler's metadata (its symbol
 definitions read the loop dimension input and the blob divides into
 stick-aligned copies) and uploads every other correction whole, as before.
-`TORCH_SPYRE_FULL_CORRECTION_UPLOAD=1` restores the whole upload for every
-step, and `torch_spyre._C._correction_upload_stats()` reports the launches,
-the cut uploads and the bytes held and sent.
+`torch_spyre._C._correction_upload_stats()` reports the launches, the cut
+uploads and the bytes held and sent.
 
 The pinned host buffer is allocated once during `prepareKernel` and reused
 across launches. For tiled execution the same buffer cycles through every

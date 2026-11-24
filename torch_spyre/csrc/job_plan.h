@@ -584,6 +584,15 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         ishape_(std::move(ishape)),
         address_table_bytes_(address_table_bytes),
         reads_input_(std::move(reads_input)) {
+    // The launch-independent part of the loop-prefix gate: a known,
+    // stick-aligned table, definitions read off the metadata, and a blob with
+    // copies behind the table. The slot and the maximum come with the launch.
+    if (address_table_bytes_ != 0 && !reads_input_.empty() &&
+        correction_size_ > address_table_bytes_ &&
+        address_table_bytes_ % kStickBytes == 0) {
+      prefix_candidate_ = true;
+      copies_bytes_ = correction_size_ - address_table_bytes_;
+    }
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
@@ -643,6 +652,10 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   std::vector<int64_t> ishape_;
   size_t address_table_bytes_ = 0;  ///< the table leading the blob, 0 unknown
   std::vector<bool> reads_input_;   ///< input slots the definitions read
+  bool prefix_candidate_ = false;   ///< the launch-independent gate passed
+  size_t copies_bytes_ = 0;         ///< the blob behind the table
+  /// Device sticks, and so flex's pinned DMA sizes, are 128-byte aligned.
+  static constexpr size_t kStickBytes = 128;
   std::unique_ptr<flex::HostComputeHandle>
       handle_;  ///< handle to the host compute operation
 };

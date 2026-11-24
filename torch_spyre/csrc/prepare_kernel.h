@@ -228,4 +228,12 @@ std::unique_ptr<JobPlan> prepareKernel(
     std::optional<std::string> profiler_event_name = std::nullopt,
     std::string sdsc_bundle_dir_prefix = {});
 
+/**
+ * @brief Which host-compute input slots a correction's symbol definitions
+ * read, from a ComputeOnHost command's Hcm (its vdci.inputSym_ and
+ * vdci.variableDefs_). One entry per input slot. Empty when the metadata does
+ * not have that shape. Exposed for the host-only test of the loop-prefix gate.
+ */
+std::vector<bool> correctionReadsInputs(const nlohmann::json& hcm);
+
 }  // namespace spyre

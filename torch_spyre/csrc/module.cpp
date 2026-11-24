@@ -314,6 +314,15 @@ PYBIND11_MODULE(_C, m) {
       "Process-lifetime counters of program-correction uploads: host-compute "
       "launches, uploads cut to the current trip count, bytes held by the "
       "correction regions and bytes uploaded");
+  m.def(
+      "_correction_reads_inputs",
+      [](const std::string& hcm_json) {
+        return spyre::correctionReadsInputs(nlohmann::json::parse(hcm_json));
+      },
+      py::arg("hcm_json"),
+      "Per host-compute input slot of a ComputeOnHost command's Hcm (JSON "
+      "text), whether its symbol definitions read that slot; empty when the "
+      "metadata lacks the fields. The loop-prefix gate's input, for tests");
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
