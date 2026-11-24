@@ -43,13 +43,17 @@ everything outside it fails at compile time with a specific message:
   of sharded storage are additionally rejected at construction; box views
   are allowed there but only for copies to the CPU; see
   [Runtime](#runtime-storage-and-addressing-c)).
-* Shard-local strides must equal the global ones (DeepTools strides each
-  core's tiles from the global shape): the shard boundary must fall on
-  whole sticks for a last-dim shard, exactly one (the shard) dim may be
-  divided, and for a shard on a non-last dim rows may not span multiple
-  sticks — a 32×128 fp16 `Shard(0)` tensor fails because the second stick
-  of every row would go unwritten (`_check_local_strides` in
-  `sharded_hbm.py`).
+* Each shard must be a whole device dim of whole sticks: the shard keeps
+  the global device layout's dim structure, the shard boundary falls on
+  whole sticks for a last-dim shard (a stick cannot be split between
+  chunks — a 32×32 fp16 `Shard(1)` tensor fails for that reason), and
+  exactly one (the shard) dim may be divided. Shard-local strides may
+  differ from the global ones: the backend addresses each core's tile with
+  the shard-local layout. Two guards make this safe: `_check_shard_layout`
+  in `sharded_hbm.py` checks the sharding itself (whole device dims, whole
+  sticks), and `verify_non_unified_split` in `sharded_hbm.py` checks that
+  the committed work split lands on the shard dim, so core *c* works
+  exactly on shard *c*.
 * Static shapes only (`dynamic=False`), one dtype across operands and
   output, and `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a
   bundle `input_arg`).
