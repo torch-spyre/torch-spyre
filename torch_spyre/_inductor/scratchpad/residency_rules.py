@@ -27,6 +27,7 @@ class ResidencyChecks(Protocol):
     def restickify(self) -> Optional[str]: ...
     def extern(self) -> Optional[str]: ...
     def multi_output_extern(self) -> Optional[str]: ...
+    def collective(self) -> Optional[str]: ...
     def indirect(self) -> Optional[str]: ...
     def reinterpret_output(self) -> Optional[str]: ...
     def mutated_output(self) -> Optional[str]: ...
@@ -185,6 +186,27 @@ BUFFER_RESIDENCY_RULES = (
             "handles the disabled case."
         ),
         ("test_buffer_residency_adapter_rejection_strings",),
+    ),
+    ResidencyRule(
+        "collective",
+        "read by a collective",
+        lambda c: c.collective(),
+        ("collective reads HBM",),
+        (
+            "Collectives read and reduce their operand in HBM. "
+            "LxContextSwitchingPass does not bracket them, and the extern guard "
+            "handles the disabled case (#6563)."
+        ),
+        ("test_buffer_residency_adapter_rejection_strings",),
+        (
+            ResidencyException(
+                "Drained loop carry",
+                "validated_drain_plans",
+                lambda c: c.drain(),
+                ("collective repointed at the drain",),
+                ("test_a_returned_carry_reduced_in_place_drains_with_its_collective",),
+            ),
+        ),
     ),
     ResidencyRule(
         "indirect",
