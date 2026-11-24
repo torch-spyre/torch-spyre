@@ -757,9 +757,14 @@ dimensions are not pinned.
   because pricing the broadcast of the shared weight needs weight-rank
   awareness the current cost function does not have. Those bmms fall
   through to Pass 2.
-- Padding is approximated rather than retrieved from the layout (FIXME
-  in `adjust_it_space_for_sticks`). Improved padding handling is being
-  added in [#2359](https://github.com/torch-spyre/torch-spyre/pull/2359).
+- Stick-dim padding is approximated rather than retrieved from the
+  layout: `adjust_it_space_for_sticks` rounds each stick variable up to
+  a whole number of sticks (FIXME there). Non-stick dims do read their
+  padding from the layout: `adjust_it_space_for_padding` grows an
+  output dim into its device padding when every tensor using it agrees
+  on the padded size and the output's `valid_elements` shows the extra
+  rows are padding, not live data (`pad_iteration_space` in
+  `padding.py`, [#741](https://github.com/torch-spyre/torch-spyre/issues/741)).
 
 **Potential future enhancements:**
 
