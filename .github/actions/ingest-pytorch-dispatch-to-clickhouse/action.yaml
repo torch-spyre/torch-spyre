@@ -75,6 +75,15 @@ inputs:
     description: ClickHouse password.
     required: false
     default: ''
+  clickhouse-schema-user:
+    description: >-
+      Login for the ensure-table DDL this ingest runs. Empty = the writer login, with a warning.
+    required: false
+    default: ''
+  clickhouse-schema-pass:
+    description: Password for clickhouse-schema-user.
+    required: false
+    default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
     required: false
@@ -122,6 +131,8 @@ runs:
         ROOT: ${{ steps.setup.outputs.root }}
         CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
         CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CLICKHOUSE_SCHEMA_USER: ${{ inputs.clickhouse-schema-user }}
+        CLICKHOUSE_SCHEMA_PASSWORD: ${{ inputs.clickhouse-schema-pass }}
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}

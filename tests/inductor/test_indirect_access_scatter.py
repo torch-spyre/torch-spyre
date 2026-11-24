@@ -30,6 +30,7 @@ import sys
 
 import pytest
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
@@ -38,9 +39,9 @@ from indirect_access_common import (  # noqa: E402
     CRASHED,
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
-    DIRECT_OP_SPEC,
     register_multicore_variants,
 )
+from utils_inductor import expects_raise  # noqa: E402
 
 from torch_spyre._C import (  # noqa: E402
     SpyreTensorLayout,
@@ -54,6 +55,9 @@ from torch_spyre._inductor.errors import Unsupported  # noqa: E402
 # the BackendCompilerFailed message.
 _INDEX_STICK_DIM_ERROR = "Expect index stick dim to be innermost in chunk loop order"
 
+# dbo-opt's rejection of a full-rank torch.scatter index on a non-leading dim of a
+# 5-D destination (GatherIndexConversion.cpp), as it appears in the compile error.
+_GATHER_INDEX_CONVERSION_ERROR = r"fmod\(dsDim, size\) == 0"
 _STICK_DIM_SCATTER = pytest.mark.xfail(
     strict=True,
     raises=InductorError,
@@ -311,6 +315,40 @@ class _ScatterScenarios:
             expect=SCATTER_OP_SPEC,
             expect_backend_error=_INDEX_STICK_DIM_ERROR,
         )
+
+    @expects_raise
+    def test_scatter_5d_dim2(self):
+        """torch.scatter(out, 2, index, src) on a 5-D destination, full-rank index.
+
+        out[2,4,8,16,64], src[2,4,3,16,64], and an int64 index with src's shape
+        whose entries along dim 2 are 3 unique rows (constant over every other
+        dim, so there is no write collision). The frontend reaches a scatter op
+        spec, then dbo-opt rejects the bundle (#4844). The same compile with a
+        1-D index (index_copy_ / index_put, see test_index_copy_5d_each_dim_e2e)
+        works.
+        """
+        shape, P = (2, 4, 8, 16, 64), 3
+        src_shape = (*shape[:2], P, *shape[3:])
+        out = torch.zeros(shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
+        rows = torch.randperm(shape[2], dtype=torch.int64)[:P]
+        index = rows.view(1, 1, P, 1, 1).expand(src_shape).contiguous().to("spyre")
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 2, index, src)
+
+        self.check(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+
+        # TODO(#4844): a full-rank torch.scatter index does not compile (dbo-opt
+        # asserts in GatherIndexConversion.cpp; torch.gather with a 2-D index fails
+        # the same way, see test_torch_gather). Once it is fixed turn this into a
+        # positive test that compares with the CPU result.
+        torch._dynamo.reset()
+        with pytest.raises(
+            BackendCompilerFailed,
+            match=_GATHER_INDEX_CONVERSION_ERROR,
+        ):
+            torch.compile(kernel, dynamic=False)(out, src, index)
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -647,6 +685,79 @@ class _ScatterScenarios:
 
         self._assert_compiled_matches_cpu(kernel, y, src_y, idx_y, z, src_z, idx_z)
 
+    def test_index_copy_twice_into_one_destination_e2e(self):
+        """Two in-place index_copy_ calls into one graph input: the second
+        scatter must start from the destination the first one wrote."""
+        dst = torch.zeros(128, 128, dtype=torch.float16).to("spyre")
+        src0 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        src1 = torch.rand(4, 128, dtype=torch.float16).to("spyre")
+        idx0 = torch.arange(0, 4, dtype=torch.int64).to("spyre")
+        idx1 = torch.arange(64, 68, dtype=torch.int64).to("spyre")
+
+        def kernel(dst, src0, src1, idx0, idx1):
+            dst.index_copy_(0, idx0, src0)
+            dst.index_copy_(0, idx1, src1)
+            return dst
+
+        self._assert_compiled_matches_cpu(kernel, dst, src0, src1, idx0, idx1)
+
+    def test_substick_index_copy_over_many_outer_entries_e2e(self):
+        """index_copy_ into [T, N, 1] with N >= 64: every outer entry of every
+        row must go to the row its index names. The index is one value per
+        row, repeated over N; it must not be read as an N-long tensor."""
+        for n in (64, 128):
+            with self.subTest(n=n):
+                cache = torch.zeros(8, n, 1, dtype=torch.float16).to("spyre")
+                src = torch.rand(4, n, 1, dtype=torch.float16).to("spyre")
+                idx = torch.tensor([7, 6, 5, 4], dtype=torch.int64).to("spyre")
+
+                def kernel(cache, idx, src):
+                    cache.index_copy_(0, idx, src)
+                    return cache
+
+                self._assert_compiled_matches_cpu(kernel, cache, idx, src)
+
+    @staticmethod
+    def _lx_planner(co_opt):
+        """LX planning on; both planners decide input clones, in separate code."""
+        from torch_spyre._inductor import config
+
+        torch._dynamo.reset()
+        return config.patch(lx_planning=True, co_optimizing_lx_planning=co_opt)
+
+    def _default_layout_pool_operands(self, P=192, D=64, rows=32):
+        """A default-layout pool, which a scatter relayouts, two row sets, a source."""
+        pool = torch.full((P, D), 3.0, dtype=torch.float16)
+        src = torch.rand(rows, D, dtype=torch.float16)
+        perm = torch.randperm(P)
+        idx_a, idx_b = perm[:rows], perm[rows : 2 * rows]
+        return pool.to("spyre"), src.to("spyre"), idx_a.to("spyre"), idx_b.to("spyre")
+
+    def test_index_copy_then_read_default_layout_input_e2e(self):
+        """A later read of a scattered graph input sees the write, not a stale LX clone."""
+
+        def kernel(pool, src, idx):
+            pool.index_copy_(0, idx, src)
+            return pool * 2
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx, _ = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx)
+
+    def test_index_copy_twice_into_default_layout_input_e2e(self):
+        """Two scatters into one graph input keep both writes."""
+
+        def kernel(pool, src, idx_a, idx_b):
+            pool.index_copy_(0, idx_a, src)
+            pool.index_copy_(0, idx_b, src + 1)
+            return pool
+
+        for co_opt in (True, False):
+            with self.subTest(co_opt=co_opt), self._lx_planner(co_opt):
+                pool, src, idx_a, idx_b = self._default_layout_pool_operands()
+                self._assert_compiled_matches_cpu(kernel, pool, src, idx_a, idx_b)
+
     def test_index_put_3d_scatter_dim1_e2e(self):
         """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
         Tests indirect access on a non-leading dimension, validating stride
@@ -677,6 +788,51 @@ class _ScatterScenarios:
             return y
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    # ===== 5-D scatter on each non-stick dim =====
+    # No 5-D coverage existed; these extend the 4-D index_put/index_copy_ cases
+    # by one rank. The last dim (64) is one full fp16 stick and is not indexed.
+    _SCATTER_5D_SHAPE = (8, 4, 8, 16, 64)
+    _SCATTER_5D_P = 3  # rows written along the indexed dim
+
+    def _scatter_5d_operands(self, dim):
+        """y[8,4,8,16,64] zeros, src with size P on `dim`, unique int64 idx[P]."""
+        shape = self._SCATTER_5D_SHAPE
+        P = self._SCATTER_5D_P
+        src_shape = list(shape)
+        src_shape[dim] = P
+        torch.manual_seed(0)  # reproducible failures; rows are unique either way
+        y = torch.zeros(shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
+        # Unique rows: repeated indices have no defined winner.
+        idx = torch.randperm(shape[dim], dtype=torch.int64)[:P].to("spyre")
+        return y, src, idx
+
+    def test_index_copy_5d_each_dim_e2e(self):
+        """y.index_copy_(dim, idx, src) on a 5-D destination, dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y.index_copy_(dim, idx, src)  # index_copy needs int64
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    def test_index_put_5d_each_dim_e2e(self):
+        """y[:, ..., idx] = src on a 5-D destination, indexing dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y[(slice(None),) * dim + (idx,)] = src
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
     # ===== scatter through a view of the destination =====================
     # The scatter writes through a view, so the shape the index uses and the
@@ -1451,6 +1607,53 @@ class _ScatterScenarios:
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
+    def _row_scatter_add_bf16_operands(self, M=128, N=64, P=4):
+        """2-D row scatter in bf16: dst[M,N] zeros, src[P,N], 1-D int32 idx[P].
+
+        Indexed along dim 0, contiguous along dim 1 (the stick dim; N=64 is one
+        full 16-bit stick). idx is arange(P), so rows are unique and the result
+        does not depend on accumulation order.
+        """
+        dst = torch.zeros(M, N, dtype=torch.bfloat16).to("spyre")
+        src = torch.randn(P, N, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(dst, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+        return dst, src, idx
+
+    def test_index_add_2d_row_bf16(self):
+        """torch.index_add(dst, 0, idx, src) on a 2-D bf16 [128, 64] destination."""
+        dst, src, idx = self._row_scatter_add_bf16_operands()
+
+        def kernel(dst, src, idx):
+            return torch.index_add(dst, 0, idx, src)
+
+        # sdsc=False: spyre_index_add (decompositions.py) lowers index_add to
+        # index_select (gather) + add + index_put (overwrite scatter), so the
+        # bundle holds both a gather and a scatter. It still classifies as
+        # SCATTER_OP_SPEC (terminal indirect store), but assert_indirect_sdsc_fields
+        # (kind="scatter") requires every indirect value tensor to be the output;
+        # the gather's value tensor is an input, so the check would fail on a
+        # correct bundle. Only that field check is skipped: the classification and
+        # the on-device result vs. CPU are still asserted (see NOTE above).
+        self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_put_accumulate_2d_row_bf16(self):
+        """dst.index_put_((idx,), src, accumulate=True) on a 2-D bf16 [128, 64]
+        destination."""
+        dst, src, idx = self._row_scatter_add_bf16_operands()
+
+        def kernel(dst, src, idx):
+            return dst.index_put_((idx,), src, accumulate=True)
+
+        # sdsc stays True (default): index_put_ is not decomposed into a gather
+        # first, so the bundle is a pure scatter and the scatter-only SDSC check
+        # applies (same as the fp16 test_index_put_accumulate above). It guards
+        # the bf16 indirect-access encoding: index/value cross-links, HBM-only
+        # int32 index tensor, and the value tensor being the output.
+        self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC)
+
     def test_scatter_add_functional(self):
         """torch.scatter_add(out, 0, index, src) -- functional accumulating scatter."""
         out, src, index = self._full_index_store()
@@ -1470,6 +1673,9 @@ class _ScatterScenarios:
         )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
+    # These modes lower to a mutating fallback rather than an indirect
+    # store, so the backend rejects the form before any op spec.
+    # TODO(issue#4361): stage and run them once they lower on device.
     def test_scatter_reduce_amax(self):
         """out.scatter_reduce_(0, index, src, "amax")"""
         out, src, index = self._full_index_store(dtype=torch.int64)
@@ -1477,10 +1683,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amax")
 
-        # The device result is wrong (#5326); drop the pin once that is fixed.
-        self._stage_and_e2e(
-            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=False
-        )
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_amin(self):
         """out.scatter_reduce_(0, index, src, "amin")"""
@@ -1489,7 +1693,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amin")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     def test_scatter_reduce_prod(self):
         """out.scatter_reduce_(0, index, src, "prod")"""
@@ -1498,7 +1703,8 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "prod")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        result = self.check(kernel, out, src, index, expect=CRASHED)
+        self.assertIn("has no Spyre kernel", str(result.exc))
 
     # -- Known crashes (separate from the indirect-store path) -------------
     def test_index_fill_crashes(self):
@@ -1731,6 +1937,219 @@ class _ScatterScenarios:
         src = torch.tensor([10.0, 20.0], dtype=torch.float16, device="spyre")
         with self.assertRaisesRegex(Unsupported, "masked_scatter needs a mask"):
             x.masked_scatter_(mask, src)
+
+    # -- Rank-changing view (issue #4443) -----------------
+
+    @expects_raise
+    def test_scatter_rank_changing_view_unsupported(self):
+        """Scatter ops into a rank-changing view whose inner dims are sub-stick.
+
+        x has allocation shape [8, 32, 32]; a .view(8, 1024) collapses the two
+        sub-stick inner dims (32 < 64 elems/stick) before the scatter.  The
+        merged dim produces an unrepresentable stick expression (Mod(d1, 32))
+        against the allocation layout.  Regression for issue #4443: every
+        scatter-lowered write must fail with a clear InductorError naming the
+        buffer, the stick expression and elems_per_stick.
+        """
+
+        def index_put(x, idx, src):
+            x.view(8, 1024).index_put_((idx,), src, accumulate=False)
+            return x
+
+        def index_put_accumulate(x, idx, src):
+            x.view(8, 1024).index_put_((idx,), src, accumulate=True)
+            return x
+
+        def index_copy(x, idx, src):
+            x.view(8, 1024).index_copy_(0, idx, src)
+            return x
+
+        def index_add(x, idx, src):
+            x.view(8, 1024).index_add_(0, idx, src)
+            return x
+
+        # (kernel, index dtype): index_copy requires a long index.
+        kernels = {
+            "index_put": (index_put, torch.int32),
+            "index_put_accumulate": (index_put_accumulate, torch.int32),
+            "index_copy": (index_copy, torch.int64),
+            "index_add": (index_add, torch.int32),
+        }
+        for name, (kernel, idx_dtype) in kernels.items():
+            with self.subTest(op=name):
+                torch._dynamo.reset()
+                x = torch.zeros(8, 32, 32, dtype=torch.float16).to("spyre")
+                idx = torch.arange(4, dtype=idx_dtype).to("spyre")
+                src = torch.ones(4, 1024, dtype=torch.float16).to("spyre")
+                with pytest.raises(
+                    InductorError,
+                    match=(
+                        r"sub-stick.*innermost allocation stride \(32\)"
+                        r".*elems_per_stick \(64\)"
+                    ),
+                ):
+                    torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_unsupported_fp32(self):
+        """Same view collapse with fp32 (32 elems/stick): [8, 16, 16] -> [8, 256].
+
+        The merged inner dim has stride 16 < 32, so the message must report the
+        fp32 stick size rather than the fp16 one.
+        """
+        x = torch.zeros(8, 16, 16, dtype=torch.float32).to("spyre")
+        idx = torch.arange(4, dtype=torch.int32).to("spyre")
+        src = torch.ones(4, 256, dtype=torch.float32).to("spyre")
+
+        def kernel(x, idx, src):
+            x.view(8, 256).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(16\)"
+                r".*elems_per_stick \(32\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_unsupported_reshape(self):
+        """reshape (which returns a view here) behaves like view."""
+        x = torch.zeros(8, 32, 32, dtype=torch.float16).to("spyre")
+        idx = torch.arange(4, dtype=torch.int32).to("spyre")
+        src = torch.ones(4, 1024, dtype=torch.float16).to("spyre")
+
+        def kernel(x, idx, src):
+            x.reshape(8, 1024).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_unsupported_row_counts(self):
+        """The failure does not depend on the number of leading rows."""
+
+        def kernel(x, idx, src):
+            x.view(x.shape[0], 1024).index_put_((idx,), src, accumulate=False)
+            return x
+
+        for rows in (2, 16):
+            with self.subTest(rows=rows):
+                torch._dynamo.reset()
+                x = torch.zeros(rows, 32, 32, dtype=torch.float16).to("spyre")
+                idx = torch.arange(2, dtype=torch.int32).to("spyre")
+                src = torch.ones(2, 1024, dtype=torch.float16).to("spyre")
+                with pytest.raises(
+                    InductorError,
+                    match=(
+                        r"sub-stick.*innermost allocation stride \(32\)"
+                        r".*elems_per_stick \(64\)"
+                    ),
+                ):
+                    torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_unsupported_bf16(self):
+        """bf16 shares fp16's 64-element stick, so the message matches fp16."""
+        x = torch.zeros(8, 32, 32, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(4, dtype=torch.int32).to("spyre")
+        src = torch.ones(4, 1024, dtype=torch.bfloat16).to("spyre")
+
+        def kernel(x, idx, src):
+            x.view(8, 1024).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_4d_to_2d_unsupported(self):
+        """4-D -> 2-D collapse when inner three dims are all sub-stick.
+
+        [4, 8, 8, 16] -> [4, 1024]: inner strides are 16 and 8 and 8 — all
+        below elems_per_stick=64.  The merged write index produces an
+        unrepresentable stick expression and must raise InductorError.
+        """
+        x = torch.zeros(4, 8, 8, 16, dtype=torch.float16).to("spyre")
+        idx = torch.arange(2, dtype=torch.int32).to("spyre")
+        src = torch.ones(2, 1024, dtype=torch.float16).to("spyre")
+
+        def kernel(x, idx, src):
+            x.view(4, 1024).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(16\)"
+                r".*elems_per_stick \(64\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_partial_collapse_unsupported(self):
+        """Partial collapse: three sub-stick trailing dims collapsed to one.
+
+        [8, 4, 32, 32] -> [8, 4096]: the three inner dims (strides 32 and 32)
+        are merged into a single dim while the leading dim stays intact.  The
+        merged inner stride is still 32 < 64, so still unrepresentable.
+        """
+        x = torch.zeros(8, 4, 32, 32, dtype=torch.float16).to("spyre")
+        idx = torch.arange(2, dtype=torch.int32).to("spyre")
+        src = torch.ones(2, 4096, dtype=torch.float16).to("spyre")
+
+        def kernel(x, idx, src):
+            x.view(8, 4096).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(32\)"
+                r".*elems_per_stick \(64\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
+
+    @expects_raise
+    def test_scatter_rank_changing_view_int8_unsupported(self):
+        """int8 has elems_per_stick=128; inner dim of 64 is sub-stick for int8.
+
+        [8, 8, 64] -> [8, 512]: inner stride 64 < 128 (int8 stick size), so
+        unrepresentable.  The error must report elems_per_stick=128.
+        """
+        x = torch.zeros(8, 8, 64, dtype=torch.int8).to("spyre")
+        idx = torch.arange(4, dtype=torch.int32).to("spyre")
+        src = torch.ones(4, 512, dtype=torch.int8).to("spyre")
+
+        def kernel(x, idx, src):
+            x.view(8, 512).index_put_((idx,), src, accumulate=False)
+            return x
+
+        with pytest.raises(
+            InductorError,
+            match=(
+                r"sub-stick.*innermost allocation stride \(64\)"
+                r".*elems_per_stick \(128\)"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
 
 # Op-behaviour scenarios run once at the default 32 cores. They classify / lower

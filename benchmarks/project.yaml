@@ -1,0 +1,129 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata:
+  name: torch-spyre
+spec:
+  component: torch-spyre
+  packs:
+    - name: kernel
+      version: '0.2'
+    - name: spyre
+      version: '0.2'
+  runner: kernel-bench
+  default_suites:
+    - ops
+    - models
+  default_environment: one-device
+  visibility: public
+  series_labels:
+    - env.label.device.count
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata:
+  name: ops
+  description: Operator-level kernel benchmarks, one Benchmark per operation name.
+spec:
+  type: perf
+  pr_selectable: true
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata:
+  name: models
+  description: Model-level benchmarks (a full model or one block), one Benchmark per model name.
+spec:
+  type: perf
+  pr_selectable: true
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata:
+  name: one-device
+  description: One accelerator device; the placer decides where.
+spec:
+  devices:
+    requests:
+      - name: cards
+        device_class: spyre/pf
+        count: 1
+  labels:
+    device.count: 1
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: smoke
+  description: One case, one repeat; never ingested.
+spec:
+  cases:
+    - matmul_prefill-n4096
+  run:
+    repeats_min: 1
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-sanity
+  description: Smallest operator set a PR may request.
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: sanity
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-core
+  description: Default operator set.
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: core
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-extended
+  description: Every declared operator.
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: extended
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: models-core
+  description: Default model set.
+spec:
+  selector:
+    suites:
+      - models
+    groupings:
+      tier:
+        at_most: core
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: perf-core
+  description: Operators and models of the default perf set, what one perf-suite report holds.
+spec:
+  selector:
+    suites:
+      - ops
+      - models
+    groupings:
+      tier:
+        at_most: core

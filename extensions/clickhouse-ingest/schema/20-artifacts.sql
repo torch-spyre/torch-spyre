@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS artifacts
     -- four fields needs nothing threaded to it; the inputs stay in `props` since a uuid can't be read back.
     artifact_id   UUID,
     component     LowCardinality(String),
-    -- amd64 | ppc64le | s390x, plus 'multi' for manifest-join refs; run_id's hash folds to x86_64.
+    -- amd64 | ppc64le | s390x, plus 'multi' for manifest-join refs and 'noarch' for architecture-independent
+    -- data (a reference); run_id's hash folds to x86_64.
     arch          LowCardinality(String),
     kind          LowCardinality(String),   -- image | rpm | wheel | generic
     artifact_name String,                   -- e.g. ibm-flex-devel; display only, NOT identity

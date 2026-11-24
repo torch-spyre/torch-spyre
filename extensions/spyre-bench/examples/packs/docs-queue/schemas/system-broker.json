@@ -1,0 +1,33 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/docs-queue/system-broker.json",
+ "title": "mq/broker configuration",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "partitions": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "settings": {
+   "type": "object",
+   "additionalProperties": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "number"
+     },
+     {
+      "type": "boolean"
+     }
+    ]
+   },
+   "description": "broker settings; identity"
+  }
+ },
+ "required": [
+  "partitions"
+ ]
+}

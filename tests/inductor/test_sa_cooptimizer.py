@@ -67,6 +67,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
+    RelayoutCharge,
     TileAxis,
     TileSpec,
     cost_expr_record,
@@ -724,7 +725,8 @@ def _chain_caps(buffers):
 
 def _live_state(solver):
     """The observable joint state: layout addresses, packer quality, divisions,
-    and the eligible count ``W`` implies (tracked, so a restore must rewind it)."""
+    the eligible count and mask ``W`` implies, and the relayout copies switched
+    on and eligible (tracked, so a restore must rewind them)."""
     return (
         list(solver.packer.addresses),
         solver.packer.quality(),
@@ -733,6 +735,9 @@ def _live_state(solver):
         # otherwise pass -- and duplicated menu entries are real.
         [(c.key, c.menu_index) for c in solver.chosen],
         solver._n_eligible,
+        bytes(solver._eligible_mask),
+        sorted(solver._relayout_on),
+        sorted(solver._eligible_copies),
     )
 
 
@@ -1321,6 +1326,33 @@ class CostExprScoringTest(TestCase):
             utils.to_fixed_us((4 * 10 + 100) / 1000),
         )
 
+    def test_the_division_symbol_binds_a_generated_choice_to_its_menu_position(
+        self,
+    ):
+        # A table term over candidates (the relayout price) is indexed by menu
+        # position. A generated config carries no ``menu_index``, so it must be
+        # resolved by choice; one the menu does not carry (here, any tiled one)
+        # has no position and must read as unpriced, never as some entry.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        prices = [1000 * (position + 1) for position in range(len(_TWO_AXIS_MENU))]
+        cost_expr = RelayoutCharge(1, buf.sym_division, *prices)
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        source = solver._sources[0]
+        on_menu = source.config_for(_axis_div(d0=4, d1=2))
+        self.assertIsNone(on_menu.menu_index)
+        position = [d.label for d in _TWO_AXIS_MENU].index(on_menu.division.label)
+        self.assertEqual(
+            solver._score_fn([on_menu], frozenset()),
+            utils.to_fixed_us(prices[position] / 1000),
+        )
+        tiled = source.config_for(
+            CoreDivision(splits=dict(on_menu.splits), tiling=_TILE_4)
+        )
+        self.assertEqual(solver._score_fn([tiled], frozenset()), 0)
+
     def test_a_space_without_tilings_declares_no_tile_symbol(self):
         # Every engine but this one, and this one with auto_coarse_tiling off.
         plain = _cdbuf("A", [], {})
@@ -1678,6 +1710,34 @@ class TilingInTheConfigTest(TestCase):
             mock.patch.object(source, "_draw_tiling", return_value=_TILE_4),
         ):
             self.assertIsNone(source.anchor(tiled, rnd.Random(0)))
+
+    def test_an_anchor_draws_from_the_tilings_own_domain(self):
+        """A tiling's per-tile frame computes its own span floors, so its
+        domain can hold a factor below the untiled floor. The anchor redraws
+        from the kept tiling's domain, or that split is never proposed."""
+        # Untiled, axis 0 has a span floor of 4; the tiling lowers it to 2.
+        space = mock_op_split_space(
+            {_AXIS_0: [4], _AXIS_1: [1, 2]},
+            {_AXIS_0, _AXIS_1},
+            tiling=_tiling_space(),
+        )
+        untiled = space.context
+        tiled = mock.MagicMock()
+        tiled.axes = untiled.axes
+        tiled.is_legal.side_effect = lambda splits: True
+        tiled.factor_domain.side_effect = {_AXIS_0: [2, 4], _AXIS_1: [1, 2]}.get
+        space._context = lambda tiling: untiled if tiling.is_untiled else tiled
+        source = _GeneratedDivisions(space, _menu_seed())
+        seed = source.config_for(space.division({_AXIS_0: 4}))
+        rng = rnd.Random(0)
+        with mock.patch.object(source, "_draw_tiling", return_value=_TILE_2):
+            anchors = [source.anchor(seed, rng) for _ in range(40)]
+        self.assertNotIn(None, anchors)
+        self.assertEqual({anchor.division.tiling for anchor in anchors}, {_TILE_2})
+        # 2 lies below the untiled floor and is only in the tiled domain.
+        self.assertEqual(
+            {anchor.division.splits.get(_AXIS_0, 1) for anchor in anchors}, {2, 4}
+        )
 
 
 class GeneratedWriteBackTest(TestCase):
@@ -2220,7 +2280,7 @@ class ApplyGroupAgreementTest(TestCase):
         # [KT] [S, V] [O]: KT escapes to S, S and V to O; each pays the copy's
         # write and one full-extent read while resident. One run would pay 0.
         solver = self._solver(_attention_ops())
-        self.assertEqual(solver._companion_bytes([0] * 4), 3 * 2 * 1024)
+        self.assertEqual(solver._companion_bytes({0, 1, 2, 3}), 3 * 2 * 1024)
 
 
 class CompanionBufferPricingTest(TestCase):
@@ -2233,17 +2293,13 @@ class CompanionBufferPricingTest(TestCase):
 
     SIZE = 1024  # ``_cdbuf``'s
 
-    @staticmethod
-    def _addresses(solver, resident):
-        return [0 if i in resident else None for i in range(len(solver._bufs))]
-
     def test_an_untiled_state_prices_no_companions(self):
         solver = _run_solver("AB", parents={"B": ["A"]})
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_a_search_with_no_tiling_space_prices_no_companions(self):
         solver = _run_solver("AB", parents={"B": ["A"]}, untiled="AB")
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_a_consumer_inside_the_run_costs_nothing(self):
         # Nothing escapes, so the apply keeps the buffer as loop-internal
@@ -2253,7 +2309,7 @@ class CompanionBufferPricingTest(TestCase):
         for idx in (0, 1):
             solver.chosen[idx] = _tiled(solver, idx)
         self.assertEqual(solver._run_bounds(0), (0, 1))
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_the_search_tiles_a_run_its_output_stays_inside(self):
         # A feeds B and nothing else. Untiled, no per-core footprint fits beside
@@ -2312,7 +2368,7 @@ class CompanionBufferPricingTest(TestCase):
         solver.chosen[0] = _tiled(solver, 0)
         self.assertEqual(solver._run_bounds(0), (0, 0))
         self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, {0})),
+            solver._companion_bytes({0}),
             3 * self.SIZE,  # the copy's write + two full-extent reads
         )
 
@@ -2322,9 +2378,7 @@ class CompanionBufferPricingTest(TestCase):
         # Independent of how many readers there are.
         solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
-        )
+        self.assertEqual(solver._companion_bytes(set()), 2 * self.SIZE)
 
     def test_a_resident_tiled_graph_output_pays_nothing(self):
         # The copy's write IS the externally visible write, which the model
@@ -2333,7 +2387,7 @@ class CompanionBufferPricingTest(TestCase):
         solver = _run_solver("A")
         solver._bufs[0].boundary = BufferType.Output
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+        self.assertEqual(solver._companion_bytes({0}), 0)
 
     def test_a_consumer_with_no_operation_position_counts_as_outside(self):
         # Nothing can carry a tiling to a buffer in no run, so a group
@@ -2344,9 +2398,7 @@ class CompanionBufferPricingTest(TestCase):
         solver._precompute_topology()
         solver.chosen = solver._seed_configs()
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
-        )
+        self.assertEqual(solver._companion_bytes({0}), 2 * self.SIZE)
 
     def test_the_score_carries_the_companion_traffic(self):
         solver = _run_solver("AB", parents={"B": ["A"]})

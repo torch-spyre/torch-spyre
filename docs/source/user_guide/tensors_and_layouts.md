@@ -471,18 +471,65 @@ y.resize_((141, 1024))  # RuntimeError: not a multiple of granularity
 ```
 
 A resize within the reservation never reallocates, and the
-`SpyreTensorLayout` stays identical for every size in range. This is what keeps
-the layout part of a compiled graph's guards from changing as the size changes.
+`SpyreTensorLayout` stays identical for every size in range, whether it was
+derived from `max` or given explicitly (next section). This is what keeps the
+layout part of a compiled graph's guards from changing as the size changes.
 Only the reserved dimension may change; the rank and every other dimension must
 stay the same, otherwise `resize_` raises.
+
+#### Declaring with an explicit device layout
+
+`dynamic=` can be combined with `device_layout=`. The layout then describes the
+reserved buffer, so it is the layout of the tensor at `max`, not at its current
+size:
+
+```python
+from torch_spyre._C import get_device_dtype, SpyreTensorLayout
+
+# 12 rows of 32 page ids today, up to 16 rows over the tensor's life.
+ids = torch.arange(12 * 32, dtype=torch.int32).reshape(12, 32, 1)
+# The layout of the buffer at max: one int32 id per 128-byte stick (32 int32
+# slots per stick, one of them holding data), 16 rows.
+layout = SpyreTensorLayout(
+    device_size=[16, 1, 32, 32],  # rows at max, 1, ids per row, slots per stick
+    stride_map=[32, 0, 1, 0],  # the host stride each device dim walks, 0 = none
+    device_dtype=get_device_dtype(torch.int32),
+    valid_elements={(0,): 16, (2,): 32, (1, 3): 1},  # data-holding extents
+)
+spec = {0: {"min": 8, "max": 16, "granularity": 1}}
+d = ids.to("spyre", device_layout=layout, dynamic=spec)
+d.resize_((9, 32, 1))  # exact, the layout stays the one given
+```
+
+`stride_map` names, for each device dimension, the host stride it walks: 32 is
+host dimension 0 (the rows), 1 is host dimension 1 (the ids), and 0 marks a
+device dimension that carries no host dimension. `valid_elements` maps a group
+of device dimensions to how many of its elements hold data, so `(1, 3): 1` says
+that of the 32 slots in each stick one is an id.
+
+The reserved host dimension must occupy exactly one device dimension of the
+layout, whole: the device dimension whose `stride_map` entry is the host stride
+of the reserved dimension. That dimension's extent must be `max`, and it cannot
+be the stick-elements dimension. A layout that folds the reserved dimension
+into another, splits it across the stick, or sizes it for anything but `max`
+is refused before anything is allocated, with a `RuntimeError` from the native
+allocation that names the rule. The layout's other dimensions are checked only
+as a whole: the layout must hold at least the bytes of the host shape at `max`,
+and beyond that sizing them for the tensor is the caller's responsibility, the
+same contract as `device_layout=` without `dynamic=`. The derived layout
+satisfies these rules by construction, so giving
+`SpyreTensorLayout(max_shape, dtype)` explicitly gives the same layout and
+contract as the call without `device_layout=`.
 
 #### Restrictions
 
 - `dynamic=` applies only to an eager, CPU to `"spyre"` call of `to()`. Make the
-  call before compiling, not inside a compiled function. It cannot be combined
-  with `device_layout=`. `dtype=` is honoured (the conversion happens on the
+  call before compiling, not inside a compiled function. `device_layout=` may be
+  given with it, as a layout for the tensor at `max` (see "Declaring with an
+  explicit device layout"). `dtype=` is honoured (the conversion happens on the
   host before the transfer); a non-default `memory_format` is rejected.
-  `non_blocking=True` is accepted, but the transfer is always synchronous.
+  `non_blocking=True` returns before the transfer completes (see "Non-blocking
+  host-to-device copies" in the runtime docs).
 - Only dimension 0, the outermost dimension, can be reserved, and only one
   dimension per tensor. Negative dimensions are accepted if they resolve to
   dimension 0 (`-2` on a 2-D tensor). Reserving any other dimension raises an
@@ -494,12 +541,29 @@ stay the same, otherwise `resize_` raises.
   integers, `min <= max`, and `max` is a multiple of `granularity`.
 - `min` must be at least `min_reserved_dim_size` (default 8), and
   `max / granularity` (the number of buckets) must not exceed `max_buckets`
-  (default 32). Both live in `torch_spyre/_inductor/config.py`.
+  (default 256, enough for a 32K context at 128 tokens per page with
+  granularity 1). Both live in `torch_spyre/_inductor/config.py` and are
+  process-wide: a consumer may set them through the `MIN_RESERVED_DIM_SIZE`
+  and `MAX_BUCKETS` environment variables, or on that module before its
+  first declaration. The floor protects a consumer whose compiled code
+  branches on a small row count, so lower it only for tensors that take no
+  such branch, page tables for example. The cap is the number of candidate
+  iterations of a loop over the declared dimension, one correction slot
+  each, and has no measured cost at the step up to 256. The compiled
+  program carries one slot per bucket, so compile work grows with the
+  count. Runs at 128 and 256 buckets compiled and ran (#6432).
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - A declared dimension reaches a compiled graph only as a `for_each_tile` loop
   over it. An op whose own iteration space depends on the declared dimension
   outside any loop is refused at compile time, see the next section.
+- Eager ops (`x.clone()`, `x + 1`, `x.copy_(...)`, ...) work on a declared tensor
+  but do not use the declaration: each one runs a fixed-size kernel, compiled
+  once for every distinct size, and returns a regular tensor of the current
+  size. The dimension is dynamic only inside a `torch.compile` function that you
+  write yourself (see the next section). Carrying the declaration over to the
+  result is tracked in
+  [#6490](https://github.com/torch-spyre/torch-spyre/issues/6490).
 
 #### Compiled graphs over a declared dimension
 
@@ -537,6 +601,18 @@ The three `torch._check` lines restate the declared range inside the traced
 function. They are what give the compiler a finite range in the trace today and
 have to be written by hand.
 
+Code in the compiled function can still split the range without an error: a
+branch such as `if rows > 256` makes the sizes above 256 compile a second
+program. Two checks report this, both warning by default:
+
+- After each compile, a guard that rejects some declared sizes is reported with
+  the sizes and the source line, for example
+  `guard s0 <= 256 causes a recompile for dim values [320, 384, 448, 512]`.
+  Set `TORCH_SPYRE_NARROWING_CHECK` to `error` or `off` to change this.
+- A recompile while a declared input has one of its declared sizes is reported
+  with PyTorch's reason. Set `TORCH_SPYRE_RECOMPILE_CHECK` to `error`, `all` or
+  `off` to change this.
+
 What is refused, with an error naming `for_each_tile`:
 
 - A plain op over the declared dimension outside a loop, such as
@@ -548,9 +624,6 @@ What is refused, with an error naming `for_each_tile`:
   made dynamic, with no `dynamic=` declaration. Without the reservation each
   size is a new allocation and a new layout, so there is no one binary to build,
   and the loop is refused with the declaration named as the fix.
-- A declared minimum equal to the granularity: declare `min` as at least
-  `2 * granularity` for now (issue #6018). The one-tile call recompiles on a
-  PyTorch contiguity guard, which #6060 removes.
 
 What changed: before the compile half landed (PR #6066), a compiled graph over a
 reserved tensor was built for the size it was first compiled at and could return
@@ -559,6 +632,20 @@ wrong values after a `resize_`, which the documentation warned about. Now a
 compile and be silently wrong raises `Unsupported` at compile time. Code that
 compiled a plain op over a reserved tensor has to tile it, or move the op out of
 the compiled region.
+
+A `for_each_tile` body may also gather rows out of a pool that was itself moved
+with `dynamic=`, as in `pool.index_select(0, idx)`. The pool's length is
+resolved to its declared maximum at compile time. It never becomes a trip count
+or a bundle parameter, it only bounds the values the index may take, and the
+loop's own trip count still follows the walked tensor as above. Only a
+declaration counts for that bound: a pool made dynamic with
+`torch._dynamo.mark_dynamic` or bounded with `torch._check`, but not declared,
+is refused with an error naming the symbol. The declaration bounds the index
+values by the maximum, not by the pool's current size, so an index at or past
+the current size reads whatever the reserved rows hold at that moment and no
+error is raised. Keeping every index below the current size is the caller's
+contract. Only one declared dimension per pool is supported, since a tensor
+declares only dimension 0 today (see the reservation rules above).
 
 #### Data Semantics
 
@@ -575,11 +662,23 @@ the compiled region.
 #### Views and In-place Reshapes
 
 The reservation describes a specific dimension of a specific tensor, so it does
-not follow a reshaped view. `detach()` of the full tensor keeps it. Other views
-(`t()`, `view()`, slices) are ordinary Spyre tensors with no reservation. If a
-reserved tensor is reshaped in place (`t_()`, `squeeze_()`, `unsqueeze_()`,
-`as_strided_()`), its reservation is no longer valid: `resize_` raises an error
-instead of resizing the wrong axis.
+not follow a reshaped view. A tensor keeps it while its storage offset, sizes
+and strides still match the allocation. `detach()` of the full tensor does, and
+so does a `view()`, `alias()` or `as_strided()` that reproduces the tensor's own
+size and strides. A view that changes any of them (`t()`, a `view()` to another
+shape, a slice such as `x[1:]`) has no valid reservation: `get_reserved_dims`
+returns `None`. If a reserved tensor is reshaped in place (`t_()`, `squeeze_()`,
+`unsqueeze_()`, `as_strided_()`), or you call `resize_` on a view that changed
+the geometry (`x[1:].resize_(...)`, `x.view(280, 2048).resize_(...)`), its
+reservation is no longer valid: `resize_` raises an error instead of resizing
+the wrong axis.
+
+A view or `detach()` result is a new tensor object, so it does not carry the
+`torch._dynamo.mark_dynamic` that `to(dynamic=...)` placed on the original.
+Without that mark, the first compile treats the tensor as static, even though
+it keeps its reservation; the next distinct size recompiles with the dimension
+dynamic and picks up the declared range. Call `torch._dynamo.mark_dynamic` on
+it yourself to skip that first compile.
 
 To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
 when there is no valid reservation):
