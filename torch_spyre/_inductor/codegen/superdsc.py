@@ -1528,8 +1528,8 @@ def _create_sdsc_tensors(
         # (innermost) tile extent this arg is written/read at per
         # iteration, and the full extent it sits within -- to compute a
         # correct base offset/backGap, since device_coordinates cannot
-        # represent "which supertile" for these ops (see
-        # coarse_tiling_loops.md's IR-rewiring appendix). The innermost
+        # represent "which supertile" for these ops (see "Invariants and
+        # failure modes" in docs/source/compiler/loop_nodes.md). The innermost
         # level that tiles a given dim owns its true per-iteration
         # tile_size; the full extent is that tile_size times every level's
         # supertile_count for that dim.
@@ -1746,8 +1746,8 @@ def _create_sdsc_tensors(
                 # dim at a different position for this (Case 2 / mutated) arg
                 # than for its sibling args, which makes the stride_idx-based
                 # arg.device_size[-stride_idx-2] lookup below read the wrong
-                # slot for this arg specifically (see
-                # coarse_tiling_loops.md's IR-rewiring appendix). Use the
+                # slot for this arg specifically (see "Invariants and failure
+                # modes" in docs/source/compiler/loop_nodes.md). Use the
                 # authoritative supertile count for dev_dim_size instead of
                 # trusting that slot. Scoped to the stick dim only: other
                 # coarse-tiled dims (e.g. mb) already read the correct slot
