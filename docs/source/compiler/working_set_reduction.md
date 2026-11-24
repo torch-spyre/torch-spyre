@@ -276,7 +276,10 @@ On Spyre, keep the destination in a layout with the indexed dimension
 outermost, such as the "indirect access" layout `torch_spyre.model_utils` gives
 an embedding table. Otherwise `reorder_nonstick_dims_mutation` copies the whole
 destination in and out around every trip's write (see
-[Indirect Access](indirect_access.md)).
+[Indirect Access](indirect_access.md)). A compiled Spyre kernel does not check
+index values: a row outside the destination, or outside an input `Gather`'s
+pool, is written or read out of bounds. An eager call checks every `Gather`
+index on the host and raises `IndexError`.
 
 ### Body contract when tracing a decomposition
 

@@ -109,13 +109,21 @@ from unittest import mock
 
 import pytest
 import torch
+from torch._dynamo.exc import UncapturedHigherOrderOpError
 from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.wsr import Gather, Slice, for_each_tile
 from torch_spyre._monkey_patch import _patch_scan_input_aliasing
+from utils_inductor import expects_raise
 
 DUMP_DIR = os.environ.get("SPYRE_FOR_EACH_TILE_DUMP")
+
+# torch_spyre's scan aliasing patch refuses an aliased pair with a mutated member.
+MUTATED_ALIAS = (
+    r"Input-to-input aliasing with input mutation detected at nodes \w+ and \w+: "
+    "a write through one would not be seen through the other"
+)
 
 # Matched as substrings of the node target. `cat`/`stack` are in here beside the copies:
 # assembling one tensor out of several is the other way a tiling loop can end up paying
@@ -1382,6 +1390,7 @@ class TestScanInputAliasing(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "(?i)mutation"):
             self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
 
+    @expects_raise
     def test_mutating_an_aliased_input_is_rejected_without_grad(self):
         """Under no_grad torch 2.14's scan accepts mutated captures, but not aliased ones.
 
@@ -1393,9 +1402,13 @@ class TestScanInputAliasing(unittest.TestCase):
             k.add_(1.0)
             return c + 1, x_t @ v.T
 
-        with torch.no_grad(), self.assertRaisesRegex(Exception, "(?i)mutation"):
+        with (
+            torch.no_grad(),
+            self.assertRaisesRegex(UncapturedHigherOrderOpError, MUTATED_ALIAS),
+        ):
             self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
 
+    @expects_raise
     def test_out_sharing_a_storage_with_an_operand_is_rejected(self):
         """for_each_tile's out= destination may not share a storage with an operand."""
 
@@ -1417,7 +1430,10 @@ class TestScanInputAliasing(unittest.TestCase):
                 out=dest,
             )[1]
 
-        with torch.no_grad(), self.assertRaisesRegex(Exception, "(?i)mutation"):
+        with (
+            torch.no_grad(),
+            self.assertRaisesRegex(UncapturedHigherOrderOpError, MUTATED_ALIAS),
+        ):
             self._compile(fn)(self.x, torch.randn(12, 6))
 
     def test_returning_an_input_is_rejected(self):
@@ -2577,6 +2593,46 @@ class TestCallerOwnedOutput(unittest.TestCase):
                 )
         torch.testing.assert_close(dest, expected)
         self.assertNotIn(f"empty_strided_cpu(({n}, {rows})", "\n".join(code))
+
+    @expects_raise
+    def test_eager_gather_index_out_of_range_is_rejected(self):
+        """An eager call checks each Gather index against its tensor's rows.
+
+        A compiled Spyre kernel does not, and reads or writes such a row out of bounds.
+        """
+        values, pool = torch.randn(4, 6), torch.randn(10, 6)
+
+        def run(in_index, out_index):
+            return for_each_tile(
+                lambda _, tiles: (None, tiles[0] + 1),
+                (values if in_index is None else pool,),
+                dims=0 if in_index is None else Gather(0, in_index),
+                tile_size=1,
+                out_dim=Gather(0, out_index),
+                out=torch.zeros(10, 6),
+            )
+
+        cases = {
+            "out index past the end": (
+                None,
+                torch.tensor([0, 1, 2, 10]),
+                r"out_dim=Gather index names row 10, outside the 10 rows",
+            ),
+            "negative out index": (
+                None,
+                torch.tensor([0, -1, 2, 3]),
+                r"out_dim=Gather index names row -1, outside the 10 rows",
+            ),
+            "input Gather index past the end": (
+                torch.tensor([0, 1, 2, 10]),
+                torch.arange(4),
+                r"dims\[0\]=Gather index names row 10, outside the 10 rows",
+            ),
+        }
+        with torch.no_grad():
+            for name, (in_index, out_index, msg) in cases.items():
+                with self.subTest(name), self.assertRaisesRegex(IndexError, msg):
+                    run(in_index, out_index)
 
     def _split_m(
         self, out_dim=Gather(0, torch.arange(M).reshape(M // 2, 2)), out=None, **kwargs

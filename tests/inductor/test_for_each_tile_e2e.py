@@ -2593,6 +2593,31 @@ class TestForEachTileCallerOwnedOutputE2E(_DynamoResetTestCase):
         index = index.to(torch.int32).to(DEVICE_NAME, device_layout=index_layout)
         return values.to(DEVICE_NAME), index, initial, expected
 
+    @expects_raise
+    def test_eager_out_of_range_index_is_rejected(self):
+        """An eager call checks the index on the host, which a Spyre kernel does not."""
+        values = torch.zeros(2, self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+        index = torch.arange(2 * self.ROWS, dtype=torch.int32).reshape(2, self.ROWS)
+        index[1, -1] = 2 * self.ROWS
+        dest = torch.zeros(2 * self.ROWS, 64, dtype=torch.float16).to(DEVICE_NAME)
+
+        def body(_, tiles):
+            (v,) = tiles
+            return None, v[0] + 1
+
+        with (
+            torch.inference_mode(),
+            self.assertRaisesRegex(IndexError, "names row 64, outside the 64 rows"),
+        ):
+            for_each_tile(
+                body,
+                (values,),
+                dims=0,
+                tile_size=1,
+                out_dim=Gather(0, index.to(DEVICE_NAME)),
+                out=dest,
+            )
+
     def test_gather_rows_into_caller_pool(self):
         """KV-cache-style write into a pool uploaded with the default layout.
 

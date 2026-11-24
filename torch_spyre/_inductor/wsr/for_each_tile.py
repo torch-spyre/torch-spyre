@@ -36,6 +36,7 @@ import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan, scan_op
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch._subclasses.fake_tensor import is_fake
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._pytree import (
     keystr,
@@ -534,6 +535,23 @@ def _normalize_out(out, out_dim, num_tiles) -> _OutSpec:
     return _OutSpec(tuple(t for _, t in leaves_with_path), tuple(dims), index)
 
 
+def _check_gather_rows(index: torch.Tensor, size: int, what: str) -> None:
+    """Raise if an eager call's Gather index names a row outside `[0, size)`.
+
+    A compiled Spyre kernel does not check indirect indices, so there such a row
+    reads or writes out of bounds. An eager call checks here, on the host.
+    """
+    if index.numel() == 0 or is_fake(index):
+        return
+    rows = index.detach().cpu()
+    bad = rows[(rows < 0) | (rows >= size)]
+    if bad.numel():
+        raise IndexError(
+            f"for_each_tile() {what} names row {int(bad[0])}, outside the {size} "
+            "rows along its axis"
+        )
+
+
 def _write_out_tiles(spec: _OutSpec, targets, y, dest_rows) -> None:
     """Scatter one step's output tiles into the caller's destinations, in place.
 
@@ -695,7 +713,8 @@ def for_each_tile(
         dims: per-operand tile spec as a tuple, or a single spec broadcast to all of
             them. ``int d`` slices the operand into ``tile_size``-wide contiguous views
             along ``d``, ``tile_size`` shared by every such entry; ``None`` passes it
-            whole every step; ``Gather(axis, index)`` takes one pool row per step;
+            whole every step; ``Gather(axis, index)`` takes one pool row per step
+            (see ``out`` for how its index values are checked);
             ``Slice(dim, extent)`` is the same contiguous slicing as ``int d``, but
             with its own ``extent`` instead of sharing ``tile_size`` -- for an operand
             that needs a different per-trip width than the rest, e.g. one row of a
@@ -718,9 +737,12 @@ def for_each_tile(
             tensors whose leaves match the body's output tiles in flattened order.
             Each step writes its tiles into it in place, so no stacked output is
             materialized, and ``out`` itself is returned. Each leaf has the tile's
-            shape except along the Gather axis, where it is at least as long as
-            the largest index. The leaves must not share storage with an operand
-            or with each other. Requires grad mode to be disabled, and is not
+            shape except along the Gather axis, which must hold every row the
+            index names. An eager call checks that, for this index and for an
+            input ``Gather``'s, and raises ``IndexError``. A compiled graph does
+            not on Spyre: there an out-of-range row reads or writes out of
+            bounds, so check the index before uploading it. The leaves must not
+            share storage with an operand or with each other. Requires grad mode to be disabled, and is not
             supported in a decomposition (see the tracing contract). ``None``
             (the default) returns a new output tensor instead.
         reverse: visit tiles high to low. The output still lands in natural order.
@@ -804,6 +826,14 @@ def for_each_tile(
                 "torch.no_grad() or torch.inference_mode()"
             )
         out_spec = _normalize_out(out, out_dim, num_tiles)
+
+    if not torch.compiler.is_dynamo_compiling() and not in_decomposition:
+        for k, (o, s) in enumerate(zip(operands, specs)):
+            if s.kind is Kind.GATHER:
+                _check_gather_rows(s.index, o.shape[s.dim], f"dims[{k}]=Gather index")
+        if out_spec is not None:
+            rows = min(t.shape[d] for t, d in zip(out_spec.leaves, out_spec.dims))
+            _check_gather_rows(out_spec.index, rows, "out_dim=Gather index")
 
     map_mode = init is None
     out_index = out_spec.index if out_spec is not None else None
