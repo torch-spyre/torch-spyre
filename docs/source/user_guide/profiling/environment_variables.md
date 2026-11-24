@@ -111,6 +111,7 @@ The `stage:` regions are:
 | `stage:CustomPreSchedulingPasses:validate` | The operation-order check after the last pass |
 | `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
 | `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
+| `stage:CustomPreSchedulingPasses:span_overflow_tilings` | Under CP-SAT with span-overflow tiling on: the span-overflow planner and the menus it gives the solve, at the start of LX planning (`meta` counts the ops with a menu and the groups left to the solve or kept from it) |
 | `stage:CustomPreSchedulingPasses:log_before` / `:log_after` | The IR dumps, only when INFO logging is on |
 | `validate:CustomPreSchedulingPasses:<pass>` | The operation-order check after one pass, only with `SPYRE_VALIDATE_EVERY_PASS=1` |
 | `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |

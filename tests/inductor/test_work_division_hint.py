@@ -857,14 +857,18 @@ def test_lx_anchor_pass_respects_planning_switch(enabled):
         allocate.assert_not_called()
 
 
-def test_lx_planning_tiles_what_the_solve_cannot_take_before_anchoring():
+def test_lx_planning_tiles_what_the_solve_cannot_take_then_plans():
     """Under CP-SAT, LX planning runs the span-overflow planner. It tiles the
-    groups the solve cannot take, with the planner's tilings, before it calls
-    ``anchor_lx_relayout_ownership``. Then it hands the menus to the allocator."""
+    groups the solve cannot take, with the planner's tilings, then hands the
+    menus to the allocator. It tiles before it calls
+    ``anchor_lx_relayout_ownership``, as when the pass tiled, although anchoring
+    does nothing under co-optimization."""
     from torch_spyre._inductor import passes
 
     graph = SimpleNamespace()
-    tilings = SimpleNamespace(kept=[("group",)], dim_hint_assignments=[("op", [])])
+    tilings = SimpleNamespace(
+        menus={}, left=[], kept=[("group",)], dim_hint_assignments=[("op", [])]
+    )
     order = []
     with (
         config.patch({"lx_planning": True}),

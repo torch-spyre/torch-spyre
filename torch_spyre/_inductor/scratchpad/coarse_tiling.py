@@ -1049,6 +1049,13 @@ def _span_overflow_candidates(
     planner's. Before this returns several, the objective has to tell them
     apart: ``cost_expr`` has no term for tile size or cut count, which is why
     ``CoOptimizingAllocator._solve`` drops it under ``auto_coarse_tiling``.
+
+    A menu of several already has a path through the solve, but no test runs a
+    span-overflow menu of several through it: add one with the generator.
+    ``_tiling_candidates`` offers such a menu
+    (``test_an_op_with_a_menu_is_offered_its_menu``). ``_extract_op_features``
+    prices it with the symbolic tile counts ``auto_coarse_tiling`` uses, which
+    ``test_solver_auto_coarse_tiling.py`` and ``test_cost_expr_dump.py`` cover.
     """
     return [] if planned is None else [planned]
 

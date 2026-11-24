@@ -486,11 +486,17 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     # scratchpad_planning -> select_allocator; no allocator wiring here.
     # Under CP-SAT the span-overflow planner runs here, in place of its pass, so
     # that the solve picks the tilings. The groups the solve cannot take are
-    # tiled now, with the planner's tilings, so that
-    # anchor_lx_relayout_ownership sees them tiled.
+    # tiled now, with the planner's tilings. They come before anchoring, as when
+    # the pass tiled them, although anchoring does nothing under co-optimization.
     span_overflow = None
     if solve_decides_span_overflow_tiling(graph):
-        span_overflow = span_overflow_tilings(graph)
+        with timing_recorder.stage(
+            "stage:CustomPreSchedulingPasses:span_overflow_tilings"
+        ) as event:
+            span_overflow = span_overflow_tilings(graph)
+        event.meta["menu_ops"] = len(span_overflow.menus)
+        event.meta["left_groups"] = len(span_overflow.left)
+        event.meta["kept_groups"] = len(span_overflow.kept)
         apply_planner_tilings(
             graph,
             span_overflow.kept,

@@ -610,6 +610,41 @@ def test_the_allocator_gets_the_menus_and_a_failed_solve_tiles_the_groups():
     ]
 
 
+@needs_ortools
+def test_a_candidate_off_the_menu_fails_the_solve_instead_of_the_compile():
+    """If ``_division_map`` gives an op with a menu a candidate off that menu
+    (here the op became pinned after the filter ran), it raises ``SolveError``.
+    The fallback then tiles with the planner's tilings, so the compile goes on."""
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+
+    with config.patch(_CPSAT):
+        allocator = allocator_module.select_allocator()
+    allocator.span_overflow_menus = {"buf0": (_D0,)}
+    op = SimpleNamespace(name="buf0", get_name=lambda: "buf0")
+    pins = allocator_module._DivisionPins
+    with (
+        config.patch({"auto_coarse_tiling": False}),
+        mock.patch.object(
+            allocator_module, "_find_distinct_matmul_splits", return_value=((), ())
+        ),
+        mock.patch.object(
+            allocator_module, "_fp8_matmul_consumer_seeds", lambda graph: {}
+        ),
+        mock.patch.object(pins, "__init__", lambda self, graph, **kwargs: None),
+        mock.patch.object(pins, "reason", lambda self, op: "user work_div hint"),
+        mock.patch.object(
+            allocator_module, "_upstream_core_division", return_value=CoreDivision({})
+        ),
+        mock.patch.object(
+            allocator_module, "_legal_fixed_division", lambda op, divs, reason: divs
+        ),
+        pytest.raises(SolveError, match="buf0: candidates off its span-overflow menu"),
+    ):
+        allocator._division_map(
+            SimpleNamespace(operations=[op]), allow_deferred_read_candidates=True
+        )
+
+
 def test_an_op_with_a_menu_is_offered_its_menu():
     """Whatever ``auto_coarse_tiling`` says, and with no untiled option."""
     from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator

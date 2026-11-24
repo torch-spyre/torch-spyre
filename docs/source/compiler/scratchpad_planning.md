@@ -222,9 +222,9 @@ the solve picks a tiling with the split, and `apply_chosen_tilings` applies it
 after the solve. The cost objective prices a one-tiling menu with its concrete
 tile counts, and a menu of several with the symbolic counts
 `auto_coarse_tiling` uses. Every other group is tiled with the planner's
-tilings before relayout ownership is anchored, so anchoring and the solve see
-the graph the pass would have built (`apply_planner_tilings`). If the solve
-fails, the groups left to it get the planner's tilings before greedy placement.
+tilings right away (`apply_planner_tilings`), so the solve plans the graph the
+pass would have built for those groups. If the solve fails, the groups left to
+it get the planner's tilings before greedy placement.
 
 The tiling of a group the solve cannot take now runs after `plan_sharded_hbm`,
 work division and `report_output_layouts`, not before them. Under CP-SAT work

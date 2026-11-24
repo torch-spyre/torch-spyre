@@ -4115,9 +4115,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             menu = self.span_overflow_menus.get(op.name)
             if menu is not None and any(d.tiling not in menu for d in divs):
                 # The menu filter gives a pinned op no menu, so only a
-                # disagreement gets here. An op left untiled would keep a span
-                # the hardware cannot address.
-                raise RuntimeError(f"{op.name}: candidates off its span-overflow menu")
+                # disagreement gets here: the graph changed after the filter ran
+                # (the groups the solve cannot take were tiled in between). Left
+                # untiled, the op would keep a span the hardware cannot address,
+                # so fail the solve. Its fallback tiles every group left to the
+                # solve with the planner's tilings.
+                logger.warning(
+                    "%s: core-division candidates off its span-overflow menu; "
+                    "falling back to the planner's tilings and greedy placement",
+                    op.name,
+                )
+                raise SolveError(f"{op.name}: candidates off its span-overflow menu")
             # The core budget is an invariant of the MENU, not of its consumers: both
             # engines pin an op's split symbols to one enumerated candidate, so nothing
             # downstream re-checks the product -- and `_matmul_split_cost`'s own budget
@@ -6002,7 +6010,8 @@ def scratchpad_planning(
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
     except SolveError as error:
-        # Strong exception guarantee: SolveError comes from the solve, before the
+        # Strong exception guarantee: SolveError comes from the solve, or from the
+        # span-overflow menu check before it (``_division_map``), before the
         # allocator commits divisions, relayouts or addresses, and select_allocator
         # configures no pre-passes. The graph is unchanged, so greedy placement
         # replans it with the work divisions already committed and recollects
