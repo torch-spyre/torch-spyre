@@ -2453,6 +2453,10 @@ _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
         DataFormats.SEN169_FP16: 0,
         DataFormats.IEEE_FP32: 0,
     },
+    "batchmatmul": {
+        DataFormats.SEN169_FP16: 0,
+        DataFormats.IEEE_FP32: 0,
+    },
 }
 
 _POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdiv"}
