@@ -19,7 +19,7 @@ These tests intentionally mirror the compiler layers used by user
 
 1. Planner: span_overflow_hint_analysis returns a selected dim and split count.
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
-3. Coarse-tile IR: the lowering consumes the group and stamps a strict LoopInfo.
+3. Coarse-tile IR: the lowering consumes the group and stamps a strict LoopMember.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
 
 Coverage in this file:
@@ -30,7 +30,7 @@ Coverage in this file:
 - planner boundary errors when no legal divisor validates post-tile span;
 - hard failure when output MemoryDep address math is unavailable;
 - adapter mapping with both constant and symbolic batch output coordinates;
-- the lowering's stamping of ranges/layout/LoopInfo;
+- the lowering's stamping of ranges/layout/LoopMember;
 - equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 
@@ -59,7 +59,6 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
@@ -90,11 +89,8 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _op_read_span_is_evaluable,
     _spec_within_read_distance,
 )
+from torch_spyre._inductor.loop_facts import enclosing_loops
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
-from torch_spyre._inductor.scheduler import (
-    CountedLoopSchedulerNode,
-    build_loop_scheduler_nodes,
-)
 from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
     ChunkingInfo,
     SpanOverflowTileLevel,
@@ -347,24 +343,6 @@ def _pretiled_h_group(op, hint_id=1, split_count=_E2E_SPLIT_COUNT):
     )
     op.dim_hints = [hint]
     return [([op], [(hint_id, sympy.Integer(split_count))])]
-
-
-def _scheduler_node_for_op(op, name):
-    """Return a minimal SchedulerNode mock wrapping one IR op."""
-    scheduler = MagicMock()
-    scheduler.name_to_fused_node = {}
-    scheduler.removed_ops = set()
-
-    snode = MagicMock(spec=SchedulerNode)
-    snode.scheduler = scheduler
-    snode.node = op
-    snode.get_name.return_value = name
-    snode.get_nodes.return_value = [snode]
-    snode.ancestors = set()
-    snode.min_order = 0
-    snode.max_order = 0
-    snode.unmet_dependencies = set()
-    return snode
 
 
 class TestSpanOverflowGroups(InductorTestCase):
@@ -4097,9 +4075,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(op.loop_info.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
-        self.assertEqual(op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(op.loop_member.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
+        self.assertEqual(op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(op.loop_member.loop_tiled_reduction_dims, [[]])
 
     def test_combined_plan_reaches_coarse_tile_planner(self):
         bmm = _reduction_op(
@@ -5645,39 +5623,24 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(auto_op.layout.size), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.layout.size), _E2E_TILE_SHAPE)
-        self.assertEqual(auto_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(manual_op.loop_info.loop_count, [sympy.Integer(5)])
-        self.assertEqual(auto_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_dims, [[1]])
-        self.assertEqual(auto_op.loop_info.loop_tiled_reduction_dims, [[]])
-        self.assertEqual(manual_op.loop_info.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(auto_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(manual_op.loop_member.loop_count, [sympy.Integer(5)])
+        self.assertEqual(auto_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_dims, [[1]])
+        self.assertEqual(auto_op.loop_member.loop_tiled_reduction_dims, [[]])
+        self.assertEqual(manual_op.loop_member.loop_tiled_reduction_dims, [[]])
 
-        # Layer 4: scheduler wrapping sees the same counted loop on both paths.
-        created = []
-
-        def fake_create(snodes, loop_count):
-            node = MagicMock(spec=CountedLoopSchedulerNode)
-            node.snodes = snodes
-            node.loop_count = loop_count
-            node.get_nodes.return_value = snodes
-            node.get_name.return_value = "_".join(n.get_name() for n in snodes)
-            node.scheduler = snodes[0].scheduler
-            created.append(node)
-            return node
-
-        auto_snode = _scheduler_node_for_op(auto_op, "auto_snode")
-        manual_snode = _scheduler_node_for_op(manual_op, "manual_snode")
-        with patch.object(
-            CountedLoopSchedulerNode, "create", staticmethod(fake_create)
-        ):
-            auto_wrapped = build_loop_scheduler_nodes([auto_snode])
-            manual_wrapped = build_loop_scheduler_nodes([manual_snode])
-
-        self.assertEqual(len(auto_wrapped), 1)
-        self.assertEqual(len(manual_wrapped), 1)
-        self.assertEqual(created[0].loop_count, sympy.Integer(5))
-        self.assertEqual(created[1].loop_count, sympy.Integer(5))
-        self.assertEqual(auto_wrapped[0].loop_count, manual_wrapped[0].loop_count)
+        # Layer 4: the readers after the lowering see the same counted loop on both
+        # paths (``enclosing_loops`` reads the lowering's record until the nodes
+        # are built).
+        for op in (auto_op, manual_op):
+            (level,) = enclosing_loops(op)
+            self.assertEqual(level.trip_count, sympy.Integer(5))
+            self.assertEqual(level.tiled_dims, (1,))
+        self.assertEqual(
+            [x.group_path for x in enclosing_loops(auto_op)],
+            [x.group_path for x in enclosing_loops(manual_op)],
+        )
 
 
 def _forced_span_plan_on_dim1(split_count, expect_size):

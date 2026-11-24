@@ -377,8 +377,8 @@ def test_the_extractor_scales_a_per_trip_body_matmul_by_its_trip(monkeypatch):
         get_buffer=lambda name: None,
     )
 
-    def macs(loop_info):
-        op.loop_info = loop_info
+    def macs(loop_member):
+        op.loop_member = loop_member
         with V.set_graph_handler(graph):
             return dcm.extract_op_features(op).matmul_macs
 
@@ -522,7 +522,7 @@ def _looped_op(trips, tiled_out, hints, write_index, read_indices, data=None):
         name="buf1",
         data=data,
         dim_hints=list(hints),
-        loop_info=SimpleNamespace(
+        loop_member=SimpleNamespace(
             loop_group_id=tuple(range(len(trips))),
             loop_count=list(trips),
             loop_tiled_dims=[list(level) for level in tiled_out],
@@ -667,7 +667,7 @@ def _looped_matmul_features(
     op = _looped_op(trips, tiled_out, hints, write_index, read_indices, data=data)
     op.get_size = lambda: list(size)
     if tiled_red is not None:
-        op.loop_info.loop_tiled_reduction_dims = [list(lv) for lv in tiled_red]
+        op.loop_member.loop_tiled_reduction_dims = [list(lv) for lv in tiled_red]
     monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _op: it_space)
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: None)
     with V.set_graph_handler(_StubGraph()):

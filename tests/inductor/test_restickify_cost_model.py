@@ -464,7 +464,7 @@ def staged_transport_graph(monkeypatch):
     from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
     from torch._inductor.virtualized import ops
     from torch_spyre._inductor.ir import FixedTiledLayout
-    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.loop_node import LoopMember
     from torch_spyre._inductor.read_copy_elision import ReadCopyElisionRecord
     from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
     from torch_spyre._inductor.propagate_hints import DimHint
@@ -570,8 +570,8 @@ def staged_transport_graph(monkeypatch):
         )
         for op in (stage, consumer):
             op.dim_hints = [hint]
-        stage.loop_info = LoopInfo((0,), [sympy.Integer(32)], [[]])
-        consumer.loop_info = LoopInfo((0,), [sympy.Integer(32)], [[]])
+        stage.loop_member = LoopMember((0,), [sympy.Integer(32)], [[]])
+        consumer.loop_member = LoopMember((0,), [sympy.Integer(32)], [[]])
         consumer._read_copy_elision_record = ReadCopyElisionRecord(
             consumer_name="consumer",
             copy_name="stage",
@@ -798,7 +798,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
                 name="other", layout=consumer.layout, data=consumer.data
             )
             other.operation_name = "other"
-            other.loop_info = consumer.loop_info
+            other.loop_member = consumer.loop_member
             commit_iteration_space_ownership(other, {b: 8, x: 2, n: 1})
             graph.operations.append(other)
             graph.name_to_buffer[other.name] = other
