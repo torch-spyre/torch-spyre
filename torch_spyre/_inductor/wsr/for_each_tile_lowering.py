@@ -722,7 +722,26 @@ def _delinearize_index(
     such a dim's digit is added onto its already-matched symbol instead of
     only ever being assigned a bare digit; a dim needing no part of the
     constant simply gets digit 0 added, so a symbol-only dim decomposes the
-    same way as before.
+    same way as before. A large enough digit can land on a dim with a
+    LARGER stride than the one its constant conceptually "belongs to" --
+    e.g. a dim-2 constant big enough to carry into dim-1's stride -- which
+    is exactly the same mixed-radix carry a dense index already relies on
+    (digit 2 of 37, base 10, carries into digit 1); it is not a new kind of
+    answer, just the same peeling reaching one dim further than before.
+
+    This only recovers a coordinate that is valid once the loop symbol
+    takes its real runtime value -- it does not, and cannot, check that
+    itself: the symbol's own range never reaches this function. What makes
+    it sound anyway is the one call site (``_InlineMarkerHandler.load``):
+    ``index`` is always a genuine Inductor load-site index into a buffer
+    shaped exactly like ``size``/``stride``/``offset``, so the FULL
+    coordinate (symbol plus any digit folded onto it) is guaranteed
+    in-bounds by Inductor's own indexing invariant for every concrete value
+    the symbol takes -- the same guarantee the pre-existing symbol-only
+    branch already leaned on without checking it either. A digit computed
+    here independently of any symbol (no matching coefficient at all) is
+    still fully checked below, since nothing but this function vouches for
+    it.
 
     Raises ``AssertionError`` if two dims share a non-zero stride, if the
     constant portion doesn't decompose evenly across the live dims, if
@@ -730,7 +749,10 @@ def _delinearize_index(
     symbolic term is not an integer multiple of a single symbol or its
     coefficient is not a multiple of a stride it may be folded into -- all
     of which indicate the one-symbol/one-stride-per-term assumption above
-    doesn't hold for this index.
+    doesn't hold for this index. A digit that lands on a symbol-matched dim
+    is bounds-checked the same way (``digit >= size[i]``); the symbol's own
+    contribution to that dim is not and relies on the caller invariant
+    above.
     """
     remaining = sympy.expand(index - offset)
     free_syms = remaining.free_symbols

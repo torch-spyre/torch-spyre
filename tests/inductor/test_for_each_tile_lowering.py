@@ -296,6 +296,46 @@ class TestDelinearizeIndex(unittest.TestCase):
         )
         self.assertEqual(coords, [d0, d1 + 12800])
 
+    def test_constant_carries_from_an_inner_dim_into_an_outer_symbol_dim(self):
+        """A constant big enough to spill past the inner dim's own stride
+        lands partly on the outer dim's symbol, the same carry a dense
+        mixed-radix index already relies on (digit 2 of 37 in base 10
+        carries into digit 1): 37450 over dim1's stride-1 width (size
+        25600) leaves 1 full unit of dim0's stride 25600 behind, so dim0's
+        symbol ``d0`` picks up that extra 1 on top of itself."""
+        import sympy
+
+        d0, d1 = sympy.symbols("d0 d1")
+        coords = self._delinearize(
+            25600 * d0 + d1 + 37450, size=[64, 25600], stride=[25600, 1], offset=0
+        )
+        self.assertEqual(coords, [d0 + 1, d1 + 11850])
+
+    def test_constant_spans_a_symbol_free_dim_and_a_symbol_bearing_dim(self):
+        """A 3-dim constant that decomposes across a plain symbol-free
+        middle dim (a bare digit, as before #6329) AND a symbol-bearing
+        inner dim (a digit added onto its symbol, the new #6329 path) in
+        the same index -- pinning that the two kinds of dim can both
+        appear in one decomposition, not only in isolation."""
+        import sympy
+
+        d0, d2 = sympy.symbols("d0 d2")
+        coords = self._delinearize(
+            800 * d0 + d2 + 250, size=[4, 8, 100], stride=[800, 100, 1], offset=0
+        )
+        self.assertEqual(coords, [d0, sympy.Integer(2), d2 + 50])
+
+    def test_symbol_plus_out_of_range_digit_still_raises(self):
+        """A symbol on the dim does not relax the digit bound check: the
+        constant's own digit (30000, independent of ``d1``'s value) still
+        has to fit the dim's size (25600) on its own, same as a
+        symbol-free dim's out-of-range digit always has."""
+        import sympy
+
+        d1 = sympy.Symbol("d1")
+        with self.assertRaises(AssertionError):
+            self._delinearize(d1 + 30000, size=[25600], stride=[1], offset=0)
+
     def test_layout_without_foldable_dim_recovers_zero(self):
         """A [1, 1] tile (tile_size=1 over an [N, 1] operand) or a broadcast
         dim loads at index 0; with nothing left to fold, nothing must raise."""
