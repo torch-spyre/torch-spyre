@@ -897,10 +897,9 @@ def test_multi_output_op_with_conversion_fails_at_compile():
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    # TODO: pin to the one message this hits once confirmed on a device run.
+    # The sort result is an unsharded operand computed in the graph.
     unsharded_rejection = (
-        "admit an unsharded operand only "
-        "(in pointwise ops|when it is a scalar constant or a graph input)"
+        "admit an unsharded operand only when it is a scalar constant or a graph input"
     )
     with pytest.raises(RuntimeError, match=unsharded_rejection):
         torch.compile(lambda x, y: torch.argsort(x, dim=1) + 0 * y, dynamic=False)(a, b)
