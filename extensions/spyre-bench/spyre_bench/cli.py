@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""spyre-bench command line: validate, explain, ids, plan, run, upload, ondemand, verdict, accept, reference, invalidate, analyze, dataset, gen-schemas."""
+"""spyre-bench command line: validate, explain, ids, plan, run, upload, ondemand, verdict, accept, reference, invalidate, analyze, dataset, catalogs, query, gen-schemas."""
 
 import sys
 
@@ -45,6 +45,8 @@ VERBS = {
         "spyre_bench.dataset_add",
         "add, list and check datasets: store staging plus Dataset/Asset definitions",
     ),
+    "catalogs": ("spyre_bench.catalog_path", "the shared catalogs this package ships, and where to find them"),
+    "query": ("spyre_bench.query", "read stored results: overview, suites, one benchmark's series, compare"),
     "gen-schemas": ("spyre_bench.gen_schemas", "regenerate (or --check) the core JSON Schemas"),
 }
 
