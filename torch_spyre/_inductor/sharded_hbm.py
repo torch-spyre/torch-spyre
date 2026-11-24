@@ -266,6 +266,9 @@ def verify_mixed_args(sdsc_spec, shard_kernel_args) -> None:
       Those are addressed as in any unified kernel, so only the output is
       constrained.
 
+    A tensor kept in the bundle (HBM pool or LX) is unified storage, sharded
+    or not, and is not an ordinary argument here.
+
     This is only a backstop: any ordinary input is accepted when the output is
     sharded. The planner is the real gate; see ``_require_replica_source`` and
     ``_require_replica_read``.
@@ -274,7 +277,11 @@ def verify_mixed_args(sdsc_spec, shard_kernel_args) -> None:
     # ``num_inputs`` counts the output too, because it is also the
     # accumulator, so position is the reliable test.)
     output = len(sdsc_spec.args) - 1
-    plain = [i for i, t in enumerate(sdsc_spec.args) if not t.non_unified]
+    plain = [
+        i
+        for i, t in enumerate(sdsc_spec.args)
+        if not t.non_unified and not t.bundle_local
+    ]
     if not shard_kernel_args or (output in plain and plain != [output]):
         raise Unsupported(
             "non-unified kernels need a sharded output, or sharded inputs and "
@@ -616,7 +623,6 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
     placements = graph_placements(graph)
     if not placements:
         return
-    outputs = set(graph.get_output_names())
     # Cross-shard reductions planned for the ring: they read sharded storage
     # but produce an ordinary (unsharded) result.
     ring_reductions: set[str] = set()
@@ -726,20 +732,6 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             _require_replica_read(graph, name, dep, write, size)
         op.shard_pinned_splits = {sym: placement.num_shards}
         placements[name] = placement
-    # A sharded result is allocated as sharded storage only at the graph
-    # boundary; an intermediate would be placed in LX or the HBM pool as
-    # unified storage. Not supported yet: fail closed.
-    for op in graph.operations:
-        name = op.get_name() if isinstance(op, ComputedBuffer) else None
-        if (
-            name in placements
-            and name not in outputs
-            and name not in graph.graph_inputs
-        ):
-            raise Unsupported(
-                f"{name}: non-unified kernels need every sharded result to be a "
-                "graph output (sharded intermediates are not supported)"
-            )
     # Only pinned non-unified ops may read sharded storage. Any other
     # consumer (a fallback op, an unshaped buffer) would compile as a unified
     # kernel over sharded storage and fail only at launch, with an error that

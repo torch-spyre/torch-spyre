@@ -26,10 +26,10 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   points for a non-identity map exist but are pinned to identity (see
   [Roadmap extension points](#roadmap-extension-points)).
 * **Pointwise ops compiled end-to-end.** Any same-shape pointwise op runs
-  as a sharded kernel (`add` is the one the test suite pins); chaining
-  works across compiled calls, but a multi-op graph with a sharded
-  intermediate is rejected. Everything else that would touch sharded
-  storage is rejected at compile time with a message saying why.
+  as a sharded kernel (`add` is the one the test suite pins); a chain of
+  them compiles as one graph, and chaining also works across compiled
+  calls. Everything else that would touch sharded storage is rejected at
+  compile time with a message saying why.
 * **Host copies and fills.** Sharded tensors copy to and from the CPU
   (whole-tensor; copies to the CPU may change the dtype, copies to the
   device may not), and eager `fill_`/`zero_` fill each shard's own
@@ -75,8 +75,7 @@ everything outside it fails at compile time with a specific message:
   `SpyreTensorLayout`, and the committed device layout must be the default
   global one — a restickified or otherwise relaid tensor cannot use chunk
   addressing (`_non_unified_shard_bytes` in `spyre_kernel.py`).
-* Sharded intermediates and in-place writes into sharded storage are
-  rejected — only graph inputs and outputs may be sharded.
+* In-place writes into sharded storage are rejected.
 
 `num_shards` must equal the active core count (`SENCORES`), so the storage
 and the kernels that consume it agree on how many cores participate.
@@ -309,9 +308,10 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 Downstream, the sharding plan pins work division — a sharded op's core
 split is fixed by its shard plan (the scratchpad allocator's "shard plan"
 branch), never renegotiated by the work-division passes — and codegen
-emits **one SDSC (kernel invocation) with the non-unified
-`nonUnifiedAllocInHBM_` form and one `input_arg` per (sharded tensor,
-core) pair** — every core executes the same kernel on its own shard:
+emits **one SDSC (kernel invocation) per op, with the non-unified
+`nonUnifiedAllocInHBM_` form and one `input_arg` per (sharded kernel
+argument, core) pair** — every core executes the same kernel on its own
+shard:
 
 * [bundle.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/bundle.py)
   introduces the `kShardAddress` symbol kind: a sharded kernel argument
@@ -329,6 +329,12 @@ core) pair** — every core executes the same kernel on its own shard:
 * [_monkey_patch.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_monkey_patch.py)
   folds sharding into the compiled-artifact cache key, so sharded and
   unsharded tensors of the same shape never share a kernel.
+
+A sharded intermediate keeps its placement, so the ops that read it are
+pinned to the same split. Kept inside one bundle (in the HBM pool or LX),
+it is ordinary unified storage, not chunks: core *c* reads back exactly
+the slice it wrote, because every op of the chain has the same split.
+Otherwise the wrapper allocates it as sharded storage, like a graph output.
 
 ## Invariants the tests pin
 
@@ -356,7 +362,8 @@ load-bearing contracts, and where they are pinned:
 * **The compiled path is correct and isolated**: one shard per core,
   each core writes only its own shard, a sharded and an unsharded tensor
   of the same shape never share a cache entry, sharded operands mix with
-  unsharded read-only replicas, and unsupported ops/shardings fail at compile with
+  unsharded read-only replicas, a pointwise chain compiles as one graph, and
+  unsupported ops/shardings fail at compile with
   stable messages (`tests/sharding/test_sharded_add.py`).
 
 `test_sharded_add.py` needs a device or the emulation shape (`SENCORES`
