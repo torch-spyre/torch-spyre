@@ -17,21 +17,17 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch  # noqa: F401
 import sympy
 from torch._inductor.ir import ExternKernel
-from torch._inductor.scheduler import SchedulerNode
 
 from torch_spyre._inductor.cost_model_pass import _loop_group_id as cost_gid
 from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
     enclosing_loops,
     loop_depth,
-    scheduler_enclosing_loops,
 )
 from torch_spyre._inductor.loop_node import LoopMember
-from torch_spyre._inductor.scheduler import _loop_count, _loop_group_id
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 
 
@@ -55,12 +51,6 @@ def _extern(info):
     op = MagicMock(spec=ExternKernel)
     op.loop_member = info
     return op
-
-
-def _snode(info):
-    sn = MagicMock(spec=SchedulerNode)
-    sn.node = _op(info)
-    return sn
 
 
 def test_flat_op():
@@ -101,23 +91,6 @@ def test_extern_excluded_by_default():
     assert counted_loop_path(op, include_extern=True) == (0,)
 
 
-def test_scheduler_skips_nodes_without_loop_info():
-    node = MagicMock()
-    node.get_nodes.return_value = [
-        _snode(None),
-        _snode(_info((2,), [sympy.Integer(5)])),
-    ]
-    (lvl,) = scheduler_enclosing_loops(node)
-    assert lvl.group_path == (2,)
-    assert lvl.trip_count == 5
-
-
-def test_scheduler_node_without_scheduler_nodes_yields_empty():
-    node = MagicMock()
-    node.get_nodes.return_value = [MagicMock()]
-    assert scheduler_enclosing_loops(node) == ()
-
-
 def test_default_tiled_reduction_dims_is_still_a_loop():
     # Like test_restickify_cost_model: loop_tiled_reduction_dims left empty.
     op = _op(LoopMember((0,), [32], [[]]))
@@ -154,39 +127,6 @@ def test_agrees_with_existing_readers():
             assert [lvl.tiled_dims for lvl in levels] == [
                 tuple(d) for d in info.loop_tiled_dims
             ] + [()] * (len(levels) - len(info.loop_tiled_dims))
-
-
-def _sched_node(info):
-    node = MagicMock()
-    node.get_nodes.return_value = [_snode(info)]
-    node.get_name.return_value = "buf0"
-    return node
-
-
-def test_scheduler_readers_well_formed():
-    node = _sched_node(_info((3, 0), [2, 8]))
-    assert _loop_group_id(node) == (3, 0)
-    assert _loop_count(node, 0) == 2
-    assert _loop_count(node, 1) == 8
-    assert _loop_group_id(_sched_node(None)) is None
-
-
-def test_scheduler_readers_malformed_ids_read_as_no_loop():
-    # A bare-int or empty id used to raise TypeError / return () from
-    # _loop_group_id; it now reads as "no loop", like the other accessors.
-    for gid in (3, ()):
-        assert _loop_group_id(_sched_node(_info(gid, [4]))) is None
-
-
-def test_scheduler_loop_count_missing_depth_is_loud():
-    node = _sched_node(_info((0,), [4]))
-    with pytest.raises(AssertionError, match="no loop_count for depth 1"):
-        _loop_count(node, 1)
-    # A loop_count shorter than the id reads as "no loop" for both readers.
-    short = _sched_node(_info((0, 1), [4]))
-    assert _loop_group_id(short) is None
-    with pytest.raises(AssertionError, match="no loop_count for depth 0"):
-        _loop_count(short, 0)
 
 
 class TestBroadcastBatchVars:

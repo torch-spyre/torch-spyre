@@ -38,7 +38,6 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor import loop_node as ln
 from torch_spyre._inductor.deadcode_elimination import (
     _has_side_effects,
     deadcode_elimination,
@@ -362,17 +361,6 @@ class TestCollapse(unittest.TestCase):
         self.assertEqual((outer.induction, inner.induction), (u0, u1))
         self.assertEqual(outer.carries, (record,))
         self.assertEqual(inner.carries, (record,))
-
-    def test_disabled_switch_builds_nothing(self):
-        ops = [_Op("a", (0,), [4])]
-        graph = _graph(ops)
-        old = ln.BUILD_LOOP_NODES
-        ln.BUILD_LOOP_NODES = False
-        try:
-            collapse(graph)
-        finally:
-            ln.BUILD_LOOP_NODES = old
-        self.assertEqual(graph.operations, ops)
 
     def test_unique_node_names(self):
         ops = [

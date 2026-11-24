@@ -251,6 +251,14 @@ def _handoff_parent_end(
     return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
+def _mutation_target_names(graph: GraphLowering) -> set[str]:
+    return {
+        op.layout.target.get_name()
+        for op in graph.operations
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    }
+
+
 def _extern_kernel_in_live_range(
     graph: GraphLowering, uses: list[int], *, excluded_op: Operation | None = None
 ) -> bool:
@@ -699,8 +707,8 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
     (input clone) attributes onto the clone, but a post-loop drain and a
     hoisted pre-loop input clone are neither loop members nor carries: a
-    surviving ``loop_member`` would re-group the clone into the counted loop at
-    scheduling time (``_loop_group_id``) and give it another op's per-read tile
+    surviving loop membership would keep the clone in the counted loop at
+    scheduling time and give it another op's per-read tile
     advance in codegen (``_index_tile_advance``), and the records would
     misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
@@ -1469,6 +1477,7 @@ class ScratchpadAllocator:
         name: str,
         uses: list[int],
         *,
+        mutated_buffers: Collection[str],
         ncores: Optional[dict[str, int]] = None,
         ncores_reasons: Optional[dict[str, str]] = None,
         division_is_fixed: bool,
@@ -1483,12 +1492,17 @@ class ScratchpadAllocator:
         it saves nothing -- which ``_read_count`` (first use excluded) states
         directly.
 
+        An input the graph writes in place is refused: the write lands in HBM, so
+        the clone would be stale for every later read.
+
         ``ncores``/``ncores_reasons`` are consulted only on the placement path
         (``division_is_fixed``); the joint path defers the core division to the
         solver and passes neither.
         """
         if not clone_at_graph_boundaries():
             return "graph input (no clone)"
+        if name in mutated_buffers:
+            return "mutation target"
         if is_empty_tiled_layout(getattr(graph.try_get_buffer(name), "layout", None)):
             return "empty tensor"
         if self._read_count(uses) == 0:
@@ -1550,11 +1564,7 @@ class ScratchpadAllocator:
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
         op_by_name = {op.name: op for op in graph.operations}
-        mutated_buffers = {
-            op.layout.target.get_name()
-            for op in graph.operations
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-        }
+        mutated_buffers = _mutation_target_names(graph)
         graph_output_names = set(graph.get_output_names())
         reinterpret_output_names = {
             go.get_name()
@@ -1766,6 +1776,7 @@ class ScratchpadAllocator:
         # parent of its own. The value is letting the consumer that performs that
         # last read reuse the clone's slot for its own output.
         built_by_name = {b.name: b for b in buffers}
+        mutated_buffers = _mutation_target_names(graph)
         for input_name in graph.graph_input_names:
             uses = lifetimes.get(input_name, [])
             if not uses:
@@ -1774,6 +1785,7 @@ class ScratchpadAllocator:
                 graph,
                 input_name,
                 uses,
+                mutated_buffers=mutated_buffers,
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=True,
@@ -2271,9 +2283,9 @@ class ScratchpadAllocator:
                     )
                     # Drain-only metadata hygiene: the clone copied the
                     # storage's attributes, but it is neither a loop member nor
-                    # a carry.  The scheduler-level
-                    # ``_loop_group_id(drain_node) is None`` is asserted by the
-                    # captured-order test; here the op-level absence is exact.
+                    # a carry.  That the drain's scheduler node is in no loop is
+                    # asserted by the captured-order test; here the op-level
+                    # absence is exact.
                     _clear_loop_membership_metadata(new_buffer)
                     if drain_plan.collective is not None:
                         # An in-place collective's result is the output: it and
@@ -5047,11 +5059,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         satisfies all its children. That constraint is enforced by requiring
         each child to match the parent, not by pre-rejecting here.
         """
+        mutated_buffers = _mutation_target_names(graph)
         return [
             name
             for name in graph.graph_input_names
             if self._input_residency_reason(
-                graph, name, lifetimes.get(name, []), division_is_fixed=False
+                graph,
+                name,
+                lifetimes.get(name, []),
+                mutated_buffers=mutated_buffers,
+                division_is_fixed=False,
             )
             is None
         ]

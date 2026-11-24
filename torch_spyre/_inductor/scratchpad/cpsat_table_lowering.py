@@ -26,7 +26,10 @@ works out which entry of a table applies: ``value == values[index]``. Three laye
   the model. Only ``cp_expr`` methods touch the model.
 
 One table per node: an expression whose inputs fit the cap together is lowered, and
-anything wider is refused. Nothing imports the module yet.
+anything wider is refused. A node's list is the numpy core's function of its sympy
+class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its candidates
+with) applied to its operands' tables; a class the core has no function for is
+lambdified. Nothing imports the module yet.
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ import sympy
 from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
+
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -213,14 +218,40 @@ Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 # The form of an operand in its node's function: as it is (None), a condition
 # (CONDITION), or the base of a Mul's factor with a negative rational exponent, which
-# the function raises to that exponent (the exponent, a sympy.Rational).
+# the Mul divides by (the exponent, a sympy.Rational).
 CONDITION = "condition"
 Form: TypeAlias = "str | sympy.Rational | None"
 
 
+def _evaluate(
+    expr: sympy.Basic, forms: tuple[Form, ...], arguments: Sequence[np.ndarray]
+) -> Any:
+    """expr's list from arguments, its operands' lists in the forms they take: by the
+    numpy core's function of its class, or by its class lambdified (_lambdified) when
+    the core has none. A condition is compared with 0, and a Mul divides its other
+    factors' product by the bases of the factors it divides by, as lambdify prints a
+    quotient: 98/a, where 98*(1/a) floors one low at a = 49."""
+    plain = [
+        argument != 0 if form == CONDITION else argument
+        for argument, form in zip(arguments, forms)
+        if form is None or form == CONDITION
+    ]
+    divisors = [
+        argument ** float(-form)  # type: ignore[operator]
+        for argument, form in zip(arguments, forms)
+        if not (form is None or form == CONDITION)
+    ]
+    try:
+        value = numpy_eval(expr, plain)
+    except NotImplementedError:
+        return _apply(_lambdified(expr.func, forms), arguments)
+    return value / math.prod(divisors) if divisors else value
+
+
 def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     """The function of a node of sympy class func whose operands take forms, lambdified
-    with the numpy module over one placeholder per operand. Nothing keeps it.
+    with the numpy module over one placeholder per operand: for a class the numpy core
+    has no function for. Nothing keeps it.
 
     The placeholders are plain symbols with identifier names: when one is a Dummy,
     lambdify renames every argument and rebuilds the node each time (a Min of 35
@@ -431,9 +462,7 @@ class TableLowering(Printer):
                 arguments.append(np.broadcast_to(table.values[at], (index.size,)))
             forms.append(form)
         values = _values(
-            expr,
-            index.size,
-            lambda: _apply(_lambdified(expr.func, tuple(forms)), arguments),
+            expr, index.size, lambda: _evaluate(expr, tuple(forms), arguments)
         )
         return self._finite(expr, TableRealization(values=values, index=index))
 
