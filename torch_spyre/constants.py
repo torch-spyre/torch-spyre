@@ -12,5 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Device name registered with PyTorch.
 DEVICE_NAME = "spyre"
 DISTRIBUTED_BACKEND_NAME = "spyreccl"
