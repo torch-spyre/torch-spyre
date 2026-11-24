@@ -1460,6 +1460,100 @@ class TestMatmulReuseDims(InductorTestCase):
         )
 
 
+class TestMatmulCoordinateMask(InductorTestCase):
+    """A matmul masks the pure-padding lanes of one padded dim with 0.
+
+    The masked dim is N (iterated by the output and the kernel but not the
+    activation) or, failing that, K (iterated by both inputs but not the
+    output). The mask covers the lanes past the dim's logical extent.
+    """
+
+    def _compiled_matmul_specs(self, fn, *inputs) -> list:
+        captured = []
+        real_parse_op_spec = superdsc.parse_op_spec
+
+        def _spy(*args, **kwargs):
+            result = real_parse_op_spec(*args, **kwargs)
+            captured.append(result[0])
+            return result
+
+        with (
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            mock_backend_compiler(),
+            patch.object(superdsc, "parse_op_spec", side_effect=_spy),
+        ):
+            run_and_get_code(torch.compile(fn), *(t.to("spyre") for t in inputs))
+        specs = [s for s in captured if s.opfunc == "batchmatmul"]
+        self.assertTrue(specs, "no batchmatmul SDSC generated")
+        return specs
+
+    def _assert_masks_columns(self, spec, n: int, padded_n: int):
+        (dim,) = spec.coordinate_masking
+        self.assertEqual(str(dim), "out")
+        self.assertEqual(spec.iteration_space[dim], padded_n)
+        self.assertEqual(spec.coordinate_masking[dim], [[n, padded_n - n]])
+        constants = list(spec.constants)
+        self.assertEqual(constants[spec.masking_const_id], "samv-maskvalue")
+        self.assertEqual(spec.constants["samv-maskvalue"], 0.0)
+
+    def test_unaligned_n_is_masked(self):
+        x = torch.randn(64, 128, dtype=torch.float16)
+        w = torch.randn(128, 100, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self._assert_masks_columns(spec, 100, 128)
+
+    def test_batched_unaligned_n_and_k_masks_only_n(self):
+        # The backend masks one dim at a time; N wins over K.
+        x = torch.randn(3, 64, 100, dtype=torch.float16)
+        w = torch.randn(3, 100, 100, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self._assert_masks_columns(spec, 100, 128)
+
+    def test_unaligned_k_is_masked(self):
+        # The activation's K padding lanes hold whatever its producer left
+        # there; against the kernel's zero-padded K rows, inf * 0 = NaN.
+        x = torch.randn(64, 32, dtype=torch.float16)
+        w = torch.randn(32, 64, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            (dim,) = spec.coordinate_masking
+            self.assertEqual(str(dim), "in")
+            self.assertEqual(spec.iteration_space[dim], 64)
+            self.assertEqual(spec.coordinate_masking[dim], [[32, 32]])
+            self.assertEqual(spec.constants["samv-maskvalue"], 0.0)
+
+    def test_aligned_n_is_not_masked(self):
+        x = torch.randn(64, 128, dtype=torch.float16)
+        w = torch.randn(128, 128, dtype=torch.float16)
+        for spec in self._compiled_matmul_specs(lambda a, b: a @ b, x, w):
+            self.assertEqual(spec.coordinate_masking, {})
+            self.assertEqual(spec.masking_const_id, -1)
+
+    def test_symbolic_n_is_not_masked(self):
+        # The iteration space holds a symbolic dim's maximum, so a mask built
+        # from it would not match the runtime extent.
+        mb, n, k = sympy.symbols("mb out in")
+        args = [
+            SimpleNamespace(scales={mb: 1, k: 1}),
+            SimpleNamespace(scales={k: 1, n: 1}),
+            SimpleNamespace(scales={mb: 1, n: 1}),
+        ]
+        it_space = {mb: 64, n: 128, k: 128}
+        mask = superdsc._get_coordinate_mask(
+            it_space, args[-1], {n: 28}, "batchmatmul", args[:-1]
+        )
+        self.assertEqual(mask, {n: [[100, 28]]})
+        mask = superdsc._get_coordinate_mask(
+            it_space,
+            args[-1],
+            {n: 28},
+            "batchmatmul",
+            args[:-1],
+            symbolic_dim_names={"out"},
+        )
+        self.assertEqual(mask, {})
+
+
 class TestStaggeredFp32Consumer(InductorTestCase):
     """An op that keeps the staggered arrangement iterates the whole stick pair.
 

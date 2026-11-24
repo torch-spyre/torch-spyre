@@ -28,7 +28,7 @@ Each case records what the current lowering produces:
 * the ops the transform adds, by name pattern (``coarse_tile_copy_*``,
   ``..._fill_*``, ``..._combine_*``), which ``scratchpad.coarse_tiling`` and work
   division depend on (``apply_tilings`` sets ``JOINT_TILING_AND_DIVISION_ATTR`` on
-  ops "not in before and with a loop_info");
+  ops "not in before and with a loop_member");
 * the result against an fp32 reference.
 
 (A test that two compiles of one graph give the same generated text lived here, to
@@ -378,7 +378,7 @@ def test_the_allocator_asks_the_enumerator_for_one_level_only():
         return None
 
     op = SimpleNamespace(
-        loop_info=None, get_operation_name=lambda: "buf0", get_name=lambda: "buf0"
+        loop_member=None, get_operation_name=lambda: "buf0", get_name=lambda: "buf0"
     )
     allocator = SimpleNamespace(
         _tilings_from_menu=True,
@@ -438,7 +438,7 @@ def test_a_nested_for_each_tile_loop_is_not_affected(limit):
 
     The 256 KB case is a control (nothing overflows). The 16 KB case is the one
     with power: with that skip removed the planner groups the loop body and the
-    compile fails with "group (1,) would overwrite the existing loop_info of
+    compile fails with "group (1,) would overwrite the existing loop_member of
     while_loop_body_graph_0_0_op5"."""
     from for_each_tile_fixtures import nested_split_m_then_k_fn
 

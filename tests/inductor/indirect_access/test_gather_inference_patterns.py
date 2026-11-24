@@ -93,11 +93,6 @@ _INDEX_PUT_IMPL_EAGER = rejection(
     "aten::_index_put_impl_ is not registered on Spyre.",
     r"Could not run 'aten::_index_put_impl_'",
 )
-_INDEX_PUT_DBO_OPT = (
-    4926,
-    "compile index_put_ on a [8, 1024] view: dbo-opt fails in sbf-ddc with 'Expect valid alloc users' (the diagnostic #4926 reports for scatter).",
-    r"SubprocException.*Expect valid alloc users",
-)
 
 
 class TestGatherInferencePatternsEagerCompile:
@@ -690,12 +685,7 @@ class TestGatherInferencePatternsEagerCompile:
     def test_index_put_view_n_32_32(self, execution_mode):
         """index_put_ on view [8, 32, 32] → [8, 1024]; compile Mod(d1, 32) (#4443)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/692
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4926
-        _xfail_existing(
-            execution_mode,
-            eager=_INDEX_PUT_IMPL_EAGER,
-            compiled=_INDEX_PUT_DBO_OPT,
-        )
+        _xfail_existing(execution_mode, eager=_INDEX_PUT_IMPL_EAGER)
         x = torch.zeros(8, 32, 32, dtype=torch.float16)
         slots = torch.arange(4, dtype=torch.int32)
         values = torch.ones(4, 1024, dtype=torch.float16)

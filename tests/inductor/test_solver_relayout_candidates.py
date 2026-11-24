@@ -303,9 +303,9 @@ def test_split_product_must_equal_core_count():
 
 def _loop_info(group):
     """A real one-record loop stamp for the loop group path ``group``."""
-    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.loop_node import LoopMember
 
-    return LoopInfo(
+    return LoopMember(
         loop_group_id=group,
         loop_count=[4] * len(group),
         loop_tiled_dims=[[0]] * len(group),
@@ -322,19 +322,19 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     """
     from torch._inductor.ir import ComputedBuffer
 
-    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.loop_node import LoopMember
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         solver_relayout_edge_context,
     )
 
     def tiled(group):
-        return LoopInfo(
+        return LoopMember(
             loop_group_id=group,
             loop_count=[4] * len(group),
             loop_tiled_dims=[[0]] * len(group),
         )
 
-    def probe(loop_info):
+    def probe(loop_member):
         class _Probe(ComputedBuffer):
             layout_accessed = False
 
@@ -343,7 +343,7 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
                 type(self).layout_accessed = True
 
         obj = _Probe.__new__(_Probe)
-        obj.loop_info = loop_info
+        obj.loop_member = loop_member
         return obj
 
     rejected = [
@@ -359,7 +359,7 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
         prod, cons = probe(prod_info), probe(cons_info)
         assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
         assert not type(prod).layout_accessed and not type(cons).layout_accessed, (
-            "a cross-group endpoint reached checks past the loop_info gate"
+            "a cross-group endpoint reached checks past the loop_member gate"
         )
 
     # Distinct metadata objects with equal IDs must also pass the scope gate.
@@ -672,12 +672,12 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
     assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
 
 
-def _consumer(name, data=None, carry_of=None, loop_info=None):
+def _consumer(name, data=None, carry_of=None, loop_member=None):
     """An op for the consumer rule: its name, IR data, loop metadata and,
     for a carry's storage or update, the carry record."""
     from torch_spyre._inductor.loop_node import LoopCarryRecord
 
-    op = SimpleNamespace(get_name=lambda: name, data=data, loop_info=loop_info)
+    op = SimpleNamespace(get_name=lambda: name, data=data, loop_member=loop_member)
     if carry_of is not None:
         op._loop_carry_record = LoopCarryRecord(
             storage_name=carry_of, update_name="buf_update"
@@ -718,7 +718,7 @@ def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
     loop's carry, so the solver may offer it a relayout copy. Another
     reduction kind, a sum inside a loop and a sum of any other producer keep
     the earlier answer (no relayout)."""
-    from torch_spyre._inductor.loop_info import LoopInfo
+    from torch_spyre._inductor.loop_node import LoopMember
 
     matmul = _consumer("mm")
     monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda o: o is matmul)
@@ -727,13 +727,13 @@ def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
     carry = _consumer("buf52", carry_of="buf52")
     update = _consumer("buf_update", carry_of="buf52")  # the record's other end
     plain = _consumer("buf7")
-    one_loop = LoopInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]])
+    one_loop = LoopMember(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]])
     supported = lx_relayout._relayout_consumer_kind_supported
     assert supported(carry, total)
     assert not supported(plain, total)
     assert not supported(update, total)
     assert not supported(carry, _consumer("max", _reduction("max")))
-    in_loop = _consumer("in_loop", _reduction("sum"), loop_info=one_loop)
+    in_loop = _consumer("in_loop", _reduction("sum"), loop_member=one_loop)
     assert not supported(carry, in_loop)
     for producer in (carry, plain):
         assert supported(producer, pointwise)
@@ -743,13 +743,13 @@ def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
 
 def test_a_sum_that_the_loop_facts_put_in_a_loop_takes_no_relayout(monkeypatch):
     """The rule asks ``counted_loop_path`` (the loop-facts read API) whether
-    the sum runs in a loop, not ``loop_info``. A sum with no ``loop_info``
+    the sum runs in a loop, not ``loop_member``. A sum with no ``loop_member``
     that the loop facts put in a loop, as they will when loop membership
     moves off the op (#5863), takes no copy."""
     carry = _consumer("buf52", carry_of="buf52")
     in_loop = _consumer("in_loop", _reduction("sum"))
     after = _consumer("after", _reduction("sum"))
-    assert in_loop.loop_info is None and after.loop_info is None
+    assert in_loop.loop_member is None and after.loop_member is None
     monkeypatch.setattr(
         lx_relayout,
         "counted_loop_path",
@@ -786,7 +786,7 @@ def test_an_edge_needs_an_fx_origin_at_both_ends(monkeypatch):
             SpyreTensorLayout(size, torch.float16),
         )
         op = ComputedBuffer(name="buf0", layout=layout, data=_pointwise(size))
-        op.loop_info, op.origins, op.origin_node = None, list(origins), origin_node
+        op.loop_member, op.origins, op.origin_node = None, list(origins), origin_node
         return op
 
     asked = []
@@ -915,9 +915,9 @@ def test_persistent_scatter_requires_independent_immutable_source(
     elif violation == "producer_alias":
         source.get_inputs_that_alias_output = lambda: ("external",)
     elif violation == "tiled_producer":
-        source.loop_info = _loop_info((0,))
+        source.loop_member = _loop_info((0,))
     elif violation == "tiled_consumer":
-        update.loop_info = _loop_info((0,))
+        update.loop_member = _loop_info((0,))
     elif violation == "opaque_aliases":
 
         def unknown():
