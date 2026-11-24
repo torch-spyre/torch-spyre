@@ -274,6 +274,22 @@ def test_a_carry_alone_widens_a_storage_that_is_only_written_in_the_loop():
     )
 
 
+def test_an_inner_carry_reset_every_outer_trip_does_not_cover_the_outer_loop():
+    # As _carries_of builds them on nested_split_m_then_k: the outer node lists the
+    # inner accumulator because its init sits directly in the outer body, and the
+    # inner node because the update does. Only the inner back edge carries it.
+    rec = LoopCarryRecord(storage_name="acc", update_name="upd")
+    upd = _Op("upd", reads=["acc"], writes=["acc"])
+    inner = _node("n1", [_Op("k"), upd], trip=4, carries=[rec])
+    outer = _node(
+        "n0",
+        [_Op("a"), _Op("init", writes=["acc"]), inner, _Op("r", reads=["acc"])],
+        trip=4,
+        carries=[rec],
+    )
+    assert LoopProgram([outer]).live_interval("acc") == (1, 4)
+
+
 def test_a_graph_input_mutated_in_a_loop_is_born_outside_it():
     w = _Op("w", reads=["in0"], writes=["in0"])
     r = _Op("r", reads=["in0"])

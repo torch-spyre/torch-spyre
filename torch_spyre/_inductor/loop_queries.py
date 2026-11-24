@@ -251,7 +251,15 @@ class LoopProgram:
             # A graph input is born outside every loop, whoever writes it later.
             born_in = wrote and name not in self._input_names
             birth = self._leaf(writer).loops if born_in else ()
-            widen = list(carried.get(name, ()))
+            # A carry crosses the back edge of a loop that holds its update but not
+            # its storage's birth. A node also lists a carry whose initial value it
+            # makes directly in its body (an inner loop's accumulator, reset every
+            # outer trip); that value does not survive the outer back edge.
+            widen = [
+                loop
+                for loop in carried.get(name, ())
+                if not any(loop is b for b in birth)
+            ]
             for op in index.readers.get(name, ()):
                 for loop in self._leaf(op).loops:
                     if not any(loop is b for b in birth):
@@ -281,5 +289,6 @@ class LoopProgram:
 
         The uses' range, widened for a read to the span of the outermost loop that
         holds the read but not the buffer's birth (a value read again every trip
-        must survive the back edge), and for a carry to its node's span."""
+        must survive the back edge), and for a carry to the span of each node that
+        carries it but does not hold its storage's birth."""
         return self._buffers().intervals.get(buffer)
