@@ -746,7 +746,7 @@ class TestNegativeScalarOperations:
 
         x = cached_randn((10, 10))
         result = _run_spyre(execution_mode, device_mul, x)
-        assert result.device.type == DEVICE.type
+        assert result.device.type == DEVICE
         assert result.shape == x.shape
 
     def test_requires_grad_scalar_operation(self, execution_mode):
