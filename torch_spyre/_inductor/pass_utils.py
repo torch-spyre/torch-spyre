@@ -1982,9 +1982,9 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     set membership on dep.index.free_symbols alone (see issue #3888): both are
     "in y and the output, but not in x".
 
-    op.loop_member.loop_tiled_dims (stamped by coarse-tiling before layout
-    propagation runs, per passes.py's pass ordering) lists, per nesting
-    level, the raw op.data.ranges positions this loop group tiles -- for the
+    Each of the op's loop levels' ``tiled_dims`` (``enclosing_loops``; coarse-tiling
+    records them before layout propagation runs, per passes.py's pass ordering)
+    lists the raw op.data.ranges positions this loop group tiles -- for the
     innermost tile-body op itself, this op's own write is already the
     tile-local slice, so loop_tiled_dims is the only surviving
     signal identifying which raw dims the enclosing loop nest tiles at all.
@@ -5496,8 +5496,8 @@ def format_operations(operations: list[Operation]) -> str:
             if dim_hints := getattr(op, "dim_hints", None):
                 buf.write(f"\n  dim_hints={dim_hints}")
             if levels := enclosing_loops(op):
-                # No induction: a node knows it, the flat path's stamp does not,
-                # and the two paths' dumps are compared.
+                # (group path, trip count, tiled dims, tiled reduction dims) per
+                # level; test_loop_scheduler_readers pins the format.
                 buf.write(
                     "\n  loop_levels="
                     f"{[(x.group_path, x.trip_count, x.tiled_dims, x.tiled_reduction_dims) for x in levels]}"

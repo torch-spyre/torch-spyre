@@ -301,7 +301,7 @@ class TensorArg:
             level's own symbol, reprojected to
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
-            ops without loop_member/coarse tiling.
+            ops in no counted loop.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
         kernel_local: True when nothing outside the kernel that produced this

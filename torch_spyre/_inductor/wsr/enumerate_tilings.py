@@ -413,8 +413,8 @@ def _untileable_reason(op: object) -> str | None:
     """Why ``op`` may not be offered a coarse tiling at all, or ``None``. It
     must not be in a loop group already, which ``apply_tilings`` would clobber
     by stamping ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint
-    and span-overflow passes tiled, ``loop_member`` the members ``coarse_tile``
-    adds around them (a copy-out, a restickify of a tiled read)."""
+    and span-overflow passes tiled, loop membership (``is_looped``) the members
+    ``coarse_tile`` adds around them (a copy-out, a restickify of a tiled read)."""
     if not isinstance(op, ComputedBuffer):
         return f"a {type(op).__name__}, not a ComputedBuffer"
     # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
@@ -426,7 +426,7 @@ def _untileable_reason(op: object) -> str | None:
     if getattr(op, "dim_hints", []):
         return "already tiled by the hint or span-overflow pass (dim_hints)"
     if is_looped(op):
-        return "already a member of a coarse-tiling loop group (loop_member)"
+        return "already a member of a coarse-tiling loop group (is_looped)"
     return None
 
 

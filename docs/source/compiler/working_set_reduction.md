@@ -69,6 +69,7 @@ def for_each_tile(
     tile_size: int,
     init=None,
     out_dim=None,
+    out=None,
     reverse: bool = False,
 ):
     """Run `body` once per tile over a co-indexed tiling of `operands`.
@@ -95,7 +96,11 @@ def for_each_tile(
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Tiles may be a tensor or a pytree of
-            tensors. ``None`` means the body emits no tile.
+            tensors. ``None`` means the body emits no tile. With ``out``,
+            ``Gather(axis, index)``: step ``i``'s tile is written at the rows
+            ``index[i]`` names along ``axis``.
+        out: the caller's destination for the output tiles, written in place and
+            returned; see "Writing into a caller-owned output" below.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -225,6 +230,56 @@ floor fits: each extra block adds a scan step that rescales the output carry.
 A tiling that covers the window exactly with an odd number of blocks is
 skipped, because the K/V loop then slices the cache view directly and its
 strides are not divisible by the tile count.
+
+### Writing into a caller-owned output (`out=`)
+
+With `out=`, the caller passes the tensor the output tiles must end up in, and
+every step scatters its tile into it in place. No stacked per-step output is
+materialized. The call returns `out` itself.
+
+```python
+with torch.inference_mode():
+    # KV-cache write: step i scatters its rows into kv_pool[slots[i]].
+    for_each_tile(
+        body, (values,), dims=0, tile_size=1, out_dim=Gather(0, slots), out=kv_pool
+    )
+```
+
+- `out_dim=Gather(axis, index)`: step `i`'s tile lands at the rows `index[i]`
+  names along `axis`. `index` is `[trips]` (one row per step) or
+  `[trips, rows]` (`rows` rows per step). A row named more than once is
+  written once per mention, in no defined order, so it is well defined only
+  when every such write carries the same value, as for pad lanes clamped to
+  the last real row. `index` may also be an operand sliced one row per step
+  (`dims=0`, `tile_size=1`); the loop then reads it once. On Spyre the
+  per-trip index row follows the index-table rules above: use
+  `[trips, rows]` with `rows` a multiple of 32.
+- `out` leaves match the body's output tiles in flattened order, with the same
+  dtype and the tile's shape on every other axis.
+- An `int` `out_dim` is not supported with `out=` yet and raises
+  `NotImplementedError`; leave `out=None` to get the output returned.
+
+The destination is written through `scan`'s input mutation: it reaches the loop
+as an additional input that the body updates with `index_copy_`, and the splice
+binds that write to the caller's buffer. Hence:
+
+- Grad mode must be disabled (`torch.no_grad()` or `torch.inference_mode()`).
+- An `out` leaf must not share storage with an operand or with another `out`
+  leaf. A shared storage with an operand the loop reads whole is rejected at
+  trace time.
+- `out=` is rejected in a decomposition (see below). There the scan is emitted
+  below functionalization, so the write would be an undeclared side effect.
+  A decomposition returns its result, or carries the destination and updates it
+  with a functional `index_copy`.
+
+On Spyre, keep the destination in a layout with the indexed dimension
+outermost, such as the "indirect access" layout `torch_spyre.model_utils` gives
+an embedding table. Otherwise `reorder_nonstick_dims_mutation` copies the whole
+destination in and out around every trip's write (see
+[Indirect Access](indirect_access.md)). A compiled Spyre kernel does not check
+index values: a row outside the destination, or outside an input `Gather`'s
+pool, is written or read out of bounds. An eager call checks every `Gather`
+index on the host and raises `IndexError`.
 
 ### Body contract when tracing a decomposition
 

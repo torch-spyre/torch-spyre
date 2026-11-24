@@ -713,6 +713,12 @@ def _patch_tensor_for_spyre():
     # from one fused QKV projection and captured whole by an outer for_each_tile.
     # ──────────────────────────────────────────────────────────────────────────
     _patch_scan_input_aliasing()
+    # ──────── while_loop writes to additional inputs (pytorch#195393) ────────
+    # Keeps a loop whose only effect is writing a captured tensor, such as
+    # for_each_tile(out=...)'s destination, and orders later reads after it.
+    # Remove in torch 2.15: https://github.com/pytorch/pytorch/pull/195393
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_while_loop_additional_input_mutation()
 
     # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────
     # Monkey-patches the three public Python entry points to support
@@ -838,6 +844,12 @@ def _patch_scan_input_aliasing() -> bool:
     aliasing for ``scan``; Dynamo's still rejects it when an aliased input requires
     grad, and input-output and output-output aliasing stay rejected.
 
+    torch 2.14 lets ``scan`` mutate captured inputs under ``no_grad``, so aliased
+    inputs are no longer read-only by construction. Dynamo's check therefore also
+    keeps rejecting an aliased pair when either input is mutated: functionalization
+    treats the two as independent, and a write through one would not be seen
+    through the other (upstream rejects the same case since pytorch/pytorch#199688).
+
     Carries need no extra check: neither stock Inductor nor torch-spyre's loop
     lowering (``_carry_real_input_is_private``) writes a carry's storage in place
     while anything else can read it.
@@ -887,6 +899,13 @@ def _patch_scan_input_aliasing() -> bool:
             return original_has_aliasing(self)
         storages = hop_vars.get_tensor_storages
         example = hop_utils._collect_fake_inputs
+        # A mutated input is only safe if nothing else views its storage:
+        # functionalization treats subgraph inputs as independent, so a write
+        # through one view would not be seen through another. torch 2.14 lets
+        # scan mutate captured inputs under no_grad, so such a pair must still be
+        # rejected (as upstream does since pytorch/pytorch#199688).
+        mutated_idx = set(self.has_input_mutation().mutated_input_indices)
+        mutated = {n for i, n in enumerate(self.graph.nodes) if i in mutated_idx}
 
         input_storages = {}
         for node in self.graph.nodes:
@@ -898,6 +917,13 @@ def _patch_scan_input_aliasing() -> bool:
             for storage in storages(value):
                 if storage in input_storages:
                     first = input_storages[storage]
+                    if first in mutated or node in mutated:
+                        msg = (
+                            "Input-to-input aliasing with input mutation detected "
+                            f"at nodes {first} and {node}: a write through one "
+                            "would not be seen through the other"
+                        )
+                        return output_graph.AliasingInfo(True, msg)
                     if not (value.requires_grad or example([first])[0].requires_grad):
                         continue
                     msg = (
@@ -973,6 +999,74 @@ def _patch_scan_input_aliasing() -> bool:
     tracer_cls.has_aliasing = has_aliasing
     hop_vars.check_aliasing_and_input_mutation = check_aliasing_and_input_mutation
     hop_utils._check_alias_and_mutation = _check_alias_and_mutation
+    return True
+
+
+def _patch_while_loop_additional_input_mutation() -> bool:
+    """Declare a while_loop's writes to its additional inputs (pytorch/pytorch#195393).
+
+    torch 2.14's ``WhileLoop.create`` gives a ``MutationOutput`` only to a carried
+    input the body writes. An additional input the body writes, such as the
+    destination ``for_each_tile(out=...)`` passes through ``scan``'s input
+    mutation, gets none. The scheduler then drops a loop whose outputs are unused,
+    and does not order later reads of that input after the loop. Both silently
+    give wrong results. This registers a ``MutationOutput`` for every additional
+    input the body mutates, as torch 2.15 does.
+
+    Only on torch 2.14: 2.13's scan cannot mutate its inputs, and 2.15 has the fix.
+    Returns whether the patch is active. Idempotent.
+
+    TODO: remove in torch 2.15, which ships the upstream fix,
+    https://github.com/pytorch/pytorch/pull/195393. TestWhileLoopMutationBackportProbe
+    in tests/inductor/test_for_each_tile.py XPASSes then.
+    """
+    import functools
+
+    import torch
+
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release != (2, 14):
+        return False
+
+    from torch._higher_order_ops.utils import check_input_alias_and_mutation
+    from torch._inductor import ir
+    from torch._inductor.virtualized import V
+
+    if getattr(ir.WhileLoop.create, "_spyre_additional_mutation_patched", False):
+        return True
+    original_create = ir.WhileLoop.create.__func__
+
+    @functools.wraps(original_create)
+    def create(cls, cond_fn, body_fn, carried_inputs, additional_inputs, *args, **kw):
+        first_new_op = len(V.graph.operations)
+        outputs = original_create(
+            cls, cond_fn, body_fn, carried_inputs, additional_inputs, *args, **kw
+        )
+        loops = [
+            op
+            for op in V.graph.operations[first_new_op:]
+            if isinstance(op, ir.WhileLoop)
+        ]
+        if len(loops) != 1:
+            raise AssertionError(
+                f"expected WhileLoop.create to register one WhileLoop, got {loops}"
+            )
+        (loop,) = loops
+        if not loop.additional_inputs:
+            return outputs
+        fx_node = V.graph.current_node
+        fake_inputs = [x.meta["val"] for x in (*fx_node.args[-2], *fx_node.args[-1])]
+        mutated = check_input_alias_and_mutation(body_fn.graph.module, fake_inputs)[3]
+        num_carried = len(loop.carried_inputs)
+        for idx in sorted(set(mutated)):
+            # 2.14 already registers a mutated carry.
+            if idx >= num_carried:
+                inp = loop.additional_inputs[idx - num_carried]
+                loop.mutation_outputs.append(ir.MutationOutput(inp.layout, inp, loop))
+        return outputs
+
+    create._spyre_additional_mutation_patched = True  # type: ignore[attr-defined]
+    ir.WhileLoop.create = classmethod(create)
     return True
 
 
