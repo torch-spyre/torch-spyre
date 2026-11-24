@@ -34,6 +34,7 @@ unsharded tensors too).
 from __future__ import annotations
 
 import json
+import math
 import os
 
 import pytest
@@ -50,7 +51,7 @@ from torch_spyre._inductor import config as spyre_config
 
 from torch_spyre.execution import kernel_runner
 
-_STRIDE_REJECTION = "shard-local strides equal to the global ones"
+_STRIDE_REJECTION = "whole device dims of whole sticks"
 
 
 def expects_raise(test):
@@ -151,6 +152,12 @@ def _sharded(cpu: torch.Tensor, dim: int, n: int) -> torch.Tensor:
         ((32, 128), 1, torch.float16),
         ((16, 32), 1, torch.float32),
         ((64,), 0, torch.float16),
+        # Shard-local strides differ from the global ones (the shard dim is
+        # not the innermost non-stick device dim): admitted since the codegen
+        # guard checks the split against the shard dim instead of unified-
+        # model stride distances (issue #5827).
+        ((4, 128), 0, torch.float16),
+        ((4, 8, 64), 2, torch.float16),
     ],
 )
 def test_compiled_add_runs_one_shard_per_core(launched, shape_per_shard, dim, dtype):
@@ -323,17 +330,9 @@ def test_unsharded_and_sharded_inputs_never_share_a_kernel(launched):
 @pytest.mark.parametrize(
     "shape_per_shard, dim",
     [
-        # Rows wider than one stick: in-tile strides would follow the global
-        # shape and leave the second stick of every row unwritten.
-        # TODO: positive once DeepTools uses per-core layout sizes.
-        ((4, 128), 0),
         # Last-dim shards that are not whole sticks (32 of 64 fp16 elements).
         # A real limit: a stick cannot be split between chunks.
         ((32, 32), 1),
-        # 3-D Shard(last): a non-shard dim sits outside the stick dim, so its
-        # global stride would address past the end of the chunk.
-        # TODO: positive once DeepTools uses per-core layout sizes.
-        ((4, 8, 64), 2),
     ],
 )
 @expects_raise
@@ -346,6 +345,183 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
 
     with pytest.raises(RuntimeError, match=_STRIDE_REJECTION):
         torch.compile(lambda x, y: x + y, dynamic=False)(a, a)
+
+
+# ---------------------------------------------------------------------------
+# verify_non_unified_split: the committed work split must be the shard dim.
+#
+# Pure-python unit tests on the codegen guard (no device needed). The guard
+# checks the committed division against each sharded arg's recorded shard
+# dim (TensorArg.non_unified_shard_dim); the earlier stride-distance
+# arithmetic only held when the shard dim was the innermost non-stick
+# device dim, so it was replaced by the dim-identity check these tests
+# pin. The e2e behavior (a re-divided op is rejected at compile) is covered
+# by the tests above through the full pipeline.
+# ---------------------------------------------------------------------------
+
+
+def _split_spec(num_cores=8):
+    """An SDSCSpec whose work division splits ``mb`` 8 ways, core c -> c."""
+    import sympy
+
+    from torch_spyre._inductor.codegen.superdsc import SDSCSpec
+    from torch_spyre._C import DataFormats
+
+    core_id = sympy.Symbol("core_id")
+    return SDSCSpec(
+        opfunc="add",
+        execution_unit="sfp",
+        data_format=DataFormats.SEN169_FP16,
+        num_inputs=2,
+        iteration_space={sympy.Symbol("mb"): 32, sympy.Symbol("out"): 128},
+        num_cores=num_cores,
+        work_slices={sympy.Symbol("mb"): num_cores, sympy.Symbol("out"): 1},
+        core_id_to_work_slice={
+            sympy.Symbol("mb"): sympy.Mod(core_id, num_cores),
+            sympy.Symbol("out"): sympy.Integer(0),
+        },
+        padding={},
+        layouts={},
+        args=[],
+        constants={},
+        coordinate_masking={},
+    )
+
+
+def _shard_arg(shard_dim, arg_index=0, indexed=("mb",)):
+    import sympy
+
+    from torch_spyre._inductor.codegen.superdsc import SDSCArgs
+
+    # ``scales`` says which dims the arg indexes in the emitted SDSC; a
+    # tiling pass that split the shard dim into sub-dims would leave the
+    # split dim out and the guard must fail closed (defence in depth).
+    return SDSCArgs(
+        layout="OUTPUT",
+        dim_order=[],
+        data_format=None,
+        scales={sympy.Symbol(d): 1 for d in indexed},
+        strides={},
+        offsets={},
+        max_dim_sizes={},
+        allocation={},
+        start_address=0,
+        backGap={},
+        arg_index=arg_index,
+        non_unified_shard_bytes=1024,
+        non_unified_shard_dim=shard_dim,
+    )
+
+
+def test_verify_non_unified_split_passes_on_the_shard_dim():
+    import sympy
+
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+
+    verify_non_unified_split(_split_spec(), [_shard_arg(sympy.Symbol("mb"))])
+
+
+def test_verify_non_unified_split_rejects_a_split_on_another_dim():
+    import sympy
+
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # A later pass re-divided the op on ``out`` while the tensors are
+    # sharded on ``mb``: each core's work slice would straddle shards.
+    spec = _split_spec()
+    spec.work_slices = {sympy.Symbol("mb"): 1, sympy.Symbol("out"): 8}
+    spec.core_id_to_work_slice = {
+        sympy.Symbol("mb"): sympy.Integer(0),
+        sympy.Symbol("out"): sympy.Mod(sympy.Symbol("core_id"), 8),
+    }
+    with pytest.raises(Unsupported, match="sharded on"):
+        verify_non_unified_split(
+            spec, [_shard_arg(sympy.Symbol("mb"), indexed=("mb", "out"))]
+        )
+
+
+def test_verify_non_unified_split_rejects_an_arg_without_a_shard_dim():
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # A sharded arg whose producer was not admitted by the sharded
+    # planner carries no shard dim; the guard must fail closed.
+    with pytest.raises(Unsupported, match="records no shard dim"):
+        verify_non_unified_split(_split_spec(), [_shard_arg(None)])
+
+
+def test_verify_non_unified_split_rejects_an_arg_that_does_not_index_the_split():
+    from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
+    from torch_spyre._inductor.errors import Unsupported
+
+    # Defence in depth: the symbol comparison alone would pass (the arg
+    # records the shard dim), but the arg does not index the split dim in
+    # the emitted SDSC -- e.g. a later tiling pass split the shard dim
+    # into sub-dims. The guard must fail closed.
+    import sympy
+
+    with pytest.raises(Unsupported, match="does not index"):
+        verify_non_unified_split(
+            _split_spec(), [_shard_arg(sympy.Symbol("mb"), indexed=())]
+        )
+
+
+def test_non_unified_shard_dim_rejects_an_unmatched_shard_dim(monkeypatch):
+    """The derivation fails closed when no iteration symbol matches the
+    shard dim's stride and extent in the iteration space."""
+    import sympy
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor import spyre_kernel
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.sharded_hbm import ShardedPlacement
+
+    monkeypatch.setattr(
+        spyre_kernel,
+        "placement_of",
+        lambda name: ShardedPlacement(
+            shard_dim=1, num_shards=8, shard_device_bytes=128
+        ),
+    )
+    # layout [4, 64]: shard dim 1 has stride 1 and extent 64, but no
+    # iteration symbol has that coefficient and extent.
+    with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+        spyre_kernel._non_unified_shard_dim(
+            "arg0",
+            # Any layout object carrying the tensor's logical size.
+            SimpleNamespace(size=[4, 64]),
+            {sympy.Symbol("mb"): 4},
+            sympy.Symbol("mb") * 64 + sympy.Symbol("out"),
+        )
+
+
+def test_non_unified_shard_dim_rejects_an_ambiguous_shard_dim(monkeypatch):
+    """Two symbols matching the shard dim's stride and extent means the
+    identification is not unique; the derivation must fail closed."""
+    import sympy
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor import spyre_kernel
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.sharded_hbm import ShardedPlacement
+
+    monkeypatch.setattr(
+        spyre_kernel,
+        "placement_of",
+        lambda name: ShardedPlacement(
+            shard_dim=1, num_shards=8, shard_device_bytes=128
+        ),
+    )
+    # Both s0 and s1 have coefficient 1 and extent 64 in the iteration
+    # space, so the shard dim (stride 1, extent 64) matches twice.
+    with pytest.raises(Unsupported, match="cannot identify the shard dim"):
+        spyre_kernel._non_unified_shard_dim(
+            "arg0",
+            SimpleNamespace(size=[4, 64]),
+            {sympy.Symbol("s0"): 64, sympy.Symbol("s1"): 64},
+            sympy.Symbol("s0") + sympy.Symbol("s1"),
+        )
 
 
 @requires_emulation
@@ -399,7 +575,9 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
     "view",
     [
         lambda t: t.view(-1),
-        lambda t: t[: t.shape[0] // 2],
+        # A strided slice: not a block of the base. (Unit-step slices are
+        # box views, accepted at construction; see the box-view tests below.)
+        lambda t: t[::2],
         lambda t: t.t(),
         # Rank-increasing: the guard must reject on rank alone, before any
         # per-dimension comparison (which would read past the base's rank).
@@ -409,7 +587,8 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
 def test_views_of_sharded_inputs_fail(view):
     # A view keeps the base's shard layout, which no longer matches the
     # view's shape; chunk addressing would read permuted data. The native
-    # view constructors reject it before the tensor can reach a kernel.
+    # view constructors reject every view that is not a block of the base
+    # before it can reach a kernel.
     # TODO: positive once views of sharded tensors have a shard mapping.
     n = num_shards()
     torch.manual_seed(0)
@@ -467,19 +646,20 @@ def test_compiled_add_over_detached_views(launched):
 
 @requires_emulation
 @expects_raise
-def test_contiguous_prefix_view_of_sharded_fails():
+def test_contiguous_prefix_view_of_sharded_fails_at_compile():
     # The hole the copy-path guards could not see: a contiguous view from
     # storage offset zero passes every is_contiguous()/storage_offset()
-    # check, yet maps view elements onto the wrong shards (element N comes
-    # from the start of a later shard instead of the shards that back the
-    # first N elements). It must be rejected at construction, not copied.
+    # check, yet a kernel binding core c to shard c would map view elements
+    # onto the wrong shards. It is a box view (copied to the CPU correctly,
+    # see test_box_view_of_sharded_copies_to_cpu), so it is built, but the
+    # compiled path must still reject it.
+    # TODO: positive once compiled ops accept box views.
     n = num_shards()
-    x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
+    x = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    prefix = x.narrow(0, 0, 2 * n)
 
-    with pytest.raises(
-        RuntimeError, match="views of sharded Spyre tensors are not supported"
-    ):
-        x.narrow(0, 0, 2 * n)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(prefix, prefix)
 
 
 @requires_emulation
@@ -766,3 +946,130 @@ def test_inputs_usable_after_compile_rejection():
     expected = roundtrip + roundtrip
     assert torch.equal(c.cpu(), expected)
     assert torch.equal(a.cpu(), roundtrip)
+
+
+# ---------------------------------------------------------------------------
+# Box views (#5817): a block of a sharded base in the same dimension order.
+# They are built and copied to the CPU; every other consumer rejects them.
+# ---------------------------------------------------------------------------
+
+
+def _box_source(shape, dtype):
+    # Whole numbers below 1024: exact in fp32 and in the device fp16 format
+    # (DL16 has one fraction bit fewer than IEEE fp16, so it rounds integers
+    # above 1024), so a wrong value shows where it came from.
+    return (torch.arange(math.prod(shape)) % 1024).reshape(shape).to(dtype)
+
+
+_BOX_VIEWS = {
+    0: [
+        ("inside_one_shard", lambda t, e: t[1 : e - 1]),
+        ("one_whole_shard", lambda t, e: t[e : 2 * e]),
+        ("across_shards", lambda t, e: t[e // 2 : 3 * e + 1]),
+        ("one_row", lambda t, e: t[3 * e + 1 : 3 * e + 2]),
+        ("prefix_narrow", lambda t, e: t.narrow(0, 0, 2 * e)),
+        ("columns", lambda t, e: t[:, 16:48]),
+        ("block", lambda t, e: t[e - 1 : 2 * e + 1, 5:37]),
+        ("slice_of_slice", lambda t, e: t[e // 2 :][1 : 2 * e, 8:]),
+    ],
+    1: [
+        ("inside_one_shard", lambda t, e: t[:, 1 : e - 1]),
+        ("one_whole_shard", lambda t, e: t[:, e : 2 * e]),
+        ("across_shards", lambda t, e: t[:, e // 2 : 3 * e + 1]),
+        ("rows", lambda t, e: t[3:11]),
+        ("block", lambda t, e: t[2:9, e - 3 : 2 * e + 3]),
+        ("slice_of_slice", lambda t, e: t[:, e // 2 :][1:, 1 : 2 * e]),
+    ],
+}
+
+
+@requires_emulation
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "dim, name",
+    [(d, name) for d, views in _BOX_VIEWS.items() for name, _ in views],
+)
+def test_box_view_of_sharded_copies_to_cpu(dim, name, dtype):
+    n = num_shards()
+    # Shard(1): one stick (64 fp16 or 32 fp32 elements) or more per shard.
+    shape = (4 * n, 64) if dim == 0 else (16, 64 * n)
+    extent = shape[dim] // n
+    view = dict(_BOX_VIEWS[dim])[name]
+    cpu = _box_source(shape, dtype)
+    x = _sharded(cpu, dim, n)
+
+    v = view(x, extent)
+
+    assert torch.spyre.is_sharded(v)
+    assert v.shape == view(cpu, extent).shape
+    assert torch.equal(v.cpu(), view(cpu, extent))
+    assert torch.equal(x.cpu(), cpu)
+
+
+@requires_emulation
+def test_box_view_of_sharded_prints_its_values():
+    n = num_shards()
+    cpu = _box_source((4 * n, 64), torch.float32)
+    x = _sharded(cpu, 0, n)
+
+    assert str(x[2:7, 3:9]).replace(", device='spyre:0'", "") == str(cpu[2:7, 3:9])
+
+
+@requires_emulation
+@expects_raise
+@pytest.mark.parametrize(
+    "view",
+    [
+        lambda t: t[1],  # rank-reducing select
+        lambda t: t[:, ::2],  # strided slice of the stick dimension
+        lambda t: t[1:5].t(),  # a box, then transposed
+        lambda t: t.view(-1)[3:70],  # flattened slice
+        lambda t: t[:1].expand(4, 64),  # broadcast
+        lambda t: t[2:4].unsqueeze(0),  # rank-increasing
+    ],
+)
+def test_views_of_sharded_that_are_not_boxes_fail(view):
+    n = num_shards()
+    x = _sharded(_box_source((4 * n, 64), torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        view(x)
+
+
+@requires_emulation
+@expects_raise
+def test_box_views_of_sharded_fail_in_other_consumers():
+    """A box view is only copied to the CPU so far; everything else rejects
+    it and leaves the sharded tensor untouched.
+    TODO: positive one by one as #5817 follow-ups land."""
+    n = num_shards()
+    cpu = _box_source((4 * n, 64), torch.float16)
+    x = _sharded(cpu, 0, n)
+    v = x[2 : 2 * n]
+
+    with pytest.raises(RuntimeError, match="copies into a view of a sharded"):
+        v.copy_(torch.zeros(v.shape, dtype=v.dtype))
+    with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
+        v.fill_(0)
+    with pytest.raises(RuntimeError, match="only support whole-tensor fills"):
+        v.zero_()
+    with pytest.raises(TypeError, match="does not support views of sharded"):
+        torch.spyre.sharding_info(v)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(v, v)
+    # A detached block view has no _base, so the compile check must look at
+    # its shape against the sharded allocation.
+    d = x[: 2 * n].detach()
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(d, d)
+    # In-place as_strided_ rewrites the tensor itself, so it must keep the
+    # whole shape even when the new geometry would be a box.
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        x.as_strided_(v.shape, v.stride(), v.storage_offset())
+
+    assert torch.equal(x.cpu(), cpu)
+    assert torch.spyre.sharding_info(x).num_shards == n

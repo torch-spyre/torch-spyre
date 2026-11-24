@@ -168,7 +168,7 @@ site has already been converted.
   when reconstructing a buffer's body. It forwards `operation_name`, provenance,
   and Spyre operation metadata.
 + `copy_op_metadata(src, dst)` in
-  [loop_info.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/loop_info.py)
+  [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
   carries only Spyre operation metadata such as loop and layout annotations.
   Provenance is intentionally owned by the provenance helpers, not this
   metadata-copy channel.

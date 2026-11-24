@@ -879,7 +879,7 @@ def _relayout_consumer_kind_supported(producer: Operation, consumer: Operation) 
     division reads, as it does for a pointwise consumer.
 
     Loop membership comes from ``counted_loop_path``, the loop-facts read API,
-    not from ``loop_info``, so the rule follows that API when the loop
+    not from ``loop_member``, so the rule follows that API when the loop
     representation changes (#5863).
 
     The carry clause is a limit of scope, not of legality: it is the reduction
