@@ -237,6 +237,10 @@ VAR_STD_DIM_PARAM_SETS = {
     "pad_3d_dim_01": ((0, 1), cached_randn((3, 7, 9))),
 }
 
+# Module level, not a TestOps attribute: the LX-planning wrapper classes
+# (test_inductor_ops_lx_planning.py) copy only the test_* methods.
+VAR_STD_TOL = {"atol": 0.05, "rtol": 0.05}
+
 
 INDEX_REDUCTION_KEEPDIM_PARAM_SETS = {
     name: (
@@ -11978,43 +11982,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     # var/std/var_mean/std_mean: Spyre two-pass decomposition
     # (decompositions.py _spyre_var_mean_two_pass). Formerly strict xfails
-    # ("No FX node for buf", #3287 / #1688).
-    _VAR_STD_TOL = {"atol": 0.05, "rtol": 0.05}
+    # ("No FX node for buf", #3287 / #1688). Tolerance: VAR_STD_TOL.
 
     def test_std_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.std(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
+            lambda x: torch.std(x, dim=0, keepdim=False), x, **VAR_STD_TOL
         )
 
     def test_var_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.var(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
+            lambda x: torch.var(x, dim=0, keepdim=False), x, **VAR_STD_TOL
         )
 
     def test_std_mean_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
+            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, **VAR_STD_TOL
         )
 
     def test_var_mean_dim0_fp32(self):
         x = cached_randn((67, 256), dtype=torch.float32)
         self.compare_with_cpu(
-            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, **self._VAR_STD_TOL
+            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, **VAR_STD_TOL
         )
 
     def test_var_mean_keepdim_fp16(self):
         x = cached_randn((67, 256))
         self.compare_with_cpu(
-            lambda x: torch.var_mean(x, dim=-1, keepdim=True), x, **self._VAR_STD_TOL
+            lambda x: torch.var_mean(x, dim=-1, keepdim=True), x, **VAR_STD_TOL
         )
 
     def test_std_mean_keepdim_fp16(self):
         x = cached_randn((67, 256))
         self.compare_with_cpu(
-            lambda x: torch.std_mean(x, dim=-1, keepdim=True), x, **self._VAR_STD_TOL
+            lambda x: torch.std_mean(x, dim=-1, keepdim=True), x, **VAR_STD_TOL
         )
 
     def test_var_plus_std_same_input(self):
@@ -12024,22 +12027,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda x: torch.var(x, dim=-1) + torch.std(x, dim=-1),
             x,
-            **self._VAR_STD_TOL,
+            **VAR_STD_TOL,
         )
 
     def test_var_std_dim_cpu(self, op, dim, keepdim, x):
         self.compare_with_cpu(
-            lambda x: op(x, dim=dim, keepdim=keepdim), x, **self._VAR_STD_TOL
+            lambda x: op(x, dim=dim, keepdim=keepdim), x, **VAR_STD_TOL
         )
 
     def test_var_std_correction_cpu(self, op, correction):
         x = cached_randn((67, 256))
         self.compare_with_cpu(
-            lambda x: op(x, dim=-1, correction=correction), x, **self._VAR_STD_TOL
+            lambda x: op(x, dim=-1, correction=correction), x, **VAR_STD_TOL
         )
 
     def test_var_std_all_dims_cpu(self, op, x):
-        self.compare_with_cpu(lambda x: op(x), x, **self._VAR_STD_TOL)
+        self.compare_with_cpu(lambda x: op(x), x, **VAR_STD_TOL)
 
     @expects_raise
     def test_cumprod_dim0_rejected(self):

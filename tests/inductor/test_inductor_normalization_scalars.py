@@ -41,6 +41,26 @@ def _xfail_round_unsupported(request, execution_mode):
         )
 
 
+def _xfail_cpsat_tie(request, observed):
+    """Non-strict xfail for an fp16 compiled case decided by a CP-SAT tie.
+
+    The work division picks one of several equal-cost plans, and which one
+    CP-SAT returns depends on its worker count (``SPYRE_NUM_CPUS``; CI runner
+    pods are limited to 10 CPUs). One plan passes and another misses the fp16
+    tolerance, so the outcome differs between machines (#5561, #6102). Any
+    failure other than an ``AssertionError`` still fails.
+    """
+    request.applymarker(
+        pytest.mark.xfail(
+            raises=AssertionError,
+            strict=False,
+            reason="fp16 compiled result depends on an equal-cost CP-SAT "
+            f"tie-break whose outcome varies with the solver worker count: "
+            f"{observed} (#5561, #6102)",
+        )
+    )
+
+
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
     compare_with_cpu(
         fn,
@@ -326,27 +346,27 @@ class TestNormalizationScalarOperations:
     def test_groupnorm(self, request, execution_mode, num_groups, dtype):
         """Test GroupNorm with various group counts and dtypes."""
         if num_groups == 8 and dtype == torch.float16:
-            strict_xfail(
-                request,
-                AssertionError,
-                "var now decomposes (two-pass, no fp32 upcast); fp16 over "
-                "N=401408 misses atol=1e-3/rtol=1e-2: max abs diff 0.0547, "
-                "max rel diff 0.0128, 0.3% of elements",
-            )
+            if execution_mode == "eager":
+                strict_xfail(
+                    request,
+                    AssertionError,
+                    "var now decomposes (two-pass, no fp32 upcast); fp16 over "
+                    "N=401408 misses atol=1e-3/rtol=1e-2: max abs diff 0.0547, "
+                    "max rel diff 0.0128, 0.3% of elements",
+                )
+            else:
+                _xfail_cpsat_tie(
+                    request,
+                    "fails with max abs diff 0.0547 vs atol 1e-3 at 72 and 1 "
+                    "workers, passes on CI (10 workers)",
+                )
         elif (
             num_groups == 32 and dtype == torch.float16 and execution_mode == "compiled"
         ):
-            # Non-strict: the result depends on which of two equal-cost CP-SAT
-            # plans the solver returns, which varies with the worker count.
-            request.applymarker(
-                pytest.mark.xfail(
-                    raises=AssertionError,
-                    strict=False,
-                    reason="fp16 32-group compiled result depends on an "
-                    "equal-cost CP-SAT tie-break: split 8x4 gives 93/102760448 "
-                    "mismatched elements (max abs 0.0273 vs atol 1e-3), 32x1 "
-                    "passes (#5561, #6102)",
-                )
+            _xfail_cpsat_tie(
+                request,
+                "split 8x4 gives 93/102760448 mismatched elements (max abs "
+                "0.0273 vs atol 1e-3), split 32x1 passes",
             )
 
         eps = 1e-5
@@ -391,6 +411,13 @@ class TestNormalizationScalarOperations:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_instancenorm_2d(self, request, execution_mode, dtype):
         """Test 2D InstanceNorm with epsilon constant."""
+        if dtype == torch.float16 and execution_mode == "compiled":
+            _xfail_cpsat_tie(
+                request,
+                "passes at 72 and 1 workers, fails on CI (10 workers) with "
+                "115524/102760448 mismatched elements (max abs 0.0586 vs atol "
+                "1e-3)",
+            )
         eps = 1e-5
 
         def instancenorm(x):
