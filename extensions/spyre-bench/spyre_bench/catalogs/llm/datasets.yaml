@@ -1,0 +1,84 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# What the bytes mean. A serve Benchmark names one of these as a workload input; `role: trace` says
+# the records are replayed in recorded order, which is what makes prefill chunking, prefix reuse and
+# KV-block pressure visible in a way a fixed prompt shape cannot.
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-cics, description: "recorded CICS router prompts, replayed in recorded order"}
+spec:
+  asset: trace-cics-files
+  role: trace
+  schema: {record: {prompt: text, output_len: int}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-aiops, description: "recorded AIOps router prompts, replayed in recorded order"}
+spec:
+  asset: trace-aiops-files
+  role: trace
+  schema: {record: {prompt: text, output_len: int}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-db2, description: recorded Db2 router prompts}
+spec: {asset: trace-db2-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-ims, description: recorded IMS router prompts}
+spec: {asset: trace-ims-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-tls, description: recorded TLS router prompts}
+spec: {asset: trace-tls-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences, description: "every recorded sequence, untruncated"}
+spec: {asset: trace-all-sequences-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-1k}
+spec: {asset: trace-all-sequences-1k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-2k}
+spec: {asset: trace-all-sequences-2k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-4k}
+spec: {asset: trace-all-sequences-4k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-8k}
+spec: {asset: trace-all-sequences-8k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-16k}
+spec: {asset: trace-all-sequences-16k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-all-sequences-32k}
+spec: {asset: trace-all-sequences-32k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-db2-32k}
+spec: {asset: trace-db2-32k-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: vision-invoices, description: "invoice pages with their images, for the vision serve path"}
+spec: {asset: vision-invoices-files, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: random-lengths, description: "seeded random prompts; the lengths come from the workload"}
+spec: {asset: random-prompts-gen, role: trace}
