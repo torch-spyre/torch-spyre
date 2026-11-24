@@ -54,11 +54,10 @@ The directory name is derived from the fused op names in that kernel, so
 it's greppable by op name when you're not sure which hash directory to
 look in.
 
-For a full worked example of what a coarse-tiled kernel's generated
-`OpSpec` (Python wrapper source) and `bundle.mlir` actually look like side
-by side, see the "Generated OpSpec" and "Generated `bundle.mlir`" sections
-in
-[`docs/source/compiler/coarse_tiling_loops.md`](../../../../../../docs/source/compiler/coarse_tiling_loops.md).
+For a full worked example of what a counted loop's generated `LoopSpec`
+(Python wrapper source) and `bundle.mlir` actually look like side by side, see
+the "The generated `LoopSpec`" and "The generated `bundle.mlir`" sections in
+[`docs/source/compiler/loop_nodes.md`](../../../../../../docs/source/compiler/loop_nodes.md).
 
 ## Provenance tracking
 

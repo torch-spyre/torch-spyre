@@ -99,6 +99,10 @@ class SDSCArgs:
     device_tile_advance_expr: Expr | None = None
     # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
     non_unified_shard_bytes: int = 0
+    # SDSC-dim symbol of the shard dim (already mapped to the dim label),
+    # when this arg is sharded storage; None otherwise. Read only by the
+    # codegen guard verify_non_unified_split.
+    non_unified_shard_dim: Symbol | None = None
 
     @property
     def non_unified(self) -> bool:
@@ -1525,8 +1529,8 @@ def _create_sdsc_tensors(
         # (innermost) tile extent this arg is written/read at per
         # iteration, and the full extent it sits within -- to compute a
         # correct base offset/backGap, since device_coordinates cannot
-        # represent "which supertile" for these ops (see
-        # coarse_tiling_loops.md's IR-rewiring appendix). The innermost
+        # represent "which supertile" for these ops (see "Invariants and
+        # failure modes" in docs/source/compiler/loop_nodes.md). The innermost
         # level that tiles a given dim owns its true per-iteration
         # tile_size; the full extent is that tile_size times every level's
         # supertile_count for that dim.
@@ -1743,8 +1747,8 @@ def _create_sdsc_tensors(
                 # dim at a different position for this (Case 2 / mutated) arg
                 # than for its sibling args, which makes the stride_idx-based
                 # arg.device_size[-stride_idx-2] lookup below read the wrong
-                # slot for this arg specifically (see
-                # coarse_tiling_loops.md's IR-rewiring appendix). Use the
+                # slot for this arg specifically (see "Invariants and failure
+                # modes" in docs/source/compiler/loop_nodes.md). Use the
                 # authoritative supertile count for dev_dim_size instead of
                 # trusting that slot. Scoped to the stick dim only: other
                 # coarse-tiled dims (e.g. mb) already read the correct slot
@@ -2044,6 +2048,14 @@ def _create_sdsc_tensors(
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
             non_unified_shard_bytes=arg.non_unified_shard_bytes,
+            non_unified_shard_dim=(
+                # Map the planner's raw pinned symbol to the emitted dim
+                # label, the same rename every other symbol gets, so the
+                # guard can compare it against work_slices' keys.
+                symbol_mapping.get(arg.non_unified_shard_dim, arg.non_unified_shard_dim)
+                if arg.non_unified_shard_dim is not None
+                else None
+            ),
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
