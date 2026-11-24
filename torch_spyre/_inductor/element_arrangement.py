@@ -447,10 +447,6 @@ def _mark_mismatched_ea(
         _log_ea_decision(op_name, op_type, out_shape, out_ea, in_str, targets, reason)
         if not targets:
             continue
-        if getattr(op, "loop_info", None) is not None:
-            raise Unsupported(
-                f"EA shuffle for {op_name} inside a coarse-tiled loop is not supported"
-            )
         marked.append((op, targets))
     return marked
 

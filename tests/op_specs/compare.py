@@ -27,8 +27,10 @@ two runs need not share), and walked in the order they were first launched.
 A kernel's inputs are the args it reads, as they were going in; its outputs are
 the args its launch changed in either run. Values are compared as host tensors,
 so two runs may lay a tensor out differently on the device as long as the copy
-to the host reads both faithfully. A NaN or an infinity in one run where the
-other has a different value counts as an infinite difference.
+to the host reads both faithfully. It does not for every element arrangement
+(#4393), so a pair whose arrangements differ is reported as not comparable
+rather than compared. A NaN or an infinity in one run where the other has a
+different value counts as an infinite difference.
 
 The first kernel whose inputs agree but whose outputs do not, or whose launch
 raised in one run only, is where the two runs part; the commands printed for it

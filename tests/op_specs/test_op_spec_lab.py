@@ -1058,6 +1058,20 @@ def test_compare_of_a_nan_that_both_runs_have(tmp_path):
     assert _compare(tmp_path) == 0
 
 
+def test_compare_skips_a_pair_whose_arrangement_differs(tmp_path, capsys):
+    """The copy to the host does not undo every element arrangement (#4393), so
+    such a pair's host values need not line up even when both runs are right."""
+    x = torch.arange(4.0)
+    runs = (("good", "STANDARD", x + 1), ("bad", "STAGGERED", x + 9))
+    for run, arrangement, out in runs:
+        inputs, outputs = [x, torch.zeros(4)], [None, out]
+        arranged = ["STANDARD", arrangement]
+        _save_launch(tmp_path / run, "k0", 0, inputs, outputs, arrangements=arranged)
+    assert _compare(tmp_path) == compare.EXIT_INCONCLUSIVE
+    out = capsys.readouterr().out
+    assert "not comparable: arg1's element arrangement differs" in out
+
+
 def test_compare_ignores_what_a_pure_output_held_going_in(tmp_path, capsys):
     """An output's incoming contents are whatever the device held there, which
     two runs need not share."""
