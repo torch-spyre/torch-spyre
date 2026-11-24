@@ -51,7 +51,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Input,
     InputIndex,
     SumRealization,
-    SymbolicRealization,
     TableRealization,
     TableLowering,
     TableLoweringError,
@@ -809,7 +808,7 @@ def test_a_sum_is_exact_with_no_table_across_its_terms():
     assert caught.value.node is None  # refused by the sum, which holds no node
 
 
-def test_a_realization_says_whether_it_is_symbolic():
+def test_a_node_with_one_list_is_a_table():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -817,13 +816,7 @@ def test_a_realization_says_whether_it_is_symbolic():
     printer = TableLowering(case.inputs, cap=CAP)
     number = sympy.log(sympy.Integer(2)) + sympy.pi
     for expr in [a, sympy.log(a * b), 7 * a**0.5, number]:
-        realization = printer.print(expr)
-        assert not realization.symbolic()
-        assert isinstance(realization, TableRealization)
-    for expr in [a + b, sympy.sqrt(2) * (a + b)]:
-        realization = printer.print(expr)
-        assert realization.symbolic()
-        assert isinstance(realization, SymbolicRealization)
+        assert isinstance(printer.print(expr), TableRealization)
 
 
 def test_a_sum_is_a_sum_realization_of_its_operands_realizations():

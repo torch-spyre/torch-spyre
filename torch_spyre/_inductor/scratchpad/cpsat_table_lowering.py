@@ -169,10 +169,6 @@ class AbstractRealization(ABC):
     values."""
 
     @abstractmethod
-    def symbolic(self) -> bool:
-        """Whether it has no list of its own."""
-
-    @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The realization in model, in COST_SCALE units."""
 
@@ -199,9 +195,6 @@ class TableRealization(AbstractRealization):
             raise TableLoweringError(None, "a value that is not finite")
         object.__setattr__(self, "values", values)
 
-    def symbolic(self) -> bool:
-        return False
-
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """A constant or affine list adds no table; any other is one add_element."""
         entries = _rounded(self.values)
@@ -227,9 +220,6 @@ class TableRealization(AbstractRealization):
 
 class SymbolicRealization(AbstractRealization):
     """No list of its own: CP-SAT builds it from its operands' expressions."""
-
-    def symbolic(self) -> bool:
-        return True
 
 
 @dataclass(frozen=True, eq=False)
@@ -501,18 +491,19 @@ class TableLowering(Printer):
         lists: dict[Index, TableRealization] = {}
         others: list[AbstractRealization] = []
         for operand in operands:
-            if operand.symbolic():
-                others.append(operand)
-                continue
-            table = operand.table(self.cap)
-            if table.index == UNIT:
-                constant += float(table.values[0])
-            elif table.index in lists:
-                with np.errstate(over="ignore"):  # inf is refused by TableRealization
-                    values = lists[table.index].values + table.values
-                lists[table.index] = TableRealization(values=values, index=table.index)
+            if isinstance(operand, TableRealization):
+                index = operand.index
+                if index == UNIT:
+                    constant += float(operand.values[0])
+                elif index in lists:
+                    # inf is refused by TableRealization
+                    with np.errstate(over="ignore"):
+                        values = lists[index].values + operand.values
+                    lists[index] = TableRealization(values=values, index=index)
+                else:
+                    lists[index] = operand
             else:
-                lists[table.index] = table
+                others.append(operand)
         terms = (*lists.values(), *others)
         return SumRealization(constant, terms, tuple(self._inputs(expr)))
 
