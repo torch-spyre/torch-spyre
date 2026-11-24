@@ -693,6 +693,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._indirect_var_count: int = 0
         self._tile_advance_seen: dict[str, int] = {}
         self._pending_lx_ownership: list[tuple[TensorArg, PerCoreView]] = []
+        self._output_valid_elements: dict[tuple[int, ...], int] | None = None
         # (node, its read/writes): the tile-advance builders run once per
         # argument of a node, so trace the node once. Keyed by identity,
         # holding the node.
@@ -1035,10 +1036,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Restore it here because the tensor data was uploaded as orig_stl.
         if is_input:
             tensor.layout = input_layout_for_operation(operation, name, tensor.layout)
-        in_lx = "lx" in tensor.layout.allocation
 
+        in_lx = "lx" in tensor.layout.allocation
         if in_lx and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
+
+        stl = tensor.layout.device_layout
+        if not is_input:
+            self._output_valid_elements = dict(stl.valid_elements)
 
         is_partial_lx_read = self._is_partial_lx_read(name, is_input, in_lx, operation)
         defer_ownership = in_lx and not is_partial_lx_read
@@ -1052,7 +1057,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         device_tile_advance_expr = self._tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
         device_coords = alignment_coordinates(
-            tensor.layout.device_layout,
+            stl,
             base_index,
             it_space,
             self.indirect_sizes,
@@ -1063,7 +1068,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         else:
             work_division = work_division_from_view(
                 tensor.layout.lx_view if in_lx else None,
-                tensor.layout.device_layout.device_size,
+                stl.device_size,
                 device_coords,
                 it_space,
                 allow_extended=_spyre_config.lx_extended_ownership,
@@ -1071,11 +1076,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         tensor_arg = TensorArg(
             is_input,
             -1,
-            tensor.layout.device_layout.device_dtype,
-            tensor.layout.device_layout.device_size,
+            stl.device_dtype,
+            stl.device_size,
             device_coords,
             tensor.layout.allocation,
-            element_arrangement=tensor.layout.device_layout.element_arrangement,
+            element_arrangement=stl.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
@@ -1085,7 +1090,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             non_unified_shard_dim=_non_unified_shard_dim(
                 name, tensor.layout, it_space, tensor.index
             ),
-            stride_map=list(tensor.layout.device_layout.stride_map),
+            stride_map=list(stl.stride_map),
         )
         if is_partial_lx_read:
             if self.local_read_contract_factory is None:
@@ -1219,14 +1224,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space = iteration_space(self.current_node)
 
         output_args = [arg for arg in args if not arg.is_input]
+        assert len(output_args) == 1, (
+            f"{op} has {len(output_args)} output args; an OpSpec should have "
+            f"exactly one"
+        )
         ir_node = self.current_node.node  # ComputedBuffer
-        if len(output_args) == 1:
-            it_space = pad_iteration_space(
-                ir_node,
-                it_space,
-                output_args[0].device_coordinates,
-                [(arg.device_coordinates, arg.device_size) for arg in args],
-            )
+
+        assert self._output_valid_elements is not None, (
+            "self._output_valid_elements should have been set by the "
+            "output's create_tensor_arg"
+        )
+        it_space = pad_iteration_space(
+            ir_node,
+            it_space,
+            output_args[0].device_coordinates,
+            self._output_valid_elements,
+            [(arg.device_coordinates, arg.device_size) for arg in args],
+        )
+        self._output_valid_elements = None
 
         for arg, view in self._pending_lx_ownership:
             assert any(a is arg for a in args), (
@@ -1484,6 +1499,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
         self._pending_lx_ownership = []
+        self._output_valid_elements = None
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -1620,6 +1636,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._tile_advance_symbols = {}
         self._alignment_repeat_info = {}
         self._pending_lx_ownership = []
+        self._output_valid_elements = None
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):

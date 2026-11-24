@@ -1355,14 +1355,6 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
         )
         self.assertEqual(kept, it_space)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "pad_iteration_space ignores the output's valid_elements, so rows "
-            "grow from 7 into the output's live row 8 (#741)"
-        ),
-    )
     def test_live_slice_output_keeps_rows(self):
         # An op outputting into a slice of a bigger, live, buffer should not
         # grow padding: that would overwrite the rest of the buffer.
@@ -1373,14 +1365,6 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
         )
         self.assertEqual(result[self.rows], 7)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "pad_iteration_space ignores the output's valid_elements, so rows "
-            "grow from 7 into an output of unknown valid_elements (#741)"
-        ),
-    )
     def test_unknown_valid_elements_keeps_rows(self):
         # If valid_elements is empty, we cannot distinguish the case of
         # test_live_slice_output_keeps_rows from the case of
@@ -1411,13 +1395,17 @@ class TestPadIterationSpaceIndirect(unittest.TestCase):
         # The output reads rows as a whole coordinate, padded 7 -> 8, so rows
         # would grow if nothing else blocked it.
         self.output = ([sympy.Integer(0), self.rows, self.cols], [1, 8, 64])
+        self.output_valid_elements = {(0, 2): 64, (1,): 7}
 
     def _pad(self, gather_row_coord):
         """Pad for ``out[rows, cols] = x[gather_row_coord, cols]``, ``x`` being
         a 100-row source table."""
         source = ([sympy.Integer(0), gather_row_coord, self.cols], [1, 100, 64])
         return _pad_iteration_space(
-            self.it_space, self.output[0], [source, self.output]
+            self.it_space,
+            self.output[0],
+            self.output_valid_elements,
+            [source, self.output],
         )
 
     def test_direct_source_lets_rows_grow(self):

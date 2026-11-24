@@ -548,7 +548,13 @@ def adjust_it_space_for_padding(
         (td.device_coords, td.layout.device_layout.device_size)
         for td in input_tds + [output_td]
     ]
-    return pad_iteration_space(op, it_space, output_td.device_coords, accesses)
+    return pad_iteration_space(
+        op,
+        it_space,
+        output_td.device_coords,
+        dict(output_td.layout.device_layout.valid_elements),
+        accesses,
+    )
 
 
 @dataclasses.dataclass(frozen=True)

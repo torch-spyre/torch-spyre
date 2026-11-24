@@ -68,7 +68,7 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import sympy
 import torch
@@ -194,6 +194,7 @@ def _padded_extent(
 def _pad_iteration_space(
     it_space: dict[Symbol, Expr],
     output_coords: Sequence[Expr],
+    output_valid_elements: Mapping[tuple[int, ...], int],
     accesses: Sequence[tuple[Sequence[Expr], Sequence[int]]],
 ) -> dict[Symbol, Expr]:
     # Indirect access: the index tensor's padding holds garbage indices, so
@@ -203,6 +204,11 @@ def _pad_iteration_space(
         for coords, _ in accesses
         for coord in coords
     ):
+        return dict(it_space)
+    # If valid_elements is an empty mapping, we can't tell padding from live
+    # data, so we don't grow. (This would happen, anyway, because of the per-dim
+    # check, but this states the rule outright.)
+    if not output_valid_elements:
         return dict(it_space)
 
     candidates = {
@@ -214,7 +220,15 @@ def _pad_iteration_space(
 
     adjusted_it_space = dict(it_space)
     for sym in candidates:
-        adjusted_it_space[sym] = _padded_extent(sym, it_space[sym], accesses)
+        grown = _padded_extent(sym, it_space[sym], accesses)
+        # Grow only if the output is valid exactly up to the op's extent:
+        # anything valid beyond it is live data, not padding.
+        if grown != it_space[sym] and all(
+            output_valid_elements.get((d,)) == it_space[sym]
+            for d, coord in enumerate(output_coords[:-1])
+            if coord == sym
+        ):
+            adjusted_it_space[sym] = grown
 
     return adjusted_it_space
 
@@ -223,6 +237,7 @@ def pad_iteration_space(
     op: Operation,
     it_space: dict[Symbol, Expr],
     output_coords: Sequence[Expr],
+    output_valid_elements: Mapping[tuple[int, ...], int],
     accesses: Sequence[tuple[Sequence[Expr], Sequence[int]]],
 ) -> dict[Symbol, Expr]:
     """Return a copy of ``it_space`` with each padded output dim grown to its
@@ -230,7 +245,10 @@ def pad_iteration_space(
 
     Only vars in the output's non-stick coordinates are candidates; every
     other var, including reduction vars, keeps its extent. See
-    :func:`_padded_extent` for when a candidate grows.
+    :func:`_padded_extent` for when a candidate grows. A candidate also needs
+    the output to be valid up to exactly the op's extent on that dim. Rows valid
+    beyond it are live data, not padding. Unknown (`{}`) ``valid_elements`` pads
+    nothing.
 
     Work division calls this through
     :func:`~torch_spyre._inductor.work_division.adjust_it_space_for_padding`;
@@ -238,9 +256,12 @@ def pad_iteration_space(
     extents.
 
     Args:
+        op: The operation whose iteration space we're padding.
         it_space: Extent of each iteration var, in elements.
         output_coords: The output's device coordinates, one per device dim; the
             last is the in-stick coordinate.
+        output_valid_elements: The output's valid elements: each group of device
+            dims mapped to its real element count.
         accesses: ``(device_coords, device_size)`` for every tensor the op
             reads or writes, the output included. The two line up dim for dim.
 
@@ -253,7 +274,9 @@ def pad_iteration_space(
     if enclosing_loops(op):
         return dict(it_space)
 
-    return _pad_iteration_space(it_space, output_coords, accesses)
+    return _pad_iteration_space(
+        it_space, output_coords, output_valid_elements, accesses
+    )
 
 
 def _move_ops_before(

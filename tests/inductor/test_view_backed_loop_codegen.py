@@ -169,6 +169,7 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
         stride_map=[1],
         device_dtype=DataFormats.SEN169_FP16,
         element_arrangement=ElementArrangement.STANDARD,
+        valid_elements={(0,): 64},
     )
     layout = SimpleNamespace(
         allocation={"hbm": 0}, lx_view=None, device_layout=device_layout
