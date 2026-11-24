@@ -526,7 +526,7 @@ def _transfer_loop_info(
         ]
     else:
         tiling = [((), ()) for _ in consumer_levels]
-    record_member(restick_buff, tiling, like=op)
+    record_member(restick_buff, tiling)
     if not has_shared_loop_scope:
         # Only this case needs the pin: a tiled-stage copy advances per trip and
         # takes its extent from the tile, while this fixed copy takes the whole

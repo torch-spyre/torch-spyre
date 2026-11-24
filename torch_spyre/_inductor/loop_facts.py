@@ -29,7 +29,6 @@ from dataclasses import dataclass
 import sympy
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, Operation
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 
 from .errors import Unsupported
 
@@ -191,22 +190,6 @@ def counted_loop_path(
     if _in_built_node(op):
         return tuple(node.group_id for node in op._loop_chain)  # type: ignore[attr-defined]
     return _group_path(getattr(op, "loop_member", None))
-
-
-def scheduler_enclosing_loops(node: BaseSchedulerNode) -> tuple[LoopLevel, ...]:
-    """Levels of the first ``SchedulerNode`` in ``node`` that has a ``loop_member``.
-
-    An ``ExternKernelSchedulerNode`` holds no ``SchedulerNode`` and so yields
-    ``()``, which is how the scheduler already excludes extern kernels.
-    """
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            if _in_built_node(snode.node):
-                return node_levels(snode.node)
-            loop_member = getattr(snode.node, "loop_member", None)
-            if loop_member is not None:
-                return _levels(loop_member)
-    return ()
 
 
 # ---------------------------------------------------------------------------
