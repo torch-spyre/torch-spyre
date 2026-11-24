@@ -625,6 +625,11 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
             )
         rw = op_read_writes(op)
         reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+        # An unsharded operand mutated in place by a sharded value is rejected
+        # downstream by the sharded-intermediate guard (the mutation's
+        # functional intermediate is never a graph output). A change that
+        # admits sharded intermediates inherits the obligation to keep that
+        # case failing closed.
         sharded = [placements[d.name] for d in reads if d.name in placements]
         if not sharded:
             continue
