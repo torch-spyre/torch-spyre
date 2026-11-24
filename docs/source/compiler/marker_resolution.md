@@ -4,7 +4,7 @@
 > slice of the `for_each_tile`/`WhileLoop`-splice pipeline: how a
 > `tile_dim_marker` op is resolved during marker consumption, and why that
 > resolution matters to later passes. It intentionally does not attempt
-> `coarse_tiling_loops.md`'s full depth yet — expect this doc to grow as
+> `loop_nodes.md`'s full depth yet — expect this doc to grow as
 > the surrounding nested-`for_each_tile` work continues.
 
 ## Background
@@ -53,7 +53,7 @@ later.
 
 ## Open areas (not yet in this doc)
 
-- A worked, real-IR example (in `coarse_tiling_loops.md`'s style) once a
+- A worked, real-IR example (in `loop_nodes.md`'s style) once a
   concrete nested-fixture trace is available to capture.
 - How arbitrary nesting depth and sibling `WhileLoop`s interact with this
   mechanism in practice -- validated by the fixture family in

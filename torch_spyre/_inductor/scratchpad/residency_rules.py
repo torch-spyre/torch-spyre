@@ -143,7 +143,7 @@ BUFFER_RESIDENCY_RULES = (
         ("fixed LX address",),
         (
             "LX addresses cannot use affine.apply symbols. The write or read "
-            "advances per tile; loop_info supplies the tile geometry."
+            "advances per tile; the loop node supplies the tile geometry."
         ),
         (
             "TestLoopCarryLxEligibility",
