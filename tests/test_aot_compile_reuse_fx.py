@@ -13,7 +13,11 @@
 # limitations under the License.
 
 """CPU tests: ``aot_compile`` reuses the graphs a parallel precompile pool left in
-the FX graph cache (``TORCH_SPYRE_AOT_REUSE_FX=1``)."""
+the FX graph cache (``TORCH_SPYRE_AOT_REUSE_FX=1``).
+
+These tests do not skip on a torch release outside ``pp.AOT_REUSE_RELEASES``: there
+the switch is ignored and the reuse tests fail. That is on purpose. A torch upgrade
+re-checks ``_pool_graph_state`` and moves ``AOT_REUSE_RELEASES``."""
 
 import os
 

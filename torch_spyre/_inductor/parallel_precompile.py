@@ -754,13 +754,16 @@ AOT_REUSE_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 
 # Process-wide state, like the swap of ``_spyre_inner_compile`` in
 # ``fork_inner_compiles``: compiles run on one thread at a time (Dynamo's compile
-# lock), and neither this dict nor ``_aot_reuse_counts`` is ever cleared:
-# ``_pool_fx_keys`` grows by one entry per graph key a pool sees. It holds the FX
-# graph cache keys of the graphs a pool of this process compiled in a child (or
-# found in the FX graph cache), kept while ``TORCH_SPYRE_AOT_REUSE_FX=1``, with the
-# key's debug lines, so a lookup that misses can name the fields that differ from
-# the pool's keys.
+# lock), and neither of the two dicts below is ever cleared.
+#
+# ``_pool_fx_keys`` holds the FX graph cache keys of the graphs a pool of this
+# process compiled in a child (or found in the FX graph cache), kept while
+# ``TORCH_SPYRE_AOT_REUSE_FX=1``, with the key's debug lines, so a lookup that
+# misses can name the fields that differ from the pool's keys. It grows by one
+# entry per graph key a pool sees.
 _pool_fx_keys: dict = {}
+# ``_aot_reuse_counts`` counts the outcomes of ``compile_reusing_pool_graph``.
+_aot_reuse_counts = {"reused": 0, "not seen": 0, "miss": 0}
 _aot_reuse_release_warned = False
 
 
@@ -854,14 +857,16 @@ def _closest_pool_key(lines: list) -> str:
     return f"closest pool key {key} differs in: {', '.join(fields(ours ^ theirs))}"
 
 
-_aot_reuse_counts = {"reused": 0, "not seen": 0, "miss": 0}
-
-
 def compile_reusing_pool_graph(compile_inner: Callable, *args: Any, **kwargs: Any):
     """``compile_inner(*args, **kwargs)``, but under ``aot_compile`` with
     ``TORCH_SPYRE_AOT_REUSE_FX=1`` a graph the FX graph cache holds (left by a pool
     child or a plain compile) is loaded from there (see ``_pool_graph_state``). Logs
-    one line per such compile: a reuse at INFO, a compile as a warning."""
+    one line per such compile: a reuse at INFO, a compile as a warning.
+
+    If torch's lookup then misses (a corrupt entry, or guards that fail under
+    dynamic shapes), that call has already compiled the graph with
+    ``bundled_autograd_cache`` off: the plain path, which writes an FX entry. The
+    result is the same graph, compiled as without the switch."""
     state, detail = _pool_graph_state(*args, **kwargs)
     if state is None:
         return compile_inner(*args, **kwargs)
@@ -916,6 +921,7 @@ def fork_inner_compiles(
 
     def inner_compile(*args: Any, **kwargs: Any) -> Any:
         if _aot_reuse_on():
+            # Key the graph once: note the key, then look it up.
             try:
                 key_info = _fx_cache_key_info(*args, **kwargs)
             except Exception as e:  # noqa: BLE001 - only the reuse is lost
@@ -923,7 +929,10 @@ def fork_inner_compiles(
                 logger.warning("aot_compile reuse: the pool cannot key a graph: %r", e)
             if key_info:
                 _pool_fx_keys[key_info[0]] = key_info[1]
-        if _fx_cache_holds(*args, **kwargs):
+            held = _fx_cache_has(key_info[0] if key_info else None)
+        else:
+            held = _fx_cache_holds(*args, **kwargs)
+        if held:
             # A graph AOTAutograd would not cache (it bypasses graphs that call
             # torch-spyre's Tensor.to) reaches the inner compile on every start, and
             # the FX graph cache answers it in place faster than a fork.
