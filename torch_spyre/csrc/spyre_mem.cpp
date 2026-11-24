@@ -735,6 +735,22 @@ auto get_device_stride_infos(
   return stride_infos;
 }
 
+// The SpyreTensorImpl behind a Spyre tensor, or a clear error for a tensor
+// without one. A view(dtype) of a Spyre tensor (t.view(torch.uint8)) shares
+// the storage but not the device layout: it is not a tracked view and its
+// TensorImpl is a plain TensorImpl, so a static_cast would read past it
+// (it segfaulted on p.view(torch.uint8).cpu(), spyre-inference#1684).
+SpyreTensorImpl* spyre_impl_or_reject(const at::Tensor& tensor) {
+  auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  TORCH_CHECK(impl != nullptr,
+              "copies of a Spyre tensor without a device layout are not "
+              "supported: this is usually a dtype view such as "
+              "t.view(torch.uint8), which shares the storage but not the "
+              "layout. Copy the original tensor, and take the dtype view on "
+              "the CPU instead.");
+  return impl;
+}
+
 /*
  * Generate description of data conversion for a tensor.
  *
@@ -795,8 +811,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       " dst=", static_cast<int>(dci.dataformat_dst_),
       " (cpu_type=", cpu_str_type, ", dev_type=", dev_str_type, ")");
 
-  auto spyre_tensor_impl =
-      static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
+  auto spyre_tensor_impl = spyre_impl_or_reject(*dev_tensor);
 
   std::vector<int64_t> cpu_sizes = cpu_tensor->sizes().vec();
   std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
@@ -2195,6 +2210,10 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     copy_sharded(self, dst);
     return dst;
   }
+  // Reject a Spyre tensor without a device layout (a dtype view) before any
+  // of the paths below reads its layout.
+  if (self.is_privateuseone()) spyre_impl_or_reject(self);
+  if (dst.is_privateuseone()) spyre_impl_or_reject(dst);
   SpyreStream stream;
   at::Tensor alloc_view;
   at::Tensor cpu_alloc;
@@ -2218,8 +2237,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     //       of a tile, and goes beyond the tile it starts in.
     //   (c) the tensor is sliced along a dimension not in the stride_map.
     if (self.is_privateuseone()) {
-      auto* spyre_impl =
-          static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+      auto* spyre_impl = spyre_impl_or_reject(self);
       const bool expanded = std::ranges::any_of(
           self.strides(), [](const int64_t& stride) { return stride < 1; });
       const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
