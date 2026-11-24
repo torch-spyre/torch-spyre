@@ -485,8 +485,8 @@ class TestSchedulerPassThrough(_Graph):
         # external reads, so its body-only buffers showed no read; their
         # range ran to the end of the bundle and the second loop could not
         # reuse the first loop's space (the paged-gather graph: pool 163840
-        # bytes vs 90112 on the flat path).  A buffer a loop writes is live
-        # through that loop's step, and no longer unless read later.
+        # bytes, against 90112 on the since-deleted flat path).  A buffer a loop
+        # writes is live through that loop's step, and no longer unless read later.
         t1 = self._buf("t1", reads="x", gid=(0,))
         o1 = self._buf("o1", reads="t1", gid=(0,))
         t2 = self._buf("t2", reads="x", gid=(1,))

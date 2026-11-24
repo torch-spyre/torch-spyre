@@ -446,7 +446,7 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
 # *independent* per-op choosers -- see that function -- on the same ground as
 # the user ``work_div`` hint exemption there. Keyed on the op rather than a
 # config flag: the greedy passes run on the same graph and stay pinned, and an
-# op the hint pass tiled carries ``loop_member`` before the menu is enumerated, so
+# op the hint pass tiled is in its loop before the menu is enumerated, so
 # its candidates respect the pin. Written by ``coarse_tiling.apply_tilings`` on
 # each op it tiles or adds to a nest, and never cleared: nothing
 # after scratchpad planning re-derives a work division, so its lifetime is the
@@ -505,9 +505,10 @@ def coarse_tile_local_dim_split_domains(
     by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
     data when that happened.
 
-    ``coarse_tile.py`` stamps ``op.loop_member`` (a ``LoopMember``) on every
-    op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
-    dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
+    ``coarse_tile.py`` records, for every op it tiles, which dims each loop level
+    tiles (``LoopMember``, held by the loop nodes once they are built and read
+    through ``enclosing_loops``). ``loop_tiled_dims``/``loop_tiled_reduction_dims``
+    name tiled dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
     ``loop_tiled_dims`` is the source: an access's per-trip advance (the index's
     loop-variable coefficient) says nothing about whether the op's own dim is
     tiled, so it could not be used to keep a tiled dim whole.
